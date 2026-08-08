@@ -122,6 +122,16 @@ class FileInfo(TypedDict):
     dispatch_relations: List[dict]
     dispatch_members: List[dict]
     dynamic_behaviors: List[dict]
+    exception_sites: List[dict]
+    catch_handlers: List[dict]
+    finally_blocks: List[dict]
+    promise_rejections: List[dict]
+    module_initializers: List[dict]
+    singletons: List[dict]
+    module_state: List[dict]
+    static_initializers: List[dict]
+    import_cycles: List[dict]
+    wiring_boundaries: List[dict]
     text: str
 
 

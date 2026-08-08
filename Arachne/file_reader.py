@@ -23,6 +23,9 @@ from .effect_analysis import analyze_effects
 from .type_system_analysis import analyze_type_system
 from .dispatch_analysis import analyze_dispatch
 from .dynamic_analysis import analyze_dynamic_behavior
+from .exception_analysis import analyze_exceptions
+from .module_init_analysis import analyze_module_init
+from .wiring_analysis import analyze_wiring
 from .types import FileInfo
 
 # SHA-256(absolute path) -> complete read_file() result.
@@ -167,6 +170,16 @@ def read_file(path: str) -> FileInfo:
         "dispatch_relations": [],
         "dispatch_members": [],
         "dynamic_behaviors": [],
+        "exception_sites": [],
+        "catch_handlers": [],
+        "finally_blocks": [],
+        "promise_rejections": [],
+        "module_initializers": [],
+        "singletons": [],
+        "module_state": [],
+        "static_initializers": [],
+        "import_cycles": [],
+        "wiring_boundaries": [],
         "text": text,
     }
     analyze_variable_flow(info)
@@ -373,6 +386,9 @@ def analyze_files(paths: List[str]) -> List[FileInfo]:
     analyze_runtime_models(results)
     analyze_effects(results)
     analyze_async_flow(results)
+    analyze_exceptions(results)
+    analyze_module_init(results)
+    analyze_wiring(results)
     analyze_taint(results)
     return results
 

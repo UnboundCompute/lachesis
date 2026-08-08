@@ -978,6 +978,137 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
                 context_stack=tainted_call["context_stack"],
             )
 
+        # Exception flow: throws, may-throw calls, catch bindings, finally, rejects.
+        for site in info["exception_sites"]:
+            add_node(
+                site["id"], "exception-site", site["expression"],
+                exception_kind=site["kind"], function_id=site["function_id"],
+                line=site["line"], escapes=site["escapes"],
+                reason=site.get("reason"),
+            )
+            if site.get("function_id"):
+                add_edge("CONTAINS_EXCEPTION_SITE", site["function_id"], site["id"])
+            if site.get("statement_id"):
+                add_edge("EXCEPTION_AT_STATEMENT", site["id"], site["statement_id"])
+            if site.get("call_id"):
+                add_edge("EXCEPTION_AT_CALL", site["id"], site["call_id"])
+            if site.get("handler_catch_id"):
+                add_edge("HANDLED_BY", site["id"], site["handler_catch_id"])
+            for finally_id in site.get("finally_ids", []):
+                add_edge("RUNS_FINALLY", site["id"], finally_id)
+            if site.get("rethrown_from_catch_id"):
+                add_edge("RETHROWN_FROM", site["id"], site["rethrown_from_catch_id"])
+            for target_id in site.get("callee_target_ids", []):
+                add_edge("THROWS_VIA_CALLEE", site["id"], target_id)
+            if site["escapes"] and site.get("function_id"):
+                add_edge("EXCEPTION_ESCAPES", site["id"], site["function_id"])
+        for handler in info["catch_handlers"]:
+            add_node(
+                handler["id"], "catch-handler",
+                handler.get("parameter_name") or "catch",
+                function_id=handler["function_id"], line=handler["line"],
+                rethrows=handler["rethrows"],
+            )
+            add_edge("CONTAINS_CATCH", handler["function_id"], handler["id"])
+            add_edge("CATCH_AT_STATEMENT", handler["id"], handler["statement_id"])
+            if handler.get("parameter_symbol_id"):
+                add_edge(
+                    "BINDS_CATCH_PARAMETER", handler["id"], handler["parameter_symbol_id"]
+                )
+        for block in info["finally_blocks"]:
+            add_node(
+                block["id"], "finally-block", "finally",
+                function_id=block["function_id"], line=block["line"],
+            )
+            add_edge("CONTAINS_FINALLY", block["function_id"], block["id"])
+            add_edge("FINALLY_AT_STATEMENT", block["id"], block["statement_id"])
+        for rejection in info["promise_rejections"]:
+            add_node(
+                rejection["id"], "promise-rejection", rejection["reason"],
+                rejection_kind=rejection["kind"], function_id=rejection["function_id"],
+                line=rejection["line"],
+            )
+            if rejection.get("function_id"):
+                add_edge("REJECTS", rejection["function_id"], rejection["id"])
+            if rejection.get("call_id"):
+                add_edge("REJECTS_AT_CALL", rejection["id"], rejection["call_id"])
+
+        # Module initialization order and global/singleton state.
+        for initializer in info["module_initializers"]:
+            add_node(
+                initializer["id"], "module-initializer", initializer["effect"],
+                order=initializer["order"], line=initializer["line"],
+                effect=initializer["effect"], has_call=initializer["has_call"],
+                text=initializer["text"],
+            )
+            add_edge(
+                "MODULE_INIT_STEP", file_id, initializer["id"],
+                order=initializer["order"],
+            )
+            add_edge("INIT_AT_STATEMENT", initializer["id"], initializer["statement_id"])
+            if initializer.get("previous_id"):
+                add_edge(
+                    "INIT_PRECEDED_BY", initializer["id"], initializer["previous_id"]
+                )
+        for singleton in info["singletons"]:
+            add_node(
+                singleton["id"], "singleton", singleton["name"],
+                singleton_kind=singleton["singleton_kind"],
+                allocated_type=singleton.get("allocated_type"),
+                exported=singleton["exported"], line=singleton["line"],
+            )
+            add_edge("HAS_SINGLETON", file_id, singleton["id"])
+            add_edge("SINGLETON_OF", singleton["id"], singleton["symbol_id"])
+        for state in info["module_state"]:
+            add_node(
+                state["id"], "module-state", state["name"],
+                state_kind=state["state_kind"], exported=state["exported"],
+                binding_kind=state["binding_kind"], line=state["line"],
+            )
+            add_edge("HAS_MODULE_STATE", file_id, state["id"])
+            if state.get("symbol_id"):
+                add_edge("MODULE_STATE_OF", state["id"], state["symbol_id"])
+        for initializer in info["static_initializers"]:
+            add_node(
+                initializer["id"], "static-initializer",
+                initializer.get("name") or "static-block",
+                static_kind=initializer["kind"], line=initializer["line"],
+            )
+            add_edge(
+                "HAS_STATIC_INITIALIZER", initializer["type_id"], initializer["id"]
+            )
+        for cycle in info["import_cycles"]:
+            add_node(
+                cycle["id"], "import-cycle", f"import cycle ({cycle['size']})",
+                size=cycle["size"], member_file_ids=cycle["member_file_ids"],
+            )
+            add_edge("PARTICIPATES_IN_CYCLE", file_id, cycle["id"])
+
+        # Framework and dependency wiring boundaries (dynamic, not unresolved).
+        for boundary in info["wiring_boundaries"]:
+            add_node(
+                boundary["id"], "wiring-boundary",
+                boundary.get("key") or boundary["kind"],
+                wiring_kind=boundary["kind"], mechanism=boundary["mechanism"],
+                key=boundary.get("key"), key_expression=boundary.get("key_expression"),
+                target_expression=boundary.get("target_expression"),
+                confidence=boundary["confidence"],
+                static_resolution=boundary["static_resolution"],
+                line=boundary["line"],
+            )
+            add_edge(
+                "HAS_WIRING_BOUNDARY", boundary.get("function_id") or file_id,
+                boundary["id"], wiring_kind=boundary["kind"],
+            )
+            if boundary.get("target_function_id"):
+                add_edge(
+                    "WIRES_TO", boundary["id"], boundary["target_function_id"],
+                    static_resolution=boundary["static_resolution"],
+                    confidence=boundary["confidence"],
+                )
+            if boundary.get("call_id"):
+                add_edge("WIRING_AT_CALL", boundary["id"], boundary["call_id"])
+
         attachment_edges = {
             "DEFINITION": "EXPRESSION_DEFINES",
             "READ": "EXPRESSION_READS",
