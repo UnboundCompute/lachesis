@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .function_analysis import mask_non_code
-from .scope_analysis import VARIABLE_RE, binding_names, innermost_scope
+from .scope_analysis import VARIABLE_RE, binding_names, innermost_scope_at
 
 ASSIGNMENT_RE = re.compile(
     r"(?P<left>[A-Za-z_$][\w$]*(?:"
@@ -360,7 +360,9 @@ def analyze_variable_flow(info: dict) -> None:
 
     def references(start: int, end: int, context_id: str) -> List[dict]:
         expression = expression_code(text, masked, start, end)
-        scope = innermost_scope(scopes, text.count("\n", 0, start) + 1)
+        scope = innermost_scope_at(
+            scopes, start, text.count("\n", 0, start) + 1
+        )
         result = []
         for match in REFERENCE_RE.finditer(expression):
             token = re.sub(r"\s+", "", match.group(0)).replace("?.", ".")
@@ -381,15 +383,18 @@ def analyze_variable_flow(info: dict) -> None:
                 "id": stable_id("read", context_id, absolute_start, token),
                 "symbol_id": target_id, "definition_id": definition["id"],
                 "name": token, "line": text.count("\n", 0, absolute_start) + 1,
-                "offset": absolute_start, "context_id": context_id,
+                "offset": absolute_start,
+                "end_offset": start + match.end(),
+                "context_id": context_id,
             }
             reads.append(read)
             add_flow("READS_FROM", definition["id"], context_id, read_id=read["id"])
             result.append(read)
             for dynamic_part in dynamic_parts:
                 dynamic_offset = absolute_start + token.find(dynamic_part)
-                dynamic_scope = innermost_scope(
-                    scopes, text.count("\n", 0, dynamic_offset) + 1
+                dynamic_scope = innermost_scope_at(
+                    scopes, dynamic_offset,
+                    text.count("\n", 0, dynamic_offset) + 1,
                 )
                 dynamic_root, dynamic_path, _nested = access_parts(dynamic_part)
                 dynamic_symbol = visible_symbol(
@@ -405,6 +410,7 @@ def analyze_variable_flow(info: dict) -> None:
                     "name": dynamic_part,
                     "line": text.count("\n", 0, dynamic_offset) + 1,
                     "offset": dynamic_offset,
+                    "end_offset": dynamic_offset + len(dynamic_part),
                     "context_id": context_id,
                 }
                 reads.append(dynamic_read)
@@ -481,7 +487,7 @@ def analyze_variable_flow(info: dict) -> None:
 
     for _offset, event_kind, event in sorted(events, key=lambda item: item[0]):
         line = text.count("\n", 0, event["offset"]) + 1
-        scope = innermost_scope(scopes, line)
+        scope = innermost_scope_at(scopes, event["offset"], line)
         dependency_reads = []
         if event["expression_end"] > event["expression_start"]:
             context_id = stable_id("write-context", info["path_hash"], event["offset"])
@@ -568,7 +574,7 @@ def analyze_variable_flow(info: dict) -> None:
     for match in UPDATE_RE.finditer(masked):
         name = match.group("prefix_name") or match.group("suffix_name")
         line = text.count("\n", 0, match.start()) + 1
-        scope = innermost_scope(scopes, line)
+        scope = innermost_scope_at(scopes, match.start(), line)
         symbol = visible_symbol(name, match.start(), scope["id"])
         previous = current_definition(symbol["id"], match.start())
         definition = add_definition(symbol["id"], "update", match.start(), "expression")

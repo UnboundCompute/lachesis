@@ -3,8 +3,8 @@ import hashlib
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .function_analysis import mask_non_code, matching_delimiter
-from .scope_analysis import innermost_scope
+from .function_analysis import mask_non_code, matching_delimiter, non_code_spans
+from .scope_analysis import innermost_scope_at
 from .variable_analysis import split_arguments
 
 
@@ -59,10 +59,12 @@ def trim_span(text: str, start: int, end: int) -> Tuple[int, int]:
 
 def lexical_tokens(text: str, functions: List[dict], path_hash: str) -> List[dict]:
     tokens = []
-    for match in TOKEN_RE.finditer(text):
+    masked = mask_non_code(text)
+
+    def append_token(start: int, end: int, token_kind: str, value: str) -> None:
         owners = [
             function for function in functions
-            if function.get("body_start_offset", function["start_offset"]) < match.start()
+            if function.get("body_start_offset", function["start_offset"]) < start
             < function["end_offset"]
         ]
         owner = min(
@@ -71,20 +73,26 @@ def lexical_tokens(text: str, functions: List[dict], path_hash: str) -> List[dic
             default=None,
         )
         if not owner:
-            continue
-        token_kind = match.lastgroup
-        value = match.group(0)
+            return
         if token_kind == "identifier" and value in KEYWORDS:
             token_kind = "keyword"
         tokens.append({
-            "id": stable_id("token", path_hash, match.start(), match.end(), value),
+            "id": stable_id("token", path_hash, start, end, value),
             "kind": token_kind, "value": value,
-            "start_offset": match.start(), "end_offset": match.end(),
-            "start_line": line_number(text, match.start()),
-            "end_line": line_number(text, max(match.start(), match.end() - 1)),
+            "start_offset": start, "end_offset": end,
+            "start_line": line_number(text, start),
+            "end_line": line_number(text, max(start, end - 1)),
             "function_id": owner["id"],
         })
-    return tokens
+
+    # Scan code only; otherwise TOKEN_RE can reinterpret a backtick contained
+    # in `/.../` as a template and swallow all later tokens. Non-code spans are
+    # then added back as single lossless lexical units.
+    for match in TOKEN_RE.finditer(masked):
+        append_token(match.start(), match.end(), match.lastgroup, text[match.start():match.end()])
+    for start, end, kind in non_code_spans(text):
+        append_token(start, end, kind, text[start:end])
+    return sorted(tokens, key=lambda item: item["start_offset"])
 
 
 def source_lines(text: str, path_hash: str) -> List[dict]:
@@ -187,7 +195,10 @@ def discover_statements(
             code_values = [item["value"] for item in current if item["kind"] != "comment"]
             first = code_values[0] if code_values else None
             if value == "{" and parens == brackets == 0:
-                if first in BLOCK_HEADERS:
+                if first == "{":
+                    current = []
+                    braces.append("block")
+                elif first in BLOCK_HEADERS:
                     flush(forced_kind=f"{first}-statement")
                     braces.append("block")
                 else:
@@ -286,12 +297,15 @@ def expression_tree(info: dict, seeds: Iterable[Tuple[int, int, str]]) -> tuple:
                 "start_line": line_number(text, start),
                 "end_line": line_number(text, max(start, end - 1)),
                 "text": text[start:end],
+                "roles": [kind],
             }
             by_range[key] = expression
             expressions.append(expression)
         elif expression["kind"] in {"expression", "leaf"} and kind not in {"expression", "leaf"}:
             expression["kind"] = kind
             expression["operator"] = operator
+        if kind not in expression["roles"]:
+            expression["roles"].append(kind)
         return expression
 
     def link(parent: dict, child: Optional[dict], role: str, position: Optional[int] = None):
@@ -340,6 +354,25 @@ def expression_tree(info: dict, seeds: Iterable[Tuple[int, int, str]]) -> tuple:
             link(parent, parse(start, question), "CONDITION")
             link(parent, parse(question + 1, colon), "TRUE_VALUE")
             link(parent, parse(colon + 1, end), "FALSE_VALUE")
+            parsing.remove(key)
+            return parent
+
+        # TypeScript `value as Type` is a value-preserving cast operation.
+        depth = 0
+        cast_offset = None
+        for match in re.finditer(r"\bas\b", masked[start:end]):
+            absolute = start + match.start()
+            depth = 0
+            for char in masked[start:absolute]:
+                if char in "([{": depth += 1
+                elif char in ")]}" and depth: depth -= 1
+            if depth == 0:
+                cast_offset = absolute
+        if cast_offset is not None:
+            parent["kind"] = "cast"
+            parent["operator"] = "as"
+            parent["cast_type"] = text[cast_offset + 2:end].strip()
+            link(parent, parse(start, cast_offset), "CAST_VALUE")
             parsing.remove(key)
             return parent
 
@@ -472,7 +505,10 @@ def expression_tree(info: dict, seeds: Iterable[Tuple[int, int, str]]) -> tuple:
             base_start = normalized_start
             base_end = base_start + len(base_text)
             parent["kind"] = "member-access"
-            parent["operator"] = "[]" if member_match.group(3) is not None else "."
+            parent["operator"] = (
+                "[]" if member_match.group(3) is not None
+                else "?." if "?." in raw else "."
+            )
             link(parent, parse(base_start, base_end), "RECEIVER")
             if member_match.group(3) is not None:
                 index_start = text.find("[", base_end, end) + 1
@@ -514,6 +550,7 @@ def expression_tree(info: dict, seeds: Iterable[Tuple[int, int, str]]) -> tuple:
 
 def analyze_body_structure(info: dict) -> None:
     text = info["text"]
+    masked = mask_non_code(text)
     lines = source_lines(text, info["path_hash"])
     tokens = lexical_tokens(text, info["functions"], info["path_hash"])
     statements = discover_statements(
@@ -535,9 +572,10 @@ def analyze_body_structure(info: dict) -> None:
             cursor += 1
         if cursor < len(text) and text[cursor] == ";":
             end = cursor + 1
-        key = (returned.get("function_id"), start, end)
         if not any(
-            (item["function_id"], item["start_offset"], item["end_offset"]) == key
+            item["function_id"] == returned.get("function_id")
+            and item["kind"] == returned["kind"]
+            and item["start_offset"] == start
             for item in statements
         ):
             statements.append({
@@ -550,6 +588,46 @@ def analyze_body_structure(info: dict) -> None:
                 "end_line": line_number(text, max(start, end - 1)),
                 "text": text[start:end],
             })
+
+    # Abrupt statements may likewise be nested in an unbraced control body,
+    # for example `if (done) break;` or `if (skip) continue;`.  The outer
+    # statement remains useful for its condition while this inner record owns
+    # the loop-control CFG edge.
+    for abrupt in re.finditer(
+        r"\b(?P<kind>break|continue)\b(?:\s+[A-Za-z_$][\w$]*)?\s*;?",
+        masked,
+    ):
+        owners = [
+            function for function in info["functions"]
+            if function.get("body_start_offset", function["start_offset"])
+            <= abrupt.start()
+            and abrupt.end() <= function["end_offset"]
+        ]
+        owner = min(
+            owners,
+            key=lambda function: function["end_offset"] - function["start_offset"],
+            default=None,
+        )
+        if not owner or any(
+            item["function_id"] == owner["id"]
+            and item["kind"] == abrupt.group("kind")
+            and item["start_offset"] == abrupt.start()
+            for item in statements
+        ):
+            continue
+        statements.append({
+            "id": stable_id(
+                "statement", info["path_hash"], owner["id"],
+                abrupt.start(), abrupt.end(),
+            ),
+            "kind": abrupt.group("kind"),
+            "function_id": owner["id"],
+            "start_offset": abrupt.start(),
+            "end_offset": abrupt.end(),
+            "start_line": line_number(text, abrupt.start()),
+            "end_line": line_number(text, max(abrupt.start(), abrupt.end() - 1)),
+            "text": text[abrupt.start():abrupt.end()],
+        })
     symbols_by_id = {symbol["id"]: symbol for symbol in info["symbols"]}
     module_events = []
     for definition in info["definitions"]:
@@ -600,8 +678,8 @@ def analyze_body_structure(info: dict) -> None:
             default=None,
         )
         statement["parent_statement_id"] = parent["id"] if parent else None
-        statement["scope_id"] = innermost_scope(
-            info["scopes"], statement["start_line"]
+        statement["scope_id"] = innermost_scope_at(
+            info["scopes"], statement["start_offset"], statement["start_line"]
         )["id"]
     by_function = {}
     for statement in statements:
@@ -616,7 +694,6 @@ def analyze_body_structure(info: dict) -> None:
                 function_statements[position + 1]["id"]
                 if position + 1 < len(function_statements) else None
             )
-    masked = mask_non_code(text)
     seeds = []
     for definition in info["definitions"]:
         start = definition.get("expression_start")
@@ -673,7 +750,10 @@ def analyze_body_structure(info: dict) -> None:
                 "DEFINITION",
             ))
     for read in info["reads"]:
-        entity_specs.append((read["id"], read["offset"], read["offset"] + 1, "READ"))
+        entity_specs.append((
+            read["id"], read["offset"], read.get("end_offset", read["offset"] + 1),
+            "READ",
+        ))
     for call in info["function_calls"]:
         entity_specs.append((call["id"], call["start_offset"], call["end_offset"] + 1, "CALL"))
     for argument in info["arguments"]:

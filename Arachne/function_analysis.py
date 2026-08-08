@@ -21,6 +21,10 @@ CALL_RE = re.compile(
     r"(?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*)*)"
     r"\s*(?P<optional>\?\.\s*)?\("
 )
+COMPUTED_CALL_RE = re.compile(
+    r"(?P<receiver>[A-Za-z_$][\w$]*(?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*)*)"
+    r"\s*\[\s*(?P<key>[^\]\n]+)\s*\]\s*(?P<optional>\?\.\s*)?\("
+)
 
 JAVASCRIPT_GLOBALS = {
     "Array", "BigInt", "Boolean", "Date", "Error", "EvalError", "Function",
@@ -71,58 +75,169 @@ def classify_language_call(callee: str) -> Optional[str]:
     return None
 
 
-def mask_non_code(text: str) -> str:
-    """Blank comments and string contents while preserving character offsets."""
-    chars = list(text)
+REGEX_PREFIX_KEYWORDS = {
+    "await", "case", "delete", "do", "else", "in", "instanceof", "new",
+    "of", "return", "throw", "typeof", "void", "yield",
+}
+VALUE_KEYWORDS = {"false", "null", "super", "this", "true", "undefined"}
+CONTROL_PAREN_KEYWORDS = {"catch", "for", "if", "switch", "while", "with"}
+
+
+def _regex_can_start(previous_kind: Optional[str], previous_value: str) -> bool:
+    """Approximate JavaScript's lexical-goal choice for `/` vs division."""
+    if previous_kind is None:
+        return True
+    if previous_kind == "keyword":
+        return previous_value in REGEX_PREFIX_KEYWORDS
+    if previous_kind == "control-close":
+        return True
+    if previous_kind in {"identifier", "number", "string", "regex", "close"}:
+        return False
+    if previous_value in {".", "?.", "++", "--"}:
+        return False
+    return True
+
+
+def non_code_spans(text: str) -> List[Tuple[int, int, str]]:
+    """Return comment, string/template, and regex literal spans.
+
+    Regex literals require lexical context because `/` is also division.  This
+    small scanner tracks whether the preceding token can terminate an
+    expression, which is sufficient for normal TS/JS regex positions while
+    keeping arithmetic such as `total / count / scale` as code.
+    """
+    spans = []
     index = 0
-    state = "code"
-    quote = ""
-    while index < len(chars):
-        char = chars[index]
-        following = chars[index + 1] if index + 1 < len(chars) else ""
-        if state == "code":
-            if char == "/" and following == "/":
-                chars[index] = chars[index + 1] = " "
-                index += 2
-                state = "line-comment"
-                continue
-            if char == "/" and following == "*":
-                chars[index] = chars[index + 1] = " "
-                index += 2
-                state = "block-comment"
-                continue
-            if char in {"'", '"', "`"}:
-                quote = char
-                chars[index] = " "
-                index += 1
-                state = "string"
-                continue
-        elif state == "line-comment":
-            if char == "\n":
-                state = "code"
+    previous_kind: Optional[str] = None
+    previous_value = ""
+    pending_control_paren = False
+    paren_context = []
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if char.isspace():
+            index += 1
+            continue
+
+        if char == "/" and following in {"/", "*"}:
+            start = index
+            if following == "/":
+                newline = text.find("\n", index + 2)
+                index = len(text) if newline < 0 else newline
             else:
-                chars[index] = " "
-        elif state == "block-comment":
-            if char == "*" and following == "/":
-                chars[index] = chars[index + 1] = " "
-                index += 2
-                state = "code"
-                continue
-            chars[index] = " "
-        elif state == "string":
-            if char == "\\":
-                chars[index] = " "
-                if index + 1 < len(chars):
-                    if chars[index + 1] != "\n":
-                        chars[index + 1] = " "
-                    index += 2
+                closing = text.find("*/", index + 2)
+                index = len(text) if closing < 0 else closing + 2
+            spans.append((start, index, "comment"))
+            continue
+
+        if char in {"'", '"', "`"}:
+            start = index
+            quote = char
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index = min(len(text), index + 2)
                     continue
-            if char == quote:
-                chars[index] = " "
-                state = "code"
-            else:
-                chars[index] = " "
+                if text[index] == quote:
+                    index += 1
+                    break
+                if quote != "`" and text[index] in "\r\n":
+                    break
+                index += 1
+            spans.append((start, index, "string"))
+            previous_kind, previous_value = "string", quote
+            pending_control_paren = False
+            continue
+
+        if char == "/" and _regex_can_start(previous_kind, previous_value):
+            start = index
+            cursor = index + 1
+            in_character_class = False
+            closing = None
+            while cursor < len(text):
+                current = text[cursor]
+                if current == "\\":
+                    cursor += 2
+                    continue
+                if current in "\r\n":
+                    break
+                if current == "[":
+                    in_character_class = True
+                elif current == "]":
+                    in_character_class = False
+                elif current == "/" and not in_character_class:
+                    closing = cursor
+                    break
+                cursor += 1
+            if closing is not None:
+                index = closing + 1
+                while index < len(text) and text[index].isalpha():
+                    index += 1
+                spans.append((start, index, "regex"))
+                previous_kind, previous_value = "regex", "/"
+                pending_control_paren = False
+                continue
+
+        identifier = re.match(r"[A-Za-z_$][\w$]*", text[index:])
+        if identifier:
+            value = identifier.group(0)
+            previous_kind = (
+                "keyword" if value in (
+                    REGEX_PREFIX_KEYWORDS | VALUE_KEYWORDS | CONTROL_PAREN_KEYWORDS
+                )
+                else "identifier"
+            )
+            previous_value = value
+            pending_control_paren = value in CONTROL_PAREN_KEYWORDS
+            index += len(value)
+            continue
+        number = re.match(
+            r"(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|0[oO][0-7]+|"
+            r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)n?",
+            text[index:],
+        )
+        if number:
+            previous_kind, previous_value = "number", number.group(0)
+            pending_control_paren = False
+            index += len(number.group(0))
+            continue
+        if char == "(":
+            paren_context.append(pending_control_paren)
+            pending_control_paren = False
+            previous_kind, previous_value = "operator", char
+            index += 1
+            continue
+        if char == ")":
+            control_close = paren_context.pop() if paren_context else False
+            previous_kind = "control-close" if control_close else "close"
+            previous_value = char
+            pending_control_paren = False
+            index += 1
+            continue
+        if char in "]}":
+            previous_kind, previous_value = "close", char
+            pending_control_paren = False
+            index += 1
+            continue
+        two = text[index:index + 2]
+        if two in {"++", "--", "?.", "=>", "==", "!=", "<=", ">=", "&&", "||", "??"}:
+            previous_kind, previous_value = "operator", two
+            pending_control_paren = False
+            index += 2
+            continue
+        previous_kind, previous_value = "operator", char
+        pending_control_paren = False
         index += 1
+    return spans
+
+
+def mask_non_code(text: str) -> str:
+    """Blank comments, strings, and regex literals while preserving offsets."""
+    chars = list(text)
+    for start, end, _kind in non_code_spans(text):
+        for index in range(start, end):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
     return "".join(chars)
 
 
@@ -359,6 +474,15 @@ def find_functions(text: str) -> List[FunctionInfo]:
         ) + 1
         if masked[statement_start:match.start()].strip().startswith(("type ", "interface ")):
             continue
+        # Function-type annotations (`callback: (x: T) => void`) are types,
+        # not executable arrow functions. They end in type punctuation rather
+        # than an expression body.
+        if re.match(
+            r"\s*(?:void|never|unknown|any|string|number|boolean|symbol|bigint|"
+            r"[A-Z][A-Za-z_$\d]*(?:\s*<[^;{}]*>)?)(?:\[\])?\s*[,;)}]",
+            masked[match.end():],
+        ):
+            continue
         start, name = arrow_start_and_name(masked, match.start())
         body_end = arrow_body_end(masked, match.end())
         if body_end is None:
@@ -429,6 +553,27 @@ def find_function_calls(text: str) -> List[FunctionCallInfo]:
             "end_offset": closing_parenthesis if closing_parenthesis is not None else match.end(),
         })
 
+    existing_spans = {(call["start_offset"], call["arguments_start_offset"]) for call in calls}
+    for match in COMPUTED_CALL_RE.finditer(masked):
+        opening_parenthesis = match.end() - 1
+        key = (match.start("receiver"), opening_parenthesis)
+        if key in existing_spans:
+            continue
+        closing_parenthesis = matching_delimiter(masked, opening_parenthesis, "(", ")")
+        receiver = re.sub(r"\s+", "", match.group("receiver"))
+        computed_key = text[match.start("key"):match.end("key")].strip()
+        calls.append({
+            "callee": f"{receiver}[{computed_key}]",
+            "form": "optional-computed-call" if match.group("optional") else "computed-call",
+            "line": text.count("\n", 0, match.start("receiver")) + 1,
+            "start_offset": match.start("receiver"),
+            "arguments_start_offset": opening_parenthesis,
+            "arguments_end_offset": closing_parenthesis,
+            "end_offset": closing_parenthesis if closing_parenthesis is not None else match.end(),
+            "receiver_expression": receiver,
+            "computed_key_expression": computed_key,
+        })
+
     # Connect `.method()` calls whose receiver is another call expression,
     # such as createHmac(...).update(...).digest(...). The ordinary callee
     # regex deliberately stays small; this pass adds the missing chain link.
@@ -448,4 +593,4 @@ def find_function_calls(text: str) -> List[FunctionCallInfo]:
             call["receiver_expression"] = text[
                 receiver_call["start_offset"]:receiver_call["end_offset"] + 1
             ].strip()
-    return calls
+    return sorted(calls, key=lambda item: item["start_offset"])

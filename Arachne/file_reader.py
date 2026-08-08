@@ -11,6 +11,18 @@ from .variable_analysis import analyze_variable_flow
 from .data_flow import link_data_flow
 from .receiver_analysis import resolve_receivers
 from .body_analysis import analyze_body_structure
+from .operation_analysis import analyze_operations
+from .context_analysis import analyze_call_contexts
+from .heap_analysis import analyze_heap
+from .control_flow import build_control_flow
+from .branch_analysis import analyze_branch_histories
+from .taint_analysis import analyze_taint
+from .runtime_models import analyze_runtime_models
+from .async_analysis import analyze_async_flow
+from .effect_analysis import analyze_effects
+from .type_system_analysis import analyze_type_system
+from .dispatch_analysis import analyze_dispatch
+from .dynamic_analysis import analyze_dynamic_behavior
 from .types import FileInfo
 
 # SHA-256(absolute path) -> complete read_file() result.
@@ -121,10 +133,45 @@ def read_file(path: str) -> FileInfo:
         "expressions": [],
         "expression_links": [],
         "body_attachments": [],
+        "operations": [],
+        "operation_inputs": [],
+        "operation_attachments": [],
+        "call_contexts": [],
+        "context_dispatches": [],
+        "heap_objects": [],
+        "heap_locations": [],
+        "points_to": [],
+        "heap_accesses": [],
+        "heap_effects": [],
+        "context_heap_effects": [],
+        "cfg_nodes": [],
+        "cfg_edges": [],
+        "unreachable": [],
+        "phi_nodes": [],
+        "branch_flows": [],
+        "taint_sources": [],
+        "taint_flows": [],
+        "taint_reaches": [],
+        "tainted_calls": [],
+        "runtime_models": [],
+        "async_nodes": [],
+        "async_edges": [],
+        "effect_summaries": [],
+        "applied_effects": [],
+        "type_parameters": [],
+        "type_refinements": [],
+        "generic_substitutions": [],
+        "overloads": [],
+        "type_compatibilities": [],
+        "dispatch_candidates": [],
+        "dispatch_relations": [],
+        "dispatch_members": [],
+        "dynamic_behaviors": [],
         "text": text,
     }
     analyze_variable_flow(info)
     analyze_body_structure(info)
+    analyze_operations(info)
     FILE_MAP[path_hash] = info
     return info
 
@@ -309,7 +356,24 @@ def analyze_files(paths: List[str]) -> List[FileInfo]:
                         terminal_call(call, "unresolved-import")
             HOLD_LIST.clear()
     resolve_receivers(results)
+    analyze_dispatch(results)
     link_data_flow(results)
+    analyze_call_contexts(results)
+    analyze_dispatch(results, include_callbacks=True)
+    # Callback dispatch depends on first-pass call contexts. Rebuild the
+    # interprocedural links once those callback targets are known.
+    link_data_flow(results)
+    analyze_call_contexts(results)
+    analyze_dynamic_behavior(results)
+    analyze_heap(results)
+    for info in results:
+        build_control_flow(info)
+    analyze_branch_histories(results)
+    analyze_type_system(results)
+    analyze_runtime_models(results)
+    analyze_effects(results)
+    analyze_async_flow(results)
+    analyze_taint(results)
     return results
 
 

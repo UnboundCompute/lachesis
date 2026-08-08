@@ -44,6 +44,22 @@ def innermost_scope(scopes: List[dict], line: int) -> dict:
     )
 
 
+def innermost_scope_at(scopes: List[dict], offset: int, line: int = None) -> dict:
+    candidates = [
+        scope for scope in scopes
+        if scope.get("start_offset", 0) <= offset < scope.get("end_offset", 0)
+    ]
+    if not candidates:
+        return innermost_scope(scopes, line or 1)
+    return min(
+        candidates,
+        key=lambda scope: (
+            scope.get("end_offset", 0) - scope.get("start_offset", 0),
+            2 if scope["kind"] == "module" else 1 if scope["kind"] == "function" else 0,
+        ),
+    )
+
+
 def binding_names(binding: str) -> List[str]:
     binding = binding.strip()
     if binding.startswith(("{", "[")):
@@ -103,6 +119,8 @@ def analyze_scopes(
         "end_line": max(line_count, 1),
         "parent_scope_id": None,
         "owner_function_id": None,
+        "start_offset": 0,
+        "end_offset": len(text) + 1,
     }]
 
     for ordinal, function in enumerate(functions, 1):
@@ -113,6 +131,8 @@ def analyze_scopes(
             "end_line": function["end_line"],
             "parent_scope_id": None,
             "owner_function_id": function["id"],
+            "start_offset": function.get("body_start_offset", function["start_offset"]),
+            "end_offset": function["end_offset"] + 1,
         }
         scopes.append(scope)
         function["scope_id"] = scope["id"]
@@ -132,6 +152,8 @@ def analyze_scopes(
             "end_line": text.count("\n", 0, closing) + 1,
             "parent_scope_id": None,
             "owner_function_id": None,
+            "start_offset": opening,
+            "end_offset": closing + 1,
         })
 
     for ordinal, match in enumerate(FOR_HEADER_RE.finditer(masked), 1):
@@ -154,6 +176,7 @@ def analyze_scopes(
             "kind": "for", "start_line": text.count("\n", 0, match.start()) + 1,
             "end_line": text.count("\n", 0, statement_end) + 1,
             "parent_scope_id": None, "owner_function_id": None,
+            "start_offset": cursor, "end_offset": statement_end + 1,
         })
 
     existing_ranges = {
@@ -175,18 +198,19 @@ def analyze_scopes(
             "id": scope_id(path_hash, "block", block_range[0], ordinal),
             "kind": "block", "start_line": block_range[0], "end_line": block_range[1],
             "parent_scope_id": None, "owner_function_id": None,
+            "start_offset": opening, "end_offset": closing + 1,
         })
 
     for scope in scopes[1:]:
         parents = [
             candidate for candidate in scopes
             if candidate is not scope
-            and candidate["start_line"] <= scope["start_line"]
-            and scope["end_line"] <= candidate["end_line"]
+            and candidate["start_offset"] <= scope["start_offset"]
+            and scope["end_offset"] <= candidate["end_offset"]
         ]
         parent = min(
             parents,
-            key=lambda candidate: candidate["end_line"] - candidate["start_line"],
+            key=lambda candidate: candidate["end_offset"] - candidate["start_offset"],
             default=scopes[0],
         )
         scope["parent_scope_id"] = parent["id"]
@@ -195,7 +219,9 @@ def analyze_scopes(
         )
 
     for call in calls:
-        call["scope_id"] = innermost_scope(scopes, call["line"])["id"]
+        call["scope_id"] = innermost_scope_at(
+            scopes, call.get("start_offset", 0), call["line"]
+        )["id"]
 
     symbols = []
 
@@ -237,13 +263,15 @@ def analyze_scopes(
     for declared_type in types or []:
         add_symbol(
             declared_type["name"], declared_type["kind"], declared_type["start_line"],
-            innermost_scope(scopes, declared_type["start_line"]), declared_type["id"],
+            innermost_scope_at(
+                scopes, declared_type.get("start_offset", 0), declared_type["start_line"]
+            ), declared_type["id"],
             declared_type.get("start_offset", 0),
         )
 
     for match in VARIABLE_RE.finditer(masked):
         line = text.count("\n", 0, match.start("binding")) + 1
-        scope = innermost_scope(scopes, line)
+        scope = innermost_scope_at(scopes, match.start("binding"), line)
         if match.group("kind") == "var":
             while scope["kind"] not in {"function", "module"}:
                 scope = next(s for s in scopes if s["id"] == scope["parent_scope_id"])
@@ -255,7 +283,8 @@ def analyze_scopes(
         line = text.count("\n", 0, match.start("name")) + 1
         add_symbol(
             match.group("name"), "catch-parameter", line,
-            innermost_scope(scopes, line), start_offset=match.start("name"),
+            innermost_scope_at(scopes, match.start("name"), line),
+            start_offset=match.start("name"),
         )
 
     by_scope_name = {}

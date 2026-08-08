@@ -53,6 +53,11 @@ class FunctionCallInfo(TypedDict, total=False):
     receiver_call_id: str
     receiver: dict
     return_type: dict
+    receiver_expression: str
+    computed_key_expression: str
+    dispatch_candidate_ids: List[str]
+    dispatch_target_ids: List[str]
+    dispatch_status: str
 
 
 class FileInfo(TypedDict):
@@ -83,6 +88,40 @@ class FileInfo(TypedDict):
     expressions: List[dict]
     expression_links: List[dict]
     body_attachments: List[dict]
+    operations: List[dict]
+    operation_inputs: List[dict]
+    operation_attachments: List[dict]
+    call_contexts: List[dict]
+    context_dispatches: List[dict]
+    heap_objects: List[dict]
+    heap_locations: List[dict]
+    points_to: List[dict]
+    heap_accesses: List[dict]
+    heap_effects: List[dict]
+    context_heap_effects: List[dict]
+    cfg_nodes: List[dict]
+    cfg_edges: List[dict]
+    unreachable: List[dict]
+    phi_nodes: List[dict]
+    branch_flows: List[dict]
+    taint_sources: List[dict]
+    taint_flows: List[dict]
+    taint_reaches: List[dict]
+    tainted_calls: List[dict]
+    runtime_models: List[dict]
+    async_nodes: List[dict]
+    async_edges: List[dict]
+    effect_summaries: List[dict]
+    applied_effects: List[dict]
+    type_parameters: List[dict]
+    type_refinements: List[dict]
+    generic_substitutions: List[dict]
+    overloads: List[dict]
+    type_compatibilities: List[dict]
+    dispatch_candidates: List[dict]
+    dispatch_relations: List[dict]
+    dispatch_members: List[dict]
+    dynamic_behaviors: List[dict]
     text: str
 
 

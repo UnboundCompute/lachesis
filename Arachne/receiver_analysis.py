@@ -494,10 +494,17 @@ def resolve_receivers(files: Iterable[dict]) -> None:
         for call in info["function_calls"]:
             normalized = call["callee"].replace("?.", ".")
             parts = normalized.split(".")
-            call["method_name"] = parts[-1]
+            computed_key = call.get("computed_key_expression")
+            literal_key = (
+                computed_key[1:-1]
+                if computed_key and len(computed_key) >= 2
+                and computed_key[0] in "'\"`" and computed_key[-1] == computed_key[0]
+                else None
+            )
+            call["method_name"] = literal_key or parts[-1]
             call["receiver"] = None
             receiver_call_id = call.get("receiver_call_id")
-            if len(parts) < 2 and not receiver_call_id:
+            if len(parts) < 2 and not receiver_call_id and not call.get("receiver_expression"):
                 if call["id"] in call_types:
                     call["return_type"] = call_types[call["id"]]
                 continue
