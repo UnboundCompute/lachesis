@@ -142,6 +142,37 @@ def analyze_taint(files: Iterable[dict]) -> None:
                 parent_source_id=parent_source["id"],
             )
 
+    # Library / API entry points. The HTTP model above only fires for
+    # request-shaped handlers (name matches handle/route/webhook AND the param
+    # is Request-typed). Real library code -- an exported download({ url }) or
+    # getInvoice(id) -- has neither: its attacker-influenced input arrives as an
+    # ordinary in-scope parameter of a *public* (exported) function. Treat every
+    # exported function as an ingress and its parameters as externally-supplied
+    # sources so the path tier and the differential engine repopulate off real
+    # code, not just webhook shapes. Medium confidence: a genuine entry point,
+    # but weaker than a confirmed remote HTTP ingress -- the strict judge and
+    # the guard layer adjudicate reach, we do not assert exploitability here.
+    for info in file_list:
+        exported_names = set(info["exports"])
+        functions = {function["id"]: function for function in info["functions"]}
+        for symbol in info["symbols"]:
+            if symbol["kind"] != "parameter":
+                continue
+            if symbol["id"] in boundary_parameter_sources:
+                continue  # already tagged by the HTTP request-parameter model
+            function = functions.get(symbol.get("owner_function_id"))
+            if not function or function["name"] not in exported_names:
+                continue
+            definitions = definitions_by_symbol.get(symbol["id"], [])
+            if not definitions:
+                continue
+            definition = min(definitions, key=lambda item: item["offset"])
+            add_source(
+                info, definition["id"], "entry-parameter",
+                f"{function['name']} parameter {symbol['name']}",
+                function["id"], definition["line"], confidence="medium",
+            )
+
     direct = []
     direct_keys = set()
 
@@ -340,7 +371,16 @@ def analyze_taint(files: Iterable[dict]) -> None:
             call_pair = calls.get(value_id)
             if call_pair and previous_state is not None and via == "TAINT_CALL_INPUT":
                 call_info, call = call_pair
-                key = (call["id"], source_id, context_stack)
+                # Collapse over calling context: the security briefing records
+                # the fact "source reaches this sink call" ONCE, not one record
+                # per distinct context interleaving. The traversal still visits
+                # every context state (needed for valid call/return matching);
+                # only the materialized tainted-call is deduped. This loop runs
+                # in BFS-distance order, so the first-seen (call, source) is the
+                # shortest path -- which is the representative we keep. Without
+                # this, k-CFA context enumeration multiplies one sink into 2^k
+                # identical records (23 sources -> 122k tainted-calls observed).
+                key = (call["id"], source_id)
                 if key not in tainted_call_keys:
                     tainted_call_keys.add(key)
                     call_info["tainted_calls"].append({
