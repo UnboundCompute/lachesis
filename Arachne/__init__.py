@@ -24,6 +24,8 @@ from .dynamic_analysis import analyze_dynamic_behavior
 from .exception_analysis import analyze_exceptions
 from .module_init_analysis import analyze_module_init
 from .wiring_analysis import analyze_wiring
+from .security_roles import derive_roles, detect_guards
+from .layered_graph import build_layered_graph, write_layered_graph
 from .types import (
     CodeGraph, ExportInfo, FileInfo, FunctionCallInfo, FunctionInfo, GraphEdge,
     GraphNode, ImportInfo,
@@ -72,6 +74,10 @@ __all__ = [
     "analyze_exceptions",
     "analyze_module_init",
     "analyze_wiring",
+    "derive_roles",
+    "detect_guards",
+    "build_layered_graph",
+    "write_layered_graph",
     "read_file",
     "resolve_import",
     "walk",
