@@ -81,8 +81,14 @@ _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 # SINGLE SOURCE OF TRUTH for "is this a test file": the graph builder imports the same
 # predicate to exclude tests at file-discovery (Arachne/pipeline.source_inventory), so
 # "in the graph" and "not a test" can never drift apart.
+# Generic test/spec conventions across languages (no vendor/interface literals):
+#  - JS/TS: *.test.*, *.spec.*, *.integration.*, *.e2e.*, __tests__/, test(s)/
+#  - C/kernel: *_test.c (KUnit), selftests/ and tools/testing/ (kernel test trees).
+# The `(^|/)tests?/` anchor requires a slash before "test", so it does NOT catch
+# "selftests/" — that needs its own alternative.
 _TEST_PATH = re.compile(
-    r"\.(test|spec)\.|\.integration\.|\.e2e\.|(^|/)__tests__/|(^|/)tests?/|_test\.",
+    r"\.(test|spec)\.|\.integration\.|\.e2e\.|(^|/)__tests__/|(^|/)tests?/|_test\."
+    r"|(^|/)selftests/|(^|/)tools/testing/",
     re.I)
 
 
