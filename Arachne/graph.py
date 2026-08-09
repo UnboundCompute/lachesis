@@ -175,6 +175,7 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
                 start_line=statement["start_line"], end_line=statement["end_line"],
                 start_offset=statement["start_offset"],
                 end_offset=statement["end_offset"],
+                compiler_node_id=statement.get("compiler_node_id"),
             )
         for expression in info["expressions"]:
             add_node(
@@ -184,6 +185,7 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
                 end_line=expression["end_line"],
                 start_offset=expression["start_offset"],
                 end_offset=expression["end_offset"],
+                compiler_node_id=expression.get("compiler_node_id"),
             )
         for operation in info["operations"]:
             add_node(
@@ -644,6 +646,11 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
                 add_edge("NEXT_TOKEN", left["id"], right["id"])
 
         for statement in info["statements"]:
+            if statement.get("compiler_node_id"):
+                add_edge(
+                    "COMPILER_BODY_VIEW_OF", statement["id"],
+                    statement["compiler_node_id"],
+                )
             owner_id = (
                 statement.get("parent_statement_id")
                 or statement.get("function_id")
@@ -669,6 +676,11 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
             link["child"] for link in info["expression_links"]
         }
         for expression in info["expressions"]:
+            if expression.get("compiler_node_id"):
+                add_edge(
+                    "COMPILER_BODY_VIEW_OF", expression["id"],
+                    expression["compiler_node_id"],
+                )
             for number in range(expression["start_line"], expression["end_line"] + 1):
                 source_line = lines_by_number.get(number)
                 if source_line:

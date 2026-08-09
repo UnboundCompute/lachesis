@@ -313,7 +313,7 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "resolved_path": properties.get("resolved_path"),
             })
 
-    from .body_analysis import analyze_body_structure
+    from .compiler_body_adapter import adapt_compiler_body
     from .operation_analysis import analyze_operations
     from .variable_analysis import analyze_variable_flow
     for info in infos.values():
@@ -322,9 +322,7 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
         info["scopes"].sort(key=lambda item: (item["start_offset"], -item["end_offset"]))
         info["symbols"].sort(key=lambda item: (item["start_offset"], item["name"]))
         analyze_variable_flow(info)
-        # Statements/expressions are still produced by the compatibility body
-        # adapter until operation/control overlays consume canonical AST kinds.
-        analyze_body_structure(info)
+        adapt_compiler_body(info, nodes, snapshot.edges)
         analyze_operations(info)
     return sorted(infos.values(), key=lambda item: item["path"])
 

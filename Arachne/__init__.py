@@ -4,7 +4,7 @@ from .graph import CODE_GRAPH, build_graph
 from .variable_analysis import analyze_variable_flow
 from .data_flow import link_data_flow, propagate_origins
 from .receiver_analysis import resolve_receivers
-from .body_analysis import analyze_body_structure
+from .compiler_body_adapter import adapt_compiler_body
 from .operation_analysis import analyze_operations
 from .context_analysis import analyze_call_contexts
 from .heap_analysis import analyze_heap
@@ -49,7 +49,7 @@ __all__ = [
     "link_data_flow",
     "propagate_origins",
     "resolve_receivers",
-    "analyze_body_structure",
+    "adapt_compiler_body",
     "analyze_operations",
     "analyze_call_contexts",
     "analyze_heap",
