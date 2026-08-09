@@ -29,7 +29,7 @@ CONFIDENCE_LEVELS = frozenset({
 # architecture document.
 PROJECT_STRUCTURE_NODE_KINDS = frozenset({
     "project", "package", "module", "file", "import", "export",
-    "external-module",
+    "external-module", "route", "event", "registration",
 })
 DECLARATION_NODE_KINDS = frozenset({
     "scope", "symbol", "declaration", "function", "method", "constructor",
@@ -116,7 +116,7 @@ CONTROL_EDGE_KINDS = frozenset({
 RUNTIME_SECURITY_EDGE_KINDS = frozenset({
     "CAPTURES", "MUTATES", "APPLIES_EFFECT", "REGISTERS_CALLBACK", "HANDLED_BY",
     "ASYNC_CONTINUES_AT", "TAINT_FLOWS_TO", "GUARDED_BY", "EVIDENCED_BY",
-    "DUPLICATES", "SHADOWS",
+    "DUPLICATES", "SHADOWS", "ROUTE_HANDLED_BY", "ENTRY_POINT_OF",
 })
 CANONICAL_EDGE_KINDS = frozenset().union(
     STRUCTURE_EDGE_KINDS,

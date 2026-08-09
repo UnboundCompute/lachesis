@@ -21,7 +21,9 @@ from Arachne.core.validation import validate_snapshot
 from Arachne.core.contract import ContractError, FrontendSnapshot
 from Arachne.core.boundaries import import_boundary_violations
 from Arachne.core.identities import stable_id
+from Arachne.core.query import GraphIndex
 from Arachne.ecosystems import EcosystemRegistry
+from Arachne.ecosystems.common import GenericRouteModel
 
 
 class CompilerFrontendTests(unittest.TestCase):
@@ -204,6 +206,29 @@ class CompilerFrontendTests(unittest.TestCase):
                 and edge["target"] == runtime_functions["createRouter"]["id"]
                 for edge in snapshot.edges
             ))
+            canonical = {"nodes": snapshot.nodes, "edges": snapshot.edges}
+            model_registry = EcosystemRegistry()
+            model_registry.register(GenericRouteModel())
+            modeled = model_registry.enrich(
+                canonical,
+                GraphIndex(canonical).package_inventory(),
+                snapshot.languages,
+                snapshot.capabilities,
+            )
+            modeled_route = next(
+                node for node in modeled["nodes"]
+                if node["kind"] == "route" and node["properties"].get("path") == "/documents"
+            )
+            modeled_handler = next(
+                node for node in modeled["nodes"]
+                if node["kind"] == "function" and node["label"] == "documentHandler"
+            )
+            self.assertTrue(any(
+                edge["kind"] == "ROUTE_HANDLED_BY"
+                and edge["source"] == modeled_route["id"]
+                and edge["target"] == modeled_handler["id"]
+                for edge in modeled["edges"]
+            ))
             files, composed, _ = analyze_typescript_with_compiler(
                 str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "framework"),
             )
@@ -268,6 +293,10 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertTrue({"typescript-compiler-api", "clang-c"}.issubset(frontend_ids))
             self.assertTrue(any(node["kind"] == "tainted-call" for node in graph["nodes"]))
             self.assertTrue(any(node["kind"] == "wiring-boundary" for node in graph["nodes"]))
+            self.assertTrue(any(node["kind"] == "route" for node in graph["nodes"]))
+            self.assertTrue(any(
+                edge["kind"] == "ROUTE_HANDLED_BY" for edge in graph["edges"]
+            ))
             self.assertTrue(any(
                 node["kind"] == "call"
                 and node["properties"].get("frontend_id") == "clang-c"

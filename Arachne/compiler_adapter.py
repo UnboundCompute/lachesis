@@ -415,7 +415,28 @@ def run_project_frontends(
         )
     graph = combine_graphs(semantic_snapshot_graph(item) for item in snapshots)
     from .core.canonical_overlays import apply_parameter_property_effects
-    return apply_parameter_property_effects(graph), snapshots
+    graph = apply_parameter_property_effects(graph)
+    from .core.query import GraphIndex
+    from .ecosystems import default_ecosystem_registry
+    capability_rank = {"none": 0, "partial": 1, "complete": 2}
+    capability_names = {
+        name for snapshot in snapshots for name in snapshot.capabilities
+    }
+    capabilities = {
+        name: max(
+            (snapshot.capability(name) for snapshot in snapshots),
+            key=lambda level: capability_rank[level],
+        )
+        for name in capability_names
+    }
+    languages = {
+        language for snapshot in snapshots for language in snapshot.languages
+    }
+    index = GraphIndex(graph)
+    graph = default_ecosystem_registry().enrich(
+        graph, index.package_inventory(), languages, capabilities,
+    )
+    return graph, snapshots
 
 
 def write_project_graph(
