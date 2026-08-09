@@ -17,6 +17,7 @@ from Arachne.compatibility.projector import (
 )
 from Arachne.pipeline import run_project, semantic_snapshot_graph, snapshot_graph
 from Arachne.projections import build_layered_graph
+from Arachne.reasoning import ReasoningQuery
 from Arachne.core.snapshot import load_snapshot
 from Arachne.core.validation import validate_snapshot
 from Arachne.core.contract import ContractError, FrontendSnapshot
@@ -175,6 +176,59 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertTrue(any(
             "req.body.id" in step.get("label", "")
             for node in paths for step in node["details"]["steps"]
+        ))
+
+    def test_reasoning_queries_are_typed_contextual_and_budgeted(self) -> None:
+        graph, _ = run_project(str(ROOT / "src"))
+        query = ReasoningQuery(graph)
+        self.assertEqual(2, query.overview()["manifest"]["schema_version"])
+        self.assertEqual("ambiguous", query.find_entity("getDocument")["status"])
+        document_match = query.find_entity("getDocument", kind="function")
+        invoice_match = query.find_entity("getInvoice", kind="function")
+        self.assertEqual("exact", document_match["status"])
+        document_id = document_match["matches"][0]["id"]
+        invoice_id = invoice_match["matches"][0]["id"]
+
+        document = query.handler_security_slice(document_id)
+        invoice = query.handler_security_slice(invoice_id)
+        self.assertEqual(
+            "UNGUARDED", document["summary"]["guard_verdicts"][0]["status"],
+        )
+        self.assertIn(
+            "getInvoice",
+            document["summary"]["guard_verdicts"][0]["differential_siblings"],
+        )
+        self.assertEqual("GUARDED", invoice["summary"]["guard_verdicts"][0]["status"])
+
+        request_paths = [
+            node for node in graph["nodes"]
+            if node["kind"] == "taint-reach" and "public parameter:req" in node["label"]
+        ]
+        self.assertEqual(2, len(request_paths))
+        slices = [query.security_path(node["id"]) for node in request_paths]
+        self.assertTrue(all(
+            any("req.body.id" in step["label"] for step in item["sections"]["path"])
+            for item in slices
+        ))
+        contexts = {tuple(item["summary"]["context_ids"]) for item in slices}
+        self.assertEqual(2, len(contexts))
+
+        call = next(
+            node for node in graph["nodes"]
+            if node["kind"] == "call" and node["label"] == "findById(documentId)"
+        )
+        explanation = query.explain_call(call["id"])
+        self.assertEqual("exact", explanation["summary"]["resolution"])
+        self.assertTrue(explanation["sections"]["targets"])
+
+        small = query.value_history(
+            request_paths[0]["properties"]["source_value_id"], budget_tokens=1_000,
+        )
+        self.assertLessEqual(small["budget"]["estimated_tokens"], 1_000)
+        self.assertTrue(small["budget"]["truncated"])
+        self.assertTrue(small["continuations"])
+        self.assertTrue(all(
+            "via" in record for record in small["sections"]["history"]
         ))
 
     def test_typescript_contextual_tokens_and_library_provenance(self) -> None:
