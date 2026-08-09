@@ -41,8 +41,8 @@ It emits `manifest.json` and one JSON file per tier:
 Each native frontend snapshot stores direct facts only. The composed project
 graph additionally contains Arachne overlays such as bounded taint closure,
 context-specific heap effects, framework wiring, and effect-resolved dispatch.
-An LLM query layer should still calculate focused slices rather than loading the
-entire graph.
+The layered-v2 manifest is the compact LLM entry card; `Arachne.reasoning`
+calculates focused slices instead of loading the entire graph into a prompt.
 
 Control flow follows the same ownership boundary. Frontends emit exact AST,
 statement-order, condition, branch, loop, switch, exception, and transfer facts.

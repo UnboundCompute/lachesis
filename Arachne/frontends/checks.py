@@ -1,6 +1,7 @@
 """Executable checks for every registered compiler frontend."""
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -149,6 +150,36 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertTrue(graph_path.is_file())
             self.assertTrue((layered_path / "manifest.json").is_file())
             self.assertTrue((layered_path / "node_index.json").is_file())
+            overview = subprocess.run(
+                [
+                    sys.executable, "Arachne/cli/query.py", str(graph_path),
+                    "overview",
+                ],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, overview.returncode, overview.stderr)
+            overview_payload = json.loads(overview.stdout)
+            self.assertEqual(2, overview_payload["manifest"]["schema_version"])
+            self.assertTrue(
+                overview_payload["manifest"]["project"]["capabilities"]
+                ["typescript-compiler-api"],
+            )
+            function = subprocess.run(
+                [
+                    sys.executable, "Arachne/cli/query.py", str(graph_path),
+                    "--budget-tokens", "1000", "function", "getDocument",
+                    "--file", "document-service.ts",
+                ],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, function.returncode, function.stderr)
+            function_payload = json.loads(function.stdout)
+            self.assertEqual("getDocument", function_payload["focus"]["label"])
+            self.assertLessEqual(function_payload["budget"]["estimated_tokens"], 1000)
+            self.assertNotIn(
+                "FileInfo",
+                (ROOT / "Arachne" / "cli" / "query.py").read_text(encoding="utf-8"),
+            )
 
     def test_layered_v2_exposes_cross_tier_navigation(self) -> None:
         graph, _ = run_project(str(ROOT / "src"))
@@ -160,6 +191,16 @@ class CompilerFrontendTests(unittest.TestCase):
             manifest["integrity"]["cross_tier_canonical_edges"],
             manifest["integrity"]["cross_tier_exposed_edges"],
         )
+        exposed_cross_tier = [
+            edge for payload in layered["tiers"].values()
+            for collection in ("expands_to", "links")
+            for edge in payload[collection]
+            if not edge.get("derived")
+        ]
+        self.assertEqual(
+            len(exposed_cross_tier),
+            len({edge["id"] for edge in exposed_cross_tier}),
+        )
         tiers = {item["tier"]: item for item in manifest["tiers"]}
         self.assertTrue(all(tiers[tier]["expands_to_count"] for tier in ("T0", "T1", "T2")))
         relationships = {
@@ -170,6 +211,31 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertIn("CONTAINS_BODY", relationships["T1"])
         self.assertIn("PATH_STEP", relationships["T2"])
         self.assertIn("EVIDENCED_BY", relationships["T3"])
+        self.assertTrue(any(
+            edge["kind"] == "DEPENDS_ON_SUMMARY"
+            for edge in layered["tiers"]["T0"]["edges"]
+        ))
+
+        document_file = next(
+            node for node in layered["tiers"]["T0"]["nodes"]
+            if node["kind"] == "file"
+            and node["location"]["file"].endswith("resources/document-service.ts")
+        )
+        document_function_id = next(
+            edge["target"] for edge in layered["tiers"]["T0"]["expands_to"]
+            if edge["source"] == document_file["id"]
+            and edge["relationship"] == "DECLARES"
+            and layered["node_index"][edge["target"]]["label"] == "getDocument"
+        )
+        body_id = next(
+            edge["target"] for edge in layered["tiers"]["T1"]["expands_to"]
+            if edge["source"] == document_function_id
+            and edge["relationship"] == "CONTAINS_BODY"
+        )
+        self.assertTrue(any(
+            edge["source"] == body_id and edge["relationship"] == "EVIDENCED_BY"
+            for edge in layered["tiers"]["T3"]["expands_to"]
+        ))
         paths = [node for node in layered["tiers"]["T2"]["nodes"] if node["kind"] == "taint-reach"]
         self.assertTrue(paths)
         self.assertTrue(all(node["details"]["steps"] for node in paths))
@@ -976,6 +1042,13 @@ class CompilerFrontendTests(unittest.TestCase):
                 and node["properties"]["evidence_ids"]
                 for node in core_locations
             ))
+            overview = ReasoningQuery(graph).overview()["manifest"]
+            self.assertTrue(
+                {"c", "typescript"}.issubset(overview["project"]["languages"]),
+            )
+            self.assertEqual(
+                len(graph["nodes"]), overview["node_index"]["count"],
+            )
 
     def test_typescript_compiler_facts_feed_semantic_overlays(self) -> None:
         with tempfile.TemporaryDirectory() as output:

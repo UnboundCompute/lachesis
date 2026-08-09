@@ -72,3 +72,11 @@ The core never interprets this data.
 
 Every registered frontend emits contract v2. Older snapshots are rejected;
 there is no parser-era migration path inside the canonical pipeline.
+
+## LLM exposure
+
+The canonical graph remains the source of truth. `Arachne.projections` organizes
+it into the T0–T4 layered-v2 artifacts and a complete node locator;
+`Arachne.reasoning` returns budgeted, typed slices with evidence and unresolved
+boundaries. Neither layer reparses source or feeds presentation facts back into
+semantic construction.

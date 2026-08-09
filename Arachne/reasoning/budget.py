@@ -39,10 +39,11 @@ def fit_sections(
             node_id = first.get("id") or first.get("node_id") \
                 or first.get("target") or first.get("source")
             result["continuations"].append({
-                "operation": "continue-slice", "query": base.get("query"),
+                "operation": "expand", "query": base.get("query"),
                 "focus_id": (base.get("focus") or {}).get("id"),
                 "section": section_name, "offset": position,
                 "omitted_count": len(remaining), "next_node_id": node_id,
+                "node_id": node_id or (base.get("focus") or {}).get("id"),
                 "reason": "budget",
             })
             break

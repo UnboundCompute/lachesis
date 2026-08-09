@@ -64,10 +64,11 @@ class ReasoningQuery:
     def __init__(
         self, graph: dict, layered: Optional[dict] = None,
         default_budget_tokens: int = DEFAULT_BUDGET_TOKENS,
+        project_metadata: Optional[dict] = None,
     ) -> None:
         self.graph = graph
         self.index = GraphIndex(graph)
-        self.layered = layered or build_layered_graph(graph)
+        self.layered = layered or build_layered_graph(graph, project_metadata)
         self.node_index = self.layered["node_index"]
         self.default_budget_tokens = default_budget_tokens
         self.layered_nodes = {
@@ -125,15 +126,28 @@ class ReasoningQuery:
 
     def _source_excerpt(self, node_id: str) -> Optional[dict]:
         candidates = []
-        for edge in [
-            *self.index.outgoing.get(node_id, []), *self.index.incoming.get(node_id, []),
-        ]:
-            if GraphIndex.semantic_edge_kind(edge) != "EVIDENCED_BY":
-                continue
-            other_id = edge["target"] if edge["source"] == node_id else edge["source"]
-            other = self.index.nodes.get(other_id)
-            if other and other["kind"] == "source-span":
-                candidates.append(other)
+        frontier, visited = [node_id], {node_id}
+        for _depth in range(2):
+            following = []
+            for current in frontier:
+                for edge in [
+                    *self.index.outgoing.get(current, []),
+                    *self.index.incoming.get(current, []),
+                ]:
+                    if GraphIndex.semantic_edge_kind(edge) != "EVIDENCED_BY":
+                        continue
+                    other_id = edge["target"] if edge["source"] == current else edge["source"]
+                    if other_id in visited:
+                        continue
+                    visited.add(other_id)
+                    other = self.index.nodes.get(other_id)
+                    if not other:
+                        continue
+                    if other["kind"] == "source-span":
+                        candidates.append(other)
+                    else:
+                        following.append(other_id)
+            frontier = following
         if not candidates:
             node = self.index.nodes.get(node_id, {})
             evidence_ids = node.get("properties", {}).get("evidence_ids", [])
@@ -252,7 +266,9 @@ class ReasoningQuery:
         function = self._node(function_id)
         if function["kind"] not in FUNCTION_KINDS:
             raise ValueError(f"node is not a function-like declaration: {function_id}")
-        owned = list(self.index.nodes_owned_by(function_id))
+        owned = sorted(self.index.nodes_owned_by(function_id), key=lambda node: (
+            node.get("properties", {}).get("start_offset", 1 << 60), node["id"],
+        ))
         parameters = [node for node in owned if node["kind"] == "parameter"]
         calls = [node for node in owned if node["kind"] in CALL_KINDS]
         body = [
@@ -329,9 +345,17 @@ class ReasoningQuery:
         call = self._node(call_id)
         if call["kind"] not in CALL_KINDS:
             raise ValueError(f"node is not a call: {call_id}")
-        arguments = list(self.index.targets(call_id, "HAS_ARGUMENT"))
-        targets = list(self.index.targets(call_id, "INVOKES", "MAY_INVOKE"))
-        contexts = list(self.index.targets(call_id, "HAS_CALL_CONTEXT"))
+        arguments = sorted(self.index.targets(call_id, "HAS_ARGUMENT"), key=lambda node: (
+            node.get("properties", {}).get("position", 1 << 30), node["id"],
+        ))
+        targets = list({
+            node["id"]: node for node in self.index.targets(
+                call_id, "INVOKES", "MAY_INVOKE",
+            )
+        }.values())
+        contexts = list({
+            node["id"]: node for node in self.index.targets(call_id, "HAS_CALL_CONTEXT")
+        }.values())
         context_ids = [node["id"] for node in contexts]
         bindings = [
             node for node in self.index.nodes_of_kind("context-parameter", "context-return")
