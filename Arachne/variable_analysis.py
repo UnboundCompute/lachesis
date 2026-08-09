@@ -3,7 +3,7 @@ import hashlib
 import re
 from typing import Dict, List, Optional, Tuple
 
-from .function_analysis import mask_non_code
+from .source_analysis import mask_non_code
 from .scope_analysis import VARIABLE_RE, binding_names, innermost_scope_at
 
 ASSIGNMENT_RE = re.compile(

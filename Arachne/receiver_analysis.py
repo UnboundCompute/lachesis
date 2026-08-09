@@ -3,7 +3,7 @@ import hashlib
 import re
 from typing import Dict, Iterable, List, Optional
 
-from .function_analysis import mask_non_code
+from .source_analysis import mask_non_code
 from .variable_analysis import access_parts
 
 

@@ -4,7 +4,7 @@ import re
 from collections import defaultdict
 from typing import Iterable, List
 
-from .function_analysis import mask_non_code, matching_delimiter
+from .source_analysis import mask_non_code, matching_delimiter
 
 
 def stable_id(kind: str, *parts) -> str:

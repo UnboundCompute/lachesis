@@ -25,7 +25,7 @@ import re
 from collections import defaultdict
 from typing import Iterable, List, Optional, Tuple
 
-from .function_analysis import mask_non_code
+from .source_analysis import mask_non_code
 
 
 def stable_id(kind: str, *parts) -> str:

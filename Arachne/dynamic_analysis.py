@@ -3,7 +3,7 @@ import hashlib
 import re
 from typing import Iterable, Optional
 
-from .function_analysis import mask_non_code, matching_delimiter
+from .source_analysis import mask_non_code, matching_delimiter
 
 
 def stable_id(kind: str, *parts) -> str:

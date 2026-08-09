@@ -4,7 +4,7 @@ import re
 from collections import defaultdict
 from typing import Iterable, List, Optional, Set
 
-from .function_analysis import mask_non_code
+from .source_analysis import mask_non_code
 from .receiver_analysis import split_top_level
 
 

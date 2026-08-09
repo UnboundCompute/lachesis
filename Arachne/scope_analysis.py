@@ -3,7 +3,7 @@ import hashlib
 import re
 from typing import List
 
-from .function_analysis import mask_non_code, matching_delimiter
+from .source_analysis import mask_non_code, matching_delimiter
 
 CONTROL_SCOPE_RE = re.compile(
     r"\b(?P<kind>if|for|while|switch|catch|try|else|finally)\b[^;{}]*\{",

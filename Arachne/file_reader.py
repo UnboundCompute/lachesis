@@ -1,73 +1,35 @@
-"""File reading, hashing, inventory storage, and source-tree walking."""
+"""Compiler-backed project inventory and language-neutral overlay execution."""
+from __future__ import annotations
+
 import hashlib
 import os
-from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from .function_analysis import classify_language_call, find_function_calls, find_functions
-from .import_export_analysis import find_exports, find_imports, reexported_source_name
-from .scope_analysis import analyze_scopes
-from .type_analysis import find_types
-from .variable_analysis import analyze_variable_flow
-from .data_flow import link_data_flow
-from .receiver_analysis import resolve_receivers
-from .body_analysis import analyze_body_structure
-from .operation_analysis import analyze_operations
-from .context_analysis import analyze_call_contexts
-from .heap_analysis import analyze_heap
-from .control_flow import build_control_flow
-from .branch_analysis import analyze_branch_histories
-from .taint_analysis import analyze_taint
-from .runtime_models import analyze_runtime_models
 from .async_analysis import analyze_async_flow
-from .effect_analysis import analyze_effects
-from .type_system_analysis import analyze_type_system
+from .branch_analysis import analyze_branch_histories
+from .context_analysis import analyze_call_contexts
+from .control_flow import build_control_flow
+from .data_flow import link_data_flow
 from .dispatch_analysis import analyze_dispatch
 from .dynamic_analysis import analyze_dynamic_behavior
+from .effect_analysis import analyze_effects
 from .exception_analysis import analyze_exceptions
+from .heap_analysis import analyze_heap
 from .module_init_analysis import analyze_module_init
-from .wiring_analysis import analyze_wiring
+from .receiver_analysis import resolve_receivers
+from .runtime_models import analyze_runtime_models
+from .taint_analysis import analyze_taint
+from .type_system_analysis import analyze_type_system
 from .types import FileInfo
+from .wiring_analysis import analyze_wiring
 
-# SHA-256(absolute path) -> complete read_file() result.
+
+# Public compatibility indexes. Compiler discovery populates the complete
+# project before overlays run, so HOLD_LIST no longer drives resolution.
 FILE_MAP: Dict[str, FileInfo] = {}
 HOLD_LIST: List[FileInfo] = []
-
-# Parsing one file (read_file) is CPU-bound pure Python and fully independent,
-# so it fans out across processes. Below this file count the pool's spawn +
-# pickle overhead outweighs the win, so we stay serial.
-PARALLEL_THRESHOLD = 16
-
-
-def default_workers() -> int:
-    override = os.environ.get("ARACHNE_WORKERS")
-    if override and override.isdigit():
-        return max(1, int(override))
-    return max(1, (os.cpu_count() or 2))
-
-
-def parse_files(paths: List[str], workers: Optional[int] = None) -> List[FileInfo]:
-    """Parse every file, in parallel when the batch is large enough.
-
-    read_file is embarrassingly parallel; the interprocedural passes that follow
-    are not, so only this phase fans out. Results are returned in input order to
-    keep every downstream id deterministic, and re-registered in the parent's
-    FILE_MAP (worker FILE_MAP writes live in a separate address space).
-    """
-    if workers is None:
-        workers = default_workers()
-    workers = min(workers, len(paths)) if paths else 1
-
-    if workers <= 1 or len(paths) < PARALLEL_THRESHOLD:
-        results = [read_file(path) for path in paths]
-    else:
-        chunk = max(1, len(paths) // (workers * 4))
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(read_file, paths, chunksize=chunk))
-
-    for info in results:
-        FILE_MAP[info["path_hash"]] = info
-    return results
+TYPESCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")
 
 
 def hash_path(path: str) -> str:
@@ -75,356 +37,85 @@ def hash_path(path: str) -> str:
     return hashlib.sha256(absolute_path.encode("utf-8")).hexdigest()
 
 
-def stable_id(path_hash: str, kind: str, name: str, line: int, ordinal: int = 0) -> str:
-    raw = f"{path_hash}:{kind}:{name}:{line}:{ordinal}"
-    return f"{kind}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-
-def enclosing_function(functions: List[dict], line: int) -> Optional[dict]:
-    candidates = [
-        function for function in functions
-        if function["start_line"] <= line <= function["end_line"]
-    ]
-    if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda function: function["end_line"] - function["start_line"],
-    )
-
-
-def add_source_identities(
-    path_hash: str, functions: List[dict], calls: List[dict],
-) -> None:
-    for ordinal, function in enumerate(functions):
-        function["id"] = stable_id(
-            path_hash, "function", function["name"], function["start_line"], ordinal
+def walk(src_dir: str) -> List[str]:
+    files = []
+    for root, directories, names in os.walk(src_dir):
+        directories[:] = sorted(
+            name for name in directories
+            if name not in {".git", "node_modules", "graph_out", "dist", "build"}
         )
-
-    # Assign nested-function ownership after every function has an ID.
-    for function in functions:
-        parents = [
-            candidate for candidate in functions
-            if candidate is not function
-            and candidate["start_line"] <= function["start_line"]
-            and function["end_line"] <= candidate["end_line"]
-        ]
-        parent = min(
-            parents,
-            key=lambda candidate: candidate["end_line"] - candidate["start_line"],
-            default=None,
-        )
-        function["owner_function_id"] = parent["id"] if parent else None
-
-    for ordinal, call in enumerate(calls):
-        call["id"] = stable_id(
-            path_hash, "call", call["callee"], call["line"], ordinal
-        )
-        owner = enclosing_function(functions, call["line"])
-        call["caller_function_id"] = owner["id"] if owner else None
-
-    calls_by_start = {call["start_offset"]: call for call in calls}
-    for call in calls:
-        receiver_start = call.get("receiver_call_start_offset")
-        if receiver_start is not None and receiver_start in calls_by_start:
-            call["receiver_call_id"] = calls_by_start[receiver_start]["id"]
+        for name in sorted(names):
+            if name.endswith(TYPESCRIPT_EXTENSIONS):
+                files.append(os.path.join(root, name))
+    return sorted(files)
 
 
-def read_file(path: str) -> FileInfo:
-    absolute_path = os.path.abspath(path)
-    path_hash = hash_path(absolute_path)
-    with open(absolute_path, "r", encoding="utf-8") as file_handle:
-        text = file_handle.read()
-
-    exports, export_details = find_exports(text, absolute_path)
-    functions = find_functions(text)
-    function_calls = find_function_calls(text)
-    add_source_identities(path_hash, functions, function_calls)
-    types = find_types(text, path_hash, functions)
-    imports = find_imports(text, absolute_path)
-    scopes, symbols = analyze_scopes(
-        text, path_hash, functions, function_calls, imports, types
-    )
-    info: FileInfo = {
-        "file_id": f"file:{path_hash}",
-        "path": absolute_path,
-        "path_hash": path_hash,
-        "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "lines": text.count("\n") + (1 if text and not text.endswith("\n") else 0),
-        "bytes": len(text.encode("utf-8")),
-        "imports": imports,
-        "exports": exports,
-        "export_details": export_details,
-        "functions": functions,
-        "function_calls": function_calls,
-        "scopes": scopes,
-        "symbols": symbols,
-        "types": types,
-        "properties": [],
-        "definitions": [],
-        "reads": [],
-        "arguments": [],
-        "returns": [],
-        "data_flows": [],
-        "aliases": [],
-        "source_lines": [],
-        "tokens": [],
-        "statements": [],
-        "expressions": [],
-        "expression_links": [],
-        "body_attachments": [],
-        "operations": [],
-        "operation_inputs": [],
-        "operation_attachments": [],
-        "call_contexts": [],
-        "context_dispatches": [],
-        "heap_objects": [],
-        "heap_locations": [],
-        "points_to": [],
-        "heap_accesses": [],
-        "heap_effects": [],
-        "context_heap_effects": [],
-        "cfg_nodes": [],
-        "cfg_edges": [],
-        "unreachable": [],
-        "phi_nodes": [],
-        "branch_flows": [],
-        "taint_sources": [],
-        "taint_flows": [],
-        "taint_reaches": [],
-        "tainted_calls": [],
-        "runtime_models": [],
-        "async_nodes": [],
-        "async_edges": [],
-        "effect_summaries": [],
-        "applied_effects": [],
-        "type_parameters": [],
-        "type_refinements": [],
-        "generic_substitutions": [],
-        "overloads": [],
-        "type_compatibilities": [],
-        "dispatch_candidates": [],
-        "dispatch_relations": [],
-        "dispatch_members": [],
-        "dynamic_behaviors": [],
-        "exception_sites": [],
-        "catch_handlers": [],
-        "finally_blocks": [],
-        "promise_rejections": [],
-        "module_initializers": [],
-        "singletons": [],
-        "module_state": [],
-        "static_initializers": [],
-        "import_cycles": [],
-        "wiring_boundaries": [],
-        "text": text,
-    }
-    analyze_variable_flow(info)
-    analyze_body_structure(info)
-    analyze_operations(info)
-    FILE_MAP[path_hash] = info
-    return info
-
-
-def declared_function(info: FileInfo, name: str) -> Optional[dict]:
-    for function in info["functions"]:
-        if function["name"] == name:
-            return function
-    return None
-
-
-def resolve_exported_function(
-    info: FileInfo, name: str, visited: Optional[set] = None,
-) -> Tuple[Optional[FileInfo], Optional[dict], bool]:
-    """Follow local declarations and re-export chains. Third result means waiting."""
-    visited = visited or set()
-    visit_key = (info["path_hash"], name)
-    if visit_key in visited:
-        return None, None, False
-    visited.add(visit_key)
-
-    function = declared_function(info, name)
-    if function:
-        return info, function, False
-
-    for exported in info["export_details"]:
-        source = exported["source"]
-        resolved_path = exported["resolved_path"]
-        if not source or not resolved_path or not os.path.isfile(resolved_path):
-            continue
-        source_name = reexported_source_name(exported["symbols"], name)
-        if source_name is None or source_name == "*":
-            continue
-        target_info = FILE_MAP.get(hash_path(resolved_path))
-        if target_info is None:
-            return None, None, True
-        found_info, found_function, waiting = resolve_exported_function(
-            target_info, source_name, visited
-        )
-        if found_function or waiting:
-            return found_info, found_function, waiting
-    return None, None, False
-
-
-def imported_call_target(info: FileInfo, callee: str) -> Optional[Tuple[dict, str]]:
-    parts = callee.replace("?.", ".").split(".")
-    local_name = parts[0]
-    for imported in info["imports"]:
-        if imported["import_kind"] == "type":
-            continue
-        for binding in imported["bindings"]:
-            if binding["local"] != local_name:
-                continue
-            if binding["imported"] == "*":
-                target_name = parts[-1] if len(parts) > 1 else "default"
-            elif len(parts) > 1 and binding["imported"] == "default":
-                target_name = parts[-1]
-            else:
-                target_name = binding["imported"]
-            return imported, target_name
-    return None
-
-
-def link_call(call: dict, target_info: FileInfo, function: dict, resolution: str) -> None:
-    call.update({
-        "resolution": resolution,
-        "declaration_symbol_id": function["id"],
-        "declaration_file": target_info["path"],
-        "declaration_file_hash": target_info["path_hash"],
-        "declaration_line": function["start_line"],
-        "declaration_end_line": function["end_line"],
-    })
-
-
-def terminal_call(call: dict, resolution: str, runtime: Optional[str] = None) -> None:
-    call.update({
-        "resolution": resolution,
-        "runtime": runtime,
-        "declaration_symbol_id": None,
-        "declaration_file": None,
-        "declaration_file_hash": None,
-        "declaration_line": None,
-        "declaration_end_line": None,
-    })
-
-
-def resolve_file_function_calls(info: FileInfo) -> bool:
-    """Resolve calls in one file; return False while an imported file is pending."""
-    waiting = False
-    for call in info["function_calls"]:
-        callee = call["callee"]
-        local_name = callee.replace("?.", ".").split(".")[-1]
-        local_function = None
-        if "." not in callee or callee.startswith(("this.", "this?.")):
-            local_function = declared_function(info, local_name)
-        if local_function:
-            link_call(call, info, local_function, "same-file")
-            continue
-
-        target = imported_call_target(info, callee)
-        if target is None:
-            runtime = classify_language_call(callee)
-            terminal_call(
-                call,
-                "language-runtime" if runtime else "unresolved",
-                runtime,
-            )
-            continue
-        imported, target_name = target
-        resolved_path = imported["resolved_path"]
-        if not resolved_path or not os.path.isfile(resolved_path):
-            runtime = "node" if imported["source_kind"] == "builtin" else None
-            terminal_call(
-                call,
-                "language-runtime" if runtime else "external",
-                runtime,
-            )
-            continue
-
-        target_hash = hash_path(resolved_path)
-        target_info = FILE_MAP.get(target_hash)
-        if target_info is None:
-            call.update({
-                "resolution": "waiting",
-                "declaration_file": resolved_path,
-                "declaration_file_hash": target_hash,
-                "declaration_line": None,
-                "declaration_end_line": None,
-            })
-            waiting = True
-            continue
-
-        declaration_info, target_function, reexport_waiting = resolve_exported_function(
-            target_info, target_name
-        )
-        if reexport_waiting:
-            call.update({
-                "resolution": "waiting",
-                "declaration_file": resolved_path,
-                "declaration_file_hash": target_hash,
-                "declaration_line": None,
-                "declaration_end_line": None,
-                "declaration_symbol_id": None,
-            })
-            waiting = True
-            continue
-        if target_function:
-            resolution = "re-exported" if declaration_info is not target_info else "imported"
-            link_call(call, declaration_info or target_info, target_function, resolution)
-        else:
-            terminal_call(call, "declaration-not-found")
-    return not waiting
+def _compiler_project_root(paths: List[str]) -> str:
+    absolute = [os.path.abspath(path) for path in paths]
+    common = Path(os.path.commonpath(absolute))
+    if common.is_file() or common.suffix:
+        common = common.parent
+    current = common
+    while True:
+        if (current / "tsconfig.json").is_file():
+            return str(current)
+        if current.parent == current:
+            return str(common)
+        current = current.parent
 
 
 def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileInfo]:
-    """Parse (parallel), then resolve and run the interprocedural passes serially.
+    """Analyze requested TS/JS files through the official compiler frontend.
 
-    With every file parsed up front, call resolution rarely has to wait on a
-    missing target, but the hold-list fixpoint is kept so any residual
-    out-of-order re-export chain still converges.
+    The complete containing compiler project is analyzed so aliases, re-exports
+    and interprocedural targets remain resolvable. Only requested application
+    records are returned, preserving the historical API. ``workers`` remains a
+    compatibility argument; the native compiler controls its own execution.
     """
+    del workers
+    if not paths:
+        FILE_MAP.clear()
+        HOLD_LIST.clear()
+        return []
+    unsupported = [path for path in paths if Path(path).suffix.lower() not in TYPESCRIPT_EXTENSIONS]
+    if unsupported:
+        raise ValueError(
+            "FileInfo semantic overlays currently support TS/JS paths; use "
+            "run_project_frontends() for mixed-language/C canonical graphs. "
+            f"First unsupported path: {unsupported[0]}"
+        )
+    from .compiler_adapter import snapshot_file_infos
+    from .frontend import default_registry, run_frontend
+
+    project_root = _compiler_project_root(paths)
+    frontend = default_registry().get("typescript-compiler-api")
+    snapshot = run_frontend(frontend, project_root)
+    all_infos = snapshot_file_infos(snapshot)
     FILE_MAP.clear()
     HOLD_LIST.clear()
-    results = parse_files(paths, workers)
-    for info in results:
-        if not resolve_file_function_calls(info):
-            HOLD_LIST.append(info)
+    for info in all_infos:
+        FILE_MAP[info["path_hash"]] = info
+    run_semantic_overlays(all_infos)
+    requested = {os.path.abspath(path) for path in paths}
+    return [info for info in all_infos if info["path"] in requested]
 
-    while HOLD_LIST:
-        pending = HOLD_LIST[:]
-        HOLD_LIST.clear()
-        resolved_count = 0
-        for info in pending:
-            if resolve_file_function_calls(info):
-                resolved_count += 1
-            else:
-                HOLD_LIST.append(info)
 
-        if HOLD_LIST and resolved_count == 0:
-            # No target appeared during this pass. Convert the remaining waits
-            # to terminal unresolved links so the hold loop always drains.
-            for info in HOLD_LIST:
-                for call in info["function_calls"]:
-                    if call.get("resolution") == "waiting":
-                        terminal_call(call, "unresolved-import")
-            HOLD_LIST.clear()
-    return run_semantic_overlays(results)
+def read_file(path: str) -> FileInfo:
+    """Return the compiler-backed record for one file in its project context."""
+    absolute = os.path.abspath(path)
+    result = analyze_files([absolute])
+    if not result:
+        raise FileNotFoundError(absolute)
+    return result[0]
 
 
 def run_semantic_overlays(results: List[FileInfo]) -> List[FileInfo]:
-    """Apply language-neutral/interprocedural layers to discovered file facts.
-
-    Manual discovery and compiler frontends intentionally converge here. This
-    keeps taint, heap, effects, framework wiring and security semantics outside
-    every language parser.
-    """
+    """Apply interprocedural/runtime/security layers after compiler discovery."""
     resolve_receivers(results)
     analyze_dispatch(results)
     link_data_flow(results)
     analyze_call_contexts(results)
     analyze_dispatch(results, include_callbacks=True)
-    # Callback dispatch depends on first-pass call contexts. Rebuild the
-    # interprocedural links once those callback targets are known.
     link_data_flow(results)
     analyze_call_contexts(results)
     analyze_dynamic_behavior(results)
@@ -441,13 +132,3 @@ def run_semantic_overlays(results: List[FileInfo]) -> List[FileInfo]:
     analyze_wiring(results)
     analyze_taint(results)
     return results
-
-
-def walk(src_dir: str) -> List[str]:
-    files = []
-    supported_extensions = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")
-    for root, _dirs, names in os.walk(src_dir):
-        for name in sorted(names):
-            if name.endswith(supported_extensions):
-                files.append(os.path.join(root, name))
-    return sorted(files)
