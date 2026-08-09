@@ -1,4 +1,4 @@
-"""Compiler-backed project inventory and language-neutral overlay execution."""
+"""Historical file API projected from the finished canonical graph."""
 from __future__ import annotations
 
 import hashlib
@@ -6,27 +6,15 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..async_analysis import analyze_async_flow
-from ..branch_analysis import analyze_branch_histories
-from ..context_analysis import analyze_call_contexts
-from ..control_flow import build_control_flow
-from ..data_flow import link_data_flow
-from ..dispatch_analysis import analyze_dispatch
-from ..effect_analysis import analyze_effects
-from ..exception_analysis import analyze_exceptions
-from ..heap_analysis import analyze_heap
-from ..module_init_analysis import analyze_module_init
-from ..receiver_analysis import resolve_receivers
-from ..runtime_models import analyze_runtime_models
-from ..taint_analysis import analyze_taint
 from ..types import FileInfo
-from ..wiring_analysis import analyze_wiring
+from .projector import compatibility_taint_path, graph_file_infos
 
 
 # Public compatibility indexes. Compiler discovery populates the complete
 # project before overlays run, so HOLD_LIST no longer drives resolution.
 FILE_MAP: Dict[str, FileInfo] = {}
 HOLD_LIST: List[FileInfo] = []
+LAST_GRAPH: dict = {"nodes": [], "edges": []}
 TYPESCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")
 
 
@@ -82,19 +70,17 @@ def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileI
             "run_project_frontends() for mixed-language/C canonical graphs. "
             f"First unsupported path: {unsupported[0]}"
         )
-    from ..compiler_adapter import snapshot_file_infos
-    from ..core.runner import run_frontend
-    from ..frontends.registry import default_registry
+    from ..compiler_adapter import run_project_frontends
 
     project_root = _compiler_project_root(paths)
-    frontend = default_registry().get("typescript-compiler-api")
-    snapshot = run_frontend(frontend, project_root)
-    all_infos = snapshot_file_infos(snapshot)
+    graph, _snapshots = run_project_frontends(project_root)
+    global LAST_GRAPH
+    LAST_GRAPH = graph
+    all_infos = graph_file_infos(graph)
     FILE_MAP.clear()
     HOLD_LIST.clear()
     for info in all_infos:
         FILE_MAP[info["path_hash"]] = info
-    run_semantic_overlays(all_infos)
     requested = {os.path.abspath(path) for path in paths}
     return [info for info in all_infos if info["path"] in requested]
 
@@ -109,23 +95,9 @@ def read_file(path: str) -> FileInfo:
 
 
 def run_semantic_overlays(results: List[FileInfo]) -> List[FileInfo]:
-    """Apply interprocedural/runtime/security layers after compiler discovery."""
-    resolve_receivers(results)
-    analyze_dispatch(results)
-    link_data_flow(results)
-    analyze_call_contexts(results)
-    analyze_dispatch(results, include_callbacks=True)
-    link_data_flow(results)
-    analyze_call_contexts(results)
-    analyze_heap(results)
-    for info in results:
-        build_control_flow(info)
-    analyze_branch_histories(results)
-    analyze_runtime_models(results)
-    analyze_effects(results)
-    analyze_async_flow(results)
-    analyze_exceptions(results)
-    analyze_module_init(results)
-    analyze_wiring(results)
-    analyze_taint(results)
+    """Deprecated no-op: compatibility records already contain final facts."""
     return results
+
+
+def taint_path(files: List[FileInfo], source_id: str, target_id: str) -> List[str]:
+    return compatibility_taint_path(files, source_id, target_id)

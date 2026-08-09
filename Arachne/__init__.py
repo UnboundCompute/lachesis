@@ -1,5 +1,5 @@
 """Arachne TypeScript source-inventory package."""
-from .file_reader import HOLD_LIST, FILE_MAP, analyze_files, read_file, walk
+from .file_reader import HOLD_LIST, FILE_MAP, analyze_files, read_file, taint_path, walk
 from .graph import CODE_GRAPH, build_graph
 from .compiler_value_adapter import adapt_compiler_values, compiler_value_facts
 from .data_flow import link_data_flow, propagate_origins
@@ -10,7 +10,7 @@ from .context_analysis import analyze_call_contexts
 from .heap_analysis import analyze_heap
 from .control_flow import build_control_flow
 from .branch_analysis import analyze_branch_histories
-from .taint_analysis import analyze_taint, taint_path
+from .taint_analysis import analyze_taint
 from .runtime_models import analyze_runtime_models, model_for_call
 from .async_analysis import analyze_async_flow
 from .effect_analysis import analyze_effects
@@ -21,7 +21,7 @@ from .wiring_analysis import analyze_wiring
 from .security_roles import derive_roles, detect_guards
 from .layered_graph import build_layered_graph, write_layered_graph
 from .compiler_adapter import (
-    analyze_typescript_with_compiler, combine_graphs, merge_overlay_graph,
+    analyze_typescript_with_compiler, combine_graphs,
     run_project_frontends, snapshot_file_infos, snapshot_graph, write_project_graph,
 )
 from .types import (
@@ -69,7 +69,6 @@ __all__ = [
     "build_layered_graph",
     "write_layered_graph",
     "combine_graphs",
-    "merge_overlay_graph",
     "snapshot_file_infos",
     "analyze_typescript_with_compiler",
     "run_project_frontends",
