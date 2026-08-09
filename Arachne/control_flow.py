@@ -1,4 +1,4 @@
-"""Structured manual control-flow graph construction."""
+"""Structured control-flow overlay over compiler-owned body and scope facts."""
 import hashlib
 from collections import defaultdict, deque
 from typing import Dict, Iterable, List, Optional, Set, Tuple

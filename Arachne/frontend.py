@@ -5,9 +5,9 @@ information (TypeScript in Node, Clang in C++, Pyright in Python, and so on).
 They communicate with Arachne through a versioned JSON fact graph instead of
 sharing parser-specific objects.
 
-This module is intentionally not wired into ``file_reader.analyze_files`` yet.
-It provides the migration boundary needed to replace fragile manual parsing one
-capability at a time while preserving Arachne's language-neutral overlays.
+The registry is the discovery path behind ``file_reader.analyze_files`` and the
+mixed-language project composer. It lets parsing capabilities migrate one at a
+time while preserving Arachne's language-neutral overlays.
 """
 from __future__ import annotations
 

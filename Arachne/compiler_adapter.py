@@ -402,7 +402,9 @@ def run_project_frontends(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    return combine_graphs(semantic_snapshot_graph(item) for item in snapshots), snapshots
+    graph = combine_graphs(semantic_snapshot_graph(item) for item in snapshots)
+    from .canonical_overlays import apply_parameter_property_effects
+    return apply_parameter_property_effects(graph), snapshots
 
 
 def write_project_graph(
