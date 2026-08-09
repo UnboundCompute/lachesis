@@ -94,21 +94,13 @@ function walk(directory) {
   return result.sort();
 }
 
-function digest(...parts) {
-  return crypto.createHash("sha256").update(parts.join(":"), "utf8").digest("hex").slice(0, 16);
-}
-
-const legacyIdsByV2 = new Map();
 function stableId(kind, ...parts) {
-  const legacyId = `${kind}:${digest(kind, ...parts)}`;
   const raw = parts.map((part) => String(part)).join("\u0000");
   const identityDigest = crypto.createHash("sha256").update(
     `v2\u0000frontend\u0000${FRONTEND_ID}\u0000${kind}\u0000${raw}`,
     "utf8",
   ).digest("hex").slice(0, 20);
-  const id = `v2:frontend:${FRONTEND_ID}:${kind}:${identityDigest}`;
-  legacyIdsByV2.set(id, legacyId);
-  return id;
+  return `v2:frontend:${FRONTEND_ID}:${kind}:${identityDigest}`;
 }
 
 function normalize(fileName) {
@@ -393,7 +385,6 @@ function addNode(tier, id, kind, label, properties = {}) {
     fact_origin: "compiler",
     confidence: "exact",
     evidence_ids: [],
-    legacy_id: legacyIdsByV2.get(id) || null,
     ...properties,
   };
   if (absoluteFile) Object.assign(canonicalProperties, {
@@ -401,8 +392,7 @@ function addNode(tier, id, kind, label, properties = {}) {
     language: languageForFile(absoluteFile),
     absolute_file: absoluteFile,
     content_hash: canonicalProperties.content_hash || contentHash(absoluteFile),
-    compiler_node_id: canonicalProperties.compiler_node_id ||
-      legacyIdsByV2.get(id) || id,
+    compiler_node_id: canonicalProperties.compiler_node_id || id,
   });
   if (!nodes.has(id)) {
     nodes.set(id, { id, kind, label, properties: canonicalProperties, tier });
@@ -3093,7 +3083,7 @@ for (const node of nodes.values()) {
 for (const ids of Object.values(roleIndex)) ids.sort();
 
 const manifest = {
-  version: 1,
+  version: 2,
   frontend_contract_version: CONTRACT_VERSION,
   frontend_id: FRONTEND_ID,
   generator: FRONTEND_ID,
@@ -3134,7 +3124,6 @@ const manifest = {
   diagnostic_count: diagnostics.length,
   direct_flow_only: true,
   identity_scheme: "v2:<owner>:<namespace>:<kind>:<digest>",
-  legacy_identity_property: "legacy_id",
   role_index: roleIndex,
   tiers: TIER_ORDER.map((tier) => ({
     tier,

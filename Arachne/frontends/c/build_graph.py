@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -38,29 +37,15 @@ VALUE_KINDS = {
     "FieldDecl": "property",
     "EnumConstantDecl": "constant",
 }
-TOKEN_RE = re.compile(
-    r"^(?P<kind>\S+)\s+'(?P<text>.*?)'.*Loc=<(?P<file>.+):(?P<line>\d+):(?P<column>\d+)>$"
-)
-
-
-def digest(*parts: object) -> str:
-    raw = ":".join(str(part) for part in parts)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-
-LEGACY_IDS_BY_V2: Dict[str, str] = {}
 CONTENT_HASHES: Dict[Path, str] = {}
 
 
 def stable_id(kind: str, *parts: object) -> str:
-    legacy_id = f"{kind}:{digest(kind, *parts)}"
     raw = "\0".join(str(part) for part in parts)
     identity_digest = hashlib.sha256(
         f"v2\0frontend\0{FRONTEND_ID}\0{kind}\0{raw}".encode("utf-8")
     ).hexdigest()[:20]
-    node_id = f"v2:frontend:{FRONTEND_ID}:{kind}:{identity_digest}"
-    LEGACY_IDS_BY_V2[node_id] = legacy_id
-    return node_id
+    return f"v2:frontend:{FRONTEND_ID}:{kind}:{identity_digest}"
 
 
 def content_hash(path: Path) -> str:
@@ -111,9 +96,33 @@ def source_text(path: Path, cache: Dict[Path, str]) -> str:
 
 def line_offsets(text: str) -> List[int]:
     offsets = [0]
-    for match in re.finditer("\n", text):
-        offsets.append(match.end())
+    for offset, character in enumerate(text):
+        if character == "\n":
+            offsets.append(offset + 1)
     return offsets
+
+
+def parse_clang_token(line: str) -> Optional[Tuple[str, str, Path, int, int]]:
+    """Decode one compiler token-dump record without interpreting C source."""
+    location_marker = "Loc=<"
+    location_start = line.rfind(location_marker)
+    if location_start < 0 or not line.endswith(">"):
+        return None
+    prefix = line[:location_start]
+    first_quote = prefix.find("'")
+    last_quote = prefix.rfind("'")
+    if first_quote < 0 or last_quote <= first_quote:
+        return None
+    kind = prefix[:first_quote].strip().split(None, 1)[0]
+    token_text = prefix[first_quote + 1:last_quote]
+    location = line[location_start + len(location_marker):-1]
+    parts = location.rsplit(":", 2)
+    if len(parts) != 3:
+        return None
+    try:
+        return kind, token_text, Path(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
 
 
 def position_from_ast(
@@ -159,7 +168,7 @@ class Graph:
     def node(self, tier: str, node_id: str, kind: str, label: str, **properties) -> str:
         canonical = {
             "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-            "legacy_id": LEGACY_IDS_BY_V2.get(node_id), **properties,
+            **properties,
         }
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
@@ -170,8 +179,7 @@ class Graph:
                 "absolute_file": str(absolute),
                 "content_hash": canonical.get("content_hash")
                     or content_hash(absolute),
-                "compiler_node_id": canonical.get("compiler_node_id")
-                    or LEGACY_IDS_BY_V2.get(node_id) or node_id,
+                "compiler_node_id": canonical.get("compiler_node_id") or node_id,
             })
         if node_id not in self.nodes:
             self.nodes[node_id] = {
@@ -538,31 +546,28 @@ def main() -> int:
         result = run_clang(source_dir, path, "-Xclang", "-dump-tokens", "-fsyntax-only", "-Wno-everything")
         previous = None
         for line in result.stderr.splitlines():
-            match = TOKEN_RE.match(line)
-            if not match:
+            parsed = parse_clang_token(line)
+            if not parsed:
                 continue
-            token_path = Path(match.group("file"))
+            token_kind, token_text, token_path, line_number, column = parsed
             if not token_path.is_absolute():
                 token_path = (Path.cwd() / token_path).resolve()
             else:
                 token_path = token_path.resolve()
             if token_path != path or path not in file_ids:
                 continue
-            token_text = match.group("text")
-            line_number = int(match.group("line"))
-            column = int(match.group("column"))
             text = source_text(path, texts)
             starts = line_offsets(text)
             start = starts[line_number - 1] + column - 1 if line_number <= len(starts) else 0
             end = start + len(token_text.encode("utf-8").decode("unicode_escape"))
-            token_id = stable_id("token", path, start, end, match.group("kind"))
+            token_id = stable_id("token", path, start, end, token_kind)
             graph.node(
                 "T4", token_id, "token", token_text,
                 file=str(path.relative_to(source_dir)), absolute_file=str(path),
                 start_offset=start, end_offset=end, start_line=line_number,
                 start_column=column, end_line=line_number,
                 end_column=column + max(0, end - start - 1),
-                token_kind=match.group("kind"), trivia=False,
+                token_kind=token_kind, trivia=False,
             )
             graph.edge("HAS_TOKEN", file_ids[path], token_id)
             graph.edge("NEXT_TOKEN", previous, token_id)
@@ -611,7 +616,7 @@ def main() -> int:
             payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
 
     manifest = {
-        "version": 1, "frontend_contract_version": CONTRACT_VERSION,
+        "version": 2, "frontend_contract_version": CONTRACT_VERSION,
         "frontend_id": FRONTEND_ID, "generator": FRONTEND_ID, "languages": ["c"],
         "capabilities": {
             "lexical": "partial", "syntax": "complete", "modules": "complete",
@@ -629,7 +634,6 @@ def main() -> int:
         "node_count": len(graph.nodes), "edge_count": len(graph.edges),
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
-        "legacy_identity_property": "legacy_id",
         "tiers": [
             {
                 "tier": tier, "name": TIERS[tier],

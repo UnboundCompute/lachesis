@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from Arachne.compatibility.legacy_file_api import analyze_files, read_file, walk
+from Arachne.compatibility.file_view import analyze_files, read_file, walk
 from Arachne.compatibility.projector import (
     compatibility_taint_path as taint_path, graph_file_infos,
 )
@@ -78,12 +78,42 @@ class CompilerFrontendTests(unittest.TestCase):
             }],
         )
         validate_snapshot(snapshot)
+        snapshot.contract_version = 1
+        with self.assertRaisesRegex(ContractError, "required version is 2"):
+            validate_snapshot(snapshot)
+        snapshot.contract_version = 2
         del snapshot.nodes[1]["properties"]["compiler_node_id"]
         with self.assertRaisesRegex(ContractError, "compiler_node_id"):
             validate_snapshot(snapshot)
 
     def test_core_has_no_frontend_ecosystem_or_compatibility_imports(self) -> None:
         self.assertEqual([], import_boundary_violations(ROOT / "Arachne"))
+
+    def test_parser_migration_has_one_compiler_native_path(self) -> None:
+        removed = {
+            "source_analysis.py", "compiler_body_adapter.py",
+            "compiler_value_adapter.py", "data_flow.py", "receiver_analysis.py",
+            "operation_analysis.py", "context_analysis.py", "heap_analysis.py",
+            "control_flow.py", "branch_analysis.py", "taint_analysis.py",
+            "runtime_models.py", "async_analysis.py", "effect_analysis.py",
+            "dispatch_analysis.py", "exception_analysis.py",
+            "module_init_analysis.py", "wiring_analysis.py", "graph.py",
+        }
+        self.assertEqual([], sorted(
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "Arachne").rglob("*.py")
+            if path.name in removed and path.parent.name != "overlays"
+        ))
+        c_frontend = (
+            ROOT / "Arachne" / "frontends" / "c" / "build_graph.py"
+        ).read_text(encoding="utf-8")
+        typescript_frontend = (
+            ROOT / "Arachne" / "frontends" / "typescript" / "build_graph.mjs"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("import re", c_frontend)
+        self.assertNotIn("TOKEN_RE", c_frontend)
+        self.assertNotIn("legacy_id", c_frontend)
+        self.assertNotIn("legacy_id", typescript_frontend)
 
     def test_ecosystem_models_register_without_core_changes(self) -> None:
         class RouteModel:
@@ -105,6 +135,18 @@ class CompilerFrontendTests(unittest.TestCase):
         )
         self.assertEqual(("test-routes",), tuple(model.model_id for model in selected))
 
+    def test_cli_canonical_views_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            graph_path = Path(output) / "canonical.json"
+            layered_path = Path(output) / "layered"
+            self.run_command(
+                sys.executable, "read_files.py", "src", "--taint",
+                "--graph-json", str(graph_path),
+                "--layered-out", str(layered_path),
+            )
+            self.assertTrue(graph_path.is_file())
+            self.assertTrue((layered_path / "manifest.json").is_file())
+
     def test_typescript_contextual_tokens_and_library_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
@@ -115,10 +157,6 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(2, snapshot.contract_version)
             self.assertTrue(all(
                 node["id"].startswith("v2:frontend:typescript-compiler-api:")
-                for node in snapshot.nodes
-            ))
-            self.assertTrue(all(
-                node["properties"].get("legacy_id")
                 for node in snapshot.nodes
             ))
             self.assertEqual("complete", snapshot.capability("scopes"))
@@ -160,7 +198,6 @@ class CompilerFrontendTests(unittest.TestCase):
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
             self.assertEqual(2, snapshot.contract_version)
-            self.assertFalse(snapshot.legacy_contract)
             self.assertEqual(1, snapshot.manifest["root_file_count"])
             self.assertEqual(1, snapshot.manifest["runtime_dependency_file_count"])
             runtime_file = next(
@@ -450,11 +487,11 @@ class CompilerFrontendTests(unittest.TestCase):
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
             self.assertEqual(2, snapshot.contract_version)
-            self.assertFalse(snapshot.legacy_contract)
             self.assertTrue(all(
                 node["id"].startswith("v2:frontend:clang-c:")
                 for node in snapshot.nodes
             ))
+            self.assertTrue(any(node["kind"] == "token" for node in snapshot.nodes))
             functions = {
                 node["label"]: node for node in snapshot.nodes
                 if node["kind"] == "function"
@@ -992,7 +1029,7 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(tainted["source_id"], witness[0])
             self.assertEqual(tainted["call_id"], witness[-1])
 
-    def test_legacy_file_api_is_compiler_backed(self) -> None:
+    def test_file_compatibility_view_is_compiler_backed(self) -> None:
         paths = walk(str(ROOT / "src"))
         files = analyze_files(paths)
         principal = read_file(str(ROOT / "src" / "auth" / "principal.ts"))

@@ -3,7 +3,7 @@
 `Arachne.core` is language-agnostic. It defines graph identities, canonical
 node/edge kinds, capability vocabulary, provenance rules, validation and graph
 composition. It must not import a language frontend, an ecosystem model or the
-legacy compatibility API.
+compatibility API.
 
 Language-neutral semantic analyses live under `Arachne.core.overlays`. They are
 registered and applied sequentially to canonical graphs, returning additive
@@ -29,10 +29,9 @@ the async/event overlay turns those facts and compiler `await` operations into
 callback registration, scheduling, continuation, event, queue, stream, and
 worker edges. Compiler-identified dynamic constructs retain their exact sites
 and inputs; the core also materializes boundaries for them and for calls that
-remain unresolved after dispatch expansion. Remaining legacy passes are being migrated before the `FileInfo`
-compatibility projection itself can be deleted. `run_project_frontends` and the
-CLI already use this direct path; `FileInfo` no longer participates in primary
-graph construction.
+remain unresolved after dispatch expansion. `run_project` and the CLI use this
+direct path. The optional `FileInfo` compatibility projection is generated from
+the completed graph and never participates in graph construction.
 
 ## Ownership
 
@@ -69,10 +68,7 @@ properties.frontend_extensions.<language>
 
 The core never interprets this data.
 
-## Version migration
+## Contract version
 
-Contract v1 snapshots remain accepted only as migration inputs. They receive
-the old structural and source-span checks, while v2 snapshots receive strict
-kind, owner, tier, source provenance and evidence validation. Frontends will be
-moved to v2 individually; once both registered frontends emit v2 and the legacy
-API reads from the completed canonical graph, v1 support can be deleted.
+Every registered frontend emits contract v2. Older snapshots are rejected;
+there is no parser-era migration path inside the canonical pipeline.

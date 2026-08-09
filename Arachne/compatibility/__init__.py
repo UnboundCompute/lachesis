@@ -1,2 +1,1 @@
-"""Temporary adapters for APIs predating the canonical graph pipeline."""
-
+"""One-way presentation views generated from completed canonical graphs."""

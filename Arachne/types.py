@@ -1,4 +1,4 @@
-"""Shared result shapes produced by the Arachne source analyzers."""
+"""Canonical graph and optional file-view result shapes."""
 from typing import List, Optional, TypedDict
 
 

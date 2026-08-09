@@ -7,14 +7,8 @@ or edge kinds that force the core to understand that language.
 """
 from __future__ import annotations
 
-from typing import FrozenSet
-
-
 CURRENT_CONTRACT_VERSION = 2
-LEGACY_CONTRACT_VERSIONS: FrozenSet[int] = frozenset({1})
-SUPPORTED_CONTRACT_VERSIONS = frozenset({
-    CURRENT_CONTRACT_VERSION, *LEGACY_CONTRACT_VERSIONS,
-})
+SUPPORTED_CONTRACT_VERSIONS = frozenset({CURRENT_CONTRACT_VERSION})
 
 TIERS = frozenset({"T0", "T1", "T2", "T3", "T4"})
 FACT_ORIGINS = frozenset({

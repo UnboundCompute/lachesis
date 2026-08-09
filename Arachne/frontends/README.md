@@ -1,8 +1,9 @@
 # Compiler-backed layered graph frontends
 
-Language-specific compiler processes live here while their canonical adapter and
-semantic overlays live in `Arachne/`. TypeScript compiler discovery is now the
-default behind `read_file`, `analyze_files`, and the CLI harness.
+Language-specific compiler processes live here. The language-neutral contract
+and semantic overlays live in `Arachne/core`, project orchestration lives in
+`Arachne/pipeline.py`, and optional presentation views live in
+`Arachne/compatibility` and `Arachne/projections`.
 
 ```sh
 node Arachne/frontends/typescript/build_graph.mjs src graph_out/compiler_layered
@@ -96,7 +97,7 @@ and can resolve later function-pointer member calls through the recorded write.
 
 [`Arachne/core/`](../core/) defines the language-neutral
 frontend contract, plugin registry, capability negotiation and snapshot validator.
-The TypeScript generator is merely the first registered command frontend.
+TypeScript/JavaScript and C are the currently registered command frontends.
 
 Each future frontend may be implemented in its native toolchain, provided it emits
 the same manifest and tier files. For example:

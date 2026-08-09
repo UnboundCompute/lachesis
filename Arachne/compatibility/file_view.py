@@ -1,4 +1,4 @@
-"""Historical file API projected from the finished canonical graph."""
+"""File-oriented compatibility view projected from the canonical graph."""
 from __future__ import annotations
 
 import hashlib

@@ -1,7 +1,7 @@
 """Materialized five-tier read-only projection of the canonical project graph.
 
-The flat graph from ``build_graph`` (~5.8k nodes / ~23k edges on the fixture) is too
-large for an LLM to traverse. This projection re-shapes the SAME graph into five
+The completed canonical graph can be too large for an LLM to traverse. This
+projection reshapes the same graph into five
 self-contained tiers so a consumer triages at the top (security summary) and drills
 down only into a specific finding:
 
@@ -12,8 +12,8 @@ down only into a specific finding:
   T4 Proof       — raw IR: SSA, heap, contexts, tokens, source lines.
 
 Two uniform mechanics:
-  * EXPANDS_TO — drill from a node to its structural children (reuses build_graph's
-    containment edges), one structural step at a time.
+  * EXPANDS_TO — drill from a node to its structural children using canonical
+    containment edges, one structural step at a time.
   * rollup     — a coarse edge aggregates the fine edges beneath it, carrying
     ``witnesses`` (the finer ids/evidence) + ``weight``.
 

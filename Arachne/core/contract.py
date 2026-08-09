@@ -54,10 +54,6 @@ class FrontendSnapshot:
     def nodes_by_id(self) -> Dict[str, dict]:
         return {node["id"]: node for node in self.nodes}
 
-    @property
-    def legacy_contract(self) -> bool:
-        return self.contract_version < 2
-
     def capability(self, name: str) -> str:
         return self.capabilities.get(name, CAPABILITY_NONE)
 

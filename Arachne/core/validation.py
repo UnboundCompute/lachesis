@@ -1,4 +1,4 @@
-"""Strict validation for canonical v2 snapshots and explicit v1 migration."""
+"""Strict validation for canonical v2 frontend snapshots."""
 from __future__ import annotations
 
 from collections import Counter
@@ -14,35 +14,20 @@ from .schema import (
     CURRENT_CONTRACT_VERSION,
     FRONTEND_FORBIDDEN_EDGE_KINDS,
     FRONTEND_FORBIDDEN_NODE_KINDS,
-    LEGACY_CONTRACT_VERSIONS,
     NODE_KIND_TIERS,
     SOURCE_DERIVED_NODE_KINDS,
     TIERS,
 )
 
 
-LEGACY_SOURCE_KINDS = frozenset({
-    "function", "method", "constructor", "class", "interface", "type", "enum",
-    "record", "parameter", "variable", "binding", "property", "statement",
-    "expression", "identifier", "call", "construct", "source-span", "token",
-})
-
-
 def validate_snapshot(snapshot: FrontendSnapshot) -> None:
-    """Validate a snapshot at its declared contract version.
-
-    Version 1 remains readable only as a migration input. New frontend output
-    must use v2 to receive strict kind, ownership, provenance and evidence checks.
-    """
-    if snapshot.contract_version == CURRENT_CONTRACT_VERSION:
-        _validate_v2(snapshot)
-    elif snapshot.contract_version in LEGACY_CONTRACT_VERSIONS:
-        _validate_v1_migration_input(snapshot)
-    else:
+    """Validate one compiler snapshot against the current canonical contract."""
+    if snapshot.contract_version != CURRENT_CONTRACT_VERSION:
         raise ContractError(
             f"unsupported frontend contract {snapshot.contract_version}; "
-            f"supported versions are {sorted({CURRENT_CONTRACT_VERSION, *LEGACY_CONTRACT_VERSIONS})}"
+            f"required version is {CURRENT_CONTRACT_VERSION}"
         )
+    _validate_v2(snapshot)
 
 
 def _validate_common(snapshot: FrontendSnapshot) -> None:
@@ -89,22 +74,6 @@ def _validate_common(snapshot: FrontendSnapshot) -> None:
     if expected_edges is not None and expected_edges != len(snapshot.edges):
         raise ContractError(
             f"manifest says {expected_edges} edges but snapshot has {len(snapshot.edges)}"
-        )
-
-
-def _validate_v1_migration_input(snapshot: FrontendSnapshot) -> None:
-    _validate_common(snapshot)
-    missing = []
-    for node in snapshot.nodes:
-        if node.get("kind") not in LEGACY_SOURCE_KINDS:
-            continue
-        properties = node.get("properties", {})
-        required = ("file", "start_offset", "end_offset", "start_line", "end_line")
-        if any(properties.get(key) is None for key in required):
-            missing.append(node["id"])
-    if missing:
-        raise ContractError(
-            f"{len(missing)} v1 source nodes lack migration provenance; first is {missing[0]}"
         )
 
 

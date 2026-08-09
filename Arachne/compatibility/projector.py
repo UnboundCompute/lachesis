@@ -319,10 +319,19 @@ def graph_file_infos(
                 binding for binding in index.nodes_of_kind("context-parameter")
                 if binding.get("properties", {}).get("context_id") == node["id"]
             ]
+            contextual_returns = [
+                returned for returned in index.nodes_of_kind("context-return")
+                if returned.get("properties", {}).get("context_id") == node["id"]
+            ]
             info["call_contexts"].append({
                 "id": node["id"], "call_id": p.get("callsite_id"),
                 "callee_function_id": p.get("callee_function_id"),
                 "caller_function_id": p.get("caller_function_id"),
+                "return_value_id": contextual_returns[0]["id"]
+                    if contextual_returns else None,
+                "call_value_id": contextual_returns[0].get("properties", {}).get(
+                    "call_value_id"
+                ) if contextual_returns else None,
                 "parameter_bindings": [{
                     "id": binding["id"],
                     **binding.get("properties", {}),
