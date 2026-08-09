@@ -49,6 +49,26 @@ INDEXED_KINDS = {
     "record": "type", "union": "type",
     "variable": "variable", "property": "property", "constant": "constant",
 }
+
+# Kind precedence for name resolution: when one name resolves to multiple nodes, prefer
+# the DEFINITION over a reference to it. §4 made variable/property/constant name-
+# addressable (import bindings, ops-struct slot assignments `.read = foo`, extern
+# decls), which introduced collisions — a function `foo` now shares its name with the
+# import binding `foo` and the struct slot `.foo`. Declaration kinds must outrank
+# reference kinds so read_body / name-seeded callers land on the def; references stay
+# reachable by explicit node_id / file:line handle. Lower rank = preferred.
+_KIND_RANK = {
+    "function": 0, "method": 0, "constructor": 0,          # callable definitions
+    "class": 1, "interface": 1, "enum": 1, "type": 1,      # type definitions
+    "record": 1, "union": 1,
+    "file": 2,
+    "variable": 5, "property": 5, "constant": 5,           # references / bindings / slots
+}
+
+
+def _kind_rank(entry: dict) -> int:
+    """Resolution precedence for an entry (definitions < unknown < references)."""
+    return _KIND_RANK.get(entry.get("kind"), 3)
 # CALLS is declaration->declaration (function/method -> function/method): the clean,
 # resolved direct call graph. It is the DIRECT set.
 CALL_EDGES = ("CALLS",)
@@ -197,9 +217,10 @@ def _ranked(entries: list[dict], q: str, mode: str = "fuzzy") -> list[tuple[int,
         s = _score(e, q, mode)
         if s is not None:
             hits.append((s, e))
-    # exported and shallower paths rank up on ties
+    # definitions outrank references (§4 collisions), then exported, then name/path
     hits.sort(key=lambda se: (
-        -se[0], not se[1]["exported"], se[1]["name"].lower(), se[1]["file"] or "",
+        -se[0], _kind_rank(se[1]), not se[1]["exported"], se[1]["name"].lower(),
+        se[1]["file"] or "",
     ))
     return hits
 
@@ -242,15 +263,20 @@ def _resolve_handle(entries: list[dict], query: str) -> list[dict]:
     hits = [e for e in entries
             if e.get("file") and (e["file"] == path or e["file"].endswith(path))
             and e.get("line") == line]
-    # tightest path match first (exact file over endswith), then production over test
-    hits.sort(key=lambda e: (e["file"] != path, e.get("is_test", False),
-                             e["file"] or ""))
+    # tightest path match first (exact file over endswith), then definition over a
+    # co-located reference, then production over test
+    hits.sort(key=lambda e: (e["file"] != path, _kind_rank(e),
+                             e.get("is_test", False), e["file"] or ""))
     return hits
 
 
 def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
     exact = [e for e in entries if e["name"] == name]
     if exact:
+        # Prefer the definition over a reference sharing the name (§4 collisions),
+        # then exported, then production over test, then a stable path/line order.
+        exact.sort(key=lambda e: (_kind_rank(e), not e["exported"],
+                                  e.get("is_test", False), e["file"] or "", e["line"] or 0))
         return exact
     handle = _resolve_handle(entries, name)
     if handle:
