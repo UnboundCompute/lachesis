@@ -105,6 +105,14 @@ def merge_overlay_graph(base: CodeGraph, overlay: CodeGraph) -> CodeGraph:
         if not existing:
             nodes[node["id"]] = node
             continue
+        if node["kind"] == "data-context" and existing["kind"] != "data-context":
+            # Overlay flows create placeholders for compiler-owned endpoints
+            # that are not re-materialized in FileInfo. Preserve the concrete
+            # frontend fact when that endpoint already exists.
+            continue
+        if existing["kind"] == "data-context" and node["kind"] != "data-context":
+            nodes[node["id"]] = node
+            continue
         compatible_kinds = (
             {existing["kind"], node["kind"]} <= {"call", "construct"}
             or {existing["kind"], node["kind"]} <= {
