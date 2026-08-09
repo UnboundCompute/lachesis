@@ -68,6 +68,17 @@ def _seed(store, token):
     return hits[0]["node_id"] if hits else None
 
 
+def _ref(store, node_id):
+    """A reusable handle for a node: {node_id, name, at} so an agent always gets
+    an addressable reference back — never just a non-unique `<anonymous@N>` name."""
+    node = store.node(node_id)
+    if not node:
+        return {"node_id": node_id, "name": None, "at": None}
+    f, l, _ = store.gl.loc(node)
+    return {"node_id": node_id, "name": store.gl.label(node),
+            "at": f"{f}:{l}" if f and l else None}
+
+
 TOOLS = [
     {"name": "search",
      "description": "Resolve a function/method/type/file name to its canonical node id(s) with "
@@ -205,14 +216,14 @@ def call_tool(name, args):
         fn = _seed(store, args["fn"])
         if not fn:
             return json.dumps({"error": f"no function for {args['fn']!r}"})
-        return json.dumps({"function": gl.label(store.node(fn)),
+        return json.dumps({"function": _ref(store, fn),
                            "guard_signal": c.guards.profile(fn)})
     if name == "call_roles":
         fn = _seed(store, args["fn"])
         if not fn:
             return json.dumps({"error": f"no function for {args['fn']!r}"})
         recs = c.roles.roles_for(fn)
-        return json.dumps({"function": gl.label(store.node(fn)),
+        return json.dumps({"function": _ref(store, fn),
                            "calls": [{"callee": r["callee"], "role": r["role"],
                                       "fact_origin": r["fact_origin"],
                                       "at": f"{r['file']}:{r['line']}"} for r in recs]})

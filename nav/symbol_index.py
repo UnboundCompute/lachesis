@@ -175,9 +175,35 @@ def search_page(entries: list[dict], q: str, mode: str = "fuzzy",
     }
 
 
+_HANDLE = re.compile(r"^(?P<path>.+):(?P<line>\d+)$")
+
+
+def _resolve_handle(entries: list[dict], query: str) -> list[dict]:
+    """Resolve a `path:line` handle (e.g. `oauth.ts:168`) to node entries.
+
+    This is how anonymous / non-uniquely-named nodes (`<anonymous@N>`) become
+    addressable: they have no useful name but always have a file:line."""
+    m = _HANDLE.match(query.strip())
+    if not m:
+        return []
+    path, line = m.group("path"), int(m.group("line"))
+    hits = [e for e in entries
+            if e.get("file") and (e["file"] == path or e["file"].endswith(path))
+            and e.get("line") == line]
+    # tightest path match first (exact file over endswith), then production over test
+    hits.sort(key=lambda e: (e["file"] != path, e.get("is_test", False),
+                             e["file"] or ""))
+    return hits
+
+
 def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
     exact = [e for e in entries if e["name"] == name]
-    return exact or search(entries, name, "fuzzy", limit=5)
+    if exact:
+        return exact
+    handle = _resolve_handle(entries, name)
+    if handle:
+        return handle
+    return search(entries, name, "fuzzy", limit=5)
 
 
 def callers(gl: GraphLib, node_id: str, include_external: bool = False) -> list[dict]:

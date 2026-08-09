@@ -138,6 +138,28 @@ class GuardProfiles:
         self._build()
         return list(self._counts)
 
+    def top(self, n: int = 20) -> list[dict]:
+        """The N most guard-shaped functions, each with an addressable handle.
+
+        This is the cold-start entry point: a ranked list needs no prior name
+        knowledge, and every row carries `node_id` + `handle` (file:line) so even
+        an anonymous high-signal function (`<anonymous@N>`) can be navigated to."""
+        self._build()
+        rows = []
+        for fn_id in self.functions():
+            node = self.gl.nodes.get(fn_id)
+            if node is None:
+                continue
+            f, l, _ = self.gl.loc(node)
+            rows.append({
+                "node_id": fn_id,
+                "name": self.gl.label(node),
+                "handle": f"{f}:{l}" if f and l else None,
+                "guard_signal": self.profile(fn_id),
+            })
+        rows.sort(key=lambda r: r["guard_signal"]["score"], reverse=True)
+        return rows[:n]
+
     def write_signals(self, overlay) -> int:
         """Materialize guard_signal onto every guard-bearing function (node_props)."""
         n = 0
@@ -175,13 +197,11 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"function": fn, "name": store.gl.label(store.node(fn)),
                           "guard_signal": prof}, indent=2, ensure_ascii=False))
         return 0
-    top = args.top or 20
-    ranked = sorted(((gp.profile(f), f) for f in gp.functions()),
-                    key=lambda pf: pf[0]["score"], reverse=True)[:top]
-    for prof, f in ranked:
-        print(f"{prof['score']:.3f} {prof['class']:11} {store.gl.label(store.node(f)):32} "
+    for row in gp.top(args.top or 20):
+        prof = row["guard_signal"]
+        print(f"{prof['score']:.3f} {prof['class']:11} {row['name']:32} "
               f"c={prof['conditions']} sc={prof['short_circuits']} thr={prof['throws']} "
-              f"sec={prof['security_weight']}")
+              f"sec={prof['security_weight']}  {row['handle'] or '?'}  {row['node_id']}")
     return 0
 
 
