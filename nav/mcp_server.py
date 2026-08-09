@@ -101,13 +101,21 @@ TOOLS = [
          "offset": {"type": "integer", "default": 0}},
          "required": ["name"]}},
     {"name": "callers",
-     "description": "Who calls this symbol (reverse call graph, external stubs filtered). A jump move.",
+     "description": "Who calls this symbol — direct + indirect dispatch (function-pointer / "
+                    "ops-struct / runtime), external stubs filtered. Each row tagged via: "
+                    "direct | indirect(may_invoke|context|fn-pointer). Set direct_only to get "
+                    "only resolved decl->decl CALLS. A jump move.",
      "inputSchema": {"type": "object", "properties": {
-         "name": {"type": "string"}}, "required": ["name"]}},
+         "name": {"type": "string"},
+         "direct_only": {"type": "boolean"}}, "required": ["name"]}},
     {"name": "callees",
-     "description": "What this symbol calls (forward call graph, in-repo only). A jump move.",
+     "description": "What this symbol calls — direct + indirect dispatch, in-repo only. Each row "
+                    "tagged via: direct | indirect(...); an indirect row with resolved:false is an "
+                    "unresolved function-pointer slot (the indirection is real, the target isn't "
+                    "pinned). Set direct_only for resolved decl->decl CALLS only. A jump move.",
      "inputSchema": {"type": "object", "properties": {
-         "name": {"type": "string"}}, "required": ["name"]}},
+         "name": {"type": "string"},
+         "direct_only": {"type": "boolean"}}, "required": ["name"]}},
     {"name": "open_file",
      "description": "L1 file graph: imports, declarations, intra-file calls, cross-file jump-stubs "
                     "for one file (repo-relative path). Returns a {nodes,edges,manifest} graph.",
@@ -184,7 +192,8 @@ def call_tool(name, args):
         seed = _seed(store, args["name"])
         if not seed:
             return json.dumps({"error": f"no node named {args['name']!r}"})
-        moves = (si.callers if name == "callers" else si.callees)(gl, seed)
+        move = si.callers if name == "callers" else si.callees
+        moves = move(gl, seed, direct_only=bool(args.get("direct_only")))
         return json.dumps({name: moves, "of": args["name"]})
     if name == "open_file":
         fn = _find_file_node(gl, path=args["file"], file_id=None)

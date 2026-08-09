@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import GraphLib
+from tier1_flag.graphlib import GraphLib, CALLABLE_KINDS
 
 # node kinds that are addressable jump targets, mapped to a granularity label
 INDEXED_KINDS = {
@@ -36,10 +36,33 @@ INDEXED_KINDS = {
     "class": "type", "interface": "type", "enum": "type", "type": "type",
     "function": "function", "method": "method", "constructor": "method",
 }
-# CALLS is declaration->declaration (function/method -> function/method): the clean
-# call graph for caller/callee moves. INVOKES/MAY_INVOKE/CONTEXT_CALLS originate at
-# call-site / call-context nodes, so they'd land moves on non-declaration noise.
+# CALLS is declaration->declaration (function/method -> function/method): the clean,
+# resolved direct call graph. It is the DIRECT set.
 CALL_EDGES = ("CALLS",)
+# The indirect-dispatch family. These edges originate at call-site / argument /
+# call-context nodes (not the owning declaration), so a caller/callee move reaches them
+# by walking the call-sites the function owns, then resolving each edge's declaration
+# endpoint. Unioning them is what makes the move see function-pointer / ops-struct /
+# runtime dispatch — on C/kernel that IS the control flow; on TS it recovers the ~22%
+# of functions reachable only indirectly. Every unioned row is TAGGED (`via`) so a
+# resolved call is never silently conflated with a maybe-dispatch, and `direct_only`
+# recovers the pure decl->decl graph unchanged.
+INDIRECT_CALL_EDGES = ("INVOKES", "MAY_INVOKE", "CONTEXT_CALLS", "READS_CALLEE")
+# Human-readable dispatch label per edge kind, surfaced inside `via=indirect(<label>)`.
+_VIA_LABEL = {
+    "INVOKES": "invokes", "MAY_INVOKE": "may_invoke",
+    "CONTEXT_CALLS": "context", "READS_CALLEE": "fn-pointer",
+}
+# call-site node kinds a function owns (where INDIRECT edges originate).
+_CALLSITE_KINDS = ("call", "construct")
+
+
+def _via_label(edge: dict) -> str:
+    """`indirect(<label>)` tag for an indirect-dispatch edge (kind, or EXPANDS_TO via)."""
+    kind = edge.get("kind")
+    if kind == "EXPANDS_TO":
+        kind = edge.get("properties", {}).get("via") or kind
+    return f"indirect({_VIA_LABEL.get(kind, (kind or 'dispatch').lower())})"
 _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 # Generic test/spec-file conventions (not vendor/interface literals). This is the
 # SINGLE SOURCE OF TRUTH for "is this a test file": the graph builder imports the same
@@ -216,41 +239,104 @@ def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
     return search(entries, name, "fuzzy", limit=5)
 
 
-def callers(gl: GraphLib, node_id: str, include_external: bool = False) -> list[dict]:
-    """Who calls this node (reverse call edges) — a traversal move.
+def _owned_callsites(gl: GraphLib, node_id: str) -> tuple[dict, ...]:
+    """The call-site / construct nodes a function owns (where indirect edges start)."""
+    return tuple(n for n in gl.index.nodes_owned_by(node_id)
+                 if gl.kind(n["id"]) in _CALLSITE_KINDS)
 
-    ``gl.index.sources`` yields node DICTS, not ids; climb each to its enclosing
-    function so the move lands on a declaration the agent can open."""
+
+def _caller_decl(gl: GraphLib, node: dict) -> dict | None:
+    """The declaration that owns a call-site / call-context node.
+
+    ``owner_function`` climbs ``owner_function_id``; call-context nodes instead carry
+    ``caller_function_id``, so honor that first before falling back to the climb."""
+    if gl.kind(node["id"]) == "call-context":
+        caller_id = node.get("properties", {}).get("caller_function_id")
+        if caller_id:
+            return gl.nodes.get(caller_id)
+    return gl.owner_function(node)
+
+
+def callers(gl: GraphLib, node_id: str, include_external: bool = False,
+            direct_only: bool = False) -> list[dict]:
+    """Who calls this node — a traversal move, direct + indirect dispatch (tagged).
+
+    Direct (``CALLS``) callers land on the calling declaration. Indirect callers are
+    found by walking the INDIRECT edges that TARGET this node (their source is a
+    call-site / call-context node) back to the declaration that owns them, so a
+    function reached only through a function pointer / ops-struct slot / runtime
+    dispatch still shows its caller. Every row is tagged ``via`` (`direct` vs
+    `indirect(...)`); ``direct_only`` returns exactly the old decl->decl set."""
     prov = _file_provenance(gl)
-    out, seen = [], set()
-    for node in gl.index.sources(node_id, *CALL_EDGES):
-        owner = gl.owner_function(node) or node
-        if owner["id"] in seen:
-            continue
-        seen.add(owner["id"])
-        f, l, _ = gl.loc(owner)
+    out: list[dict] = []
+    seen: dict[str, int] = {}
+
+    def _add(decl: dict, via: str, resolved: bool) -> None:
+        f, l, _ = gl.loc(decl)
         if not include_external and _is_external(f, prov):
+            return
+        did = decl["id"]
+        if did in seen:  # prefer the direct tag when a pair is reachable both ways
+            idx = seen[did]
+            if via == "direct" and out[idx]["via"] != "direct":
+                out[idx].update(via="direct", resolved=True)
+            return
+        seen[did] = len(out)
+        out.append({"node_id": did, "name": gl.label(decl), "kind": gl.kind(did),
+                    "file": f, "line": l, "via": via, "resolved": resolved})
+
+    for node in gl.index.sources(node_id, *CALL_EDGES):
+        decl = gl.owner_function(node) or node
+        _add(decl, "direct", True)
+    if direct_only:
+        return out
+    for edge in gl.index.incoming_of_kind(node_id, *INDIRECT_CALL_EDGES):
+        src = gl.nodes.get(edge.get("source"))
+        if src is None:
             continue
-        out.append({"node_id": owner["id"], "name": gl.label(owner),
-                    "kind": gl.kind(owner["id"]), "file": f, "line": l})
+        decl = _caller_decl(gl, src) or src
+        _add(decl, _via_label(edge), True)
     return out
 
 
-def callees(gl: GraphLib, node_id: str, include_external: bool = False) -> list[dict]:
-    """What this node calls (forward call edges) — a traversal move.
+def callees(gl: GraphLib, node_id: str, include_external: bool = False,
+            direct_only: bool = False) -> list[dict]:
+    """What this node calls — a traversal move, direct + indirect dispatch (tagged).
 
-    ``gl.index.targets`` yields node DICTS, not ids — use them directly."""
+    Direct (``CALLS``) targets are already declarations. Indirect targets come from
+    the call-sites this function owns: each INDIRECT edge's target is the resolved
+    callee declaration — except ``READS_CALLEE``, whose target is the unresolved
+    function-pointer *slot* (a field/variable). Slot rows carry ``resolved=False`` so
+    the indirection is visible without pretending a concrete callee was found. Every
+    row is tagged ``via``; ``direct_only`` returns exactly the old decl->decl set."""
     prov = _file_provenance(gl)
-    out, seen = [], set()
-    for node in gl.index.targets(node_id, *CALL_EDGES):
-        if node["id"] in seen:
-            continue
-        seen.add(node["id"])
+    out: list[dict] = []
+    seen: dict[str, int] = {}
+
+    def _add(node: dict, via: str, resolved: bool) -> None:
         f, l, _ = gl.loc(node)
         if not include_external and _is_external(f, prov):
-            continue  # skip external stubs (e.g. Array.push in lib.es5.d.ts)
-        out.append({"node_id": node["id"], "name": gl.label(node),
-                    "kind": gl.kind(node["id"]), "file": f, "line": l})
+            return  # skip external stubs (e.g. Array.push in lib.es5.d.ts)
+        nid = node["id"]
+        if nid in seen:
+            idx = seen[nid]
+            if via == "direct" and out[idx]["via"] != "direct":
+                out[idx].update(via="direct", resolved=True)
+            return
+        seen[nid] = len(out)
+        out.append({"node_id": nid, "name": gl.label(node), "kind": gl.kind(nid),
+                    "file": f, "line": l, "via": via, "resolved": resolved})
+
+    for node in gl.index.targets(node_id, *CALL_EDGES):
+        _add(node, "direct", True)
+    if direct_only:
+        return out
+    for site in _owned_callsites(gl, node_id):
+        for edge in gl.index.outgoing_of_kind(site["id"], *INDIRECT_CALL_EDGES):
+            tgt = gl.nodes.get(edge.get("target"))
+            if tgt is None:
+                continue
+            _add(tgt, _via_label(edge), gl.kind(tgt["id"]) in CALLABLE_KINDS)
     return out
 
 
@@ -270,6 +356,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--prefix", action="store_true", help="with --search: prefix match")
     p.add_argument("--refs", metavar="NAME", help="list callers of NAME (a jump move)")
     p.add_argument("--callees", metavar="NAME", help="list what NAME calls (a jump move)")
+    p.add_argument("--direct-only", action="store_true",
+                   help="with --refs/--callees: only direct CALLS edges (drop indirect dispatch)")
     p.add_argument("--limit", type=int, default=25)
     p.add_argument("--offset", type=int, default=0, help="with --search: page offset")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
@@ -307,14 +395,18 @@ def main(argv: list[str]) -> int:
             print(f"no node named {name!r}", file=sys.stderr)
             return 2
         for tgt in targets:
-            moves = callers(gl, tgt["node_id"]) if args.refs else callees(gl, tgt["node_id"])
+            move = callers if args.refs else callees
+            moves = move(gl, tgt["node_id"], direct_only=args.direct_only)
             verb = "callers of" if args.refs else "callees of"
             if args.json:
                 print(json.dumps({"target": tgt, "verb": verb, "moves": moves}, indent=2, ensure_ascii=False))
             else:
                 print(f"{verb} {tgt['name']}  ({tgt['file']}:{tgt['line']}):")
                 for m in moves or []:
-                    print(_fmt(m))
+                    tag = m.get("via", "")
+                    if tag and not m.get("resolved", True):
+                        tag += " [unresolved]"
+                    print(f"{_fmt(m)}    {tag}".rstrip())
                 if not moves:
                     print("  (none)")
         return 0
