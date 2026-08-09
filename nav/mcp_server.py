@@ -13,11 +13,15 @@ named + file:line, edges typed with via/reason/role/confidence/fact_origin), so 
 agent gets one consistent, provenance-carrying shape back from every move.
 
 Tools:
-  cold-start — guards_top (ranked entry point; no name knowledge needed)
-  navigation — search, callers, callees, open_file (L1), open_folder (L0)
+  cold-start — hubs (centrality spine; language-agnostic), guards_top (guard-shaped; security)
+  navigation — search, callers, callees, read_body (L3), open_file (L1), open_folder (L0)
   reasoning  — flow, reaches, sources_of, points_to, aliases, guards, call_roles, siblings
 
-  python3 nav/mcp_server.py <graph.json> [overlay.json]
+Profiles (additive): the default "all" exposes every tool (TS surface unchanged). The
+opt-in "comprehension" profile (env ARACHNE_MCP_PROFILE=comprehension, or a 3rd argv)
+hides the four security tools for a focused understanding run — nothing else changes.
+
+  python3 nav/mcp_server.py <graph.json> [overlay.json] [profile]
 """
 import json
 import os
@@ -39,6 +43,30 @@ from nav.file_graph import build_file_graph, _find_file_node
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
 _CTX = None  # lazily-built bundle of store + engines, loaded once
+_PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
+
+# The security-hunting tools. Under the DEFAULT "all" profile every one is exposed
+# exactly as before (TS surface unchanged). The opt-in "comprehension" profile hides
+# these four for a focused language-agnostic (C/kernel) understanding run — the only
+# mode that narrows the surface, and only when explicitly requested.
+SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
+
+# Canonical display order for tools/list: the centrality cold-start (hubs) leads, then
+# navigation, then value-flow reasoning, then the security tools last. Ordering only —
+# a name missing here (or a future tool) still shows, appended in definition order.
+TOOL_ORDER = (
+    "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
+    "flow", "reaches", "sources_of", "points_to", "aliases",
+    "guards", "call_roles", "siblings", "guards_top",
+)
+
+
+def _visible_tools():
+    """TOOLS filtered by the active profile and sorted into canonical order."""
+    tools = TOOLS if _PROFILE != "comprehension" \
+        else [t for t in TOOLS if t["name"] not in SECURITY_TOOLS]
+    rank = {n: i for i, n in enumerate(TOOL_ORDER)}
+    return sorted(tools, key=lambda t: rank.get(t["name"], len(rank)))
 
 
 def log(*a):
@@ -84,11 +112,11 @@ def _ref(store, node_id):
 
 TOOLS = [
     {"name": "guards_top",
-     "description": "COLD-START ENTRY POINT — the N most guard-shaped functions, ranked by "
-                    "derived guard signal, with no name knowledge needed. Each row carries "
-                    "node_id + handle (file:line) so a high-signal function (even an anonymous "
-                    "one) is immediately navigable. Start here on an unfamiliar graph, THEN "
-                    "search/callers/callees to traverse.",
+     "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
+                    "name knowledge needed — a security-hunting entry point (for the spine of an "
+                    "unfamiliar subsystem, use `hubs` instead). Each row carries node_id + handle "
+                    "(file:line) so a high-signal function (even an anonymous one) is immediately "
+                    "navigable.",
      "inputSchema": {"type": "object", "properties": {
          "n": {"type": "integer", "default": 20}}}},
     {"name": "hubs",
@@ -194,6 +222,9 @@ TOOLS = [
 
 
 def call_tool(name, args):
+    if _PROFILE == "comprehension" and name in SECURITY_TOOLS:
+        return json.dumps({"error": f"tool {name!r} is hidden under the "
+                                    "'comprehension' profile (security tool)"})
     c = ctx()
     store, gl = c.store, c.store.gl
 
@@ -314,13 +345,17 @@ def send(obj):
 
 
 def main():
-    global _GRAPH_PATH, _OVERLAY_PATH
+    global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE
     if len(sys.argv) < 2:
-        print("usage: mcp_server.py <graph.json> [overlay.json]", file=sys.stderr)
+        print("usage: mcp_server.py <graph.json> [overlay.json] [profile]", file=sys.stderr)
         return 2
     _GRAPH_PATH = sys.argv[1]
     _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
-    log(f"starting; graph = {_GRAPH_PATH}")
+    # Profile: explicit 3rd argv wins, else env, else the default "all". Only
+    # "comprehension" narrows the surface; any other value falls back to "all".
+    profile = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("ARACHNE_MCP_PROFILE", "all")
+    _PROFILE = "comprehension" if profile == "comprehension" else "all"
+    log(f"starting; graph = {_GRAPH_PATH}; profile = {_PROFILE}")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -339,7 +374,7 @@ def main():
         elif method == "notifications/initialized":
             pass
         elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": _visible_tools()}})
         elif method == "tools/call":
             p = msg.get("params") or {}
             try:
