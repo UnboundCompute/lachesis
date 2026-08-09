@@ -464,6 +464,113 @@ function safeType(node) {
   }
 }
 
+function typeFlagNames(type) {
+  return Object.entries(ts.TypeFlags)
+    .filter(([name, value]) =>
+      typeof value === "number" && value > 0 && (value & (value - 1)) === 0 &&
+      (type.flags & value) !== 0 && !Number.isInteger(Number(name)),
+    )
+    .map(([name]) => name)
+    .sort();
+}
+
+function typeMetadata(node) {
+  if (!node) return null;
+  try {
+    const type = checker.getTypeAtLocation(node);
+    const unionTypes = type.isUnion?.() ? type.types.map((item) => safeTypeFromType(item, node)) : [];
+    const intersectionTypes = type.isIntersection?.()
+      ? type.types.map((item) => safeTypeFromType(item, node)) : [];
+    let typeArguments = [];
+    if ((type.flags & ts.TypeFlags.Object) &&
+        (type.objectFlags & ts.ObjectFlags.Reference)) {
+      typeArguments = checker.getTypeArguments(type)
+        .map((item) => safeTypeFromType(item, node));
+    }
+    return {
+      text: safeTypeFromType(type, node),
+      flags: typeFlagNames(type),
+      symbol: type.aliasSymbol?.getName?.() || type.getSymbol?.()?.getName?.() || null,
+      union_types: unionTypes,
+      intersection_types: intersectionTypes,
+      type_arguments: typeArguments,
+      nullable: Boolean(type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)),
+      literal: Boolean(type.flags & ts.TypeFlags.Literal),
+    };
+  } catch {
+    return { text: "unknown", flags: [], union_types: [], intersection_types: [],
+      type_arguments: [], nullable: false, literal: false };
+  }
+}
+
+function safeTypeFromType(type, location) {
+  try {
+    return compact(checker.typeToString(
+      type,
+      location,
+      ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope,
+    ), 500);
+  } catch {
+    return "unknown";
+  }
+}
+
+function declaredTypeMetadata(node) {
+  if (!ts.isIdentifier(node)) return null;
+  try {
+    let symbol = checker.getSymbolAtLocation(node);
+    if (!symbol) return null;
+    if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    const declaration = symbol.valueDeclaration || symbol.declarations?.[0];
+    if (!declaration) return null;
+    const type = checker.getTypeOfSymbolAtLocation(symbol, declaration);
+    return {
+      text: safeTypeFromType(type, declaration),
+      declaration_file: normalize(declaration.getSourceFile().fileName),
+      declaration_start_offset: declaration.getStart(declaration.getSourceFile(), false),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function declarationTypeExtensions(node) {
+  const typeParameters = [...(node.typeParameters || [])].map((parameter, position) => ({
+    name: parameter.name.text,
+    position,
+    constraint: parameter.constraint ? safeType(parameter.constraint) : null,
+    default: parameter.default ? safeType(parameter.default) : null,
+  }));
+  const heritage = [...(node.heritageClauses || [])].flatMap((clause) =>
+    clause.types.map((heritageType) => ({
+      relationship: clause.token === ts.SyntaxKind.ExtendsKeyword ? "extends" : "implements",
+      expression: heritageType.expression.getText(node.getSourceFile()),
+      type: safeType(heritageType),
+      type_arguments: heritageType.typeArguments?.map((item) => safeType(item)) || [],
+    })),
+  );
+  let overloads = [];
+  if (node.name) {
+    try {
+      const symbol = checker.getSymbolAtLocation(node.name);
+      overloads = (symbol?.declarations || [])
+        .filter((declaration) => isFunctionEntity(declaration))
+        .map((declaration) => {
+          const signature = checker.getSignatureFromDeclaration(declaration);
+          return {
+            file: normalize(declaration.getSourceFile().fileName),
+            start_offset: declaration.getStart(declaration.getSourceFile(), false),
+            signature: signature ? checker.signatureToString(
+              signature, declaration, ts.TypeFormatFlags.NoTruncation,
+            ) : null,
+            implementation: Boolean(declaration.body),
+          };
+        });
+    } catch { /* anonymous/compiler-synthesized declarations have no symbol */ }
+  }
+  return { type_parameters: typeParameters, heritage, overloads };
+}
+
 function declarationName(node) {
   if (node.name && ts.isIdentifier(node.name)) return node.name.text;
   if (node.name && ts.isStringLiteralLike(node.name)) return node.name.text;
@@ -551,6 +658,9 @@ function registerEntity(node, ownerId = null) {
     owner_id: ownerId,
     parameters_start_offset: parameterRange.start,
     parameters_end_offset: parameterRange.end,
+    frontend_extensions: {
+      typescript: declarationTypeExtensions(node),
+    },
   });
   entityByDeclaration.set(node, id);
   const sfId = ensureSourceFile(node.getSourceFile(), "referenced-declaration");
@@ -653,6 +763,8 @@ function bodyForNode(node) {
     operator,
     owner_function_id: ownerFunction(node),
     scope_id: nearestScope(node),
+    type_facts: ts.isExpression(node) ? typeMetadata(node) : null,
+    declared_type_facts: ts.isIdentifier(node) ? declaredTypeMetadata(node) : null,
   });
   bodyByNode.set(node, id);
   return id;
@@ -685,6 +797,8 @@ function pathForNode(node, pathKind = "value") {
     type: ts.isExpression(node) ? safeType(node) : null,
     owner_function_id: ownerFunction(node),
     roles: [],
+    type_facts: ts.isExpression(node) ? typeMetadata(node) : null,
+    declared_type_facts: ts.isIdentifier(node) ? declaredTypeMetadata(node) : null,
   });
   variants.set(pathKind, id);
   addEdge("EVIDENCED_BY", id, bodyForNode(node));
@@ -1307,12 +1421,15 @@ function callMetadata(node) {
   const expression = node.expression;
   const callee = compact(expression.getText(node.getSourceFile()), 240);
   let receiverExpression = null;
+  let receiverNode = null;
   let methodName = lastCallName(callee);
   let computedKeyExpression = null;
   if (ts.isPropertyAccessExpression(expression)) {
+    receiverNode = expression.expression;
     receiverExpression = compact(expression.expression.getText(node.getSourceFile()), 240);
     methodName = expression.name.text;
   } else if (ts.isElementAccessExpression(expression)) {
+    receiverNode = expression.expression;
     receiverExpression = compact(expression.expression.getText(node.getSourceFile()), 240);
     computedKeyExpression = expression.argumentExpression
       ? compact(expression.argumentExpression.getText(node.getSourceFile()), 240) : null;
@@ -1328,11 +1445,64 @@ function callMetadata(node) {
     ) ? bodyForNode(expression.expression) : null,
     method_name: methodName,
     computed_key_expression: computedKeyExpression,
+    receiver_type_facts: typeMetadata(receiverNode),
+    frontend_extensions: {
+      typescript: callTypeExtensions(node),
+    },
   };
 }
 
 function lastCallName(label) {
-  return label.replace(/\?\./g, ".").split(/[.\[]/).pop().replace(/[^A-Za-z0-9_$].*$/, "");
+  const normalized = label.split("?.").join(".");
+  const separator = Math.max(normalized.lastIndexOf("."), normalized.lastIndexOf("["));
+  const tail = normalized.slice(separator + 1);
+  let result = "";
+  for (const character of tail) {
+    const code = character.codePointAt(0);
+    const identifierCharacter = character === "_" || character === "$" ||
+      (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122);
+    if (!identifierCharacter) break;
+    result += character;
+  }
+  return result;
+}
+
+function callTypeExtensions(node) {
+  try {
+    const signature = checker.getResolvedSignature(node);
+    const declaration = signature?.declaration;
+    const predicate = signature ? checker.getTypePredicateOfSignature(signature) : null;
+    return {
+      selected_signature: signature
+        ? checker.signatureToString(signature, node, ts.TypeFormatFlags.NoTruncation)
+        : null,
+      selected_declaration: declaration ? {
+        file: normalize(declaration.getSourceFile().fileName),
+        start_offset: declaration.getStart(declaration.getSourceFile(), false),
+        end_offset: declaration.getEnd(),
+      } : null,
+      return_type: signature
+        ? safeTypeFromType(checker.getReturnTypeOfSignature(signature), node) : "unknown",
+      parameter_types: (signature?.parameters || []).map((parameter) =>
+        safeTypeFromType(checker.getTypeOfSymbolAtLocation(parameter, node), node)),
+      explicit_type_arguments: (node.typeArguments || []).map((argument) => safeType(argument)),
+      signature_type_parameters: (signature?.typeParameters || []).map((parameter) =>
+        safeTypeFromType(parameter, node)),
+      type_predicate: predicate ? {
+        kind: ts.TypePredicateKind[predicate.kind],
+        parameter_name: predicate.parameterName || null,
+        parameter_index: predicate.parameterIndex,
+        type: predicate.type ? safeTypeFromType(predicate.type, node) : null,
+      } : null,
+    };
+  } catch {
+    return {
+      selected_signature: null, selected_declaration: null, return_type: "unknown",
+      parameter_types: [], explicit_type_arguments: [], signature_type_parameters: [],
+      type_predicate: null,
+    };
+  }
 }
 
 function targetDeclarationsForCall(node) {

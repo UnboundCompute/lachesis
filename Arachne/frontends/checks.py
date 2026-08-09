@@ -246,6 +246,63 @@ class CompilerFrontendTests(unittest.TestCase):
                 for node in composed["nodes"]
             ))
 
+    def test_typescript_compiler_emits_structured_type_and_receiver_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                "node", "Arachne/frontends/typescript/build_graph.mjs",
+                "Arachne/frontends/typescript/fixtures/semantics", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            entities = {
+                (node["kind"], node["label"]): node for node in snapshot.nodes
+                if node["kind"] in {"class", "interface", "function"}
+            }
+            runner = entities[("interface", "Runner")]
+            identity = entities[("function", "identity")]
+            string_runner = entities[("class", "StringRunner")]
+            self.assertEqual(
+                "T",
+                runner["properties"]["frontend_extensions"]["typescript"]
+                ["type_parameters"][0]["name"],
+            )
+            self.assertEqual(
+                "T",
+                identity["properties"]["frontend_extensions"]["typescript"]
+                ["type_parameters"][0]["name"],
+            )
+            self.assertEqual(
+                "implements",
+                string_runner["properties"]["frontend_extensions"]["typescript"]
+                ["heritage"][0]["relationship"],
+            )
+            calls = [node for node in snapshot.nodes if node["kind"] == "call"]
+            method_call = next(node for node in calls if node["label"].startswith("runner.run"))
+            self.assertEqual(
+                "Runner<string>", method_call["properties"]["receiver_type_facts"]["text"],
+            )
+            generic_call = next(node for node in calls if node["label"] == "identity(value)")
+            self.assertEqual(
+                "string",
+                generic_call["properties"]["frontend_extensions"]["typescript"]
+                ["return_type"],
+            )
+            predicate_call = next(node for node in calls if node["label"] == "isString(value)")
+            self.assertEqual(
+                "string",
+                predicate_call["properties"]["frontend_extensions"]["typescript"]
+                ["type_predicate"]["type"],
+            )
+            narrowed = next(
+                node for node in snapshot.nodes
+                if node["kind"] == "identifier" and node["label"] == "value"
+                and node["properties"].get("start_line") == 24
+            )
+            self.assertEqual(
+                "string | number", narrowed["properties"]["declared_type_facts"]["text"],
+            )
+            self.assertEqual("string", narrowed["properties"]["type_facts"]["text"])
+
     def test_c_header_declarations_and_calls(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
