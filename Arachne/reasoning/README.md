@@ -46,3 +46,23 @@ subsequent queries use the stable node ID.
 
 The current interface is intentionally in-process Python plus CLI. An HTTP or MCP
 surface can wrap the same query class later without changing graph semantics.
+
+## Lightweight investigation loop
+
+`InvestigationAgent` adds a bounded LLM loop without an agent framework. Each
+model turn chooses one validated reasoning query or a terminal outcome. Python
+rejects unknown IDs, repeated actions, and confirmed findings whose evidence was
+not observed in a previous slice.
+
+The live CLI uses the repository's `llmseam.py` and emits one JSON investigation:
+
+```sh
+python3 Arachne/cli/investigate.py graph.json --max-steps 8
+python3 Arachne/cli/investigate.py graph.json --focus-id NODE_ID
+```
+
+The default is eight model calls with a 2,500-token budget for each graph slice.
+Agent slices are capped at 3,000 tokens so state plus observation stays inside the
+`llmseam` context envelope; larger standalone reasoning queries remain available.
+Provider absence is reported as `LLM_UNAVAILABLE`; it does not fall back to an
+unstructured or fabricated investigation.

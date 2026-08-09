@@ -1,6 +1,7 @@
 """Executable checks for every registered compiler frontend."""
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -18,7 +19,8 @@ from Arachne.compatibility.projector import (
 )
 from Arachne.pipeline import run_project, semantic_snapshot_graph, snapshot_graph
 from Arachne.projections import build_layered_graph
-from Arachne.reasoning import ReasoningQuery
+from Arachne.reasoning import InvestigationAgent, ReasoningQuery
+from Arachne.reasoning.agent import ACTION_SCHEMA, AgentRequest
 from Arachne.core.snapshot import load_snapshot
 from Arachne.core.validation import validate_snapshot
 from Arachne.core.contract import ContractError, FrontendSnapshot
@@ -304,6 +306,86 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertTrue(small["continuations"])
         self.assertTrue(all(
             "via" in record for record in small["sections"]["history"]
+        ))
+
+    def test_lightweight_agent_uses_observed_evidence_and_rejects_repeats(self) -> None:
+        class Response:
+            def __init__(self, data):
+                self.data = data
+                self.status = "ok"
+                self.usage = {"input_tokens": 10, "output_tokens": 5}
+
+        class ScriptedLLM:
+            def __init__(self, decisions):
+                self.decisions = list(decisions)
+                self.requests = []
+
+            async def complete(self, request):
+                self.requests.append(request)
+                return Response(self.decisions.pop(0))
+
+        graph, _ = run_project(str(ROOT / "src"))
+        query = ReasoningQuery(graph)
+        function_id = query.find_entity(
+            "getDocument", kind="function",
+        )["matches"][0]["id"]
+        nodes_by_id = {node["id"]: node for node in graph["nodes"]}
+        reach_id = next(
+            node["id"] for node in graph["nodes"]
+            if node["kind"] == "taint-reach"
+            and "public parameter:req" in node["label"]
+            and any(
+                nodes_by_id[witness_id].get("properties", {}).get("owner_function_id")
+                == function_id
+                for witness_id in node["properties"]["witness_ids"]
+            )
+        )
+        repeated = {
+            "action": "handler_security", "node_id": function_id,
+            "rationale": "inspect the handler guard and paths",
+            "hypothesis": "document lookup may lack tenant authorization",
+        }
+        llm = ScriptedLLM([
+            repeated,
+            repeated,
+            {
+                "action": "security_path", "node_id": reach_id,
+                "rationale": "inspect the contextual request-to-repository path",
+            },
+            {
+                "action": "finish", "outcome": "CONFIRMED_FOR_PROOF",
+                "rationale": "the observed path and handler evidence support runtime proof",
+                "finding": {
+                    "title": "Document lookup lacks tenant binding",
+                    "claim": "Attacker-controlled document identity reaches repository lookup.",
+                    "affected_node_ids": [function_id],
+                    "evidence_ids": [function_id, reach_id],
+                    "attack_preconditions": ["Reach the webhook handler"],
+                    "potential_impact": ["Cross-tenant document access"],
+                    "contradicting_evidence": [],
+                    "unresolved_boundaries": [],
+                    "confidence": "high",
+                    "next_action": "Run a cross-tenant request proof",
+                },
+            },
+        ])
+        result = asyncio.run(
+            InvestigationAgent(query, llm, max_steps=4).run(function_id),
+        )
+        self.assertEqual("CONFIRMED_FOR_PROOF", result["status"])
+        self.assertEqual(2, len(result["steps"]))
+        self.assertIn("repeated action rejected", result["errors"][0]["error"])
+        self.assertEqual({function_id, reach_id}, {
+            record["id"] for record in result["evidence"]
+        })
+        json.loads(json.dumps(result))
+        self.assertTrue(all(
+            isinstance(request, AgentRequest) and request.schema == ACTION_SCHEMA
+            for request in llm.requests
+        ))
+        self.assertTrue(all(
+            len(json.dumps(request.context, default=str)) < 24_000
+            for request in llm.requests
         ))
 
     def test_typescript_contextual_tokens_and_library_provenance(self) -> None:
