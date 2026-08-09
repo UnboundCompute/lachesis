@@ -347,6 +347,26 @@ def analyze_typescript_with_compiler(
     return infos, merged, snapshot
 
 
+def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
+    """Apply available language-neutral overlays to one frontend snapshot.
+
+    Frontends remain independently pluggable. A language can enter the shared
+    graph immediately with compiler facts, then opt into compatibility-backed
+    overlays as its adapter reaches the required contract capabilities.
+    """
+    graph = snapshot_graph(snapshot)
+    if not ({"typescript", "javascript"} & set(snapshot.languages)):
+        return graph
+    infos = snapshot_file_infos(snapshot)
+    from .file_reader import FILE_MAP, run_semantic_overlays
+    from .graph import build_graph
+    FILE_MAP.clear()
+    for info in infos:
+        FILE_MAP[info["path_hash"]] = info
+    run_semantic_overlays(infos)
+    return merge_overlay_graph(graph, build_graph(infos))
+
+
 def source_inventory(source_dir: str) -> List[str]:
     ignored = {".git", "node_modules", "graph_out", "dist", "build"}
     result = []
@@ -382,7 +402,7 @@ def run_project_frontends(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    return combine_graphs(snapshot_graph(item) for item in snapshots), snapshots
+    return combine_graphs(semantic_snapshot_graph(item) for item in snapshots), snapshots
 
 
 def write_project_graph(
