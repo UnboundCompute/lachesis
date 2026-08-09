@@ -29,7 +29,7 @@ CONFIDENCE_LEVELS = frozenset({
 # architecture document.
 PROJECT_STRUCTURE_NODE_KINDS = frozenset({
     "project", "package", "module", "file", "import", "export",
-    "external-module", "route", "event", "registration",
+    "external-module", "route", "event", "registration", "import-cycle",
 })
 DECLARATION_NODE_KINDS = frozenset({
     "scope", "symbol", "declaration", "function", "method", "constructor",
@@ -48,7 +48,7 @@ VALUE_NODE_KINDS = frozenset({
 CONTROL_RUNTIME_NODE_KINDS = frozenset({
     "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit", "phi",
     "async-event", "dynamic-behavior", "function-effect", "module-initializer",
-    "static-initializer",
+    "static-initializer", "singleton", "module-state",
 })
 SECURITY_EVIDENCE_NODE_KINDS = frozenset({
     "source", "sink", "boundary", "guard", "taint-reach", "diagnostic",
@@ -92,6 +92,7 @@ FRONTEND_FORBIDDEN_NODE_KINDS = frozenset({
     "heap-object", "heap-location", "function-effect", "async-event",
     "source", "sink", "boundary", "guard", "taint-reach",
     "call-context", "context-parameter", "context-return",
+    "singleton", "module-state", "import-cycle",
 })
 
 STRUCTURE_EDGE_KINDS = frozenset({
@@ -103,6 +104,8 @@ STRUCTURE_EDGE_KINDS = frozenset({
     "HAS_DIAGNOSTIC", "HAS_PROPERTY_PATH", "DECORATES", "DECORATOR_ARGUMENT",
     "INITIALIZES_WITH", "CONTAINS_BODY", "HAS_SCOPE",
     "HAS_TYPE_PARAMETER", "OVERLOAD_OF", "STRUCTURALLY_COMPATIBLE_WITH",
+    "HAS_SINGLETON", "SINGLETON_OF", "HAS_MODULE_STATE", "STATE_OF",
+    "PARTICIPATES_IN_IMPORT_CYCLE",
 })
 CALL_EDGE_KINDS = frozenset({
     "INVOKES", "MAY_INVOKE", "CALLS", "HAS_ARGUMENT",

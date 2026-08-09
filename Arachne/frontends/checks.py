@@ -460,6 +460,46 @@ class CompilerFrontendTests(unittest.TestCase):
                 for edge in snapshot.edges
             ))
 
+    def test_canonical_module_initialization_overlay(self) -> None:
+        semantics, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
+        )
+        core_singletons = [
+            node for node in semantics["nodes"]
+            if node["kind"] == "singleton"
+            and node["id"].startswith("v2:core:module-initialization:")
+        ]
+        self.assertEqual(
+            {"callbacks", "proxied", "singleton"},
+            {node["label"] for node in core_singletons},
+        )
+        core_state = [
+            node for node in semantics["nodes"]
+            if node["kind"] == "module-state"
+            and node["id"].startswith("v2:core:module-initialization:")
+        ]
+        self.assertIn("mutableState", {node["label"] for node in core_state})
+        self.assertTrue(all(
+            node["properties"]["fact_origin"] == "core-inference"
+            and node["properties"]["evidence_ids"]
+            for node in [*core_singletons, *core_state]
+        ))
+
+        cycle_graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "module_cycle")
+        )
+        cycle = next(
+            node for node in cycle_graph["nodes"]
+            if node["kind"] == "import-cycle"
+            and node["id"].startswith("v2:core:module-initialization:")
+        )
+        self.assertEqual(2, cycle["properties"]["size"])
+        self.assertEqual(2, sum(
+            edge["kind"] == "PARTICIPATES_IN_IMPORT_CYCLE"
+            and edge["target"] == cycle["id"]
+            for edge in cycle_graph["edges"]
+        ))
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             graph, snapshots = run_project_frontends(str(ROOT), output)

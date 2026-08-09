@@ -11,10 +11,11 @@ registered and applied sequentially to canonical graphs, returning additive
 not mutate or relabel a compiler fact: alternate dispatch, contextual bindings,
 heap locations and other conclusions are represented as separate nodes/edges.
 
-The default direct pipeline currently instantiates call-site contexts and
-compiler-emitted parameter/property effects. Remaining legacy passes are being
-migrated into this registry before the `FileInfo` compatibility projection is
-removed from primary graph construction.
+The default direct pipeline currently instantiates call-site contexts,
+compiler-emitted parameter/property effects, module singleton/mutable state and
+import cycles. Remaining legacy passes are being migrated into this registry
+before the `FileInfo` compatibility projection is removed from primary graph
+construction.
 
 ## Ownership
 
