@@ -27,7 +27,9 @@ function-valued properties, aliases, bound functions, and contextual callbacks
 without interpreting language syntax in core. Declarative runtime models add library behavior without parsing source;
 the async/event overlay turns those facts and compiler `await` operations into
 callback registration, scheduling, continuation, event, queue, stream, and
-worker edges. Remaining legacy passes are being migrated before the `FileInfo`
+worker edges. Compiler-identified dynamic constructs retain their exact sites
+and inputs; the core also materializes boundaries for them and for calls that
+remain unresolved after dispatch expansion. Remaining legacy passes are being migrated before the `FileInfo`
 compatibility projection itself can be deleted. `run_project_frontends` and the
 CLI already use this direct path; `FileInfo` no longer participates in primary
 graph construction.

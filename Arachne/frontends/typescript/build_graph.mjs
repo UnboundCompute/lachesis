@@ -2093,11 +2093,53 @@ function addDynamicBehavior(node, behaviorKind, properties = {}) {
     behavior_kind: behaviorKind,
     expression: compact(node.getText(node.getSourceFile()), 300),
     owner_function_id: ownerFunction(node),
+    site_id: bodyForNode(node),
+    callsite_id: ts.isCallExpression(node) || ts.isNewExpression(node)
+      ? bodyForNode(node) : null,
     ...properties,
   });
   addEdge("DYNAMIC_BEHAVIOR_AT", id, bodyForNode(node));
   addEdge("EVIDENCED_BY", id, proofForNode(node));
   return id;
+}
+
+function isExternalRuntimeIdentifier(node, expectedName) {
+  if (!ts.isIdentifier(node) || node.text !== expectedName) return false;
+  try {
+    const symbol = checker.getSymbolAtLocation(node);
+    const declarations = symbol?.declarations || [];
+    if (!declarations.length) return true;
+    return declarations.every((declaration) => {
+      if (!rootSet.has(normalize(declaration.getSourceFile().fileName))) return true;
+      let current = declaration;
+      while (current && !ts.isSourceFile(current)) {
+        if ((ts.getCombinedModifierFlags(current) & ts.ModifierFlags.Ambient) ||
+            (current.flags & ts.NodeFlags.Ambient)) return true;
+        current = current.parent;
+      }
+      return false;
+    });
+  } catch {
+    return false;
+  }
+}
+
+function staticAccessSegments(node) {
+  const segments = [];
+  let current = node;
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    if (ts.isPropertyAccessExpression(current)) {
+      segments.unshift(current.name.text);
+    } else {
+      const key = literalValue(current.argumentExpression);
+      if (!key.literal) return null;
+      segments.unshift(String(key.value));
+    }
+    current = current.expression;
+  }
+  if (!ts.isIdentifier(current)) return null;
+  segments.unshift(current.text);
+  return { base: current, segments };
 }
 
 function recordDirectDynamicBehavior(node) {
@@ -2108,18 +2150,18 @@ function recordDirectDynamicBehavior(node) {
         literal_specifier: literalValue(argument).literal,
         specifier: literalValue(argument).value,
       });
-    } else if (ts.isIdentifier(node.expression) && node.expression.text === "eval") {
+    } else if (isExternalRuntimeIdentifier(node.expression, "eval")) {
       addDynamicBehavior(node, "eval", { static_resolution: "none" });
-    } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
+    } else if (isExternalRuntimeIdentifier(node.expression, "require")) {
       const argument = node.arguments[0];
       if (!literalValue(argument).literal) {
         addDynamicBehavior(node, "runtime-module-load", { static_resolution: "dynamic" });
       }
     } else if (ts.isPropertyAccessExpression(node.expression)) {
-      const receiver = node.expression.expression.getText(node.getSourceFile());
-      if (receiver === "Reflect") {
+      const receiver = node.expression.expression;
+      if (isExternalRuntimeIdentifier(receiver, "Reflect")) {
         addDynamicBehavior(node, "reflection", { operation: node.expression.name.text });
-      } else if (receiver === "Object" &&
+      } else if (isExternalRuntimeIdentifier(receiver, "Object") &&
           ["defineProperty", "defineProperties", "setPrototypeOf"].includes(node.expression.name.text)) {
         addDynamicBehavior(node, "runtime-object-mutation", {
           operation: node.expression.name.text,
@@ -2127,9 +2169,12 @@ function recordDirectDynamicBehavior(node) {
       }
     }
   } else if (ts.isNewExpression(node)) {
-    const name = node.expression.getText(node.getSourceFile());
-    if (name === "Function") addDynamicBehavior(node, "new-function", { static_resolution: "none" });
-    if (name === "Proxy") addDynamicBehavior(node, "proxy", { static_resolution: "runtime" });
+    if (isExternalRuntimeIdentifier(node.expression, "Function")) {
+      addDynamicBehavior(node, "new-function", { static_resolution: "none" });
+    }
+    if (isExternalRuntimeIdentifier(node.expression, "Proxy")) {
+      addDynamicBehavior(node, "proxy", { static_resolution: "runtime" });
+    }
   } else if (ts.isElementAccessExpression(node) &&
       !literalValue(node.argumentExpression).literal) {
     const parent = node.parent;
@@ -2139,13 +2184,27 @@ function recordDirectDynamicBehavior(node) {
        parent.operand === node);
     addDynamicBehavior(node, write ? "computed-property-write" : "computed-property-read", {
       key_expression: node.argumentExpression?.getText(node.getSourceFile()) || null,
+      key_value_id: node.argumentExpression ? pathForNode(node.argumentExpression) : null,
+      target_id: propertyPathForNode(node),
     });
   } else if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
-    const left = node.left.getText(node.getSourceFile());
-    if (left.includes(".prototype") || left === "module.exports" || left.startsWith("exports.")) {
-      addDynamicBehavior(node, "monkey-patch", { target: left });
+    const access = staticAccessSegments(node.left);
+    const commonJsExport = access && (
+      (access.segments[0] === "module" && access.segments[1] === "exports" &&
+        isExternalRuntimeIdentifier(access.base, "module")) ||
+      (access.segments[0] === "exports" &&
+        isExternalRuntimeIdentifier(access.base, "exports"))
+    );
+    const monkeyPatch = access && (
+      access.segments.includes("prototype") || commonJsExport
+    );
+    if (monkeyPatch) {
+      addDynamicBehavior(node, "monkey-patch", {
+        target: access.segments.join("."),
+        target_id: propertyPathForNode(node.left),
+      });
     }
   }
 }

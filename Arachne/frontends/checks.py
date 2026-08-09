@@ -749,6 +749,43 @@ class CompilerFrontendTests(unittest.TestCase):
         }
         self.assertTrue(implementations.issubset(reached))
 
+    def test_compiler_dynamic_facts_and_core_boundaries(self) -> None:
+        graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "dynamic")
+        )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        compiler_behaviors = [
+            node for node in nodes.values()
+            if node["kind"] == "dynamic-behavior"
+            and node["id"].startswith("v2:frontend:typescript-compiler-api:")
+        ]
+        kinds = {node["properties"].get("behavior_kind") for node in compiler_behaviors}
+        self.assertTrue({
+            "eval", "new-function", "runtime-module-load", "reflection", "proxy",
+            "computed-property-write", "monkey-patch", "dynamic-import",
+        }.issubset(kinds))
+        self.assertEqual(1, sum(
+            node["properties"].get("behavior_kind") == "eval"
+            for node in compiler_behaviors
+        ), "the locally shadowed eval must not be tagged as the global builtin")
+        boundaries = [
+            node for node in nodes.values()
+            if node["kind"] == "boundary"
+            and node["properties"].get("boundary_kind") == "dynamic-runtime"
+        ]
+        represented = {node["properties"].get("behavior_id") for node in boundaries}
+        self.assertTrue({node["id"] for node in compiler_behaviors}.issubset(represented))
+        computed = next(
+            node for node in compiler_behaviors
+            if node["properties"].get("behavior_kind") == "computed-property-write"
+        )
+        self.assertTrue(computed["properties"].get("key_value_id"))
+        self.assertTrue(computed["properties"].get("target_id"))
+        self.assertTrue(any(
+            edge["kind"] == "DYNAMIC_INPUT" and edge["target"] == computed["id"]
+            for edge in graph["edges"]
+        ))
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             with patch(

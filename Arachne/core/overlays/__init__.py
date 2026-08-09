@@ -5,6 +5,7 @@ from .effects import ParameterPropertyEffects, apply_parameter_property_effects
 from .branch_history import BranchHistory
 from .control_flow import ControlFlow
 from .dispatch import DynamicDispatch
+from .dynamic_behavior import DynamicBehavior
 from .interprocedural import InterproceduralContexts
 from .heap import HeapIdentity
 from .module_initialization import ModuleInitialization
@@ -17,6 +18,7 @@ def default_overlay_registry() -> OverlayRegistry:
     registry.register(ControlFlow())
     registry.register(BranchHistory())
     registry.register(DynamicDispatch())
+    registry.register(DynamicBehavior())
     registry.register(InterproceduralContexts())
     registry.register(HeapIdentity())
     registry.register(ModuleInitialization())
@@ -42,6 +44,7 @@ __all__ = [
     "BranchHistory",
     "ControlFlow",
     "DynamicDispatch",
+    "DynamicBehavior",
     "InterproceduralContexts",
     "HeapIdentity",
     "ModuleInitialization",
