@@ -122,9 +122,15 @@ CANONICAL_CAPABILITY_SIGNALS = {
         {"phi"},
         {"PHI_INPUT", "PHI_FOR_SYMBOL", "BRANCH_PREVIOUS", "BRANCH_READS_FROM"},
     ),
+    # Only claim a taint policy once taint actually REACHED a sink. TAINT_SOURCE /
+    # TAINT_FLOWS_TO / source / sink are minted the moment any source or sensitive
+    # call exists — they are present on graphs with 0 witnesses, so keying on them
+    # made the manifest self-disagree (frontend "none" vs composed "partial") while
+    # `security-path` had nothing to answer. Require the materialized reach so
+    # "partial" is consistent with a witness existing.
     "taint_policy": (
-        {"source", "sink", "taint-reach"},
-        {"TAINT_SOURCE", "TAINT_SINK", "TAINT_FLOWS_TO", "TAINT_REACHES"},
+        {"taint-reach"},
+        {"TAINT_REACHES"},
     ),
     "runtime_models": (
         {"runtime-model-application"},
@@ -605,6 +611,10 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
             "id": project_id, "languages": languages, "frontends": frontends,
             "capabilities": effective_capabilities,
             "frontend_capabilities": frontend_capabilities,
+            "capability_semantics": {
+                "capabilities": "effective after canonical overlays composed",
+                "frontend_capabilities": "declared by the parser frontend(s)",
+            },
             "canonical": {"node_count": len(index.nodes), "edge_count": len(graph.get("edges", []))},
         },
         "node_index": {"file": "node_index.json", "count": len(node_index)},

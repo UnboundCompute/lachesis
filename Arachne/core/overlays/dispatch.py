@@ -14,6 +14,17 @@ IDENTITY_REASONS = frozenset({
 })
 
 
+def _last_name(value: str) -> str:
+    normalized = value.split("?.")[-1]
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    if "[" in normalized:
+        normalized = normalized.rsplit("[", 1)[-1]
+    if "(" in normalized:
+        normalized = normalized.split("(", 1)[0]
+    return normalized.strip("'\"`] ")
+
+
 def _fact(evidence_ids: list[str], confidence: str = "high") -> dict:
     return {
         "fact_origin": "core-inference", "confidence": confidence,
@@ -179,6 +190,52 @@ class DynamicDispatch:
                     "MAY_INVOKE", call_id, target_id,
                     [call_id, receiver_id, target_id],
                     reason="callable-receiver",
+                )
+
+        # Name-fallback resolution. A call the compiler and the passes above left
+        # entirely unresolved (no INVOKES/MAY_INVOKE, no primary target) otherwise
+        # projects `call_targets: None` — the projection is faithful, the graph is
+        # just missing the edge for the common cross-module / dynamically-referenced
+        # case. If exactly one project callable shares the callee's last name we
+        # emit a low-confidence MAY_INVOKE; several matches are emitted as
+        # low-confidence polymorphic candidates. Never overrides a real resolution.
+        callables_by_name: dict[str, list[str]] = defaultdict(list)
+        for callable_node in index.nodes_of_kind(*callable_kinds):
+            properties = callable_node.get("properties", {})
+            name = properties.get("name") or _last_name(
+                str(callable_node.get("label", ""))
+            )
+            if name:
+                callables_by_name[name].append(callable_node["id"])
+
+        resolved_call_ids = {source for _kind, source, _target in emitted}
+        for call in index.nodes_of_kind("call", "construct"):
+            call_id = call["id"]
+            properties = call.get("properties", {})
+            if properties.get("primary_target_id"):
+                continue
+            if any(
+                edge.get("kind") in {"INVOKES", "MAY_INVOKE"}
+                for edge in index.outgoing.get(call_id, [])
+            ):
+                continue
+            if call_id in resolved_call_ids:
+                continue
+            name = properties.get("method_name") or _last_name(
+                str(properties.get("callee") or call.get("label", ""))
+            )
+            candidates = sorted(
+                target for target in callables_by_name.get(name, [])
+                if target != call_id
+            )
+            if not candidates:
+                continue
+            reason = "name-fallback" if len(candidates) == 1 \
+                else "name-fallback-polymorphic"
+            for target_id in candidates:
+                add_edge(
+                    "MAY_INVOKE", call_id, target_id,
+                    [call_id, target_id], confidence="low", reason=reason,
                 )
 
         return GraphDelta(self.overlay_id, [], edges)
