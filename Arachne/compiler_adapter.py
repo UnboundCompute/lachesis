@@ -347,7 +347,7 @@ def analyze_typescript_with_compiler(
     output = os.path.join(output_root, frontend.frontend_id) if output_root else None
     snapshot = run_frontend(frontend, source_dir, output)
     infos = snapshot_file_infos(snapshot)
-    from .file_reader import FILE_MAP, run_semantic_overlays
+    from .compatibility.legacy_file_api import FILE_MAP, run_semantic_overlays
     from .core.graph import build_graph
     FILE_MAP.clear()
     for info in infos:
@@ -369,7 +369,7 @@ def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
     if not ({"typescript", "javascript"} & set(snapshot.languages)):
         return graph
     infos = snapshot_file_infos(snapshot)
-    from .file_reader import FILE_MAP, run_semantic_overlays
+    from .compatibility.legacy_file_api import FILE_MAP, run_semantic_overlays
     from .core.graph import build_graph
     FILE_MAP.clear()
     for info in infos:
