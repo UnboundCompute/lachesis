@@ -275,12 +275,17 @@ def _ownership(
 
 def _location(node: dict) -> Optional[dict]:
     properties = node.get("properties", {})
-    path = properties.get("absolute_file") or properties.get("file")
+    # Prefer the repo-relative `file` so a locator never leaks a temp build/staging
+    # absolute path as its primary location; keep the absolute as a side field.
+    relative = properties.get("file")
+    absolute = properties.get("absolute_file")
+    path = relative or absolute
     if not path:
         return None
     return {
         key: value for key, value in {
-            "file": path, "start_line": properties.get("start_line"),
+            "file": path, "absolute_file": absolute if absolute != path else None,
+            "start_line": properties.get("start_line"),
             "start_column": properties.get("start_column"),
             "end_line": properties.get("end_line"),
             "end_column": properties.get("end_column"),

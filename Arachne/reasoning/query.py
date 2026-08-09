@@ -27,12 +27,20 @@ VALUE_HISTORY_EDGES = frozenset({
 
 def _location(node: dict) -> Optional[dict]:
     properties = node.get("properties", {})
-    path = properties.get("absolute_file") or properties.get("file")
+    # Surface the repo-relative `file` as the portable location. `absolute_file`
+    # can point into a temporary build/staging copy (e.g. an MCP stage dir), which
+    # is non-portable — keep it as a separate field so a slice never leaks a temp
+    # path as its primary location while still preserving the absolute for callers
+    # that legitimately need it.
+    relative = properties.get("file")
+    absolute = properties.get("absolute_file")
+    path = relative or absolute
     if not path:
         return None
     return {
         key: value for key, value in {
-            "file": path, "start_line": properties.get("start_line"),
+            "file": path, "absolute_file": absolute if absolute != path else None,
+            "start_line": properties.get("start_line"),
             "start_column": properties.get("start_column"),
             "end_line": properties.get("end_line"),
             "end_column": properties.get("end_column"),
