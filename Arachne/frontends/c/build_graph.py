@@ -158,16 +158,98 @@ def classify_provenance(
     return "dependency", True, False
 
 
-def clang_command(source_dir: Path, path: Path, *arguments: str) -> List[str]:
+_PATH_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter", "-include", "-F")
+
+
+def _resolve_flag_path(value: str, directory: Path) -> str:
+    # compile_commands paths are recorded relative to the entry's directory.
+    return value if os.path.isabs(value) else str((directory / value).resolve())
+
+
+def extract_compile_flags(arguments: List[str], directory: Path) -> List[str]:
+    """Keep the parse-relevant flags (include paths / defines / std) from a
+    compile_commands entry, resolving path-bearing flags against its directory and
+    dropping the compiler, the input file, and output/dependency bookkeeping."""
+    flags: List[str] = []
+    index = 1  # skip argv[0] (the compiler)
+    total = len(arguments)
+    while index < total:
+        argument = arguments[index]
+        handled = False
+        for prefix in _PATH_FLAGS:
+            if argument == prefix and index + 1 < total:
+                flags += [prefix, _resolve_flag_path(arguments[index + 1], directory)]
+                index += 2
+                handled = True
+                break
+            if argument.startswith(prefix) and len(argument) > len(prefix):
+                flags.append(prefix + _resolve_flag_path(argument[len(prefix):], directory))
+                index += 1
+                handled = True
+                break
+        if handled:
+            continue
+        if argument in {"-D", "-U"} and index + 1 < total:
+            flags += [argument, arguments[index + 1]]
+            index += 2
+            continue
+        if argument.startswith(("-D", "-U", "-std=")) or argument in {"-ansi", "-nostdinc"}:
+            flags.append(argument)
+        index += 1
+    return flags
+
+
+def load_compile_commands(source_dir: Path) -> Dict[Path, List[str]]:
+    """Map absolute source path -> per-file clang flags from compile_commands.json.
+
+    Real multi-directory C projects need each file's own include paths / defines /
+    std to parse; a single global -I mis-parses them. Looked up at
+    ARACHNE_COMPILE_COMMANDS or <source_dir>/compile_commands.json; absent, callers
+    fall back to the global flag model.
+    """
+    location = os.environ.get("ARACHNE_COMPILE_COMMANDS")
+    candidates = [Path(location)] if location else [source_dir / "compile_commands.json"]
+    db_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if not db_path:
+        return {}
+    try:
+        entries = json.loads(db_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    flags_by_file: Dict[Path, List[str]] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        file_field = entry.get("file")
+        if not file_field:
+            continue
+        directory = Path(entry.get("directory", "."))
+        file_path = (Path(file_field) if os.path.isabs(file_field) else directory / file_field).resolve()
+        arguments = entry.get("arguments")
+        if arguments is None and entry.get("command"):
+            arguments = shlex.split(entry["command"])
+        if arguments:
+            flags_by_file[file_path] = extract_compile_flags(list(arguments), directory)
+    return flags_by_file
+
+
+def clang_command(
+    source_dir: Path, path: Path, *arguments: str,
+    file_flags: Optional[List[str]] = None,
+) -> List[str]:
     configured = shlex.split(os.environ.get("CLANG", "clang"))
     language = ["-x", "c-header"] if path.suffix.lower() == ".h" else []
-    extra = shlex.split(os.environ.get("ARACHNE_CFLAGS", ""))
-    return configured + ["-I", str(source_dir)] + extra + language + list(arguments) + [str(path)]
+    if file_flags is not None:
+        base = list(file_flags)
+    else:
+        base = ["-I", str(source_dir)] + shlex.split(os.environ.get("ARACHNE_CFLAGS", ""))
+    return configured + base + language + list(arguments) + [str(path)]
 
 
-def run_clang(source_dir: Path, path: Path, *arguments: str) -> subprocess.CompletedProcess:
+def run_clang(
+    source_dir: Path, path: Path, *arguments: str,
+    file_flags: Optional[List[str]] = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
-        clang_command(source_dir, path, *arguments),
+        clang_command(source_dir, path, *arguments, file_flags=file_flags),
         text=True, capture_output=True, check=False,
     )
 
@@ -340,6 +422,9 @@ def main() -> int:
     # include dirs, not by file extension (parity with TS sourceProvenance).
     root_set = set(files)
     system_dirs = system_include_dirs()
+    # Per-file compiler flags (include paths / defines / std) so multi-directory
+    # projects parse with their real build configuration; empty ⇒ global fallback.
+    compile_commands = load_compile_commands(source_dir)
 
     graph = Graph()
     texts: Dict[Path, str] = {}
@@ -365,7 +450,7 @@ def main() -> int:
 
     # Compiler dependency extraction makes framework/header ownership explicit.
     for path in translation_units:
-        dependency = run_clang(source_dir, path, "-MM")
+        dependency = run_clang(source_dir, path, "-MM", file_flags=compile_commands.get(path))
         flattened = dependency.stdout.replace("\\\n", " ")
         dependencies = flattened.split(":", 1)[1].split() if ":" in flattened else []
         for raw in dependencies:
@@ -390,7 +475,7 @@ def main() -> int:
     # offsets; Clang otherwise reports included declarations using header-local
     # offsets but only the including-file provenance.
     for path in files:
-        result = run_clang(source_dir, path, "-Xclang", "-ast-dump=json", "-fsyntax-only", "-Wno-everything")
+        result = run_clang(source_dir, path, "-Xclang", "-ast-dump=json", "-fsyntax-only", "-Wno-everything", file_flags=compile_commands.get(path))
         if result.returncode != 0 or not result.stdout.strip():
             diagnostics.extend((path, line) for line in result.stderr.splitlines() if line.strip())
             continue
@@ -768,7 +853,7 @@ def main() -> int:
     # stream represents compiled tokens, while comments and inactive #if arms
     # require a separate raw-source trivia pass.
     for path in files:
-        result = run_clang(source_dir, path, "-Xclang", "-dump-tokens", "-fsyntax-only", "-Wno-everything")
+        result = run_clang(source_dir, path, "-Xclang", "-dump-tokens", "-fsyntax-only", "-Wno-everything", file_flags=compile_commands.get(path))
         previous = None
         for line in result.stderr.splitlines():
             parsed = parse_clang_token(line)

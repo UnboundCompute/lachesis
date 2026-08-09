@@ -791,6 +791,44 @@ class CompilerFrontendTests(unittest.TestCase):
                 for edge in snapshot.edges
             ))
 
+    def test_c_compile_commands_supply_per_file_flags(self) -> None:
+        # A two-directory project whose header lives outside the source dir fails to
+        # parse under a single global -I, but parses cleanly once compile_commands.json
+        # supplies the include dir; a per-file -D also changes the parsed AST.
+        with tempfile.TemporaryDirectory() as project:
+            root = Path(project)
+            (root / "src").mkdir()
+            (root / "include").mkdir()
+            (root / "include" / "helper.h").write_text("int helper_value(void);\n", encoding="utf-8")
+            (root / "src" / "main.c").write_text(
+                '#include "helper.h"\n'
+                "#ifdef FEATURE\n"
+                "int feature_enabled(void) { return helper_value(); }\n"
+                "#endif\n"
+                "int main(void) { return helper_value(); }\n",
+                encoding="utf-8",
+            )
+            (root / "compile_commands.json").write_text(
+                json.dumps([{
+                    "directory": str(root), "file": "src/main.c",
+                    "arguments": ["clang", "-c", "src/main.c", "-Iinclude", "-DFEATURE=1", "-o", "main.o"],
+                }]),
+                encoding="utf-8",
+            )
+            with tempfile.TemporaryDirectory() as output:
+                self.run_command(
+                    sys.executable, "Arachne/frontends/c/build_graph.py",
+                    str(root), output,
+                )
+                snapshot = load_snapshot(output)
+                validate_snapshot(snapshot)
+                functions = {
+                    node["label"] for node in snapshot.nodes if node["kind"] == "function"
+                }
+                # -Iinclude resolved the header; -DFEATURE enabled the guarded function.
+                self.assertIn("helper_value", functions)
+                self.assertIn("feature_enabled", functions)
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
