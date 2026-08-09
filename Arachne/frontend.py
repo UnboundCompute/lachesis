@@ -48,6 +48,10 @@ FRONTEND_OWNED_CAPABILITIES = {
     "symbols": (
         "scopes", "declarations", "references", "shadowing", "aliases",
     ),
+    "scopes": (
+        "module scopes", "function scopes", "block/control scopes",
+        "lexical parents", "declaration ownership",
+    ),
     "types": (
         "declared types", "inferred types", "signatures", "overloads",
         "generic substitutions", "narrowing facts",

@@ -45,11 +45,27 @@ def build_control_flow(info: dict) -> None:
         return min(candidates, key=lambda scope: scope["start_offset"], default=None)
 
     def direct_statements(scope_id: str, function_id: str) -> List[dict]:
+        # Headerless lexical blocks (for example `case 'x': { ... }`)
+        # introduce scope but no executable statement of their own. Flatten
+        # those blocks into the surrounding execution sequence while keeping
+        # control scopes opaque until their header is evaluated.
+        visible_scopes = {scope_id}
+        changed = True
+        while changed:
+            changed = False
+            for candidate in scopes.values():
+                if (
+                    candidate["kind"] == "block"
+                    and candidate.get("parent_scope_id") in visible_scopes
+                    and candidate["id"] not in visible_scopes
+                ):
+                    visible_scopes.add(candidate["id"])
+                    changed = True
         return sorted(
             (
                 statement for statement in statements.values()
                 if statement["function_id"] == function_id
-                and statement["scope_id"] == scope_id
+                and statement["scope_id"] in visible_scopes
                 and not statement.get("parent_statement_id")
             ),
             key=lambda statement: (statement["start_offset"], -statement["end_offset"]),
@@ -226,7 +242,9 @@ def build_control_flow(info: dict) -> None:
                     inline_else = None
                     else_test = control_expression(else_statement)
                     else_entry, else_exits, _else_scope = body_for(
-                        else_statement, {"else"}, break_target, continue_target,
+                        else_statement,
+                        {"else", "if"} if else_test else {"else"},
+                        break_target, continue_target,
                         exception_target, finally_target,
                     )
                     if else_test:

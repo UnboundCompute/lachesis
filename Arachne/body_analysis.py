@@ -4,7 +4,7 @@ import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .source_analysis import mask_non_code, matching_delimiter, non_code_spans
-from .scope_analysis import innermost_scope_at
+from .scope_utils import innermost_scope_at
 from .variable_analysis import split_arguments
 
 

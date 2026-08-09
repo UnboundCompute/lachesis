@@ -187,6 +187,8 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "exported": bool(properties.get("exported")),
                 "async": bool(properties.get("async")),
                 "signature": properties.get("signature"),
+                "scope_id": properties.get("scope_id"),
+                "captures": list(properties.get("capture_symbol_ids", [])),
             })
         elif node["kind"] in {"class", "interface", "type", "enum"}:
             info["types"].append({
@@ -196,6 +198,32 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "exported": bool(properties.get("exported")),
                 "extends": properties.get("extends", []),
                 "implements": properties.get("implements", []),
+            })
+        elif node["kind"] == "scope":
+            info["scopes"].append({
+                "id": node["id"],
+                "kind": properties.get("scope_kind", node["label"]),
+                "start_line": properties["start_line"],
+                "end_line": properties["end_line"],
+                "parent_scope_id": properties.get("parent_scope_id"),
+                "owner_function_id": properties.get("owner_function_id"),
+                "start_offset": properties["start_offset"],
+                "end_offset": properties["end_offset"],
+            })
+        elif node["kind"] == "symbol" and properties.get("symbol_kind") != "property":
+            info["symbols"].append({
+                "id": node["id"], "name": properties["symbol_name"],
+                "kind": properties["symbol_kind"],
+                "line": properties["start_line"],
+                "scope_id": properties["scope_id"],
+                "declaration_id": properties.get("declaration_id"),
+                "start_offset": properties["start_offset"],
+                "duplicate_of": properties.get("duplicate_of"),
+                "shadows": properties.get("shadows"),
+                "owner_function_id": properties.get("owner_function_id"),
+                "declared_type": properties.get("declared_type"),
+                **({"position": properties["parameter_position"]}
+                   if properties.get("parameter_position") is not None else {}),
             })
         elif node["kind"] in {"call", "construct"}:
             start = properties["start_offset"]
@@ -219,6 +247,7 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "arguments_start_offset": open_paren if open_paren >= 0 else None,
                 "arguments_end_offset": close_paren if close_paren >= 0 else None,
                 "caller_function_id": properties.get("owner_function_id"),
+                "scope_id": properties.get("scope_id"),
                 "resolution": resolution,
                 "declaration_symbol_id": target["id"] if target else None,
                 "declaration_file": target_file,
@@ -286,15 +315,12 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
 
     from .body_analysis import analyze_body_structure
     from .operation_analysis import analyze_operations
-    from .scope_analysis import analyze_scopes
     from .variable_analysis import analyze_variable_flow
     for info in infos.values():
         info["functions"].sort(key=lambda item: (item["start_offset"], item["end_offset"]))
         info["function_calls"].sort(key=lambda item: (item["start_offset"], item["end_offset"]))
-        info["scopes"], info["symbols"] = analyze_scopes(
-            info["text"], info["path_hash"], info["functions"],
-            info["function_calls"], info["imports"], info["types"],
-        )
+        info["scopes"].sort(key=lambda item: (item["start_offset"], -item["end_offset"]))
+        info["symbols"].sort(key=lambda item: (item["start_offset"], item["name"]))
         analyze_variable_flow(info)
         # Statements/expressions are still produced by the compatibility body
         # adapter until operation/control overlays consume canonical AST kinds.

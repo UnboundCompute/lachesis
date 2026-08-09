@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .source_analysis import mask_non_code
-from .scope_analysis import VARIABLE_RE, binding_names, innermost_scope_at
+from .scope_utils import VARIABLE_RE, binding_names, innermost_scope_at
 
 ASSIGNMENT_RE = re.compile(
     r"(?P<left>[A-Za-z_$][\w$]*(?:"
