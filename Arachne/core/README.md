@@ -5,6 +5,17 @@ node/edge kinds, capability vocabulary, provenance rules, validation and graph
 composition. It must not import a language frontend, an ecosystem model or the
 legacy compatibility API.
 
+Language-neutral semantic analyses live under `Arachne.core.overlays`. They are
+registered and applied sequentially to canonical graphs, returning additive
+`GraphDelta` facts with core-owned v2 identities and evidence. An overlay must
+not mutate or relabel a compiler fact: alternate dispatch, contextual bindings,
+heap locations and other conclusions are represented as separate nodes/edges.
+
+The default direct pipeline currently instantiates call-site contexts and
+compiler-emitted parameter/property effects. Remaining legacy passes are being
+migrated into this registry before the `FileInfo` compatibility projection is
+removed from primary graph construction.
+
 ## Ownership
 
 Every v2 ID is ownership-qualified:

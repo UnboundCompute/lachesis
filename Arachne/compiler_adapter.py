@@ -447,6 +447,8 @@ def analyze_typescript_with_compiler(
     run_semantic_overlays(infos)
     overlay = build_graph(infos)
     merged = merge_overlay_graph(snapshot_graph(snapshot), overlay)
+    from .core.overlays import default_overlay_registry
+    merged = default_overlay_registry().enrich(merged)
     return infos, merged, snapshot
 
 
@@ -506,8 +508,8 @@ def run_project_frontends(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(semantic_snapshot_graph(item) for item in snapshots)
-    from .core.canonical_overlays import apply_parameter_property_effects
-    graph = apply_parameter_property_effects(graph)
+    from .core.overlays import default_overlay_registry
+    graph = default_overlay_registry().enrich(graph)
     from .core.query import GraphIndex
     from .ecosystems import default_ecosystem_registry
     capability_rank = {"none": 0, "partial": 1, "complete": 2}

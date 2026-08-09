@@ -43,6 +43,7 @@ EXECUTABLE_NODE_KINDS = frozenset({
 VALUE_NODE_KINDS = frozenset({
     "definition", "read", "write", "literal", "property-path", "allocation",
     "heap-object", "heap-location", "type-refinement", "generic-substitution",
+    "call-context", "context-parameter", "context-return",
 })
 CONTROL_RUNTIME_NODE_KINDS = frozenset({
     "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit", "phi",
@@ -90,6 +91,7 @@ NODE_KIND_TIERS["module"] = frozenset({"T0", "T1"})
 FRONTEND_FORBIDDEN_NODE_KINDS = frozenset({
     "heap-object", "heap-location", "function-effect", "async-event",
     "source", "sink", "boundary", "guard", "taint-reach",
+    "call-context", "context-parameter", "context-return",
 })
 
 STRUCTURE_EDGE_KINDS = frozenset({
@@ -106,12 +108,14 @@ CALL_EDGE_KINDS = frozenset({
     "INVOKES", "MAY_INVOKE", "CALLS", "HAS_ARGUMENT",
     "BINDS_PARAMETER", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE", "THROWS_VALUE",
     "RETURN_EVIDENCED_BY", "READS_CALLEE", "PASSES_CALLBACK",
+    "HAS_CALL_CONTEXT", "CONTEXT_CALLS", "CONTEXTUALIZES", "CONTEXT_RETURNS",
 })
 VALUE_EDGE_KINDS = frozenset({
     "DEFINES", "READS_FROM", "WRITES_TO", "WRITES_PARAMETER_PROPERTY",
     "VALUE_FLOWS_TO", "ALIASES", "ALIASES_VALUE", "POINTS_TO",
     "PREVIOUS_VERSION", "PROPERTY_READ", "READ_EVIDENCED_BY", "ALLOCATES",
     "FUNCTION_VALUE", "NARROWS_TYPE", "REFINES_SYMBOL", "SUBSTITUTES_TYPE",
+    "WRITES_HEAP", "READS_HEAP",
 })
 CONTROL_EDGE_KINDS = frozenset({
     "CFG_NEXT", "EXECUTES_BEFORE", "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH",
@@ -134,6 +138,8 @@ CANONICAL_EDGE_KINDS = frozenset().union(
 FRONTEND_FORBIDDEN_EDGE_KINDS = frozenset({
     "POINTS_TO", "MUTATES", "APPLIES_EFFECT", "REGISTERS_CALLBACK", "HANDLED_BY",
     "ASYNC_CONTINUES_AT", "TAINT_FLOWS_TO", "GUARDED_BY",
+    "HAS_CALL_CONTEXT", "CONTEXT_CALLS", "CONTEXTUALIZES", "CONTEXT_RETURNS",
+    "WRITES_HEAP", "READS_HEAP",
 })
 
 SOURCE_DERIVED_NODE_KINDS = frozenset().union(

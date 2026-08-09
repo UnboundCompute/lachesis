@@ -488,13 +488,35 @@ class CompilerFrontendTests(unittest.TestCase):
                 and "handler" in node["label"]
             )
             self.assertEqual(
-                "effect-resolved-function-pointer",
+                "function-pointer",
                 c_pointer_call["properties"]["resolution"],
             )
             self.assertTrue(any(
                 edge["kind"] == "MAY_INVOKE"
                 and edge["source"] == c_pointer_call["id"]
+                and edge["properties"].get("resolution")
+                    == "interprocedural-property-effect"
                 for edge in graph["edges"]
+            ))
+            core_contexts = [
+                node for node in graph["nodes"] if node["kind"] == "call-context"
+                and node["id"].startswith("v2:core:interprocedural-contexts:")
+            ]
+            self.assertTrue(core_contexts)
+            self.assertTrue(all(
+                node["properties"]["fact_origin"] == "core-inference"
+                and node["properties"]["evidence_ids"]
+                for node in core_contexts
+            ))
+            core_locations = [
+                node for node in graph["nodes"] if node["kind"] == "heap-location"
+                and node["id"].startswith("v2:core:parameter-property-effects:")
+            ]
+            self.assertTrue(core_locations)
+            self.assertTrue(all(
+                node["properties"]["fact_origin"] == "core-inference"
+                and node["properties"]["evidence_ids"]
+                for node in core_locations
             ))
 
     def test_typescript_compiler_facts_feed_semantic_overlays(self) -> None:
