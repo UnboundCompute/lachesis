@@ -22,7 +22,9 @@ caller-owned object. After ecosystem models run, a security overlay materializes
 compiler/model-tagged sources and sinks and calculates context-stack-aware taint
 witnesses. Call entry pushes a call-site context and return flow must pop that
 same context, preventing two calls to a shared callee from contaminating each
-other. Declarative runtime models add library behavior without parsing source;
+other. Compiler-seeded dynamic dispatch expands interface/base methods,
+function-valued properties, aliases, bound functions, and contextual callbacks
+without interpreting language syntax in core. Declarative runtime models add library behavior without parsing source;
 the async/event overlay turns those facts and compiler `await` operations into
 callback registration, scheduling, continuation, event, queue, stream, and
 worker edges. Remaining legacy passes are being migrated before the `FileInfo`

@@ -698,6 +698,57 @@ class CompilerFrontendTests(unittest.TestCase):
             for edge in graph["edges"]
         ))
 
+    def test_canonical_dynamic_dispatch_overlay(self) -> None:
+        graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "dispatch")
+        )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        action = next(
+            node for node in nodes.values()
+            if node["kind"] == "function" and node["label"] == "action"
+        )
+        invoke = next(
+            node for node in nodes.values()
+            if node["kind"] == "function" and node["label"] == "invoke"
+        )
+        callback_call = next(
+            node for node in nodes.values()
+            if node["kind"] == "call" and node["label"] == "callback()"
+            and node["properties"].get("owner_function_id") == invoke["id"]
+        )
+        self.assertTrue(any(
+            edge["kind"] == "MAY_INVOKE" and edge["source"] == callback_call["id"]
+            and edge["target"] == action["id"]
+            and edge["properties"].get("reason") == "contextual-callback-binding"
+            for edge in graph["edges"]
+        ))
+        for label in ("action.call(null)", "action.apply(null)", "bound()"):
+            call = next(
+                node for node in nodes.values()
+                if node["kind"] == "call" and node["label"] == label
+            )
+            self.assertTrue(any(
+                edge["kind"] in {"INVOKES", "MAY_INVOKE"}
+                and edge["source"] == call["id"] and edge["target"] == action["id"]
+                for edge in graph["edges"]
+            ), label)
+        service_call = next(
+            node for node in nodes.values()
+            if node["kind"] == "call" and node["label"] == "service.run()"
+        )
+        implementations = {
+            node["id"] for node in nodes.values()
+            if node["kind"] == "method" and node["label"] == "run"
+            and nodes.get(node["properties"].get("owner_id"), {}).get("label")
+                in {"First", "Second"}
+        }
+        self.assertEqual(2, len(implementations))
+        reached = {
+            edge["target"] for edge in graph["edges"]
+            if edge["kind"] == "MAY_INVOKE" and edge["source"] == service_call["id"]
+        }
+        self.assertTrue(implementations.issubset(reached))
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             with patch(

@@ -38,7 +38,8 @@ class GenericRouteModel:
         del package_inventory
         return any(
             node.get("kind") == "call"
-            and node.get("properties", {}).get("method_name", "").lower() in ROUTE_METHODS
+            and str(node.get("properties", {}).get("method_name") or "").lower()
+                in ROUTE_METHODS
             for node in graph.get("nodes", [])
         )
 

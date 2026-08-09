@@ -2666,6 +2666,22 @@ for (const fileName of analysisFileNames) {
         nodes.get(callId).properties.primary_target_id = primaryTarget;
         nodes.get(callId).properties.candidate_target_ids = [...new Set(candidateTargetIds)];
       }
+      if ((ts.isPropertyAccessExpression(node.expression) ||
+          ts.isElementAccessExpression(node.expression)) &&
+          ["call", "apply", "bind"].includes(nodes.get(callId).properties.method_name)) {
+        const receiver = node.expression.expression;
+        for (const functionId of callableTargetsForExpression(receiver)) {
+          if (nodes.get(callId).properties.method_name === "bind") {
+            addEdge("FUNCTION_VALUE", functionId, pathId, {
+              reason: "bound-function", callsite: callId,
+            });
+          } else {
+            addEdge("MAY_INVOKE", callId, functionId, {
+              reason: `function-${nodes.get(callId).properties.method_name}`,
+            });
+          }
+        }
+      }
       const signature = checker.getResolvedSignature(node);
       recordGenericSubstitution(node, callId, primaryTarget, signature);
       const args = node.arguments ? [...node.arguments] : [];
