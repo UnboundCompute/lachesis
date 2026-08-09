@@ -71,9 +71,15 @@ def _seed(store, token):
 TOOLS = [
     {"name": "search",
      "description": "Resolve a function/method/type/file name to its canonical node id(s) with "
-                    "file:line. The entry point — teleport to any symbol, fuzzy by default.",
+                    "file:line. Teleport to any symbol, fuzzy by default. Returns a real "
+                    "match total with paging (limit/offset), and de-prioritizes test/spec "
+                    "symbols. NOTE: on a cold graph prefer `guards_top` first — blind "
+                    "name-search has no ranking; use this once you know a name.",
      "inputSchema": {"type": "object", "properties": {
-         "name": {"type": "string"}}, "required": ["name"]}},
+         "name": {"type": "string"},
+         "limit": {"type": "integer", "default": 25},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["name"]}},
     {"name": "callers",
      "description": "Who calls this symbol (reverse call graph, external stubs filtered). A jump move.",
      "inputSchema": {"type": "object", "properties": {
@@ -141,7 +147,9 @@ def call_tool(name, args):
     store, gl = c.store, c.store.gl
 
     if name == "search":
-        return json.dumps({"query": args["name"], "hits": store.resolve(args["name"])})
+        page = si.search_page(store.entries, args["name"], "fuzzy",
+                              int(args.get("limit", 25)), int(args.get("offset", 0)))
+        return json.dumps(page)
     if name in ("callers", "callees"):
         seed = _seed(store, args["name"])
         if not seed:

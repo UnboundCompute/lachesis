@@ -41,10 +41,20 @@ INDEXED_KINDS = {
 # call-site / call-context nodes, so they'd land moves on non-declaration noise.
 CALL_EDGES = ("CALLS",)
 _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
+# Generic test/spec-file conventions (not vendor/interface literals): symbols declared
+# in these files are de-prioritized in search so a cold blind-search surfaces production
+# code first instead of drowning in `.test.ts` / `__tests__` noise.
+_TEST_PATH = re.compile(
+    r"\.(test|spec)\.|\.integration\.|\.e2e\.|(^|/)__tests__/|(^|/)tests?/|_test\.",
+    re.I)
 
 
 def _tokens(name: str) -> list[str]:
     return [t.lower() for t in _TOKEN.findall(name or "")]
+
+
+def _is_test(file: str | None) -> bool:
+    return bool(file) and _TEST_PATH.search(file) is not None
 
 
 def _file_provenance(gl: GraphLib) -> dict[str, str]:
@@ -96,6 +106,8 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
                 "exported": node["id"] in exported,
                 "container": container,
                 "tokens": _tokens(name),
+                "handle": f"{file}:{line}" if file and line else None,
+                "is_test": _is_test(file),
             })
     entries.sort(key=lambda e: (e["name"].lower(), e["file"] or "", e["line"] or 0))
     return entries
@@ -124,17 +136,43 @@ def _score(entry: dict, q: str, mode: str) -> int | None:
     return None
 
 
-def search(entries: list[dict], q: str, mode: str = "fuzzy", limit: int = 25) -> list[dict]:
+def _ranked(entries: list[dict], q: str, mode: str = "fuzzy") -> list[tuple[int, dict]]:
+    """Every match, fully sorted (best first). Test-file symbols are de-prioritized:
+    a production symbol outranks a test symbol of equal score, but tests still appear."""
     hits = []
     for e in entries:
         s = _score(e, q, mode)
         if s is not None:
             hits.append((s, e))
-    # exported and shallower paths rank up on ties
+    # score, then production-before-test, then exported, then name/path on ties
     hits.sort(key=lambda se: (
-        -se[0], not se[1]["exported"], se[1]["name"].lower(), se[1]["file"] or "",
+        -se[0], se[1].get("is_test", False), not se[1]["exported"],
+        se[1]["name"].lower(), se[1]["file"] or "",
     ))
-    return [e for _, e in hits[:limit]]
+    return hits
+
+
+def search(entries: list[dict], q: str, mode: str = "fuzzy", limit: int = 25) -> list[dict]:
+    """Back-compat list form (used by `_resolve` and seed resolution)."""
+    return [e for _, e in _ranked(entries, q, mode)[:limit]]
+
+
+def search_page(entries: list[dict], q: str, mode: str = "fuzzy",
+                limit: int = 25, offset: int = 0) -> dict:
+    """Paged search with a real total, so a cold search never silently caps.
+
+    Returns the window `[offset, offset+limit)` plus `total`/`has_more` so an agent
+    can see "showing 25 of 340" and page instead of assuming 25 is everything."""
+    ranked = _ranked(entries, q, mode)
+    total = len(ranked)
+    offset = max(0, offset)
+    window = [e for _, e in ranked[offset:offset + limit]]
+    return {
+        "query": q, "mode": mode, "total": total,
+        "offset": offset, "limit": limit, "returned": len(window),
+        "has_more": offset + len(window) < total,
+        "hits": window,
+    }
 
 
 def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
@@ -197,6 +235,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--refs", metavar="NAME", help="list callers of NAME (a jump move)")
     p.add_argument("--callees", metavar="NAME", help="list what NAME calls (a jump move)")
     p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--offset", type=int, default=0, help="with --search: page offset")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     return p
 
@@ -212,12 +251,16 @@ def main(argv: list[str]) -> int:
 
     if args.search:
         mode = "exact" if args.exact else "prefix" if args.prefix else "fuzzy"
-        hits = search(entries, args.search, mode, args.limit)
+        page = search_page(entries, args.search, mode, args.limit, args.offset)
         if args.json:
-            print(json.dumps(hits, indent=2, ensure_ascii=False))
+            print(json.dumps(page, indent=2, ensure_ascii=False))
         else:
-            print(f"{len(hits)} match(es) for {args.search!r}:")
-            for e in hits:
+            lo = page["offset"] + 1 if page["returned"] else 0
+            hi = page["offset"] + page["returned"]
+            more = "  (+more; page with --offset)" if page["has_more"] else ""
+            print(f"{page['total']} match(es) for {args.search!r}"
+                  f" — showing {lo}-{hi}{more}:")
+            for e in page["hits"]:
                 print(_fmt(e))
         return 0
 
