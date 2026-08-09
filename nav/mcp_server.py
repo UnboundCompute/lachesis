@@ -128,6 +128,17 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"},
          "direct_only": {"type": "boolean"}}, "required": ["name"]}},
+    {"name": "read_body",
+     "description": "Read a function/method's real source (L3) — the 'open this and read it' move, "
+                    "so an agent never falls back to cat. Accepts a name or a node_id; returns the "
+                    "exact source span from byte offsets plus {node_id, name, file, start_line, "
+                    "end_line}, capped at max_chars (default 4000) with a truncated flag. If the "
+                    "file/offsets are unavailable it reconstructs a best-effort body from the "
+                    "function's L3 body nodes in line order.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"},
+         "node_id": {"type": "string"},
+         "max_chars": {"type": "integer", "default": 4000}}}},
     {"name": "open_file",
      "description": "L1 file graph: imports, declarations, intra-file calls, cross-file jump-stubs "
                     "for one file (repo-relative path). Returns a {nodes,edges,manifest} graph.",
@@ -210,6 +221,25 @@ def call_tool(name, args):
         move = si.callers if name == "callers" else si.callees
         moves = move(gl, seed, direct_only=bool(args.get("direct_only")))
         return json.dumps({name: moves, "of": args["name"]})
+    if name == "read_body":
+        seed = args.get("node_id") if store.node(args.get("node_id") or "") \
+            else _seed(store, args.get("name") or "")
+        if not seed:
+            return json.dumps({"error": f"no node named {args.get('name') or args.get('node_id')!r}"})
+        node = store.node(seed)
+        f, sl, el = gl.loc(node)
+        body = gl.source_text(node)
+        via = "offsets"
+        if not body:  # file/offsets unavailable — reconstruct from L3 body nodes in line order
+            parts = sorted((n for n in gl.body_nodes(seed)),
+                           key=lambda n: (gl.loc(n)[1] or 0))
+            body = "\n".join(gl.label(n) for n in parts if gl.label(n))
+            via = "body_nodes"
+        cap = int(args.get("max_chars", 4000))
+        truncated = len(body) > cap
+        return json.dumps({"move": "read_body", "node_id": seed, "name": gl.label(node),
+                           "file": f, "start_line": sl, "end_line": el, "via": via,
+                           "truncated": truncated, "body": body[:cap]})
     if name == "open_file":
         fn = _find_file_node(gl, path=args["file"], file_id=None)
         if not fn:
