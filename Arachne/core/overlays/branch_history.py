@@ -114,31 +114,48 @@ class BranchHistory:
             if owner:
                 reads_by_function[owner].append(read)
 
+        # Bucket cfg nodes/entries and cfg edges by owning function ONCE, so the
+        # per-function loop below never re-scans the whole graph (was O(functions x
+        # (nodes + edges)) = O(files^2); now the buckets are O(nodes + edges) total).
+        cfg_nodes_by_function: dict[str, set[str]] = defaultdict(set)
+        cfg_entries_by_function: dict[str, list[dict]] = defaultdict(list)
+        node_to_function: dict[str, str] = {}
+        for node in index.nodes.values():
+            kind = node.get("kind", "")
+            if not kind.startswith("cfg-"):
+                continue
+            owner = node.get("properties", {}).get("function_id")
+            if not owner:
+                continue
+            cfg_nodes_by_function[owner].add(node["id"])
+            node_to_function[node["id"]] = owner
+            if kind == "cfg-entry":
+                cfg_entries_by_function[owner].append(node)
+        for owner, statements in statements_by_function.items():
+            for statement in statements:
+                node_to_function[statement["id"]] = owner
+        cfg_edges_by_function: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for edge in graph.get("edges", []):
+            if index.semantic_edge_kind(edge) not in CFG_EDGE_KINDS:
+                continue
+            source, target = edge["source"], edge["target"]
+            owner = node_to_function.get(source)
+            if owner is not None and owner == node_to_function.get(target):
+                cfg_edges_by_function[owner].append((source, target))
+
         for function in index.nodes_of_kind("function", "method", "constructor"):
             function_id = function["id"]
-            entries = [
-                node for node in index.nodes_of_kind("cfg-entry")
-                if node.get("properties", {}).get("function_id") == function_id
-            ]
+            entries = cfg_entries_by_function.get(function_id)
             if not entries:
                 continue
             entry_id = entries[0]["id"]
-            owned = {
-                node["id"] for node in index.nodes.values()
-                if node.get("properties", {}).get("function_id") == function_id
-                and node.get("kind", "").startswith("cfg-")
-            }
+            owned = set(cfg_nodes_by_function.get(function_id, ()))
             owned.update(statement["id"] for statement in statements_by_function[function_id])
             predecessors: dict[str, set[str]] = defaultdict(set)
             successors: dict[str, set[str]] = defaultdict(set)
-            for edge in graph.get("edges", []):
-                kind = index.semantic_edge_kind(edge)
-                if kind not in CFG_EDGE_KINDS:
-                    continue
-                source, target = edge["source"], edge["target"]
-                if source in owned and target in owned:
-                    predecessors[target].add(source)
-                    successors[source].add(target)
+            for source, target in cfg_edges_by_function.get(function_id, ()):
+                predecessors[target].add(source)
+                successors[source].add(target)
 
             definitions_by_statement: dict[str, list[dict]] = defaultdict(list)
             seed: dict[str, set[str]] = defaultdict(set)

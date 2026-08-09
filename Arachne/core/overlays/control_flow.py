@@ -108,12 +108,19 @@ class ControlFlow:
                 ) == owner_id
             ), key=position)
 
+        # Bucket statements by owner ONCE (was O(functions x statements) = O(files^2)).
+        statements_by_function: dict[str, list[dict]] = defaultdict(list)
+        for statement in index.nodes_of_kind("statement"):
+            owner = statement.get("properties", {}).get("owner_function_id")
+            if owner:
+                statements_by_function[owner].append(statement)
+
         for function in index.nodes_of_kind("function", "method", "constructor"):
             function_id = function["id"]
-            owned_statements = [
-                node for node in index.nodes_of_kind("statement")
-                if node.get("properties", {}).get("owner_function_id") == function_id
-            ]
+            # Edges appended below all belong to THIS function; slicing from here
+            # avoids re-scanning the whole accumulated edge list per function.
+            function_edge_start = len(edges)
+            owned_statements = statements_by_function.get(function_id, [])
             entry_id = stable_id(
                 "core", self.overlay_id, "cfg-entry", function_id,
             )
@@ -357,7 +364,7 @@ class ControlFlow:
                     add_edge("CFG_NEXT", branch_end(last, function_id), exit_id, [last, function_id])
 
             cfg_adjacency: dict[str, list[str]] = defaultdict(list)
-            for edge in edges:
+            for edge in edges[function_edge_start:]:
                 if edge["kind"] in {
                     "CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK",
                     "SWITCH_CASE", "EXCEPTION_BRANCH", "RUNS_FINALLY", "MERGES_AT",

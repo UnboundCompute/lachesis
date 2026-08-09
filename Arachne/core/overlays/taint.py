@@ -8,6 +8,14 @@ from ..identities import stable_id
 from ..query import GraphIndex
 
 
+# Fail-open safety valve: a single source whose value is reachable under a
+# combinatorial number of call-context stacks (k-CFA, depth 12) can enumerate an
+# exponential state space. We keep full context depth for precision but cap the
+# number of distinct BFS states visited PER SOURCE so a pathological component can
+# never hang the build. Any truncation is recorded and surfaced (never silent).
+MAX_STATES_PER_SOURCE = 300_000
+
+
 FLOW_EDGE_KINDS = frozenset({
     "DEFINES", "VALUE_FLOWS_TO", "READS_FROM", "PROPERTY_READ",
     "ALIASES", "ALIASES_VALUE",
@@ -144,6 +152,37 @@ class TaintPropagation:
 
         emitted_flows: set[tuple[str, str, str | None]] = set()
         sinks_by_value = {value["id"]: sink for sink, value in sink_records}
+        truncated_sources: list[str] = []
+
+        # Safety net: when the graph produced NO named sink at all, taint would
+        # otherwise materialize 0 reaches and security-path would have nothing to
+        # answer. In that degenerate case only, synthesize an "unclassified" sink at
+        # each call-argument a source actually reaches, so the query is always
+        # answerable (low confidence; the strict judge adjudicates). When named
+        # sinks exist we rely on them and this stays inert.
+        enable_unclassified = not sink_records
+        arg_callsite: dict[str, str] = {}
+        if enable_unclassified:
+            for callsite_id, argument_ids in arguments_by_call.items():
+                for argument_id in argument_ids:
+                    arg_callsite[argument_id] = callsite_id
+        unclassified_sinks: dict[str, dict] = {}
+        MAX_UNCLASSIFIED_PER_SOURCE = 3
+
+        def _trace(state, predecessor, initial_state):
+            witness = [state[0]]
+            context_trace = [list(state[1])]
+            cursor = state
+            while cursor != initial_state and cursor in predecessor:
+                cursor = predecessor[cursor][0]
+                witness.append(cursor[0])
+                context_trace.append(list(cursor[1]))
+            if cursor != initial_state:
+                return None, None
+            witness.reverse()
+            context_trace.reverse()
+            return witness, context_trace
+
         for source, source_value in source_records:
             initial_state = (source_value["id"], ())
             queue = deque([initial_state])
@@ -153,11 +192,19 @@ class TaintPropagation:
             ] = {}
             seen = {initial_state}
             reached_sinks: dict[str, tuple[str, tuple[str, ...]]] = {}
+            reached_arg_states: dict[str, tuple[str, tuple[str, ...]]] = {}
             while queue:
+                if len(seen) > MAX_STATES_PER_SOURCE:
+                    truncated_sources.append(source["id"])
+                    break
                 current_state = queue.popleft()
                 current, contexts = current_state
                 if current in sinks_by_value and current not in reached_sinks:
                     reached_sinks[current] = current_state
+                if enable_unclassified:
+                    callsite = arg_callsite.get(current)
+                    if callsite and callsite not in reached_arg_states:
+                        reached_arg_states[callsite] = current_state
                 for target, transition, properties in adjacency.get(current, []):
                     next_contexts = contexts
                     reason = properties.get("reason")
@@ -231,5 +278,83 @@ class TaintPropagation:
                         "target": sink["id"], "properties": fact,
                     },
                 ])
+
+            if enable_unclassified and not reached_sinks and reached_arg_states:
+                candidates = sorted(reached_arg_states.items())[:MAX_UNCLASSIFIED_PER_SOURCE]
+                for callsite_id, arg_state in candidates:
+                    witness, context_trace = _trace(arg_state, predecessor, initial_state)
+                    if witness is None:
+                        continue
+                    sink = unclassified_sinks.get(callsite_id)
+                    if sink is None:
+                        call_node = index.nodes.get(callsite_id, {})
+                        sink_id = stable_id(
+                            "core", self.overlay_id, "unclassified-sink", callsite_id,
+                        )
+                        sink_fact = _fact([callsite_id], "low")
+                        sink = {
+                            "id": sink_id,
+                            "kind": "sink",
+                            "label": f"sink:unclassified:{call_node.get('label', callsite_id)}",
+                            "properties": {
+                                **sink_fact,
+                                "value_id": callsite_id,
+                                "sink_kind": "unclassified",
+                                "callsite_id": callsite_id,
+                                "evidence": "reached-by-taint-no-model",
+                            },
+                        }
+                        unclassified_sinks[callsite_id] = sink
+                        nodes.append(sink)
+                        edges.append({
+                            "kind": "TAINT_SINK", "source": sink_id,
+                            "target": callsite_id, "properties": sink_fact,
+                        })
+                    reach_id = stable_id(
+                        "core", self.overlay_id, "taint-reach", source["id"], sink["id"],
+                    )
+                    reach_fact = _fact(witness, "low")
+                    nodes.append({
+                        "id": reach_id,
+                        "kind": "taint-reach",
+                        "label": f"{source['label']} → {sink['label']}",
+                        "properties": {
+                            **reach_fact,
+                            "source_id": source["id"],
+                            "sink_id": sink["id"],
+                            "source_value_id": source_value["id"],
+                            "sink_value_id": callsite_id,
+                            "witness_ids": witness,
+                            "context_trace": context_trace,
+                        },
+                    })
+                    edges.extend([
+                        {
+                            "kind": "TAINT_REACHES", "source": source["id"],
+                            "target": reach_id, "properties": reach_fact,
+                        },
+                        {
+                            "kind": "TAINT_REACHES", "source": reach_id,
+                            "target": sink["id"], "properties": reach_fact,
+                        },
+                    ])
+
+        if truncated_sources:
+            truncated_sources = sorted(dict.fromkeys(truncated_sources))
+            nodes.append({
+                "id": stable_id("core", self.overlay_id, "budget-truncation"),
+                "kind": "taint-budget-note",
+                "label": (
+                    f"taint budget hit for {len(truncated_sources)} source(s) "
+                    f"(cap {MAX_STATES_PER_SOURCE} states/source)"
+                ),
+                "properties": {
+                    "fact_origin": "core-inference",
+                    "confidence": "high",
+                    "evidence_ids": truncated_sources,
+                    "truncated_source_ids": truncated_sources,
+                    "max_states_per_source": MAX_STATES_PER_SOURCE,
+                },
+            })
 
         return GraphDelta(self.overlay_id, nodes, edges)
