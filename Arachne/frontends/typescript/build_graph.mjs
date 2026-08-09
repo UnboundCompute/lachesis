@@ -2660,6 +2660,60 @@ for (const fileName of analysisFileNames) {
       addDefinition(targetId, node, "update", "expression", node.operand);
     }
 
+    // Compiler AST operands define the value of their enclosing expression.
+    // These direct edges are intentionally operation-agnostic: policies may
+    // later distinguish sanitizing or lossy operations, while the frontend
+    // preserves the complete possible derivation relation.
+    if (ts.isBinaryExpression(node) && !ASSIGNMENT_KINDS.has(node.operatorToken.kind)) {
+      addEdge("VALUE_FLOWS_TO", pathForNode(node.left), pathForNode(node), {
+        reason: "left-operand", operator: node.operatorToken.getText(),
+      });
+      addEdge("VALUE_FLOWS_TO", pathForNode(node.right), pathForNode(node), {
+        reason: "right-operand", operator: node.operatorToken.getText(),
+      });
+    } else if (ts.isConditionalExpression(node)) {
+      addEdge("VALUE_FLOWS_TO", pathForNode(node.whenTrue), pathForNode(node), {
+        reason: "conditional-true",
+      });
+      addEdge("VALUE_FLOWS_TO", pathForNode(node.whenFalse), pathForNode(node), {
+        reason: "conditional-false",
+      });
+    } else if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+      addEdge("VALUE_FLOWS_TO", pathForNode(node.operand), pathForNode(node), {
+        reason: "unary-operand",
+      });
+    } else if (ts.isAwaitExpression(node) || ts.isYieldExpression(node) ||
+        ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) ||
+        ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node) ||
+        ts.isParenthesizedExpression(node)) {
+      addEdge("VALUE_FLOWS_TO", pathForNode(node.expression), pathForNode(node), {
+        reason: ts.isAwaitExpression(node) ? "await-result" : "value-preserving-expression",
+      });
+    } else if (ts.isArrayLiteralExpression(node)) {
+      for (const element of node.elements) {
+        if (!ts.isOmittedExpression(element)) {
+          addEdge("VALUE_FLOWS_TO", pathForNode(element), pathForNode(node), {
+            reason: "array-element",
+          });
+        }
+      }
+    } else if (ts.isObjectLiteralExpression(node)) {
+      for (const property of node.properties) {
+        const value = ts.isPropertyAssignment(property) ? property.initializer :
+          ts.isShorthandPropertyAssignment(property) ? property.name :
+          ts.isSpreadAssignment(property) ? property.expression : null;
+        if (value) addEdge("VALUE_FLOWS_TO", pathForNode(value), pathForNode(node), {
+          reason: "object-property",
+        });
+      }
+    } else if (ts.isTemplateExpression(node)) {
+      for (const span of node.templateSpans) {
+        addEdge("VALUE_FLOWS_TO", pathForNode(span.expression), pathForNode(node), {
+          reason: "template-substitution",
+        });
+      }
+    }
+
     if (ts.isReturnStatement(node) && owningFunction) {
       const returnId = stableId("return-value", ...nodeKey(node, owningFunction));
       const position = node.expression ? sourcePosition(node.expression) : sourcePosition(node);
