@@ -229,8 +229,12 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
-            self.assertEqual(1, snapshot.contract_version)
-            self.assertTrue(snapshot.legacy_contract)
+            self.assertEqual(2, snapshot.contract_version)
+            self.assertFalse(snapshot.legacy_contract)
+            self.assertTrue(all(
+                node["id"].startswith("v2:frontend:clang-c:")
+                for node in snapshot.nodes
+            ))
             functions = {
                 node["label"]: node for node in snapshot.nodes
                 if node["kind"] == "function"

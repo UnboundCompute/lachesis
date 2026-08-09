@@ -2,8 +2,7 @@
   "frontend_id": "clang-c",
   "languages": ["c"],
   "extensions": [".c", ".h"],
-  "contract_version": 1,
-  "migration_target": 2,
+  "contract_version": 2,
   "capabilities": {
     "lexical": "partial",
     "syntax": "complete",
@@ -26,4 +25,3 @@
     "security_roles": "none"
   }
 }
-

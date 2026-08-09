@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
+FRONTEND_ID = "clang-c"
 TIERS = {
     "T0": "perimeter", "T1": "reachability", "T2": "path",
     "T3": "body", "T4": "proof",
@@ -47,8 +48,30 @@ def digest(*parts: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+LEGACY_IDS_BY_V2: Dict[str, str] = {}
+CONTENT_HASHES: Dict[Path, str] = {}
+
+
 def stable_id(kind: str, *parts: object) -> str:
-    return f"{kind}:{digest(kind, *parts)}"
+    legacy_id = f"{kind}:{digest(kind, *parts)}"
+    raw = "\0".join(str(part) for part in parts)
+    identity_digest = hashlib.sha256(
+        f"v2\0frontend\0{FRONTEND_ID}\0{kind}\0{raw}".encode("utf-8")
+    ).hexdigest()[:20]
+    node_id = f"v2:frontend:{FRONTEND_ID}:{kind}:{identity_digest}"
+    LEGACY_IDS_BY_V2[node_id] = legacy_id
+    return node_id
+
+
+def content_hash(path: Path) -> str:
+    absolute = path.resolve()
+    if absolute not in CONTENT_HASHES:
+        try:
+            contents = absolute.read_bytes()
+        except OSError:
+            contents = b""
+        CONTENT_HASHES[absolute] = hashlib.sha256(contents).hexdigest()
+    return CONTENT_HASHES[absolute]
 
 
 def compact(value: object, limit: int = 300) -> str:
@@ -134,26 +157,46 @@ class Graph:
         self.edge_keys = set()
 
     def node(self, tier: str, node_id: str, kind: str, label: str, **properties) -> str:
+        canonical = {
+            "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
+            "legacy_id": LEGACY_IDS_BY_V2.get(node_id), **properties,
+        }
+        absolute_file = canonical.get("absolute_file")
+        if absolute_file:
+            absolute = Path(absolute_file).resolve()
+            canonical.update({
+                "frontend_id": FRONTEND_ID,
+                "language": "c",
+                "absolute_file": str(absolute),
+                "content_hash": canonical.get("content_hash")
+                    or content_hash(absolute),
+                "compiler_node_id": canonical.get("compiler_node_id")
+                    or LEGACY_IDS_BY_V2.get(node_id) or node_id,
+            })
         if node_id not in self.nodes:
             self.nodes[node_id] = {
                 "id": node_id, "kind": kind, "label": label,
-                "properties": properties,
+                "properties": canonical,
             }
             self.node_tier[node_id] = tier
         else:
-            self.nodes[node_id]["properties"].update(properties)
+            self.nodes[node_id]["properties"].update(canonical)
         return node_id
 
     def edge(self, kind: str, source: Optional[str], target: Optional[str], **properties) -> None:
         if not source or not target or source == target:
             return
-        key = (kind, source, target, json.dumps(properties, sort_keys=True))
+        canonical = {
+            "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
+            **properties,
+        }
+        key = (kind, source, target, json.dumps(canonical, sort_keys=True))
         if key in self.edge_keys:
             return
         self.edge_keys.add(key)
         self.edges.append({
             "kind": kind, "source": source, "target": target,
-            "properties": properties,
+            "properties": canonical,
         })
 
 
@@ -534,7 +577,10 @@ def main() -> int:
         elif edge["kind"] in structural:
             tier_payloads[source_tier]["expands_to"].append({
                 "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
-                "properties": {"via": edge["kind"]},
+                "properties": {
+                    "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
+                    "via": edge["kind"],
+                },
             })
         else:
             linked = dict(edge)
@@ -547,7 +593,7 @@ def main() -> int:
 
     manifest = {
         "version": 1, "frontend_contract_version": CONTRACT_VERSION,
-        "frontend_id": "clang-c", "generator": "clang-c", "languages": ["c"],
+        "frontend_id": FRONTEND_ID, "generator": FRONTEND_ID, "languages": ["c"],
         "capabilities": {
             "lexical": "partial", "syntax": "complete", "modules": "complete",
             "dependency_sources": "complete",
@@ -563,6 +609,8 @@ def main() -> int:
         "source_dir": str(source_dir), "root_file_count": len(files),
         "node_count": len(graph.nodes), "edge_count": len(graph.edges),
         "diagnostic_count": len(diagnostics),
+        "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
+        "legacy_identity_property": "legacy_id",
         "tiers": [
             {
                 "tier": tier, "name": TIERS[tier],
