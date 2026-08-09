@@ -21,7 +21,7 @@
     "effects": "none",
     "async_events": "none",
     "dynamic_behavior": "partial",
-    "framework_wiring": "partial",
+    "framework_wiring": "none",
     "security_roles": "none"
   }
 }

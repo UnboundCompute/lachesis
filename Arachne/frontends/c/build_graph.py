@@ -15,7 +15,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 CONTRACT_VERSION = 2
@@ -434,6 +434,7 @@ def main() -> int:
     function_parameters: Dict[str, List[str]] = defaultdict(list)
     asts: List[Tuple[Path, dict]] = []
     diagnostics: List[Tuple[Path, str]] = []
+    failed_files: Set[Path] = set()
 
     for path in files:
         text = source_text(path, texts)
@@ -477,6 +478,10 @@ def main() -> int:
     for path in files:
         result = run_clang(source_dir, path, "-Xclang", "-ast-dump=json", "-fsyntax-only", "-Wno-everything", file_flags=compile_commands.get(path))
         if result.returncode != 0 or not result.stdout.strip():
+            # Degrade, don't drop: the file node (emitted above) survives with its
+            # compiler diagnostics attached as T4 proof, rather than vanishing from
+            # the graph. Only its AST-derived declarations/calls are unavailable.
+            failed_files.add(path)
             diagnostics.extend((path, line) for line in result.stderr.splitlines() if line.strip())
             continue
         try:
@@ -925,22 +930,33 @@ def main() -> int:
         for collection in ("edges", "expands_to", "links"):
             payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
 
+    analyzed_file_count = len(files) - len(failed_files)
+    # Honest coverage: a file that failed to parse contributes only its file node,
+    # so any capability that depends on complete parsing can no longer claim it.
+    # A "complete" claim collapses to "partial" the moment coverage has a hole.
+    parse_complete = not failed_files
+    complete_if_parsed = "complete" if parse_complete else "partial"
     manifest = {
         "version": 2, "frontend_contract_version": CONTRACT_VERSION,
         "frontend_id": FRONTEND_ID, "generator": FRONTEND_ID, "languages": ["c"],
         "capabilities": {
-            "lexical": "partial", "syntax": "complete", "modules": "complete",
-            "dependency_sources": "complete",
+            "lexical": "partial", "syntax": complete_if_parsed, "modules": complete_if_parsed,
+            "dependency_sources": complete_if_parsed,
             "symbols": "partial", "types": "partial", "calls": "partial",
             "control_flow": "partial", "direct_data_flow": "partial",
             "heap_identity": "none", "context_sensitivity": "none",
             "branch_histories": "none", "taint_policy": "none",
             "runtime_models": "none", "effects": "none", "async_events": "none",
-            "dynamic_behavior": "partial", "framework_wiring": "partial",
+            # dynamic_behavior: indirect dispatch (ops-struct + function pointers) is
+            # resolved to MAY_INVOKE/PASSES_CALLBACK. framework_wiring: the C frontend
+            # models no framework DI/registration convention, so it is honestly none.
+            "dynamic_behavior": "partial", "framework_wiring": "none",
             "security_roles": "none",
         },
         "compiler": subprocess.run(shlex.split(os.environ.get("CLANG", "clang")) + ["--version"], text=True, capture_output=True).stdout.splitlines()[0],
         "source_dir": str(source_dir), "root_file_count": len(files),
+        "analyzed_file_count": analyzed_file_count,
+        "failed_file_count": len(failed_files),
         "node_count": len(graph.nodes), "edge_count": len(graph.edges),
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",

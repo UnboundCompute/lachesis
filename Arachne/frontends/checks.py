@@ -829,6 +829,40 @@ class CompilerFrontendTests(unittest.TestCase):
                 self.assertIn("helper_value", functions)
                 self.assertIn("feature_enabled", functions)
 
+    def test_c_partial_ingest_keeps_failed_file_and_downgrades_capability(self) -> None:
+        # A file that clang cannot parse must not vanish: its file node survives,
+        # its diagnostics land as T4 proof, the manifest counts it as failed, and
+        # the "complete" parse claims collapse to "partial" — while a sibling file
+        # that parses cleanly still contributes its declarations.
+        with tempfile.TemporaryDirectory() as project:
+            root = Path(project)
+            (root / "good.c").write_text("int good(void) { return 1; }\n", encoding="utf-8")
+            (root / "broken.c").write_text("int broken( { this is not valid C ;;;\n", encoding="utf-8")
+            with tempfile.TemporaryDirectory() as output:
+                self.run_command(
+                    sys.executable, "Arachne/frontends/c/build_graph.py",
+                    str(root), output,
+                )
+                snapshot = load_snapshot(output)
+                validate_snapshot(snapshot)
+                manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(1, manifest["failed_file_count"])
+                self.assertEqual(1, manifest["analyzed_file_count"])
+                # A parse hole downgrades the otherwise-complete parse capabilities.
+                self.assertEqual("partial", manifest["capabilities"]["syntax"])
+                # The failed file keeps its file node rather than being dropped.
+                self.assertTrue(any(
+                    node["kind"] == "file" and node["label"].endswith("broken.c")
+                    for node in snapshot.nodes
+                ))
+                # Its diagnostics are retained as T4 proof.
+                self.assertTrue(any(node["kind"] == "diagnostic" for node in snapshot.nodes))
+                # The clean sibling still yields its declaration.
+                self.assertTrue(any(
+                    node["kind"] == "function" and node["label"] == "good"
+                    for node in snapshot.nodes
+                ))
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
