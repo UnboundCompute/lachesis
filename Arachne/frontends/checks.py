@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -517,7 +518,11 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
-            graph, snapshots = run_project_frontends(str(ROOT), output)
+            with patch(
+                "Arachne.compiler_adapter.snapshot_file_infos",
+                side_effect=AssertionError("primary project graph used FileInfo"),
+            ):
+                graph, snapshots = run_project_frontends(str(ROOT), output)
             self.assertEqual({"typescript-compiler-api", "clang-c"}, {
                 snapshot.frontend_id for snapshot in snapshots
             })
@@ -525,8 +530,19 @@ class CompilerFrontendTests(unittest.TestCase):
                 node["properties"].get("frontend_id") for node in graph["nodes"]
             }
             self.assertTrue({"typescript-compiler-api", "clang-c"}.issubset(frontend_ids))
-            self.assertTrue(any(node["kind"] == "tainted-call" for node in graph["nodes"]))
-            self.assertTrue(any(node["kind"] == "wiring-boundary" for node in graph["nodes"]))
+            self.assertTrue(all(
+                node["id"].startswith("v2:") for node in graph["nodes"]
+            ))
+            self.assertTrue(any(
+                node["kind"] == "taint-reach"
+                and node["id"].startswith("v2:core:taint-propagation:")
+                for node in graph["nodes"]
+            ))
+            self.assertTrue(any(
+                node["kind"] == "source"
+                and node["id"].startswith(("v2:runtime-model:", "v2:framework-model:"))
+                for node in graph["nodes"]
+            ))
             self.assertTrue(any(node["kind"] == "route" for node in graph["nodes"]))
             self.assertTrue(any(
                 edge["kind"] == "ROUTE_HANDLED_BY" for edge in graph["edges"]

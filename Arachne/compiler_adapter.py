@@ -465,11 +465,11 @@ def analyze_typescript_with_compiler(
 
 
 def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
-    """Apply available language-neutral overlays to one frontend snapshot.
+    """Build the temporary legacy-compatible semantic graph for one snapshot.
 
-    Frontends remain independently pluggable. A language can enter the shared
-    graph immediately with compiler facts, then opt into compatibility-backed
-    overlays as its adapter reaches the required contract capabilities.
+    This is retained for ``read_file``/``analyze_files`` migration only. The
+    primary mixed-language project runner composes compiler snapshots directly
+    and applies registered canonical overlays without calling this function.
     """
     graph = snapshot_graph(snapshot)
     if not ({"typescript", "javascript"} & set(snapshot.languages)):
@@ -519,7 +519,10 @@ def run_project_frontends(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    graph = combine_graphs(semantic_snapshot_graph(item) for item in snapshots)
+    # The primary project graph is composed directly from compiler facts.
+    # FileInfo and its legacy analyzers remain available only through the
+    # explicit compatibility APIs above and never feed this path.
+    graph = combine_graphs(snapshot_graph(item) for item in snapshots)
     from .core.overlays import default_overlay_registry
     graph = default_overlay_registry().enrich(graph)
     from .core.query import GraphIndex

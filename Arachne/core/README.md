@@ -18,7 +18,9 @@ compiler/model-tagged sources and sinks and calculates context-stack-aware taint
 witnesses. Call entry pushes a call-site context and return flow must pop that
 same context, preventing two calls to a shared callee from contaminating each
 other. Remaining legacy passes are being migrated before the `FileInfo`
-compatibility projection is removed from primary graph construction.
+compatibility projection itself can be deleted. `run_project_frontends` and the
+CLI already use this direct path; `FileInfo` no longer participates in primary
+graph construction.
 
 ## Ownership
 
