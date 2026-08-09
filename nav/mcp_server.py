@@ -32,6 +32,7 @@ from nav.guards import GuardProfiles
 from nav.call_roles import CallRoles
 from nav.siblings import SiblingDiff
 from nav import symbol_index as si
+from nav.hubs import Hubs
 from nav.folder_graph import build_folder_graph
 from nav.file_graph import build_file_graph, _find_file_node
 
@@ -51,6 +52,7 @@ class _Ctx:
         self.guards = GuardProfiles(self.store)
         self.roles = CallRoles(self.store, guards=self.guards)
         self.siblings = SiblingDiff(self.store)
+        self.hubs = Hubs(self.store.gl)
         log(f"loaded {len(self.store.gl.nodes)} nodes; "
             f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges")
 
@@ -87,6 +89,16 @@ TOOLS = [
                     "node_id + handle (file:line) so a high-signal function (even an anonymous "
                     "one) is immediately navigable. Start here on an unfamiliar graph, THEN "
                     "search/callers/callees to traverse.",
+     "inputSchema": {"type": "object", "properties": {
+         "n": {"type": "integer", "default": 20}}}},
+    {"name": "hubs",
+     "description": "The subsystem's spine: the N highest-degree functions over the UNION call "
+                    "graph (direct CALLS + indirect function-pointer / ops-struct / runtime "
+                    "dispatch), ranked by fan_in + fan_out — no name knowledge needed. Each row "
+                    "carries node_id + handle (file:line), fan_in/fan_out/degree, and entry-point "
+                    "flags (exported | dispatch_target | callback). Language-agnostic cold-start: "
+                    "start here to find what a subsystem is built around, THEN callers/callees/"
+                    "read_body to traverse.",
      "inputSchema": {"type": "object", "properties": {
          "n": {"type": "integer", "default": 20}}}},
     {"name": "search",
@@ -184,6 +196,9 @@ def call_tool(name, args):
              "throws": r["guard_signal"]["throws"],
              "security_weight": r["guard_signal"]["security_weight"]}
             for r in rows]})
+    if name == "hubs":
+        rows = c.hubs.top(int(args.get("n", 20)))
+        return json.dumps({"move": "hubs", "count": len(rows), "ranked": rows})
     if name == "search":
         page = si.search_page(store.entries, args["name"], "fuzzy",
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
