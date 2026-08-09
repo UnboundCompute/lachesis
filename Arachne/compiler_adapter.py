@@ -177,6 +177,8 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
             continue
         info = infos[os.path.abspath(absolute)]
         if node["kind"] in {"function", "method", "constructor"}:
+            owner = nodes.get(properties.get("owner_id"), {})
+            owner_kind = owner.get("kind")
             info["functions"].append({
                 "id": node["id"], "name": node["label"],
                 "form": properties.get("form", node["kind"]),
@@ -188,9 +190,9 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "parameters_start_offset": properties.get("parameters_start_offset"),
                 "parameters_end_offset": properties.get("parameters_end_offset"),
                 "owner_function_id": properties.get("owner_id")
-                    if str(properties.get("owner_id", "")).startswith(("function:", "method:")) else None,
+                    if owner_kind in {"function", "method"} else None,
                 "owner_type_id": properties.get("owner_id")
-                    if str(properties.get("owner_id", "")).startswith(("class:", "interface:")) else None,
+                    if owner_kind in {"class", "interface"} else None,
                 "exported": bool(properties.get("exported")),
                 "async": bool(properties.get("async")),
                 "signature": properties.get("signature"),

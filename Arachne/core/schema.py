@@ -76,6 +76,12 @@ NODE_KIND_TIERS = {
     }},
     **{kind: frozenset({"T4"}) for kind in SECURITY_EVIDENCE_NODE_KINDS},
 }
+# Arguments and produced/returned values belong to the path tier even though
+# their syntax nodes also participate in executable AST structure.
+NODE_KIND_TIERS.update({
+    kind: frozenset({"T2"})
+    for kind in {"argument", "call-value", "return", "return-value"}
+})
 
 # Compiler frontends may emit language-level dynamic constructs and diagnostics,
 # but policy judgments and runtime/heap conclusions belong to core/model layers.

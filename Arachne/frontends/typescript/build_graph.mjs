@@ -45,6 +45,8 @@ function loadTypeScript() {
 }
 
 const { ts, loadedFrom } = loadTypeScript();
+const FRONTEND_ID = "typescript-compiler-api";
+const CONTRACT_VERSION = 2;
 const sourceDir = path.resolve(process.argv[2] || "src");
 const outputDir = path.resolve(
   process.argv[3] || "graph_out/compiler_layered",
@@ -113,8 +115,17 @@ function digest(...parts) {
   return crypto.createHash("sha256").update(parts.join(":"), "utf8").digest("hex").slice(0, 16);
 }
 
+const legacyIdsByV2 = new Map();
 function stableId(kind, ...parts) {
-  return `${kind}:${digest(kind, ...parts)}`;
+  const legacyId = `${kind}:${digest(kind, ...parts)}`;
+  const raw = parts.map((part) => String(part)).join("\u0000");
+  const identityDigest = crypto.createHash("sha256").update(
+    `v2\u0000frontend\u0000${FRONTEND_ID}\u0000${kind}\u0000${raw}`,
+    "utf8",
+  ).digest("hex").slice(0, 20);
+  const id = `v2:frontend:${FRONTEND_ID}:${kind}:${identityDigest}`;
+  legacyIdsByV2.set(id, legacyId);
+  return id;
 }
 
 function normalize(fileName) {
@@ -129,6 +140,25 @@ function relative(fileName) {
 function compact(text, limit = 240) {
   const value = String(text || "").replace(/\s+/g, " ").trim();
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+const contentHashes = new Map();
+function languageForFile(fileName) {
+  const extension = path.extname(fileName).toLowerCase();
+  return extension === ".js" || extension === ".jsx" ? "javascript" : "typescript";
+}
+
+function contentHash(fileName) {
+  const absolute = normalize(fileName);
+  if (!contentHashes.has(absolute)) {
+    let contents = "";
+    try { contents = fs.readFileSync(absolute); } catch { /* diagnostics can lack source files */ }
+    contentHashes.set(
+      absolute,
+      crypto.createHash("sha256").update(contents).digest("hex"),
+    );
+  }
+  return contentHashes.get(absolute);
 }
 
 function jsonKey(value) {
@@ -362,21 +392,41 @@ function ensureSourceFile(sourceFile, includedBecause = "project-root") {
 }
 
 function addNode(tier, id, kind, label, properties = {}) {
+  const absoluteFile = properties.absolute_file
+    ? normalize(properties.absolute_file) : null;
+  const canonicalProperties = {
+    fact_origin: "compiler",
+    confidence: "exact",
+    evidence_ids: [],
+    legacy_id: legacyIdsByV2.get(id) || null,
+    ...properties,
+  };
+  if (absoluteFile) Object.assign(canonicalProperties, {
+    frontend_id: FRONTEND_ID,
+    language: languageForFile(absoluteFile),
+    absolute_file: absoluteFile,
+    content_hash: canonicalProperties.content_hash || contentHash(absoluteFile),
+    compiler_node_id: canonicalProperties.compiler_node_id ||
+      legacyIdsByV2.get(id) || id,
+  });
   if (!nodes.has(id)) {
-    nodes.set(id, { id, kind, label, properties: { ...properties }, tier });
+    nodes.set(id, { id, kind, label, properties: canonicalProperties, tier });
     tierNodes.get(tier).add(id);
   } else {
-    Object.assign(nodes.get(id).properties, properties);
+    Object.assign(nodes.get(id).properties, canonicalProperties);
   }
   return id;
 }
 
 function addEdge(kind, source, target, properties = {}) {
   if (!source || !target || source === target) return;
-  const key = `${kind}|${source}|${target}|${jsonKey(properties)}`;
+  const canonicalProperties = {
+    fact_origin: "compiler", confidence: "exact", evidence_ids: [], ...properties,
+  };
+  const key = `${kind}|${source}|${target}|${jsonKey(canonicalProperties)}`;
   if (edgeKeys.has(key)) return;
   edgeKeys.add(key);
-  edges.push({ kind, source, target, properties });
+  edges.push({ kind, source, target, properties: canonicalProperties });
 }
 
 function sourcePosition(node) {
@@ -1766,7 +1816,8 @@ for (const edge of [...edges]) {
   const targetOwner = target?.properties?.owner_function_id;
   if (!functionId || targetOwner === functionId) continue;
   const functionNode = nodes.get(functionId);
-  if (!functionNode || !String(functionNode.properties.owner_id || "").match(/^(function|method):/)) {
+  const owner = nodes.get(functionNode?.properties.owner_id);
+  if (!functionNode || !owner || !["function", "method"].includes(owner.kind)) {
     continue;
   }
   const capturedSymbolId = target?.properties?.symbol_id;
@@ -1833,7 +1884,10 @@ for (const edge of edges) {
       kind: "EXPANDS_TO",
       source: edge.source,
       target: edge.target,
-      properties: { via: edge.kind },
+      properties: {
+        fact_origin: "compiler", confidence: "exact", evidence_ids: [],
+        via: edge.kind,
+      },
     });
   } else {
     tiers[sourceTier].links.push({ ...edge, properties: { ...edge.properties, target_tier: targetTier } });
@@ -1858,9 +1912,9 @@ for (const ids of Object.values(roleIndex)) ids.sort();
 
 const manifest = {
   version: 1,
-  frontend_contract_version: 1,
-  frontend_id: "typescript-compiler-api",
-  generator: "typescript-compiler-api",
+  frontend_contract_version: CONTRACT_VERSION,
+  frontend_id: FRONTEND_ID,
+  generator: FRONTEND_ID,
   languages: ["typescript", "javascript"],
   capabilities: {
     lexical: "complete",
@@ -1897,6 +1951,8 @@ const manifest = {
   edge_count: edges.length,
   diagnostic_count: diagnostics.length,
   direct_flow_only: true,
+  identity_scheme: "v2:<owner>:<namespace>:<kind>:<digest>",
+  legacy_identity_property: "legacy_id",
   role_index: roleIndex,
   tiers: TIER_ORDER.map((tier) => ({
     tier,

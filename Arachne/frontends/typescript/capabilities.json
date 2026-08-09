@@ -2,8 +2,7 @@
   "frontend_id": "typescript-compiler-api",
   "languages": ["typescript", "javascript"],
   "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"],
-  "contract_version": 1,
-  "migration_target": 2,
+  "contract_version": 2,
   "capabilities": {
     "lexical": "complete",
     "syntax": "complete",
@@ -27,4 +26,3 @@
     "security_roles": "partial"
   }
 }
-

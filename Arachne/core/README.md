@@ -21,9 +21,12 @@ an identity.
 
 Every v2 node and edge declares:
 
-- `origin`: `compiler`, `runtime-model`, `framework-model` or `core-inference`.
+- `fact_origin`: `compiler`, `runtime-model`, `framework-model` or `core-inference`.
 - `confidence`: `exact`, `high`, `conservative` or `unresolved`.
 - `evidence_ids`: required and non-empty for every non-compiler inference.
+
+`fact_origin` is deliberately distinct from domain fields such as a value
+definition's `origin=parameter|literal|expression`.
 
 Source-derived nodes additionally carry the complete source interval, content
 hash, language, frontend ID and compiler node identity defined in
@@ -44,4 +47,3 @@ the old structural and source-span checks, while v2 snapshots receive strict
 kind, owner, tier, source provenance and evidence validation. Frontends will be
 moved to v2 individually; once both registered frontends emit v2 and the legacy
 API reads from the completed canonical graph, v1 support can be deleted.
-

@@ -24,14 +24,13 @@ def source_provenance_errors(properties: Mapping[str, object]) -> list[str]:
 
 def inference_provenance_errors(properties: Mapping[str, object]) -> list[str]:
     errors = []
-    origin = properties.get("origin")
+    origin = properties.get("fact_origin")
     confidence = properties.get("confidence")
     evidence = properties.get("evidence_ids")
     if origin not in FACT_ORIGINS:
-        errors.append("origin")
+        errors.append("fact_origin")
     if confidence not in CONFIDENCE_LEVELS:
         errors.append("confidence")
     if origin != "compiler" and (not isinstance(evidence, list) or not evidence):
         errors.append("evidence_ids")
     return errors
-

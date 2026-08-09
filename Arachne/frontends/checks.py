@@ -49,13 +49,13 @@ class CompilerFrontendTests(unittest.TestCase):
                 {
                     "id": file_id, "kind": "file", "label": "app.ts", "tier": "T0",
                     "properties": {
-                        "origin": "compiler", "confidence": "exact", "evidence_ids": [],
+                        "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
                     },
                 },
                 {
                     "id": function_id, "kind": "function", "label": "run", "tier": "T1",
                     "properties": {
-                        "origin": "compiler", "confidence": "exact", "evidence_ids": [],
+                        "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
                         "frontend_id": "typescript-compiler-api", "language": "typescript",
                         "absolute_file": "/app.ts", "content_hash": "abc",
                         "start_offset": 0, "end_offset": 25,
@@ -71,7 +71,7 @@ class CompilerFrontendTests(unittest.TestCase):
             edges=[{
                 "kind": "DECLARES", "source": file_id, "target": function_id,
                 "properties": {
-                    "origin": "compiler", "confidence": "exact", "evidence_ids": [],
+                    "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
                 },
             }],
         )
@@ -110,6 +110,15 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
+            self.assertEqual(2, snapshot.contract_version)
+            self.assertTrue(all(
+                node["id"].startswith("v2:frontend:typescript-compiler-api:")
+                for node in snapshot.nodes
+            ))
+            self.assertTrue(all(
+                node["properties"].get("legacy_id")
+                for node in snapshot.nodes
+            ))
             self.assertEqual("complete", snapshot.capability("scopes"))
             self.assertTrue(any(node["kind"] == "scope" for node in snapshot.nodes))
             self.assertTrue(any(node["kind"] == "symbol" for node in snapshot.nodes))
@@ -148,6 +157,8 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
+            self.assertEqual(2, snapshot.contract_version)
+            self.assertFalse(snapshot.legacy_contract)
             self.assertEqual(1, snapshot.manifest["root_file_count"])
             self.assertEqual(1, snapshot.manifest["runtime_dependency_file_count"])
             runtime_file = next(
@@ -218,6 +229,8 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
+            self.assertEqual(1, snapshot.contract_version)
+            self.assertTrue(snapshot.legacy_contract)
             functions = {
                 node["label"]: node for node in snapshot.nodes
                 if node["kind"] == "function"
