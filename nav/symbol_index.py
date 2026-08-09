@@ -41,9 +41,10 @@ INDEXED_KINDS = {
 # call-site / call-context nodes, so they'd land moves on non-declaration noise.
 CALL_EDGES = ("CALLS",)
 _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
-# Generic test/spec-file conventions (not vendor/interface literals): symbols declared
-# in these files are de-prioritized in search so a cold blind-search surfaces production
-# code first instead of drowning in `.test.ts` / `__tests__` noise.
+# Generic test/spec-file conventions (not vendor/interface literals). This is the
+# SINGLE SOURCE OF TRUTH for "is this a test file": the graph builder imports the same
+# predicate to exclude tests at file-discovery (Arachne/pipeline.source_inventory), so
+# "in the graph" and "not a test" can never drift apart.
 _TEST_PATH = re.compile(
     r"\.(test|spec)\.|\.integration\.|\.e2e\.|(^|/)__tests__/|(^|/)tests?/|_test\.",
     re.I)
@@ -53,8 +54,14 @@ def _tokens(name: str) -> list[str]:
     return [t.lower() for t in _TOKEN.findall(name or "")]
 
 
-def _is_test(file: str | None) -> bool:
+def is_test_path(file: str | None) -> bool:
+    """True if a path is a test/spec file. The canonical predicate — reused by the
+    builder so build-time exclusion and any query-time handling share one definition."""
     return bool(file) and _TEST_PATH.search(file) is not None
+
+
+# Back-compat alias (the predicate was originally private).
+_is_test = is_test_path
 
 
 def _file_provenance(gl: GraphLib) -> dict[str, str]:
@@ -137,17 +144,20 @@ def _score(entry: dict, q: str, mode: str) -> int | None:
 
 
 def _ranked(entries: list[dict], q: str, mode: str = "fuzzy") -> list[tuple[int, dict]]:
-    """Every match, fully sorted (best first). Test-file symbols are de-prioritized:
-    a production symbol outranks a test symbol of equal score, but tests still appear."""
+    """Every match, fully sorted (best first).
+
+    Test symbols are excluded from the graph at build time (the default), so no
+    query-time test-demotion is needed; the `is_test` flag survives only as metadata
+    for the rare `--include-tests` build, where tests then rank by score like anything
+    else."""
     hits = []
     for e in entries:
         s = _score(e, q, mode)
         if s is not None:
             hits.append((s, e))
-    # score, then production-before-test, then exported, then name/path on ties
+    # exported and shallower paths rank up on ties
     hits.sort(key=lambda se: (
-        -se[0], se[1].get("is_test", False), not se[1]["exported"],
-        se[1]["name"].lower(), se[1]["file"] or "",
+        -se[0], not se[1]["exported"], se[1]["name"].lower(), se[1]["file"] or "",
     ))
     return hits
 

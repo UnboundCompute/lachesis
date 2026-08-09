@@ -186,7 +186,24 @@ function compilerOptions() {
   };
 }
 
-const applicationRootNames = walk(sourceDir);
+// Discovery is owned by the Python driver: when it hands us an explicit root set
+// (via ARACHNE_ROOTS_FILE — test files already excluded there), compile exactly that
+// list instead of re-walking, so the walker can't re-introduce what was filtered out.
+function readRoots(rootsFile) {
+  const names = [];
+  for (const line of fs.readFileSync(rootsFile, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const absolute = normalize(trimmed);
+    if (SUPPORTED.has(path.extname(absolute)) && fs.existsSync(absolute)) {
+      names.push(absolute);
+    }
+  }
+  return names.sort();
+}
+
+const rootsFile = process.env.ARACHNE_ROOTS_FILE;
+const applicationRootNames = rootsFile ? readRoots(rootsFile) : walk(sourceDir);
 if (!applicationRootNames.length) throw new Error(`No TypeScript/JavaScript files found under ${sourceDir}`);
 const rootSet = new Set(applicationRootNames.map(normalize));
 const config = compilerOptions();

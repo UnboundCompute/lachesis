@@ -78,12 +78,25 @@ def combine_graphs(graphs: Iterable[CodeGraph]) -> CodeGraph:
     }
 
 
-def source_inventory(source_dir: str) -> List[str]:
+def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
+    """Discover source files. Test/spec files are excluded by default — they are not
+    attack surface and production code does not import them, so dropping them at
+    discovery (before compile) is safe for type resolution and shrinks the graph. The
+    test predicate is the single source of truth in ``nav.symbol_index`` (imported
+    lazily to avoid an import cycle), so build-time exclusion can never drift from any
+    query-time notion of "is a test"."""
     ignored = {".git", "node_modules", "graph_out", "dist", "build"}
+    is_test = None
+    if not include_tests:
+        from nav.symbol_index import is_test_path as is_test
     result = []
     for root, directories, files in os.walk(os.path.abspath(source_dir)):
         directories[:] = sorted(name for name in directories if name not in ignored)
-        result.extend(os.path.join(root, name) for name in sorted(files))
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            if is_test is not None and is_test(path):
+                continue
+            result.append(path)
     return result
 
 
@@ -125,11 +138,16 @@ def run_project(
     output_root: Optional[str] = None,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
+    include_tests: bool = False,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
-    """Run selected frontends and enrich their canonical facts directly."""
+    """Run selected frontends and enrich their canonical facts directly.
+
+    Discovery (``source_inventory``) drops test files by default; the filtered
+    per-frontend file list is handed to each frontend as its explicit root set, so a
+    frontend that re-walks the tree cannot re-introduce the tests we excluded."""
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
-    groups = registry.partition(source_inventory(source_dir))
+    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
     snapshots = []
     for frontend_id in sorted(groups):
         frontend = registry.get(frontend_id)
@@ -139,6 +157,7 @@ def run_project(
         )
         snapshots.append(run_frontend(
             frontend, source_dir, frontend_output, timeout_seconds,
+            roots=groups[frontend_id],
         ))
     if not snapshots:
         supported = sorted({
