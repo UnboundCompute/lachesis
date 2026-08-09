@@ -1,0 +1,30 @@
+{
+  "frontend_id": "typescript-compiler-api",
+  "languages": ["typescript", "javascript"],
+  "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"],
+  "contract_version": 1,
+  "migration_target": 2,
+  "capabilities": {
+    "lexical": "complete",
+    "syntax": "complete",
+    "modules": "partial",
+    "dependency_sources": "partial",
+    "scopes": "complete",
+    "symbols": "partial",
+    "types": "partial",
+    "calls": "partial",
+    "control_flow": "partial",
+    "direct_data_flow": "partial",
+    "heap_identity": "none",
+    "context_sensitivity": "none",
+    "branch_histories": "none",
+    "taint_policy": "none",
+    "runtime_models": "none",
+    "effects": "none",
+    "async_events": "none",
+    "dynamic_behavior": "partial",
+    "framework_wiring": "none",
+    "security_roles": "partial"
+  }
+}
+

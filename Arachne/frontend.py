@@ -1,22 +1,9 @@
-"""Pluggable, language-neutral compiler frontend contract.
+"""Compatibility imports for the canonical core and frontend registry.
 
-Frontends should run in the ecosystem that gives them the strongest semantic
-information (TypeScript in Node, Clang in C++, Pyright in Python, and so on).
-They communicate with Arachne through a versioned JSON fact graph instead of
-sharing parser-specific objects.
-
-The registry is the discovery path behind ``file_reader.analyze_files`` and the
-mixed-language project composer. It lets parsing capabilities migrate one at a
-time while preserving Arachne's language-neutral overlays.
+New code should import contract/runner/snapshot APIs from ``Arachne.core`` and
+registry APIs from ``Arachne.frontends``. This module remains until legacy
+callers have migrated.
 """
-from __future__ import annotations
-
-import json
-import os
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
 
 from .core.capabilities import (
     CAPABILITY_COMPLETE,
@@ -31,189 +18,22 @@ from .core.contract import (
     FrontendSnapshot,
     FrontendSpec,
 )
+from .core.runner import run_frontend
 from .core.schema import CURRENT_CONTRACT_VERSION as FRONTEND_CONTRACT_VERSION
-from .core.validation import validate_snapshot as validate_contract_snapshot
+from .core.snapshot import load_snapshot
+from .core.validation import validate_snapshot
+from .frontends.registry import (
+    FrontendRegistry,
+    clang_c_frontend,
+    default_registry,
+    typescript_compiler_frontend,
+)
 
-
-class FrontendRegistry:
-    """Select frontends without teaching Arachne about individual languages."""
-
-    def __init__(self) -> None:
-        self._frontends: Dict[str, FrontendSpec] = {}
-
-    def register(self, frontend: FrontendSpec) -> None:
-        if frontend.frontend_id in self._frontends:
-            raise FrontendError(
-                f"frontend already registered: {frontend.frontend_id}"
-            )
-        self._frontends[frontend.frontend_id] = frontend
-
-    def get(self, frontend_id: str) -> FrontendSpec:
-        try:
-            return self._frontends[frontend_id]
-        except KeyError as error:
-            raise FrontendError(f"unknown frontend: {frontend_id}") from error
-
-    def select(self, path: str) -> Optional[FrontendSpec]:
-        matches = [
-            frontend for frontend in self._frontends.values()
-            if frontend.supports(path)
-        ]
-        return min(matches, key=lambda item: item.priority, default=None)
-
-    def partition(self, paths: Iterable[str]) -> Dict[str, List[str]]:
-        """Group a mixed-language source inventory by selected frontend."""
-        result: Dict[str, List[str]] = {}
-        for path in paths:
-            frontend = self.select(path)
-            if frontend:
-                result.setdefault(frontend.frontend_id, []).append(path)
-        for grouped in result.values():
-            grouped.sort()
-        return result
-
-    @property
-    def frontends(self) -> Tuple[FrontendSpec, ...]:
-        return tuple(sorted(self._frontends.values(), key=lambda item: item.priority))
-
-
-def _tier_files(manifest: dict, output_dir: str) -> List[Tuple[str, Path]]:
-    result = []
-    for tier in manifest.get("tiers", []):
-        tier_name = tier.get("tier")
-        file_name = tier.get("file")
-        if not tier_name or not file_name:
-            raise FrontendError("manifest tier is missing `tier` or `file`")
-        result.append((tier_name, Path(output_dir) / file_name))
-    return result
-
-
-def load_snapshot(
-    output_dir: str, stdout: str = "", stderr: str = "",
-) -> FrontendSnapshot:
-    """Load and normalize the standard layered frontend interchange format."""
-    manifest_path = Path(output_dir) / "manifest.json"
-    if not manifest_path.is_file():
-        raise FrontendError(f"frontend did not emit {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    contract_version = manifest.get(
-        "frontend_contract_version", manifest.get("version")
-    )
-    frontend_id = manifest.get("frontend_id") or manifest.get("generator")
-    if not frontend_id:
-        raise FrontendError("manifest is missing `frontend_id`")
-
-    nodes: List[dict] = []
-    edges: List[dict] = []
-    for tier_name, tier_path in _tier_files(manifest, output_dir):
-        if not tier_path.is_file():
-            raise FrontendError(f"missing tier file: {tier_path}")
-        payload = json.loads(tier_path.read_text(encoding="utf-8"))
-        for node in payload.get("nodes", []):
-            nodes.append({**node, "tier": tier_name})
-        for collection in ("edges", "expands_to", "links"):
-            for edge in payload.get(collection, []):
-                edges.append({
-                    **edge,
-                    "source_tier": tier_name,
-                    "relationship_class": collection,
-                })
-
-    capabilities = dict(manifest.get("capabilities", {}))
-    snapshot = FrontendSnapshot(
-        frontend_id=frontend_id,
-        contract_version=contract_version,
-        languages=tuple(manifest.get("languages", ())),
-        capabilities=capabilities,
-        manifest=manifest,
-        nodes=nodes,
-        edges=edges,
-        stdout=stdout,
-        stderr=stderr,
-    )
-    validate_snapshot(snapshot)
-    return snapshot
-
-
-def validate_snapshot(snapshot: FrontendSnapshot) -> None:
-    """Compatibility entry point delegated to the canonical core validator."""
-    validate_contract_snapshot(snapshot)
-
-
-def run_frontend(
-    frontend: FrontendSpec,
-    source_dir: str,
-    output_dir: Optional[str] = None,
-    timeout_seconds: int = 300,
-) -> FrontendSnapshot:
-    """Execute any command frontend and return its validated canonical snapshot."""
-    temporary = None
-    if output_dir is None:
-        temporary = tempfile.TemporaryDirectory(prefix="arachne-frontend-")
-        output_dir = temporary.name
-    os.makedirs(output_dir, exist_ok=True)
-    environment = os.environ.copy()
-    environment.update(frontend.environment)
-    command = frontend.render_command(source_dir, output_dir)
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=frontend.working_directory,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-        if completed.returncode != 0:
-            raise FrontendError(
-                f"frontend {frontend.frontend_id} exited {completed.returncode}\n"
-                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-            )
-        return load_snapshot(output_dir, completed.stdout, completed.stderr)
-    except subprocess.TimeoutExpired as error:
-        raise FrontendError(
-            f"frontend {frontend.frontend_id} exceeded {timeout_seconds}s"
-        ) from error
-    finally:
-        if temporary is not None:
-            temporary.cleanup()
-
-
-def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
-    """The first plugin: TypeScript/JavaScript through the official compiler API."""
-    root = Path(workspace_root or Path(__file__).resolve().parent.parent).resolve()
-    script = root / "compiler_graph" / "build_layered_graph.mjs"
-    return FrontendSpec(
-        frontend_id="typescript-compiler-api",
-        languages=("typescript", "javascript"),
-        extensions=(".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"),
-        command=(
-            "node", str(script), "{source_dir}", "{output_dir}",
-        ),
-        working_directory=str(root),
-        priority=10,
-    )
-
-
-def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
-    """C through Clang's preprocessor, AST and semantic declaration resolver."""
-    root = Path(workspace_root or Path(__file__).resolve().parent.parent).resolve()
-    script = root / "compiler_graph" / "build_clang_graph.py"
-    return FrontendSpec(
-        frontend_id="clang-c",
-        languages=("c",),
-        extensions=(".c", ".h"),
-        command=(
-            "python3", str(script), "{source_dir}", "{output_dir}",
-        ),
-        working_directory=str(root),
-        priority=20,
-    )
-
-
-def default_registry(workspace_root: Optional[str] = None) -> FrontendRegistry:
-    registry = FrontendRegistry()
-    registry.register(typescript_compiler_frontend(workspace_root))
-    registry.register(clang_c_frontend(workspace_root))
-    return registry
+__all__ = [
+    "CAPABILITY_COMPLETE", "CAPABILITY_NONE", "CAPABILITY_PARTIAL",
+    "FRONTEND_CONTRACT_VERSION", "FRONTEND_OWNED_CAPABILITIES",
+    "OVERLAY_OWNED_CAPABILITIES", "VALID_CAPABILITY_LEVELS",
+    "FrontendError", "FrontendRegistry", "FrontendSnapshot", "FrontendSpec",
+    "clang_c_frontend", "default_registry", "load_snapshot", "run_frontend",
+    "typescript_compiler_frontend", "validate_snapshot",
+]

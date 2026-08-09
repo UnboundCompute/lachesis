@@ -1,0 +1,102 @@
+# Compiler-backed layered graph frontends
+
+Language-specific compiler processes live here while their canonical adapter and
+semantic overlays live in `Arachne/`. TypeScript compiler discovery is now the
+default behind `read_file`, `analyze_files`, and the CLI harness.
+
+```sh
+node Arachne/frontends/typescript/build_graph.mjs src graph_out/compiler_layered
+```
+
+Run every compiler plugin needed by a mixed-language tree, apply the available
+language-neutral semantic/security overlays, and compose the results without
+converting them back into parser-specific objects:
+
+```sh
+python3 Arachne/cli/analyze.py . graph_out/compiler_project.json
+```
+
+The default registry currently contains the official TypeScript Compiler API
+frontend (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`) and a Clang frontend for
+C (`.c`, `.h`). The Clang frontend accepts normal include flags through
+`ARACHNE_CFLAGS`; `CLANG` may select another compatible compiler command.
+
+The generator prefers a normal local `typescript` dependency. You can point it at
+another installation without changing the repository:
+
+```sh
+TYPESCRIPT_PATH=/absolute/path/to/typescript \
+  node Arachne/frontends/typescript/build_graph.mjs src graph_out/compiler_layered
+```
+
+It emits `manifest.json` and one JSON file per tier:
+
+- `T0 perimeter`: source files and compiler-resolved module dependencies.
+- `T1 reachability`: functions, methods, classes, interfaces, types and resolved calls.
+- `T2 path`: parameters, variables, call values, arguments, direct value-flow and roles.
+- `T3 body`: compiler AST statements/expressions, calls, operators and control edges.
+- `T4 proof`: exact source spans and compiler diagnostics.
+
+Each native frontend snapshot stores direct facts only. The composed project
+graph additionally contains Arachne overlays such as bounded taint closure,
+context-specific heap effects, framework wiring, and effect-resolved dispatch.
+An LLM query layer should still calculate focused slices rather than loading the
+entire graph.
+
+Cross-tier relationships are split into:
+
+- `expands_to`: structural drill-down links.
+- `links`: semantic relationships such as a body identifier referring to a path value.
+
+Compiler frontends replace lexical, declaration, module and type discovery—not
+Arachne's security overlays. Framework wiring, runtime models, heap identity,
+taint policy and exploit reasoning are layered over compiler-backed facts.
+
+## Libraries and frameworks
+
+Frontends do not stop at application files. Compiler-resolved declarations that
+an application actually reaches are included with provenance:
+
+- `application`: project implementation files.
+- `workspace-library`: local headers/packages outside the application root.
+- `dependency`: installed package declarations or included dependency headers.
+- `standard-library`: compiler/runtime declarations such as `lib.dom.d.ts`.
+
+TypeScript dependency files connect to package nodes through
+`PACKAGE_CONTAINS`; import edges retain the package specifier, bindings, type-only
+status and resolved location. For statically imported packages, the frontend also
+follows the reachable runtime JavaScript source without recursively indexing all
+of `node_modules`. `RUNTIME_DEPENDS_ON` preserves the executable module target,
+`IMPLEMENTED_BY` bridges `.d.ts` API entities to matching implementations, and
+calls retain both the compiler-selected declaration and runtime candidates. The
+bounded traversal defaults to 500 dependency files and can be changed with
+`ARACHNE_MAX_DEPENDENCY_FILES`.
+
+C include edges retain header ownership, and AST declarations from headers
+participate in call resolution. Framework semantic wiring (routes, dependency
+injection, decorators, ORM metadata) remains an Arachne overlay over these
+compiler-backed declarations and implementation bodies rather than a parser
+special case.
+
+Clang also emits parameter/property mutation summaries. The shared canonical
+overlay instantiates them at call sites, creates context-specific heap locations,
+and can resolve later function-pointer member calls through the recorded write.
+
+## Generic frontend boundary
+
+[`Arachne/core/`](../core/) defines the language-neutral
+frontend contract, plugin registry, capability negotiation and snapshot validator.
+The TypeScript generator is merely the first registered command frontend.
+
+Each future frontend may be implemented in its native toolchain, provided it emits
+the same manifest and tier files. For example:
+
+- Python: CPython AST plus Pyright/Pylance-compatible symbol and type facts.
+- Java/Kotlin: compiler frontend or semantic indexer.
+- C/C++: Clang AST, symbols and source locations.
+- Go: `go/packages`, `go/types` and SSA.
+
+Capabilities are explicitly marked `complete`, `partial` or `none`. A manual
+Arachne discovery pass is replaceable only when the selected frontend reports the
+corresponding frontend-owned capability as `complete`. Heap, context sensitivity,
+taint policy, runtime models, framework wiring and security roles remain overlays.

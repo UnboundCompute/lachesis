@@ -13,10 +13,9 @@ import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .frontend import (
-    FrontendError, FrontendRegistry, FrontendSnapshot, default_registry,
-    run_frontend,
-)
+from .core.contract import ContractError as FrontendError, FrontendSnapshot
+from .core.runner import run_frontend
+from .frontends.registry import FrontendRegistry, default_registry
 from .types import CodeGraph, GraphEdge, GraphNode
 from .types import FileInfo
 
@@ -347,7 +346,7 @@ def analyze_typescript_with_compiler(
     snapshot = run_frontend(frontend, source_dir, output)
     infos = snapshot_file_infos(snapshot)
     from .file_reader import FILE_MAP, run_semantic_overlays
-    from .graph import build_graph
+    from .core.graph import build_graph
     FILE_MAP.clear()
     for info in infos:
         FILE_MAP[info["path_hash"]] = info
@@ -369,7 +368,7 @@ def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
         return graph
     infos = snapshot_file_infos(snapshot)
     from .file_reader import FILE_MAP, run_semantic_overlays
-    from .graph import build_graph
+    from .core.graph import build_graph
     FILE_MAP.clear()
     for info in infos:
         FILE_MAP[info["path_hash"]] = info
@@ -413,7 +412,7 @@ def run_project_frontends(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(semantic_snapshot_graph(item) for item in snapshots)
-    from .canonical_overlays import apply_parameter_property_effects
+    from .core.canonical_overlays import apply_parameter_property_effects
     return apply_parameter_property_effects(graph), snapshots
 
 

@@ -1,0 +1,2 @@
+"""TypeScript/JavaScript compiler frontend."""
+

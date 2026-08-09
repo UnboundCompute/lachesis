@@ -85,7 +85,8 @@ def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileI
             f"First unsupported path: {unsupported[0]}"
         )
     from .compiler_adapter import snapshot_file_infos
-    from .frontend import default_registry, run_frontend
+    from .core.runner import run_frontend
+    from .frontends.registry import default_registry
 
     project_root = _compiler_project_root(paths)
     frontend = default_registry().get("typescript-compiler-api")
