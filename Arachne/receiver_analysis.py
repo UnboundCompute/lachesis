@@ -4,7 +4,7 @@ import re
 from typing import Dict, Iterable, List, Optional
 
 from .source_analysis import mask_non_code
-from .variable_analysis import access_parts
+from .value_utils import access_parts
 
 
 BUILTIN_TYPES = {

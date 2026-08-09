@@ -38,6 +38,14 @@ EXACT_MODELS = {
 }
 
 METHOD_MODELS = {
+    "update": {
+        "behaviors": ["mutates-receiver", "derives-return-from-receiver", "derives-return"],
+        "derives_return_from_receiver": True, "derives_return_from": [0],
+    },
+    "digest": {
+        "behaviors": ["derives-return-from-receiver"],
+        "derives_return_from_receiver": True,
+    },
     "get": {"behaviors": ["reads-receiver"], "receiver_read": "keyed", "key_argument": 0},
     "has": {"behaviors": ["reads-receiver"], "receiver_read": "keyed", "key_argument": 0},
     "set": {"behaviors": ["mutates-receiver"], "receiver_write": "keyed", "key_argument": 0, "value_arguments": [1]},

@@ -257,8 +257,10 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "declaration_end_line": target_properties.get("end_line"),
                 "method_name": properties.get("method_name"),
                 "receiver_expression": properties.get("receiver_expression"),
+                "receiver_call_id": properties.get("receiver_call_id"),
                 "computed_key_expression": properties.get("computed_key_expression"),
                 "return_type": {"kind": "compiler", "type": properties.get("type")},
+                "compiler_value_id": properties.get("value_id"),
             }
             info["function_calls"].append(call)
         elif node["kind"] == "token":
@@ -315,13 +317,13 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
 
     from .compiler_body_adapter import adapt_compiler_body
     from .operation_analysis import analyze_operations
-    from .variable_analysis import analyze_variable_flow
+    from .compiler_value_adapter import adapt_compiler_values
     for info in infos.values():
         info["functions"].sort(key=lambda item: (item["start_offset"], item["end_offset"]))
         info["function_calls"].sort(key=lambda item: (item["start_offset"], item["end_offset"]))
         info["scopes"].sort(key=lambda item: (item["start_offset"], -item["end_offset"]))
         info["symbols"].sort(key=lambda item: (item["start_offset"], item["name"]))
-        analyze_variable_flow(info)
+        adapt_compiler_values(info, nodes, snapshot.edges)
         adapt_compiler_body(info, nodes, snapshot.edges)
         analyze_operations(info)
     return sorted(infos.values(), key=lambda item: item["path"])

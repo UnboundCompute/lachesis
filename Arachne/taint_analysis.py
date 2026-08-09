@@ -287,6 +287,10 @@ def analyze_taint(files: Iterable[dict]) -> None:
 
             receiver = call.get("receiver") or {}
             model = runtime_models.get(call["id"], {})
+            add_flow(
+                "TAINT_CALL_RECEIVER", receiver.get("definition_id"), call["id"],
+                terminal=True,
+            )
             if model.get("derives_return_from_receiver"):
                 add_flow(
                     "TAINT_RECEIVER_RESULT", receiver.get("definition_id"),
@@ -399,7 +403,9 @@ def analyze_taint(files: Iterable[dict]) -> None:
                 continue
             via = incoming_flow[state]["kind"]
             call_pair = calls.get(value_id)
-            if call_pair and previous_state is not None and via == "TAINT_CALL_INPUT":
+            if call_pair and previous_state is not None and via in {
+                "TAINT_CALL_INPUT", "TAINT_CALL_RECEIVER",
+            }:
                 call_info, call = call_pair
                 # Collapse over calling context: the security briefing records
                 # the fact "source reaches this sink call" ONCE, not one record

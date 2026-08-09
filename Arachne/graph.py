@@ -286,6 +286,7 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
             add_node(
                 property_info["id"], "property", property_info["name"],
                 base_symbol_id=property_info["base_symbol_id"], path=property_info["path"],
+                compiler_node_id=property_info.get("compiler_node_id"),
             )
         for definition in info["definitions"]:
             add_node(
@@ -381,6 +382,11 @@ def build_graph(files: Iterable[FileInfo]) -> CodeGraph:
                 add_edge("SHADOWS", symbol_node, symbol["shadows"])
 
         for property_info in info["properties"]:
+            if property_info.get("compiler_node_id"):
+                add_edge(
+                    "COMPILER_VALUE_VIEW_OF", property_info["id"],
+                    property_info["compiler_node_id"],
+                )
             add_edge(
                 "PROPERTY_OF", property_info["id"], property_info["base_symbol_id"],
                 path=property_info["path"],

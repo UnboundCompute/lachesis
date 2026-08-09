@@ -1,7 +1,7 @@
 """Arachne TypeScript source-inventory package."""
 from .file_reader import HOLD_LIST, FILE_MAP, analyze_files, read_file, walk
 from .graph import CODE_GRAPH, build_graph
-from .variable_analysis import analyze_variable_flow
+from .compiler_value_adapter import adapt_compiler_values, compiler_value_facts
 from .data_flow import link_data_flow, propagate_origins
 from .receiver_analysis import resolve_receivers
 from .compiler_body_adapter import adapt_compiler_body
@@ -45,7 +45,8 @@ __all__ = [
     "analyze_files",
     "build_graph",
     "CODE_GRAPH",
-    "analyze_variable_flow",
+    "adapt_compiler_values",
+    "compiler_value_facts",
     "link_data_flow",
     "propagate_origins",
     "resolve_receivers",
