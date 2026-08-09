@@ -41,6 +41,10 @@ FRONTEND_OWNED_CAPABILITIES = {
     "modules": (
         "imports", "exports", "re-exports", "resolved module targets",
     ),
+    "dependency_sources": (
+        "library files", "package ownership", "declaration provenance",
+        "framework source or declarations reached by the application",
+    ),
     "symbols": (
         "scopes", "declarations", "references", "shadowing", "aliases",
     ),
@@ -394,7 +398,24 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
     )
 
 
+def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
+    """C through Clang's preprocessor, AST and semantic declaration resolver."""
+    root = Path(workspace_root or Path(__file__).resolve().parent.parent).resolve()
+    script = root / "compiler_graph" / "build_clang_graph.py"
+    return FrontendSpec(
+        frontend_id="clang-c",
+        languages=("c",),
+        extensions=(".c", ".h"),
+        command=(
+            "python3", str(script), "{source_dir}", "{output_dir}",
+        ),
+        working_directory=str(root),
+        priority=20,
+    )
+
+
 def default_registry(workspace_root: Optional[str] = None) -> FrontendRegistry:
     registry = FrontendRegistry()
     registry.register(typescript_compiler_frontend(workspace_root))
+    registry.register(clang_c_frontend(workspace_root))
     return registry

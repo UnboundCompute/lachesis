@@ -341,7 +341,28 @@ def analyze_taint(files: Iterable[dict]) -> None:
                 distance[next_state] = distance[(node_id, context_stack)] + 1
                 queue.append(next_state)
 
-        for state, previous_state in predecessor.items():
+        # Traversal stays fully context-sensitive, but materializing every
+        # (value, complete call-stack) state grows exponentially and turns a
+        # small graph into gigabytes. Retain one shortest valid witness per
+        # (source, value) and summarize how many context variants reached it.
+        # Direct transition edges plus call-context nodes retain the complete
+        # graph needed to recompute another witness on demand.
+        representative = {}
+        context_variant_count = defaultdict(int)
+        for state in predecessor:
+            value_id, context_stack = state
+            context_variant_count[value_id] += 1
+            previous = representative.get(value_id)
+            if previous is None or (
+                distance[state], context_stack
+            ) < (
+                distance[previous], previous[1]
+            ):
+                representative[value_id] = state
+
+        for value_id, state in representative.items():
+            _value_id, context_stack = state
+            previous_state = predecessor[state]
             value_id, context_stack = state
             if previous_state is None:
                 via = "TAINT_SOURCE"
@@ -359,6 +380,7 @@ def analyze_taint(files: Iterable[dict]) -> None:
                 "hop_count": distance[state], "predecessor_id": predecessor_id,
                 "predecessor_context_stack": predecessor_context_stack,
                 "via": via, "context_stack": list(context_stack),
+                "context_variant_count": context_variant_count[value_id],
             }
             owner = value_owner.get(value_id) or value_owner.get(source["value_id"])
             if owner:
@@ -368,6 +390,14 @@ def analyze_taint(files: Iterable[dict]) -> None:
                 record.setdefault("taint_source_ids", [])
                 if source_id not in record["taint_source_ids"]:
                     record["taint_source_ids"].append(source_id)
+        # Sink/call findings remain call-site and source specific. Iterate all
+        # valid context states so a representative chosen for generic closure
+        # cannot hide the only balanced call/return route to a sink.
+        for state, previous_state in predecessor.items():
+            value_id, context_stack = state
+            if previous_state is None:
+                continue
+            via = incoming_flow[state]["kind"]
             call_pair = calls.get(value_id)
             if call_pair and previous_state is not None and via == "TAINT_CALL_INPUT":
                 call_info, call = call_pair
@@ -397,30 +427,48 @@ def analyze_taint(files: Iterable[dict]) -> None:
 
 
 def taint_path(files: Iterable[dict], source_id: str, value_id: str) -> List[str]:
-    """Return one shortest materialized source-to-value path."""
-    reaches = [
-        reach for info in files for reach in info.get("taint_reaches", [])
-        if reach["source_id"] == source_id and reach["value_id"] == value_id
-    ]
-    if not reaches:
+    """Compute one shortest balanced source-to-value path from direct flows."""
+    file_list = list(files)
+    source = next((
+        item for info in file_list for item in info.get("taint_sources", [])
+        if item["id"] == source_id
+    ), None)
+    if not source:
         return []
-    current = min(reaches, key=lambda item: item["hop_count"])
-    path = [current["value_id"]]
-    all_reaches = [
-        reach for info in files for reach in info.get("taint_reaches", [])
-        if reach["source_id"] == source_id
-    ]
-    while current["predecessor_id"] != source_id:
-        predecessor_id = current["predecessor_id"]
-        path.append(predecessor_id)
-        candidates = [
-            reach for reach in all_reaches
-            if reach["value_id"] == predecessor_id
-            and reach["hop_count"] == current["hop_count"] - 1
-            and reach["context_stack"] == current["predecessor_context_stack"]
-        ]
-        if not candidates:
+    adjacency = defaultdict(list)
+    for info in file_list:
+        for flow in info.get("taint_flows", []):
+            adjacency[flow["source"]].append(flow)
+    start = (source["value_id"], tuple())
+    queue = deque([start])
+    predecessor = {start: None}
+    target = None
+    while queue:
+        state = queue.popleft()
+        node_id, context_stack = state
+        if node_id == value_id:
+            target = state
             break
-        current = candidates[0]
+        for flow in adjacency.get(node_id, []):
+            next_stack = context_stack
+            if flow.get("transition") == "push":
+                if len(context_stack) >= MAX_CONTEXT_DEPTH:
+                    continue
+                next_stack = context_stack + (flow.get("context_id"),)
+            elif flow.get("transition") == "pop":
+                if not context_stack or context_stack[-1] != flow.get("context_id"):
+                    continue
+                next_stack = context_stack[:-1]
+            next_state = (flow["target"], next_stack)
+            if next_state not in predecessor:
+                predecessor[next_state] = state
+                queue.append(next_state)
+    if target is None:
+        return []
+    path = []
+    current = target
+    while current is not None:
+        path.append(current[0])
+        current = predecessor[current]
     path.append(source_id)
     return list(reversed(path))

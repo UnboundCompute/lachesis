@@ -1,6 +1,7 @@
 """File reading, hashing, inventory storage, and source-tree walking."""
 import hashlib
 import os
+from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 from .function_analysis import classify_language_call, find_function_calls, find_functions
@@ -31,6 +32,42 @@ from .types import FileInfo
 # SHA-256(absolute path) -> complete read_file() result.
 FILE_MAP: Dict[str, FileInfo] = {}
 HOLD_LIST: List[FileInfo] = []
+
+# Parsing one file (read_file) is CPU-bound pure Python and fully independent,
+# so it fans out across processes. Below this file count the pool's spawn +
+# pickle overhead outweighs the win, so we stay serial.
+PARALLEL_THRESHOLD = 16
+
+
+def default_workers() -> int:
+    override = os.environ.get("ARACHNE_WORKERS")
+    if override and override.isdigit():
+        return max(1, int(override))
+    return max(1, (os.cpu_count() or 2))
+
+
+def parse_files(paths: List[str], workers: Optional[int] = None) -> List[FileInfo]:
+    """Parse every file, in parallel when the batch is large enough.
+
+    read_file is embarrassingly parallel; the interprocedural passes that follow
+    are not, so only this phase fans out. Results are returned in input order to
+    keep every downstream id deterministic, and re-registered in the parent's
+    FILE_MAP (worker FILE_MAP writes live in a separate address space).
+    """
+    if workers is None:
+        workers = default_workers()
+    workers = min(workers, len(paths)) if paths else 1
+
+    if workers <= 1 or len(paths) < PARALLEL_THRESHOLD:
+        results = [read_file(path) for path in paths]
+    else:
+        chunk = max(1, len(paths) // (workers * 4))
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(read_file, paths, chunksize=chunk))
+
+    for info in results:
+        FILE_MAP[info["path_hash"]] = info
+    return results
 
 
 def hash_path(path: str) -> str:
@@ -339,14 +376,17 @@ def resolve_file_function_calls(info: FileInfo) -> bool:
     return not waiting
 
 
-def analyze_files(paths: List[str]) -> List[FileInfo]:
-    """Read once, defer missing targets, then drain the hold list to a fixed point."""
+def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileInfo]:
+    """Parse (parallel), then resolve and run the interprocedural passes serially.
+
+    With every file parsed up front, call resolution rarely has to wait on a
+    missing target, but the hold-list fixpoint is kept so any residual
+    out-of-order re-export chain still converges.
+    """
     FILE_MAP.clear()
     HOLD_LIST.clear()
-    results = []
-    for path in paths:
-        info = read_file(path)
-        results.append(info)
+    results = parse_files(paths, workers)
+    for info in results:
         if not resolve_file_function_calls(info):
             HOLD_LIST.append(info)
 
@@ -368,6 +408,16 @@ def analyze_files(paths: List[str]) -> List[FileInfo]:
                     if call.get("resolution") == "waiting":
                         terminal_call(call, "unresolved-import")
             HOLD_LIST.clear()
+    return run_semantic_overlays(results)
+
+
+def run_semantic_overlays(results: List[FileInfo]) -> List[FileInfo]:
+    """Apply language-neutral/interprocedural layers to discovered file facts.
+
+    Manual discovery and compiler frontends intentionally converge here. This
+    keeps taint, heap, effects, framework wiring and security semantics outside
+    every language parser.
+    """
     resolve_receivers(results)
     analyze_dispatch(results)
     link_data_flow(results)

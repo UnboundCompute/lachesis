@@ -26,6 +26,10 @@ from .module_init_analysis import analyze_module_init
 from .wiring_analysis import analyze_wiring
 from .security_roles import derive_roles, detect_guards
 from .layered_graph import build_layered_graph, write_layered_graph
+from .compiler_adapter import (
+    analyze_typescript_with_compiler, combine_graphs, merge_overlay_graph,
+    run_project_frontends, snapshot_file_infos, snapshot_graph, write_project_graph,
+)
 from .types import (
     CodeGraph, ExportInfo, FileInfo, FunctionCallInfo, FunctionInfo, GraphEdge,
     GraphNode, ImportInfo,
@@ -78,6 +82,13 @@ __all__ = [
     "detect_guards",
     "build_layered_graph",
     "write_layered_graph",
+    "combine_graphs",
+    "merge_overlay_graph",
+    "snapshot_file_infos",
+    "analyze_typescript_with_compiler",
+    "run_project_frontends",
+    "snapshot_graph",
+    "write_project_graph",
     "read_file",
     "resolve_import",
     "walk",
