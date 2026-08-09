@@ -96,6 +96,53 @@ class ReasoningQuery:
         except KeyError as error:
             raise KeyError(f"unknown canonical node id: {node_id}") from error
 
+    def _suggest_nodes(self, node: dict, expected: frozenset[str]) -> list[str]:
+        """Concrete node ids of an expected kind related to a wrong-kind node."""
+        node_id = node["id"]
+        kind = node.get("kind")
+        if "taint-reach" in expected:
+            related, any_reach = [], []
+            for reach in self.index.nodes_of_kind("taint-reach"):
+                any_reach.append(reach["id"])
+                properties = reach.get("properties", {})
+                anchors = {
+                    properties.get("source_id"), properties.get("sink_id"),
+                    properties.get("source_value_id"), properties.get("sink_value_id"),
+                }
+                if node_id in anchors or node_id in properties.get("witness_ids", []):
+                    related.append(reach["id"])
+            return sorted(related) or sorted(any_reach)
+        if expected & CALL_KINDS and kind in FUNCTION_KINDS:
+            return sorted(
+                owned["id"] for owned in self.index.nodes_owned_by(node_id)
+                if owned["kind"] in CALL_KINDS
+            )
+        if expected & FUNCTION_KINDS:
+            owner = node.get("properties", {}).get("owner_function_id")
+            if owner and owner in self.index.nodes:
+                return [owner]
+        return []
+
+    def _kind_mismatch(
+        self, node: dict, expected: frozenset[str], action: str,
+    ) -> ValueError:
+        """A wrong-node-kind error that names the valid kind and suggests nodes."""
+        expected_text = " or ".join(sorted(expected))
+        message = (
+            f"node is a '{node.get('kind')}', but {action} expects a "
+            f"{expected_text} node: {node['id']}"
+        )
+        suggestions = self._suggest_nodes(node, expected)
+        if suggestions:
+            listed = ", ".join(suggestions[:5])
+            message += f". Try a {expected_text} node instead — e.g. {listed}"
+        else:
+            message += (
+                f". No related {expected_text} node exists; run 'overview' to see "
+                f"available anchors"
+            )
+        return ValueError(message)
+
     def _record(self, node_or_id: dict | str, include_excerpt: bool = False) -> dict:
         node = self._node(node_or_id) if isinstance(node_or_id, str) else node_or_id
         properties = node.get("properties", {})
@@ -265,7 +312,7 @@ class ReasoningQuery:
     ) -> dict:
         function = self._node(function_id)
         if function["kind"] not in FUNCTION_KINDS:
-            raise ValueError(f"node is not a function-like declaration: {function_id}")
+            raise self._kind_mismatch(function, FUNCTION_KINDS, "function")
         owned = sorted(self.index.nodes_owned_by(function_id), key=lambda node: (
             node.get("properties", {}).get("start_offset", 1 << 60), node["id"],
         ))
@@ -344,7 +391,7 @@ class ReasoningQuery:
     ) -> dict:
         call = self._node(call_id)
         if call["kind"] not in CALL_KINDS:
-            raise ValueError(f"node is not a call: {call_id}")
+            raise self._kind_mismatch(call, CALL_KINDS, "call")
         arguments = sorted(self.index.targets(call_id, "HAS_ARGUMENT"), key=lambda node: (
             node.get("properties", {}).get("position", 1 << 30), node["id"],
         ))
@@ -388,7 +435,9 @@ class ReasoningQuery:
     ) -> dict:
         reach = self._node(reach_id)
         if reach["kind"] != "taint-reach":
-            raise ValueError(f"node is not a security path: {reach_id}")
+            raise self._kind_mismatch(
+                reach, frozenset({"taint-reach"}), "security-path",
+            )
         properties = reach.get("properties", {})
         witness_ids = properties.get("witness_ids", [])
         steps = []
@@ -436,7 +485,7 @@ class ReasoningQuery:
     ) -> dict:
         function = self._node(function_id)
         if function["kind"] not in FUNCTION_KINDS:
-            raise ValueError(f"node is not a handler/function: {function_id}")
+            raise self._kind_mismatch(function, FUNCTION_KINDS, "handler-security")
         owned = {node["id"] for node in self.index.nodes_owned_by(function_id)}
         reaches = []
         for reach in self.index.nodes_of_kind("taint-reach"):
