@@ -459,6 +459,109 @@ def main() -> int:
     for path, ast in asts:
         declarations(ast, path)
 
+    # Indirect-dispatch binding pre-pass. Function pointers reach their targets
+    # through ops-struct slots (`.read = ext4_file_read`) and pointer variables
+    # (`fp = handler`); on C/kernel this indirection *is* the control flow. We
+    # resolve those bindings here so the call pass can attach MAY_INVOKE to the
+    # dispatch call-site (parity with the TS frontend). Genuinely unresolved
+    # pointers keep their READS_CALLEE slot edge — the indirection is never dropped.
+    record_fields_by_type: Dict[str, List[Optional[str]]] = {}
+
+    def collect_record_fields(node: dict) -> None:
+        if node.get("kind") == "RecordDecl" and node.get("name") and node.get("tagUsed"):
+            key = f'{node["tagUsed"]} {node["name"]}'
+            record_fields_by_type[key] = [
+                declarations_by_raw_id.get(child.get("id", ""))
+                for child in node.get("inner", []) if child.get("kind") == "FieldDecl"
+            ]
+        for child in node.get("inner", []):
+            collect_record_fields(child)
+
+    for path, ast in asts:
+        collect_record_fields(ast)
+
+    def normalize_type(text: str) -> str:
+        for qualifier in ("const ", "volatile ", "restrict ", "_Atomic "):
+            while text.startswith(qualifier):
+                text = text[len(qualifier):]
+        return text.strip()
+
+    def function_refs(node: dict) -> List[str]:
+        """Function declaration node-ids referenced anywhere below an expression."""
+        ids = []
+        for reference in referenced_decls(node):
+            node_id = declarations_by_raw_id.get(reference.get("id", ""))
+            if node_id and graph.nodes.get(node_id, {}).get("kind") == "function":
+                ids.append(node_id)
+        return ids
+
+    def callback_argument(argument: dict) -> Optional[str]:
+        """Function node-id when an argument *is* a bare function reference.
+
+        Unwraps the function-to-pointer decay / casts so a passed callback
+        (`register(cb)`) is recognised, while a called function (`foo(bar())`)
+        is not mistaken for one.
+        """
+        node = argument
+        while node.get("kind") in {"ImplicitCastExpr", "ParenExpr", "CStyleCastExpr"} and node.get("inner"):
+            node = node["inner"][0]
+        if node.get("kind") == "DeclRefExpr":
+            node_id = declarations_by_raw_id.get(node.get("referencedDecl", {}).get("id", ""))
+            if node_id and graph.nodes.get(node_id, {}).get("kind") == "function":
+                return node_id
+        return None
+
+    field_bindings: Dict[str, set] = defaultdict(set)   # property slot -> {function ids}
+    var_bindings: Dict[str, set] = defaultdict(set)     # pointer variable -> {function ids}
+
+    def bind_init_list(init_list: dict) -> None:
+        # Clang emits initializer values in record-field order (holes filled with
+        # ImplicitValueInitExpr), so element position maps to the ordered fields.
+        type_name = normalize_type(init_list.get("type", {}).get("qualType", ""))
+        fields = record_fields_by_type.get(type_name)
+        if not fields:
+            return
+        for position, element in enumerate(init_list.get("inner", [])):
+            if position >= len(fields) or not fields[position]:
+                continue
+            for function_id in function_refs(element):
+                field_bindings[fields[position]].add(function_id)
+
+    def slot_of_lvalue(lvalue: dict) -> Optional[Tuple[str, str]]:
+        for reference in referenced_decls(lvalue):
+            node_id = declarations_by_raw_id.get(reference.get("id", ""))
+            kind = graph.nodes.get(node_id, {}).get("kind") if node_id else None
+            if kind in {"property", "variable"}:
+                return node_id, kind
+        return None
+
+    def collect_bindings(node: dict) -> None:
+        kind = node.get("kind", "")
+        if kind == "VarDecl":
+            init_list = next((c for c in node.get("inner", []) if c.get("kind") == "InitListExpr"), None)
+            if init_list is not None:
+                bind_init_list(init_list)
+            else:
+                variable_id = declarations_by_raw_id.get(node.get("id", ""))
+                if variable_id and graph.nodes.get(variable_id, {}).get("kind") == "variable":
+                    for function_id in function_refs(node):
+                        var_bindings[variable_id].add(function_id)
+        elif kind in {"BinaryOperator", "CompoundAssignOperator"} and node.get("opcode") == "=":
+            inner = node.get("inner", [])
+            if len(inner) >= 2:
+                functions = function_refs(inner[1])
+                slot = slot_of_lvalue(inner[0]) if functions else None
+                if slot:
+                    slot_id, slot_kind = slot
+                    target_map = field_bindings if slot_kind == "property" else var_bindings
+                    for function_id in functions:
+                        target_map[slot_id].add(function_id)
+        for child in node.get("inner", []):
+            collect_bindings(child)
+
+    for path, ast in asts:
+        collect_bindings(ast)
+
     # Body/reference/call pass.
     def body_identity(node: dict, path: Path) -> str:
         position = position_from_ast(node, path, texts)
@@ -581,12 +684,28 @@ def main() -> int:
                     graph.edge("INVOKES", body_id, target, resolution="compiler-local")
                     graph.edge("CALLS", owner, target, callsite=body_id)
                 elif target:
+                    # Unresolved slot stays visible; when the pointer's binding is
+                    # known (ops-struct initializer / pointer assignment), also resolve
+                    # the concrete target as MAY_INVOKE from the dispatch call-site.
                     graph.edge("READS_CALLEE", body_id, target, dispatch="function-pointer")
+                    field_bound = field_bindings.get(target)
+                    resolved = field_bound or var_bindings.get(target)
+                    if resolved:
+                        dispatch_label = "ops-struct" if field_bound else "function-pointer"
+                        for function_id in sorted(resolved):
+                            graph.edge(
+                                "MAY_INVOKE", body_id, function_id,
+                                dispatch=dispatch_label, resolution="binding",
+                            )
                 arguments = node.get("inner", [])[1:]
                 parameters = function_parameters.get(target or "", [])
                 for position_index, argument in enumerate(arguments):
                     argument_id = body_identity(argument, path)
                     graph.edge("HAS_ARGUMENT", body_id, argument_id, position=position_index)
+                    # A function passed by name is a callback handed to the callee.
+                    callback_id = callback_argument(argument)
+                    if callback_id:
+                        graph.edge("PASSES_CALLBACK", body_id, callback_id, position=position_index)
                     if position_index < len(parameters):
                         parameter_id = parameters[position_index]
                         graph.edge(

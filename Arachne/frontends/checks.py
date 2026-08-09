@@ -764,12 +764,30 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(functions["route_register"]["id"], route_call["properties"]["primary_target_id"])
             pointer_call = next(node for node in calls if "handler" in node["label"])
             self.assertEqual("function-pointer", pointer_call["properties"]["resolution"])
-            self.assertEqual(2, sum(
+            self.assertEqual(3, sum(
                 edge["kind"] == "ARGUMENT_BINDS_PARAMETER"
                 for edge in snapshot.edges
             ))
             self.assertTrue(any(
                 edge["kind"] == "WRITES_PARAMETER_PROPERTY"
+                for edge in snapshot.edges
+            ))
+            # Indirect-dispatch resolution (dispatch.c): the ops-struct initializer
+            # binds .read -> ext4_read, so the ops->read(...) call-site resolves to
+            # MAY_INVOKE; a function handed to a callee is PASSES_CALLBACK.
+            functions_by_label = {
+                node["label"]: node["id"] for node in snapshot.nodes
+                if node["kind"] == "function"
+            }
+            may_invoke = [edge for edge in snapshot.edges if edge["kind"] == "MAY_INVOKE"]
+            self.assertTrue(any(
+                edge["target"] == functions_by_label["ext4_read"]
+                and edge["properties"].get("dispatch") == "ops-struct"
+                for edge in may_invoke
+            ))
+            self.assertTrue(any(
+                edge["kind"] == "PASSES_CALLBACK"
+                and edge["target"] == functions_by_label["ext4_write"]
                 for edge in snapshot.edges
             ))
 
