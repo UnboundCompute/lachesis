@@ -150,6 +150,42 @@ class TaintPropagation:
                     argument_id, callsite_id, sink_value["id"],
                 ]
 
+        # Conservative call pass-through. Precise interprocedural flow (argument ->
+        # context-parameter -> callee definition -> ... -> return -> context-return)
+        # only exists for the calls the frontend actually resolved a body for — a
+        # small minority (~233 bindings here). Taint therefore DIES at every
+        # unmodeled call: `new URL(serverUrl)`, `normalizeUrl(x)`, `x.replace(...)`,
+        # `response.json()`, higher-order and cross-module calls — because nothing
+        # connects a call's inputs to its result. We add the standard conservative
+        # summary "the result may derive from any argument or the receiver", so a
+        # tainted input keeps flowing through the call to its return value. This is
+        # what connects real source->sink chains; over-approximation is deliberate
+        # (a leak is refutable by the guard-differential / strict judge), and the
+        # per-source budget above bounds any blow-up. For calls WITH a resolved body
+        # the precise path still exists and yields the tighter witness.
+        call_result_by_callsite: dict[str, str] = {}
+        for call in index.nodes_of_kind("call", "construct"):
+            result_id = call.get("properties", {}).get("value_id")
+            if result_id and result_id in index.nodes and result_id != call["id"]:
+                call_result_by_callsite[call["id"]] = result_id
+        for callsite_id, argument_ids in arguments_by_call.items():
+            result_id = call_result_by_callsite.get(callsite_id)
+            if not result_id:
+                continue
+            for argument_id in argument_ids:
+                adjacency[argument_id].append((result_id, "CALL_PASSTHROUGH", {}))
+                flow_evidence.setdefault(
+                    (argument_id, result_id), [argument_id, callsite_id, result_id],
+                )
+        for call in index.nodes_of_kind("call", "construct"):
+            receiver_id = call.get("properties", {}).get("receiver_value_id")
+            result_id = call_result_by_callsite.get(call["id"])
+            if receiver_id and result_id and receiver_id in index.nodes:
+                adjacency[receiver_id].append((result_id, "CALL_PASSTHROUGH", {}))
+                flow_evidence.setdefault(
+                    (receiver_id, result_id), [receiver_id, call["id"], result_id],
+                )
+
         emitted_flows: set[tuple[str, str, str | None]] = set()
         sinks_by_value = {value["id"]: sink for sink, value in sink_records}
         truncated_sources: list[str] = []
