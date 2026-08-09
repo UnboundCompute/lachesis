@@ -1014,6 +1014,7 @@ function pathForNode(node, pathKind = "value") {
   if (variants.has(pathKind)) return variants.get(pathKind);
   const position = sourcePosition(node);
   const id = stableId("path", ...nodeKey(node, pathKind));
+  const literal = literalValue(node);
   addNode("T2", id, pathKind, compact(node.getText(node.getSourceFile())), {
     ...position,
     type: ts.isExpression(node) ? safeType(node) : null,
@@ -1021,6 +1022,8 @@ function pathForNode(node, pathKind = "value") {
     roles: [],
     type_facts: ts.isExpression(node) ? typeMetadata(node) : null,
     declared_type_facts: ts.isIdentifier(node) ? declaredTypeMetadata(node) : null,
+    literal: literal.literal,
+    literal_value: literal.value,
   });
   variants.set(pathKind, id);
   addEdge("EVIDENCED_BY", id, bodyForNode(node));
@@ -1750,11 +1753,14 @@ function callMetadata(node) {
     const key = literalValue(expression.argumentExpression);
     if (key.literal && typeof key.value === "string") methodName = key.value;
   }
+  const receiverSymbolId = receiverNode ? targetForValueNode(receiverNode) : null;
   return {
     callee,
     form: ts.isNewExpression(node) ? "constructor" :
       receiverExpression ? "method" : "call",
     receiver_expression: receiverExpression,
+    receiver_symbol_id: receiverSymbolId,
+    receiver_value_id: receiverSymbolId || (receiverNode ? pathForNode(receiverNode) : null),
     receiver_call_id: (
       (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) &&
       ts.isCallExpression(expression.expression)

@@ -12,15 +12,14 @@ ROUTE_METHODS = frozenset({
 
 
 def _literal_value(argument: dict) -> str | None:
-    label = str(argument.get("label", ""))
-    if len(label) < 2 or label[0] not in {'"', "'", "`"} or label[-1] != label[0]:
-        return None
-    if label[0] == "`" and "${" in label:
-        return None
-    return label[1:-1]
+    properties = argument.get("properties", {})
+    return str(properties.get("literal_value")) if properties.get("literal") else None
 
 
 def _handler_target(index: GraphIndex, argument: dict) -> dict | None:
+    for target in index.targets(argument["id"], "PASSES_CALLBACK"):
+        if target.get("kind") in {"function", "method"}:
+            return target
     for syntax in index.targets(argument["id"], "EXPANDS_TO", "EVIDENCED_BY"):
         for target in index.targets(syntax["id"], "REFERS_TO"):
             if target.get("kind") in {"function", "method"}:

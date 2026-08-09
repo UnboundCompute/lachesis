@@ -652,6 +652,52 @@ class CompilerFrontendTests(unittest.TestCase):
         }
         self.assertTrue(applied_locations & account_read_locations)
 
+    def test_canonical_runtime_and_async_event_overlays(self) -> None:
+        graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "async_events")
+        )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        effects = [
+            node for node in nodes.values()
+            if node["kind"] == "function-effect"
+            and node["id"].startswith("v2:runtime-model:generic-runtime-behaviors:")
+        ]
+        self.assertTrue(effects)
+        handle = next(
+            node for node in nodes.values()
+            if node["kind"] == "function" and node["label"] == "handle"
+        )
+        self.assertGreaterEqual(sum(
+            edge["kind"] == "REGISTERS_CALLBACK" and edge["target"] == handle["id"]
+            for edge in graph["edges"]
+        ), 3)
+        data_events = [
+            node for node in nodes.values()
+            if node["kind"] == "async-event"
+            and node["properties"].get("event_name") == "data"
+        ]
+        self.assertEqual(1, len(data_events))
+        self.assertTrue(any(
+            edge["kind"] == "HANDLED_BY"
+            and edge["source"] == data_events[0]["id"]
+            and edge["target"] == handle["id"]
+            for edge in graph["edges"]
+        ))
+        self.assertTrue(any(
+            edge["kind"] == "EMITS_EVENT" and edge["target"] == data_events[0]["id"]
+            for edge in graph["edges"]
+        ))
+        self.assertTrue(any(
+            edge["kind"] == "SCHEDULES" and edge["target"] == handle["id"]
+            and edge["properties"].get("queue") == "timer"
+            for edge in graph["edges"]
+        ))
+        self.assertTrue(any(
+            edge["kind"] == "ASYNC_CONTINUES_AT"
+            and edge["properties"].get("suspension") == "await"
+            for edge in graph["edges"]
+        ))
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             with patch(

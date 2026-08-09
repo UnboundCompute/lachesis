@@ -545,6 +545,8 @@ def run_project_frontends(
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), languages, capabilities,
     )
+    from .core.overlays import default_model_overlay_registry
+    graph = default_model_overlay_registry().enrich(graph)
     from .core.overlays import default_security_overlay_registry
     graph = default_security_overlay_registry().enrich(graph)
     return graph, snapshots

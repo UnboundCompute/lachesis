@@ -1,5 +1,6 @@
 """Registered language-neutral analyses over canonical compiler facts."""
 
+from .async_events import AsyncEvents
 from .effects import ParameterPropertyEffects, apply_parameter_property_effects
 from .branch_history import BranchHistory
 from .control_flow import ControlFlow
@@ -27,8 +28,15 @@ def default_security_overlay_registry() -> OverlayRegistry:
     return registry
 
 
+def default_model_overlay_registry() -> OverlayRegistry:
+    registry = OverlayRegistry()
+    registry.register(AsyncEvents())
+    return registry
+
+
 __all__ = [
     "CanonicalOverlay",
+    "AsyncEvents",
     "BranchHistory",
     "ControlFlow",
     "InterproceduralContexts",
@@ -39,5 +47,6 @@ __all__ = [
     "TaintPropagation",
     "apply_parameter_property_effects",
     "default_overlay_registry",
+    "default_model_overlay_registry",
     "default_security_overlay_registry",
 ]
