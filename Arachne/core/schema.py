@@ -48,7 +48,7 @@ VALUE_NODE_KINDS = frozenset({
 CONTROL_RUNTIME_NODE_KINDS = frozenset({
     "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit", "phi",
     "async-event", "dynamic-behavior", "function-effect", "module-initializer",
-    "static-initializer", "singleton", "module-state",
+    "static-initializer", "singleton", "module-state", "unreachable-region",
 })
 SECURITY_EVIDENCE_NODE_KINDS = frozenset({
     "source", "sink", "boundary", "guard", "taint-reach", "diagnostic",
@@ -93,6 +93,8 @@ FRONTEND_FORBIDDEN_NODE_KINDS = frozenset({
     "source", "sink", "boundary", "guard", "taint-reach",
     "call-context", "context-parameter", "context-return",
     "singleton", "module-state", "import-cycle",
+    "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit",
+    "phi", "unreachable-region",
 })
 
 STRUCTURE_EDGE_KINDS = frozenset({
@@ -124,6 +126,7 @@ CONTROL_EDGE_KINDS = frozenset({
     "CFG_NEXT", "EXECUTES_BEFORE", "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH",
     "LOOP_BACK", "LOOP_TRUE", "ITERATES", "EXCEPTION_BRANCH", "TRY_BODY", "RUNS_FINALLY",
     "MERGES_AT", "SHORT_CIRCUIT_LEFT", "SHORT_CIRCUIT_RIGHT",
+    "SWITCH_CASE", "BREAKS_TO", "CONTINUES_TO",
 })
 RUNTIME_SECURITY_EDGE_KINDS = frozenset({
     "CAPTURES", "MUTATES", "APPLIES_EFFECT", "REGISTERS_CALLBACK", "HANDLED_BY",

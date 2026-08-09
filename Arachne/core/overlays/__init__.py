@@ -1,6 +1,7 @@
 """Registered language-neutral analyses over canonical compiler facts."""
 
 from .effects import ParameterPropertyEffects, apply_parameter_property_effects
+from .control_flow import ControlFlow
 from .interprocedural import InterproceduralContexts
 from .module_initialization import ModuleInitialization
 from .registry import CanonicalOverlay, OverlayRegistry
@@ -9,6 +10,7 @@ from .taint import TaintPropagation
 
 def default_overlay_registry() -> OverlayRegistry:
     registry = OverlayRegistry()
+    registry.register(ControlFlow())
     registry.register(InterproceduralContexts())
     registry.register(ModuleInitialization())
     registry.register(ParameterPropertyEffects())
@@ -23,6 +25,7 @@ def default_security_overlay_registry() -> OverlayRegistry:
 
 __all__ = [
     "CanonicalOverlay",
+    "ControlFlow",
     "InterproceduralContexts",
     "ModuleInitialization",
     "OverlayRegistry",

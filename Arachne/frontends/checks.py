@@ -516,6 +516,40 @@ class CompilerFrontendTests(unittest.TestCase):
             for edge in cycle_graph["edges"]
         ))
 
+    def test_canonical_control_flow_overlay(self) -> None:
+        graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "control_flow")
+        )
+        function = next(
+            node for node in graph["nodes"]
+            if node["kind"] == "function" and node["label"] == "controlFlow"
+        )
+        owned = {
+            node["id"]: node for node in graph["nodes"]
+            if node.get("properties", {}).get("function_id") == function["id"]
+        }
+        self.assertEqual(1, sum(node["kind"] == "cfg-entry" for node in owned.values()))
+        self.assertEqual(1, sum(node["kind"] == "cfg-exit" for node in owned.values()))
+        self.assertGreaterEqual(sum(node["kind"] == "cfg-condition" for node in owned.values()), 5)
+        self.assertGreaterEqual(sum(node["kind"] == "cfg-merge" for node in owned.values()), 5)
+        edge_kinds = {
+            edge["kind"] for edge in graph["edges"]
+            if edge["source"] in owned or edge["target"] in owned
+        }
+        self.assertTrue({
+            "CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK",
+            "SWITCH_CASE", "MERGES_AT",
+        }.issubset(edge_kinds))
+        unreachable = [
+            node for node in owned.values() if node["kind"] == "unreachable-region"
+        ]
+        self.assertEqual(1, len(unreachable))
+        body = next(
+            node for node in graph["nodes"]
+            if node["id"] == unreachable[0]["properties"]["body_id"]
+        )
+        self.assertEqual("total = 999;", body["label"])
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             with patch(
@@ -616,7 +650,7 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(81, totals["arguments"])
             self.assertEqual(38, totals["returns"])
             self.assertEqual(159, totals["statements"])
-            self.assertEqual(1121, totals["expressions"])
+            self.assertEqual(1118, totals["expressions"])
             self.assertEqual(326, totals["operations"])
             self.assertEqual(81, totals["cfg_nodes"])
             self.assertEqual(24, totals["taint_sources"])

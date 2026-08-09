@@ -907,13 +907,51 @@ function ownerFunction(node) {
   return null;
 }
 
+function enclosingOwnerFunction(node) {
+  return ownerFunction(node?.parent);
+}
+
+function canonicalControlKind(node) {
+  if (ts.isBlock(node) || ts.isModuleBlock(node)) return "block";
+  if (ts.isIfStatement(node)) return "if";
+  if (ts.isSwitchStatement(node)) return "switch";
+  if (ts.isCaseClause(node)) return "case";
+  if (ts.isDefaultClause(node)) return "default";
+  if (ts.isForStatement(node)) return "for";
+  if (ts.isForInStatement(node) || ts.isForOfStatement(node)) return "for-each";
+  if (ts.isWhileStatement(node)) return "while";
+  if (ts.isDoStatement(node)) return "do-while";
+  if (ts.isTryStatement(node)) return "try";
+  if (ts.isCatchClause(node)) return "catch";
+  if (ts.isReturnStatement(node)) return "return";
+  if (ts.isThrowStatement(node)) return "throw";
+  if (ts.isBreakStatement(node)) return "break";
+  if (ts.isContinueStatement(node)) return "continue";
+  if (ts.isVariableStatement(node)) return "declaration";
+  if (ts.isExpressionStatement(node)) return "expression";
+  return ts.isStatement(node) ? "statement" : null;
+}
+
+function enclosingControlTransferTarget(node, continueOnly = false) {
+  let current = node.parent;
+  while (current && !isFunctionEntity(current)) {
+    if (ts.isForStatement(current) || ts.isForInStatement(current) ||
+        ts.isForOfStatement(current) || ts.isWhileStatement(current) ||
+        ts.isDoStatement(current)) return current;
+    if (!continueOnly && ts.isSwitchStatement(current)) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
 function bodyForNode(node) {
   if (bodyByNode.has(node)) return bodyByNode.get(node);
   const position = sourcePosition(node);
   let kind = "expression";
   if (ts.isCallExpression(node)) kind = "call";
   else if (ts.isNewExpression(node)) kind = "construct";
-  else if (ts.isStatement(node) || ts.isCaseClause(node) || ts.isDefaultClause(node)) kind = "statement";
+  else if (ts.isStatement(node) || ts.isBlock(node) || ts.isModuleBlock(node) ||
+      ts.isCaseClause(node) || ts.isDefaultClause(node)) kind = "statement";
   else if (ts.isIdentifier(node)) kind = "identifier";
   const id = stableId("body", ...nodeKey(node, ts.SyntaxKind[node.kind]));
   const operator = ts.isBinaryExpression(node) ? node.operatorToken.getText() :
@@ -924,7 +962,12 @@ function bodyForNode(node) {
     syntax_kind: ts.SyntaxKind[node.kind],
     type: ts.isExpression(node) ? safeType(node) : null,
     operator,
-    owner_function_id: ownerFunction(node),
+    control_kind: canonicalControlKind(node),
+    // A function declaration is executable structure of its enclosing frame,
+    // not a statement inside the function it declares. Its children switch to
+    // the declared function as their owner in the traversal below.
+    owner_function_id: isFunctionEntity(node)
+      ? enclosingOwnerFunction(node) : ownerFunction(node),
     scope_id: nearestScope(node),
     type_facts: ts.isExpression(node) ? typeMetadata(node) : null,
     declared_type_facts: ts.isIdentifier(node) ? declaredTypeMetadata(node) : null,
@@ -2408,7 +2451,8 @@ for (const fileName of analysisFileNames) {
     if (isFunctionEntity(node)) owningFunction = entityByDeclaration.get(node) || currentFunction;
 
     const includeBody = node !== sf && (
-      ts.isStatement(node) || ts.isExpression(node) ||
+      ts.isStatement(node) || ts.isExpression(node) || ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
       ts.isCaseClause(node) || ts.isDefaultClause(node)
     );
     let bodyId = parentBody;
@@ -2416,7 +2460,11 @@ for (const fileName of analysisFileNames) {
       bodyId = bodyForNode(node);
       addEdge("EVIDENCED_BY", bodyId, proofForNode(node));
       if (parentBody) addEdge("AST_CHILD", parentBody, bodyId, astChildMetadata(node.parent, node));
-      else addEdge("CONTAINS_BODY", owningFunction || fileId, bodyId);
+      else addEdge(
+        "CONTAINS_BODY",
+        (isFunctionEntity(node) ? currentFunction : owningFunction) || fileId,
+        bodyId,
+      );
     }
 
     addAllocation(node, owningFunction);
@@ -2640,6 +2688,14 @@ for (const fileName of analysisFileNames) {
       addEdge("LOOP_BACK", bodyForNode(node.statement), bodyForNode(node.expression));
     } else if (ts.isSwitchStatement(node)) {
       recordSwitchRefinements(node);
+      addEdge("CONDITION", bodyForNode(node), bodyForNode(node.expression));
+      for (const clause of node.caseBlock.clauses) {
+        addEdge("SWITCH_CASE", bodyForNode(node.expression), bodyForNode(clause), {
+          default: ts.isDefaultClause(clause),
+          label: ts.isCaseClause(clause)
+            ? compact(clause.expression.getText(clause.getSourceFile()), 160) : null,
+        });
+      }
     } else if (ts.isTryStatement(node)) {
       addEdge("TRY_BODY", bodyForNode(node), bodyForNode(node.tryBlock));
       if (node.catchClause) addEdge("EXCEPTION_BRANCH", bodyForNode(node.tryBlock), bodyForNode(node.catchClause.block));
@@ -2656,9 +2712,16 @@ for (const fileName of analysisFileNames) {
       addEdge("SHORT_CIRCUIT_RIGHT", bodyForNode(node.left), bodyForNode(node.right), {
         operator: node.operatorToken.getText(),
       });
+    } else if (ts.isBreakStatement(node)) {
+      const target = enclosingControlTransferTarget(node, false);
+      if (target) addEdge("BREAKS_TO", bodyForNode(node), bodyForNode(target));
+    } else if (ts.isContinueStatement(node)) {
+      const target = enclosingControlTransferTarget(node, true);
+      if (target) addEdge("CONTINUES_TO", bodyForNode(node), bodyForNode(target));
     }
 
-    ts.forEachChild(node, (child) => visit(child, bodyId, owningFunction));
+    const childParentBody = isFunctionEntity(node) ? null : bodyId;
+    ts.forEachChild(node, (child) => visit(child, childParentBody, owningFunction));
   };
   visit(sf, null, null);
   recordModuleInitializers(sf, fileId);

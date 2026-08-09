@@ -43,6 +43,11 @@ context-specific heap effects, framework wiring, and effect-resolved dispatch.
 An LLM query layer should still calculate focused slices rather than loading the
 entire graph.
 
+Control flow follows the same ownership boundary. Frontends emit exact AST,
+statement-order, condition, branch, loop, switch, exception, and transfer facts.
+The language-neutral control-flow overlay composes those facts into per-function
+entry, condition, merge, and exit nodes plus explicit unreachable regions.
+
 Cross-tier relationships are split into:
 
 - `expands_to`: structural drill-down links.

@@ -377,6 +377,24 @@ def main() -> int:
             return {"role": "CONDITION" if index == 0 else "LOOP_BODY"}
         return {"role": "AST_CHILD"}
 
+    def control_kind(kind: str) -> Optional[str]:
+        return {
+            "CompoundStmt": "block",
+            "IfStmt": "if",
+            "SwitchStmt": "switch",
+            "CaseStmt": "case",
+            "DefaultStmt": "default",
+            "ForStmt": "for",
+            "WhileStmt": "while",
+            "DoStmt": "do-while",
+            "ReturnStmt": "return",
+            "BreakStmt": "break",
+            "ContinueStmt": "continue",
+            "GotoStmt": "goto",
+            "IndirectGotoStmt": "computed-goto",
+            "DeclStmt": "declaration",
+        }.get(kind, "statement" if kind.endswith("Stmt") else None)
+
     def bodies(
         node: dict, path: Path, owner: Optional[str] = None,
         parent_body: Optional[str] = None, included: bool = False,
@@ -402,6 +420,7 @@ def main() -> int:
                 "T3", body_id, node_kind, snippet or kind, **position,
                 syntax_kind=kind, type=node.get("type", {}).get("qualType"),
                 operator=node.get("opcode"), owner_function_id=owner,
+                control_kind=control_kind(kind),
             )
             proof_id = stable_id("source-proof", path, position["start_offset"], position["end_offset"], kind)
             graph.node("T4", proof_id, "source-span", f"{path.name}:{position['start_line']}", **position, text=snippet, syntax_kind=kind)
