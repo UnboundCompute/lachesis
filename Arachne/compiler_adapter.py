@@ -198,7 +198,21 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "signature": properties.get("signature"),
                 "scope_id": properties.get("scope_id"),
                 "captures": list(properties.get("capture_symbol_ids", [])),
+                "type_parameter_ids": list(properties.get("type_parameter_ids", [])),
+                "type_predicate": properties.get("type_predicate"),
             })
+            if properties.get("overload_of"):
+                digest = hashlib.sha256(
+                    f"overload-view:{node['id']}".encode("utf-8")
+                ).hexdigest()[:16]
+                info["overloads"].append({
+                    "id": f"overload-view:{digest}",
+                    "compiler_node_id": node["id"],
+                    "name": node["label"],
+                    "line": properties["start_line"],
+                    "signature": properties.get("signature") or node["label"],
+                    "implementation_id": properties["overload_of"],
+                })
         elif node["kind"] in {"class", "interface", "type", "enum"}:
             info["types"].append({
                 "id": node["id"], "kind": node["kind"], "name": node["label"],
@@ -207,6 +221,44 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "exported": bool(properties.get("exported")),
                 "extends": properties.get("extends", []),
                 "implements": properties.get("implements", []),
+                "members": list(properties.get("members", [])),
+                "type_parameter_ids": list(properties.get("type_parameter_ids", [])),
+                "alias_expression": properties.get("alias_expression"),
+                "union_members": list(properties.get("union_members", [])),
+                "conditional": bool(properties.get("conditional")),
+                "mapped": bool(properties.get("mapped")),
+            })
+        elif node["kind"] == "type-parameter":
+            info["type_parameters"].append({
+                "id": node["id"],
+                "compiler_node_id": node["id"],
+                "owner_id": properties["owner_id"],
+                "position": properties["position"],
+                "name": node["label"],
+                "constraint": properties.get("constraint"),
+                "default": properties.get("default"),
+            })
+        elif node["kind"] == "type-refinement":
+            info["type_refinements"].append({
+                "id": node["id"],
+                "compiler_node_id": node["id"],
+                "expression_id": properties["expression_id"],
+                "symbol_id": properties["symbol_id"],
+                "kind": properties["refinement_kind"],
+                "narrowed_type": properties["narrowed_type"],
+                "true_branch": properties["true_branch"],
+                "false_excludes": properties.get("false_excludes"),
+                "line": properties["start_line"],
+                "case_statement_id": properties.get("case_statement_id"),
+            })
+        elif node["kind"] == "generic-substitution":
+            info["generic_substitutions"].append({
+                "id": node["id"],
+                "compiler_node_id": node["id"],
+                "call_id": properties["call_id"],
+                "function_id": properties.get("function_id"),
+                "bindings": dict(properties.get("bindings", {})),
+                "complete": bool(properties.get("complete")),
             })
         elif node["kind"] == "scope":
             info["scopes"].append({
@@ -307,6 +359,24 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                     "end_offset": properties["end_offset"], "start_line": properties["start_line"],
                     "end_line": properties["end_line"], "function_id": owner["id"],
                 })
+
+    for edge in snapshot.edges:
+        if edge["kind"] != "STRUCTURALLY_COMPATIBLE_WITH":
+            continue
+        source = nodes.get(edge["source"], {})
+        source_path = source.get("properties", {}).get("absolute_file")
+        if not source_path or os.path.abspath(source_path) not in infos:
+            continue
+        digest = hashlib.sha256(
+            f"type-compatibility-view:{edge['source']}:{edge['target']}".encode("utf-8")
+        ).hexdigest()[:16]
+        infos[os.path.abspath(source_path)]["type_compatibilities"].append({
+            "id": f"type-compatibility-view:{digest}",
+            "source_type_id": edge["source"],
+            "target_type_id": edge["target"],
+            "matched_members": list(edge.get("properties", {}).get("matched_members", [])),
+            "kind": "structural",
+        })
 
     for edge in snapshot.edges:
         if edge["source"] not in file_nodes:

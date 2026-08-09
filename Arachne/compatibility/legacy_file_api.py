@@ -19,7 +19,6 @@ from ..module_init_analysis import analyze_module_init
 from ..receiver_analysis import resolve_receivers
 from ..runtime_models import analyze_runtime_models
 from ..taint_analysis import analyze_taint
-from ..type_system_analysis import analyze_type_system
 from ..types import FileInfo
 from ..wiring_analysis import analyze_wiring
 
@@ -122,7 +121,6 @@ def run_semantic_overlays(results: List[FileInfo]) -> List[FileInfo]:
     for info in results:
         build_control_flow(info)
     analyze_branch_histories(results)
-    analyze_type_system(results)
     analyze_runtime_models(results)
     analyze_effects(results)
     analyze_async_flow(results)

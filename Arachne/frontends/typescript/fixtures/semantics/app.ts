@@ -31,6 +31,23 @@ export function identity<T>(value: T): T {
   return value;
 }
 
+export function overloaded(value: string): string;
+export function overloaded(value: number): number;
+export function overloaded(value: string | number): string | number {
+  return value;
+}
+
+type Message =
+  | { kind: "text"; value: string }
+  | { kind: "count"; value: number };
+
+export function narrowMessage(message: Message, value: unknown): string {
+  if (message.kind === "text" && typeof value === "string") {
+    return message.value + value;
+  }
+  return "";
+}
+
 export function execute(
   value: string | number,
   runner: Runner<string>,

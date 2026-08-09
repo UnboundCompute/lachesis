@@ -138,7 +138,17 @@ function relative(fileName) {
 }
 
 function compact(text, limit = 240) {
-  const value = String(text || "").replace(/\s+/g, " ").trim();
+  let value = "";
+  let pendingSpace = false;
+  for (const character of String(text || "").trim()) {
+    if (character.trim() === "") {
+      pendingSpace = Boolean(value);
+    } else {
+      if (pendingSpace) value += " ";
+      value += character;
+      pendingSpace = false;
+    }
+  }
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
@@ -306,6 +316,7 @@ const scopeKinds = new Map();
 const moduleScopeIds = new Map();
 const lexicalSymbols = [];
 const symbolIdsByTarget = new Map();
+const typeParameterIdsByDeclaration = new Map();
 const definitionHistoryByTarget = new Map();
 const definitionByDeclaration = new Map();
 const propertyPathIds = new Map();
@@ -572,6 +583,101 @@ function declarationTypeExtensions(node) {
   return { type_parameters: typeParameters, heritage, overloads };
 }
 
+function declarationTypePredicate(node) {
+  if (!isFunctionEntity(node)) return null;
+  try {
+    const signature = checker.getSignatureFromDeclaration(node);
+    const predicate = signature ? checker.getTypePredicateOfSignature(signature) : null;
+    if (!predicate) return null;
+    return {
+      kind: ts.TypePredicateKind[predicate.kind],
+      asserts: predicate.kind === ts.TypePredicateKind.AssertsIdentifier ||
+        predicate.kind === ts.TypePredicateKind.AssertsThis,
+      parameter: predicate.parameterName ||
+        (predicate.kind === ts.TypePredicateKind.This ||
+         predicate.kind === ts.TypePredicateKind.AssertsThis ? "this" : null),
+      parameter_index: predicate.parameterIndex,
+      type: predicate.type ? safeTypeFromType(predicate.type, node) : "truthy",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function declarationMemberName(member) {
+  if (!member.name) return null;
+  if (ts.isIdentifier(member.name) || ts.isPrivateIdentifier(member.name) ||
+      ts.isStringLiteralLike(member.name) || ts.isNumericLiteral(member.name)) {
+    return member.name.text;
+  }
+  if (ts.isComputedPropertyName(member.name)) {
+    return `[${compact(member.name.expression.getText(member.getSourceFile()), 120)}]`;
+  }
+  return compact(member.name.getText(member.getSourceFile()), 120);
+}
+
+function directTypeMembers(node) {
+  let members = node.members ? [...node.members] : [];
+  if (ts.isTypeAliasDeclaration(node) && ts.isTypeLiteralNode(node.type)) {
+    members = [...node.type.members];
+  }
+  return members.map((member) => ({
+    name: declarationMemberName(member),
+    optional: Boolean(member.questionToken),
+    readonly: hasModifier(member, ts.SyntaxKind.ReadonlyKeyword),
+    kind: ts.SyntaxKind[member.kind],
+    type: member.name ? safeType(member.name) : safeType(member),
+  })).filter((member) => member.name);
+}
+
+function typeDeclarationProperties(node, extensions) {
+  const heritage = extensions.heritage || [];
+  const result = {
+    members: directTypeMembers(node),
+    extends: heritage.filter((item) => item.relationship === "extends")
+      .map((item) => item.type),
+    implements: heritage.filter((item) => item.relationship === "implements")
+      .map((item) => item.type),
+  };
+  if (ts.isTypeAliasDeclaration(node)) {
+    Object.assign(result, {
+      alias_expression: compact(node.type.getText(node.getSourceFile()), 1000),
+      union_members: ts.isUnionTypeNode(node.type)
+        ? node.type.types.map((item) => compact(item.getText(node.getSourceFile()), 300)) : [],
+      conditional: ts.isConditionalTypeNode(node.type),
+      mapped: ts.isMappedTypeNode(node.type),
+    });
+  }
+  return result;
+}
+
+function registerTypeParameters(node, ownerId) {
+  const result = [];
+  for (const [positionIndex, parameter] of [...(node.typeParameters || [])].entries()) {
+    const position = sourcePosition(parameter);
+    const id = stableId(
+      "type-parameter", ...nodeKey(parameter, `${ownerId}:${positionIndex}:${parameter.name.text}`),
+    );
+    addNode("T2", id, "type-parameter", parameter.name.text, {
+      ...position,
+      owner_id: ownerId,
+      position: positionIndex,
+      constraint: parameter.constraint
+        ? compact(parameter.constraint.getText(parameter.getSourceFile()), 500) : null,
+      default: parameter.default
+        ? compact(parameter.default.getText(parameter.getSourceFile()), 500) : null,
+      type: safeType(parameter.name),
+      frontend_extensions: {
+        typescript: { syntax_kind: ts.SyntaxKind[parameter.kind] },
+      },
+    });
+    addEdge("HAS_TYPE_PARAMETER", ownerId, id, { position: positionIndex });
+    typeParameterIdsByDeclaration.set(parameter, id);
+    result.push(id);
+  }
+  return result;
+}
+
 function literalValue(node) {
   if (!node) return { literal: false, value: null };
   if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) {
@@ -673,6 +779,9 @@ function registerEntity(node, ownerId = null) {
   const name = declarationName(node);
   const position = sourcePosition(node);
   const id = stableId(kind, ...nodeKey(node, name));
+  const typeExtensions = declarationTypeExtensions(node);
+  const declaredTypeProperties = ["class", "interface", "type", "enum"].includes(kind)
+    ? typeDeclarationProperties(node, typeExtensions) : {};
   const signature = isFunctionEntity(node) ? (() => {
     try {
       const sig = checker.getSignatureFromDeclaration(node);
@@ -716,11 +825,20 @@ function registerEntity(node, ownerId = null) {
     owner_id: ownerId,
     parameters_start_offset: parameterRange.start,
     parameters_end_offset: parameterRange.end,
+    type_predicate: declarationTypePredicate(node),
+    ...declaredTypeProperties,
     frontend_extensions: {
-      typescript: declarationTypeExtensions(node),
+      typescript: typeExtensions,
     },
   });
   entityByDeclaration.set(node, id);
+  const typeParameterIds = registerTypeParameters(node, id);
+  if (typeParameterIds.length) {
+    nodes.get(id).properties.type_parameter_ids = typeParameterIds;
+    typeExtensions.type_parameters.forEach((parameter, index) => {
+      parameter.node_id = typeParameterIds[index];
+    });
+  }
   const decoratorIds = registerDecorators(node, id);
   if (decoratorIds.length) nodes.get(id).properties.decorator_ids = decoratorIds;
   const sfId = ensureSourceFile(node.getSourceFile(), "referenced-declaration");
@@ -899,7 +1017,7 @@ function propertyPathForNode(node) {
   addNode("T2", id, "property-path", `${nodes.get(baseId)?.label || current.getText()}${pathText}`, {
     ...position,
     base_value_id: baseId,
-    path: pathText.replace(/^\./, ""),
+    path: pathText.startsWith(".") ? pathText.slice(1) : pathText,
     dynamic: pieces.some((piece) => piece.startsWith("[")),
     owner_function_id: ownerFunction(node),
     type: safeType(node),
@@ -1413,6 +1531,60 @@ for (const fileName of analysisFileNames) {
     ts.forEachChild(node, (child) => visit(child, nextFunction, nextType, nextScope));
   };
   visit(sf, null, null, moduleScope);
+}
+
+// Overload ownership and structural compatibility come from compiler symbols
+// and types. They are direct type-system facts, not reconstructed declarations.
+for (const [declaration, declarationId] of entityByDeclaration) {
+  if (!isFunctionEntity(declaration) || declaration.body || !declaration.name) continue;
+  try {
+    const symbol = checker.getSymbolAtLocation(declaration.name);
+    const implementation = (symbol?.declarations || []).find((candidate) =>
+      isFunctionEntity(candidate) && Boolean(candidate.body));
+    const implementationId = implementation ? entityForDeclaration(implementation) : null;
+    if (implementationId && implementationId !== declarationId) {
+      nodes.get(declarationId).properties.overload_of = implementationId;
+      addEdge("OVERLOAD_OF", declarationId, implementationId, {
+        compiler_resolved: true,
+      });
+    }
+  } catch { /* an unresolved overload remains a body-less declaration */ }
+}
+
+const applicationTypeDeclarations = [...entityByDeclaration.entries()].filter(
+  ([declaration, declarationId]) =>
+    ["class", "interface", "type"].includes(nodes.get(declarationId)?.kind) &&
+    rootSet.has(normalize(declaration.getSourceFile().fileName)),
+);
+for (const [sourceDeclaration, sourceId] of applicationTypeDeclarations) {
+  let sourceType = null;
+  try {
+    sourceType = checker.getTypeAtLocation(sourceDeclaration.name || sourceDeclaration);
+  } catch { /* malformed declarations remain represented without compatibility edges */ }
+  if (!sourceType) continue;
+  for (const [targetDeclaration, targetId] of applicationTypeDeclarations) {
+    if (sourceId === targetId) continue;
+    let targetType = null;
+    try {
+      targetType = checker.getTypeAtLocation(targetDeclaration.name || targetDeclaration);
+    } catch { /* handled below */ }
+    if (!targetType) continue;
+    const requiredMembers = checker.getPropertiesOfType(targetType)
+      .filter((member) => !(member.flags & ts.SymbolFlags.Optional))
+      .map((member) => member.getName())
+      .sort();
+    if (!requiredMembers.length) continue;
+    let compatible = false;
+    try {
+      compatible = Boolean(checker.isTypeAssignableTo?.(sourceType, targetType));
+    } catch { /* compiler versions without the helper omit this exact fact */ }
+    if (compatible) {
+      addEdge("STRUCTURALLY_COMPATIBLE_WITH", sourceId, targetId, {
+        matched_members: requiredMembers,
+        compiler_resolved: true,
+      });
+    }
+  }
 }
 
 // Compiler-owned inheritance and interface relationships seed dynamic dispatch
@@ -1992,6 +2164,281 @@ function recordModuleInitializers(sf, fileId) {
   }
 }
 
+function unwrapRefinementExpression(node) {
+  let current = node;
+  while (current && (
+    ts.isParenthesizedExpression(current) || ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current) ||
+    ts.isSatisfiesExpression(current)
+  )) current = current.expression;
+  return current;
+}
+
+function refinementTarget(node) {
+  let current = unwrapRefinementExpression(node);
+  const properties = [];
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    if (ts.isPropertyAccessExpression(current)) {
+      properties.unshift(current.name.text);
+      current = unwrapRefinementExpression(current.expression);
+    } else {
+      const key = literalValue(current.argumentExpression);
+      properties.unshift(key.literal ? String(key.value) :
+        `[${compact(current.argumentExpression?.getText(current.getSourceFile()) || "?", 100)}]`);
+      current = unwrapRefinementExpression(current.expression);
+    }
+  }
+  if (!current || (!ts.isIdentifier(current) && current.kind !== ts.SyntaxKind.ThisKeyword)) {
+    return null;
+  }
+  const targetId = current.kind === ts.SyntaxKind.ThisKeyword
+    ? ownerFunction(current) : targetForValueNode(current);
+  if (!targetId) return null;
+  const symbolId = nodes.get(targetId)?.properties?.symbol_id ||
+    symbolIdsByTarget.get(targetId) || targetId;
+  return {
+    expression: node,
+    base_expression: current,
+    target_id: targetId,
+    symbol_id: symbolId,
+    property_path: properties.join("."),
+  };
+}
+
+function comparisonLiteral(node) {
+  const current = unwrapRefinementExpression(node);
+  const literal = literalValue(current);
+  if (literal.literal) return {
+    matched: true,
+    value: literal.value,
+    display: compact(current.getText(current.getSourceFile()), 160),
+  };
+  if (ts.isIdentifier(current) && current.text === "undefined") {
+    return { matched: true, value: "undefined", display: "undefined" };
+  }
+  return { matched: false, value: null, display: null };
+}
+
+function addTypeRefinement(
+  condition, targetExpression, refinementKind, narrowedType, trueBranch, details = {},
+) {
+  const target = refinementTarget(targetExpression);
+  if (!target) return null;
+  const position = sourcePosition(details.evidence_node || condition);
+  const conditionId = bodyForNode(condition);
+  const id = stableId(
+    "type-refinement", ...nodeKey(
+      details.evidence_node || condition,
+      `${target.symbol_id}:${target.property_path}:${refinementKind}:${narrowedType}:${trueBranch}`,
+    ),
+  );
+  addNode("T2", id, "type-refinement", narrowedType, {
+    ...position,
+    expression_id: conditionId,
+    symbol_id: target.symbol_id,
+    target_id: target.target_id,
+    property_path: target.property_path,
+    refinement_kind: refinementKind,
+    narrowed_type: narrowedType,
+    true_branch: trueBranch,
+    false_excludes: narrowedType,
+    owner_function_id: ownerFunction(condition),
+    operator: details.operator || null,
+    compared_value: details.compared_value,
+    case_statement_id: details.case_statement_id || null,
+  });
+  addEdge("NARROWS_TYPE", conditionId, id, { true_branch: trueBranch });
+  addEdge("REFINES_SYMBOL", id, target.symbol_id, {
+    property_path: target.property_path,
+  });
+  return id;
+}
+
+const EQUALITY_OPERATORS = new Set([
+  ts.SyntaxKind.EqualsEqualsToken,
+  ts.SyntaxKind.EqualsEqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsEqualsToken,
+]);
+
+function recordConditionRefinements(condition, positive = true, rootCondition = condition) {
+  const current = unwrapRefinementExpression(condition);
+  if (!current) return;
+  if (ts.isPrefixUnaryExpression(current) &&
+      current.operator === ts.SyntaxKind.ExclamationToken) {
+    recordConditionRefinements(current.operand, !positive, rootCondition);
+    return;
+  }
+  if (ts.isBinaryExpression(current) && [
+    ts.SyntaxKind.AmpersandAmpersandToken,
+    ts.SyntaxKind.BarBarToken,
+    ts.SyntaxKind.QuestionQuestionToken,
+  ].includes(current.operatorToken.kind)) {
+    recordConditionRefinements(current.left, positive, rootCondition);
+    recordConditionRefinements(current.right, positive, rootCondition);
+    return;
+  }
+  if (ts.isBinaryExpression(current) &&
+      current.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword) {
+    addTypeRefinement(
+      rootCondition, current.left, "instanceof",
+      compact(current.right.getText(current.getSourceFile()), 300), positive,
+      { operator: "instanceof", evidence_node: current },
+    );
+    return;
+  }
+  if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.InKeyword) {
+    const key = comparisonLiteral(current.left);
+    if (key.matched) addTypeRefinement(
+      rootCondition, current.right, "property-presence", `has:${key.display}`, positive,
+      { operator: "in", compared_value: key.value, evidence_node: current },
+    );
+    return;
+  }
+  if (ts.isBinaryExpression(current) && EQUALITY_OPERATORS.has(current.operatorToken.kind)) {
+    const equality = [
+      ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.EqualsEqualsEqualsToken,
+    ].includes(current.operatorToken.kind);
+    const trueBranch = positive ? equality : !equality;
+    const pairs = [[current.left, current.right], [current.right, current.left]];
+    for (const [candidate, compared] of pairs) {
+      const literal = comparisonLiteral(compared);
+      if (!literal.matched) continue;
+      const unwrapped = unwrapRefinementExpression(candidate);
+      if (ts.isTypeOfExpression(unwrapped) && typeof literal.value === "string") {
+        addTypeRefinement(
+          rootCondition, unwrapped.expression, "typeof", String(literal.value), trueBranch,
+          {
+            operator: current.operatorToken.getText(), compared_value: literal.value,
+            evidence_node: current,
+          },
+        );
+        return;
+      }
+      const target = refinementTarget(unwrapped);
+      if (!target) continue;
+      const nullish = literal.value === null || literal.value === "undefined";
+      const refinementKind = nullish && !equality ? "non-null" :
+        target.property_path ? "discriminant" : "literal-equality";
+      const narrowed = nullish && !equality ? "NonNullable" :
+        target.property_path ? `${target.property_path}=${literal.display}` : literal.display;
+      addTypeRefinement(
+        rootCondition, unwrapped, refinementKind, narrowed, trueBranch,
+        {
+          operator: current.operatorToken.getText(), compared_value: literal.value,
+          evidence_node: current,
+        },
+      );
+      return;
+    }
+  }
+  if (ts.isCallExpression(current)) {
+    try {
+      const signature = checker.getResolvedSignature(current);
+      const predicate = signature ? checker.getTypePredicateOfSignature(signature) : null;
+      if (predicate) {
+        let targetExpression = null;
+        if (predicate.parameterIndex >= 0) {
+          targetExpression = current.arguments[predicate.parameterIndex];
+        } else if (ts.isPropertyAccessExpression(current.expression) ||
+            ts.isElementAccessExpression(current.expression)) {
+          targetExpression = current.expression.expression;
+        }
+        if (targetExpression) addTypeRefinement(
+          rootCondition, targetExpression, "type-predicate",
+          predicate.type ? safeTypeFromType(predicate.type, current) : "truthy", positive,
+          {
+            operator: ts.TypePredicateKind[predicate.kind],
+            evidence_node: current,
+          },
+        );
+        return;
+      }
+    } catch { /* unresolved calls do not establish compiler-backed refinements */ }
+  }
+  if (refinementTarget(current)) {
+    addTypeRefinement(rootCondition, current, "truthy", "truthy", positive, {
+      evidence_node: current,
+    });
+  }
+}
+
+function recordSwitchRefinements(node) {
+  const target = refinementTarget(node.expression);
+  if (!target?.property_path) return;
+  for (const clause of node.caseBlock.clauses) {
+    if (!ts.isCaseClause(clause)) continue;
+    const label = comparisonLiteral(clause.expression);
+    if (!label.matched) continue;
+    addTypeRefinement(
+      node.expression, node.expression, "discriminated-union-case",
+      `${target.property_path}=${label.display}`, true,
+      {
+        operator: "switch-case", compared_value: label.value,
+        case_statement_id: bodyForNode(clause), evidence_node: clause.expression,
+      },
+    );
+  }
+}
+
+function collectTypeBindings(formal, actual, location, bindings) {
+  if (!formal || !actual) return;
+  if (formal.flags & ts.TypeFlags.TypeParameter) {
+    const name = formal.symbol?.getName?.() || safeTypeFromType(formal, location);
+    bindings[name] = safeTypeFromType(actual, location);
+    return;
+  }
+  const formalArguments = formal.aliasTypeArguments || formal.typeArguments || [];
+  const actualArguments = actual.aliasTypeArguments || actual.typeArguments || [];
+  for (let index = 0; index < Math.min(formalArguments.length, actualArguments.length); index += 1) {
+    collectTypeBindings(formalArguments[index], actualArguments[index], location, bindings);
+  }
+}
+
+function recordGenericSubstitution(node, callId, targetId, signature) {
+  if (!signature) return null;
+  const genericSignature = signature.target || signature;
+  const typeParameters = [...(genericSignature.typeParameters || [])];
+  if (!typeParameters.length) return null;
+  const bindings = {};
+  const explicit = [...(node.typeArguments || [])];
+  for (let index = 0; index < Math.min(typeParameters.length, explicit.length); index += 1) {
+    try {
+      bindings[safeTypeFromType(typeParameters[index], node)] = safeType(explicit[index]);
+    } catch { /* a malformed explicit type argument remains unbound */ }
+  }
+  const genericParameters = [...(genericSignature.parameters || [])];
+  const instantiatedParameters = [...(signature.parameters || [])];
+  const argumentsList = [...(node.arguments || [])];
+  for (let index = 0; index < Math.min(genericParameters.length, argumentsList.length); index += 1) {
+    try {
+      const genericDeclaration = declarationForSymbol(genericParameters[index]);
+      const instantiatedDeclaration = declarationForSymbol(instantiatedParameters[index]);
+      const formal = checker.getTypeOfSymbolAtLocation(
+        genericParameters[index], genericDeclaration || node,
+      );
+      const actual = instantiatedParameters[index]
+        ? checker.getTypeOfSymbolAtLocation(
+          instantiatedParameters[index], instantiatedDeclaration || node,
+        ) : checker.getTypeAtLocation(argumentsList[index]);
+      collectTypeBindings(formal, actual, node, bindings);
+    } catch { /* partial inference is retained below */ }
+  }
+  const position = sourcePosition(node);
+  const id = stableId("generic-substitution", ...nodeKey(node, targetId || "unresolved"));
+  addNode("T2", id, "generic-substitution", "generic substitution", {
+    ...position,
+    call_id: callId,
+    function_id: targetId,
+    bindings,
+    complete: typeParameters.every((parameter) =>
+      Object.hasOwn(bindings, safeTypeFromType(parameter, node))),
+    owner_function_id: ownerFunction(node),
+  });
+  addEdge("SUBSTITUTES_TYPE", callId, id, { function_id: targetId });
+  return id;
+}
+
 // Second pass: AST/body, direct value flow, compiler-resolved calls and control.
 for (const fileName of analysisFileNames) {
   const sf = program.getSourceFile(fileName);
@@ -2191,6 +2638,7 @@ for (const fileName of analysisFileNames) {
         nodes.get(callId).properties.candidate_target_ids = [...new Set(candidateTargetIds)];
       }
       const signature = checker.getResolvedSignature(node);
+      recordGenericSubstitution(node, callId, primaryTarget, signature);
       const args = node.arguments ? [...node.arguments] : [];
       args.forEach((argument, index) => {
         const argId = pathForNode(argument, "argument");
@@ -2225,22 +2673,27 @@ for (const fileName of analysisFileNames) {
     }
 
     if (ts.isIfStatement(node)) {
+      recordConditionRefinements(node.expression);
       addEdge("CONDITION", bodyForNode(node), bodyForNode(node.expression));
       addEdge("TRUE_BRANCH", bodyForNode(node.expression), bodyForNode(node.thenStatement));
       if (node.elseStatement) addEdge("FALSE_BRANCH", bodyForNode(node.expression), bodyForNode(node.elseStatement));
     } else if (ts.isConditionalExpression(node)) {
+      recordConditionRefinements(node.condition);
       addEdge("TRUE_BRANCH", bodyForNode(node.condition), bodyForNode(node.whenTrue));
       addEdge("FALSE_BRANCH", bodyForNode(node.condition), bodyForNode(node.whenFalse));
     } else if (ts.isWhileStatement(node) || ts.isDoStatement(node) || ts.isForStatement(node)) {
       const condition = node.expression || node.condition;
       const statement = node.statement;
       if (condition && statement) {
+        recordConditionRefinements(condition);
         addEdge("LOOP_TRUE", bodyForNode(condition), bodyForNode(statement));
         addEdge("LOOP_BACK", bodyForNode(statement), bodyForNode(condition));
       }
     } else if (ts.isForOfStatement(node) || ts.isForInStatement(node)) {
       addEdge("ITERATES", bodyForNode(node.expression), bodyForNode(node.statement));
       addEdge("LOOP_BACK", bodyForNode(node.statement), bodyForNode(node.expression));
+    } else if (ts.isSwitchStatement(node)) {
+      recordSwitchRefinements(node);
     } else if (ts.isTryStatement(node)) {
       addEdge("TRY_BODY", bodyForNode(node), bodyForNode(node.tryBlock));
       if (node.catchClause) addEdge("EXCEPTION_BRANCH", bodyForNode(node.tryBlock), bodyForNode(node.catchClause.block));

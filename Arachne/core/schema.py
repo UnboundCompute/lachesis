@@ -34,7 +34,7 @@ PROJECT_STRUCTURE_NODE_KINDS = frozenset({
 DECLARATION_NODE_KINDS = frozenset({
     "scope", "symbol", "declaration", "function", "method", "constructor",
     "class", "interface", "type", "enum", "record", "parameter", "variable",
-    "binding", "property", "constant", "value", "decorator",
+    "binding", "property", "constant", "value", "decorator", "type-parameter",
 })
 EXECUTABLE_NODE_KINDS = frozenset({
     "statement", "expression", "operation", "identifier", "call", "construct",
@@ -42,7 +42,7 @@ EXECUTABLE_NODE_KINDS = frozenset({
 })
 VALUE_NODE_KINDS = frozenset({
     "definition", "read", "write", "literal", "property-path", "allocation",
-    "heap-object", "heap-location",
+    "heap-object", "heap-location", "type-refinement", "generic-substitution",
 })
 CONTROL_RUNTIME_NODE_KINDS = frozenset({
     "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit", "phi",
@@ -70,7 +70,7 @@ NODE_KIND_TIERS = {
     }},
     **{kind: frozenset({"T2"}) for kind in {
         "scope", "symbol", "parameter", "variable", "binding", "property",
-        "constant", "value", "decorator", *VALUE_NODE_KINDS,
+        "constant", "value", "decorator", "type-parameter", *VALUE_NODE_KINDS,
     }},
     **{kind: frozenset({"T3"}) for kind in {
         *EXECUTABLE_NODE_KINDS, *CONTROL_RUNTIME_NODE_KINDS,
@@ -100,6 +100,7 @@ STRUCTURE_EDGE_KINDS = frozenset({
     "RE_EXPORTS", "AST_CHILD", "EXPANDS_TO", "HAS_TOKEN", "NEXT_TOKEN",
     "HAS_DIAGNOSTIC", "HAS_PROPERTY_PATH", "DECORATES", "DECORATOR_ARGUMENT",
     "INITIALIZES_WITH", "CONTAINS_BODY", "HAS_SCOPE",
+    "HAS_TYPE_PARAMETER", "OVERLOAD_OF", "STRUCTURALLY_COMPATIBLE_WITH",
 })
 CALL_EDGE_KINDS = frozenset({
     "INVOKES", "MAY_INVOKE", "CALLS", "HAS_ARGUMENT",
@@ -110,7 +111,7 @@ VALUE_EDGE_KINDS = frozenset({
     "DEFINES", "READS_FROM", "WRITES_TO", "WRITES_PARAMETER_PROPERTY",
     "VALUE_FLOWS_TO", "ALIASES", "ALIASES_VALUE", "POINTS_TO",
     "PREVIOUS_VERSION", "PROPERTY_READ", "READ_EVIDENCED_BY", "ALLOCATES",
-    "FUNCTION_VALUE",
+    "FUNCTION_VALUE", "NARROWS_TYPE", "REFINES_SYMBOL", "SUBSTITUTES_TYPE",
 })
 CONTROL_EDGE_KINDS = frozenset({
     "CFG_NEXT", "EXECUTES_BEFORE", "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH",
@@ -139,6 +140,7 @@ SOURCE_DERIVED_NODE_KINDS = frozenset().union(
     DECLARATION_NODE_KINDS,
     EXECUTABLE_NODE_KINDS,
     {"definition", "read", "write", "literal", "property-path", "allocation",
+     "type-refinement", "generic-substitution",
      "dynamic-behavior", "module-initializer", "static-initializer",
      "source-span", "token"},
 )

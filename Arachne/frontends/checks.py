@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from Arachne import analyze_files, read_file, walk
 from Arachne.compiler_adapter import (
-    analyze_typescript_with_compiler, run_project_frontends,
+    analyze_typescript_with_compiler, run_project_frontends, snapshot_file_infos,
 )
 from Arachne.taint_analysis import taint_path
 from Arachne.core.snapshot import load_snapshot
@@ -307,6 +307,58 @@ class CompilerFrontendTests(unittest.TestCase):
                 "string | number", narrowed["properties"]["declared_type_facts"]["text"],
             )
             self.assertEqual("string", narrowed["properties"]["type_facts"]["text"])
+
+            type_parameters = [
+                node for node in snapshot.nodes if node["kind"] == "type-parameter"
+            ]
+            self.assertTrue(any(
+                node["label"] == "T"
+                and snapshot.nodes_by_id[node["properties"]["owner_id"]]["label"]
+                    == "identity"
+                for node in type_parameters
+            ))
+            self.assertEqual(
+                len(type_parameters),
+                sum(edge["kind"] == "HAS_TYPE_PARAMETER" for edge in snapshot.edges),
+            )
+            refinements = [
+                node for node in snapshot.nodes if node["kind"] == "type-refinement"
+            ]
+            self.assertTrue(any(
+                node["properties"]["refinement_kind"] == "type-predicate"
+                and node["properties"]["narrowed_type"] == "string"
+                for node in refinements
+            ))
+            self.assertTrue(any(
+                node["properties"]["refinement_kind"] == "discriminant"
+                and node["properties"]["property_path"] == "kind"
+                and node["properties"]["compared_value"] == "text"
+                for node in refinements
+            ))
+            substitutions = [
+                node for node in snapshot.nodes
+                if node["kind"] == "generic-substitution"
+            ]
+            self.assertTrue(any(
+                node["properties"]["bindings"].get("T") == "string"
+                and snapshot.nodes_by_id[node["properties"]["function_id"]]["label"]
+                    == "identity"
+                for node in substitutions
+            ))
+            self.assertEqual(
+                2, sum(edge["kind"] == "OVERLOAD_OF" for edge in snapshot.edges),
+            )
+            self.assertTrue(any(
+                edge["kind"] == "STRUCTURALLY_COMPATIBLE_WITH"
+                for edge in snapshot.edges
+            ))
+
+            compatibility = snapshot_file_infos(snapshot)
+            self.assertTrue(any(
+                refinement.get("compiler_node_id")
+                for info in compatibility for refinement in info["type_refinements"]
+            ))
+            self.assertFalse((ROOT / "Arachne" / "type_system_analysis.py").exists())
 
     def test_typescript_compiler_emits_dispatch_mutation_and_runtime_facts(self) -> None:
         with tempfile.TemporaryDirectory() as output:

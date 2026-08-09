@@ -14,7 +14,6 @@ from .taint_analysis import analyze_taint, taint_path
 from .runtime_models import analyze_runtime_models, model_for_call
 from .async_analysis import analyze_async_flow
 from .effect_analysis import analyze_effects
-from .type_system_analysis import analyze_type_system
 from .dispatch_analysis import analyze_dispatch
 from .exception_analysis import analyze_exceptions
 from .module_init_analysis import analyze_module_init
@@ -61,7 +60,6 @@ __all__ = [
     "model_for_call",
     "analyze_async_flow",
     "analyze_effects",
-    "analyze_type_system",
     "analyze_dispatch",
     "analyze_exceptions",
     "analyze_module_init",
