@@ -36,7 +36,10 @@ class TaintPropagation:
     overlay_id = "taint-propagation"
 
     def applies(self, graph: dict) -> bool:
-        return any(_roles(node, "source") for node in graph.get("nodes", []))
+        return any(
+            node.get("kind") == "source" or _roles(node, "source")
+            for node in graph.get("nodes", [])
+        )
 
     def enrich(self, graph: dict) -> GraphDelta:
         index = GraphIndex(graph)
@@ -65,6 +68,19 @@ class TaintPropagation:
 
         source_records = []
         sink_records = []
+        for role_node in graph.get("nodes", []):
+            if not role_node["id"].startswith("v2:") or role_node.get("kind") not in {
+                "source", "sink",
+            }:
+                continue
+            value_id = role_node.get("properties", {}).get("value_id")
+            value = index.nodes.get(value_id)
+            if not value:
+                continue
+            if role_node["kind"] == "source":
+                source_records.append((role_node, value))
+            else:
+                sink_records.append((role_node, value))
         for value in graph.get("nodes", []):
             if not value["id"].startswith("v2:"):
                 continue

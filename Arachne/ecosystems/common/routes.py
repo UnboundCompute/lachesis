@@ -47,6 +47,11 @@ class GenericRouteModel:
         index = GraphIndex(graph)
         nodes = []
         edges = []
+        parameters_by_function = {}
+        for parameter in index.nodes_of_kind("parameter"):
+            owner_id = parameter.get("properties", {}).get("owner_function_id")
+            if owner_id:
+                parameters_by_function.setdefault(owner_id, []).append(parameter)
         arguments_by_call = {}
         for argument in index.nodes_of_kind("argument"):
             callsite_id = argument.get("properties", {}).get("callsite_id")
@@ -104,5 +109,42 @@ class GenericRouteModel:
                     "kind": "ENTRY_POINT_OF", "source": route_id,
                     "target": handler["id"], "properties": dict(fact),
                 })
+                parameters = sorted(
+                    parameters_by_function.get(handler["id"], []),
+                    key=lambda item: item.get("properties", {}).get(
+                        "parameter_position", 0,
+                    ),
+                )
+                if parameters:
+                    request_parameter = parameters[0]
+                    source_id = stable_id(
+                        "framework-model", self.model_id, "source",
+                        route_id, request_parameter["id"],
+                    )
+                    source_fact = {
+                        "fact_origin": "framework-model",
+                        "confidence": "conservative",
+                        "evidence_ids": [
+                            route_id, call["id"], handler["id"],
+                            request_parameter["id"],
+                        ],
+                    }
+                    nodes.append({
+                        "id": source_id,
+                        "kind": "source",
+                        "label": f"route input:{request_parameter.get('label', 'parameter')}",
+                        "properties": {
+                            **source_fact,
+                            "model_id": self.model_id,
+                            "value_id": request_parameter["id"],
+                            "source_kind": "route-handler-parameter",
+                            "route_id": route_id,
+                            "function_id": handler["id"],
+                        },
+                    })
+                    edges.append({
+                        "kind": "TAINT_SOURCE", "source": source_id,
+                        "target": request_parameter["id"],
+                        "properties": dict(source_fact),
+                    })
         return GraphDelta(self.model_id, nodes, edges)
-

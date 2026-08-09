@@ -229,6 +229,17 @@ class CompilerFrontendTests(unittest.TestCase):
                 and edge["target"] == modeled_handler["id"]
                 for edge in modeled["edges"]
             ))
+            route_source = next(
+                node for node in modeled["nodes"]
+                if node["kind"] == "source"
+                and node["properties"].get("route_id") == modeled_route["id"]
+            )
+            self.assertEqual("route-handler-parameter", route_source["properties"]["source_kind"])
+            self.assertTrue(any(
+                edge["kind"] == "TAINT_SOURCE"
+                and edge["source"] == route_source["id"]
+                for edge in modeled["edges"]
+            ))
             files, composed, _ = analyze_typescript_with_compiler(
                 str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "framework"),
             )
@@ -254,6 +265,10 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
+            self.assertEqual("none", snapshot.capability("security_roles"))
+            self.assertFalse(any(
+                node.get("properties", {}).get("roles") for node in snapshot.nodes
+            ))
             entities = {
                 (node["kind"], node["label"]): node for node in snapshot.nodes
                 if node["kind"] in {"class", "interface", "function"}
@@ -626,6 +641,16 @@ class CompilerFrontendTests(unittest.TestCase):
                 if node["kind"] == "taint-reach"
                 and node["id"].startswith("v2:core:taint-propagation:")
             ]
+            self.assertTrue(any(
+                node["kind"] == "source"
+                and node["id"].startswith("v2:runtime-model:generic-security-roles:")
+                for node in graph["nodes"]
+            ))
+            self.assertTrue(any(
+                node["kind"] == "sink"
+                and node["id"].startswith("v2:runtime-model:generic-security-roles:")
+                for node in graph["nodes"]
+            ))
             reach_pairs = {
                 (
                     graph_nodes[node["properties"]["source_value_id"]]["label"],

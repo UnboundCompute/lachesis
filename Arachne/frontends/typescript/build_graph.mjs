@@ -80,23 +80,6 @@ const ASSIGNMENT_KINDS = new Set([
   ts.SyntaxKind.BarBarEqualsToken,
   ts.SyntaxKind.QuestionQuestionEqualsToken,
 ]);
-const SINK_NAMES = new Map([
-  ["eval", "dynamic-code"],
-  ["Function", "dynamic-code"],
-  ["fetch", "network"],
-  ["exec", "process"],
-  ["execFile", "process"],
-  ["spawn", "process"],
-  ["writeFile", "filesystem-write"],
-  ["writeFileSync", "filesystem-write"],
-  ["query", "database"],
-  ["execute", "database"],
-  ["findById", "database"],
-  ["findOne", "database"],
-  ["send", "response"],
-  ["json", "response"],
-  ["redirect", "response"],
-]);
 
 function walk(directory) {
   const result = [];
@@ -1135,16 +1118,6 @@ function addRuntimeRead(node, targetId) {
   return id;
 }
 
-function addRole(nodeId, role, subtype, confidence = "high") {
-  const node = nodes.get(nodeId);
-  if (!node) return;
-  const roles = node.properties.roles || [];
-  if (!roles.some((item) => item.role === role && item.subtype === subtype)) {
-    roles.push({ role, subtype, confidence });
-  }
-  node.properties.roles = roles;
-}
-
 function registerScope(
   node, scopeKind, parentScopeId = null, ownerFunctionId = null,
   positionOverride = null,
@@ -1696,7 +1669,7 @@ function callMetadata(node) {
   const callee = compact(expression.getText(node.getSourceFile()), 240);
   let receiverExpression = null;
   let receiverNode = null;
-  let methodName = lastCallName(callee);
+  let methodName = ts.isIdentifier(expression) ? expression.text : null;
   let computedKeyExpression = null;
   if (ts.isPropertyAccessExpression(expression)) {
     receiverNode = expression.expression;
@@ -1727,22 +1700,6 @@ function callMetadata(node) {
       typescript: callTypeExtensions(node),
     },
   };
-}
-
-function lastCallName(label) {
-  const normalized = label.split("?.").join(".");
-  const separator = Math.max(normalized.lastIndexOf("."), normalized.lastIndexOf("["));
-  const tail = normalized.slice(separator + 1);
-  let result = "";
-  for (const character of tail) {
-    const code = character.codePointAt(0);
-    const identifierCharacter = character === "_" || character === "$" ||
-      (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
-      (code >= 97 && code <= 122);
-    if (!identifierCharacter) break;
-    result += character;
-  }
-  return result;
 }
 
 function callTypeExtensions(node) {
@@ -2445,7 +2402,6 @@ for (const fileName of analysisFileNames) {
   const sf = program.getSourceFile(fileName);
   if (!sf) continue;
   const fileId = sourceFileIds.get(normalize(fileName));
-  const exported = moduleExportNames.get(normalize(fileName)) || new Set();
 
   const visit = (node, parentBody = null, currentFunction = null) => {
     let owningFunction = currentFunction;
@@ -2502,15 +2458,6 @@ for (const fileName of analysisFileNames) {
         (ts.isImportClause(node) && node.name)) {
       const targetId = valueForDeclaration(node);
       addDefinition(targetId, node, "initial", "import", null, node);
-    }
-
-    if (ts.isParameter(node) && valueByDeclaration.has(node)) {
-      const valueId = valueForDeclaration(node);
-      const functionNode = node.parent;
-      const functionName = declarationName(functionNode);
-      if (exported.has(functionName) || hasModifier(functionNode, ts.SyntaxKind.ExportKeyword)) {
-        addRole(valueId, "Source", "exported-parameter", "medium");
-      }
     }
 
     if (ts.isVariableDeclaration(node) && node.initializer) {
@@ -2669,13 +2616,6 @@ for (const fileName of analysisFileNames) {
           });
         }
       });
-      const shortName = lastCallName(label);
-      if (SINK_NAMES.has(shortName)) addRole(pathId, "Sink", SINK_NAMES.get(shortName));
-      if (shortName === "eval" || shortName === "Function" ||
-          ts.isElementAccessExpression(node.expression) ||
-          (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword)) {
-        addRole(pathId, "Boundary", "dynamic-dispatch", "high");
-      }
     }
 
     if (ts.isIfStatement(node)) {
@@ -2953,7 +2893,7 @@ const manifest = {
     async_events: "none",
     dynamic_behavior: "partial",
     framework_wiring: "none",
-    security_roles: "partial",
+    security_roles: "none",
   },
   typescript_version: ts.version,
   typescript_loaded_from: loadedFrom,

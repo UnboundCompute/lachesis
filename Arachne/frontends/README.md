@@ -51,6 +51,11 @@ Cross-tier relationships are split into:
 Compiler frontends replace lexical, declaration, module and type discovery—not
 Arachne's security overlays. Framework wiring, runtime models, heap identity,
 taint policy and exploit reasoning are layered over compiler-backed facts.
+Frontends therefore do not tag attacker sources or security sinks. The generic
+security-role runtime model consumes exported functions, parameters and
+compiler-resolved call metadata, while framework models may add stronger entry
+facts such as route-handler parameters. The core taint overlay runs only after
+those independently registered policies have enriched the graph.
 
 ## Libraries and frameworks
 

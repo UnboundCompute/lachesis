@@ -451,6 +451,15 @@ def analyze_typescript_with_compiler(
         default_overlay_registry, default_security_overlay_registry,
     )
     merged = default_overlay_registry().enrich(merged)
+    from .core.query import GraphIndex
+    from .ecosystems import default_ecosystem_registry
+    index = GraphIndex(merged)
+    merged = default_ecosystem_registry().enrich(
+        merged,
+        index.package_inventory(),
+        snapshot.languages,
+        snapshot.capabilities,
+    )
     merged = default_security_overlay_registry().enrich(merged)
     return infos, merged, snapshot
 
