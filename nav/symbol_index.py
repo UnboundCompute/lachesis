@@ -30,11 +30,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tier1_flag.graphlib import GraphLib, CALLABLE_KINDS
 
-# node kinds that are addressable jump targets, mapped to a granularity label
+# node kinds that are addressable jump targets, mapped to a granularity label. Kinds
+# are a normalized cross-language vocabulary, so this is a language-agnostic superset:
+# the TS-shaped kinds plus the C declaration kinds (record = struct+union, type =
+# typedef, variable = globals, property = struct fields / ops-struct slots, constant).
+# Making globals and ops-struct slots addressable is what lets `search`/`open_file`
+# reach the things a C/kernel reader navigates by.
+#
+# Known limits (documented, not fixable here):
+#  - `macro` is NOT emitted by the C frontend (macros appear only as raw `token`
+#    nodes), so macro names are unindexable — a frontend gap, not a symbol-index one.
+#  - `variable`/`property` are high-volume (a large C tree has thousands of globals /
+#    struct fields); external + test filtering still applies, but expect a bigger index.
 INDEXED_KINDS = {
     "file": "file",
     "class": "type", "interface": "type", "enum": "type", "type": "type",
     "function": "function", "method": "method", "constructor": "method",
+    "record": "type", "union": "type",
+    "variable": "variable", "property": "property", "constant": "constant",
 }
 # CALLS is declaration->declaration (function/method -> function/method): the clean,
 # resolved direct call graph. It is the DIRECT set.
