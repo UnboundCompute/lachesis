@@ -23,7 +23,7 @@ def load_graph(path: str) -> tuple[dict, dict]:
     }
     return (
         {"nodes": payload["nodes"], "edges": payload["edges"]},
-        {"capabilities": frontend_capabilities},
+        {"frontend_capabilities": frontend_capabilities},
     )
 
 

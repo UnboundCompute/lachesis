@@ -7,6 +7,7 @@ import os
 from collections import Counter, defaultdict
 from typing import Iterable, Optional
 
+from ..core.capabilities import ALL_CAPABILITIES
 from ..core.query import GraphIndex
 from .security import derive_roles, detect_guards
 
@@ -82,6 +83,75 @@ COMMON_PROPERTY_KEYS = frozenset({
     "end_column", "frontend_id", "frontend_tier", "language", "content_hash", "roles",
 })
 
+CAPABILITY_LEVEL = {"none": 0, "partial": 1, "complete": 2}
+CANONICAL_CAPABILITY_SIGNALS = {
+    "lexical": ({"token", "source-span"}, {"HAS_TOKEN"}),
+    "syntax": (
+        {"statement", "expression", "function", "class", "interface"},
+        {"AST_CHILD", "DECLARES"},
+    ),
+    "modules": (
+        {"module", "external-module"},
+        {"DEPENDS_ON", "RUNTIME_DEPENDS_ON", "RE_EXPORTS", "EXPORTS"},
+    ),
+    "dependency_sources": ({"package", "external-module"}, {"PACKAGE_CONTAINS"}),
+    "scopes": ({"scope"}, {"DECLARES_SCOPE"}),
+    "symbols": ({"symbol", "identifier"}, {"DECLARES_SYMBOL", "REFERS_TO"}),
+    "types": (
+        {"type", "interface", "type-refinement", "generic-substitution"},
+        {"TYPE_REFERS_TO", "NARROWS_TYPE", "SUBSTITUTES_TYPE"},
+    ),
+    "calls": ({"call", "construct"}, {"CALLS", "INVOKES", "MAY_INVOKE"}),
+    "control_flow": (
+        {"cfg-entry", "cfg-condition", "cfg-merge", "cfg-exit"},
+        {"CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH"},
+    ),
+    "direct_data_flow": (
+        {"definition", "read", "write", "argument", "return-value"},
+        {"DEFINES", "READS_FROM", "WRITES_TO", "VALUE_FLOWS_TO"},
+    ),
+    "heap_identity": (
+        {"allocation", "heap-object", "heap-location", "heap-access"},
+        {"ALLOCATES", "POINTS_TO", "READS_HEAP", "WRITES_HEAP"},
+    ),
+    "context_sensitivity": (
+        {"call-context", "context-parameter", "context-return", "context-receiver"},
+        {"HAS_CALL_CONTEXT", "CONTEXTUALIZES", "BINDS_PARAMETER", "CONTEXT_RETURNS"},
+    ),
+    "branch_histories": (
+        {"phi"},
+        {"PHI_INPUT", "PHI_FOR_SYMBOL", "BRANCH_PREVIOUS", "BRANCH_READS_FROM"},
+    ),
+    "taint_policy": (
+        {"source", "sink", "taint-reach"},
+        {"TAINT_SOURCE", "TAINT_SINK", "TAINT_FLOWS_TO", "TAINT_REACHES"},
+    ),
+    "runtime_models": (
+        {"runtime-model-application"},
+        {"APPLIES_EFFECT", "MODELED_BY"},
+    ),
+    "effects": (
+        {"function-effect", "effect-summary", "heap-effect", "context-heap-effect"},
+        {"APPLIES_EFFECT", "MUTATES", "WRITES_HEAP", "HAS_FUNCTION_EFFECT"},
+    ),
+    "async_events": (
+        {"async-event", "promise-rejection"},
+        {"SCHEDULES", "REGISTERS_CALLBACK", "ASYNC_CONTINUES_AT", "HANDLED_BY"},
+    ),
+    "framework_wiring": (
+        {"route", "wiring-boundary", "decorator"},
+        {"ROUTE_HANDLED_BY", "WIRES_TO", "REGISTERED_AT"},
+    ),
+    "security_roles": (
+        {"source", "sink", "boundary", "route"},
+        {"TAINT_SOURCE", "TAINT_SINK", "ROUTE_HANDLED_BY"},
+    ),
+    "dynamic_behavior": (
+        {"dynamic-behavior", "boundary"},
+        {"DYNAMIC_BEHAVIOR_AT", "DYNAMIC_INPUT"},
+    ),
+}
+
 
 def _edge_id(edge: dict, semantic_kind: str) -> str:
     raw = json.dumps([
@@ -98,6 +168,30 @@ def _project_id(graph: dict) -> str:
     )
     raw = json.dumps(files, separators=(",", ":"), ensure_ascii=False)
     return "layered-project:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _effective_capabilities(
+    index: GraphIndex, frontend_capabilities: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """Combine compiler declarations with facts present after canonical overlays."""
+    effective = {name: "none" for name in ALL_CAPABILITIES}
+    for capabilities in frontend_capabilities.values():
+        for name, level in capabilities.items():
+            if name not in effective or level not in CAPABILITY_LEVEL:
+                continue
+            if CAPABILITY_LEVEL[level] > CAPABILITY_LEVEL[effective[name]]:
+                effective[name] = level
+    graph_edge_kinds = {
+        GraphIndex.semantic_edge_kind(edge)
+        for edges in index.outgoing.values() for edge in edges
+    }
+    graph_node_kinds = set(index.by_kind)
+    for name, (node_kinds, edge_kinds) in CANONICAL_CAPABILITY_SIGNALS.items():
+        if graph_node_kinds.intersection(node_kinds) \
+                or graph_edge_kinds.intersection(edge_kinds):
+            if effective[name] == "none":
+                effective[name] = "partial"
+    return dict(sorted(effective.items()))
 
 
 def _tier_assignments(index: GraphIndex) -> tuple[dict[str, str], list[str]]:
@@ -492,6 +586,10 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
         node.get("properties", {}).get("frontend_id") for node in index.nodes.values()
         if node.get("properties", {}).get("frontend_id")
     })
+    frontend_capabilities = (
+        project_metadata or {}
+    ).get("frontend_capabilities", {})
+    effective_capabilities = _effective_capabilities(index, frontend_capabilities)
     unresolved_counts, unresolved_examples = _unresolved_summary(index)
     reaches = sorted(index.nodes_of_kind("taint-reach"), key=lambda item: item["id"])
     differentials = [{
@@ -505,7 +603,8 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
         "schema_version": SCHEMA_VERSION,
         "project": {
             "id": project_id, "languages": languages, "frontends": frontends,
-            "capabilities": (project_metadata or {}).get("capabilities", {}),
+            "capabilities": effective_capabilities,
+            "frontend_capabilities": frontend_capabilities,
             "canonical": {"node_count": len(index.nodes), "edge_count": len(graph.get("edges", []))},
         },
         "node_index": {"file": "node_index.json", "count": len(node_index)},

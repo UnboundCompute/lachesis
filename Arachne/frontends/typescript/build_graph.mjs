@@ -1226,9 +1226,9 @@ function declarationSymbolKind(declaration) {
     ts.isBindingElement(current) || ts.isObjectBindingPattern(current) ||
     ts.isArrayBindingPattern(current)
   )) current = current.parent;
+  if (!current) return "variable";
   if (ts.isParameter(current)) return "parameter";
-  if (ts.isCatchClause(current?.parent) ||
-      (ts.isVariableDeclaration(current) && ts.isCatchClause(current.parent))) {
+  if (current.parent && ts.isCatchClause(current.parent)) {
     return "catch-parameter";
   }
   if (ts.isImportClause(declaration) || ts.isImportSpecifier(declaration) ||

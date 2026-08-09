@@ -160,9 +160,15 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(0, overview.returncode, overview.stderr)
             overview_payload = json.loads(overview.stdout)
             self.assertEqual(2, overview_payload["manifest"]["schema_version"])
-            self.assertTrue(
-                overview_payload["manifest"]["project"]["capabilities"]
-                ["typescript-compiler-api"],
+            project = overview_payload["manifest"]["project"]
+            frontend_capabilities = project["frontend_capabilities"]
+            self.assertTrue(frontend_capabilities["typescript-compiler-api"])
+            effective = project["capabilities"]
+            for capability in ("heap_identity", "effects", "taint_policy"):
+                self.assertEqual("partial", effective[capability])
+            self.assertEqual(
+                "none",
+                frontend_capabilities["typescript-compiler-api"]["heap_identity"],
             )
             function = subprocess.run(
                 [
@@ -247,7 +253,10 @@ class CompilerFrontendTests(unittest.TestCase):
     def test_reasoning_queries_are_typed_contextual_and_budgeted(self) -> None:
         graph, _ = run_project(str(ROOT / "src"))
         query = ReasoningQuery(graph)
-        self.assertEqual(2, query.overview()["manifest"]["schema_version"])
+        manifest = query.overview()["manifest"]
+        self.assertEqual(2, manifest["schema_version"])
+        for capability in ("heap_identity", "effects", "taint_policy"):
+            self.assertEqual("partial", manifest["project"]["capabilities"][capability])
         self.assertEqual("ambiguous", query.find_entity("getDocument")["status"])
         document_match = query.find_entity("getDocument", kind="function")
         invoice_match = query.find_entity("getInvoice", kind="function")
@@ -338,6 +347,25 @@ class CompilerFrontendTests(unittest.TestCase):
                 for node in dependency_files
             ))
             self.assertTrue(any(edge["kind"] == "PACKAGE_CONTAINS" for edge in snapshot.edges))
+
+    def test_typescript_optional_catch_binding_is_null_safe(self) -> None:
+        frontend = (
+            ROOT / "Arachne" / "frontends" / "typescript" / "build_graph.mjs"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("ts.isCatchClause(current?.parent)", frontend)
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                "node", "Arachne/frontends/typescript/build_graph.mjs",
+                "Arachne/frontends/typescript/fixtures/optional_catch", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            functions = {
+                node["label"] for node in snapshot.nodes if node["kind"] == "function"
+            }
+            self.assertEqual(
+                {"parseOptional", "continuesAfterCatch"}, functions,
+            )
 
     def test_typescript_reachable_framework_runtime_sources(self) -> None:
         with tempfile.TemporaryDirectory() as output:

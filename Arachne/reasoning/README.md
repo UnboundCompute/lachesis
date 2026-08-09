@@ -36,6 +36,8 @@ subsequent queries use the stable node ID.
 ## Exposure model
 
 - `manifest.json` is the compact project entry card.
+- `project.capabilities` reports effective canonical capabilities after overlays;
+  `project.frontend_capabilities` retains each compiler's raw declaration.
 - T0–T4 artifacts are progressive semantic views.
 - `node_index.json` locates every canonical node in those artifacts.
 - `ReasoningQuery` calculates focused function, value, call, security, and
