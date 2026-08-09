@@ -1930,7 +1930,12 @@ function recordDirectDynamicBehavior(node) {
     if (name === "Proxy") addDynamicBehavior(node, "proxy", { static_resolution: "runtime" });
   } else if (ts.isElementAccessExpression(node) &&
       !literalValue(node.argumentExpression).literal) {
-    addDynamicBehavior(node, "computed-property-access", {
+    const parent = node.parent;
+    const write = (ts.isBinaryExpression(parent) && parent.left === node &&
+      ASSIGNMENT_KINDS.has(parent.operatorToken.kind)) ||
+      ((ts.isPrefixUnaryExpression(parent) || ts.isPostfixUnaryExpression(parent)) &&
+       parent.operand === node);
+    addDynamicBehavior(node, write ? "computed-property-write" : "computed-property-read", {
       key_expression: node.argumentExpression?.getText(node.getSourceFile()) || null,
     });
   } else if (ts.isBinaryExpression(node) &&

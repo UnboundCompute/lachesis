@@ -272,6 +272,28 @@ def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
                 "compiler_value_id": properties.get("value_id"),
             }
             info["function_calls"].append(call)
+        elif node["kind"] == "dynamic-behavior":
+            reserved = {
+                "fact_origin", "confidence", "evidence_ids", "legacy_id",
+                "file", "absolute_file", "content_hash", "frontend_id", "language",
+                "compiler_node_id", "start_offset", "end_offset", "start_line",
+                "start_column", "end_line", "end_column", "behavior_kind",
+                "expression", "owner_function_id",
+            }
+            info["dynamic_behaviors"].append({
+                "id": node["id"],
+                "compiler_node_id": node["id"],
+                "kind": properties["behavior_kind"],
+                "line": properties["start_line"],
+                "offset": properties["start_offset"],
+                "expression": properties.get("expression", node["label"]),
+                "entity_id": properties.get("callsite_id"),
+                "function_id": properties.get("owner_function_id"),
+                "properties": {
+                    key: value for key, value in properties.items()
+                    if key not in reserved
+                },
+            })
         elif node["kind"] == "token":
             owners = [
                 function for function in info["functions"]

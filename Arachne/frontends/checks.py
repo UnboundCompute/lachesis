@@ -353,7 +353,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 for node in snapshot.nodes if node["kind"] == "dynamic-behavior"
             }
             self.assertTrue({
-                "dynamic-import", "reflection", "proxy", "computed-property-access",
+                "dynamic-import", "reflection", "proxy", "computed-property-read",
             }.issubset(behavior_kinds))
             self.assertGreaterEqual(sum(
                 node["kind"] == "module-initializer" for node in snapshot.nodes
@@ -508,6 +508,11 @@ class CompilerFrontendTests(unittest.TestCase):
             ))
             self.assertFalse((ROOT / "Arachne" / "variable_analysis.py").exists())
             self.assertFalse((ROOT / "Arachne" / "scope_utils.py").exists())
+            self.assertFalse((ROOT / "Arachne" / "dynamic_analysis.py").exists())
+            self.assertTrue(all(
+                behavior.get("compiler_node_id")
+                for info in files for behavior in info["dynamic_behaviors"]
+            ))
             request_id = next(
                 source for info in files for source in info["taint_sources"]
                 if source["label"] == "req.body.id"

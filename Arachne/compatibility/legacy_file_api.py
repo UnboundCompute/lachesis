@@ -12,7 +12,6 @@ from ..context_analysis import analyze_call_contexts
 from ..control_flow import build_control_flow
 from ..data_flow import link_data_flow
 from ..dispatch_analysis import analyze_dispatch
-from ..dynamic_analysis import analyze_dynamic_behavior
 from ..effect_analysis import analyze_effects
 from ..exception_analysis import analyze_exceptions
 from ..heap_analysis import analyze_heap
@@ -119,7 +118,6 @@ def run_semantic_overlays(results: List[FileInfo]) -> List[FileInfo]:
     analyze_dispatch(results, include_callbacks=True)
     link_data_flow(results)
     analyze_call_contexts(results)
-    analyze_dynamic_behavior(results)
     analyze_heap(results)
     for info in results:
         build_control_flow(info)

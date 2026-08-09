@@ -16,7 +16,6 @@ from .async_analysis import analyze_async_flow
 from .effect_analysis import analyze_effects
 from .type_system_analysis import analyze_type_system
 from .dispatch_analysis import analyze_dispatch
-from .dynamic_analysis import analyze_dynamic_behavior
 from .exception_analysis import analyze_exceptions
 from .module_init_analysis import analyze_module_init
 from .wiring_analysis import analyze_wiring
@@ -64,7 +63,6 @@ __all__ = [
     "analyze_effects",
     "analyze_type_system",
     "analyze_dispatch",
-    "analyze_dynamic_behavior",
     "analyze_exceptions",
     "analyze_module_init",
     "analyze_wiring",
