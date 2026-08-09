@@ -334,12 +334,61 @@ def inferred_function_name(
     return f"<anonymous@{line}>"
 
 
-def arrow_start_and_name(masked: str, arrow_start: int) -> Tuple[int, str]:
-    statement_start = max(
-        masked.rfind(";", 0, arrow_start),
-        masked.rfind("{", 0, arrow_start),
-        masked.rfind("}", 0, arrow_start),
+def _arrow_statement_start(masked: str, arrow_start: int) -> int:
+    """Backward scan for the start of the statement holding an arrow function.
+
+    Naive `rfind(";{}")` breaks on modern typed arrows because braces appear
+    *inside* the parameter/return-type region and get mistaken for a statement
+    boundary, truncating the prefix to ") " and losing the `const NAME =`
+    binding:
+      export const download = async ({ url }) =>        # destructured param
+      const f = (opts: { url: string }) =>              # object-type param
+      export const download = async (x): Promise<T> =>  # return-type annotation
+    Fix: step left over any return-type annotation to the parameter list's
+    closing ")", jump to its matching "(", then run the boundary scan from
+    there -- the `NAME =` region left of the param list carries no braces.
+    Generic "<>" are ignored (unbalanced-safe). A bare single-identifier
+    parameter (no parens) has no braces to trip over, so it falls back to the
+    naive scan from the arrow itself.
+    """
+    cursor = arrow_start
+    while cursor > 0 and masked[cursor - 1].isspace():
+        cursor -= 1
+    head = arrow_start
+    depth = 0
+    param_close = -1
+    index = cursor - 1
+    while index >= 0:
+        char = masked[index]
+        if char in ")]}":
+            if depth == 0 and char == ")":
+                param_close = index
+                break
+            depth += 1
+        elif char in "([{":
+            if depth == 0:
+                break  # an opener before any param ")" -> no parenthesized params
+            depth -= 1
+        index -= 1
+    if param_close >= 0:
+        depth = 0
+        for j in range(param_close, -1, -1):
+            if masked[j] == ")":
+                depth += 1
+            elif masked[j] == "(":
+                depth -= 1
+                if depth == 0:
+                    head = j
+                    break
+    return max(
+        masked.rfind(";", 0, head),
+        masked.rfind("{", 0, head),
+        masked.rfind("}", 0, head),
     ) + 1
+
+
+def arrow_start_and_name(masked: str, arrow_start: int) -> Tuple[int, str]:
+    statement_start = _arrow_statement_start(masked, arrow_start)
     prefix = masked[statement_start:arrow_start]
     assignments = list(re.finditer(
         r"(?:(?:export|declare)\s+)*(?:const|let|var)\s+"
