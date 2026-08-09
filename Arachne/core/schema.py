@@ -34,7 +34,7 @@ PROJECT_STRUCTURE_NODE_KINDS = frozenset({
 DECLARATION_NODE_KINDS = frozenset({
     "scope", "symbol", "declaration", "function", "method", "constructor",
     "class", "interface", "type", "enum", "record", "parameter", "variable",
-    "binding", "property", "constant", "value",
+    "binding", "property", "constant", "value", "decorator",
 })
 EXECUTABLE_NODE_KINDS = frozenset({
     "statement", "expression", "operation", "identifier", "call", "construct",
@@ -46,7 +46,8 @@ VALUE_NODE_KINDS = frozenset({
 })
 CONTROL_RUNTIME_NODE_KINDS = frozenset({
     "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit", "phi",
-    "async-event", "dynamic-behavior", "function-effect",
+    "async-event", "dynamic-behavior", "function-effect", "module-initializer",
+    "static-initializer",
 })
 SECURITY_EVIDENCE_NODE_KINDS = frozenset({
     "source", "sink", "boundary", "guard", "taint-reach", "diagnostic",
@@ -69,7 +70,7 @@ NODE_KIND_TIERS = {
     }},
     **{kind: frozenset({"T2"}) for kind in {
         "scope", "symbol", "parameter", "variable", "binding", "property",
-        "constant", "value", *VALUE_NODE_KINDS,
+        "constant", "value", "decorator", *VALUE_NODE_KINDS,
     }},
     **{kind: frozenset({"T3"}) for kind in {
         *EXECUTABLE_NODE_KINDS, *CONTROL_RUNTIME_NODE_KINDS,
@@ -82,6 +83,7 @@ NODE_KIND_TIERS.update({
     kind: frozenset({"T2"})
     for kind in {"argument", "call-value", "return", "return-value"}
 })
+NODE_KIND_TIERS["module"] = frozenset({"T0", "T1"})
 
 # Compiler frontends may emit language-level dynamic constructs and diagnostics,
 # but policy judgments and runtime/heap conclusions belong to core/model layers.
@@ -96,27 +98,30 @@ STRUCTURE_EDGE_KINDS = frozenset({
     "TYPE_REFERS_TO", "HAS_TYPE", "DEPENDS_ON", "RUNTIME_DEPENDS_ON",
     "RUNTIME_IMPLEMENTATION", "IMPLEMENTED_BY", "PACKAGE_CONTAINS", "EXPORTS",
     "RE_EXPORTS", "AST_CHILD", "EXPANDS_TO", "HAS_TOKEN", "NEXT_TOKEN",
-    "HAS_DIAGNOSTIC", "HAS_PROPERTY_PATH",
+    "HAS_DIAGNOSTIC", "HAS_PROPERTY_PATH", "DECORATES", "DECORATOR_ARGUMENT",
+    "INITIALIZES_WITH", "CONTAINS_BODY", "HAS_SCOPE",
 })
 CALL_EDGE_KINDS = frozenset({
     "INVOKES", "MAY_INVOKE", "CALLS", "HAS_ARGUMENT",
-    "BINDS_PARAMETER", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE",
-    "RETURN_EVIDENCED_BY", "READS_CALLEE",
+    "BINDS_PARAMETER", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE", "THROWS_VALUE",
+    "RETURN_EVIDENCED_BY", "READS_CALLEE", "PASSES_CALLBACK",
 })
 VALUE_EDGE_KINDS = frozenset({
     "DEFINES", "READS_FROM", "WRITES_TO", "WRITES_PARAMETER_PROPERTY",
     "VALUE_FLOWS_TO", "ALIASES", "ALIASES_VALUE", "POINTS_TO",
-    "PREVIOUS_VERSION", "PROPERTY_READ", "READ_EVIDENCED_BY",
+    "PREVIOUS_VERSION", "PROPERTY_READ", "READ_EVIDENCED_BY", "ALLOCATES",
+    "FUNCTION_VALUE",
 })
 CONTROL_EDGE_KINDS = frozenset({
     "CFG_NEXT", "EXECUTES_BEFORE", "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH",
-    "LOOP_BACK", "ITERATES", "EXCEPTION_BRANCH", "TRY_BODY", "RUNS_FINALLY",
+    "LOOP_BACK", "LOOP_TRUE", "ITERATES", "EXCEPTION_BRANCH", "TRY_BODY", "RUNS_FINALLY",
     "MERGES_AT", "SHORT_CIRCUIT_LEFT", "SHORT_CIRCUIT_RIGHT",
 })
 RUNTIME_SECURITY_EDGE_KINDS = frozenset({
     "CAPTURES", "MUTATES", "APPLIES_EFFECT", "REGISTERS_CALLBACK", "HANDLED_BY",
     "ASYNC_CONTINUES_AT", "TAINT_FLOWS_TO", "GUARDED_BY", "EVIDENCED_BY",
     "DUPLICATES", "SHADOWS", "ROUTE_HANDLED_BY", "ENTRY_POINT_OF",
+    "OVERRIDES", "IMPLEMENTS_MEMBER", "DYNAMIC_BEHAVIOR_AT",
 })
 CANONICAL_EDGE_KINDS = frozenset().union(
     STRUCTURE_EDGE_KINDS,
@@ -134,5 +139,6 @@ SOURCE_DERIVED_NODE_KINDS = frozenset().union(
     DECLARATION_NODE_KINDS,
     EXECUTABLE_NODE_KINDS,
     {"definition", "read", "write", "literal", "property-path", "allocation",
+     "dynamic-behavior", "module-initializer", "static-initializer",
      "source-span", "token"},
 )

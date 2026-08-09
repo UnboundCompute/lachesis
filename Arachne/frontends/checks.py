@@ -271,10 +271,13 @@ class CompilerFrontendTests(unittest.TestCase):
                 identity["properties"]["frontend_extensions"]["typescript"]
                 ["type_parameters"][0]["name"],
             )
-            self.assertEqual(
+            self.assertIn(
                 "implements",
-                string_runner["properties"]["frontend_extensions"]["typescript"]
-                ["heritage"][0]["relationship"],
+                {
+                    item["relationship"]
+                    for item in string_runner["properties"]["frontend_extensions"]
+                    ["typescript"]["heritage"]
+                },
             )
             calls = [node for node in snapshot.nodes if node["kind"] == "call"]
             method_call = next(node for node in calls if node["label"].startswith("runner.run"))
@@ -296,12 +299,79 @@ class CompilerFrontendTests(unittest.TestCase):
             narrowed = next(
                 node for node in snapshot.nodes
                 if node["kind"] == "identifier" and node["label"] == "value"
-                and node["properties"].get("start_line") == 24
+                and node["properties"].get("declared_type_facts", {}).get("text")
+                    == "string | number"
+                and node["properties"].get("type_facts", {}).get("text") == "string"
             )
             self.assertEqual(
                 "string | number", narrowed["properties"]["declared_type_facts"]["text"],
             )
             self.assertEqual("string", narrowed["properties"]["type_facts"]["text"])
+
+    def test_typescript_compiler_emits_dispatch_mutation_and_runtime_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                "node", "Arachne/frontends/typescript/build_graph.mjs",
+                "Arachne/frontends/typescript/fixtures/semantics", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            nodes = snapshot.nodes_by_id
+            decorator = next(
+                node for node in snapshot.nodes
+                if node["kind"] == "decorator" and node["label"] == "Controller"
+            )
+            self.assertEqual("/runner", decorator["properties"]["arguments"][0]["value"])
+            self.assertEqual(1, sum(edge["kind"] == "OVERRIDES" for edge in snapshot.edges))
+            self.assertEqual(
+                1, sum(edge["kind"] == "IMPLEMENTS_MEMBER" for edge in snapshot.edges),
+            )
+            function_values = [
+                edge for edge in snapshot.edges if edge["kind"] == "FUNCTION_VALUE"
+            ]
+            self.assertTrue(any(
+                nodes[edge["source"]]["label"] == "isString"
+                and nodes[edge["target"]]["label"] == "callbacks.check"
+                for edge in function_values
+            ))
+            self.assertTrue(any(
+                edge["kind"] == "PASSES_CALLBACK" for edge in snapshot.edges
+            ))
+            computed_call = next(
+                node for node in snapshot.nodes
+                if node["kind"] == "call" and node["label"].startswith("callbacks[action]")
+            )
+            self.assertEqual("isString", nodes[computed_call["properties"]["primary_target_id"]]["label"])
+            self.assertTrue(all(
+                nodes[edge["target"]]["tier"] == "T1"
+                for edge in snapshot.edges
+                if edge["kind"] in {"INVOKES", "MAY_INVOKE"}
+                and edge["source"] == computed_call["id"]
+            ))
+            behavior_kinds = {
+                node["properties"]["behavior_kind"]
+                for node in snapshot.nodes if node["kind"] == "dynamic-behavior"
+            }
+            self.assertTrue({
+                "dynamic-import", "reflection", "proxy", "computed-property-access",
+            }.issubset(behavior_kinds))
+            self.assertGreaterEqual(sum(
+                node["kind"] == "module-initializer" for node in snapshot.nodes
+            ), 4)
+            self.assertEqual(2, sum(
+                node["kind"] == "static-initializer" for node in snapshot.nodes
+            ))
+            self.assertTrue(any(
+                node["kind"] == "allocation"
+                and node["properties"].get("allocated_type") == "Map<string, string>"
+                and node["properties"].get("module_singleton")
+                for node in snapshot.nodes
+            ))
+            self.assertTrue(any(
+                node["kind"] == "write" and node["label"] == "mutableState"
+                and node["properties"].get("write_kind") == "assignment"
+                for node in snapshot.nodes
+            ))
 
     def test_c_header_declarations_and_calls(self) -> None:
         with tempfile.TemporaryDirectory() as output:

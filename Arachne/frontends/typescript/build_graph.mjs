@@ -181,6 +181,7 @@ function compilerOptions() {
     jsx: ts.JsxEmit.Preserve,
     allowSyntheticDefaultImports: true,
     esModuleInterop: true,
+    experimentalDecorators: true,
   };
   const configPath = ts.findConfigFile(sourceDir, ts.sys.fileExists, "tsconfig.json");
   if (!configPath) return { options: defaults, configPath: null, configErrors: [] };
@@ -571,6 +572,63 @@ function declarationTypeExtensions(node) {
   return { type_parameters: typeParameters, heritage, overloads };
 }
 
+function literalValue(node) {
+  if (!node) return { literal: false, value: null };
+  if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) {
+    return { literal: true, value: node.text };
+  }
+  if (node.kind === ts.SyntaxKind.TrueKeyword) return { literal: true, value: true };
+  if (node.kind === ts.SyntaxKind.FalseKeyword) return { literal: true, value: false };
+  if (node.kind === ts.SyntaxKind.NullKeyword) return { literal: true, value: null };
+  if (ts.isNoSubstitutionTemplateLiteral(node)) return { literal: true, value: node.text };
+  return { literal: false, value: null };
+}
+
+function decoratorName(expression) {
+  let current = expression;
+  if (ts.isCallExpression(current)) current = current.expression;
+  if (ts.isIdentifier(current)) return current.text;
+  if (ts.isPropertyAccessExpression(current)) return current.name.text;
+  return compact(current.getText(current.getSourceFile()), 120);
+}
+
+function registerDecorators(node, targetId) {
+  if (!ts.canHaveDecorators(node)) return [];
+  const decorators = ts.getDecorators(node) || [];
+  const ids = [];
+  decorators.forEach((decorator, decoratorIndex) => {
+    const expression = decorator.expression;
+    const call = ts.isCallExpression(expression) ? expression : null;
+    const position = sourcePosition(decorator);
+    const name = decoratorName(expression);
+    const id = stableId("decorator", ...nodeKey(decorator, `${targetId}:${decoratorIndex}:${name}`));
+    const argumentsData = (call?.arguments || []).map((argument, argumentIndex) => ({
+      position: argumentIndex,
+      expression: compact(argument.getText(argument.getSourceFile()), 240),
+      type: safeType(argument),
+      ...literalValue(argument),
+    }));
+    addNode("T2", id, "decorator", name, {
+      ...position,
+      target_id: targetId,
+      expression: compact(expression.getText(expression.getSourceFile()), 300),
+      arguments: argumentsData,
+      frontend_extensions: {
+        typescript: { syntax_kind: ts.SyntaxKind[decorator.kind] },
+      },
+    });
+    addEdge("DECORATES", id, targetId);
+    argumentsData.forEach((argument) => addEdge("DECORATOR_ARGUMENT", id, targetId, {
+      position: argument.position,
+      expression: argument.expression,
+      literal: argument.literal,
+      value: argument.value,
+    }));
+    ids.push(id);
+  });
+  return ids;
+}
+
 function declarationName(node) {
   if (node.name && ts.isIdentifier(node.name)) return node.name.text;
   if (node.name && ts.isStringLiteralLike(node.name)) return node.name.text;
@@ -663,6 +721,8 @@ function registerEntity(node, ownerId = null) {
     },
   });
   entityByDeclaration.set(node, id);
+  const decoratorIds = registerDecorators(node, id);
+  if (decoratorIds.length) nodes.get(id).properties.decorator_ids = decoratorIds;
   const sfId = ensureSourceFile(node.getSourceFile(), "referenced-declaration");
   addEdge(ownerId ? "DECLARES_MEMBER" : "DECLARES", ownerId || sfId, id);
   return id;
@@ -723,6 +783,8 @@ function valueForDeclaration(declaration, explicitScopeId = null) {
     roles: [],
   });
   valueByDeclaration.set(declaration, id);
+  const decoratorIds = registerDecorators(declaration, id);
+  if (decoratorIds.length) nodes.get(id).properties.decorator_ids = decoratorIds;
   addEdge("DECLARES_VALUE", owningFunction || sourceFileIds.get(normalize(sf.fileName)), id);
   if (ts.isIdentifier(nameNode) || ts.isPrivateIdentifier(nameNode)) {
     registerLexicalSymbol(
@@ -1353,6 +1415,45 @@ for (const fileName of analysisFileNames) {
   visit(sf, null, null, moduleScope);
 }
 
+// Compiler-owned inheritance and interface relationships seed dynamic dispatch
+// without parsing class text or matching names globally.
+for (const fileName of analysisFileNames) {
+  const sf = program.getSourceFile(fileName);
+  if (!sf) continue;
+  const visitDispatchRelations = (node) => {
+    if (ts.isClassDeclaration(node) && node.name) {
+      for (const member of node.members) {
+        if (!ts.isMethodDeclaration(member) || !member.name) continue;
+        const memberId = entityByDeclaration.get(member);
+        const name = ts.isIdentifier(member.name) || ts.isStringLiteralLike(member.name)
+          ? member.name.text : null;
+        if (!memberId || !name) continue;
+        for (const clause of node.heritageClauses || []) {
+          for (const heritageNode of clause.types) {
+            try {
+              const heritageType = checker.getTypeAtLocation(heritageNode);
+              const inheritedSymbol = checker.getPropertyOfType(heritageType, name);
+              for (const declaration of inheritedSymbol?.declarations || []) {
+                const inheritedId = entityForDeclaration(declaration);
+                if (!inheritedId || nodes.get(inheritedId)?.tier !== "T1") continue;
+                addEdge(
+                  clause.token === ts.SyntaxKind.ImplementsKeyword
+                    ? "IMPLEMENTS_MEMBER" : "OVERRIDES",
+                  memberId,
+                  inheritedId,
+                  { compiler_resolved: true },
+                );
+              }
+            } catch { /* unresolved heritage remains in type extensions */ }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visitDispatchRelations);
+  };
+  visitDispatchRelations(sf);
+}
+
 // Same-scope duplicates and ancestor shadowing use compiler-owned scope IDs.
 for (const symbol of lexicalSymbols) {
   if (symbol.kind !== "import" || !symbol.declaration) continue;
@@ -1431,8 +1532,11 @@ function callMetadata(node) {
   } else if (ts.isElementAccessExpression(expression)) {
     receiverNode = expression.expression;
     receiverExpression = compact(expression.expression.getText(node.getSourceFile()), 240);
+    methodName = null;
     computedKeyExpression = expression.argumentExpression
       ? compact(expression.argumentExpression.getText(node.getSourceFile()), 240) : null;
+    const key = literalValue(expression.argumentExpression);
+    if (key.literal && typeof key.value === "string") methodName = key.value;
   }
   return {
     callee,
@@ -1517,6 +1621,41 @@ function targetDeclarationsForCall(node) {
       if (candidate.declaration) candidates.push(candidate.declaration);
     }
   } catch { /* unresolved dynamic call */ }
+  const expression = node.expression;
+  if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+    const receiver = expression.expression;
+    const methodNames = [];
+    if (ts.isPropertyAccessExpression(expression)) {
+      methodNames.push(expression.name.text);
+    } else {
+      const key = literalValue(expression.argumentExpression);
+      if (key.literal && typeof key.value === "string") methodNames.push(key.value);
+      else if (expression.argumentExpression) {
+        try {
+          const keyType = checker.getTypeAtLocation(expression.argumentExpression);
+          const alternatives = keyType.isUnion?.() ? keyType.types : [keyType];
+          for (const alternative of alternatives) {
+            if (alternative.isStringLiteral?.()) methodNames.push(alternative.value);
+          }
+        } catch { /* dynamic key stays unresolved */ }
+      }
+    }
+    try {
+      const receiverType = checker.getTypeAtLocation(receiver);
+      const receiverTypes = receiverType.isUnion?.() ? receiverType.types : [receiverType];
+      for (const receiverAlternative of receiverTypes) {
+        for (const methodName of methodNames) {
+          const member = checker.getPropertyOfType(receiverAlternative, methodName);
+          for (const declaration of member?.declarations || []) candidates.push(declaration);
+        }
+      }
+      if (["call", "apply", "bind"].includes(methodNames[0])) {
+        for (const signature of receiverType.getCallSignatures()) {
+          if (signature.declaration) candidates.push(signature.declaration);
+        }
+      }
+    } catch { /* union/dynamic receiver remains an explicit unresolved call */ }
+  }
   return { resolved, candidates: [...new Set(candidates)] };
 }
 
@@ -1619,6 +1758,235 @@ function astChildMetadata(parent, child) {
   return position === null ? { role } : { role, position };
 }
 
+function callableTargetsForExpression(expression) {
+  const targets = [];
+  const addDeclaration = (declaration) => {
+    if (!declaration) return;
+    if (isFunctionEntity(declaration)) {
+      targets.push(entityForDeclaration(declaration));
+      return;
+    }
+    const initializer = declaration.initializer;
+    if (initializer && isFunctionEntity(initializer)) {
+      targets.push(entityForDeclaration(initializer));
+    } else if (initializer && initializer !== expression) {
+      targets.push(...callableTargetsForExpression(initializer));
+    }
+  };
+  if (isFunctionEntity(expression)) {
+    addDeclaration(expression);
+  } else {
+    try {
+      let symbol = checker.getSymbolAtLocation(expression);
+      if (symbol?.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+      for (const declaration of symbol?.declarations || []) addDeclaration(declaration);
+    } catch { /* unresolved function values remain explicit values */ }
+  }
+  if (ts.isConditionalExpression(expression)) {
+    targets.push(...callableTargetsForExpression(expression.whenTrue));
+    targets.push(...callableTargetsForExpression(expression.whenFalse));
+  }
+  return [...new Set(targets.filter(Boolean))];
+}
+
+function addAllocation(node, owningFunction) {
+  if (!ts.isNewExpression(node) && !ts.isObjectLiteralExpression(node) &&
+      !ts.isArrayLiteralExpression(node) && !ts.isFunctionExpression(node) &&
+      !ts.isArrowFunction(node)) return null;
+  const position = sourcePosition(node);
+  const id = stableId("allocation", ...nodeKey(node, ts.SyntaxKind[node.kind]));
+  const allocationKind = ts.isNewExpression(node) ? "class-instance" :
+    ts.isObjectLiteralExpression(node) ? "object" :
+    ts.isArrayLiteralExpression(node) ? "array" : "function-object";
+  addNode("T2", id, "allocation", compact(node.getText(node.getSourceFile()), 180), {
+    ...position,
+    allocation_kind: allocationKind,
+    allocated_type: safeType(node),
+    owner_function_id: owningFunction,
+    module_singleton: !owningFunction,
+  });
+  addEdge("ALLOCATES", bodyForNode(node), id);
+  addEdge("VALUE_FLOWS_TO", id, pathForNode(node), { reason: "allocation" });
+  return id;
+}
+
+function addWrite(
+  node, targetNode, valueNode, owningFunction, writeKind, explicitTargetId = null,
+) {
+  const targetId = explicitTargetId || targetForValueNode(targetNode);
+  if (!targetId) return null;
+  const position = sourcePosition(node);
+  const id = stableId("write", ...nodeKey(node, `${targetId}:${writeKind}`));
+  const target = nodes.get(targetId);
+  addNode("T2", id, "write", compact(
+    targetNode?.getText(node.getSourceFile()) || nodes.get(targetId)?.label || "write", 180,
+  ), {
+    ...position,
+    write_kind: writeKind,
+    target_id: targetId,
+    value_id: valueNode ? pathForNode(valueNode) : null,
+    property_path: target?.kind === "property-path" ? target.properties.path : null,
+    owner_function_id: owningFunction,
+    target_scope: target?.properties?.symbol_kind === "parameter" ? "parameter" :
+      target?.properties?.symbol_kind === "import" ? "imported" :
+      target?.properties?.owner_function_id ? "local" : "module",
+  });
+  addEdge("WRITES_TO", id, targetId);
+  const evidenceNode = ts.isExpression(node) || ts.isStatement(node) ? node : valueNode;
+  if (evidenceNode) addEdge("EVIDENCED_BY", id, bodyForNode(evidenceNode));
+  else addEdge("EVIDENCED_BY", id, proofForNode(node));
+  if (valueNode) addEdge("VALUE_FLOWS_TO", pathForNode(valueNode), id, { reason: writeKind });
+  for (const functionId of valueNode ? callableTargetsForExpression(valueNode) : []) {
+    addEdge("FUNCTION_VALUE", functionId, targetId, { write_id: id });
+  }
+  return id;
+}
+
+function addAggregatePropertyWrites(declaration, baseId, owningFunction) {
+  const initializer = declaration.initializer;
+  if (!initializer || !baseId) return;
+  const entries = [];
+  if (ts.isObjectLiteralExpression(initializer)) {
+    for (const property of initializer.properties) {
+      if (ts.isPropertyAssignment(property)) {
+        const name = ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name) ||
+          ts.isNumericLiteral(property.name) ? property.name.text : null;
+        if (name !== null) entries.push({ name, node: property, value: property.initializer });
+      } else if (ts.isShorthandPropertyAssignment(property)) {
+        entries.push({ name: property.name.text, node: property, value: property.name });
+      } else if (ts.isMethodDeclaration(property)) {
+        const name = ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)
+          ? property.name.text : null;
+        if (name !== null) entries.push({ name, node: property, value: property });
+      }
+    }
+  } else if (ts.isArrayLiteralExpression(initializer)) {
+    initializer.elements.forEach((value, index) => {
+      if (!ts.isOmittedExpression(value)) entries.push({ name: String(index), node: value, value });
+    });
+  }
+  for (const entry of entries) {
+    const position = sourcePosition(entry.node);
+    const propertyId = stableId("property-path", baseId, entry.name);
+    addNode("T2", propertyId, "property-path", `${nodes.get(baseId)?.label}.${entry.name}`, {
+      ...position,
+      base_value_id: baseId,
+      path: entry.name,
+      dynamic: false,
+      owner_function_id: owningFunction,
+      type: safeType(entry.value),
+    });
+    addEdge("HAS_PROPERTY_PATH", baseId, propertyId);
+    addWrite(
+      entry.node, null, entry.value, owningFunction, "property-initializer", propertyId,
+    );
+  }
+}
+
+function addDynamicBehavior(node, behaviorKind, properties = {}) {
+  const position = sourcePosition(node);
+  const id = stableId("dynamic-behavior", ...nodeKey(node, behaviorKind));
+  addNode("T3", id, "dynamic-behavior", behaviorKind, {
+    ...position,
+    behavior_kind: behaviorKind,
+    expression: compact(node.getText(node.getSourceFile()), 300),
+    owner_function_id: ownerFunction(node),
+    ...properties,
+  });
+  addEdge("DYNAMIC_BEHAVIOR_AT", id, bodyForNode(node));
+  addEdge("EVIDENCED_BY", id, proofForNode(node));
+  return id;
+}
+
+function recordDirectDynamicBehavior(node) {
+  if (ts.isCallExpression(node)) {
+    if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const argument = node.arguments[0];
+      addDynamicBehavior(node, "dynamic-import", {
+        literal_specifier: literalValue(argument).literal,
+        specifier: literalValue(argument).value,
+      });
+    } else if (ts.isIdentifier(node.expression) && node.expression.text === "eval") {
+      addDynamicBehavior(node, "eval", { static_resolution: "none" });
+    } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
+      const argument = node.arguments[0];
+      if (!literalValue(argument).literal) {
+        addDynamicBehavior(node, "runtime-module-load", { static_resolution: "dynamic" });
+      }
+    } else if (ts.isPropertyAccessExpression(node.expression)) {
+      const receiver = node.expression.expression.getText(node.getSourceFile());
+      if (receiver === "Reflect") {
+        addDynamicBehavior(node, "reflection", { operation: node.expression.name.text });
+      } else if (receiver === "Object" &&
+          ["defineProperty", "defineProperties", "setPrototypeOf"].includes(node.expression.name.text)) {
+        addDynamicBehavior(node, "runtime-object-mutation", {
+          operation: node.expression.name.text,
+        });
+      }
+    }
+  } else if (ts.isNewExpression(node)) {
+    const name = node.expression.getText(node.getSourceFile());
+    if (name === "Function") addDynamicBehavior(node, "new-function", { static_resolution: "none" });
+    if (name === "Proxy") addDynamicBehavior(node, "proxy", { static_resolution: "runtime" });
+  } else if (ts.isElementAccessExpression(node) &&
+      !literalValue(node.argumentExpression).literal) {
+    addDynamicBehavior(node, "computed-property-access", {
+      key_expression: node.argumentExpression?.getText(node.getSourceFile()) || null,
+    });
+  } else if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
+    const left = node.left.getText(node.getSourceFile());
+    if (left.includes(".prototype") || left === "module.exports" || left.startsWith("exports.")) {
+      addDynamicBehavior(node, "monkey-patch", { target: left });
+    }
+  }
+}
+
+function recordStaticInitializer(node, owningFunction) {
+  if (!ts.isClassStaticBlockDeclaration(node) &&
+      !(ts.isPropertyDeclaration(node) && hasModifier(node, ts.SyntaxKind.StaticKeyword))) {
+    return;
+  }
+  const position = sourcePosition(node);
+  const ownerId = nodes.get(nearestScope(node))?.properties?.owner_function_id ||
+    entityByDeclaration.get(node.parent) || null;
+  const id = stableId("static-initializer", ...nodeKey(node, ownerId || "class"));
+  addNode("T3", id, "static-initializer", compact(node.getText(node.getSourceFile()), 200), {
+    ...position,
+    owner_type_id: ownerId,
+    owner_function_id: owningFunction,
+    initializer_kind: ts.isClassStaticBlockDeclaration(node) ? "static-block" : "static-property",
+  });
+  addEdge("INITIALIZES_WITH", ownerId, id);
+  addEdge("EVIDENCED_BY", id, proofForNode(node));
+}
+
+function recordModuleInitializers(sf, fileId) {
+  let previous = null;
+  let order = 0;
+  for (const statement of sf.statements) {
+    if (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement) ||
+        ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) ||
+        ts.isFunctionDeclaration(statement)) continue;
+    const position = sourcePosition(statement);
+    const id = stableId("module-initializer", ...nodeKey(statement, order));
+    addNode("T3", id, "module-initializer", compact(statement.getText(sf), 220), {
+      ...position,
+      order,
+      statement_kind: ts.SyntaxKind[statement.kind],
+      side_effect_kind: ts.isVariableStatement(statement) ? "binding" :
+        ts.isClassDeclaration(statement) ? "class-definition" :
+        ts.isExpressionStatement(statement) ? "expression" : "module-load",
+    });
+    addEdge("INITIALIZES_WITH", fileId, id, { order });
+    addEdge("EVIDENCED_BY", id, bodyForNode(statement));
+    if (previous) addEdge("EXECUTES_BEFORE", previous, id);
+    previous = id;
+    order += 1;
+  }
+}
+
 // Second pass: AST/body, direct value flow, compiler-resolved calls and control.
 for (const fileName of analysisFileNames) {
   const sf = program.getSourceFile(fileName);
@@ -1641,6 +2009,10 @@ for (const fileName of analysisFileNames) {
       if (parentBody) addEdge("AST_CHILD", parentBody, bodyId, astChildMetadata(node.parent, node));
       else addEdge("CONTAINS_BODY", owningFunction || fileId, bodyId);
     }
+
+    addAllocation(node, owningFunction);
+    recordDirectDynamicBehavior(node);
+    recordStaticInitializer(node, owningFunction);
 
     if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node)) {
       sequenceStatements(node);
@@ -1692,6 +2064,8 @@ for (const fileName of analysisFileNames) {
       addEdge("VALUE_FLOWS_TO", pathForNode(node.initializer), valueForDeclaration(node), {
         reason: "initializer",
       });
+      addWrite(node, node.name, node.initializer, owningFunction, "initializer");
+      addAggregatePropertyWrites(node, valueForDeclaration(node), owningFunction);
     }
 
     if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
@@ -1730,6 +2104,7 @@ for (const fileName of analysisFileNames) {
         if (target) addEdge("VALUE_FLOWS_TO", pathForNode(node.right), target, { reason: "write" });
       }
       const targetId = targetForValueNode(node.left);
+      addWrite(node, node.left, node.right, owningFunction, "assignment");
       const definitionId = addDefinition(
         targetId, node, ts.isIdentifier(node.left) ? "assignment" : "property-write",
         "expression", node.right,
@@ -1745,6 +2120,7 @@ for (const fileName of analysisFileNames) {
     } else if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
         [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator)) {
       const targetId = targetForValueNode(node.operand);
+      addWrite(node, node.operand, node.operand, owningFunction, "update");
       addDefinition(targetId, node, "update", "expression", node.operand);
     }
 
@@ -1795,8 +2171,8 @@ for (const fileName of analysisFileNames) {
       }
       const candidateTargetIds = [];
       for (const declaration of candidates) {
-        const targetId = entityForDeclaration(declaration);
-        if (!targetId) continue;
+      const targetId = entityForDeclaration(declaration);
+      if (!targetId || nodes.get(targetId)?.tier !== "T1") continue;
         candidateTargetIds.push(targetId);
         if (targetId !== primaryTarget) {
           addEdge("MAY_INVOKE", callId, targetId, { reason: "overload-candidate" });
@@ -1825,6 +2201,12 @@ for (const fileName of analysisFileNames) {
           addEdge("ARGUMENT_BINDS_PARAMETER", argId, parameterId, {
             position: index,
             callsite: callId,
+          });
+        }
+        for (const functionId of callableTargetsForExpression(argument)) {
+          addEdge("PASSES_CALLBACK", argId, functionId, {
+            callsite: callId,
+            position: index,
           });
         }
       });
@@ -1875,6 +2257,7 @@ for (const fileName of analysisFileNames) {
     ts.forEachChild(node, (child) => visit(child, bodyId, owningFunction));
   };
   visit(sf, null, null);
+  recordModuleInitializers(sf, fileId);
 }
 
 // TypeScript resolves package calls through declarations, while runtime behavior
