@@ -64,7 +64,40 @@ def compact(value: object, limit: int = 300) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def read_roots(roots_file: str) -> List[Path]:
+    """Ingest exactly the discovery-provided root list.
+
+    The Python driver (Arachne/core/runner.py) writes ARACHNE_ROOTS_FILE after it
+    has already pruned vendor directories and excluded tests via
+    nav.symbol_index.is_test_path.  Honoring it means the C frontend inherits that
+    single discovery instead of re-walking the tree and re-introducing what was
+    filtered out — mirroring the TypeScript frontend's readRoots().
+    """
+    roots: List[Path] = []
+    try:
+        lines = Path(roots_file).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return roots
+    for line in lines:
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        candidate = Path(trimmed).resolve()
+        if candidate.suffix.lower() in SOURCE_SUFFIXES and candidate.is_file():
+            roots.append(candidate)
+    return sorted(set(roots))
+
+
 def walk(source_dir: Path) -> List[Path]:
+    # Discovery owns file selection: when the driver hands us an explicit root set
+    # (ARACHNE_ROOTS_FILE — vendor/test files already excluded), ingest exactly that
+    # list so the walker can't re-introduce what was filtered out.  Absent the env
+    # var (standalone CLI run), fall back to a full source-tree walk.
+    roots_file = os.environ.get("ARACHNE_ROOTS_FILE")
+    if roots_file:
+        roots = read_roots(roots_file)
+        if roots:
+            return roots
     return sorted(
         path.resolve() for path in source_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES
