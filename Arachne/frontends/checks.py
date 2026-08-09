@@ -790,6 +790,26 @@ class CompilerFrontendTests(unittest.TestCase):
                 and edge["target"] == functions_by_label["ext4_write"]
                 for edge in snapshot.edges
             ))
+            # Macro recovery (macros.c): the post-preprocessor AST has no #defines,
+            # so the -E -dD pass reconstructs them as first-class `macro` nodes with
+            # object-like vs function-like distinguished and their definition site.
+            macros = {
+                node["label"]: node for node in snapshot.nodes
+                if node["kind"] == "macro"
+            }
+            self.assertEqual("object-like", macros["MAX_PATH"]["properties"]["form"])
+            self.assertEqual(
+                "function-like", macros["SQUARE"]["properties"]["form"]
+            )
+            self.assertEqual(["x"], macros["SQUARE"]["properties"]["parameters"])
+            # The file->macro containment is a cross-tier structural edge, surfaced
+            # as EXPANDS_TO(via=DECLARES) like every other file->declaration link.
+            macro_id = macros["MAX_PATH"]["id"]
+            self.assertTrue(any(
+                edge["kind"] == "EXPANDS_TO" and edge["target"] == macro_id
+                and edge["properties"].get("via") == "DECLARES"
+                for edge in snapshot.edges
+            ))
 
     def test_c_compile_commands_supply_per_file_flags(self) -> None:
         # A two-directory project whose header lives outside the source dir fails to

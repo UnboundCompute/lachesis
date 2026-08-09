@@ -48,6 +48,7 @@ INDEXED_KINDS = {
     "function": "function", "method": "method", "constructor": "method",
     "record": "type", "union": "type",
     "variable": "variable", "property": "property", "constant": "constant",
+    "macro": "macro",
 }
 
 # Kind precedence for name resolution: when one name resolves to multiple nodes, prefer

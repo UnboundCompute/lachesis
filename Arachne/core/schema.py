@@ -29,6 +29,7 @@ DECLARATION_NODE_KINDS = frozenset({
     "scope", "symbol", "declaration", "function", "method", "constructor",
     "class", "interface", "type", "enum", "record", "parameter", "variable",
     "binding", "property", "constant", "value", "decorator", "type-parameter",
+    "macro",
 })
 EXECUTABLE_NODE_KINDS = frozenset({
     "statement", "expression", "operation", "identifier", "call", "construct",
@@ -61,7 +62,7 @@ NODE_KIND_TIERS = {
     **{kind: frozenset({"T0"}) for kind in PROJECT_STRUCTURE_NODE_KINDS},
     **{kind: frozenset({"T1"}) for kind in {
         "declaration", "function", "method", "constructor", "class", "interface",
-        "type", "enum", "record",
+        "type", "enum", "record", "macro",
     }},
     **{kind: frozenset({"T2"}) for kind in {
         "scope", "symbol", "parameter", "variable", "binding", "property",

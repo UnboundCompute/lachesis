@@ -17,6 +17,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+try:  # run as a script (sys.path[0] is this directory) …
+    from macros import parse_macro_definitions
+except ImportError:  # … or imported as a package module.
+    from Arachne.frontends.c.macros import parse_macro_definitions
+
 
 CONTRACT_VERSION = 2
 FRONTEND_ID = "clang-c"
@@ -324,6 +329,27 @@ def position_from_ast(
         "start_column": loc.get("col", begin.get("col", start_column)),
         "end_line": end.get("line", end_line),
         "end_column": end.get("col", end_column),
+    }
+
+
+def position_from_line(path: Path, line: int, texts: Dict[Path, str]) -> dict:
+    """A source position spanning the physical definition line (macros have no AST
+    range). Backslash-continued lines are folded into a single logical span so
+    ``read_body`` shows the whole ``#define``."""
+    text = source_text(path, texts)
+    starts = line_offsets(text)
+    lines = text.splitlines()
+    index = max(0, min(line, len(starts)) - 1)
+    start = starts[index]
+    last = index
+    while last < len(lines) and lines[last].endswith("\\"):
+        last += 1
+    end = starts[last + 1] - 1 if last + 1 < len(starts) else len(text)
+    return {
+        "file": str(path), "absolute_file": str(path),
+        "start_offset": start, "end_offset": max(start, end),
+        "start_line": index + 1, "start_column": 1,
+        "end_line": last + 1, "end_column": len(lines[last]) + 1 if last < len(lines) else 1,
     }
 
 
@@ -887,6 +913,33 @@ def main() -> int:
             graph.edge("HAS_TOKEN", file_ids[path], token_id)
             graph.edge("NEXT_TOKEN", previous, token_id)
             previous = token_id
+
+    # Preprocessor macro recovery. The JSON AST is post-preprocessor, so macros
+    # are reconstructed from a dedicated -E -dD pass (macros.py) and made
+    # addressable. Preprocessing is lexical, so this succeeds even for a file
+    # whose C body failed to parse — its #defines are still real.
+    for path in files:
+        if path not in file_ids:
+            continue
+        result = run_clang(source_dir, path, "-E", "-dD", file_flags=compile_commands.get(path))
+        if result.returncode != 0:
+            continue
+        for macro in parse_macro_definitions(result.stdout, path):
+            position = position_from_line(path, int(macro["line"]), texts)
+            signature = (
+                f'{macro["name"]}({", ".join(macro["parameters"])})'
+                if macro["form"] == "function-like" else macro["name"]
+            )
+            macro_id = stable_id(
+                "macro", path, position["start_offset"], macro["name"],
+            )
+            graph.node(
+                "T1", macro_id, "macro", macro["name"], **position,
+                syntax_kind="macro", form=macro["form"],
+                parameters=macro["parameters"], body=macro["body"],
+                signature=signature,
+            )
+            graph.edge("DECLARES", file_ids[path], macro_id)
 
     for path, message in diagnostics:
         diagnostic_id = stable_id("diagnostic", path, message)
