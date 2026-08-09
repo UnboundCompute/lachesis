@@ -5,18 +5,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from Arachne import analyze_files, read_file, walk
-from Arachne.compiler_adapter import (
-    analyze_typescript_with_compiler, run_project_frontends, snapshot_file_infos,
+from Arachne.compatibility.legacy_file_api import analyze_files, read_file, walk
+from Arachne.compatibility.projector import (
+    compatibility_taint_path as taint_path, graph_file_infos,
 )
-from Arachne.compatibility.projector import compatibility_taint_path as taint_path
+from Arachne.pipeline import run_project, semantic_snapshot_graph, snapshot_graph
 from Arachne.core.snapshot import load_snapshot
 from Arachne.core.validation import validate_snapshot
 from Arachne.core.contract import ContractError, FrontendSnapshot
@@ -241,9 +240,10 @@ class CompilerFrontendTests(unittest.TestCase):
                 and edge["source"] == route_source["id"]
                 for edge in modeled["edges"]
             ))
-            files, composed, _ = analyze_typescript_with_compiler(
+            composed, _ = run_project(
                 str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "framework"),
             )
+            files = graph_file_infos(composed)
             handler = next(
                 function for info in files for function in info["functions"]
                 if function["name"] == "documentHandler"
@@ -369,7 +369,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 for edge in snapshot.edges
             ))
 
-            compatibility = snapshot_file_infos(snapshot)
+            compatibility = graph_file_infos(snapshot_graph(snapshot))
             self.assertTrue(any(
                 refinement.get("compiler_node_id")
                 for info in compatibility for refinement in info["type_refinements"]
@@ -477,7 +477,7 @@ class CompilerFrontendTests(unittest.TestCase):
             ))
 
     def test_canonical_module_initialization_overlay(self) -> None:
-        semantics, _ = run_project_frontends(
+        semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
         )
         core_singletons = [
@@ -501,7 +501,7 @@ class CompilerFrontendTests(unittest.TestCase):
             for node in [*core_singletons, *core_state]
         ))
 
-        cycle_graph, _ = run_project_frontends(
+        cycle_graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "module_cycle")
         )
         cycle = next(
@@ -517,7 +517,7 @@ class CompilerFrontendTests(unittest.TestCase):
         ))
 
     def test_canonical_control_flow_overlay(self) -> None:
-        graph, _ = run_project_frontends(
+        graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "control_flow")
         )
         function = next(
@@ -551,7 +551,7 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertEqual("total = 999;", body["label"])
 
     def test_canonical_branch_history_overlay(self) -> None:
-        graph, _ = run_project_frontends(
+        graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "branch_history")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
@@ -584,7 +584,7 @@ class CompilerFrontendTests(unittest.TestCase):
         ))
 
     def test_canonical_heap_identity_overlay(self) -> None:
-        graph, _ = run_project_frontends(
+        graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "heap")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
@@ -653,7 +653,7 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertTrue(applied_locations & account_read_locations)
 
     def test_canonical_runtime_and_async_event_overlays(self) -> None:
-        graph, _ = run_project_frontends(
+        graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "async_events")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
@@ -699,7 +699,7 @@ class CompilerFrontendTests(unittest.TestCase):
         ))
 
     def test_canonical_dynamic_dispatch_overlay(self) -> None:
-        graph, _ = run_project_frontends(
+        graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "dispatch")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
@@ -750,7 +750,7 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertTrue(implementations.issubset(reached))
 
     def test_compiler_dynamic_facts_and_core_boundaries(self) -> None:
-        graph, _ = run_project_frontends(
+        graph, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "dynamic")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
@@ -788,11 +788,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
-            with patch(
-                "Arachne.compiler_adapter.snapshot_file_infos",
-                side_effect=AssertionError("primary project graph used FileInfo"),
-            ):
-                graph, snapshots = run_project_frontends(str(ROOT), output)
+            graph, snapshots = run_project(str(ROOT), output)
             self.assertEqual({"typescript-compiler-api", "clang-c"}, {
                 snapshot.frontend_id for snapshot in snapshots
             })
@@ -862,8 +858,11 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_typescript_compiler_facts_feed_semantic_overlays(self) -> None:
         with tempfile.TemporaryDirectory() as output:
-            files, graph, snapshot = analyze_typescript_with_compiler(
-                str(ROOT / "src"), output,
+            graph, snapshots = run_project(str(ROOT / "src"), output)
+            files = graph_file_infos(graph)
+            snapshot = next(
+                item for item in snapshots
+                if item.frontend_id == "typescript-compiler-api"
             )
             self.assertEqual("typescript-compiler-api", snapshot.frontend_id)
             totals = {

@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from Arachne.compiler_adapter import run_project_frontends, write_project_graph
+from Arachne.pipeline import run_project, write_project_graph
 
 
 def main() -> None:
@@ -21,7 +21,7 @@ def main() -> None:
         help="directory retaining each compiler's native layered snapshot",
     )
     args = parser.parse_args()
-    graph, snapshots = run_project_frontends(args.source_dir, args.frontend_out)
+    graph, snapshots = run_project(args.source_dir, args.frontend_out)
     written = write_project_graph(graph, snapshots, args.output_path)
     kinds = Counter(node["kind"] for node in graph["nodes"])
     print(

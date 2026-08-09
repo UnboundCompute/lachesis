@@ -1,4 +1,4 @@
-"""Compose compiler snapshots and run language-neutral canonical overlays."""
+"""Build one canonical project graph through registered compiler frontends."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
 from .core.runner import run_frontend
 from .frontends.registry import FrontendRegistry, default_registry
-from .types import CodeGraph, FileInfo, GraphEdge, GraphNode
+from .types import CodeGraph, GraphEdge, GraphNode
 
 
 def snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
@@ -120,13 +120,13 @@ def _enrich_graph(graph: CodeGraph, snapshots: Sequence[FrontendSnapshot]) -> Co
     return default_security_overlay_registry().enrich(graph)
 
 
-def run_project_frontends(
+def run_project(
     source_dir: str,
     output_root: Optional[str] = None,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
-    """Run every needed frontend and enrich their canonical facts directly."""
+    """Run selected frontends and enrich their canonical facts directly."""
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
     groups = registry.partition(source_inventory(source_dir))
@@ -150,26 +150,6 @@ def run_project_frontends(
         )
     graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
     return _enrich_graph(graph, snapshots), snapshots
-
-
-def analyze_typescript_with_compiler(
-    source_dir: str, output_root: Optional[str] = None,
-) -> Tuple[List[FileInfo], CodeGraph, FrontendSnapshot]:
-    """Compatibility entrypoint backed by the finished canonical graph."""
-    graph, snapshots = run_project_frontends(source_dir, output_root)
-    snapshot = next((
-        item for item in snapshots if item.frontend_id == "typescript-compiler-api"
-    ), None)
-    if snapshot is None:
-        raise FrontendError(f"no TypeScript/JavaScript frontend selected for {source_dir}")
-    from .compatibility.projector import graph_file_infos
-    return graph_file_infos(graph), graph, snapshot
-
-
-def snapshot_file_infos(snapshot: FrontendSnapshot) -> List[FileInfo]:
-    """Deprecated direct-fact projection; primary compatibility uses final graphs."""
-    from .compatibility.projector import graph_file_infos
-    return graph_file_infos(snapshot_graph(snapshot))
 
 
 def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:

@@ -1,4 +1,4 @@
-"""Materialized, partitioned 5-tier security graph — a projection over build_graph.
+"""Materialized five-tier read-only projection of the canonical project graph.
 
 The flat graph from ``build_graph`` (~5.8k nodes / ~23k edges on the fixture) is too
 large for an LLM to traverse. This projection re-shapes the SAME graph into five
@@ -17,15 +17,14 @@ Two uniform mechanics:
   * rollup     — a coarse edge aggregates the fine edges beneath it, carrying
     ``witnesses`` (the finer ids/evidence) + ``weight``.
 
-This module is READ-ONLY over the input graph: ``build_graph`` returns the mutable
-module-global ``CODE_GRAPH`` singleton, so we never mutate the nodes/edges we are
-handed — every annotated node is a freshly-built dict.
+This module is read-only over its input and never invokes compatibility or source
+analysis. Every annotated node is a freshly-built dictionary.
 """
 import json
 import os
 from collections import defaultdict
 
-from ..security_roles import derive_roles, detect_guards
+from .security import derive_roles, detect_guards
 
 # --- tier assignment --------------------------------------------------------
 TIER_NAMES = {
@@ -43,21 +42,26 @@ NODE_KIND_TIER = {
     # T0 Perimeter
     "file": "T0", "module": "T0", "import-cycle": "T0",
     # T1 Reachability
-    "function": "T1", "class": "T1", "interface": "T1", "type": "T1", "enum": "T1",
+    "function": "T1", "method": "T1", "constructor": "T1",
+    "class": "T1", "interface": "T1", "type": "T1", "enum": "T1",
     "type-reference": "T1", "dispatch-member": "T1", "wiring-boundary": "T1",
     "dynamic-behavior": "T1", "singleton": "T1", "module-state": "T1",
     "module-initializer": "T1", "static-initializer": "T1", "effect-summary": "T1",
-    "function-effect": "T1", "runtime-model-application": "T1",
+    "function-effect": "T1", "runtime-model-application": "T1", "route": "T1",
+    "boundary": "T1", "package": "T0", "external-module": "T0",
     # T2 Path
-    "taint-source": "T2", "tainted-call": "T2",
+    "source": "T2", "sink": "T2", "taint-reach": "T2",
     # T3 Body
-    "statement": "T3", "expression": "T3", "operation": "T3", "call": "T3",
+    "statement": "T3", "expression": "T3", "identifier": "T3",
+    "operation": "T3", "call": "T3", "construct": "T3",
     "argument": "T3", "return-value": "T3", "call-return": "T3", "cfg-node": "T3",
+    "cfg-entry": "T3", "cfg-exit": "T3", "cfg-condition": "T3", "cfg-merge": "T3",
     "phi": "T3", "exception-site": "T3", "catch-handler": "T3",
     "finally-block": "T3", "promise-rejection": "T3", "type-refinement": "T3",
     "dispatch-candidate": "T3", "scope": "T3",
     # T4 Proof
-    "definition": "T4", "read": "T4", "property": "T4", "heap-object": "T4",
+    "definition": "T4", "read": "T4", "parameter": "T4", "property": "T4",
+    "heap-object": "T4",
     "heap-location": "T4", "heap-access": "T4", "heap-effect": "T4",
     "context-heap-effect": "T4", "call-context": "T4", "context-return": "T4",
     "context-parameter": "T4", "context-receiver": "T4", "context-dispatch": "T4",
@@ -65,7 +69,9 @@ NODE_KIND_TIER = {
     "overload": "T4", "type-compatibility": "T4", "async-event": "T4",
     "runtime-symbol": "T4", "receiver-type": "T4", "unresolved-symbol": "T4",
     "dynamic-type-reference": "T4", "token": "T4", "source-line": "T4",
-    "data-context": "T4",
+    "data-context": "T4", "source-span": "T4", "value": "T4",
+    "variable": "T4", "binding": "T4", "write": "T4", "call-value": "T4",
+    "property-path": "T4", "allocation": "T4", "diagnostic": "T4",
     # "symbol" is resolved contextually (module-scope -> T1, function-local -> T3).
 }
 
@@ -204,15 +210,16 @@ def _build_rollups(index, tier_of, verdicts, sinks):
         })
 
     # T1 HANDLES: wiring-boundary -> handler function.
-    for edge in index.by_kind.get("WIRES_TO", []):
-        if tier_of.get(edge["source"]) != "T1" or tier_of.get(edge["target"]) != "T1":
-            continue
-        edges.append({
-            "tier": "T1", "kind": "HANDLES", "source": edge["source"],
-            "target": edge["target"],
-            "properties": {"witnesses": [edge["source"]], "weight": 1,
-                           "confidence": edge["properties"].get("confidence")},
-        })
+    for kind in ("WIRES_TO", "ROUTE_HANDLED_BY"):
+        for edge in index.by_kind.get(kind, []):
+            if tier_of.get(edge["source"]) != "T1" or tier_of.get(edge["target"]) != "T1":
+                continue
+            edges.append({
+                "tier": "T1", "kind": "HANDLES", "source": edge["source"],
+                "target": edge["target"],
+                "properties": {"witnesses": [edge["source"]], "weight": 1,
+                               "confidence": edge["properties"].get("confidence")},
+            })
 
     # T1 GUARDED_BY / UNGUARDED: handler function -> sink function.
     function_by_name = defaultdict(list)
@@ -237,30 +244,32 @@ def _build_rollups(index, tier_of, verdicts, sinks):
                     },
                 })
 
-    # T2 REACHES: taint-source -> tainted-call.
-    for edge in index.by_kind.get("TAINTED_CALL_FROM", []):  # source -> tainted-call
-        if tier_of.get(edge["source"]) != "T2" or tier_of.get(edge["target"]) != "T2":
+    # T2 REACHES: canonical source -> witnessed reach -> canonical sink.
+    for reach in (node for node in index.nodes.values() if node["kind"] == "taint-reach"):
+        properties = reach.get("properties", {})
+        source_id, sink_id = properties.get("source_id"), properties.get("sink_id")
+        witnesses = properties.get("witness_ids", [])
+        if not source_id or not sink_id:
             continue
-        tainted = index.nodes.get(edge["target"], {})
-        edges.append({
-            "tier": "T2", "kind": "REACHES", "source": edge["source"],
-            "target": edge["target"],
-            "properties": {
-                "witnesses": [tainted.get("properties", {}).get("call_id")],
-                "weight": tainted.get("properties", {}).get("hop_count", 1),
-            },
-        })
+        for source, target in ((source_id, reach["id"]), (reach["id"], sink_id)):
+            if tier_of.get(source) != "T2" or tier_of.get(target) != "T2":
+                continue
+            edges.append({
+                "tier": "T2", "kind": "REACHES", "source": source,
+                "target": target,
+                "properties": {"witnesses": witnesses, "weight": len(witnesses)},
+            })
 
     return edges
 
 
-def build_layered_graph(graph, files):
+def build_layered_graph(graph):
     """Project the flat graph into the materialized 5-tier layered graph."""
     index = GraphIndex(graph)
     tier_of, untiered = _assign_tiers(index)
 
-    role_of, sinks = derive_roles(index, files)
-    verdicts = detect_guards(index, files, sinks)
+    role_of, sinks = derive_roles(graph)
+    verdicts = detect_guards(graph, sinks)
 
     # Attach the Guard role to the authz-accessor call carried in each GUARDED verdict.
     for verdict in verdicts:
@@ -274,15 +283,11 @@ def build_layered_graph(graph, files):
                     "witnesses": [verdict["handler_id"]],
                 })
 
-    # Guard verdict lookup by sink call id, for T2 tainted-call annotation.
+    # Guard verdict lookup by sink call id, for T2 taint-path annotation.
     verdict_by_call = {}
     for verdict in verdicts:
         for call_id in verdict["sink_call_ids"]:
             verdict_by_call[call_id] = verdict
-    call_to_tainted = {}
-    for node in index.nodes.values():
-        if node["kind"] == "tainted-call":
-            call_to_tainted[node["properties"].get("call_id")] = node["id"]
 
     rollups = _build_rollups(index, tier_of, verdicts, sinks)
     expands = _emit_expands_to(index, tier_of)
@@ -325,9 +330,9 @@ def build_layered_graph(graph, files):
             properties["roles"] = roles
             for role in roles:
                 role_index[role["role"]].append(node_id)
-        # T2 tainted-call carries its guard verdict inline (keeps T2 self-contained).
-        if node["kind"] == "tainted-call":
-            verdict = verdict_by_call.get(node["properties"].get("call_id"))
+        # T2 sink carries its owning call's guard verdict inline.
+        if node["kind"] == "sink":
+            verdict = verdict_by_call.get(node["properties"].get("callsite_id"))
             if verdict:
                 properties["guard_status"] = verdict["status"]
                 properties["guard_signal"] = verdict["guard_signal"]

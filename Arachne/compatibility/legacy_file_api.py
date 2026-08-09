@@ -67,13 +67,13 @@ def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileI
     if unsupported:
         raise ValueError(
             "FileInfo semantic overlays currently support TS/JS paths; use "
-            "run_project_frontends() for mixed-language/C canonical graphs. "
+        "run_project() for mixed-language/C canonical graphs. "
             f"First unsupported path: {unsupported[0]}"
         )
-    from ..compiler_adapter import run_project_frontends
+    from ..pipeline import run_project
 
     project_root = _compiler_project_root(paths)
-    graph, _snapshots = run_project_frontends(project_root)
+    graph, _snapshots = run_project(project_root)
     global LAST_GRAPH
     LAST_GRAPH = graph
     all_infos = graph_file_infos(graph)
