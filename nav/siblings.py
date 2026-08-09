@@ -15,10 +15,14 @@ guard (Fix 2 `class == guard`) or makes a guard-family call (Fix 4 role). A memb
 demoted by a callee guard is reported with `where = callee:<name>` so the FP-kill is
 auditable, never silent.
 
-Family formation is purely structural (no target literals): a member's *role key* is
-its identifier tokens minus the tokens of its own directory segments (the platform/
-package word), so functions that differ only by platform align into one family — the
-same alignment `graphlib.directory_template_families` uses, done per-query.
+Family formation is purely structural (no target literals) and **widened** so a
+specific name still finds peers: a member is keyed by a *verb anchor* (its security-
+role bucket via the shared `role_from_name` lexicon, else its leading camel token)
+plus its remaining dir-stripped *noun* tokens. Two functions are peers when they
+share the verb AND overlap on >=1 noun — so `validateInlineAuthKey` aligns with
+`validateApiKey` (verb `validate` + noun `key`) instead of keying into a family of
+one, while a bare `getUser` with no noun-sharing verb-peer stays size 1 (no mega-
+family). Noun-overlap isn't transitive, so families are formed per-seed at query time.
 
 Output is negative-space aware: a flagged outlier is shown *with* the guard its peers
 have and it lacks. `--build-overlay` materializes the flag as a first-class
@@ -36,17 +40,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import segment_tokens
+from tier1_flag.graphlib import camel_tokens, segment_tokens
 from nav.graph_store import GraphStore
 from nav.guards import GuardProfiles
-from nav.call_roles import CallRoles, GUARD_FAMILY_ROLES
+from nav.call_roles import CallRoles, GUARD_FAMILY_ROLES, role_from_name
 from nav.overlay import Overlay, sidecar_path
 
 # how far to chase a centralized guard through callees before giving up
 GUARD_RADIUS = 2
 
 
-def _role_key(entry: dict) -> frozenset[str]:
+def _residual_tokens(entry: dict) -> frozenset[str]:
     """Identifier tokens minus the function's own directory-segment tokens.
 
     `deleteTeamsMessage` in `adapter-teams/...` -> {delete, message} (the `teams`
@@ -57,6 +61,27 @@ def _role_key(entry: dict) -> frozenset[str]:
     return frozenset(t for t in entry.get("tokens", []) if t not in dir_tokens)
 
 
+def _anchor(entry: dict) -> tuple[str | None, frozenset[str]]:
+    """(verb, nouns) — the widened family signature (field break #4).
+
+    The old key was the *exact* dir-stripped token set, so a specific name
+    (`validateInlineAuthKey` -> {validate,inline,auth,key}) keyed into a family of
+    one. Instead we anchor on the **verb** (the security-role bucket via the shared
+    lexicon `role_from_name`, else the leading camel token) and keep the remaining
+    **nouns** (dir-stripped residual minus the leading token). Two functions are
+    peers when they share the verb AND overlap on >=1 noun — so
+    `validateInlineAuthKey` aligns with `validateApiKey` (verb `validate` + noun
+    `key`), while a bare `getUser` with no noun-sharing verb-peer stays a family of
+    one (no mega-family collapse). Purely structural: lexicon + tokens, no literals."""
+    name = entry.get("name") or ""
+    residual = _residual_tokens(entry)
+    lead = camel_tokens(name)
+    lead_tok = lead[0] if lead else None
+    verb = role_from_name(name) or lead_tok
+    nouns = frozenset(t for t in residual if t != lead_tok)
+    return verb, nouns
+
+
 class SiblingDiff:
     def __init__(self, store: GraphStore) -> None:
         self.store = store
@@ -64,29 +89,32 @@ class SiblingDiff:
         self.index = store.index
         self.guards = GuardProfiles(store)
         self.roles = CallRoles(store, guards=self.guards)
-        self._by_key: dict[frozenset[str], list[dict]] | None = None
+        # verb anchor -> list of (entry, nouns); built once
+        self._by_verb: dict[str, list[tuple[dict, frozenset[str]]]] | None = None
 
     # -- family formation ----------------------------------------------------
 
-    def _families(self) -> dict[frozenset[str], list[dict]]:
-        if self._by_key is None:
-            groups: dict[frozenset[str], list[dict]] = {}
+    def _families(self) -> dict[str, list[tuple[dict, frozenset[str]]]]:
+        if self._by_verb is None:
+            groups: dict[str, list[tuple[dict, frozenset[str]]]] = {}
             for e in self.store.entries:
                 if e["granularity"] not in ("function", "method"):
                     continue
-                key = _role_key(e)
-                if key:
-                    groups.setdefault(key, []).append(e)
-            self._by_key = groups
-        return self._by_key
+                verb, nouns = _anchor(e)
+                if verb and nouns:
+                    groups.setdefault(verb, []).append((e, nouns))
+            self._by_verb = groups
+        return self._by_verb
 
-    def family_of(self, entry: dict) -> tuple[frozenset[str], list[dict]]:
-        key = _role_key(entry)
-        members = [m for m in self._families().get(key, [])
-                   if (m["file"], m["line"]) != (entry["file"], entry["line"])]
-        # distinct directories only — same-dir overloads aren't a cross-module peer set
+    def family_of(self, entry: dict) -> tuple[tuple[str, frozenset[str]], list[dict]]:
+        """Peers = same verb anchor AND >=1 shared noun (break #4 widening)."""
+        verb, nouns = _anchor(entry)
+        members = [m for m, m_nouns in self._families().get(verb, [])
+                   if (m_nouns & nouns)
+                   and (m["file"], m["line"]) != (entry["file"], entry["line"])]
+        # distinct locations only — the seed leads, peers follow
         members = [entry] + members
-        return key, members
+        return (verb, nouns), members
 
     # -- guardedness (with transitivity) ------------------------------------
 
@@ -127,7 +155,7 @@ class SiblingDiff:
     # -- the differential ----------------------------------------------------
 
     def diff(self, entry: dict) -> dict:
-        key, members = self.family_of(entry)
+        (verb, nouns), members = self.family_of(entry)
         classified = []
         for m in members:
             g = self.guardedness(m["node_id"])
@@ -152,7 +180,8 @@ class SiblingDiff:
                 })
         return {
             "move": "siblings", "symbol": entry["name"],
-            "role_key": sorted(key), "family_size": len(members),
+            "family_key": {"verb": verb, "nouns": sorted(nouns)},
+            "family_size": len(members),
             "verdict": {"guarded": len(guarded), "unguarded": len(unguarded),
                         "peers_guard": peers_guard},
             "members": [{
@@ -179,7 +208,7 @@ class SiblingDiff:
                                "fact_origin": "sibling-differential"},
             })
         return self.store.path_shape(ids, edges, manifest={
-            **{k: diff[k] for k in ("move", "symbol", "role_key",
+            **{k: diff[k] for k in ("move", "symbol", "family_key",
                                     "family_size", "verdict")},
             "flagged": diff["flagged"],
         })
@@ -187,16 +216,18 @@ class SiblingDiff:
     # -- materialization -----------------------------------------------------
 
     def build_overlay(self, overlay: Overlay, entries: list[dict]) -> dict:
-        # one family per role_key (the diff is symmetric within a family), and one
-        # UNGUARDED edge per (outlier -> peer) pair.
-        seen_keys: set[frozenset[str]] = set()
+        # one family per member-set (noun-overlap isn't transitive, so families are
+        # per-seed; the member-set signature collapses re-diffs of the same peer
+        # group), and one UNGUARDED edge per (outlier -> peer) pair.
+        seen_families: set[frozenset[str]] = set()
         seen_edges: set[tuple[str, str]] = set()
         flagged_total = 0
         for entry in entries:
-            key = _role_key(entry)
-            if not key or key in seen_keys:
+            _sig, members = self.family_of(entry)
+            fam = frozenset(m["node_id"] for m in members)
+            if len(fam) < 2 or fam in seen_families:
                 continue
-            seen_keys.add(key)
+            seen_families.add(fam)
             diff = self.diff(entry)
             for f in diff["flagged"]:
                 pair = (f["node_id"], f["peer_guard"]["node_id"])
