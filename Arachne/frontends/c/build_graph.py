@@ -427,6 +427,13 @@ def main() -> int:
             declarations_by_name[(kind, name)].append(entity_id)
             if kind == "FunctionDecl":
                 current_owner = entity_id
+                # External linkage = the file's exported symbol surface (parity with
+                # TS EXPORTS). A non-static function *definition* (has a body) is what
+                # this file makes externally visible; static/inline-only and pure
+                # prototypes are not exports.
+                has_body = any(child.get("kind") == "CompoundStmt" for child in node.get("inner", []))
+                if owner is None and has_body and node.get("storageClass") != "static":
+                    graph.edge("EXPORTS", file_ids[path], entity_id, name=name)
         elif not node.get("isImplicit") and not is_included and kind in VALUE_KINDS:
             value_kind = VALUE_KINDS[kind]
             name = node.get("name") or "<anonymous>"
@@ -442,6 +449,10 @@ def main() -> int:
             declarations_by_name[(kind, name)].append(value_id)
             if kind == "ParmVarDecl" and owner:
                 function_parameters[owner].append(value_id)
+            # A file-scope global with external linkage is exported; a `static`
+            # global is file-local and `extern` only imports a symbol defined elsewhere.
+            if owner is None and kind == "VarDecl" and node.get("storageClass") not in {"static", "extern"}:
+                graph.edge("EXPORTS", file_ids[path], value_id, name=name)
         for child in node.get("inner", []):
             declarations(child, path, current_owner, is_included)
 
