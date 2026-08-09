@@ -16,6 +16,7 @@ from Arachne.compatibility.projector import (
     compatibility_taint_path as taint_path, graph_file_infos,
 )
 from Arachne.pipeline import run_project, semantic_snapshot_graph, snapshot_graph
+from Arachne.projections import build_layered_graph
 from Arachne.core.snapshot import load_snapshot
 from Arachne.core.validation import validate_snapshot
 from Arachne.core.contract import ContractError, FrontendSnapshot
@@ -146,6 +147,35 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             self.assertTrue(graph_path.is_file())
             self.assertTrue((layered_path / "manifest.json").is_file())
+            self.assertTrue((layered_path / "node_index.json").is_file())
+
+    def test_layered_v2_exposes_cross_tier_navigation(self) -> None:
+        graph, _ = run_project(str(ROOT / "src"))
+        layered = build_layered_graph(graph)
+        manifest = layered["manifest"]
+        self.assertEqual(2, manifest["schema_version"])
+        self.assertEqual(len(graph["nodes"]), len(layered["node_index"]))
+        self.assertEqual(
+            manifest["integrity"]["cross_tier_canonical_edges"],
+            manifest["integrity"]["cross_tier_exposed_edges"],
+        )
+        tiers = {item["tier"]: item for item in manifest["tiers"]}
+        self.assertTrue(all(tiers[tier]["expands_to_count"] for tier in ("T0", "T1", "T2")))
+        relationships = {
+            tier: {edge.get("relationship") for edge in layered["tiers"][tier]["expands_to"]}
+            for tier in ("T0", "T1", "T2", "T3")
+        }
+        self.assertIn("DECLARES", relationships["T0"])
+        self.assertIn("CONTAINS_BODY", relationships["T1"])
+        self.assertIn("PATH_STEP", relationships["T2"])
+        self.assertIn("EVIDENCED_BY", relationships["T3"])
+        paths = [node for node in layered["tiers"]["T2"]["nodes"] if node["kind"] == "taint-reach"]
+        self.assertTrue(paths)
+        self.assertTrue(all(node["details"]["steps"] for node in paths))
+        self.assertTrue(any(
+            "req.body.id" in step.get("label", "")
+            for node in paths for step in node["details"]["steps"]
+        ))
 
     def test_typescript_contextual_tokens_and_library_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as output:
