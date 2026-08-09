@@ -620,6 +620,47 @@ class CompilerFrontendTests(unittest.TestCase):
                 edge["kind"] == "COMPILER_BODY_VIEW_OF"
                 for edge in graph["edges"]
             ))
+            graph_nodes = {node["id"]: node for node in graph["nodes"]}
+            canonical_reaches = [
+                node for node in graph["nodes"]
+                if node["kind"] == "taint-reach"
+                and node["id"].startswith("v2:core:taint-propagation:")
+            ]
+            reach_pairs = {
+                (
+                    graph_nodes[node["properties"]["source_value_id"]]["label"],
+                    graph_nodes[node["properties"]["sink_value_id"]]["label"],
+                )
+                for node in canonical_reaches
+            }
+            self.assertIn(
+                ("documentId", "findById(documentId)"), reach_pairs,
+            )
+            self.assertIn(
+                ("invoiceId", "findById(invoiceId)"), reach_pairs,
+            )
+            self.assertNotIn(
+                ("documentId", "findById(invoiceId)"), reach_pairs,
+            )
+            self.assertNotIn(
+                ("invoiceId", "findById(documentId)"), reach_pairs,
+            )
+            request_to_document = next(
+                node for node in canonical_reaches
+                if graph_nodes[node["properties"]["source_value_id"]]["label"] == "req"
+                and graph_nodes[node["properties"]["sink_value_id"]]["label"]
+                    == "findById(documentId)"
+            )
+            self.assertIn(
+                "req.body.id",
+                {
+                    graph_nodes[node_id]["label"]
+                    for node_id in request_to_document["properties"]["witness_ids"]
+                },
+            )
+            self.assertGreater(
+                max(map(len, request_to_document["properties"]["context_trace"])), 0,
+            )
             self.assertFalse((ROOT / "Arachne" / "variable_analysis.py").exists())
             self.assertFalse((ROOT / "Arachne" / "scope_utils.py").exists())
             self.assertFalse((ROOT / "Arachne" / "dynamic_analysis.py").exists())

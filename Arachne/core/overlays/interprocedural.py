@@ -173,13 +173,20 @@ class InterproceduralContexts:
                     edges.append({
                         "kind": "VALUE_FLOWS_TO", "source": source_return_id,
                         "target": return_id,
-                        "properties": {**return_fact, "reason": "context-return"},
+                        "properties": {
+                            **return_fact,
+                            "reason": "context-return",
+                            "context_id": context_id,
+                        },
                     })
                 edges.append({
                     "kind": "VALUE_FLOWS_TO", "source": return_id,
                     "target": call_value_id,
-                    "properties": {**return_fact, "reason": "context-call-result"},
+                    "properties": {
+                        **return_fact,
+                        "reason": "context-call-result",
+                        "context_id": context_id,
+                    },
                 })
 
         return GraphDelta(self.overlay_id, nodes, edges)
-

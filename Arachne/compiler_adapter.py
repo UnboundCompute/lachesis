@@ -447,8 +447,11 @@ def analyze_typescript_with_compiler(
     run_semantic_overlays(infos)
     overlay = build_graph(infos)
     merged = merge_overlay_graph(snapshot_graph(snapshot), overlay)
-    from .core.overlays import default_overlay_registry
+    from .core.overlays import (
+        default_overlay_registry, default_security_overlay_registry,
+    )
     merged = default_overlay_registry().enrich(merged)
+    merged = default_security_overlay_registry().enrich(merged)
     return infos, merged, snapshot
 
 
@@ -530,6 +533,8 @@ def run_project_frontends(
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), languages, capabilities,
     )
+    from .core.overlays import default_security_overlay_registry
+    graph = default_security_overlay_registry().enrich(graph)
     return graph, snapshots
 
 

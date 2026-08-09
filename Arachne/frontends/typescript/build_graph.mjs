@@ -1130,6 +1130,7 @@ function addRuntimeRead(node, targetId) {
     scope_id: nearestScope(node),
   });
   addEdge("READS_FROM", definitionId, id);
+  addEdge("VALUE_FLOWS_TO", id, pathForNode(node), { reason: "read-value" });
   addEdge("READ_EVIDENCED_BY", id, bodyForNode(node));
   return id;
 }
@@ -2644,6 +2645,11 @@ for (const fileName of analysisFileNames) {
         const argId = pathForNode(argument, "argument");
         Object.assign(nodes.get(argId).properties, {
           callsite_id: callId, position: index,
+        });
+        addEdge("VALUE_FLOWS_TO", pathForNode(argument), argId, {
+          reason: "argument-value",
+          callsite: callId,
+          position: index,
         });
         addEdge("HAS_ARGUMENT", pathId, argId, { position: index });
         const parameter = signature?.parameters?.[index] ||

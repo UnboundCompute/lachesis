@@ -13,9 +13,12 @@ heap locations and other conclusions are represented as separate nodes/edges.
 
 The default direct pipeline currently instantiates call-site contexts,
 compiler-emitted parameter/property effects, module singleton/mutable state and
-import cycles. Remaining legacy passes are being migrated into this registry
-before the `FileInfo` compatibility projection is removed from primary graph
-construction.
+import cycles. After ecosystem models run, a security overlay materializes
+compiler/model-tagged sources and sinks and calculates context-stack-aware taint
+witnesses. Call entry pushes a call-site context and return flow must pop that
+same context, preventing two calls to a shared callee from contaminating each
+other. Remaining legacy passes are being migrated before the `FileInfo`
+compatibility projection is removed from primary graph construction.
 
 ## Ownership
 
