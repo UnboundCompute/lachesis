@@ -11,9 +11,11 @@ registered and applied sequentially to canonical graphs, returning additive
 not mutate or relabel a compiler fact: alternate dispatch, contextual bindings,
 heap locations and other conclusions are represented as separate nodes/edges.
 
-The default direct pipeline currently instantiates call-site contexts,
+The default direct pipeline currently builds per-function control flow and
+branch-sensitive SSA histories, then instantiates call-site contexts,
 compiler-emitted parameter/property effects, module singleton/mutable state and
-import cycles. After ecosystem models run, a security overlay materializes
+import cycles. Phi nodes retain every incoming definition and branch-correct
+reads point to the merged version. After ecosystem models run, a security overlay materializes
 compiler/model-tagged sources and sinks and calculates context-stack-aware taint
 witnesses. Call entry pushes a call-site context and return flow must pop that
 same context, preventing two calls to a shared callee from contaminating each

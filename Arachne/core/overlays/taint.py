@@ -11,6 +11,7 @@ from ..query import GraphIndex
 FLOW_EDGE_KINDS = frozenset({
     "DEFINES", "VALUE_FLOWS_TO", "READS_FROM", "PROPERTY_READ",
     "ALIASES", "ALIASES_VALUE",
+    "PHI_INPUT", "BRANCH_READS_FROM", "BRANCH_PREVIOUS",
     "POINTS_TO", "WRITES_HEAP", "READS_HEAP",
 })
 

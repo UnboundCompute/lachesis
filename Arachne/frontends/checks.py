@@ -550,6 +550,39 @@ class CompilerFrontendTests(unittest.TestCase):
         )
         self.assertEqual("total = 999;", body["label"])
 
+    def test_canonical_branch_history_overlay(self) -> None:
+        graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "branch_history")
+        )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        function = next(
+            node for node in nodes.values()
+            if node["kind"] == "function" and node["label"] == "choose"
+        )
+        phis = [
+            node for node in nodes.values()
+            if node["kind"] == "phi"
+            and node["properties"].get("function_id") == function["id"]
+        ]
+        result_phi = next(node for node in phis if node["label"] == "phi:result")
+        self.assertEqual(2, len(result_phi["properties"]["incoming_definition_ids"]))
+        self.assertTrue(result_phi["id"].startswith("v2:core:branch-history:phi:"))
+        self.assertEqual(2, sum(
+            edge["kind"] == "PHI_INPUT" and edge["target"] == result_phi["id"]
+            for edge in graph["edges"]
+        ))
+        return_read = next(
+            node for node in nodes.values()
+            if node["kind"] == "read" and node["label"] == "result"
+            and node["properties"].get("start_line") == 8
+        )
+        self.assertTrue(any(
+            edge["kind"] == "BRANCH_READS_FROM"
+            and edge["source"] == result_phi["id"]
+            and edge["target"] == return_read["id"]
+            for edge in graph["edges"]
+        ))
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             with patch(
