@@ -104,6 +104,60 @@ def walk(source_dir: Path) -> List[Path]:
     )
 
 
+def system_include_dirs() -> List[Path]:
+    """Directories the toolchain treats as system / standard-library headers.
+
+    Parsed from the compiler's own verbose include-search list (`-E -v` on empty
+    input), so "external vs application" is decided by the installed toolchain, never
+    by a hardcoded path literal like /usr/include.
+    """
+    configured = shlex.split(os.environ.get("CLANG", "clang"))
+    try:
+        proc = subprocess.run(
+            configured + ["-E", "-v", "-x", "c", os.devnull],
+            text=True, capture_output=True, check=False,
+        )
+    except OSError:
+        return []
+    dirs: List[Path] = []
+    capturing = False
+    for line in proc.stderr.splitlines():
+        stripped = line.strip()
+        if stripped.endswith("search starts here:"):
+            capturing = True
+            continue
+        if stripped.startswith("End of search list"):
+            capturing = False
+            continue
+        if capturing and stripped:
+            # Clang annotates framework dirs with a trailing " (framework directory)".
+            candidate = stripped.split(" (", 1)[0]
+            try:
+                dirs.append(Path(candidate).resolve())
+            except OSError:
+                continue
+    return dirs
+
+
+def classify_provenance(
+    path: Path, root_set: set, system_dirs: List[Path],
+) -> Tuple[str, bool, bool]:
+    """(provenance, is_external, is_system) from rootset membership + toolchain dirs.
+
+    Membership in the discovered root set — not the file extension — decides
+    application vs external, matching the TS frontend's sourceProvenance().
+    """
+    if path in root_set:
+        return "application", False, False
+    for directory in system_dirs:
+        try:
+            path.relative_to(directory)
+            return "standard-library", True, True
+        except ValueError:
+            continue
+    return "dependency", True, False
+
+
 def clang_command(source_dir: Path, path: Path, *arguments: str) -> List[str]:
     configured = shlex.split(os.environ.get("CLANG", "clang"))
     language = ["-x", "c-header"] if path.suffix.lower() == ".h" else []
@@ -282,6 +336,11 @@ def main() -> int:
     if not files:
         raise SystemExit(f"No C source files found under {source_dir}")
 
+    # Provenance is decided by rootset membership + the toolchain's own system
+    # include dirs, not by file extension (parity with TS sourceProvenance).
+    root_set = set(files)
+    system_dirs = system_include_dirs()
+
     graph = Graph()
     texts: Dict[Path, str] = {}
     file_ids: Dict[Path, str] = {}
@@ -294,13 +353,14 @@ def main() -> int:
     for path in files:
         text = source_text(path, texts)
         file_id = stable_id("file", path)
+        provenance, is_external, is_system = classify_provenance(path, root_set, system_dirs)
         file_ids[path] = graph.node(
             "T0", file_id, "file", str(path.relative_to(source_dir)),
             file=str(path.relative_to(source_dir)), absolute_file=str(path),
             content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
             lines=len(text.splitlines()), language="c",
-            provenance="application" if path.suffix.lower() == ".c" else "workspace-library",
-            included_because="project-root" if path.suffix.lower() == ".c" else "project-header",
+            provenance=provenance, is_external=is_external, is_system=is_system,
+            included_because="project-root",
         )
 
     # Compiler dependency extraction makes framework/header ownership explicit.
@@ -315,12 +375,14 @@ def main() -> int:
             if target not in file_ids:
                 text = source_text(target, texts)
                 target_id = stable_id("file", target)
+                provenance, is_external, is_system = classify_provenance(target, root_set, system_dirs)
                 file_ids[target] = graph.node(
                     "T0", target_id, "file", str(target),
                     file=str(target), absolute_file=str(target),
                     content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     lines=len(text.splitlines()), language="c",
-                    provenance="dependency", included_because="included-header",
+                    provenance=provenance, is_external=is_external, is_system=is_system,
+                    included_because="included-header",
                 )
             graph.edge("DEPENDS_ON", file_ids[path], file_ids[target], directive="#include")
 
