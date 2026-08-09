@@ -71,7 +71,7 @@ class GenericRouteModel:
             if method != "use" and path is None:
                 continue
             handler_argument = arguments[-1] if arguments else None
-            if handler_argument is arguments[0] and method != "use":
+            if arguments and handler_argument is arguments[0] and method != "use":
                 handler_argument = None
             handler = _handler_target(index, handler_argument) if handler_argument else None
             evidence_ids = [call["id"], *(arg["id"] for arg in arguments)]
