@@ -13,6 +13,7 @@ named + file:line, edges typed with via/reason/role/confidence/fact_origin), so 
 agent gets one consistent, provenance-carrying shape back from every move.
 
 Tools:
+  cold-start — guards_top (ranked entry point; no name knowledge needed)
   navigation — search, callers, callees, open_file (L1), open_folder (L0)
   reasoning  — flow, reaches, sources_of, points_to, aliases, guards, call_roles, siblings
 
@@ -80,6 +81,14 @@ def _ref(store, node_id):
 
 
 TOOLS = [
+    {"name": "guards_top",
+     "description": "COLD-START ENTRY POINT — the N most guard-shaped functions, ranked by "
+                    "derived guard signal, with no name knowledge needed. Each row carries "
+                    "node_id + handle (file:line) so a high-signal function (even an anonymous "
+                    "one) is immediately navigable. Start here on an unfamiliar graph, THEN "
+                    "search/callers/callees to traverse.",
+     "inputSchema": {"type": "object", "properties": {
+         "n": {"type": "integer", "default": 20}}}},
     {"name": "search",
      "description": "Resolve a function/method/type/file name to its canonical node id(s) with "
                     "file:line. Teleport to any symbol, fuzzy by default. Returns a real "
@@ -157,6 +166,16 @@ def call_tool(name, args):
     c = ctx()
     store, gl = c.store, c.store.gl
 
+    if name == "guards_top":
+        rows = c.guards.top(int(args.get("n", 20)))
+        return json.dumps({"move": "guards_top", "count": len(rows), "ranked": [
+            {"node_id": r["node_id"], "name": r["name"], "at": r["handle"],
+             "score": r["guard_signal"]["score"], "class": r["guard_signal"]["class"],
+             "conditions": r["guard_signal"]["conditions"],
+             "short_circuits": r["guard_signal"]["short_circuits"],
+             "throws": r["guard_signal"]["throws"],
+             "security_weight": r["guard_signal"]["security_weight"]}
+            for r in rows]})
     if name == "search":
         page = si.search_page(store.entries, args["name"], "fuzzy",
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
