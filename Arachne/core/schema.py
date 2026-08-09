@@ -1,0 +1,132 @@
+"""Canonical graph contract shared by every language frontend.
+
+Contract v2 deliberately separates portable node/edge kinds from optional
+frontend extensions. A language may attach additional data only below
+``properties.frontend_extensions.<language>``; it must not create private node
+or edge kinds that force the core to understand that language.
+"""
+from __future__ import annotations
+
+from typing import FrozenSet
+
+
+CURRENT_CONTRACT_VERSION = 2
+LEGACY_CONTRACT_VERSIONS: FrozenSet[int] = frozenset({1})
+SUPPORTED_CONTRACT_VERSIONS = frozenset({
+    CURRENT_CONTRACT_VERSION, *LEGACY_CONTRACT_VERSIONS,
+})
+
+TIERS = frozenset({"T0", "T1", "T2", "T3", "T4"})
+FACT_ORIGINS = frozenset({
+    "compiler", "runtime-model", "framework-model", "core-inference",
+})
+CONFIDENCE_LEVELS = frozenset({
+    "exact", "high", "conservative", "unresolved",
+})
+
+# Kinds are serialized in the existing lowercase/kebab-case convention. The
+# families below correspond directly to the uppercase conceptual names in the
+# architecture document.
+PROJECT_STRUCTURE_NODE_KINDS = frozenset({
+    "project", "package", "module", "file", "import", "export",
+    "external-module",
+})
+DECLARATION_NODE_KINDS = frozenset({
+    "scope", "symbol", "declaration", "function", "method", "constructor",
+    "class", "interface", "type", "enum", "record", "parameter", "variable",
+    "binding", "property", "constant", "value",
+})
+EXECUTABLE_NODE_KINDS = frozenset({
+    "statement", "expression", "operation", "identifier", "call", "construct",
+    "call-value", "argument", "return", "return-value", "throw",
+})
+VALUE_NODE_KINDS = frozenset({
+    "definition", "read", "write", "literal", "property-path", "allocation",
+    "heap-object", "heap-location",
+})
+CONTROL_RUNTIME_NODE_KINDS = frozenset({
+    "cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit", "phi",
+    "async-event", "dynamic-behavior", "function-effect",
+})
+SECURITY_EVIDENCE_NODE_KINDS = frozenset({
+    "source", "sink", "boundary", "guard", "taint-reach", "diagnostic",
+    "source-span", "token",
+})
+CANONICAL_NODE_KINDS = frozenset().union(
+    PROJECT_STRUCTURE_NODE_KINDS,
+    DECLARATION_NODE_KINDS,
+    EXECUTABLE_NODE_KINDS,
+    VALUE_NODE_KINDS,
+    CONTROL_RUNTIME_NODE_KINDS,
+    SECURITY_EVIDENCE_NODE_KINDS,
+)
+
+NODE_KIND_TIERS = {
+    **{kind: frozenset({"T0"}) for kind in PROJECT_STRUCTURE_NODE_KINDS},
+    **{kind: frozenset({"T1"}) for kind in {
+        "declaration", "function", "method", "constructor", "class", "interface",
+        "type", "enum", "record",
+    }},
+    **{kind: frozenset({"T2"}) for kind in {
+        "scope", "symbol", "parameter", "variable", "binding", "property",
+        "constant", "value", *VALUE_NODE_KINDS,
+    }},
+    **{kind: frozenset({"T3"}) for kind in {
+        *EXECUTABLE_NODE_KINDS, *CONTROL_RUNTIME_NODE_KINDS,
+    }},
+    **{kind: frozenset({"T4"}) for kind in SECURITY_EVIDENCE_NODE_KINDS},
+}
+
+# Compiler frontends may emit language-level dynamic constructs and diagnostics,
+# but policy judgments and runtime/heap conclusions belong to core/model layers.
+FRONTEND_FORBIDDEN_NODE_KINDS = frozenset({
+    "heap-object", "heap-location", "function-effect", "async-event",
+    "source", "sink", "boundary", "guard", "taint-reach",
+})
+
+STRUCTURE_EDGE_KINDS = frozenset({
+    "CONTAINS", "DECLARES", "DECLARES_MEMBER", "DECLARES_VALUE",
+    "DECLARES_SCOPE", "DECLARES_SYMBOL", "SYMBOL_DECLARES", "REFERS_TO",
+    "TYPE_REFERS_TO", "HAS_TYPE", "DEPENDS_ON", "RUNTIME_DEPENDS_ON",
+    "RUNTIME_IMPLEMENTATION", "IMPLEMENTED_BY", "PACKAGE_CONTAINS", "EXPORTS",
+    "RE_EXPORTS", "AST_CHILD", "EXPANDS_TO", "HAS_TOKEN", "NEXT_TOKEN",
+    "HAS_DIAGNOSTIC", "HAS_PROPERTY_PATH",
+})
+CALL_EDGE_KINDS = frozenset({
+    "INVOKES", "MAY_INVOKE", "CALLS", "HAS_ARGUMENT",
+    "BINDS_PARAMETER", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE",
+    "RETURN_EVIDENCED_BY", "READS_CALLEE",
+})
+VALUE_EDGE_KINDS = frozenset({
+    "DEFINES", "READS_FROM", "WRITES_TO", "WRITES_PARAMETER_PROPERTY",
+    "VALUE_FLOWS_TO", "ALIASES", "ALIASES_VALUE", "POINTS_TO",
+    "PREVIOUS_VERSION", "PROPERTY_READ", "READ_EVIDENCED_BY",
+})
+CONTROL_EDGE_KINDS = frozenset({
+    "CFG_NEXT", "EXECUTES_BEFORE", "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH",
+    "LOOP_BACK", "ITERATES", "EXCEPTION_BRANCH", "TRY_BODY", "RUNS_FINALLY",
+    "MERGES_AT", "SHORT_CIRCUIT_LEFT", "SHORT_CIRCUIT_RIGHT",
+})
+RUNTIME_SECURITY_EDGE_KINDS = frozenset({
+    "CAPTURES", "MUTATES", "APPLIES_EFFECT", "REGISTERS_CALLBACK", "HANDLED_BY",
+    "ASYNC_CONTINUES_AT", "TAINT_FLOWS_TO", "GUARDED_BY", "EVIDENCED_BY",
+    "DUPLICATES", "SHADOWS",
+})
+CANONICAL_EDGE_KINDS = frozenset().union(
+    STRUCTURE_EDGE_KINDS,
+    CALL_EDGE_KINDS,
+    VALUE_EDGE_KINDS,
+    CONTROL_EDGE_KINDS,
+    RUNTIME_SECURITY_EDGE_KINDS,
+)
+FRONTEND_FORBIDDEN_EDGE_KINDS = frozenset({
+    "POINTS_TO", "MUTATES", "APPLIES_EFFECT", "REGISTERS_CALLBACK", "HANDLED_BY",
+    "ASYNC_CONTINUES_AT", "TAINT_FLOWS_TO", "GUARDED_BY",
+})
+
+SOURCE_DERIVED_NODE_KINDS = frozenset().union(
+    DECLARATION_NODE_KINDS,
+    EXECUTABLE_NODE_KINDS,
+    {"definition", "read", "write", "literal", "property-path", "allocation",
+     "source-span", "token"},
+)

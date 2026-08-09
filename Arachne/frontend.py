@@ -15,167 +15,24 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
-
-FRONTEND_CONTRACT_VERSION = 1
-CAPABILITY_COMPLETE = "complete"
-CAPABILITY_PARTIAL = "partial"
-CAPABILITY_NONE = "none"
-VALID_CAPABILITY_LEVELS = {
-    CAPABILITY_COMPLETE, CAPABILITY_PARTIAL, CAPABILITY_NONE,
-}
-
-# These facts should be owned by a compiler/language frontend. Once a frontend
-# reports a capability as complete, the corresponding manual discovery pass can
-# be retired for that language.
-FRONTEND_OWNED_CAPABILITIES = {
-    "lexical": (
-        "tokens", "comments", "strings", "regex literals", "source offsets",
-    ),
-    "syntax": (
-        "declarations", "statements", "expressions", "operators", "source spans",
-    ),
-    "modules": (
-        "imports", "exports", "re-exports", "resolved module targets",
-    ),
-    "dependency_sources": (
-        "library files", "package ownership", "declaration provenance",
-        "framework source or declarations reached by the application",
-    ),
-    "symbols": (
-        "scopes", "declarations", "references", "shadowing", "aliases",
-    ),
-    "scopes": (
-        "module scopes", "function scopes", "block/control scopes",
-        "lexical parents", "declaration ownership",
-    ),
-    "types": (
-        "declared types", "inferred types", "signatures", "overloads",
-        "generic substitutions", "narrowing facts",
-    ),
-    "calls": (
-        "call expressions", "constructors", "selected signatures",
-        "static targets", "overload candidates",
-    ),
-    "control_flow": (
-        "execution order", "branches", "loops", "try/catch/finally",
-        "break/continue", "merges", "unreachable code",
-    ),
-    "direct_data_flow": (
-        "definitions", "reads", "assignments", "arguments", "parameters", "returns",
-    ),
-}
-
-# These remain Arachne overlays even when the frontend is compiler-backed. A
-# frontend may provide stronger seed facts, but language parsing alone does not
-# define the security/runtime policy represented here.
-OVERLAY_OWNED_CAPABILITIES = {
-    "heap_identity": (
-        "allocation identities", "points-to sets", "property locations", "aliases",
-    ),
-    "context_sensitivity": (
-        "per-call parameter instances", "receiver contexts", "contextual returns",
-    ),
-    "branch_histories": (
-        "SSA versions", "phi nodes", "branch-sensitive reaching definitions",
-    ),
-    "taint_policy": (
-        "attacker sources", "sinks", "sanitizers", "trust-boundary policy",
-    ),
-    "runtime_models": (
-        "library effects", "external behavior", "framework behavior",
-    ),
-    "effects": (
-        "function summaries", "argument mutations", "receiver/global/imported state",
-    ),
-    "async_events": (
-        "callbacks", "events", "queues", "timers", "workers", "webhooks",
-    ),
-    "dynamic_behavior": (
-        "eval", "reflection", "proxies", "runtime loading", "monkey patching",
-    ),
-    "framework_wiring": (
-        "routes", "dependency injection", "decorators", "registries", "ORM wiring",
-    ),
-    "security_roles": (
-        "entry points", "boundaries", "guards", "sources", "sinks", "state",
-    ),
-}
-
-
-class FrontendError(RuntimeError):
-    """A frontend failed or emitted a snapshot that violates the contract."""
-
-
-@dataclass(frozen=True)
-class FrontendSpec:
-    """Registration record for an out-of-process language frontend."""
-
-    frontend_id: str
-    languages: Tuple[str, ...]
-    extensions: Tuple[str, ...]
-    command: Tuple[str, ...]
-    working_directory: str
-    environment: Mapping[str, str] = field(default_factory=dict)
-    priority: int = 100
-
-    def supports(self, path: str) -> bool:
-        return Path(path).suffix.lower() in self.extensions
-
-    def render_command(self, source_dir: str, output_dir: str) -> List[str]:
-        values = {
-            "source_dir": os.path.abspath(source_dir),
-            "output_dir": os.path.abspath(output_dir),
-        }
-        return [part.format(**values) for part in self.command]
-
-
-@dataclass
-class FrontendSnapshot:
-    """Normalized graph emitted by any registered frontend."""
-
-    frontend_id: str
-    contract_version: int
-    languages: Tuple[str, ...]
-    capabilities: Dict[str, str]
-    manifest: dict
-    nodes: List[dict]
-    edges: List[dict]
-    stdout: str = ""
-    stderr: str = ""
-
-    @property
-    def nodes_by_id(self) -> Dict[str, dict]:
-        return {node["id"]: node for node in self.nodes}
-
-    def capability(self, name: str) -> str:
-        return self.capabilities.get(name, CAPABILITY_NONE)
-
-    def can_replace(self, capability: str) -> bool:
-        return self.capability(capability) == CAPABILITY_COMPLETE
-
-    def replacement_report(self) -> dict:
-        """Return an explicit migration decision for every capability family."""
-        frontend = {}
-        for name, facts in FRONTEND_OWNED_CAPABILITIES.items():
-            level = self.capability(name)
-            frontend[name] = {
-                "status": level,
-                "safe_to_replace_manual_pass": level == CAPABILITY_COMPLETE,
-                "facts": list(facts),
-            }
-        overlays = {
-            name: {
-                "status": "overlay-owned",
-                "safe_to_replace_manual_pass": False,
-                "facts": list(facts),
-            }
-            for name, facts in OVERLAY_OWNED_CAPABILITIES.items()
-        }
-        return {"frontend_owned": frontend, "overlay_owned": overlays}
+from .core.capabilities import (
+    CAPABILITY_COMPLETE,
+    CAPABILITY_NONE,
+    CAPABILITY_PARTIAL,
+    FRONTEND_OWNED_CAPABILITIES,
+    OVERLAY_OWNED_CAPABILITIES,
+    VALID_CAPABILITY_LEVELS,
+)
+from .core.contract import (
+    ContractError as FrontendError,
+    FrontendSnapshot,
+    FrontendSpec,
+)
+from .core.schema import CURRENT_CONTRACT_VERSION as FRONTEND_CONTRACT_VERSION
+from .core.validation import validate_snapshot as validate_contract_snapshot
 
 
 class FrontendRegistry:
@@ -279,71 +136,8 @@ def load_snapshot(
 
 
 def validate_snapshot(snapshot: FrontendSnapshot) -> None:
-    """Reject ambiguous or lossy frontend output before overlays consume it."""
-    if snapshot.contract_version != FRONTEND_CONTRACT_VERSION:
-        raise FrontendError(
-            f"unsupported frontend contract {snapshot.contract_version}; "
-            f"expected {FRONTEND_CONTRACT_VERSION}"
-        )
-    invalid_levels = {
-        name: level for name, level in snapshot.capabilities.items()
-        if level not in VALID_CAPABILITY_LEVELS
-    }
-    if invalid_levels:
-        raise FrontendError(f"invalid capability levels: {invalid_levels}")
-
-    node_ids = [node.get("id") for node in snapshot.nodes]
-    missing_ids = sum(node_id is None for node_id in node_ids)
-    if missing_ids:
-        raise FrontendError(f"{missing_ids} frontend nodes have no id")
-    duplicates = len(node_ids) - len(set(node_ids))
-    if duplicates:
-        raise FrontendError(f"frontend emitted {duplicates} duplicate node ids")
-    known = set(node_ids)
-    dangling = [
-        edge for edge in snapshot.edges
-        if edge.get("source") not in known or edge.get("target") not in known
-    ]
-    if dangling:
-        sample = dangling[0]
-        raise FrontendError(
-            f"frontend emitted {len(dangling)} dangling relationships; "
-            f"first is {sample.get('kind')} {sample.get('source')} -> "
-            f"{sample.get('target')}"
-        )
-
-    expected_nodes = snapshot.manifest.get("node_count")
-    expected_edges = snapshot.manifest.get("edge_count")
-    if expected_nodes is not None and expected_nodes != len(snapshot.nodes):
-        raise FrontendError(
-            f"manifest says {expected_nodes} nodes but tiers contain "
-            f"{len(snapshot.nodes)}"
-        )
-    if expected_edges is not None and expected_edges != len(snapshot.edges):
-        raise FrontendError(
-            f"manifest says {expected_edges} edges but tiers contain "
-            f"{len(snapshot.edges)}"
-        )
-
-    # Every source-derived fact must retain a file and exact source interval.
-    source_kinds = {
-        "function", "method", "constructor", "class", "interface", "type", "enum",
-        "parameter", "variable", "binding", "property", "statement", "expression",
-        "identifier", "call", "construct", "source-span", "token",
-    }
-    missing_provenance = []
-    for node in snapshot.nodes:
-        if node.get("kind") not in source_kinds:
-            continue
-        properties = node.get("properties", {})
-        required = ("file", "start_offset", "end_offset", "start_line", "end_line")
-        if any(properties.get(key) is None for key in required):
-            missing_provenance.append(node["id"])
-    if missing_provenance:
-        raise FrontendError(
-            f"{len(missing_provenance)} source-derived nodes lack exact provenance; "
-            f"first is {missing_provenance[0]}"
-        )
+    """Compatibility entry point delegated to the canonical core validator."""
+    validate_contract_snapshot(snapshot)
 
 
 def run_frontend(
