@@ -583,6 +583,75 @@ class CompilerFrontendTests(unittest.TestCase):
             for edge in graph["edges"]
         ))
 
+    def test_canonical_heap_identity_overlay(self) -> None:
+        graph, _ = run_project_frontends(
+            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "heap")
+        )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        variables = {
+            node["label"]: node for node in nodes.values()
+            if node["kind"] == "variable" and node["label"] in {"a", "b"}
+        }
+        points = {
+            variable: {
+                edge["target"] for edge in graph["edges"]
+                if edge["kind"] == "POINTS_TO" and edge["source"] == node["id"]
+                and nodes[edge["target"]]["kind"] == "heap-object"
+            }
+            for variable, node in variables.items()
+        }
+        self.assertTrue(points["a"])
+        self.assertEqual(points["a"], points["b"])
+        secret_paths = [
+            node for node in nodes.values()
+            if node["kind"] == "property-path" and node["properties"].get("path") == "secret"
+        ]
+        self.assertEqual({"a.secret", "b.secret"}, {node["label"] for node in secret_paths})
+        write_locations = {
+            edge["target"] for edge in graph["edges"] if edge["kind"] == "WRITES_HEAP"
+        }
+        read_locations = {
+            edge["source"] for edge in graph["edges"] if edge["kind"] == "READS_HEAP"
+        }
+        self.assertTrue(write_locations & read_locations)
+        self.assertTrue(all(
+            nodes[location]["id"].startswith("v2:core:heap-identity:heap-location:")
+            for location in write_locations & read_locations
+        ))
+        context_variables = {
+            node["label"]: node for node in nodes.values()
+            if node["kind"] == "variable" and node["label"] in {"first", "second"}
+        }
+        context_points = {
+            name: {
+                edge["target"] for edge in graph["edges"]
+                if edge["kind"] == "POINTS_TO" and edge["source"] == variable["id"]
+                and nodes[edge["target"]]["kind"] == "heap-object"
+                and nodes[edge["target"]]["properties"].get("context_id")
+            }
+            for name, variable in context_variables.items()
+        }
+        self.assertTrue(context_points["first"])
+        self.assertTrue(context_points["second"])
+        self.assertTrue(context_points["first"].isdisjoint(context_points["second"]))
+        effects = [
+            node for node in nodes.values()
+            if node["kind"] == "function-effect"
+            and node["properties"].get("effect_kind") == "parameter-property-write"
+        ]
+        self.assertEqual(1, len(effects))
+        applied_locations = {
+            edge["target"] for edge in graph["edges"]
+            if edge["kind"] == "APPLIES_EFFECT"
+            and edge["properties"].get("effect_id") == effects[0]["id"]
+        }
+        account_read_locations = {
+            edge["source"] for edge in graph["edges"]
+            if edge["kind"] == "READS_HEAP"
+            and nodes[edge["target"]].get("label") == "account.admin"
+        }
+        self.assertTrue(applied_locations & account_read_locations)
+
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             with patch(

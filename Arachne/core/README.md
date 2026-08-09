@@ -15,7 +15,10 @@ The default direct pipeline currently builds per-function control flow and
 branch-sensitive SSA histories, then instantiates call-site contexts,
 compiler-emitted parameter/property effects, module singleton/mutable state and
 import cycles. Phi nodes retain every incoming definition and branch-correct
-reads point to the merged version. After ecosystem models run, a security overlay materializes
+reads point to the merged version. Allocation-site heap objects survive aliases,
+nested property reads/writes share stable locations, returned allocations are
+cloned per call context, and parameter-property effects are applied to the
+caller-owned object. After ecosystem models run, a security overlay materializes
 compiler/model-tagged sources and sinks and calculates context-stack-aware taint
 witnesses. Call entry pushes a call-site context and return flow must pop that
 same context, preventing two calls to a shared callee from contaminating each

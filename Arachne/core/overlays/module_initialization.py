@@ -90,6 +90,11 @@ class ModuleInitialization:
 
         sources_by_variable: dict[str, list[dict]] = defaultdict(list)
         for source in index.nodes_of_kind("allocation", "call-value"):
+            if source.get("kind") == "call-value" and (
+                source.get("properties", {}).get("value_category")
+                or source.get("properties", {}).get("type_facts", {}).get("value_category")
+            ) == "primitive":
+                continue
             frontier = [source["id"]]
             seen = {source["id"]}
             for _depth in range(3):

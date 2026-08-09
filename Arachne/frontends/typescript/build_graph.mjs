@@ -491,11 +491,25 @@ function typeMetadata(node) {
       type_arguments: typeArguments,
       nullable: Boolean(type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)),
       literal: Boolean(type.flags & ts.TypeFlags.Literal),
+      value_category: typeValueCategory(type),
     };
   } catch {
     return { text: "unknown", flags: [], union_types: [], intersection_types: [],
       type_arguments: [], nullable: false, literal: false };
   }
+}
+
+function typeValueCategory(type) {
+  if (!type) return "unknown";
+  if (type.isUnion?.() || type.isIntersection?.()) {
+    const categories = new Set(type.types.map((item) => typeValueCategory(item)));
+    return categories.size === 1 ? [...categories][0] : "unknown";
+  }
+  const primitive = ts.TypeFlags.Any | ts.TypeFlags.Unknown |
+    ts.TypeFlags.TypeParameter;
+  if (type.flags & primitive) return "unknown";
+  if (type.flags & ts.TypeFlags.Object) return "reference";
+  return "primitive";
 }
 
 function safeTypeFromType(type, location) {
@@ -874,6 +888,8 @@ function valueForDeclaration(declaration, explicitScopeId = null) {
     ...position,
     ...sourceProvenance(position.absolute_file),
     type: safeType(nameNode),
+    type_facts: typeMetadata(nameNode),
+    value_category: typeMetadata(nameNode)?.value_category || "unknown",
     declaration_kind: ts.SyntaxKind[declaration.kind],
     owner_function_id: owningFunction,
     scope_id: scopeId,
@@ -1044,9 +1060,16 @@ function propertyPathForNode(node) {
     ...position,
     base_value_id: baseId,
     path: pathText.startsWith(".") ? pathText.slice(1) : pathText,
+    path_segments: pieces.map((piece) => ({
+      key: piece.startsWith("[") ? piece.slice(1, -1) : piece,
+      computed: piece.startsWith("["),
+      dynamic: piece.startsWith("[") && piece !== "[?]",
+    })),
     dynamic: pieces.some((piece) => piece.startsWith("[")),
     owner_function_id: ownerFunction(node),
     type: safeType(node),
+    type_facts: typeMetadata(node),
+    value_category: typeMetadata(node)?.value_category || "unknown",
   });
   addEdge("HAS_PROPERTY_PATH", baseId, id);
   propertyPathIds.set(key, id);
@@ -2606,6 +2629,10 @@ for (const fileName of analysisFileNames) {
       const pathId = pathForNode(node, "call-value");
       Object.assign(nodes.get(callId).properties, { value_id: pathId });
       Object.assign(nodes.get(pathId).properties, { callsite_id: callId });
+      addEdge("VALUE_FLOWS_TO", pathId, pathForNode(node), {
+        reason: "call-result",
+        callsite: callId,
+      });
       const { resolved, candidates } = targetDeclarationsForCall(node);
       const primaryTarget = resolved ? entityForDeclaration(resolved) : null;
       if (resolved && primaryTarget) {

@@ -1,0 +1,404 @@
+"""Language-neutral allocation-site and property heap identity."""
+from __future__ import annotations
+
+from collections import defaultdict
+
+from ..composition import GraphDelta
+from ..identities import stable_id
+from ..query import GraphIndex
+
+
+IDENTITY_FLOW_REASONS = frozenset({
+    "allocation", "initializer", "assignment", "write", "read", "read-value",
+    "argument-value", "context-argument", "context-call-result", "return",
+    "call-result", "branch-reaching-definition", "phi-input", "call-argument",
+})
+
+
+def _fact(evidence_ids: list[str], confidence: str = "high") -> dict:
+    return {
+        "fact_origin": "core-inference",
+        "confidence": confidence,
+        "evidence_ids": list(dict.fromkeys(evidence_ids)),
+    }
+
+
+class HeapIdentity:
+    """Propagate allocation identities and collapse alias property locations."""
+
+    overlay_id = "heap-identity"
+
+    def applies(self, graph: dict) -> bool:
+        return any(node.get("kind") == "allocation" for node in graph.get("nodes", []))
+
+    def enrich(self, graph: dict) -> GraphDelta:
+        index = GraphIndex(graph)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        emitted_edges: set[tuple[str, str, str]] = set()
+        emitted_nodes: set[str] = set()
+        points: dict[str, set[str]] = defaultdict(set)
+        object_properties: dict[str, dict] = {}
+        parameter_objects: dict[str, str] = {}
+
+        def add_node(node: dict) -> None:
+            if node["id"] in emitted_nodes:
+                return
+            emitted_nodes.add(node["id"])
+            nodes.append(node)
+
+        def add_edge(kind: str, source: str, target: str, evidence: list[str], **properties) -> None:
+            if not source or not target or source == target:
+                return
+            key = (kind, source, target)
+            if key in emitted_edges:
+                return
+            emitted_edges.add(key)
+            edges.append({
+                "kind": kind,
+                "source": source,
+                "target": target,
+                "properties": {**_fact(evidence), **properties},
+            })
+
+        def add_points(value_id: str | None, object_ids) -> bool:
+            if not value_id:
+                return False
+            before = len(points[value_id])
+            points[value_id].update(object_ids)
+            return len(points[value_id]) != before
+
+        # Concrete allocation sites are templates. Context-return handling
+        # below clones callee-local templates per call site when needed.
+        for allocation in index.nodes_of_kind("allocation"):
+            allocation_id = allocation["id"]
+            object_id = stable_id(
+                "core", self.overlay_id, "heap-object", allocation_id,
+            )
+            properties = allocation.get("properties", {})
+            fact = _fact([allocation_id], "exact")
+            object_properties[object_id] = {
+                "allocation_id": allocation_id,
+                "owner_function_id": properties.get("owner_function_id"),
+                "allocation_kind": properties.get("allocation_kind"),
+                "allocated_type": properties.get("allocated_type"),
+                "context_id": None,
+            }
+            add_node({
+                "id": object_id,
+                "kind": "heap-object",
+                "label": f"object:{allocation.get('label', allocation_id)}",
+                "properties": {**fact, **object_properties[object_id]},
+            })
+            add_points(allocation_id, {object_id})
+            add_edge("POINTS_TO", allocation_id, object_id, [allocation_id])
+
+        # Reference-like parameters receive an abstract object. Generic or
+        # unknown categories stay conservative; only compiler-labelled
+        # primitive values are excluded.
+        for parameter in index.nodes_of_kind("parameter"):
+            if parameter.get("properties", {}).get("value_category") == "primitive":
+                continue
+            definitions = [
+                target for target in index.targets(parameter["id"], "DEFINES")
+                if target.get("kind") == "definition"
+                and target.get("properties", {}).get("origin") == "parameter"
+            ]
+            if not definitions:
+                continue
+            object_id = stable_id(
+                "core", self.overlay_id, "heap-object", "parameter", parameter["id"],
+            )
+            evidence = [parameter["id"], *(definition["id"] for definition in definitions)]
+            fact = _fact(evidence, "conservative")
+            object_properties[object_id] = {
+                "allocation_id": None,
+                "owner_function_id": parameter.get("properties", {}).get("owner_function_id"),
+                "allocation_kind": "parameter",
+                "allocated_type": parameter.get("properties", {}).get("type"),
+                "parameter_id": parameter["id"],
+                "context_id": None,
+            }
+            add_node({
+                "id": object_id, "kind": "heap-object",
+                "label": f"parameter-object:{parameter.get('label', parameter['id'])}",
+                "properties": {**fact, **object_properties[object_id]},
+            })
+            parameter_objects[parameter["id"]] = object_id
+            add_points(parameter["id"], {object_id})
+            add_edge("POINTS_TO", parameter["id"], object_id, evidence, abstract=True)
+            for definition in definitions:
+                add_points(definition["id"], {object_id})
+                add_edge("POINTS_TO", definition["id"], object_id, evidence, abstract=True)
+
+        identity_edges: list[tuple[str, str]] = []
+        context_return_sources: dict[str, list[str]] = defaultdict(list)
+        for edge in graph.get("edges", []):
+            kind = index.semantic_edge_kind(edge)
+            properties = edge.get("properties", {})
+            if kind in {"ALIASES", "ALIASES_VALUE", "READS_FROM", "PHI_INPUT"}:
+                identity_edges.append((edge["source"], edge["target"]))
+            elif kind == "VALUE_FLOWS_TO":
+                reason = properties.get("reason")
+                if reason == "context-return":
+                    context_return_sources[edge["target"]].append(edge["source"])
+                elif reason in IDENTITY_FLOW_REASONS:
+                    identity_edges.append((edge["source"], edge["target"]))
+
+        # A definition is the versioned value of its declared target. Keep the
+        # target's flow-insensitive points-to set as the union of its versions.
+        for definition in index.nodes_of_kind("definition"):
+            target_id = definition.get("properties", {}).get("target_id")
+            if target_id:
+                identity_edges.append((definition["id"], target_id))
+
+        changed = True
+        while changed:
+            changed = False
+            for source, target in identity_edges:
+                changed |= add_points(target, points.get(source, set()))
+
+        # Bind caller objects to the context parameter without contaminating a
+        # shared callee parameter definition across unrelated call sites.
+        context_parameter_objects: dict[str, dict[str, set[str]]] = defaultdict(dict)
+        for binding in index.nodes_of_kind("context-parameter"):
+            properties = binding.get("properties", {})
+            argument_id = properties.get("argument_id")
+            parameter_id = properties.get("parameter_id")
+            context_id = properties.get("context_id")
+            caller_objects = set(points.get(argument_id, set()))
+            add_points(binding["id"], caller_objects)
+            if context_id and parameter_id:
+                abstract = parameter_objects.get(parameter_id)
+                if abstract:
+                    context_parameter_objects[context_id][abstract] = caller_objects
+
+        # Substitute parameter templates and clone callee-local return
+        # allocations separately for every call context.
+        for returned in index.nodes_of_kind("context-return"):
+            properties = returned.get("properties", {})
+            context_id = properties.get("context_id")
+            callee_id = properties.get("callee_function_id")
+            substitutions = context_parameter_objects.get(context_id, {})
+            returned_objects: set[str] = set()
+            for source_id in context_return_sources.get(returned["id"], []):
+                for object_id in points.get(source_id, set()):
+                    if object_id in substitutions:
+                        returned_objects.update(substitutions[object_id])
+                        continue
+                    template = object_properties.get(object_id, {})
+                    if callee_id and template.get("owner_function_id") == callee_id:
+                        instance_id = stable_id(
+                            "core", self.overlay_id, "heap-object",
+                            "context", context_id, object_id,
+                        )
+                        evidence = [returned["id"], context_id, object_id]
+                        fact = _fact(evidence, "exact")
+                        object_properties[instance_id] = {
+                            **template,
+                            "context_id": context_id,
+                            "allocation_template_id": object_id,
+                        }
+                        add_node({
+                            "id": instance_id, "kind": "heap-object",
+                            "label": f"context-object:{index.nodes.get(object_id, {}).get('label', object_id)}",
+                            "properties": {**fact, **object_properties[instance_id]},
+                        })
+                        add_edge("CONTEXT_ALLOCATES", context_id, instance_id, evidence)
+                        returned_objects.add(instance_id)
+                    else:
+                        returned_objects.add(object_id)
+            add_points(returned["id"], returned_objects)
+
+        changed = True
+        while changed:
+            changed = False
+            for source, target in identity_edges:
+                changed |= add_points(target, points.get(source, set()))
+
+        property_paths = list(index.nodes_of_kind("property-path"))
+        writes_by_target: dict[str, list[dict]] = defaultdict(list)
+        reads_by_target: dict[str, list[dict]] = defaultdict(list)
+        for write in index.nodes_of_kind("write"):
+            target_id = write.get("properties", {}).get("target_id")
+            if target_id:
+                writes_by_target[target_id].append(write)
+        for read in index.nodes_of_kind("read"):
+            target_id = read.get("properties", {}).get("target_id")
+            if target_id:
+                reads_by_target[target_id].append(read)
+
+        locations: dict[tuple[str, tuple[str, ...]], str] = {}
+        location_values: dict[str, set[str]] = defaultdict(set)
+        effects: set[str] = set()
+
+        def normalized_segments(path: dict) -> tuple[str, ...]:
+            structured = path.get("properties", {}).get("path_segments") or []
+            if structured:
+                return tuple(
+                    "[*]" if segment.get("dynamic") else str(segment.get("key", "?"))
+                    for segment in structured
+                )
+            opaque = path.get("properties", {}).get("path")
+            return (str(opaque or "?"),)
+
+        def location(object_id: str, segments: tuple[str, ...], evidence: list[str]) -> str:
+            key = (object_id, segments)
+            if key in locations:
+                return locations[key]
+            location_id = stable_id(
+                "core", self.overlay_id, "heap-location", object_id, segments,
+            )
+            fact = _fact(evidence)
+            locations[key] = location_id
+            add_node({
+                "id": location_id, "kind": "heap-location",
+                "label": f"{index.nodes.get(object_id, {}).get('label', object_id)}.{'.'.join(segments)}",
+                "properties": {
+                    **fact, "object_id": object_id,
+                    "path_segments": list(segments),
+                    "path": ".".join(segments),
+                },
+            })
+            add_edge("POINTS_TO", object_id, location_id, evidence, relationship="property")
+            return location_id
+
+        def target_locations(
+            object_id: str, segments: tuple[str, ...], evidence: list[str],
+        ) -> set[str]:
+            current_objects = {object_id}
+            prefix: tuple[str, ...] = ()
+            for segment in segments[:-1]:
+                prefix = (*prefix, segment)
+                next_objects: set[str] = set()
+                for current_object in current_objects:
+                    prefix_location = location(current_object, (segment,), evidence)
+                    stored = location_values[prefix_location]
+                    if not stored:
+                        child_id = stable_id(
+                            "core", self.overlay_id, "heap-object",
+                            "property", current_object, segment,
+                        )
+                        fact = _fact([*evidence, prefix_location], "conservative")
+                        object_properties[child_id] = {
+                            "allocation_id": None,
+                            "owner_function_id": None,
+                            "allocation_kind": "property",
+                            "parent_object_id": current_object,
+                            "property_segment": segment,
+                            "context_id": None,
+                        }
+                        add_node({
+                            "id": child_id, "kind": "heap-object",
+                            "label": f"property-object:{segment}",
+                            "properties": {**fact, **object_properties[child_id]},
+                        })
+                        stored.add(child_id)
+                        add_edge("POINTS_TO", prefix_location, child_id, evidence)
+                    next_objects.update(stored)
+                current_objects = next_objects
+            return {
+                location(current_object, (segments[-1],), evidence)
+                for current_object in current_objects
+            }
+
+        # Property reads and writes can reveal new aliases. Iterate location
+        # contents and identity propagation to a fixed point.
+        changed = True
+        while changed:
+            changed = False
+            for path in property_paths:
+                properties = path.get("properties", {})
+                base_id = properties.get("base_value_id")
+                segments = normalized_segments(path)
+                if not base_id or not segments:
+                    continue
+                for object_id in list(points.get(base_id, set())):
+                    target_ids = target_locations(
+                        object_id, segments, [path["id"], base_id, object_id],
+                    )
+                    for write in writes_by_target.get(path["id"], []):
+                        value_id = write.get("properties", {}).get("value_id")
+                        value_objects = set(points.get(value_id, set()))
+                        for location_id in target_ids:
+                            before = len(location_values[location_id])
+                            location_values[location_id].update(value_objects)
+                            changed |= len(location_values[location_id]) != before
+                            add_edge(
+                                "WRITES_HEAP", write["id"], location_id,
+                                [write["id"], path["id"], location_id],
+                                property_path_id=path["id"],
+                            )
+                        abstract_object = parameter_objects.get(base_id)
+                        function_id = write.get("properties", {}).get("owner_function_id")
+                        if abstract_object and function_id:
+                            effect_id = stable_id(
+                                "core", self.overlay_id, "function-effect",
+                                function_id, base_id, segments, write["id"],
+                            )
+                            effect_evidence = [function_id, base_id, path["id"], write["id"]]
+                            if effect_id not in effects:
+                                effects.add(effect_id)
+                                add_node({
+                                    "id": effect_id, "kind": "function-effect",
+                                    "label": f"writes:{path.get('label', path['id'])}",
+                                    "properties": {
+                                        **_fact(effect_evidence),
+                                        "function_id": function_id,
+                                        "effect_kind": "parameter-property-write",
+                                        "parameter_id": base_id,
+                                        "path_segments": list(segments),
+                                        "write_id": write["id"],
+                                        "value_id": value_id,
+                                    },
+                                })
+                                add_edge("MUTATES", function_id, effect_id, effect_evidence)
+                                add_edge("EVIDENCED_BY", effect_id, write["id"], effect_evidence)
+                            for context_id, substitutions in context_parameter_objects.items():
+                                caller_objects = substitutions.get(abstract_object)
+                                if not caller_objects:
+                                    continue
+                                contextual_values: set[str] = set()
+                                for value_object in value_objects:
+                                    contextual_values.update(
+                                        substitutions.get(value_object, {value_object})
+                                    )
+                                for caller_object in caller_objects:
+                                    caller_locations = target_locations(
+                                        caller_object, segments,
+                                        [effect_id, context_id, caller_object],
+                                    )
+                                    for caller_location in caller_locations:
+                                        before = len(location_values[caller_location])
+                                        location_values[caller_location].update(contextual_values)
+                                        changed |= len(location_values[caller_location]) != before
+                                        add_edge(
+                                            "APPLIES_EFFECT", context_id, caller_location,
+                                            [effect_id, context_id, caller_location],
+                                            effect_id=effect_id,
+                                        )
+                                        add_edge(
+                                            "WRITES_HEAP", write["id"], caller_location,
+                                            [effect_id, context_id, write["id"], caller_location],
+                                            effect_id=effect_id, context_id=context_id,
+                                        )
+                    for read in reads_by_target.get(path["id"], []):
+                        for location_id in target_ids:
+                            changed |= add_points(
+                                read["id"], location_values.get(location_id, set()),
+                            )
+                            add_edge(
+                                "READS_HEAP", location_id, read["id"],
+                                [read["id"], path["id"], location_id],
+                                property_path_id=path["id"],
+                            )
+            for source, target in identity_edges:
+                changed |= add_points(target, points.get(source, set()))
+
+        for value_id, object_ids in sorted(points.items()):
+            if value_id not in index.nodes and value_id not in emitted_nodes:
+                continue
+            for object_id in sorted(object_ids):
+                add_edge("POINTS_TO", value_id, object_id, [value_id, object_id])
+
+        return GraphDelta(self.overlay_id, nodes, edges)
