@@ -9,7 +9,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from Arachne.pipeline import run_project, write_project_graph
+from Arachne.pipeline import (
+    run_project, run_project_incremental, write_project_graph,
+)
 
 
 def main() -> None:
@@ -25,8 +27,17 @@ def main() -> None:
         help="also write the composed graph to a Kùzu DB directory (dual-write; "
              "the JSON output is unchanged). Requires Python 3.10+ with `kuzu`.",
     )
+    parser.add_argument(
+        "--incremental", action="store_true",
+        help="reuse each frontend's prior on-disk bundle (under --frontend-out) when "
+             "none of its source files changed, recompiling only the ones that did; "
+             "the composed graph is identical to a full run.",
+    )
     args = parser.parse_args()
-    graph, snapshots = run_project(args.source_dir, args.frontend_out)
+    if args.incremental:
+        graph, snapshots = run_project_incremental(args.source_dir, args.frontend_out)
+    else:
+        graph, snapshots = run_project(args.source_dir, args.frontend_out)
     written = write_project_graph(graph, snapshots, args.output_path)
     if args.kuzu_out:
         from Arachne.kuzu_store import write_kuzu_graph
