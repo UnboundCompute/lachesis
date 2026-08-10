@@ -202,6 +202,9 @@ def write_kuzu_graph(
     kept_ids = {n["id"] for n in nodes}
     edges = [e for e in graph.get("edges", [])
              if e.get("source") in kept_ids and e.get("target") in kept_ids]
+    # id -> owning file, so an edge (which carries no `file` of its own) can inherit
+    # its source node's unit as the §5 incremental key.
+    node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
 
     db = kuzu.Database(db_file(db_dir))
     conn = kuzu.Connection(db)
@@ -215,10 +218,11 @@ def write_kuzu_graph(
     if pa is not None and pq is not None:
         with tempfile.TemporaryDirectory(prefix="kuzu_stage_") as stage_dir:
             _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir)
-            _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir)
+            _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
+                             node_units=node_units)
     else:  # pragma: no cover - exercised only without pyarrow
         _load_nodes_rowwise(conn, nodes, elide=elide_constants)
-        _load_edges_rowwise(conn, edges, elide=elide_constants)
+        _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units)
     return db_dir
 
 
@@ -231,6 +235,15 @@ def _node_unit(props: dict) -> Optional[str]:
 
 def _promoted_value(props: dict, prop: str):
     return _node_unit(props) if prop == "unit" else props.get(prop)
+
+
+def _edge_unit(edge: dict, node_units: dict) -> Optional[str]:
+    """The edge's incremental key. Edges carry no ``file`` of their own
+    (``Graph.edge`` stamps none), so attribute an edge to the source node's owning
+    file — mirroring ``owner_file(source)`` — giving the ``unit`` column a usable,
+    non-NULL value. A rare edge that does carry ``file`` keeps it."""
+    props = edge.get("properties") or {}
+    return _node_unit(props) or node_units.get(edge.get("source"))
 
 
 # -- bulk load: stage one Parquet per table, then `COPY FROM` -------------------
@@ -277,7 +290,8 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str) ->
     conn.execute(f"COPY Node FROM '{path}'")
 
 
-def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str) -> None:
+def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
+                     node_units: dict) -> None:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
     hot: dict[str, dict[str, list]] = {
@@ -289,7 +303,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str) ->
     for edge in edges:
         kind = edge.get("kind")
         props = edge.get("properties") or {}
-        unit = _node_unit(props)
+        unit = _edge_unit(edge, node_units)
         stored = _stored_props(props, elide)
         if kind in _HOT_SET:
             bucket = hot[kind]
@@ -351,7 +365,7 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool) -> None:
         raise
 
 
-def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool) -> None:
+def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dict) -> None:
     hot_stmt = {
         kind: (f"MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
                f"CREATE (a)-[:{kind} {{unit: $unit, props: $props}}]->(b)")
@@ -366,7 +380,8 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool) -> None:
             kind = edge.get("kind")
             props = edge.get("properties") or {}
             base = {"s": edge["source"], "t": edge["target"],
-                    "unit": _node_unit(props), "props": _stored_props(props, elide)}
+                    "unit": _edge_unit(edge, node_units),
+                    "props": _stored_props(props, elide)}
             if kind in _HOT_SET:
                 conn.execute(hot_stmt[kind], base)
             else:
