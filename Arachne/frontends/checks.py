@@ -1215,6 +1215,113 @@ class CompilerFrontendTests(unittest.TestCase):
                     if stream and not stream.closed:
                         stream.close()
 
+    def test_nav_parity_json_store_vs_kuzu_store(self) -> None:
+        # Step 3 (KUZU_STORE_SPEC): the Kùzu-backed store answers every nav tool
+        # identically to the JSON-backed store. A parity build (prune + constant
+        # elision OFF) must reconstruct the canonical node/edge dicts exactly, so
+        # the full nav set matches byte-for-byte (order-normalized — the two
+        # backends may enumerate a set in a different order, but the *content* is
+        # identical). A pruned build must still answer the lossless nav set
+        # (read_body reads source by offset, not the dropped token/span nodes).
+        # Skip-guarded: kuzu needs Python 3.10+, so the 3.9 suite stays green.
+        import importlib.util as _ilu
+        if _ilu.find_spec("kuzu") is None:
+            self.skipTest("kuzu not installed (3.9 env)")
+        import os as _os
+        import sys as _sys
+        import types as _types
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from nav.graph_store import GraphStore
+        from nav.reachability import Reachability
+        from nav.hubs import Hubs
+        from nav import mcp_server
+        from Arachne.kuzu_store import write_kuzu_graph
+
+        def _run_nav(store, calls):
+            # each store drives the same global nav dispatch, one at a time
+            mcp_server._CTX = _types.SimpleNamespace(
+                store=store, reach=Reachability(store), hubs=Hubs(store.gl))
+            mcp_server._PROFILE = "all"
+            mcp_server._DEFAULT_FORMAT = "json"
+            return {label: mcp_server.call_tool(tool, args, format="json")
+                    for label, tool, args in calls}
+
+        def _norm(payload):
+            # order-invariant: sort every nested list so set-shaped results
+            # (which the two backends may enumerate in a different order)
+            # compare equal while any real content difference still shows.
+            def walk(x):
+                if isinstance(x, list):
+                    return sorted((walk(v) for v in x),
+                                  key=lambda e: json.dumps(e, sort_keys=True))
+                if isinstance(x, dict):
+                    return {k: walk(v) for k, v in x.items()}
+                return x
+            return walk(json.loads(payload))
+
+        with tempfile.TemporaryDirectory() as output:
+            # fixtures_opsreg carries an ops-struct dispatch table, so the nav set
+            # exercises MAY_INVOKE / reverse-dispatch alongside CALLS and flow.
+            self.run_command(
+                sys.executable, "Arachne/frontends/c/build_graph.py",
+                "Arachne/frontends/c/fixtures_opsreg", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            graph = {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)}
+
+            json_store = GraphStore(graph)
+            # derive valid file / folder targets from the graph itself, so the
+            # same args exercise a real answer on both backends.
+            file_node = next(iter(json_store.index.nodes_of_kind("file")), None)
+            self.assertIsNotNone(file_node, "fixture must contain a file node")
+            file_path = (file_node.get("properties") or {}).get("file")
+            self.assertTrue(file_path, "file node must carry its path")
+            root = file_path.rsplit("/", 1)[0] if "/" in file_path else file_path
+
+            calls = [
+                ("hubs", "hubs", {"n": 20}),
+                ("search", "search", {"name": "drv"}),
+                ("callers", "callers", {"name": "drv_start"}),
+                ("callees", "callees", {"name": "init_driver"}),
+                ("read_body", "read_body", {"name": "drv_start"}),
+                ("flow", "flow", {"seed": "drv_start"}),
+                ("reaches", "reaches", {"src": "drv_start", "sink": "init_driver"}),
+                ("sources_of", "sources_of", {"sink": "init_driver"}),
+                ("points_to", "points_to", {"value": "drv_start"}),
+                ("aliases", "aliases", {"value": "drv_start"}),
+                ("open_file", "open_file", {"file": file_path}),
+                ("open_folder", "open_folder", {"root": root}),
+            ]
+            json_out = _run_nav(json_store, calls)
+
+            # -- parity build (prune + elide OFF): full nav set identical ----------
+            parity_dir = _os.path.join(output, "kuzu_parity")
+            write_kuzu_graph(graph, None, parity_dir,
+                             prune=False, elide_constants=False)
+            parity_out = _run_nav(GraphStore.load(parity_dir), calls)
+            for label, _tool, _args in calls:
+                self.assertEqual(
+                    _norm(json_out[label]), _norm(parity_out[label]),
+                    f"{label}: Kùzu parity store must match the JSON store")
+
+            # -- pruned build: the lossless nav set still answers identically ------
+            # prune drops pure-lexical token/source-span nodes (and dangling edges);
+            # read_body reads the source file by offset, so this set is unaffected.
+            lossless = ("hubs", "search", "callers", "callees", "read_body")
+            pruned_dir = _os.path.join(output, "kuzu_pruned")
+            write_kuzu_graph(graph, None, pruned_dir,
+                             prune=True, elide_constants=True)
+            pruned_out = _run_nav(GraphStore.load(pruned_dir),
+                                  [c for c in calls if c[0] in lossless])
+            for label in lossless:
+                self.assertNotIn('"error"', pruned_out[label],
+                                 f"{label}: pruned Kùzu store must still answer")
+                self.assertEqual(
+                    _norm(json_out[label]), _norm(pruned_out[label]),
+                    f"{label}: pruned Kùzu store must match the JSON store")
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
