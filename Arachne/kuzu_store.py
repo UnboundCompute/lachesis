@@ -42,12 +42,20 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from typing import Iterable, Optional, Sequence
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
     import kuzu  # type: ignore
 except Exception:  # pragma: no cover - absent under 3.9
     kuzu = None
+
+try:  # optional; enables the fast bulk `COPY FROM` staged-Parquet load path
+    import pyarrow as pa  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
+except Exception:  # pragma: no cover - falls back to per-row inserts if absent
+    pa = None
+    pq = None
 
 
 # -- schema shared with the read side (single source of truth) ----------------
@@ -83,10 +91,19 @@ CONSTANT_PROP_DEFAULTS = {
 }
 
 
+# the Kùzu store is a *directory* holding this DB file (+ room for a future
+# unit→content_hash manifest); the JSON store is a plain file. The marker file lets the
+# loader branch without a magic byte and is robust to Kùzu using a single-file DB.
+KUZU_DB_FILENAME = "graph.kuzu"
+
+
+def db_file(db_dir: str) -> str:
+    return os.path.join(db_dir, KUZU_DB_FILENAME)
+
+
 def is_kuzu_dir(path: str) -> bool:
-    """A Kùzu store is a directory; the JSON store is a file. Used by the loader to
-    branch without a magic byte."""
-    return bool(path) and os.path.isdir(path)
+    """True when ``path`` is a Kùzu store directory (contains the DB file)."""
+    return bool(path) and os.path.isdir(path) and os.path.exists(db_file(path))
 
 
 def _semantic_kind(edge: dict) -> str:
@@ -137,10 +154,13 @@ def _node_ddl() -> str:
 
 
 def _rel_ddl() -> list[str]:
-    stmts = [f"CREATE REL TABLE {kind}(FROM Node TO Node, props STRING)"
+    # `unit` (= emitting source file) is the §5 incremental key, carried on every
+    # edge as well as every node. Column order is the rel-COPY contract: the two
+    # endpoint PKs come first, then the properties in this definition order.
+    stmts = [f"CREATE REL TABLE {kind}(FROM Node TO Node, unit STRING, props STRING)"
              for kind in HOT_REL_KINDS]
     stmts.append("CREATE REL TABLE EDGE(FROM Node TO Node, "
-                 "kind STRING, semantic_kind STRING, props STRING)")
+                 "kind STRING, semantic_kind STRING, unit STRING, props STRING)")
     return stmts
 
 
@@ -175,6 +195,7 @@ def write_kuzu_graph(
         if not overwrite:
             raise FileExistsError(db_dir)
         shutil.rmtree(db_dir) if os.path.isdir(db_dir) else os.remove(db_dir)
+    os.makedirs(db_dir, exist_ok=True)
 
     nodes = _kept_nodes(graph.get("nodes", []), prune=prune,
                         drop_diagnostics=drop_diagnostics, drop_tests=drop_tests)
@@ -182,18 +203,135 @@ def write_kuzu_graph(
     edges = [e for e in graph.get("edges", [])
              if e.get("source") in kept_ids and e.get("target") in kept_ids]
 
-    db = kuzu.Database(db_dir)
+    db = kuzu.Database(db_file(db_dir))
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
         conn.execute(stmt)
 
-    _load_nodes(conn, nodes, elide=elide_constants)
-    _load_edges(conn, edges, elide=elide_constants)
+    # Bulk `COPY FROM` staged Parquet is the fast path (per-row inserts measured
+    # ~9.4 min/package — too slow for whole-repo). When pyarrow is absent we fall
+    # back to per-row inserts so the module still works everywhere.
+    if pa is not None and pq is not None:
+        with tempfile.TemporaryDirectory(prefix="kuzu_stage_") as stage_dir:
+            _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir)
+            _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir)
+    else:  # pragma: no cover - exercised only without pyarrow
+        _load_nodes_rowwise(conn, nodes, elide=elide_constants)
+        _load_edges_rowwise(conn, edges, elide=elide_constants)
     return db_dir
 
 
-def _load_nodes(conn, nodes: list[dict], *, elide: bool) -> None:
+# -- node/edge unit key (§5 incremental) --------------------------------------
+
+def _node_unit(props: dict) -> Optional[str]:
+    """The incremental key: the source file that emitted this node/edge."""
+    return props.get("file")
+
+
+def _promoted_value(props: dict, prop: str):
+    return _node_unit(props) if prop == "unit" else props.get(prop)
+
+
+# -- bulk load: stage one Parquet per table, then `COPY FROM` -------------------
+
+def _arrow_type(column: str):
+    return pa.int64() if column in _INT_COLUMNS else pa.string()
+
+
+def _cell(column: str, value):
+    """Coerce a promoted-column value to its Parquet type. Promoted columns are
+    query-only duplicates (the read side reconstructs from the ``props`` blob), so
+    stringifying a stray non-string here never affects reconstructed dicts."""
+    if value is None:
+        return None
+    if column in _INT_COLUMNS:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return value if isinstance(value, str) else str(value)
+
+
+def _str_col(values: list) -> "pa.Array":
+    return pa.array([None if v is None else str(v) for v in values], pa.string())
+
+
+def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str) -> None:
+    if not nodes:
+        return
+    columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
+    data: dict[str, list] = {c: [] for c in columns}
+    for node in nodes:
+        props = node.get("properties") or {}
+        data["id"].append(node["id"])
+        data["kind"].append(node.get("kind"))
+        data["label"].append(node.get("label"))
+        for prop in PROMOTED_NODE_PROPS:
+            data[prop].append(_promoted_value(props, prop))
+        data["props"].append(_stored_props(props, elide))
+    table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
+                      for c in columns})
+    path = os.path.join(stage_dir, "node.parquet")
+    pq.write_table(table, path)
+    conn.execute(f"COPY Node FROM '{path}'")
+
+
+def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str) -> None:
+    # group edges by destination table; column order is the rel-COPY contract
+    # (endpoint PKs first, then properties in table-definition order).
+    hot: dict[str, dict[str, list]] = {
+        kind: {"src": [], "tgt": [], "unit": [], "props": []}
+        for kind in HOT_REL_KINDS
+    }
+    cold: dict[str, list] = {"src": [], "tgt": [], "kind": [], "sem": [],
+                             "unit": [], "props": []}
+    for edge in edges:
+        kind = edge.get("kind")
+        props = edge.get("properties") or {}
+        unit = _node_unit(props)
+        stored = _stored_props(props, elide)
+        if kind in _HOT_SET:
+            bucket = hot[kind]
+            bucket["src"].append(edge["source"])
+            bucket["tgt"].append(edge["target"])
+            bucket["unit"].append(unit)
+            bucket["props"].append(stored)
+        else:
+            cold["src"].append(edge["source"])
+            cold["tgt"].append(edge["target"])
+            cold["kind"].append(kind)
+            cold["sem"].append(_semantic_kind(edge))
+            cold["unit"].append(unit)
+            cold["props"].append(stored)
+
+    for kind, bucket in hot.items():
+        if not bucket["src"]:
+            continue
+        table = pa.table({
+            "src": _str_col(bucket["src"]), "tgt": _str_col(bucket["tgt"]),
+            "unit": _str_col(bucket["unit"]),
+            "props": pa.array(bucket["props"], pa.string()),
+        })
+        path = os.path.join(stage_dir, f"rel_{kind}.parquet")
+        pq.write_table(table, path)
+        conn.execute(f"COPY {kind} FROM '{path}'")
+
+    if cold["src"]:
+        table = pa.table({
+            "src": _str_col(cold["src"]), "tgt": _str_col(cold["tgt"]),
+            "kind": _str_col(cold["kind"]), "sem": _str_col(cold["sem"]),
+            "unit": _str_col(cold["unit"]),
+            "props": pa.array(cold["props"], pa.string()),
+        })
+        path = os.path.join(stage_dir, "rel_EDGE.parquet")
+        pq.write_table(table, path)
+        conn.execute(f"COPY EDGE FROM '{path}'")
+
+
+# -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
+
+def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool) -> None:
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     placeholders = ", ".join(f"{c}: ${c}" for c in columns)
     stmt = f"CREATE (n:Node {{{placeholders}}})"
@@ -204,7 +342,7 @@ def _load_nodes(conn, nodes: list[dict], *, elide: bool) -> None:
             params = {"id": node["id"], "kind": node.get("kind"),
                       "label": node.get("label")}
             for prop in PROMOTED_NODE_PROPS:
-                params[prop] = props.get(prop)
+                params[prop] = _promoted_value(props, prop)
             params["props"] = _stored_props(props, elide)
             conn.execute(stmt, params)
         conn.execute("COMMIT")
@@ -213,20 +351,22 @@ def _load_nodes(conn, nodes: list[dict], *, elide: bool) -> None:
         raise
 
 
-def _load_edges(conn, edges: list[dict], *, elide: bool) -> None:
+def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool) -> None:
     hot_stmt = {
         kind: (f"MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
-               f"CREATE (a)-[:{kind} {{props: $props}}]->(b)")
+               f"CREATE (a)-[:{kind} {{unit: $unit, props: $props}}]->(b)")
         for kind in HOT_REL_KINDS
     }
     edge_stmt = ("MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
-                 "CREATE (a)-[:EDGE {kind: $kind, semantic_kind: $sem, props: $props}]->(b)")
+                 "CREATE (a)-[:EDGE {kind: $kind, semantic_kind: $sem, "
+                 "unit: $unit, props: $props}]->(b)")
     conn.execute("BEGIN TRANSACTION")
     try:
         for edge in edges:
             kind = edge.get("kind")
-            props = _stored_props(edge.get("properties") or {}, elide)
-            base = {"s": edge["source"], "t": edge["target"], "props": props}
+            props = edge.get("properties") or {}
+            base = {"s": edge["source"], "t": edge["target"],
+                    "unit": _node_unit(props), "props": _stored_props(props, elide)}
             if kind in _HOT_SET:
                 conn.execute(hot_stmt[kind], base)
             else:
