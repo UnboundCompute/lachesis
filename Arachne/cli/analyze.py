@@ -24,8 +24,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--kuzu-out", metavar="DIR", default=None,
-        help="also write the composed graph to a Kùzu DB directory (dual-write; "
-             "the JSON output is unchanged). Requires Python 3.10+ with `kuzu`.",
+        help="Kùzu DB directory to write (defaults to a sibling <output>.kuzu). Nav "
+             "prefers this low-RAM store over the JSON when it exists. Requires "
+             "Python 3.10+ with `kuzu`.",
+    )
+    parser.add_argument(
+        "--no-kuzu", action="store_true",
+        help="skip the Kùzu store (JSON only). Nav then serves from the JSON graph.",
     )
     parser.add_argument(
         "--incremental", action="store_true",
@@ -39,10 +44,20 @@ def main() -> None:
     else:
         graph, snapshots = run_project(args.source_dir, args.frontend_out)
     written = write_project_graph(graph, snapshots, args.output_path)
-    if args.kuzu_out:
-        from Arachne.kuzu_store import write_kuzu_graph
-        kuzu_dir = write_kuzu_graph(graph, snapshots, args.kuzu_out)
-        print(f"Kùzu store: {kuzu_dir}")
+    # Dual-write by default: the JSON stays the canonical artifact (and the
+    # ARACHNE_FORCE_JSON fallback), while the sibling Kùzu store becomes the
+    # low-RAM default nav serves from. Best-effort — a 3.9 env without kuzu still
+    # produces the JSON.
+    if not args.no_kuzu:
+        import importlib.util
+        kuzu_out = args.kuzu_out or str(Path(args.output_path).with_suffix(".kuzu"))
+        if importlib.util.find_spec("kuzu") is None:
+            print("Kùzu store skipped (needs Python 3.10+ with kuzu); wrote JSON only.",
+                  file=sys.stderr)
+        else:
+            from Arachne.kuzu_store import write_kuzu_graph
+            kuzu_dir = write_kuzu_graph(graph, snapshots, kuzu_out)
+            print(f"Kùzu store: {kuzu_dir}")
     kinds = Counter(node["kind"] for node in graph["nodes"])
     print(
         f"Composed {len(snapshots)} frontends into {len(graph['nodes'])} nodes "

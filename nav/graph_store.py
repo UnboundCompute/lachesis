@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -36,6 +37,32 @@ from Arachne.cli.query import load_graph
 from tier1_flag.graphlib import GraphLib
 from nav import symbol_index as si
 from nav.overlay import Overlay, sidecar_path
+
+
+def resolve_graph_path(graph_path: str) -> str:
+    """Prefer a sibling Kùzu store over a JSON graph when one has been built.
+
+    The Kùzu path opens in seconds at a fraction of the RAM of parsing the JSON
+    (the ceiling that blocked whole-repo graphs), so once a sibling ``<stem>.kuzu``
+    directory exists next to a ``.json`` graph, nav serves from it by default.
+
+      * ``ARACHNE_FORCE_JSON`` (any truthy value) forces the JSON path — for
+        debugging, or when the derived-signal overlay sidecar is needed (the
+        Kùzu path serves base facts; the security tools recompute either way).
+      * A path that is already a Kùzu dir, or a ``.json`` with no sibling store,
+        is returned unchanged.
+    """
+    from Arachne.kuzu_store import is_kuzu_dir
+    if os.environ.get("ARACHNE_FORCE_JSON"):
+        return graph_path
+    if is_kuzu_dir(graph_path):
+        return graph_path
+    candidate = Path(graph_path)
+    if candidate.suffix == ".json":
+        sibling = str(candidate.with_suffix(".kuzu"))
+        if is_kuzu_dir(sibling):
+            return sibling
+    return graph_path
 
 
 def node_view(node: dict) -> dict:
@@ -104,8 +131,12 @@ class GraphStore:
         # A Kùzu store is a directory; the JSON store is a file. The disk-backed index
         # satisfies the same accessor surface, so GraphLib/every tool is unchanged. The
         # derived-signal overlay is a JSON-path enrichment; the Kùzu path serves base
-        # facts directly (overlay support over the DB is a later step).
+        # facts directly — the security tools recompute those signals from base facts
+        # either way (proven by test_nav_parity_json_store_vs_kuzu_store).
         from Arachne.kuzu_store import is_kuzu_dir
+        # prefer a sibling Kùzu store when one exists (low-RAM default); an explicit
+        # Kùzu dir or ARACHNE_FORCE_JSON both pass through resolve_graph_path unchanged.
+        graph_path = resolve_graph_path(graph_path)
         if is_kuzu_dir(graph_path):
             from nav.kuzu_index import KuzuGraphIndex
             gl = GraphLib.from_index(KuzuGraphIndex(graph_path))
