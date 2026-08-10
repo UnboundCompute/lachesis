@@ -24,9 +24,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tier1_flag.graphlib import GraphLib
 from nav import edge_names
+from nav.file_graph import _norm, file_node_keys
 from nav.symbol_index import _file_provenance, _is_external
 
 DECL_KINDS = ("function", "method", "class", "interface", "enum")
+
+
+def _under_root(gl: GraphLib, node: dict, root: str) -> bool:
+    """True if a file node lies at or under a folder root, in any path form.
+
+    The root query is matched against every form the file answers to (source-
+    relative `file`, `absolute_file`, basename), so a relative root, an absolute
+    root, or a bare folder name all select the same subtree."""
+    r = _norm(root)
+    if not r:
+        return True
+    prefix = r + "/"
+    for key in file_node_keys(gl, node):
+        if key == r or key.startswith(prefix):
+            return True
+    return False
 
 
 def _folder_chain(rel_path: str) -> list[str]:
@@ -64,7 +81,7 @@ def build_folder_graph(
             continue
         if not include_external and _is_external(path, prov):
             continue
-        if root and not (path == root or path.startswith(root.rstrip("/") + "/")):
+        if root and not _under_root(gl, node, root):
             continue
         files.append(node)
 

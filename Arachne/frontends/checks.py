@@ -923,6 +923,88 @@ class CompilerFrontendTests(unittest.TestCase):
                     for node in snapshot.nodes
                 ))
 
+    def test_c_cross_tu_call_linking_and_nav(self) -> None:
+        # A call whose definition lives in another translation unit only sees the
+        # header prototype at parse time, so intra-TU resolution leaves it
+        # "dynamic-or-unresolved". The post-merge cross-TU linker must connect it to
+        # the unique body-bearing definition, collapse the prototype/definition twins,
+        # and the nav resolver must then land a bare name on the definition.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from tier1_flag.graphlib import GraphLib
+        from nav.symbol_index import build_index, _resolve, callees
+        from nav.file_graph import _find_file_node
+        from nav.folder_graph import build_folder_graph
+
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "Arachne/frontends/c/build_graph.py",
+                "Arachne/frontends/c/fixtures_crosstu", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+
+            functions = [n for n in snapshot.nodes if n["kind"] == "function"]
+            defs = [n for n in functions
+                    if n["label"] == "lib_compute"
+                    and not n["properties"].get("declaration_only")]
+            protos = [n for n in functions
+                      if n["label"] == "lib_compute"
+                      and n["properties"].get("declaration_only")]
+            self.assertEqual(1, len(defs), "exactly one body-bearing definition")
+            self.assertEqual(1, len(protos), "the header prototype twin survives")
+            def_id = defs[0]["id"]
+            proto_id = protos[0]["id"]
+            client = next(n for n in functions if n["label"] == "client_run")
+
+            # Fix C: the cross-TU call is linked to the DEFINITION, not the prototype.
+            call = next(n for n in snapshot.nodes
+                        if n["kind"] == "call" and n["properties"].get("callee") == "lib_compute")
+            self.assertEqual("cross-tu", call["properties"]["resolution"])
+            self.assertEqual(def_id, call["properties"]["primary_target_id"])
+            self.assertTrue(any(
+                e["kind"] == "CALLS" and e["source"] == client["id"] and e["target"] == def_id
+                for e in snapshot.edges
+            ), "CALLS(client_run -> lib_compute definition)")
+            # The prototype is connected to its definition so the body stays reachable.
+            self.assertTrue(any(
+                e["kind"] == "REFERS_TO" and e["source"] == proto_id and e["target"] == def_id
+                for e in snapshot.edges
+            ), "REFERS_TO(prototype -> definition)")
+
+            gl = GraphLib({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            index = build_index(gl)
+
+            # Fix A: a bare-name resolve prefers the body-bearing definition twin, and
+            # a nav traversal off it reaches the callee a resolve-to-prototype misses.
+            resolved = _resolve(gl, index, "lib_compute")
+            self.assertEqual(def_id, resolved[0]["node_id"])
+            client_resolved = _resolve(gl, index, "client_run")[0]
+            self.assertIn("lib_compute",
+                          [c["name"] for c in callees(gl, client_resolved["node_id"])])
+
+            # Fix B: the file node resolves from every path form — the absolute path,
+            # the source-relative path, and the bare basename all reach one node.
+            client_file = next(n for n in snapshot.nodes
+                               if n["kind"] == "file" and n["label"].endswith("client.c"))
+            absolute = client_file["properties"]["absolute_file"]
+            relative = client_file["properties"]["file"]
+            by_abs = _find_file_node(gl, path=absolute, file_id=None)
+            by_rel = _find_file_node(gl, path=relative, file_id=None)
+            by_base = _find_file_node(gl, path="client.c", file_id=None)
+            self.assertIsNotNone(by_abs)
+            self.assertEqual(client_file["id"], by_abs["id"])
+            self.assertEqual(client_file["id"], by_rel["id"])
+            self.assertEqual(client_file["id"], by_base["id"])
+            # open_folder resolves the source-dir root by absolute path too.
+            source_root = str(_Path(absolute).parent)
+            folder = build_folder_graph(gl, root=source_root)
+            self.assertTrue(any(
+                n["kind"] == "file" and n["label"] == "client.c"
+                for n in folder["nodes"]
+            ), "open_folder finds the fixture files under the absolute root")
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")

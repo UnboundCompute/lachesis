@@ -269,6 +269,20 @@ def source_text(path: Path, cache: Dict[Path, str]) -> str:
     return cache[path]
 
 
+def display_path(target: Path, source_dir: Path) -> str:
+    """Canonical `properties.file` key for a file node.
+
+    Files under the project source dir get a source-relative path (matching the
+    root-TU convention); files outside it (system / vendor headers) stay absolute.
+    Every file node routes its `file` key through this one helper so open_file /
+    open_folder see a single, consistent convention regardless of whether a path
+    arrived as a project root or an included header."""
+    try:
+        return str(target.relative_to(source_dir))
+    except ValueError:
+        return str(target)
+
+
 def line_offsets(text: str) -> List[int]:
     offsets = [0]
     for offset, character in enumerate(text):
@@ -515,9 +529,10 @@ def main() -> int:
         text = source_text(path, texts)
         file_id = stable_id("file", path)
         provenance, is_external, is_system = classify_provenance(path, root_set, system_dirs)
+        shown = display_path(path, source_dir)
         file_ids[path] = graph.node(
-            "T0", file_id, "file", str(path.relative_to(source_dir)),
-            file=str(path.relative_to(source_dir)), absolute_file=str(path),
+            "T0", file_id, "file", shown,
+            file=shown, absolute_file=str(path),
             content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
             lines=len(text.splitlines()), language="c",
             provenance=provenance, is_external=is_external, is_system=is_system,
@@ -537,9 +552,10 @@ def main() -> int:
                 text = source_text(target, texts)
                 target_id = stable_id("file", target)
                 provenance, is_external, is_system = classify_provenance(target, root_set, system_dirs)
+                shown = display_path(target, source_dir)
                 file_ids[target] = graph.node(
-                    "T0", target_id, "file", str(target),
-                    file=str(target), absolute_file=str(target),
+                    "T0", target_id, "file", shown,
+                    file=shown, absolute_file=str(target),
                     content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     lines=len(text.splitlines()), language="c",
                     provenance=provenance, is_external=is_external, is_system=is_system,
@@ -627,6 +643,10 @@ def main() -> int:
                 # this file makes externally visible; static/inline-only and pure
                 # prototypes are not exports.
                 has_body = any(child.get("kind") == "CompoundStmt" for child in node.get("inner", []))
+                # A bodyless prototype (header/forward declaration) twins the real
+                # definition under the same name; flag it so the cross-TU pass and the
+                # nav resolver can prefer the body-bearing node.
+                graph.nodes[entity_id]["properties"]["declaration_only"] = not has_body
                 if owner is None and has_body and node.get("storageClass") != "static":
                     graph.edge("EXPORTS", file_ids[path], entity_id, name=name)
         elif not node.get("isImplicit") and not is_included and kind in VALUE_KINDS:
@@ -984,7 +1004,7 @@ def main() -> int:
             token_id = stable_id("token", path, start, end, token_kind)
             graph.node(
                 "T4", token_id, "token", token_text,
-                file=str(path.relative_to(source_dir)), absolute_file=str(path),
+                file=display_path(path, source_dir), absolute_file=str(path),
                 start_offset=start, end_offset=end, start_line=line_number,
                 start_column=column, end_line=line_number,
                 end_column=column + max(0, end - start - 1),
@@ -1028,6 +1048,63 @@ def main() -> int:
             category="compiler", message=message, file=str(path),
         )
         graph.edge("HAS_DIAGNOSTIC", file_ids.get(path), diagnostic_id)
+
+    # ---- Cross-TU call linking ------------------------------------------------
+    # Call resolution in the bodies pass is intra-TU: a CallExpr whose definition
+    # lives in another translation unit only sees the header prototype (which twins
+    # the real definition under the same name), so the single-candidate name
+    # fallback is ambiguous and the call is left "dynamic-or-unresolved". Now that
+    # every TU is merged into one graph, link those calls to the unique body-bearing
+    # definition and collapse the prototype/definition twins. Ambiguity is bounded:
+    # extern names are unique, and a name shared by two static definitions across TUs
+    # is deliberately left unresolved rather than linked to an arbitrary twin.
+    definitions_by_name: Dict[str, List[str]] = defaultdict(list)
+    for node_id, node in graph.nodes.items():
+        if node.get("kind") == "function" and not node["properties"].get("declaration_only"):
+            definitions_by_name[node["label"]].append(node_id)
+
+    def sole_definition(name: Optional[str]) -> Optional[str]:
+        defs = definitions_by_name.get(name or "", ())
+        return defs[0] if len(defs) == 1 else None
+
+    # 1. Map each bodyless prototype to its unique definition and connect the twins,
+    #    so the body is reachable from a header prototype.
+    prototype_definition: Dict[str, str] = {}
+    for node_id, node in graph.nodes.items():
+        if node.get("kind") == "function" and node["properties"].get("declaration_only"):
+            definition = sole_definition(node["label"])
+            if definition and definition != node_id:
+                prototype_definition[node_id] = definition
+                graph.edge("REFERS_TO", node_id, definition, reason="prototype-of")
+
+    # 2. Redirect any resolved CALLS/INVOKES that landed on a prototype (cross-TU or
+    #    same-file forward declaration) onto the definition twin.
+    for edge in graph.edges:
+        if edge["kind"] in {"CALLS", "INVOKES"}:
+            definition = prototype_definition.get(edge["target"])
+            if definition:
+                edge["target"] = definition
+                edge["properties"]["resolution"] = "cross-tu"
+
+    # 3. Resolve each still-unresolved call-site whose callee name has a unique
+    #    definition, and 4. repoint any call whose primary target was a prototype.
+    for node_id, node in graph.nodes.items():
+        if node.get("kind") != "call":
+            continue
+        props = node["properties"]
+        target = props.get("primary_target_id")
+        if target in prototype_definition:  # (4) repoint off the prototype twin
+            props["primary_target_id"] = prototype_definition[target]
+            props["resolution"] = "cross-tu"
+        elif props.get("resolution") == "dynamic-or-unresolved" and not target:
+            definition = sole_definition(props.get("callee"))
+            if definition:
+                props["resolution"] = "cross-tu"
+                props["primary_target_id"] = definition
+                graph.edge("INVOKES", node_id, definition, resolution="cross-tu")
+                owner = props.get("owner_function_id")
+                if owner:
+                    graph.edge("CALLS", owner, definition, callsite=node_id)
 
     structural = {
         "DECLARES", "DECLARES_MEMBER", "DECLARES_VALUE", "CONTAINS_BODY",

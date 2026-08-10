@@ -32,14 +32,48 @@ DECL_KINDS = ("function", "method", "class", "interface", "enum", "constructor")
 IMPORT_EDGES = ("DEPENDS_ON", "RE_EXPORTS", "RUNTIME_DEPENDS_ON")
 
 
+def _norm(p: str | None) -> str:
+    """Normalize a path for comparison: strip a leading `./` and trailing slash."""
+    if not p:
+        return ""
+    p = p.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
+
+
+def file_node_keys(gl: GraphLib, node: dict) -> set[str]:
+    """Every path form a file node answers to: its `file` key, its `absolute_file`,
+    and its bare basename — each normalized. A query in any of these forms (an
+    absolute handle, a source-relative path, a bare basename) resolves the node, so
+    open_file/open_folder no longer depend on which convention a handle arrived in."""
+    keys: set[str] = set()
+    for raw in (gl.prop(node, "file"), gl.prop(node, "absolute_file")):
+        norm = _norm(raw)
+        if norm:
+            keys.add(norm)
+            keys.add(norm.rsplit("/", 1)[-1])
+    return keys
+
+
 def _find_file_node(gl: GraphLib, *, path: str | None, file_id: str | None) -> dict | None:
     if file_id:
         node = gl.nodes.get(file_id)
         return node if node and node.get("kind") == "file" else None
+    query = _norm(path)
+    if not query:
+        return None
+    base = query.rsplit("/", 1)[-1]
+    # exact file/absolute match wins over a basename-only match, so a bare basename
+    # never shadows a full-path hit when both are present in the tree.
+    fallback: dict | None = None
     for node in gl.index.nodes_of_kind("file"):
-        if gl.prop(node, "file") == path:
+        keys = file_node_keys(gl, node)
+        if query in keys:
             return node
-    return None
+        if base in keys:
+            fallback = fallback or node
+    return fallback
 
 
 def _edge(source: str, target: str, kind: str, extra: dict | None = None,
