@@ -722,8 +722,16 @@ def main() -> int:
 
     field_bindings: Dict[str, set] = defaultdict(set)   # property slot -> {function ids}
     var_bindings: Dict[str, set] = defaultdict(set)     # pointer variable -> {function ids}
+    # Ops-struct registrations: (ops-struct variable id, field slot id, handler id).
+    # `field_bindings` is keyed by slot only (a dispatch call-site `ops->f()` knows the
+    # field, not which instance), but an *entry-point* handler is registered into a
+    # concrete table and never dispatched in-tree — so its slot binding is otherwise
+    # invisible to reverse navigation. Keeping the owning variable lets us surface the
+    # registration as a MAY_INVOKE(table -> handler) edge, so `callers(handler)` walks
+    # from a leaf handler back to the ops table it is registered in.
+    ops_registrations: List[Tuple[str, str, str]] = []
 
-    def bind_init_list(init_list: dict) -> None:
+    def bind_init_list(init_list: dict, variable_id: Optional[str] = None) -> None:
         # Clang emits initializer values in record-field order (holes filled with
         # ImplicitValueInitExpr), so element position maps to the ordered fields.
         type_name = normalize_type(init_list.get("type", {}).get("qualType", ""))
@@ -735,6 +743,8 @@ def main() -> int:
                 continue
             for function_id in function_refs(element):
                 field_bindings[fields[position]].add(function_id)
+                if variable_id is not None:
+                    ops_registrations.append((variable_id, fields[position], function_id))
 
     def slot_of_lvalue(lvalue: dict) -> Optional[Tuple[str, str]]:
         for reference in referenced_decls(lvalue):
@@ -747,14 +757,16 @@ def main() -> int:
     def collect_bindings(node: dict) -> None:
         kind = node.get("kind", "")
         if kind == "VarDecl":
+            variable_id = declarations_by_raw_id.get(node.get("id", ""))
+            is_variable = variable_id and graph.nodes.get(variable_id, {}).get("kind") == "variable"
             init_list = next((c for c in node.get("inner", []) if c.get("kind") == "InitListExpr"), None)
             if init_list is not None:
-                bind_init_list(init_list)
-            else:
-                variable_id = declarations_by_raw_id.get(node.get("id", ""))
-                if variable_id and graph.nodes.get(variable_id, {}).get("kind") == "variable":
-                    for function_id in function_refs(node):
-                        var_bindings[variable_id].add(function_id)
+                # Pass the owning variable so ops-struct slot bindings record the
+                # concrete table, not just the shared field slot.
+                bind_init_list(init_list, variable_id if is_variable else None)
+            elif is_variable:
+                for function_id in function_refs(node):
+                    var_bindings[variable_id].add(function_id)
         elif kind in {"BinaryOperator", "CompoundAssignOperator"} and node.get("opcode") == "=":
             inner = node.get("inner", [])
             if len(inner) >= 2:
@@ -777,6 +789,19 @@ def main() -> int:
         declarations(ast, path)
         collect_record_fields(ast)
         collect_bindings(ast)
+
+    # Ops-struct registration edges. A handler bound into a dispatch table
+    # (`static const struct net_device_ops ops = { .ndo_start_xmit = handler }`) is an
+    # entry point the runtime invokes through the table; there is no in-tree call-site,
+    # so without this edge `callers(handler)` is empty and reverse navigation from a
+    # leaf handler is blind. Model the registration as MAY_INVOKE(table -> handler) so
+    # the handler's fan-in surfaces the ops table it belongs to (and the slot it fills).
+    for variable_id, slot_id, function_id in ops_registrations:
+        slot_name = graph.nodes.get(slot_id, {}).get("label")
+        graph.edge(
+            "MAY_INVOKE", variable_id, function_id,
+            dispatch="ops-struct", resolution="registration", slot=slot_name,
+        )
 
     # Body/reference/call pass.
     def body_identity(node: dict, path: Path) -> str:
@@ -1077,14 +1102,18 @@ def main() -> int:
                 prototype_definition[node_id] = definition
                 graph.edge("REFERS_TO", node_id, definition, reason="prototype-of")
 
-    # 2. Redirect any resolved CALLS/INVOKES that landed on a prototype (cross-TU or
-    #    same-file forward declaration) onto the definition twin.
+    # 2. Redirect any resolved CALLS/INVOKES/MAY_INVOKE that landed on a prototype
+    #    (cross-TU or same-file forward declaration) onto the definition twin — so a
+    #    dispatch or ops-struct registration edge points at the body, not the stub.
+    #    A dispatch/registration edge keeps its own resolution tag (binding /
+    #    registration); a plain resolved call is retagged cross-tu.
     for edge in graph.edges:
-        if edge["kind"] in {"CALLS", "INVOKES"}:
+        if edge["kind"] in {"CALLS", "INVOKES", "MAY_INVOKE"}:
             definition = prototype_definition.get(edge["target"])
             if definition:
                 edge["target"] = definition
-                edge["properties"]["resolution"] = "cross-tu"
+                if edge["properties"].get("resolution") not in {"registration", "binding"}:
+                    edge["properties"]["resolution"] = "cross-tu"
 
     # 3. Resolve each still-unresolved call-site whose callee name has a unique
     #    definition, and 4. repoint any call whose primary target was a prototype.

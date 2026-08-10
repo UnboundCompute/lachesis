@@ -1005,6 +1005,48 @@ class CompilerFrontendTests(unittest.TestCase):
                 for n in folder["nodes"]
             ), "open_folder finds the fixture files under the absolute root")
 
+    def test_c_ops_struct_registration_reverse_navigation(self) -> None:
+        # An entry-point handler registered into a dispatch table but never called
+        # in-tree (the runtime dispatches through the table) must still be reachable
+        # by reverse navigation: the frontend models each ops-struct slot binding as
+        # MAY_INVOKE(table -> handler), so callers(handler) walks back to the table.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from tier1_flag.graphlib import GraphLib
+        from nav.symbol_index import build_index, _resolve, callers
+
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "Arachne/frontends/c/build_graph.py",
+                "Arachne/frontends/c/fixtures_opsreg", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+
+            ops = next(n for n in snapshot.nodes
+                       if n["kind"] == "variable" and n["label"] == "driver_ops")
+            handlers = {n["label"]: n["id"] for n in snapshot.nodes
+                        if n["kind"] == "function" and n["label"] in {"drv_start", "drv_stop"}}
+            # Each slot binding is a MAY_INVOKE(table -> handler), tagged as an
+            # ops-struct registration and carrying the slot it fills.
+            reg = {e["target"]: e for e in snapshot.edges
+                   if e["kind"] == "MAY_INVOKE" and e["source"] == ops["id"]
+                   and e["properties"].get("resolution") == "registration"}
+            self.assertEqual(set(handlers.values()), set(reg),
+                             "every registered handler has a table->handler edge")
+            self.assertEqual("ops-struct", reg[handlers["drv_start"]]["properties"]["dispatch"])
+            self.assertEqual("start", reg[handlers["drv_start"]]["properties"]["slot"])
+
+            # The handler is never called directly, so reverse navigation must come
+            # from the registration: callers(drv_start) surfaces the ops table.
+            gl = GraphLib({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            index = build_index(gl)
+            resolved = _resolve(gl, index, "drv_start")[0]
+            callers_of = callers(gl, resolved["node_id"])
+            self.assertIn("driver_ops", [c["name"] for c in callers_of])
+            self.assertTrue(all(c["via"].startswith("indirect") for c in callers_of))
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
