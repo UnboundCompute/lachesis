@@ -20,9 +20,18 @@ def main() -> None:
         "--frontend-out", default="graph_out/frontends",
         help="directory retaining each compiler's native layered snapshot",
     )
+    parser.add_argument(
+        "--kuzu-out", metavar="DIR", default=None,
+        help="also write the composed graph to a Kùzu DB directory (dual-write; "
+             "the JSON output is unchanged). Requires Python 3.10+ with `kuzu`.",
+    )
     args = parser.parse_args()
     graph, snapshots = run_project(args.source_dir, args.frontend_out)
     written = write_project_graph(graph, snapshots, args.output_path)
+    if args.kuzu_out:
+        from Arachne.kuzu_store import write_kuzu_graph
+        kuzu_dir = write_kuzu_graph(graph, snapshots, args.kuzu_out)
+        print(f"Kùzu store: {kuzu_dir}")
     kinds = Counter(node["kind"] for node in graph["nodes"])
     print(
         f"Composed {len(snapshots)} frontends into {len(graph['nodes'])} nodes "
