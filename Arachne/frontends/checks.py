@@ -1235,13 +1235,23 @@ class CompilerFrontendTests(unittest.TestCase):
         from nav.graph_store import GraphStore
         from nav.reachability import Reachability
         from nav.hubs import Hubs
+        from nav.guards import GuardProfiles
+        from nav.call_roles import CallRoles
+        from nav.siblings import SiblingDiff
         from nav import mcp_server
         from Arachne.kuzu_store import write_kuzu_graph
 
         def _run_nav(store, calls):
-            # each store drives the same global nav dispatch, one at a time
+            # each store drives the same global nav dispatch, one at a time. The
+            # security tools (guards/guards_top/call_roles/siblings) recompute from
+            # base facts, so the injected context mirrors the real `_Ctx` — a Kùzu
+            # store with an empty overlay must answer them identically to the JSON
+            # store, proving the overlay is a cache, not a dependency.
+            guards = GuardProfiles(store)
             mcp_server._CTX = _types.SimpleNamespace(
-                store=store, reach=Reachability(store), hubs=Hubs(store.gl))
+                store=store, reach=Reachability(store), hubs=Hubs(store.gl),
+                guards=guards, roles=CallRoles(store, guards=guards),
+                siblings=SiblingDiff(store))
             mcp_server._PROFILE = "all"
             mcp_server._DEFAULT_FORMAT = "json"
             return {label: mcp_server.call_tool(tool, args, format="json")
@@ -1293,6 +1303,13 @@ class CompilerFrontendTests(unittest.TestCase):
                 ("aliases", "aliases", {"value": "drv_start"}),
                 ("open_file", "open_file", {"file": file_path}),
                 ("open_folder", "open_folder", {"root": root}),
+                # security tools — recompute guard/role/sibling signals from base
+                # facts (CONDITION/SHORT_CIRCUIT/THROWS_VALUE/CALLS edges); parity
+                # here proves they need no overlay to answer identically off Kùzu.
+                ("guards_top", "guards_top", {"n": 20}),
+                ("guards", "guards", {"fn": "drv_start"}),
+                ("call_roles", "call_roles", {"fn": "drv_start"}),
+                ("siblings", "siblings", {"sym": "drv_start"}),
             ]
             json_out = _run_nav(json_store, calls)
 
@@ -1321,6 +1338,52 @@ class CompilerFrontendTests(unittest.TestCase):
                 self.assertEqual(
                     _norm(json_out[label]), _norm(pruned_out[label]),
                     f"{label}: pruned Kùzu store must match the JSON store")
+
+            # -- guard-rich synthetic graph: exercise the NONZERO guard-count path --
+            # The C fixtures emit no CONDITION/THROWS_VALUE edges (those come from
+            # TS control-flow overlays), so the parity above only proves the empty
+            # guard path. Guard kinds are cold (not HOT_REL_KINDS): they live in the
+            # catch-all EDGE table and edges_of_kind matches them by `semantic_kind`.
+            # This synthetic graph drives real, nonzero guard counts through that
+            # path so a Kùzu vs JSON divergence in guard attribution would show.
+            fn = {"id": "fn1", "kind": "function", "label": "validate_input",
+                  "properties": {"file": "g.c", "start_line": 1}}
+            stmt = {"id": "s1", "kind": "statement", "label": "if",
+                    "properties": {"file": "g.c", "start_line": 2,
+                                   "owner_function_id": "fn1"}}
+            callee = {"id": "authn", "kind": "function", "label": "authenticate",
+                      "properties": {"file": "g.c", "start_line": 9}}
+            guard_graph = {
+                "nodes": [fn, stmt, callee],
+                # guard edges (cold → catch-all EDGE table), source owned by fn1:
+                "edges": [
+                    {"kind": "CONDITION", "source": "s1", "target": "fn1", "properties": {}},
+                    {"kind": "THROWS_VALUE", "source": "s1", "target": "fn1", "properties": {}},
+                    {"kind": "SHORT_CIRCUIT_LEFT", "source": "s1", "target": "fn1", "properties": {}},
+                    # a hot CALLS edge so call_roles/security_weight also runs:
+                    {"kind": "CALLS", "source": "fn1", "target": "authn", "properties": {}},
+                ],
+            }
+            guard_calls = [
+                ("guards_top", "guards_top", {"n": 20}),
+                ("guards", "guards", {"fn": "validate_input"}),
+                ("call_roles", "call_roles", {"fn": "validate_input"}),
+            ]
+            guard_json = _run_nav(GraphStore(guard_graph), guard_calls)
+            # sanity: the counting path actually fired (not a vacuous all-zero match)
+            gsig = json.loads(guard_json["guards"])["guard_signal"]
+            self.assertEqual("guard", gsig["class"])
+            self.assertGreaterEqual(gsig["conditions"], 1)
+            self.assertGreaterEqual(gsig["throws"], 1)
+
+            guard_dir = _os.path.join(output, "kuzu_guard")
+            write_kuzu_graph(guard_graph, None, guard_dir,
+                             prune=False, elide_constants=False)
+            guard_kuzu = _run_nav(GraphStore.load(guard_dir), guard_calls)
+            for label, _tool, _args in guard_calls:
+                self.assertEqual(
+                    _norm(guard_json[label]), _norm(guard_kuzu[label]),
+                    f"{label}: Kùzu must match JSON on the nonzero guard-count path")
 
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
