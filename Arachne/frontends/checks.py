@@ -849,6 +849,46 @@ class CompilerFrontendTests(unittest.TestCase):
                 self.assertIn("helper_value", functions)
                 self.assertIn("feature_enabled", functions)
 
+    def test_c_nonzero_exit_with_ast_recovers_full_semantics(self) -> None:
+        # Clang emits a complete AST on stdout even when it exits nonzero from
+        # residual diagnostics — routine for real-world TUs (e.g. an unconfigured
+        # kernel tree). Recovery must not gate on the return code: the file's whole
+        # semantic layer (functions, calls) has to survive, the file must count as
+        # analyzed rather than failed, and the diagnostic still lands as T4 proof.
+        with tempfile.TemporaryDirectory() as project:
+            root = Path(project)
+            # The duplicate definition makes clang exit 1 while still dumping the
+            # full AST for `handler`/`dispatch` and the call between them.
+            (root / "mod.c").write_text(
+                "static int handler(int x) { return x + 1; }\n"
+                "int dispatch(int x) { return handler(x); }\n"
+                "int dup(void) { return 42; }\n"
+                "int dup(void) { return 43; }\n",
+                encoding="utf-8",
+            )
+            with tempfile.TemporaryDirectory() as output:
+                self.run_command(
+                    sys.executable, "Arachne/frontends/c/build_graph.py",
+                    str(root), output,
+                )
+                snapshot = load_snapshot(output)
+                validate_snapshot(snapshot)
+                manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+                # Nonzero exit, but the AST was consumed: file analyzed, not failed.
+                self.assertEqual(0, manifest["failed_file_count"])
+                self.assertEqual(1, manifest["analyzed_file_count"])
+                functions = {
+                    node["label"] for node in snapshot.nodes if node["kind"] == "function"
+                }
+                self.assertIn("handler", functions)
+                self.assertIn("dispatch", functions)
+                # The dispatch -> handler call survived the nonzero exit.
+                self.assertTrue(any(
+                    edge["kind"] in {"CALLS", "INVOKES"} for edge in snapshot.edges
+                ))
+                # Diagnostics are still recorded even though the file was recovered.
+                self.assertTrue(any(node["kind"] == "diagnostic" for node in snapshot.nodes))
+
     def test_c_partial_ingest_keeps_failed_file_and_downgrades_capability(self) -> None:
         # A file that clang cannot parse must not vanish: its file node survives,
         # its diagnostics land as T4 proof, the manifest counts it as failed, and

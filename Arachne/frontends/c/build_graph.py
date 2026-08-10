@@ -13,9 +13,10 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 try:  # run as a script (sys.path[0] is this directory) …
     from macros import parse_macro_definitions
@@ -434,6 +435,35 @@ def referenced_decls(node: dict) -> List[dict]:
     return result
 
 
+class AstStore:
+    """Disk-backed sequence of Clang ASTs, re-parsed one translation unit at a time.
+
+    A single real kernel translation unit dumps ~1 GB of JSON AST, and the
+    declaration/binding and body passes each re-walk every TU; holding all of them
+    parsed in memory simultaneously would exhaust it. Each recovered AST is spilled
+    to a temp file and re-parsed on demand, so peak memory stays at one TU while the
+    passes keep iterating ``(path, ast)`` unchanged. The trade is disk (~AST size
+    per TU) and re-parsing each TU once per pass.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self._directory = directory
+        self._entries: List[Tuple[Path, Path]] = []
+
+    def add(self, path: Path, ast_json: str) -> None:
+        spill = self._directory / f"{len(self._entries)}.json"
+        spill.write_text(ast_json, encoding="utf-8")
+        self._entries.append((path, spill))
+
+    def __iter__(self) -> Iterator[Tuple[Path, dict]]:
+        for path, spill in self._entries:
+            with spill.open(encoding="utf-8") as handle:
+                yield path, json.load(handle)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
 def main() -> int:
     source_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "src").resolve()
     output_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "graph_out/clang_layered").resolve()
@@ -458,7 +488,8 @@ def main() -> int:
     declarations_by_raw_id: Dict[str, str] = {}
     declarations_by_name: Dict[Tuple[str, str], List[str]] = defaultdict(list)
     function_parameters: Dict[str, List[str]] = defaultdict(list)
-    asts: List[Tuple[Path, dict]] = []
+    ast_spill = tempfile.TemporaryDirectory(prefix="arachne-c-ast-")
+    asts = AstStore(Path(ast_spill.name))
     diagnostics: List[Tuple[Path, str]] = []
     failed_files: Set[Path] = set()
 
@@ -503,18 +534,48 @@ def main() -> int:
     # offsets but only the including-file provenance.
     for path in files:
         result = run_clang(source_dir, path, "-Xclang", "-ast-dump=json", "-fsyntax-only", "-Wno-everything", file_flags=compile_commands.get(path))
-        if result.returncode != 0 or not result.stdout.strip():
+        # Clang emits a COMPLETE AST on stdout even when it exits nonzero from
+        # residual (cross-config) diagnostics — routine for real kernel TUs, which
+        # almost always have a few. Gating on returncode would discard that entire
+        # AST and collapse the file to a lexical-only husk (file node + tokens, no
+        # symbols/calls). So the AST is consumed whenever one is present; a file
+        # only falls back to "failed" when nothing usable was recovered: empty
+        # stdout, unparseable JSON, or a TranslationUnitDecl with no declarations.
+        # Diagnostics are recorded either way.
+        stderr_lines = [line for line in result.stderr.splitlines() if line.strip()]
+        meaningful = [line for line in stderr_lines if "error:" in line or "warning:" in line]
+        diagnostics.extend((path, line) for line in meaningful)
+        recovered = False
+        if result.stdout.strip():
+            try:
+                ast = json.loads(result.stdout)
+            except json.JSONDecodeError as error:
+                diagnostics.append((path, f"invalid Clang AST JSON: {error}"))
+            else:
+                # Clang injects an implicit built-in typedef preamble
+                # (``__int128_t`` &c.) into every TU, present even when the source
+                # is entirely unparseable — so "has inner decls" is too weak. A TU
+                # is only genuinely recovered when it carries at least one
+                # *non-implicit* declaration (an actual source/header symbol).
+                if any(
+                    isinstance(child, dict) and child.get("kind")
+                    and not child.get("isImplicit")
+                    for child in ast.get("inner", [])
+                ):
+                    asts.add(path, result.stdout)
+                    recovered = True
+                else:
+                    diagnostics.append((path, "Clang AST recovered no declarations"))
+                del ast
+        if not recovered:
             # Degrade, don't drop: the file node (emitted above) survives with its
-            # compiler diagnostics attached as T4 proof, rather than vanishing from
-            # the graph. Only its AST-derived declarations/calls are unavailable.
+            # compiler diagnostics attached as T4 proof; only the semantic layer for
+            # this one file is unavailable. Capture fatal messages that carry no
+            # error:/warning: prefix so nothing is lost.
             failed_files.add(path)
-            diagnostics.extend((path, line) for line in result.stderr.splitlines() if line.strip())
-            continue
-        try:
-            asts.append((path, json.loads(result.stdout)))
-        except json.JSONDecodeError as error:
-            diagnostics.append((path, f"invalid Clang AST JSON: {error}"))
-        diagnostics.extend((path, line) for line in result.stderr.splitlines() if "error:" in line or "warning:" in line)
+            diagnostics.extend(
+                (path, line) for line in stderr_lines if line not in meaningful
+            )
 
     def eligible(node: dict, inherited_included: bool) -> bool:
         loc = node.get("loc", {})
@@ -572,9 +633,6 @@ def main() -> int:
         for child in node.get("inner", []):
             declarations(child, path, current_owner, is_included)
 
-    for path, ast in asts:
-        declarations(ast, path)
-
     # Indirect-dispatch binding pre-pass. Function pointers reach their targets
     # through ops-struct slots (`.read = ext4_file_read`) and pointer variables
     # (`fp = handler`); on C/kernel this indirection *is* the control flow. We
@@ -592,9 +650,6 @@ def main() -> int:
             ]
         for child in node.get("inner", []):
             collect_record_fields(child)
-
-    for path, ast in asts:
-        collect_record_fields(ast)
 
     def normalize_type(text: str) -> str:
         for qualifier in ("const ", "volatile ", "restrict ", "_Atomic "):
@@ -675,7 +730,14 @@ def main() -> int:
         for child in node.get("inner", []):
             collect_bindings(child)
 
+    # One combined table-building pass over each TU: declarations (the global
+    # symbol table), then record fields, then dispatch bindings — each reads what
+    # the prior step produced for the *same* TU, and every TU is self-contained
+    # (it includes its own headers), so the three fuse safely into a single reload.
+    # The body pass below reloads each TU once more; peak memory stays at one TU.
     for path, ast in asts:
+        declarations(ast, path)
+        collect_record_fields(ast)
         collect_bindings(ast)
 
     # Body/reference/call pass.
@@ -1032,6 +1094,7 @@ def main() -> int:
         )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Clang analyzed {len(files)} C files; emitted {len(graph.nodes)} nodes and {len(graph.edges)} edges to {output_dir}")
+    ast_spill.cleanup()
     return 0
 
 
