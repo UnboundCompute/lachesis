@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Arachne build artifacts / graphs
+*.kuzu/
+*.kuzu
+*.db-shm
+*.db-wal
+*.parquet
+out/
+.store/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
