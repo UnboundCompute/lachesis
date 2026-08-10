@@ -617,9 +617,20 @@ def main() -> int:
                     # implicit builtin preamble is kept so the bytes the passes consume
                     # are untouched; a header's own decls survive because every file is
                     # also parsed as its own compiler root.
+                    #
+                    # RecordDecls are the one exception that must survive pruning: an
+                    # ops-struct initializer in a .c (``static const struct T x = {…}``)
+                    # binds its handlers by the field *layout* of ``struct T`` — and for
+                    # a kernel driver the struct is defined in a header outside the
+                    # ingested tree (e.g. ``struct net_device_ops`` in netdevice.h), so
+                    # the only place its field order/names are visible is the TU's own
+                    # included copy. Keep those (small, body-less) so ``collect_record_fields``
+                    # can still recover the layout the binding pass needs.
                     ast["inner"] = [
                         child for child in ast.get("inner", [])
-                        if child.get("isImplicit") or not _has_include_origin(child)
+                        if child.get("isImplicit")
+                        or not _has_include_origin(child)
+                        or child.get("kind") == "RecordDecl"
                     ]
                     asts.add(path, json.dumps(ast))
                     recovered = True
@@ -700,15 +711,32 @@ def main() -> int:
     # resolve those bindings here so the call pass can attach MAY_INVOKE to the
     # dispatch call-site (parity with the TS frontend). Genuinely unresolved
     # pointers keep their READS_CALLEE slot edge — the indirection is never dropped.
-    record_fields_by_type: Dict[str, List[Optional[str]]] = {}
+    record_fields_by_type: Dict[str, List[Tuple[Optional[str], Optional[str]]]] = {}
 
     def collect_record_fields(node: dict) -> None:
         if node.get("kind") == "RecordDecl" and node.get("name") and node.get("tagUsed"):
             key = f'{node["tagUsed"]} {node["name"]}'
-            record_fields_by_type[key] = [
-                declarations_by_raw_id.get(child.get("id", ""))
+            # Each slot is (field name, field node-id). The name is always present;
+            # the node-id is None when the struct is defined in an un-ingested header
+            # (its FieldDecls are never registered as graph nodes). The binding pass
+            # uses the id for in-tree dispatch resolution and the name for ops-struct
+            # registration, so a name-only layout still yields the registration edge.
+            harvested = [
+                (child.get("name"), declarations_by_raw_id.get(child.get("id", "")))
                 for child in node.get("inner", []) if child.get("kind") == "FieldDecl"
             ]
+            existing = record_fields_by_type.get(key)
+            if existing is not None and len(existing) == len(harvested):
+                # Same layout seen from multiple TUs (an included copy and the
+                # header-as-root copy): prefer a real node-id over None so the
+                # dispatch path keeps its slot, and never let a body-less forward
+                # decl (no fields) clobber a real layout.
+                record_fields_by_type[key] = [
+                    (name or prev_name, fid or prev_id)
+                    for (name, fid), (prev_name, prev_id) in zip(harvested, existing)
+                ]
+            elif harvested or existing is None:
+                record_fields_by_type[key] = harvested
         for child in node.get("inner", []):
             collect_record_fields(child)
 
@@ -745,14 +773,16 @@ def main() -> int:
 
     field_bindings: Dict[str, set] = defaultdict(set)   # property slot -> {function ids}
     var_bindings: Dict[str, set] = defaultdict(set)     # pointer variable -> {function ids}
-    # Ops-struct registrations: (ops-struct variable id, field slot id, handler id).
-    # `field_bindings` is keyed by slot only (a dispatch call-site `ops->f()` knows the
-    # field, not which instance), but an *entry-point* handler is registered into a
-    # concrete table and never dispatched in-tree — so its slot binding is otherwise
-    # invisible to reverse navigation. Keeping the owning variable lets us surface the
-    # registration as a MAY_INVOKE(table -> handler) edge, so `callers(handler)` walks
-    # from a leaf handler back to the ops table it is registered in.
-    ops_registrations: List[Tuple[str, str, str]] = []
+    # Ops-struct registrations: (ops-struct variable id, field slot id, handler id,
+    # field name). `field_bindings` is keyed by slot only (a dispatch call-site
+    # `ops->f()` knows the field, not which instance), but an *entry-point* handler is
+    # registered into a concrete table and never dispatched in-tree — so its slot
+    # binding is otherwise invisible to reverse navigation. Keeping the owning variable
+    # lets us surface the registration as a MAY_INVOKE(table -> handler) edge, so
+    # `callers(handler)` walks from a leaf handler back to the ops table it is
+    # registered in. The field name labels the slot even when the struct is defined in
+    # an un-ingested header (no field node, so `slot_id` is None).
+    ops_registrations: List[Tuple[str, Optional[str], str, Optional[str]]] = []
 
     def bind_init_list(init_list: dict, variable_id: Optional[str] = None) -> None:
         # Clang emits initializer values in record-field order (holes filled with
@@ -762,12 +792,18 @@ def main() -> int:
         if not fields:
             return
         for position, element in enumerate(init_list.get("inner", [])):
-            if position >= len(fields) or not fields[position]:
+            if position >= len(fields):
                 continue
+            field_name, field_id = fields[position]
             for function_id in function_refs(element):
-                field_bindings[fields[position]].add(function_id)
+                # In-tree dispatch resolution keys on the field node; skip when the
+                # struct is header-defined and has no field node.
+                if field_id:
+                    field_bindings[field_id].add(function_id)
+                # Entry-point registration only needs the owning table and the slot
+                # name, so it fires even for a header-defined ops struct.
                 if variable_id is not None:
-                    ops_registrations.append((variable_id, fields[position], function_id))
+                    ops_registrations.append((variable_id, field_id, function_id, field_name))
 
     def slot_of_lvalue(lvalue: dict) -> Optional[Tuple[str, str]]:
         for reference in referenced_decls(lvalue):
@@ -819,8 +855,7 @@ def main() -> int:
     # so without this edge `callers(handler)` is empty and reverse navigation from a
     # leaf handler is blind. Model the registration as MAY_INVOKE(table -> handler) so
     # the handler's fan-in surfaces the ops table it belongs to (and the slot it fills).
-    for variable_id, slot_id, function_id in ops_registrations:
-        slot_name = graph.nodes.get(slot_id, {}).get("label")
+    for variable_id, _slot_id, function_id, slot_name in ops_registrations:
         graph.edge(
             "MAY_INVOKE", variable_id, function_id,
             dispatch="ops-struct", resolution="registration", slot=slot_name,
