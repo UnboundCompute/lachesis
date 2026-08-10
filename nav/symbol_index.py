@@ -166,18 +166,28 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
                 continue  # external type-stub noise, not the codebase
             owner = gl.owner_function(node)
             container = gl.label(owner) if owner and owner["id"] != node["id"] else None
+            nid = node["id"]
+            # Twin-disambiguation signals. `declaration_only` is the crisp flag the C
+            # frontend stamps on a bodyless prototype (twins the real definition under
+            # the same name); `degree` is the language-agnostic fallback (a definition
+            # bears call/body edges, a prototype bears none). Both let name resolution
+            # prefer the body-bearing definition when a name collides with its prototype.
+            degree = (len(gl.index.outgoing.get(nid, ()))
+                      + len(gl.index.incoming.get(nid, ())))
             entries.append({
-                "node_id": node["id"],
+                "node_id": nid,
                 "name": name,
                 "kind": kind,
                 "granularity": granularity,
                 "file": file,
                 "line": line,
-                "exported": node["id"] in exported,
+                "exported": nid in exported,
                 "container": container,
                 "tokens": _tokens(name),
                 "handle": f"{file}:{line}" if file and line else None,
                 "is_test": _is_test(file),
+                "declaration_only": bool(gl.prop(node, "declaration_only")),
+                "degree": degree,
             })
     entries.sort(key=lambda e: (e["name"].lower(), e["file"] or "", e["line"] or 0))
     return entries
@@ -218,10 +228,13 @@ def _ranked(entries: list[dict], q: str, mode: str = "fuzzy") -> list[tuple[int,
         s = _score(e, q, mode)
         if s is not None:
             hits.append((s, e))
-    # definitions outrank references (§4 collisions), then exported, then name/path
+    # definitions outrank references (§4 collisions); within a kind the body-bearing
+    # definition outranks its bodyless prototype twin (declaration_only / higher degree),
+    # then exported, then name/path
     hits.sort(key=lambda se: (
-        -se[0], _kind_rank(se[1]), not se[1]["exported"], se[1]["name"].lower(),
-        se[1]["file"] or "",
+        -se[0], _kind_rank(se[1]),
+        se[1].get("declaration_only", False), -se[1].get("degree", 0),
+        not se[1]["exported"], se[1]["name"].lower(), se[1]["file"] or "",
     ))
     return hits
 
@@ -265,8 +278,10 @@ def _resolve_handle(entries: list[dict], query: str) -> list[dict]:
             if e.get("file") and (e["file"] == path or e["file"].endswith(path))
             and e.get("line") == line]
     # tightest path match first (exact file over endswith), then definition over a
-    # co-located reference, then production over test
+    # co-located reference, then body-bearing definition over prototype twin, then
+    # production over test
     hits.sort(key=lambda e: (e["file"] != path, _kind_rank(e),
+                             e.get("declaration_only", False), -e.get("degree", 0),
                              e.get("is_test", False), e["file"] or ""))
     return hits
 
@@ -274,9 +289,13 @@ def _resolve_handle(entries: list[dict], query: str) -> list[dict]:
 def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
     exact = [e for e in entries if e["name"] == name]
     if exact:
-        # Prefer the definition over a reference sharing the name (§4 collisions),
-        # then exported, then production over test, then a stable path/line order.
-        exact.sort(key=lambda e: (_kind_rank(e), not e["exported"],
+        # Prefer the definition over a reference sharing the name (§4 collisions), then
+        # the body-bearing definition over its bodyless prototype twin (declaration_only
+        # / higher degree), then exported, then production over test, then a stable
+        # path/line order.
+        exact.sort(key=lambda e: (_kind_rank(e),
+                                  e.get("declaration_only", False), -e.get("degree", 0),
+                                  not e["exported"],
                                   e.get("is_test", False), e["file"] or "", e["line"] or 0))
         return exact
     handle = _resolve_handle(entries, name)

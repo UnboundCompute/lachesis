@@ -98,6 +98,11 @@ class Hubs:
             nid = node["id"]
             if not self._keep(node):
                 continue
+            # A bodyless prototype (header/forward decl) is not part of the spine —
+            # after cross-TU linking its call edges live on the definition twin, so
+            # exclude it from the centrality ranking rather than showing a 0-edge stub.
+            if self.gl.prop(node, "declaration_only"):
+                continue
             fan_in = self._fan_in.get(nid, 0)
             fan_out = self._fan_out.get(nid, 0)
             degree = fan_in + fan_out
