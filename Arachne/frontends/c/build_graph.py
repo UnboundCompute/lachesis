@@ -466,6 +466,19 @@ def referenced_decls(node: dict) -> List[dict]:
     return result
 
 
+def _has_include_origin(node: dict) -> bool:
+    """True when a Clang AST node originates from an ``#include``d file.
+
+    Clang stamps ``includedFrom`` on the location of every node that comes from a
+    header — repeated on each such node, even consecutive top-level siblings where
+    the redundant ``file`` field is omitted — so its presence reliably identifies
+    header/system content. Every descendant of such a node inherits the origin.
+    """
+    loc = node.get("loc", {})
+    begin = node.get("range", {}).get("begin", {})
+    return bool(loc.get("includedFrom") or begin.get("includedFrom"))
+
+
 class AstStore:
     """Disk-backed sequence of Clang ASTs, re-parsed one translation unit at a time.
 
@@ -596,7 +609,19 @@ def main() -> int:
                     and not child.get("isImplicit")
                     for child in ast.get("inner", [])
                 ):
-                    asts.add(path, result.stdout)
+                    # Prune header/system top-level subtrees before spilling. Every
+                    # pass below emits only for non-included nodes (``eligible``), so
+                    # the ~1 GB of re-expanded header AST the raw stdout carries is
+                    # already discarded — dropping it here shrinks per-TU scratch from
+                    # ~1 GB to tens of MB with no change to the emitted graph. The tiny
+                    # implicit builtin preamble is kept so the bytes the passes consume
+                    # are untouched; a header's own decls survive because every file is
+                    # also parsed as its own compiler root.
+                    ast["inner"] = [
+                        child for child in ast.get("inner", [])
+                        if child.get("isImplicit") or not _has_include_origin(child)
+                    ]
+                    asts.add(path, json.dumps(ast))
                     recovered = True
                 else:
                     diagnostics.append((path, "Clang AST recovered no declarations"))
@@ -612,9 +637,7 @@ def main() -> int:
             )
 
     def eligible(node: dict, inherited_included: bool) -> bool:
-        loc = node.get("loc", {})
-        begin = node.get("range", {}).get("begin", {})
-        return not (inherited_included or loc.get("includedFrom") or begin.get("includedFrom"))
+        return not (inherited_included or _has_include_origin(node))
 
     # Declaration pass.
     def declarations(node: dict, path: Path, owner: Optional[str] = None, included: bool = False) -> None:
