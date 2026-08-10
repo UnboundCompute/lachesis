@@ -71,6 +71,20 @@ class GraphIndex:
                 if edge.get("kind") in accepted or self.semantic_edge_kind(edge) in accepted:
                     yield edge
 
+    def flow_edges(self, kinds) -> list[dict]:
+        """All edges whose *semantic* kind is in ``kinds`` — the single adjacency
+        source ``Reachability._build`` consumes. Filtering here (instead of inline in
+        the BFS) lets a disk-backed index answer it with one query while the JSON index
+        keeps today's exact iteration order (``outgoing`` insertion order, inner lists
+        pre-sorted), so the value-flow closure is unchanged."""
+        accepted = frozenset(kinds)
+        return [
+            edge
+            for edges in self.outgoing.values()
+            for edge in edges
+            if self.semantic_edge_kind(edge) in accepted
+        ]
+
     def targets(self, source: str, *edge_kinds: str) -> Iterable[dict]:
         accepted = frozenset(edge_kinds)
         for edge in self.outgoing.get(source, []):

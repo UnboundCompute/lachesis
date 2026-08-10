@@ -87,7 +87,29 @@ class GraphStore:
         self._entries: list[dict] | None = None
 
     @classmethod
+    def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None) -> "GraphStore":
+        """Build a store around an already-constructed ``GraphLib`` (the disk-backed
+        Kùzu path), bypassing the dict + overlay merge that the JSON path needs."""
+        self = cls.__new__(cls)
+        self.overlay = Overlay()
+        self.graph = None
+        self.gl = gl
+        self.index = gl.index
+        self.graph_path = graph_path
+        self._entries = None
+        return self
+
+    @classmethod
     def load(cls, graph_path: str, overlay_path: str | None = None) -> "GraphStore":
+        # A Kùzu store is a directory; the JSON store is a file. The disk-backed index
+        # satisfies the same accessor surface, so GraphLib/every tool is unchanged. The
+        # derived-signal overlay is a JSON-path enrichment; the Kùzu path serves base
+        # facts directly (overlay support over the DB is a later step).
+        from Arachne.kuzu_store import is_kuzu_dir
+        if is_kuzu_dir(graph_path):
+            from nav.kuzu_index import KuzuGraphIndex
+            gl = GraphLib.from_index(KuzuGraphIndex(graph_path))
+            return cls.from_graphlib(gl, graph_path=graph_path)
         graph, _meta = load_graph(graph_path)
         ov_path = Path(overlay_path) if overlay_path else sidecar_path(graph_path)
         overlay = Overlay.load(ov_path)

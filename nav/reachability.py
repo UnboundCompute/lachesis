@@ -76,11 +76,8 @@ class Reachability:
     def _build(self) -> None:
         fwd: dict[str, list] = defaultdict(list)
         rev: dict[str, list] = defaultdict(list)
-        for edges in self.index.outgoing.values():
-            for edge in edges:
+        for edge in self.index.flow_edges(FLOW_EDGE_KINDS):
                 kind = self.index.semantic_edge_kind(edge)
-                if kind not in FLOW_EDGE_KINDS:
-                    continue
                 src, tgt = edge.get("source"), edge.get("target")
                 if src is None or tgt is None:
                     continue
