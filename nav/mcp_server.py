@@ -39,11 +39,16 @@ from nav import symbol_index as si
 from nav.hubs import Hubs
 from nav.folder_graph import build_folder_graph
 from nav.file_graph import build_file_graph, _find_file_node
+from nav import render as render_mod
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
 _CTX = None  # lazily-built bundle of store + engines, loaded once
 _PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
+# Process-wide default output format for tools/call when a call omits `format`.
+# "text" = compact LLM-facing rendering (Spec 1); "json" = the full result dict.
+# Set from ARACHNE_FORMAT in main(); defaults to text.
+_DEFAULT_FORMAT = "text"
 
 # The security-hunting tools. Under the DEFAULT "all" profile every one is exposed
 # exactly as before (TS surface unchanged). The opt-in "comprehension" profile hides
@@ -55,6 +60,7 @@ SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 # navigation, then value-flow reasoning, then the security tools last. Ordering only —
 # a name missing here (or a future tool) still shows, appended in definition order.
 TOOL_ORDER = (
+    "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "guards", "call_roles", "siblings", "guards_top",
@@ -111,6 +117,16 @@ def _ref(store, node_id):
 
 
 TOOLS = [
+    {"name": "load_graph",
+     "description": "Switch/attach the active graph the whole server reasons over — point it at a "
+                    "different target (e.g. bnxt -> igb) mid-session with no restart. Takes a canonical "
+                    "graph JSON path and an optional overlay + profile; the graph loads once and every "
+                    "subsequent tool hits the in-memory copy.",
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "overlay": {"type": "string"},
+         "profile": {"type": "string", "enum": ["all", "comprehension"]}},
+         "required": ["path"]}},
     {"name": "guards_top",
      "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
                     "name knowledge needed — a security-hunting entry point (for the spine of an "
@@ -220,43 +236,77 @@ TOOLS = [
          "sym": {"type": "string"}}, "required": ["sym"]}},
 ]
 
+# Every tool accepts an optional `format` ("text" compact | "json" full). Inject it
+# once here so each tool advertises it in tools/list without repeating the property on
+# 17 schemas. `load_graph` is control-plane, not a graph query, so it is left json-only.
+for _t in TOOLS:
+    if _t["name"] != "load_graph":
+        _t["inputSchema"].setdefault("properties", {})["format"] = {
+            "type": "string", "enum": ["text", "json"],
+            "description": "text (compact, default) | json (full result dict)"}
+# Paging fields on the list-shaped moves: they window the TEXT rendering only (JSON is
+# always the full, un-paged result), so a call on a 400-caller hub stays bounded.
+for _name in ("hubs", "callers", "callees"):
+    _tool = next(t for t in TOOLS if t["name"] == _name)
+    _tool["inputSchema"]["properties"].update(
+        offset={"type": "integer", "default": 0},
+        limit={"type": "integer", "default": 40})
 
-def call_tool(name, args):
+
+def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
+    """Serialize a tool's result dict: full JSON, or compact text via the renderer.
+
+    JSON is byte-identical to the pre-render behavior; text applies id/handle/null
+    stripping, path relativization, and the offset/limit window (text-only paging)."""
+    if fmt == "json":
+        return json.dumps(result)
+    return render_mod.render(name, result, offset=offset, limit=limit)
+
+
+def call_tool(name, args, format=None):
+    fmt = "json" if format == "json" else ("text" if format == "text" else _DEFAULT_FORMAT)
+    offset, limit = int(args.get("offset", 0)), int(args.get("limit", render_mod.DEFAULT_LIMIT))
+
+    if name == "load_graph":
+        return _load_graph(args)
     if _PROFILE == "comprehension" and name in SECURITY_TOOLS:
-        return json.dumps({"error": f"tool {name!r} is hidden under the "
-                                    "'comprehension' profile (security tool)"})
+        return _emit(name, {"error": f"tool {name!r} is hidden under the "
+                                     "'comprehension' profile (security tool)"}, fmt)
     c = ctx()
     store, gl = c.store, c.store.gl
+    text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
 
     if name == "guards_top":
         rows = c.guards.top(int(args.get("n", 20)))
-        return json.dumps({"move": "guards_top", "count": len(rows), "ranked": [
+        return _emit(name, {"move": "guards_top", "count": len(rows), "ranked": [
             {"node_id": r["node_id"], "name": r["name"], "at": r["handle"],
              "score": r["guard_signal"]["score"], "class": r["guard_signal"]["class"],
              "conditions": r["guard_signal"]["conditions"],
              "short_circuits": r["guard_signal"]["short_circuits"],
              "throws": r["guard_signal"]["throws"],
              "security_weight": r["guard_signal"]["security_weight"]}
-            for r in rows]})
+            for r in rows]}, fmt, offset, limit)
     if name == "hubs":
         rows = c.hubs.top(int(args.get("n", 20)))
-        return json.dumps({"move": "hubs", "count": len(rows), "ranked": rows})
+        return _emit(name, {"move": "hubs", "count": len(rows), "ranked": rows},
+                     fmt, offset, limit)
     if name == "search":
         page = si.search_page(store.entries, args["name"], "fuzzy",
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
-        return json.dumps(page)
+        return _emit(name, page, fmt, offset, limit)
     if name in ("callers", "callees"):
         seed = _seed(store, args["name"])
         if not seed:
-            return json.dumps({"error": f"no node named {args['name']!r}"})
+            return _emit(name, {"error": f"no node named {args['name']!r}"}, fmt)
         move = si.callers if name == "callers" else si.callees
-        moves = move(gl, seed, direct_only=bool(args.get("direct_only")))
-        return json.dumps({name: moves, "of": args["name"]})
+        moves = move(gl, seed, direct_only=bool(args.get("direct_only")),
+                     with_dispatch=text)
+        return _emit(name, {name: moves, "of": args["name"]}, fmt, offset, limit)
     if name == "read_body":
         seed = args.get("node_id") if store.node(args.get("node_id") or "") \
             else _seed(store, args.get("name") or "")
         if not seed:
-            return json.dumps({"error": f"no node named {args.get('name') or args.get('node_id')!r}"})
+            return _emit(name, {"error": f"no node named {args.get('name') or args.get('node_id')!r}"}, fmt)
         node = store.node(seed)
         f, sl, el = gl.loc(node)
         body = gl.source_text(node)
@@ -268,43 +318,46 @@ def call_tool(name, args):
             via = "body_nodes"
         cap = int(args.get("max_chars", 4000))
         truncated = len(body) > cap
-        return json.dumps({"move": "read_body", "node_id": seed, "name": gl.label(node),
-                           "file": f, "start_line": sl, "end_line": el, "via": via,
-                           "truncated": truncated, "body": body[:cap]})
+        return _emit(name, {"move": "read_body", "node_id": seed, "name": gl.label(node),
+                            "file": f, "start_line": sl, "end_line": el, "via": via,
+                            "truncated": truncated, "body": body[:cap]}, fmt)
     if name == "open_file":
         fn = _find_file_node(gl, path=args["file"], file_id=None)
         if not fn:
-            return json.dumps({"error": f"no file node for {args['file']!r}"})
-        return json.dumps(build_file_graph(gl, fn))
+            return _emit(name, {"error": f"no file node for {args['file']!r}"}, fmt)
+        return _emit(name, build_file_graph(gl, fn), fmt, offset, limit)
     if name == "open_folder":
-        return json.dumps(build_folder_graph(gl, root=args["root"]))
+        return _emit(name, build_folder_graph(gl, root=args["root"]), fmt, offset, limit)
     if name == "flow":
         seed = _seed(store, args["seed"])
         if not seed:
-            return json.dumps({"error": f"no node for {args['seed']!r}"})
-        return json.dumps(c.reach.flow(seed, limit=int(args.get("limit", 200))))
+            return _emit(name, {"error": f"no node for {args['seed']!r}"}, fmt)
+        return _emit(name, c.reach.flow(seed, limit=int(args.get("limit", 200))),
+                     fmt, offset, limit)
     if name == "reaches":
         src, sink = _seed(store, args["src"]), _seed(store, args["sink"])
         if not src or not sink:
-            return json.dumps({"error": "could not resolve src/sink"})
-        return json.dumps(c.reach.reaches(src, sink))
+            return _emit(name, {"error": "could not resolve src/sink"}, fmt)
+        return _emit(name, c.reach.reaches(src, sink), fmt, offset, limit)
     if name == "sources_of":
         sink = _seed(store, args["sink"])
         if not sink:
-            return json.dumps({"error": f"no node for {args['sink']!r}"})
-        return json.dumps(c.reach.sources_of(sink, limit=int(args.get("limit", 200))))
+            return _emit(name, {"error": f"no node for {args['sink']!r}"}, fmt)
+        return _emit(name, c.reach.sources_of(sink, limit=int(args.get("limit", 200))),
+                     fmt, offset, limit)
     if name == "points_to":
         value = _seed(store, args["value"])
         if not value:
-            return json.dumps({"error": f"no node for {args['value']!r}"})
+            return _emit(name, {"error": f"no node for {args['value']!r}"}, fmt)
         heaps = list(store.index.targets(value, "POINTS_TO"))
         edges = store.index.outgoing_of_kind(value, "POINTS_TO")
-        return json.dumps(store.path_shape([store.node(value)] + heaps, edges,
-                                           manifest={"move": "points_to", "value": value}))
+        return _emit(name, store.path_shape([store.node(value)] + heaps, edges,
+                                            manifest={"move": "points_to", "value": value}),
+                     fmt, offset, limit)
     if name == "aliases":
         value = _seed(store, args["value"])
         if not value:
-            return json.dumps({"error": f"no node for {args['value']!r}"})
+            return _emit(name, {"error": f"no node for {args['value']!r}"}, fmt)
         alias_nodes, edges = [], []
         for heap in store.index.targets(value, "POINTS_TO"):
             for sib in store.index.sources(heap["id"], "POINTS_TO"):
@@ -314,29 +367,48 @@ def call_tool(name, args):
                                   "kind": "POINTS_TO",
                                   "properties": {"reason": "alias-via-heap",
                                                  "via": heap["id"]}})
-        return json.dumps(store.path_shape([store.node(value)] + alias_nodes, edges,
-                                           manifest={"move": "aliases", "value": value}))
+        return _emit(name, store.path_shape([store.node(value)] + alias_nodes, edges,
+                                            manifest={"move": "aliases", "value": value}),
+                     fmt, offset, limit)
     if name == "guards":
         fn = _seed(store, args["fn"])
         if not fn:
-            return json.dumps({"error": f"no function for {args['fn']!r}"})
-        return json.dumps({"function": _ref(store, fn),
-                           "guard_signal": c.guards.profile(fn)})
+            return _emit(name, {"error": f"no function for {args['fn']!r}"}, fmt)
+        return _emit(name, {"function": _ref(store, fn),
+                            "guard_signal": c.guards.profile(fn)}, fmt)
     if name == "call_roles":
         fn = _seed(store, args["fn"])
         if not fn:
-            return json.dumps({"error": f"no function for {args['fn']!r}"})
+            return _emit(name, {"error": f"no function for {args['fn']!r}"}, fmt)
         recs = c.roles.roles_for(fn)
-        return json.dumps({"function": _ref(store, fn),
-                           "calls": [{"callee": r["callee"], "role": r["role"],
-                                      "fact_origin": r["fact_origin"],
-                                      "at": f"{r['file']}:{r['line']}"} for r in recs]})
+        return _emit(name, {"function": _ref(store, fn),
+                            "calls": [{"callee": r["callee"], "role": r["role"],
+                                       "fact_origin": r["fact_origin"],
+                                       "at": f"{r['file']}:{r['line']}"} for r in recs]}, fmt)
     if name == "siblings":
         hits = store.resolve(args["sym"])
         if not hits:
-            return json.dumps({"error": f"no node named {args['sym']!r}"})
-        return json.dumps(c.siblings.diff(hits[0]))
+            return _emit(name, {"error": f"no node named {args['sym']!r}"}, fmt)
+        return _emit(name, c.siblings.diff(hits[0]), fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")
+
+
+def _load_graph(args):
+    """Runtime target switch: repoint the server and drop the cached ctx so the next
+    tool call rebuilds against the new graph (load-once still holds within a target)."""
+    global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _CTX
+    path = args.get("path")
+    if not path or not os.path.exists(path):
+        return json.dumps({"error": f"graph path not found: {path!r}"})
+    _GRAPH_PATH = path
+    _OVERLAY_PATH = args.get("overlay")
+    prof = args.get("profile")
+    if prof in ("all", "comprehension"):
+        _PROFILE = prof
+    _CTX = None
+    c = ctx()  # eager load so a load failure surfaces here, not on the next tool call
+    return json.dumps({"move": "load_graph", "graph": path, "profile": _PROFILE,
+                       "nodes": len(c.store.gl.nodes)})
 
 
 def send(obj):
@@ -345,17 +417,26 @@ def send(obj):
 
 
 def main():
-    global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE
-    if len(sys.argv) < 2:
-        print("usage: mcp_server.py <graph.json> [overlay.json] [profile]", file=sys.stderr)
+    global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _DEFAULT_FORMAT
+    # Config precedence: explicit argv wins, else env. The graph path may come from
+    # argv[1] or ARACHNE_GRAPH; a session can also (re)attach at runtime via load_graph.
+    _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ARACHNE_GRAPH")
+    if not _GRAPH_PATH:
+        print("usage: mcp_server.py <graph.json> [overlay.json] [profile]\n"
+              "   or: ARACHNE_GRAPH=<graph.json> mcp_server.py", file=sys.stderr)
         return 2
-    _GRAPH_PATH = sys.argv[1]
     _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
-    # Profile: explicit 3rd argv wins, else env, else the default "all". Only
-    # "comprehension" narrows the surface; any other value falls back to "all".
-    profile = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("ARACHNE_MCP_PROFILE", "all")
+    # Profile: explicit 3rd argv wins, else env (ARACHNE_PROFILE, back-compat
+    # ARACHNE_MCP_PROFILE), else the default "all". Only "comprehension" narrows the
+    # surface; any other value falls back to "all".
+    profile = (sys.argv[3] if len(sys.argv) > 3
+               else os.environ.get("ARACHNE_PROFILE")
+               or os.environ.get("ARACHNE_MCP_PROFILE", "all"))
     _PROFILE = "comprehension" if profile == "comprehension" else "all"
-    log(f"starting; graph = {_GRAPH_PATH}; profile = {_PROFILE}")
+    # Default output format when a tools/call omits `format`: text (compact) unless
+    # ARACHNE_FORMAT=json flips the whole server back to full JSON.
+    _DEFAULT_FORMAT = render_mod.default_format()
+    log(f"starting; graph = {_GRAPH_PATH}; profile = {_PROFILE}; format = {_DEFAULT_FORMAT}")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -378,7 +459,8 @@ def main():
         elif method == "tools/call":
             p = msg.get("params") or {}
             try:
-                text = call_tool(p["name"], p.get("arguments") or {})
+                a = p.get("arguments") or {}
+                text = call_tool(p["name"], a, format=a.get("format"))
                 send({"jsonrpc": "2.0", "id": mid,
                       "result": {"content": [{"type": "text", "text": text}]}})
             except Exception as e:  # noqa: BLE001

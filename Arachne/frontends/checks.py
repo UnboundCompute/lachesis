@@ -1092,6 +1092,129 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertIn("driver_ops", [c["name"] for c in callers_of])
             self.assertTrue(all(c["via"].startswith("indirect") for c in callers_of))
 
+    def test_nav_compact_render_and_mcp_format(self) -> None:
+        # Spec 1 + Spec 2: the MCP nav tools render compact text for LLM consumers
+        # (no node_id / absolute paths / null; lists paginated), preserve byte-identical
+        # JSON for programmatic callers, and drive over the real stdio JSON-RPC server.
+        # fixtures_opsreg is used because it carries an ops-struct dispatch table, so the
+        # `via=ops-struct[.slot]` reverse-dispatch differentiator can be asserted to
+        # survive compaction.
+        import sys as _sys
+        import types as _types
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from tier1_flag.graphlib import GraphLib
+        from nav.graph_store import GraphStore
+        from nav.reachability import Reachability
+        from nav.hubs import Hubs
+        from nav.symbol_index import (
+            build_index, _resolve, callers as _callers, search_page,
+        )
+        from nav import mcp_server, render as render_mod
+
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "Arachne/frontends/c/build_graph.py",
+                "Arachne/frontends/c/fixtures_opsreg", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            graph = {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)}
+
+            store = GraphStore(graph)
+            mcp_server._CTX = _types.SimpleNamespace(
+                store=store, reach=Reachability(store), hubs=Hubs(store.gl))
+            mcp_server._PROFILE = "all"
+            mcp_server._DEFAULT_FORMAT = "text"
+
+            # -- compaction: no node_id / no absolute path / no null in text --------
+            for tool, args in (("hubs", {"n": 10}), ("callers", {"name": "drv_start"}),
+                               ("callees", {"name": "init_driver"}),
+                               ("search", {"name": "drv"}),
+                               ("read_body", {"name": "drv_start"})):
+                text = mcp_server.call_tool(tool, args, format="text")
+                self.assertNotIn("node_id", text, f"{tool}: node_id leaked into text")
+                self.assertNotIn("/Users/", text, f"{tool}: absolute path leaked into text")
+                self.assertNotIn("null", text, f"{tool}: null leaked into text")
+
+            # -- the reverse-dispatch differentiator survives compaction -----------
+            callers_text = mcp_server.call_tool("callers", {"name": "drv_start"}, format="text")
+            self.assertIn("via=ops-struct[.start]", callers_text)
+
+            # -- JSON byte-identical to the pre-render behavior --------------------
+            gl = store.gl
+            idx = build_index(gl)
+            seed = _resolve(gl, idx, "drv_start")[0]["node_id"]
+            self.assertEqual(
+                json.dumps({"callers": _callers(gl, seed, direct_only=False), "of": "drv_start"}),
+                mcp_server.call_tool("callers", {"name": "drv_start"}, format="json"),
+                "callers JSON must be byte-identical to the legacy dump")
+            hub_rows = Hubs(gl).top(10)
+            self.assertEqual(
+                json.dumps({"move": "hubs", "count": len(hub_rows), "ranked": hub_rows}),
+                mcp_server.call_tool("hubs", {"n": 10}, format="json"),
+                "hubs JSON must be byte-identical to the legacy dump")
+            self.assertEqual(
+                json.dumps(search_page(store.entries, "drv", "fuzzy", 25, 0)),
+                mcp_server.call_tool("search", {"name": "drv"}, format="json"),
+                "search JSON must be byte-identical to the legacy dump")
+
+            # -- token reduction (char/4 proxy) >= 3x on hubs ----------------------
+            j = mcp_server.call_tool("hubs", {"n": 10}, format="json")
+            t = mcp_server.call_tool("hubs", {"n": 10}, format="text")
+            self.assertGreaterEqual(len(j) / max(1, len(t)), 3.0,
+                                    "compact text must be >=3x smaller than JSON")
+
+            # -- truncation is text-only: cap 40 + footer; JSON returns all --------
+            big = {"move": "hubs", "count": 45, "ranked": [
+                {"name": f"fn{i}", "file": "a/b/c.c", "line": i,
+                 "fan_in": 1, "fan_out": 0, "flags": []} for i in range(45)]}
+            rendered = render_mod.render("hubs", big)
+            self.assertIn("… +5 more (offset=40)", rendered)
+            self.assertEqual(40, sum(1 for ln in rendered.splitlines()
+                                     if ln.strip().startswith(tuple("0123456789"))))
+
+            # -- Spec 2: real stdio JSON-RPC server, scripted client ---------------
+            canon = _Path(output) / "canonical.json"
+            canon.write_text(json.dumps(graph), encoding="utf-8")
+            env = dict(__import__("os").environ, ARACHNE_GRAPH=str(canon),
+                       ARACHNE_FORMAT="text")
+            proc = subprocess.Popen(
+                [sys.executable, "nav/mcp_server.py"], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(ROOT), env=env)
+            try:
+                def rpc(mid, method, params=None):
+                    proc.stdin.write(json.dumps(
+                        {"jsonrpc": "2.0", "id": mid, "method": method,
+                         "params": params or {}}) + "\n")
+                    proc.stdin.flush()
+                    return json.loads(proc.stdout.readline())
+
+                init = rpc(1, "initialize", {"protocolVersion": "2024-11-05"})
+                self.assertEqual("nav-reasoning", init["result"]["serverInfo"]["name"])
+                tools = rpc(2, "tools/list")["result"]["tools"]
+                names = [t["name"] for t in tools]
+                self.assertIn("load_graph", names)
+                self.assertTrue(all("format" in t["inputSchema"]["properties"]
+                                    for t in tools if t["name"] != "load_graph"),
+                                "every graph tool advertises a format field")
+                hubs_call = rpc(3, "tools/call", {"name": "hubs", "arguments": {"n": 3}})
+                self.assertIn("HUBS", hubs_call["result"]["content"][0]["text"])
+                # load_graph re-attaches the same target and reports node count.
+                lg = rpc(4, "tools/call", {"name": "load_graph",
+                                           "arguments": {"path": str(canon)}})
+                self.assertIn("load_graph", lg["result"]["content"][0]["text"])
+                proc.stdin.close()
+                self.assertEqual(0, proc.wait(timeout=10))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                for stream in (proc.stdout, proc.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")

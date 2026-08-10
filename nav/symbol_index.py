@@ -322,8 +322,23 @@ def _caller_decl(gl: GraphLib, node: dict) -> dict | None:
     return gl.owner_function(node)
 
 
+def _dispatch_of(edge: dict) -> dict:
+    """The dispatch descriptor an indirect edge carries: ``{dispatch, slot}``.
+
+    Ops-struct registration edges (`MAY_INVOKE`) stamp ``dispatch="ops-struct"`` and
+    the ``slot`` field name — the reverse-dispatch differentiator. Returns only the
+    keys actually present so a non-dispatch edge adds nothing."""
+    props = edge.get("properties") or {}
+    out: dict = {}
+    if props.get("dispatch"):
+        out["dispatch"] = props["dispatch"]
+    if props.get("slot"):
+        out["slot"] = props["slot"]
+    return out
+
+
 def callers(gl: GraphLib, node_id: str, include_external: bool = False,
-            direct_only: bool = False) -> list[dict]:
+            direct_only: bool = False, with_dispatch: bool = False) -> list[dict]:
     """Who calls this node — a traversal move, direct + indirect dispatch (tagged).
 
     Direct (``CALLS``) callers land on the calling declaration. Indirect callers are
@@ -331,12 +346,17 @@ def callers(gl: GraphLib, node_id: str, include_external: bool = False,
     call-site / call-context node) back to the declaration that owns them, so a
     function reached only through a function pointer / ops-struct slot / runtime
     dispatch still shows its caller. Every row is tagged ``via`` (`direct` vs
-    `indirect(...)`); ``direct_only`` returns exactly the old decl->decl set."""
+    `indirect(...)`); ``direct_only`` returns exactly the old decl->decl set.
+
+    ``with_dispatch`` additionally stamps each indirect row with the edge's
+    ``dispatch``/``slot`` (e.g. ops-struct `.ndo_open`) so a text renderer can show
+    `via=ops-struct[.slot]`. It defaults off, so the default return — and therefore
+    the JSON a programmatic caller sees — is byte-identical to before."""
     prov = _file_provenance(gl)
     out: list[dict] = []
     seen: dict[str, int] = {}
 
-    def _add(decl: dict, via: str, resolved: bool) -> None:
+    def _add(decl: dict, via: str, resolved: bool, edge: dict | None = None) -> None:
         f, l, _ = gl.loc(decl)
         if not include_external and _is_external(f, prov):
             return
@@ -347,8 +367,11 @@ def callers(gl: GraphLib, node_id: str, include_external: bool = False,
                 out[idx].update(via="direct", resolved=True)
             return
         seen[did] = len(out)
-        out.append({"node_id": did, "name": gl.label(decl), "kind": gl.kind(did),
-                    "file": f, "line": l, "via": via, "resolved": resolved})
+        row = {"node_id": did, "name": gl.label(decl), "kind": gl.kind(did),
+               "file": f, "line": l, "via": via, "resolved": resolved}
+        if with_dispatch and edge is not None:
+            row.update(_dispatch_of(edge))
+        out.append(row)
 
     for node in gl.index.sources(node_id, *CALL_EDGES):
         decl = gl.owner_function(node) or node
@@ -360,12 +383,12 @@ def callers(gl: GraphLib, node_id: str, include_external: bool = False,
         if src is None:
             continue
         decl = _caller_decl(gl, src) or src
-        _add(decl, _via_label(edge), True)
+        _add(decl, _via_label(edge), True, edge)
     return out
 
 
 def callees(gl: GraphLib, node_id: str, include_external: bool = False,
-            direct_only: bool = False) -> list[dict]:
+            direct_only: bool = False, with_dispatch: bool = False) -> list[dict]:
     """What this node calls — a traversal move, direct + indirect dispatch (tagged).
 
     Direct (``CALLS``) targets are already declarations. Indirect targets come from
@@ -373,12 +396,15 @@ def callees(gl: GraphLib, node_id: str, include_external: bool = False,
     callee declaration — except ``READS_CALLEE``, whose target is the unresolved
     function-pointer *slot* (a field/variable). Slot rows carry ``resolved=False`` so
     the indirection is visible without pretending a concrete callee was found. Every
-    row is tagged ``via``; ``direct_only`` returns exactly the old decl->decl set."""
+    row is tagged ``via``; ``direct_only`` returns exactly the old decl->decl set.
+
+    ``with_dispatch`` stamps each indirect row with the edge's ``dispatch``/``slot``
+    (text-render differentiator); it defaults off, so the default return is unchanged."""
     prov = _file_provenance(gl)
     out: list[dict] = []
     seen: dict[str, int] = {}
 
-    def _add(node: dict, via: str, resolved: bool) -> None:
+    def _add(node: dict, via: str, resolved: bool, edge: dict | None = None) -> None:
         f, l, _ = gl.loc(node)
         if not include_external and _is_external(f, prov):
             return  # skip external stubs (e.g. Array.push in lib.es5.d.ts)
@@ -389,8 +415,11 @@ def callees(gl: GraphLib, node_id: str, include_external: bool = False,
                 out[idx].update(via="direct", resolved=True)
             return
         seen[nid] = len(out)
-        out.append({"node_id": nid, "name": gl.label(node), "kind": gl.kind(nid),
-                    "file": f, "line": l, "via": via, "resolved": resolved})
+        row = {"node_id": nid, "name": gl.label(node), "kind": gl.kind(nid),
+               "file": f, "line": l, "via": via, "resolved": resolved}
+        if with_dispatch and edge is not None:
+            row.update(_dispatch_of(edge))
+        out.append(row)
 
     for node in gl.index.targets(node_id, *CALL_EDGES):
         _add(node, "direct", True)
@@ -401,7 +430,7 @@ def callees(gl: GraphLib, node_id: str, include_external: bool = False,
             tgt = gl.nodes.get(edge.get("target"))
             if tgt is None:
                 continue
-            _add(tgt, _via_label(edge), gl.kind(tgt["id"]) in CALLABLE_KINDS)
+            _add(tgt, _via_label(edge), gl.kind(tgt["id"]) in CALLABLE_KINDS, edge)
     return out
 
 
