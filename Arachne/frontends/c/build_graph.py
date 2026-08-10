@@ -277,6 +277,19 @@ def line_offsets(text: str) -> List[int]:
     return offsets
 
 
+def line_starts(path: Path, text: str, cache: Dict[Path, List[int]]) -> List[int]:
+    """Memoize the line->offset table by path, parallel to the ``source_text``
+    cache. The table depends only on the file text (already cached), but is looked
+    up once per AST node and once per token — rebuilding it each time re-walks the
+    whole fully-expanded TU source (headers included), an accidental O(N^2). Cache
+    it so each distinct file is scanned exactly once."""
+    starts = cache.get(path)
+    if starts is None:
+        starts = line_offsets(text)
+        cache[path] = starts
+    return starts
+
+
 def parse_clang_token(line: str) -> Optional[Tuple[str, str, Path, int, int]]:
     """Decode one compiler token-dump record without interpreting C source."""
     location_marker = "Loc=<"
@@ -302,6 +315,7 @@ def parse_clang_token(line: str) -> Optional[Tuple[str, str, Path, int, int]]:
 
 def position_from_ast(
     ast_node: dict, path: Path, texts: Dict[Path, str],
+    line_starts_cache: Dict[Path, List[int]],
 ) -> dict:
     begin = ast_node.get("range", {}).get("begin", {})
     end = ast_node.get("range", {}).get("end", {})
@@ -309,7 +323,7 @@ def position_from_ast(
     start = begin.get("offset", loc.get("offset", 0))
     finish = end.get("offset", start) + end.get("tokLen", loc.get("tokLen", 0))
     text = source_text(path, texts)
-    starts = line_offsets(text)
+    starts = line_starts(path, text, line_starts_cache)
 
     def line_col(offset: int) -> Tuple[int, int]:
         low, high = 0, len(starts)
@@ -333,12 +347,15 @@ def position_from_ast(
     }
 
 
-def position_from_line(path: Path, line: int, texts: Dict[Path, str]) -> dict:
+def position_from_line(
+    path: Path, line: int, texts: Dict[Path, str],
+    line_starts_cache: Dict[Path, List[int]],
+) -> dict:
     """A source position spanning the physical definition line (macros have no AST
     range). Backslash-continued lines are folded into a single logical span so
     ``read_body`` shows the whole ``#define``."""
     text = source_text(path, texts)
-    starts = line_offsets(text)
+    starts = line_starts(path, text, line_starts_cache)
     lines = text.splitlines()
     index = max(0, min(line, len(starts)) - 1)
     start = starts[index]
@@ -484,6 +501,7 @@ def main() -> int:
 
     graph = Graph()
     texts: Dict[Path, str] = {}
+    line_starts_cache: Dict[Path, List[int]] = {}
     file_ids: Dict[Path, str] = {}
     declarations_by_raw_id: Dict[str, str] = {}
     declarations_by_name: Dict[Tuple[str, str], List[str]] = defaultdict(list)
@@ -590,7 +608,7 @@ def main() -> int:
         if not node.get("isImplicit") and not is_included and kind in ENTITY_KINDS:
             entity_kind = ENTITY_KINDS[kind]
             name = node.get("name") or f"<anonymous@{node.get('id', '')}>"
-            position = position_from_ast(node, path, texts)
+            position = position_from_ast(node, path, texts, line_starts_cache)
             entity_id = stable_id(entity_kind, path, position["start_offset"], position["end_offset"], name)
             graph.node(
                 "T1", entity_id, entity_kind, name, **position,
@@ -614,7 +632,7 @@ def main() -> int:
         elif not node.get("isImplicit") and not is_included and kind in VALUE_KINDS:
             value_kind = VALUE_KINDS[kind]
             name = node.get("name") or "<anonymous>"
-            position = position_from_ast(node, path, texts)
+            position = position_from_ast(node, path, texts, line_starts_cache)
             value_id = stable_id("value", path, position["start_offset"], position["end_offset"], name)
             graph.node(
                 "T2", value_id, value_kind, name, **position,
@@ -742,7 +760,7 @@ def main() -> int:
 
     # Body/reference/call pass.
     def body_identity(node: dict, path: Path) -> str:
-        position = position_from_ast(node, path, texts)
+        position = position_from_ast(node, path, texts, line_starts_cache)
         return stable_id(
             "body", path, position["start_offset"], position["end_offset"],
             node.get("kind", ""),
@@ -806,7 +824,7 @@ def main() -> int:
             "IntegerLiteral", "StringLiteral", "CharacterLiteral",
         }
         if not node.get("isImplicit") and not is_included and is_body:
-            position = position_from_ast(node, path, texts)
+            position = position_from_ast(node, path, texts, line_starts_cache)
             text = source_text(path, texts)
             snippet = compact(text[position["start_offset"]:position["end_offset"]])
             node_kind = "call" if kind == "CallExpr" else "statement" if kind.endswith("Stmt") else "expression"
@@ -960,7 +978,7 @@ def main() -> int:
             if token_path != path or path not in file_ids:
                 continue
             text = source_text(path, texts)
-            starts = line_offsets(text)
+            starts = line_starts(path, text, line_starts_cache)
             start = starts[line_number - 1] + column - 1 if line_number <= len(starts) else 0
             end = start + len(token_text.encode("utf-8").decode("unicode_escape"))
             token_id = stable_id("token", path, start, end, token_kind)
@@ -987,7 +1005,7 @@ def main() -> int:
         if result.returncode != 0:
             continue
         for macro in parse_macro_definitions(result.stdout, path):
-            position = position_from_line(path, int(macro["line"]), texts)
+            position = position_from_line(path, int(macro["line"]), texts, line_starts_cache)
             signature = (
                 f'{macro["name"]}({", ".join(macro["parameters"])})'
                 if macro["form"] == "function-like" else macro["name"]
