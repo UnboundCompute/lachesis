@@ -27,7 +27,7 @@ from .emit import (
 from .inventory import (
     FileFacts, ModuleIndex, collect_imports, dunder_all, emit_exports, emit_imports,
 )
-from .bodies import BodyWalk
+from .bodies import BODY_COUNTERS, BodyWalk
 from .resolve import Resolver
 from .scopes import ScopeWalk, build_symbol_table, emit_overrides
 
@@ -248,11 +248,11 @@ def build(source_dir: Path, output_dir: Path) -> int:
     # once that import clause has been pointed at a file.
     override_count = emit_overrides(graph, facts_by_path)
 
-    # Pass three: call sites. Resolution needs every file's binding table, which
+    # Pass three: bodies. Call resolution needs every file's binding table, which
     # only exists now, so the file is re-parsed rather than held from pass one:
     # a bounded second parse in exchange for never holding the whole tree's ASTs.
     resolver = Resolver(facts_by_path)
-    call_count = construct_count = resolved_call_count = dynamic_count = 0
+    body_totals = dict.fromkeys(BODY_COUNTERS, 0)
     for path in sorted(facts_by_path):
         facts = facts_by_path[path]
         module, failure = parse_module(facts.source.text, path)
@@ -260,10 +260,8 @@ def build(source_dir: Path, output_dir: Path) -> int:
             continue
         walker = BodyWalk(graph, facts.source, facts.file_id, facts, resolver)
         walker.run(module)
-        call_count += walker.call_count
-        construct_count += walker.construct_count
-        resolved_call_count += walker.resolved_count
-        dynamic_count += walker.dynamic_count
+        for name in BODY_COUNTERS:
+            body_totals[name] += getattr(walker, name)
 
     payloads = graph.tier_payloads()
     analyzed = len(files) - len(failed_files)
@@ -292,10 +290,15 @@ def build(source_dir: Path, output_dir: Path) -> int:
         "binding_count": binding_count,
         "capture_count": capture_count,
         "override_count": override_count,
-        "call_count": call_count,
-        "construct_count": construct_count,
-        "resolved_call_count": resolved_call_count,
-        "dynamic_behavior_count": dynamic_count,
+        "call_count": body_totals["call_count"],
+        "construct_count": body_totals["construct_count"],
+        "resolved_call_count": body_totals["resolved_count"],
+        "dynamic_behavior_count": body_totals["dynamic_count"],
+        "statement_count": body_totals["statement_count"],
+        "condition_count": body_totals["condition_count"],
+        "short_circuit_count": body_totals["short_circuit_count"],
+        "throw_count": body_totals["throw_count"],
+        "exception_branch_count": body_totals["exception_branch_count"],
         "scope_correlated_file_count": len(facts_by_path) - len(uncorrelated_files),
         "scope_uncorrelated_file_count": len(uncorrelated_files),
         "dropped_edge_count": graph.dropped_edges,
@@ -352,7 +355,11 @@ def capabilities(complete_if_parsed: str) -> Dict[str, str]:
         # Lexically and import-resolved calls are decided by the layout; attribute
         # dispatch on an unannotated value is not, so the claim stops at partial.
         "calls": "partial",
-        "control_flow": "none",
+        # Branches, loops, try/except/finally and match are exact. Generator
+        # resumption is not modelled (a yield folds onto its return value, losing
+        # the point control comes back to) and neither is the with protocol, whose
+        # branch lives in __enter__ and __exit__, so this stops at partial.
+        "control_flow": "partial",
         "direct_data_flow": "none",
         "heap_identity": "none", "context_sensitivity": "none",
         "branch_histories": "none", "taint_policy": "none",

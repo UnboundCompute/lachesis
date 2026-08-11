@@ -1,11 +1,24 @@
-"""Call sites: the `call` and `construct` nodes the traversal tools stand on.
+"""Bodies: the call sites and the control shapes the traversal tools stand on.
 
-``callers``, ``callees``, ``hubs`` and ``call_roles`` all read the same two
+``callers``, ``callees``, ``hubs`` and ``call_roles`` all read the same two call
 shapes. ``CALLS`` is the resolved declaration-to-declaration graph
 (nav/symbol_index.py:73). ``INVOKES``/``MAY_INVOKE`` start at the call site
 itself, which is why every node emitted here carries ``owner_function_id``: the
 traversal climbs from a call site to the declaration that owns it, and a call
 site with no owner is attributed to itself and ranks as its own hub.
+
+``guards``, ``guards_top`` and ``siblings`` read a second set of shapes off the
+same spine: ``CONDITION``, ``SHORT_CIRCUIT_LEFT``/``SHORT_CIRCUIT_RIGHT``,
+``THROWS_VALUE``, ``TRY_BODY`` and ``EXCEPTION_BRANCH``, bucketed by the owning
+function (nav/guards.py:78-86). Without ``CONDITION`` every function classifies
+as ``passthrough``; without ``THROWS_VALUE`` the best a function can reach is
+``validate``, which is exactly why the C frontend caps there
+(nav/guards.py:117-122). Python emits all of them.
+
+Body nodes are emitted for statements and for the expressions a control edge
+lands on, not for every expression in the tree. That is a deliberate line: the
+navigation surface reads control shape and ownership, and a node per identifier
+would multiply the store without answering a question anyone asks of it.
 
 This pass re-parses the file rather than holding pass one's AST, because
 resolution needs the whole tree's binding tables and keeping every AST resident
@@ -14,14 +27,56 @@ to get them would trade a bounded second parse for unbounded memory.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, NamedTuple, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set
 
 from .declarations import declaration_id, declaration_kind
 from .emit import Graph, SourceFile, compact, stable_id
 from .resolve import DYNAMIC_CALLEES, NOTHING, Resolution, Resolver
 from .scopes import (
-    FUNCTION_NODES, SCOPE_NODES, bound_occurrences, own_regions, outer_regions,
-    scope_kind,
+    COMPREHENSIONS, FUNCTION_NODES, SCOPE_NODES, bound_occurrences, own_regions,
+    outer_regions, scope_kind,
+)
+
+# 3.11 added ``except*``; on 3.10 there is no such node and the tuple is empty.
+TRY_NODES = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
+
+# Lachesis/core/overlays/control_flow.py switches on these strings
+# (control_flow.py:11-14), so the vocabulary is theirs and not ours.
+CONTROL_KIND = {
+    ast.If: "if",
+    # Python's ``for`` is always iteration over an iterable, never a C-style
+    # three-clause loop, so it is "for-each" and never "for".
+    ast.For: "for-each", ast.AsyncFor: "for-each",
+    ast.While: "while",
+    ast.Match: "switch",
+    ast.Return: "return", ast.Raise: "throw",
+    ast.Break: "break", ast.Continue: "continue",
+    ast.Assign: "declaration", ast.AnnAssign: "declaration",
+    ast.AugAssign: "declaration",
+    ast.Expr: "expression",
+}
+CONTROL_KIND.update({node: "try" for node in TRY_NODES})
+
+
+def control_kind(node: ast.stmt) -> str:
+    """The canonical control vocabulary for one statement.
+
+    Two omissions are deliberate. ``with``/``async with`` gets a plain
+    ``statement``: the branch it really introduces lives in ``__enter__`` and
+    ``__exit__``, which are invisible from here, and naming it a container would
+    describe a shape the graph cannot back up. ``assert`` is not reported as
+    ``if`` either, because that would inject a phantom branch into the control
+    flow of every function that uses one.
+    """
+    return CONTROL_KIND.get(type(node), "statement")
+
+
+# What a caller sums across files to fill the manifest. Naming them once here
+# keeps the manifest from silently missing a counter added later.
+BODY_COUNTERS = (
+    "call_count", "construct_count", "resolved_count", "dynamic_count",
+    "statement_count", "condition_count", "short_circuit_count",
+    "throw_count", "exception_branch_count",
 )
 
 
@@ -58,13 +113,22 @@ class BodyWalk:
         self.construct_count = 0
         self.resolved_count = 0
         self.dynamic_count = 0
+        self.statement_count = 0
+        self.condition_count = 0
+        self.short_circuit_count = 0
+        self.throw_count = 0
+        self.exception_branch_count = 0
+        # ast node -> body node id. Keyed by identity, which is safe because the
+        # tree outlives the walk; the first visit owns the parent edge, so a node
+        # pre-created as a branch target is not re-parented when it is reached.
+        self._bodies: Dict[int, str] = {}
 
     # -- the walk ------------------------------------------------------------
 
     def run(self, module: ast.Module) -> None:
         frame = self._frame(module, None)
         for region in own_regions(module):
-            self._visit(region, frame)
+            self._visit(region, frame, None)
 
     def _frame(self, node: ast.AST, parent: Optional[Frame]) -> Frame:
         kind = scope_kind(node)
@@ -123,24 +187,365 @@ class BodyWalk:
             locals_of_scope, declarations,
         )
 
-    def _visit(self, node: ast.AST, frame: Frame) -> None:
+    def _visit(self, node: ast.AST, frame: Frame, parent: Optional[str]) -> None:
         if isinstance(node, SCOPE_NODES):
             # Decorators, defaults and base-class expressions run in the enclosing
             # scope, so a call hiding in one is attributed there and not inside.
             for region in outer_regions(node):
-                self._visit(region, frame)
+                self._visit(region, frame, parent)
             child = self._frame(node, frame)
+            # A def or class starts a new body: its statements hang off the
+            # declaration, not off whatever statement the def happened to sit in.
+            # A comprehension declares nothing, so its parts stay attached to the
+            # expression node standing in for it.
+            inner = (
+                self._comprehension(node, child, parent)
+                if isinstance(node, COMPREHENSIONS) else None
+            )
             for region in own_regions(node):
-                self._visit(region, child)
+                self._visit(region, child, inner)
             return
-        if isinstance(node, ast.Call):
-            self._call(node, frame)
+        if isinstance(node, ast.stmt):
+            parent = self._statement(node, frame, parent)
+        elif isinstance(node, ast.Call):
+            parent = self._call(node, frame, parent)
+        elif isinstance(node, ast.BoolOp):
+            parent = self._short_circuit(node, frame, parent)
+        elif isinstance(node, ast.IfExp):
+            parent = self._conditional_expression(node, frame, parent)
+        elif isinstance(node, (ast.Yield, ast.YieldFrom)):
+            self._yield(node, frame, parent)
         for child in ast.iter_child_nodes(node):
-            self._visit(child, frame)
+            self._visit(child, frame, parent)
+
+    # -- body nodes ----------------------------------------------------------
+
+    def _body(
+        self, node: ast.AST, kind: str, frame: Frame, parent: Optional[str],
+        role: Optional[str] = None, **properties,
+    ) -> str:
+        """One body node, attached to its parent exactly once.
+
+        The attachment follows the C frontend: ``AST_CHILD`` when there is a
+        parent body node and ``CONTAINS_BODY`` from the owning declaration when
+        there is not, so ``role`` survives the tier crossing for
+        Lachesis/core/overlays/control_flow.py to read.
+        """
+        existing = self._bodies.get(id(node))
+        if existing is not None:
+            return existing
+        position = self.source.position(node)
+        text = compact(self.source.excerpt(node))
+        node_id = stable_id(
+            kind, self.source.display, position["start_offset"],
+            position["end_offset"], type(node).__name__,
+        )
+        self.graph.node(
+            node_id, kind, text or type(node).__name__, **position,
+            syntax_kind=type(node).__name__,
+            owner_function_id=frame.owner_function_id,
+            owner_id=frame.class_id if frame.kind == "class" else None,
+            **properties,
+        )
+        self._bodies[id(node)] = node_id
+        if parent:
+            self.graph.edge("AST_CHILD", parent, node_id, role=role or "AST_CHILD")
+        else:
+            self.graph.edge(
+                "CONTAINS_BODY", frame.owner_function_id or self.file_id, node_id,
+            )
+        return node_id
+
+    def _statement(
+        self, node: ast.stmt, frame: Frame, parent: Optional[str],
+    ) -> Optional[str]:
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            # A scope declaration executes nothing. The fact it carries is which
+            # scope a name binds in, which the scope pass already recorded.
+            return parent
+        node_id = self._body(
+            node, "statement", frame, parent, control_kind=control_kind(node),
+        )
+        self.statement_count += 1
+        self._control(node, node_id, frame)
+        return node_id
+
+    def _first(
+        self, block: Optional[Sequence[ast.stmt]], frame: Frame,
+        parent: Optional[str], role: Optional[str] = None,
+    ) -> Optional[str]:
+        """The body node a block is entered through.
+
+        Python has no block node: a suite is a bare list of statements. The first
+        statement is where control actually arrives, so it is what a branch edge
+        points at, and inventing a block node to point at instead would put a
+        span in the graph that no source text backs.
+        """
+        if not block:
+            return None
+        return self._statement_target(block[0], frame, parent, role)
+
+    def _statement_target(
+        self, node: ast.stmt, frame: Frame, parent: Optional[str],
+        role: Optional[str],
+    ) -> Optional[str]:
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            return None
+        return self._body(
+            node, "statement", frame, parent, role,
+            control_kind=control_kind(node),
+        )
+
+    def _expression(
+        self, node: ast.expr, frame: Frame, parent: Optional[str],
+        role: Optional[str] = None,
+    ) -> str:
+        if isinstance(node, ast.Call):
+            # A call that is also a condition keeps its call node; two nodes over
+            # one span would double it in every count that walks either kind.
+            return self._call(node, frame, parent, role)
+        if isinstance(node, ast.BoolOp):
+            return self._short_circuit(node, frame, parent)
+        return self._body(node, "expression", frame, parent, role)
+
+    # -- control shapes ------------------------------------------------------
+
+    def _control(self, node: ast.stmt, node_id: str, frame: Frame) -> None:
+        if isinstance(node, ast.If):
+            self._branch(node.test, node.body, node.orelse, node_id, frame)
+        elif isinstance(node, ast.While):
+            # A while test is a branch as much as an if test is, and guards.py
+            # counts CONDITION regardless of what the branch loops back to.
+            test = self._expression(node.test, frame, node_id, "CONDITION")
+            self.graph.edge("CONDITION", node_id, test)
+            self.condition_count += 1
+            entered = self._first(node.body, frame, test, "LOOP_BODY")
+            if entered:
+                self.graph.edge("LOOP_TRUE", test, entered)
+                self.graph.edge("LOOP_BACK", entered, test)
+            self._else(node.orelse, frame, test)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            iterated = self._expression(node.iter, frame, node_id, "ITERATED")
+            entered = self._first(node.body, frame, node_id, "LOOP_BODY")
+            if entered:
+                self.graph.edge("ITERATES", iterated, entered)
+                self.graph.edge("LOOP_BACK", entered, iterated)
+            self._else(node.orelse, frame, node_id)
+        elif isinstance(node, TRY_NODES):
+            self._try(node, node_id, frame)
+        elif isinstance(node, ast.Match):
+            self._match(node, node_id, frame)
+        elif isinstance(node, ast.Return):
+            self._return(node, node_id, frame, "return", node.value)
+        elif isinstance(node, ast.Raise):
+            self._return(node, node_id, frame, "throw", node.exc)
+
+    def _branch(
+        self, test: ast.expr, body: Sequence[ast.stmt],
+        orelse: Sequence[ast.stmt], node_id: str, frame: Frame,
+    ) -> None:
+        condition = self._expression(test, frame, node_id, "CONDITION")
+        self.graph.edge("CONDITION", node_id, condition)
+        self.condition_count += 1
+        taken = self._first(body, frame, condition, "TRUE_BRANCH")
+        if taken:
+            self.graph.edge("TRUE_BRANCH", condition, taken)
+        skipped = self._first(orelse, frame, condition, "FALSE_BRANCH")
+        if skipped:
+            self.graph.edge("FALSE_BRANCH", condition, skipped)
+
+    def _else(
+        self, orelse: Sequence[ast.stmt], frame: Frame, anchor: Optional[str],
+    ) -> None:
+        """``for``/``while`` else: the block that runs when the loop was not broken."""
+        exhausted = self._first(orelse, frame, anchor, "FALSE_BRANCH")
+        if exhausted and anchor:
+            self.graph.edge("FALSE_BRANCH", anchor, exhausted)
+
+    def _try(self, node: ast.stmt, node_id: str, frame: Frame) -> None:
+        attempted = self._first(node.body, frame, node_id, "TRY_BODY")
+        if attempted:
+            self.graph.edge("TRY_BODY", node_id, attempted)
+        for handler in node.handlers:
+            caught = self._first(handler.body, frame, node_id, "EXCEPTION_BRANCH")
+            if caught is None:
+                continue
+            self.graph.edge(
+                "EXCEPTION_BRANCH", attempted or node_id, caught,
+                exception_type=(
+                    compact(self.source.excerpt(handler.type))
+                    if handler.type is not None else None
+                ),
+                binds=handler.name,
+            )
+            self.exception_branch_count += 1
+        finally_id = self._first(node.finalbody, frame, node_id, "RUNS_FINALLY")
+        if finally_id:
+            self.graph.edge("RUNS_FINALLY", attempted or node_id, finally_id)
+        self._else(node.orelse, frame, attempted or node_id)
+
+    def _match(self, node: ast.Match, node_id: str, frame: Frame) -> None:
+        subject = self._expression(node.subject, frame, node_id, "CONDITION")
+        self.graph.edge("CONDITION", node_id, subject)
+        self.condition_count += 1
+        for case in node.cases:
+            entered = self._first(case.body, frame, subject, "SWITCH_CASE")
+            if entered is None:
+                continue
+            self.graph.edge(
+                "SWITCH_CASE", subject, entered,
+                label=compact(self.source.excerpt(case.pattern)),
+                default=isinstance(case.pattern, ast.MatchAs)
+                    and case.pattern.pattern is None,
+            )
+            if case.guard is not None:
+                # A case guard is an ordinary condition that happens to sit in a
+                # pattern: it decides whether the arm runs at all, so it hangs off
+                # the subject that is being matched and not off the arm's body,
+                # which is what the guard decides about rather than what tests it.
+                guard = self._expression(case.guard, frame, subject, "CONDITION")
+                self.graph.edge("CONDITION", subject, guard)
+                self.condition_count += 1
+
+    def _return(
+        self, node: ast.stmt, node_id: str, frame: Frame, return_kind: str,
+        value: Optional[ast.expr],
+    ) -> None:
+        """``return``/``raise``, as the value that leaves the function.
+
+        The TypeScript frontend models both as a ``return-value`` node so the
+        shared overlays see one shape, and ``THROWS_VALUE`` is what separates a
+        validate-and-throw guard from a function that merely branches
+        (nav/guards.py:117-122).
+        """
+        position = self.source.position(node)
+        return_id = stable_id(
+            "return-value", self.source.display, position["start_offset"],
+            position["end_offset"], return_kind,
+        )
+        self.graph.node(
+            return_id, "return-value",
+            compact(self.source.excerpt(value)) if value is not None else return_kind,
+            **position,
+            return_kind=return_kind,
+            origin="expression" if value is not None else "empty",
+            owner_function_id=frame.owner_function_id,
+        )
+        self.graph.edge("RETURN_EVIDENCED_BY", return_id, node_id)
+        if frame.owner_function_id:
+            if return_kind == "throw":
+                self.graph.edge("THROWS_VALUE", return_id, frame.owner_function_id)
+                self.throw_count += 1
+            else:
+                self.graph.edge("RETURNS_VALUE", return_id, frame.owner_function_id)
+
+    def _yield(
+        self, node: ast.AST, frame: Frame, parent: Optional[str],
+    ) -> None:
+        """``yield`` folded onto the return shape.
+
+        What is lost is the resumption point: a generator continues after the
+        yield, and nothing emitted here says where. That is one of the reasons
+        ``control_flow`` stays partial rather than claiming complete.
+        """
+        position = self.source.position(node)
+        return_id = stable_id(
+            "return-value", self.source.display, position["start_offset"],
+            position["end_offset"], "yield",
+        )
+        self.graph.node(
+            return_id, "return-value", compact(self.source.excerpt(node)),
+            **position, return_kind="yield", origin="expression",
+            owner_function_id=frame.owner_function_id,
+        )
+        if parent:
+            self.graph.edge("RETURN_EVIDENCED_BY", return_id, parent)
+        if frame.owner_function_id:
+            self.graph.edge("RETURNS_VALUE", return_id, frame.owner_function_id)
+
+    def _short_circuit(
+        self, node: ast.BoolOp, frame: Frame, parent: Optional[str],
+    ) -> str:
+        """``a and b`` / ``a or b``: the operand that may never be evaluated.
+
+        This is the fail-open shape ``x or raise`` and ``x and use(x)`` are built
+        from, and the C frontend's lack of it is why C guard classes stop at
+        ``validate`` (nav/guards.py:117-122).
+
+        A condition reaches this twice, once through the statement that owns it and
+        once through the generic descent, so the memo is checked before any edge is
+        written: the edges themselves deduplicate, but the counters would not.
+        """
+        existing = self._bodies.get(id(node))
+        if existing is not None:
+            return existing
+        node_id = self._body(node, "expression", frame, parent, "AST_CHILD")
+        operator = "and" if isinstance(node.op, ast.And) else "or"
+        previous: Optional[str] = None
+        for index, operand in enumerate(node.values):
+            side = self._expression(
+                operand, frame, node_id,
+                "LEFT_OPERAND" if index == 0 else "RIGHT_OPERAND",
+            )
+            if previous is None:
+                self.graph.edge("SHORT_CIRCUIT_LEFT", node_id, side)
+            else:
+                self.graph.edge(
+                    "SHORT_CIRCUIT_RIGHT", previous, side, operator=operator,
+                )
+            self.short_circuit_count += 1
+            previous = side
+        return node_id
+
+    def _conditional_expression(
+        self, node: ast.IfExp, frame: Frame, parent: Optional[str],
+    ) -> str:
+        existing = self._bodies.get(id(node))
+        if existing is not None:
+            return existing
+        node_id = self._body(node, "expression", frame, parent, "AST_CHILD")
+        condition = self._expression(node.test, frame, node_id, "CONDITION")
+        self.graph.edge("CONDITION", node_id, condition)
+        self.condition_count += 1
+        self.graph.edge(
+            "TRUE_BRANCH", condition,
+            self._expression(node.body, frame, condition, "TRUE_VALUE"),
+        )
+        self.graph.edge(
+            "FALSE_BRANCH", condition,
+            self._expression(node.orelse, frame, condition, "FALSE_VALUE"),
+        )
+        return node_id
+
+    def _comprehension(
+        self, node: ast.expr, frame: Frame, parent: Optional[str],
+    ) -> str:
+        """A comprehension's ``if`` clauses are conditions like any other.
+
+        No ``function`` node is emitted for the comprehension scope itself: PEP
+        709 inlines comprehensions on 3.12 and later, so a declaration node here
+        would be a lie on half the interpreters this runs on.
+        """
+        existing = self._bodies.get(id(node))
+        if existing is not None:
+            return existing
+        node_id = self._body(node, "expression", frame, parent, "AST_CHILD")
+        for generator in node.generators:
+            for test in generator.ifs:
+                condition = self._expression(test, frame, node_id, "CONDITION")
+                self.graph.edge("CONDITION", node_id, condition)
+                self.condition_count += 1
+        return node_id
 
     # -- call sites ----------------------------------------------------------
 
-    def _call(self, node: ast.Call, frame: Frame) -> None:
+    def _call(
+        self, node: ast.Call, frame: Frame, parent: Optional[str],
+        role: Optional[str] = None,
+    ) -> str:
+        existing = self._bodies.get(id(node))
+        if existing is not None:
+            return existing
         position = self.source.position(node)
         callee = node.func
         callee_text = compact(self.source.excerpt(callee))
@@ -174,13 +579,17 @@ class BodyWalk:
                 if constructed and constructed in self.graph.nodes else None
             ),
         )
+        self._bodies[id(node)] = node_id
         if kind == "construct":
             self.construct_count += 1
         else:
             self.call_count += 1
-        self.graph.edge(
-            "CONTAINS_BODY", frame.owner_function_id or self.file_id, node_id,
-        )
+        if parent:
+            self.graph.edge("AST_CHILD", parent, node_id, role=role or "AST_CHILD")
+        else:
+            self.graph.edge(
+                "CONTAINS_BODY", frame.owner_function_id or self.file_id, node_id,
+            )
 
         for target in resolution.targets:
             self.graph.edge(
@@ -207,6 +616,7 @@ class BodyWalk:
         if resolution.resolution == "dynamic":
             self._dynamic_behavior(node, node_id, callee, frame, position)
         self._arguments(node, node_id, resolution, frame)
+        return node_id
 
     def _dynamic_behavior(
         self, node: ast.Call, call_id: str, callee: ast.expr, frame: Frame,

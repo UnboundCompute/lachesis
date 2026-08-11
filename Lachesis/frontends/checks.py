@@ -1788,6 +1788,116 @@ class CompilerFrontendTests(unittest.TestCase):
             ranked = {row["name"] for row in Hubs(gl).top(20)}
             self.assertTrue({"run", "build_service", "open_repository"} <= ranked)
 
+    def test_python_guard_shapes_classify_and_flag_the_unguarded_peer(self) -> None:
+        # nav/guards.py reads the raw frontend guard edges, not the CFG overlay, and
+        # classifies a function `guard` only when it both branches and throws. The C
+        # frontend emits neither SHORT_CIRCUIT_* nor THROWS_VALUE, which is exactly
+        # why C tops out at `validate`; the point of this step is that Python does
+        # not, and that the peer differential can therefore name the sibling that
+        # skipped the check its family performs.
+        from nav.graph_store import GraphStore
+        from nav.guards import GuardProfiles
+        from nav.siblings import SiblingDiff
+        from Lachesis.core.overlays.control_flow import CONTAINER_KINDS, TERMINAL_KINDS
+
+        fixtures = ROOT / "Lachesis" / "frontends" / "python" / "fixtures"
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(fixtures), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            self.assertEqual(0, snapshot.manifest["dropped_edge_count"])
+            self.assertEqual("partial", snapshot.capabilities["control_flow"])
+
+            by_id = {node["id"]: node for node in snapshot.nodes}
+            edges = list(snapshot.edges)
+
+            # Every guard-shaped edge kind is actually emitted, and its endpoints
+            # carry the attribution that buckets it by owning function. A guard edge
+            # at module level genuinely has no owning function and says so by
+            # omission; inside a body the property is mandatory, because an
+            # unattributed edge is counted against whatever guards.py falls back to.
+            for kind in ("CONDITION", "SHORT_CIRCUIT_LEFT", "SHORT_CIRCUIT_RIGHT",
+                         "THROWS_VALUE", "EXCEPTION_BRANCH", "TRY_BODY"):
+                found = [edge for edge in edges if edge["kind"] == kind]
+                self.assertTrue(found, f"no {kind} edge was emitted")
+                for edge in found:
+                    for end in ("source", "target"):
+                        node = by_id[edge[end]]
+                        if node["kind"] in {"function", "method", "constructor"}:
+                            continue
+                        if node["properties"]["file"] != "app/guarded.py":
+                            continue        # module-level shapes in other fixtures
+                        self.assertTrue(
+                            node["properties"].get("owner_function_id"),
+                            f"{kind} {end} {node['label']!r} has no owning function")
+
+            # control_flow.py builds its CFG from `control_kind` on statement nodes,
+            # so the values have to come from its vocabulary rather than from a
+            # parallel one this frontend invented.
+            known = CONTAINER_KINDS | TERMINAL_KINDS | {
+                "statement", "declaration", "expression", "break", "continue",
+            }
+            kinds = {node["properties"]["control_kind"] for node in snapshot.nodes
+                     if node["kind"] == "statement"}
+            self.assertTrue(kinds <= known, f"unknown control kinds: {kinds - known}")
+            self.assertTrue({"if", "try", "while", "for-each", "switch", "return",
+                             "throw"} <= kinds)
+            # ...and the overlay does consume them: a CFG with no successor edges is
+            # what emitting the property but not the AST_CHILD roles looks like.
+            enriched = semantic_snapshot_graph(snapshot)
+            self.assertTrue(
+                [edge for edge in enriched["edges"] if edge["kind"] == "CFG_NEXT"])
+
+            store = GraphStore(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            profiles = GuardProfiles(store)
+            entries = {}
+            for entry in store.entries:
+                entries[(entry["name"], entry["file"])] = entry
+
+            def profile_of(name: str) -> dict:
+                entry = entries[(name, "app/guarded.py")]
+                return profiles.profile(entry["node_id"])
+
+            # validate-and-throw through two plain `if`s...
+            mysql = profile_of("delete_mysql_record")
+            self.assertEqual("guard", mysql["class"])
+            self.assertEqual((2, 2), (mysql["conditions"], mysql["throws"]))
+            # ...and through one `if` over an `or`, which reaches the same class
+            # only because the short-circuit operands are edges here.
+            postgres = profile_of("delete_postgres_record")
+            self.assertEqual("guard", postgres["class"])
+            self.assertEqual(2, postgres["short_circuits"])
+            # the peer that does the same job and checks nothing
+            self.assertEqual("passthrough", profile_of("delete_sqlite_record")["class"])
+            # branch-without-throw stays `validate`: a conditional expression and a
+            # comprehension `if` are conditions like any other.
+            self.assertEqual("validate", profile_of("pick")["class"])
+            self.assertEqual("validate", profile_of("enabled_names")["class"])
+            # try/except/finally is handling, which is a separate axis from guarding
+            handler = profile_of("read_config")
+            self.assertEqual((2, 1), (handler["exception_branches"], handler["handles"]))
+
+            # guards_top is the cold-start entry point, so an empty ranking is the
+            # failure mode this step exists to remove.
+            ranked = profiles.top(20)
+            self.assertTrue(ranked)
+            self.assertEqual("delete_mysql_record", ranked[0]["name"])
+
+            # The peer differential: same verb, overlapping nouns, most of the
+            # family guards, one does not, and it is named.
+            diff = SiblingDiff(store).diff(entries[("delete_sqlite_record",
+                                                    "app/guarded.py")])
+            self.assertEqual(3, diff["family_size"])
+            self.assertTrue(diff["verdict"]["peers_guard"])
+            self.assertEqual(["delete_sqlite_record"],
+                             [row["name"] for row in diff["flagged"]])
+            self.assertEqual("delete_mysql_record",
+                             diff["flagged"][0]["peer_guard"]["name"])
+
     def test_python_unparseable_file_keeps_its_file_node(self) -> None:
         # A syntax error must not evict the file: it still has to appear in search,
         # open_file and open_folder. Written to a temporary tree rather than
