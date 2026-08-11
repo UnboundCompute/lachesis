@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": false,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@lachesis-fixture/core": ["packages/core/src/index.ts"]
+    }
+  },
+  "include": ["packages/**/*.ts"]
+}

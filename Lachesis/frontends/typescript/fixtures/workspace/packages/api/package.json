@@ -1,0 +1,10 @@
+{
+  "name": "@lachesis-fixture/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@lachesis-fixture/core": "1.0.0"
+  }
+}

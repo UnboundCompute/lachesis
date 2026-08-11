@@ -54,6 +54,32 @@ cached in a sibling `graph.kuzu.enriched` directory keyed to the core's content 
 Answers are identical either way; the work moves off every build and onto one first
 query per graph. `lachesis-analyze --enrich` folds it in at build time instead.
 
+### Parallel builds for monorepos
+
+`lachesis-analyze --parallel-packages` splits a workspace by package (every
+directory holding a `package.json` outside `node_modules`, deepest one wins) and
+builds the packages in a process pool. `--max-workers N` caps the pool; it
+defaults to the number of packages or the core count, whichever is smaller.
+
+It is opt-in because it is a real semantic change, not just a scheduling one.
+Each package becomes its own compiler program, so types resolve across that
+package's files rather than across the whole tree. On the two-package workspace
+fixture in this repo, the per-package build recovers 647 of the whole-repo
+build's 650 edges, with an identical node set and zero invented edges. The three
+it misses are cross-program: two macro expansions into `lib.es5.d.ts` and one
+value flow across the package boundary. Edges whose far endpoint lands in a
+different unit are dropped rather than guessed at, and the count is always
+printed:
+
+```
+Dropped 0 cross-package edges (parallel build)
+```
+
+Wall time here is floored by the largest single package, so this does not scale
+linearly with worker count: a workspace whose weight sits in one big package
+gains almost nothing. `--parallel-packages` cannot be combined with
+`--incremental`, whose manifest keys bundles by frontend rather than by package.
+
 ## See it work
 
 Before you point it at your own code, watch the dataflow tier catch something on

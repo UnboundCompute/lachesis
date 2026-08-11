@@ -21,6 +21,13 @@ CORPUS = Path(os.environ.get(
     "LACHESIS_CORPUS",
     ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "project",
 ))
+# The two-package workspace Lever 3's per-package build is exercised against: a root
+# workspace manifest plus `packages/api` and `packages/core`, with a real import across
+# the boundary. Always in-tree — this one is not swappable, because the test is about
+# the package partition itself.
+WORKSPACE_FIXTURE = (
+    ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "workspace"
+)
 requires_corpus = unittest.skipIf(
     not CORPUS.is_dir(), f"corpus not present at {CORPUS} (set LACHESIS_CORPUS)",
 )
@@ -1515,6 +1522,72 @@ class CompilerFrontendTests(unittest.TestCase):
             with open(store_manifest_file(cache), "w", encoding="utf-8") as handle:
                 json.dump(tampered, handle)
             self.assertFalse(GraphStore.load(core_dir).dataflow_ready)
+
+    def test_package_detection_assigns_each_file_to_its_deepest_package(self) -> None:
+        # Lever 3's partitioning unit. The two-package workspace fixture has a
+        # package.json at the root *and* one per package, so a shallowest-match rule
+        # would put everything in the root bucket and the build would not parallelize.
+        from Lachesis.packages import ROOT_PACKAGE_KEY, detect_packages
+        from Lachesis.pipeline import source_inventory
+
+        workspace = WORKSPACE_FIXTURE
+        buckets = detect_packages(str(workspace), source_inventory(str(workspace)))
+        self.assertEqual([".", "packages/api", "packages/core"], list(buckets))
+        self.assertEqual(
+            [str(workspace / "packages" / "api" / "package.json"),
+             str(workspace / "packages" / "api" / "src" / "index.ts")],
+            buckets["packages/api"])
+        # the root package.json is a workspace manifest, so the root bucket holds only
+        # the files no package claims — and it is a bucket, not a discard pile
+        self.assertEqual([str(workspace / "package.json"),
+                          str(workspace / "tsconfig.json")], buckets["."])
+        self.assertNotIn(ROOT_PACKAGE_KEY, buckets)
+
+    def test_parallel_package_build_matches_serial_over_the_same_partition(self) -> None:
+        # Lever 3. The claim is narrow and deliberate: a pooled per-package build equals
+        # a *serial per-package* build exactly. It is NOT a claim that either equals a
+        # whole-repo single-program build — each package compiles as its own program, so
+        # types resolve within a package rather than across the tree, and that is why
+        # the flag is opt-in. The whole-repo comparison at the end of this test measures
+        # that gap rather than asserting it away.
+        from Lachesis.pipeline import run_project, run_project_parallel
+
+        workspace = str(WORKSPACE_FIXTURE)
+        with tempfile.TemporaryDirectory() as output:
+            pooled, pooled_snaps, pooled_dropped = run_project_parallel(
+                workspace, os.path.join(output, "pooled"), enrich=False)
+            serial, _, serial_dropped = run_project_parallel(
+                workspace, os.path.join(output, "serial"), enrich=False, max_workers=1)
+
+            self.assertEqual(2, len(pooled_snaps))  # it really did split the work
+            self.assertEqual(serial, pooled)
+            self.assertEqual(serial_dropped, pooled_dropped)
+
+            # the cross-package call survives the union: its callee id is the same id
+            # the owning package emitted, so the merge resolves it rather than dropping it
+            labels = {node["id"]: node["label"] for node in pooled["nodes"]}
+            cross = [edge for edge in pooled["edges"]
+                     if edge["kind"] == "CALLS"
+                     and labels.get(edge["target"]) == "principalFor"]
+            self.assertTrue(cross, "the api -> core call edge must survive the merge")
+
+            # every file is named once, project-relative. Each package compiles from its
+            # own root, so the frontend would otherwise report both as `src/index.ts` —
+            # one user-facing path for two different files.
+            files = sorted(node["label"] for node in pooled["nodes"]
+                           if node["kind"] == "file"
+                           and not node["label"].startswith(os.sep))
+            self.assertEqual(["packages/api/src/index.ts",
+                              "packages/core/src/index.ts"], files)
+
+            whole, _ = run_project(workspace, os.path.join(output, "whole"),
+                                   enrich=False)
+            self.assertEqual(whole["nodes"], pooled["nodes"])
+            triples = lambda graph: {(e["kind"], e["source"], e["target"])
+                                     for e in graph["edges"]}
+            # the gap is one-directional: per-package resolution can *miss* an edge the
+            # whole-repo program recovers, but it must never invent one.
+            self.assertEqual(set(), triples(pooled) - triples(whole))
 
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(

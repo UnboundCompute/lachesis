@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 from ..core.contract import ContractError, FrontendSpec
 
@@ -35,6 +35,21 @@ class FrontendRegistry:
         for grouped in result.values():
             grouped.sort()
         return result
+
+    def partition_by_package(
+        self, packages: Mapping[str, Iterable[str]],
+    ) -> Dict[Tuple[str, str], List[str]]:
+        """Split an already-bucketed ``{package_key: files}`` mapping by frontend.
+
+        The unit of a parallel build is a (frontend, package) pair, because two
+        frontends over one package are as independent as one frontend over two
+        packages. ``partition`` is left alone: three callers depend on its shape.
+        """
+        result: Dict[Tuple[str, str], List[str]] = {}
+        for package, paths in packages.items():
+            for frontend_id, grouped in self.partition(paths).items():
+                result[(frontend_id, package)] = grouped
+        return dict(sorted(result.items()))
 
     @property
     def frontends(self) -> Tuple[FrontendSpec, ...]:

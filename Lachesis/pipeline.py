@@ -44,6 +44,20 @@ def snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
 
 def combine_graphs(graphs: Iterable[CodeGraph]) -> CodeGraph:
     """Union canonical graphs while rejecting conflicting stable identities."""
+    graph, _ = _combine_graphs(graphs, drop_dangling=False)
+    return graph
+
+
+def _combine_graphs(
+    graphs: Iterable[CodeGraph], *, drop_dangling: bool,
+) -> Tuple[CodeGraph, int]:
+    """``combine_graphs``, plus a count of the edges dropped for a missing endpoint.
+
+    ``drop_dangling`` exists for the per-package parallel build, where a cross-package
+    edge's far endpoint legitimately lives in a graph this union does not contain. It
+    is never silent: the count comes back so the caller can report it. The serial path
+    passes ``False`` and keeps raising, because there a dangling edge is a real bug.
+    """
     nodes: Dict[str, GraphNode] = {}
     edges: List[GraphEdge] = []
     edge_keys = set()
@@ -66,18 +80,21 @@ def combine_graphs(graphs: Iterable[CodeGraph]) -> CodeGraph:
         edge for edge in edges
         if edge["source"] not in known or edge["target"] not in known
     ]
-    if dangling:
+    if dangling and not drop_dangling:
         first = dangling[0]
         raise FrontendError(
             f"combined graph has {len(dangling)} dangling edges; first is "
             f"{first['source']} -> {first['target']}"
         )
+    if dangling:
+        dropped = {id(edge) for edge in dangling}
+        edges = [edge for edge in edges if id(edge) not in dropped]
     return {
         "nodes": sorted(nodes.values(), key=lambda item: item["id"]),
         "edges": sorted(edges, key=lambda item: (
             item["kind"], item["source"], item["target"],
         )),
-    }
+    }, len(dangling)
 
 
 def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
@@ -293,6 +310,207 @@ def run_project_incremental(
     result = _enrich_graph(graph, snapshots) if enrich else graph
     _write_manifest(manifest_path, manifest)
     return result, snapshots
+
+
+def _job_output_dir(output_root: str, frontend_id: str, package: str) -> str:
+    """A private output directory per (frontend, package).
+
+    Mandatory, not an optimization: ``run_frontend`` writes ``lachesis-roots.txt`` into
+    its output directory under a fixed name, so two jobs sharing one directory would
+    overwrite each other's root set and compile the wrong files.
+    """
+    slug = package.replace(os.sep, "__").replace("<", "").replace(">", "") or "root"
+    return os.path.join(output_root, frontend_id, slug)
+
+
+def package_jobs(
+    source_dir: str,
+    output_root: str,
+    registry: FrontendRegistry,
+    include_tests: bool = False,
+) -> List[Tuple[str, str, str, str, List[str]]]:
+    """The (frontend_id, package, compile_root, output_dir, roots) units of a build.
+
+    ``compile_root`` is the package directory, not the repo root, so each job discovers
+    its own ``tsconfig.json`` and compiles as one program — which is the semantic change
+    that makes this opt-in.
+    """
+    from .packages import detect_packages, package_root_for
+
+    source_dir = os.path.abspath(source_dir)
+    output_root = os.path.abspath(output_root)
+    packages = detect_packages(source_dir,
+                               source_inventory(source_dir, include_tests=include_tests))
+    jobs = []
+    for (frontend_id, package), roots in registry.partition_by_package(packages).items():
+        jobs.append((frontend_id, package, package_root_for(source_dir, package),
+                     _job_output_dir(output_root, frontend_id, package), roots))
+    return jobs
+
+
+def _run_package_job(job: Tuple[str, str, str, List[str], int, Optional[str]]) -> str:
+    """Pool worker: compile one (frontend, package) unit, return its bundle directory.
+
+    The worker returns a *path*, not the snapshot: a ``FrontendSnapshot`` is a large
+    dict-of-lists and pickling it back through the pool is pure overhead when the
+    parent can ``load_snapshot`` the bundle it just wrote — which is exactly what the
+    incremental path already does. Module-level and taking only picklable arguments so
+    it works under the spawn start method.
+    """
+    frontend_id, compile_root, output_dir, roots, timeout_seconds, workspace_root = job
+    registry = default_registry(workspace_root)
+    run_frontend(registry.get(frontend_id), compile_root, output_dir, timeout_seconds,
+                 roots=roots)
+    return output_dir
+
+
+def _reanchor_file(node: GraphNode, source_dir: str) -> GraphNode:
+    """Rewrite a node's ``file`` to be relative to the *project*, not its package.
+
+    The frontend reports ``file`` relative to the directory it was pointed at, so a
+    per-package build gives every package its own ``src/index.ts`` — the same
+    user-facing path for different files, which breaks `open_file`, the by-file index,
+    and every ``file:line`` anchor an answer prints. ``absolute_file`` is unambiguous
+    and always present for in-tree nodes, so the project-relative path is recoverable
+    exactly. Out-of-tree nodes (the TypeScript lib declarations) are left alone: the
+    whole-repo build reports those as absolute paths too.
+    """
+    properties = node.get("properties") or {}
+    absolute = properties.get("absolute_file")
+    prefix = source_dir.rstrip(os.sep) + os.sep
+    if not isinstance(absolute, str) or not absolute.startswith(prefix):
+        return node
+    relative = os.path.relpath(absolute, source_dir)
+    previous = properties.get("file")
+    if previous == relative:
+        return node
+    node = {**node, "properties": {**properties, "file": relative}}
+    # `file` and `source-span` nodes carry the path in their *label* as well, which is
+    # what every answer prints; leaving it package-relative would keep exactly the
+    # ambiguity this rewrite removes. Anchored to the old value rather than guessed, so
+    # a label that is not path-derived is untouched.
+    label = node.get("label")
+    if isinstance(previous, str) and isinstance(label, str):
+        if label == previous:
+            node["label"] = relative
+        elif label.startswith(previous + ":"):
+            node["label"] = relative + label[len(previous):]
+    return node
+
+
+def _merge_package_graphs(
+    units: Sequence[Tuple[str, CodeGraph]], owner_of_file: Dict[str, str],
+    source_dir: str,
+) -> Tuple[CodeGraph, int]:
+    """Union per-package graphs, letting the package that owns a file speak for it.
+
+    Per-package programs overlap: compiling ``packages/api`` pulls ``packages/core``'s
+    sources in as imported dependencies and emits nodes for them too. Those nodes carry
+    the *same* ids but strictly poorer facts — the neighbour sees the file as a
+    ``workspace-library`` and resolves no ``scope_id``/``symbol_id`` for it, while the
+    owning package sees it as ``application`` code and resolves both. Feeding both
+    copies to ``combine_graphs`` is what makes it raise on conflicting ids, and picking
+    arbitrarily would silently degrade whichever file lost.
+
+    So the rule is ownership: a node about a file belongs to the package that contains
+    that file, and every other package's view of it is discarded. Nodes with no
+    first-party owner (the TypeScript lib declarations, synthetic package nodes) go to
+    the first unit that emits them, in the units' fixed sorted order, so the result does
+    not depend on scheduling. Edges follow their source node's winner, which keeps
+    cross-package call edges — their target id is the same id the owning package
+    emitted, so the union resolves them.
+    """
+    winner: Dict[str, int] = {}
+    for index, (package, graph) in enumerate(units):
+        for node in graph["nodes"]:
+            path = (node.get("properties") or {}).get("absolute_file")
+            if path is not None and owner_of_file.get(path) == package:
+                winner[node["id"]] = index  # an owning package always outranks a viewer
+            elif node["id"] not in winner:
+                winner[node["id"]] = index
+    selected = [
+        {"nodes": [_reanchor_file(n, source_dir)
+                   for n in graph["nodes"] if winner.get(n["id"]) == index],
+         "edges": [e for e in graph["edges"] if winner.get(e["source"]) == index]}
+        for index, (_package, graph) in enumerate(units)
+    ]
+    return _combine_graphs(selected, drop_dangling=True)
+
+
+def run_project_parallel(
+    source_dir: str,
+    output_root: str,
+    registry: Optional[FrontendRegistry] = None,
+    timeout_seconds: int = 300,
+    include_tests: bool = False,
+    *,
+    enrich: bool = True,
+    max_workers: Optional[int] = None,
+    workspace_root: Optional[str] = None,
+) -> Tuple[CodeGraph, List[FrontendSnapshot], int]:
+    """Compile each (frontend, package) unit in its own process, then compose.
+
+    Returns the graph, the snapshots, and the number of cross-package edges dropped.
+
+    Two honest caveats, both structural:
+
+    * **This is not the serial build made faster.** Each package compiles as its own
+      program, so type resolution spans one package rather than the whole tree. The
+      result is compared against a *serial per-package* build, not against a whole-repo
+      one. That is why the caller has to opt in.
+    * **Wall time is floored by the largest single package.** A repo whose work sits in
+      one big package gains nothing here, and a repo with N packages does not go N times
+      faster. Do not read this as linear scaling.
+
+    A single-unit repo takes the serial path and constructs no pool.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .packages import detect_packages
+
+    source_dir = os.path.abspath(source_dir)
+    output_root = os.path.abspath(output_root)
+    registry = registry or default_registry(workspace_root)
+    jobs = package_jobs(source_dir, output_root, registry, include_tests=include_tests)
+    if not jobs:
+        supported = sorted({
+            extension for item in registry.frontends for extension in item.extensions
+        })
+        raise FrontendError(
+            f"no registered frontend supports files below {source_dir}; "
+            f"supported extensions: {', '.join(supported)}"
+        )
+
+    payloads = [(frontend_id, compile_root, output_dir, roots, timeout_seconds,
+                 workspace_root)
+                for frontend_id, _package, compile_root, output_dir, roots in jobs]
+    # capped at the core count: the frontends are themselves CPU-bound compilers, so
+    # oversubscribing turns parallelism into contention.
+    workers = max_workers or min(len(payloads), os.cpu_count() or 1)
+    if len(payloads) == 1 or workers <= 1:
+        # ``max_workers=1`` is the serial-over-the-same-partition reference the parallel
+        # build is tested against; a single unit never justifies a pool either way.
+        bundles = [_run_package_job(payload) for payload in payloads]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            # map preserves input order, so the snapshot order (and with it the composed
+            # graph) does not depend on which worker finished first
+            bundles = list(pool.map(_run_package_job, payloads))
+
+    snapshots = [load_snapshot(bundle) for bundle in bundles]
+    owner_of_file = {
+        path: package
+        for package, paths in detect_packages(
+            source_dir, source_inventory(source_dir, include_tests=include_tests),
+        ).items()
+        for path in paths
+    }
+    graph, dropped = _merge_package_graphs(
+        [(job[1], snapshot_graph(snapshot))
+         for job, snapshot in zip(jobs, snapshots)],
+        owner_of_file, source_dir,
+    )
+    return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots, dropped
 
 
 def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:

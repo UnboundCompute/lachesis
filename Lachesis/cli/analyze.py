@@ -11,7 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from Lachesis.kuzu_store import write_kuzu_graph
-from Lachesis.pipeline import run_project, run_project_incremental
+from Lachesis.pipeline import (run_project, run_project_incremental,
+                               run_project_parallel)
 from Lachesis.projections import build_layered_graph, write_layered_graph
 
 
@@ -56,12 +57,36 @@ def main() -> None:
              "none of its source files changed, recompiling only the ones that did; "
              "the composed graph is identical to a full run.",
     )
+    parser.add_argument(
+        "--parallel-packages", action="store_true",
+        help="compile each first-party package (a directory with a package.json, "
+             "outside node_modules) in its own process. OFF by default because it is "
+             "a semantic change, not just a scheduling one: each package becomes its "
+             "own compiler program, so types resolve within a package rather than "
+             "across the whole tree, and cross-package edges whose far endpoint lands "
+             "in another unit are dropped (the count is printed). Wall time is floored "
+             "by the largest single package, so this is not linear scaling.",
+    )
+    parser.add_argument(
+        "--max-workers", type=int, default=None, metavar="N",
+        help="cap the --parallel-packages pool (default: one worker per package, "
+             "never more than the core count). N=1 runs the same partition serially.",
+    )
     args = parser.parse_args()
+    if args.parallel_packages and args.incremental:
+        parser.error("--parallel-packages and --incremental cannot be combined: the "
+                     "incremental manifest keys bundles by frontend, not by package")
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
     enrich = args.enrich or bool(args.layered_out)
-    if args.incremental:
+    dropped = 0
+    if args.parallel_packages:
+        graph, snapshots, dropped = run_project_parallel(
+            args.source_dir, args.frontend_out, enrich=enrich,
+            max_workers=args.max_workers,
+        )
+    elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, args.frontend_out,
                                                    enrich=enrich)
     else:
@@ -72,13 +97,17 @@ def main() -> None:
         layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)
         print(f"Layered projection: {len(layered_files)} files in {args.layered_out}")
     kinds = Counter(node["kind"] for node in graph["nodes"])
+    # a parallel build runs one frontend per package, so snapshots counts units, not frontends
+    unit = "package units" if args.parallel_packages else "frontends"
     print(
-        f"Composed {len(snapshots)} frontends into {len(graph['nodes'])} nodes "
+        f"Composed {len(snapshots)} {unit} into {len(graph['nodes'])} nodes "
         f"and {len(graph['edges'])} edges: {written}"
     )
+    if args.parallel_packages:
+        print(f"Dropped {dropped} cross-package edges (parallel build)")
     print("Tier: " + ("enriched (core + overlay dataflow)" if enrich else
                       "core-only (nav rebuilds the dataflow tier on first use)"))
-    print("Frontends: " + ", ".join(item.frontend_id for item in snapshots))
+    print("Frontends: " + ", ".join(sorted({item.frontend_id for item in snapshots})))
     print("Node kinds: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())))
 
 
