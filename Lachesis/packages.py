@@ -5,10 +5,12 @@ that can run concurrently with its siblings. Nothing else in the builder had a n
 of a first-party package: the TypeScript frontend's ``packageIdentity`` only keys off
 ``/node_modules/``, so first-party files carry ``package_name: null``.
 
-A "package" here is deliberately shallow — a directory holding a ``package.json``,
-outside ``node_modules``. That is the same boundary the ecosystem tooling uses and the
-same boundary a ``tsconfig.json`` usually follows, so compiling one package as one
-program matches how the package is built for real.
+A "package" here is deliberately shallow — a directory holding a package manifest,
+outside vendored trees. For JavaScript that is ``package.json``; for Python it is
+``pyproject.toml``, ``setup.py`` or ``setup.cfg``, which mark exactly the same
+boundary for the same reason. That is the boundary the ecosystem tooling uses and
+the one a ``tsconfig.json`` usually follows, so compiling one package as one program
+matches how the package is built for real.
 
 **This is a real semantic boundary, not just a scheduling one.** One program per
 package resolves types across that package's files only; a whole-repo program resolves
@@ -21,21 +23,28 @@ from typing import Dict, Iterable, List
 
 ROOT_PACKAGE_KEY = "<root>"
 
-_IGNORED_DIRECTORIES = {".git", "node_modules", "graph_out", "dist", "build", ".venv"}
+_IGNORED_DIRECTORIES = {
+    ".git", "node_modules", "graph_out", "dist", "build", ".venv", "venv",
+    "site-packages", ".tox", ".nox", ".eggs",
+}
+
+# A directory holding any one of these is a package root. An installed dependency
+# carries the same files, which is what the ignore list above is for.
+_MANIFESTS = ("package.json", "pyproject.toml", "setup.py", "setup.cfg")
 
 
 def find_package_roots(source_dir: str) -> List[str]:
-    """Absolute directories under ``source_dir`` that hold a ``package.json``.
+    """Absolute directories under ``source_dir`` that hold a package manifest.
 
     ``source_dir`` itself counts when it holds one. Vendored trees are skipped: a
-    dependency's ``package.json`` describes code we are not compiling.
+    dependency's manifest describes code we are not compiling.
     """
     source_dir = os.path.abspath(source_dir)
     roots = []
     for root, directories, files in os.walk(source_dir):
         directories[:] = sorted(name for name in directories
                                 if name not in _IGNORED_DIRECTORIES)
-        if "package.json" in files:
+        if any(manifest in files for manifest in _MANIFESTS):
             roots.append(root)
     return sorted(roots)
 
