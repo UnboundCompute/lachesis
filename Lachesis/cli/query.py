@@ -19,16 +19,17 @@ def load_graph(path: str) -> tuple[dict, dict]:
     nav (which navigates the store lazily, node by node) this path genuinely has to
     pay the materialization. The frontend capability inventory comes from the store
     manifest written beside the DB file.
-    """
-    from Lachesis.kuzu_store import is_kuzu_dir, read_store_manifest
-    from nav.kuzu_index import KuzuGraphIndex, materialize_graph
 
-    if not is_kuzu_dir(path):
-        raise ValueError(
-            f"{path} is not a Lachesis graph store; build one with "
-            f"`lachesis-analyze <source_dir> {path}`"
-        )
-    graph = materialize_graph(KuzuGraphIndex(path))
+    Opening through ``GraphStore`` rather than the index directly is deliberate: a
+    core-only store grows (and caches) its overlay dataflow tier there, so this CLI and
+    the nav tools share one cache instead of each rebuilding the tier.
+    """
+    from Lachesis.kuzu_store import read_store_manifest
+    from nav.graph_store import GraphStore
+    from nav.kuzu_index import materialize_graph
+
+    store = GraphStore.load(path).ensure_dataflow_tier()
+    graph = materialize_graph(store.index)
     manifest = read_store_manifest(path)
     frontend_capabilities = {
         item["frontend_id"]: item.get("capabilities", {})

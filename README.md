@@ -48,6 +48,12 @@ is the graph, and every tool reads it directly. `lachesis-mcp` speaks MCP over
 stdio, so point an MCP-capable client at `lachesis-mcp /abs/path/to/graph.kuzu` and
 the navigation tools show up as tools.
 
+The build writes the core tier. The dataflow tier is `f(core graph, languages,
+capabilities)` — pure and deterministic — so it is rebuilt on the first query and
+cached in a sibling `graph.kuzu.enriched` directory keyed to the core's content hash.
+Answers are identical either way; the work moves off every build and onto one first
+query per graph. `lachesis-analyze --enrich` folds it in at build time instead.
+
 ## See it work
 
 Before you point it at your own code, watch the dataflow tier catch something on
@@ -115,10 +121,12 @@ python -m Lachesis.cli.analyze path/to/vercel-ai/packages/ai/src ai.kuzu
 ```
 
 These build times and sizes were measured when the builder also wrote the whole
-graph out as indented JSON, which it no longer does. The last column is that JSON
+graph out as indented JSON, which it no longer does, and when it folded in the
+dataflow tier on every build, which is now `--enrich`. The last column is that JSON
 dump, kept here because it is the most direct measure of how much graph each
 package produces. Both columns are therefore an upper bound on what the command
-above costs today.
+above costs today. The current numbers are not published here yet; they will be
+once they have been re-measured on this same public target.
 
 ### Storage and open time
 

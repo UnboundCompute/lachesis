@@ -142,7 +142,7 @@ def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     # Load through GraphStore so an overlay's derived edges (extra dispatch context)
     # are folded into the same union graph the MCP `hubs` tool ranks over.
-    gl = GraphStore.load(args.graph, overlay_path=args.overlay).gl
+    gl = GraphStore.load(args.graph, overlay_path=args.overlay).ensure_dataflow_tier().gl
     rows = Hubs(gl, include_external=args.include_external,
                 include_tests=args.include_tests).top(args.n)
     if args.json:

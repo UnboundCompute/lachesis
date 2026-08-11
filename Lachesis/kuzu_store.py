@@ -38,6 +38,7 @@ absent; the writer then raises a clear error.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -146,6 +147,48 @@ def read_store_manifest(db_dir: str) -> dict:
         return json.load(handle)
 
 
+def manifest_languages(manifest: dict) -> set:
+    """Every language any frontend in the store reported."""
+    return {language
+            for item in manifest.get("frontends", [])
+            for language in item.get("languages", [])}
+
+
+def manifest_capabilities(manifest: dict) -> dict:
+    """The store-wide capability levels: the strongest claim any frontend made.
+
+    Same max-by-rank rule as ``pipeline._combined_capabilities``, recomputed from the
+    manifest because the per-frontend levels are what gets persisted.
+    """
+    rank = {"none": 0, "partial": 1, "complete": 2}
+    combined: dict = {}
+    for item in manifest.get("frontends", []):
+        for name, level in (item.get("capabilities") or {}).items():
+            if rank.get(level, 0) >= rank.get(combined.get(name, "none"), 0):
+                combined[name] = level
+    return combined
+
+
+def graph_content_hash(nodes: Sequence[dict], edges: Sequence[dict]) -> str:
+    """A stable digest of a graph's identity: node ids plus edge triples.
+
+    This is the cache key that ties a derived overlay store back to the core store it
+    was computed from. Properties are deliberately excluded — they are large, and the
+    node/edge identity set is what enrichment is a function of. A rebuild always
+    rewrites store and manifest together, so the key cannot go stale silently.
+    """
+    digest = hashlib.sha256()
+    for node_id in sorted(node["id"] for node in nodes):
+        digest.update(node_id.encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(b"\1")
+    for triple in sorted((e.get("kind") or "", e.get("source") or "", e.get("target") or "")
+                         for e in edges):
+        digest.update("\0".join(triple).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _semantic_kind(edge: dict) -> str:
     kind = edge.get("kind")
     if kind == "EXPANDS_TO":
@@ -216,6 +259,8 @@ def write_kuzu_graph(
     drop_diagnostics: bool = False,
     drop_tests: bool = False,
     overwrite: bool = True,
+    enriched: bool = True,
+    core_content_hash: Optional[str] = None,
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
@@ -223,6 +268,11 @@ def write_kuzu_graph(
     file): the frontend inventory, and with it the capabilities and languages that
     overlay enrichment needs. Set ``prune=False, elide_constants=False`` for an
     exact-reconstruction parity build.
+
+    ``enriched`` records whether the graph carries the overlay dataflow tier. A
+    core-only store also gets its own ``core_content_hash`` stamped, which is the key a
+    derived ``<store>.enriched`` cache validates itself against; pass that same hash
+    explicitly when writing the derived store so the two manifests agree.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -268,6 +318,13 @@ def write_kuzu_graph(
     payload = manifest_payload(graph, snapshots)
     payload["node_count"] = len(nodes)
     payload["edge_count"] = len(edges)
+    payload["enriched"] = bool(enriched)
+    # The hash describes what was *stored*, so pruning is inside the key: a pruned core
+    # and a lossless one are different cores and must not share a derived cache.
+    payload["core_content_hash"] = (
+        core_content_hash if core_content_hash is not None
+        else (None if enriched else graph_content_hash(nodes, edges))
+    )
     with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")

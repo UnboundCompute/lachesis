@@ -71,6 +71,36 @@ def edge_view(edge: dict) -> dict:
     }
 
 
+def enriched_store_path(graph_path: str) -> str:
+    """The derived overlay-tier cache that sits beside a core-only store."""
+    return str(graph_path).rstrip("/") + ".enriched"
+
+
+def _cache_matches(cache_path: str, core_hash: str | None) -> bool:
+    """True when ``cache_path`` is a store derived from exactly this core graph.
+
+    A missing hash on either side is a miss, never a match: an unkeyed cache cannot be
+    proven to describe the current core, and serving a stale dataflow tier is worse
+    than rebuilding one."""
+    from Lachesis.kuzu_store import is_kuzu_dir, read_store_manifest
+    if not core_hash or not is_kuzu_dir(cache_path):
+        return False
+    cached = read_store_manifest(cache_path)
+    return bool(cached.get("enriched")) and cached.get("core_content_hash") == core_hash
+
+
+def _copy_frontend_inventory(core_path: str, cache_path: str) -> None:
+    """Carry the core's frontend inventory into the derived store's manifest, so the
+    cache stays self-describing (capabilities, languages) rather than depending on the
+    core store still being readable."""
+    from Lachesis.kuzu_store import read_store_manifest, store_manifest_file
+    payload = read_store_manifest(cache_path)
+    payload["frontends"] = read_store_manifest(core_path).get("frontends", [])
+    with open(store_manifest_file(cache_path), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
 class GraphStore:
     """Everything a reasoning move needs, loaded once and shared."""
 
@@ -84,6 +114,11 @@ class GraphStore:
         self.index = self.gl.index
         self.graph_path = graph_path
         self._entries: list[dict] | None = None
+        # an in-memory graph is whatever the caller handed us; there is no core store to
+        # re-enrich from, so the lazy path is a no-op
+        self._enriched = True
+        self._core_path = graph_path
+        self._overlay_path = None
 
     @classmethod
     def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None,
@@ -98,26 +133,110 @@ class GraphStore:
         self.index = gl.index
         self.graph_path = graph_path
         self._entries = None
+        self._enriched = True
+        self._core_path = graph_path
+        self._overlay_path = None
         return self
 
     @classmethod
     def load(cls, graph_path: str, overlay_path: str | None = None) -> "GraphStore":
         """Open a Kùzu store directory. The disk-backed index satisfies the same
         accessor surface as the in-RAM one, so ``GraphLib`` and every nav tool are
-        unchanged, and nothing loads the whole graph into memory."""
-        from Lachesis.kuzu_store import is_kuzu_dir
-        from nav.kuzu_index import KuzuGraphIndex
+        unchanged, and nothing loads the whole graph into memory.
+
+        A core-only store (the default `lachesis-analyze` output) opens as-is; the
+        overlay dataflow tier is materialized lazily by ``ensure_dataflow_tier`` on the
+        first tool that needs it, and a previously built cache beside the store is
+        opened directly here so the steady state costs nothing extra."""
+        from Lachesis.kuzu_store import is_kuzu_dir, read_store_manifest
         if not is_kuzu_dir(graph_path):
             raise ValueError(
                 f"{graph_path} is not a Lachesis graph store; build one with "
                 f"`lachesis-analyze <source_dir> {graph_path}`"
             )
-        index = KuzuGraphIndex(graph_path)
-        ov_path = Path(overlay_path) if overlay_path else sidecar_path(graph_path)
+        core_manifest = read_store_manifest(graph_path)
+        open_path = graph_path
+        if not core_manifest.get("enriched", True):
+            cached = enriched_store_path(graph_path)
+            if _cache_matches(cached, core_manifest.get("core_content_hash")):
+                open_path = cached
+        self = cls._open(open_path, overlay_path=overlay_path)
+        # The overlay sidecar and the caller-facing identity stay the *core* path even
+        # when the derived cache is what is actually open: the cache is an
+        # implementation detail, and its sidecar would be a second, divergent copy.
+        self.graph_path = graph_path
+        self._core_path = graph_path
+        self._overlay_path = overlay_path
+        self._enriched = open_path != graph_path or bool(core_manifest.get("enriched", True))
+        return self
+
+    @classmethod
+    def _open(cls, path: str, overlay_path: str | None = None) -> "GraphStore":
+        from nav.kuzu_index import KuzuGraphIndex
+        index = KuzuGraphIndex(path)
+        ov_path = Path(overlay_path) if overlay_path else sidecar_path(path)
         overlay = Overlay.load(ov_path)
         index.attach_overlay(overlay)
-        return cls.from_graphlib(GraphLib.from_index(index), graph_path=graph_path,
+        return cls.from_graphlib(GraphLib.from_index(index), graph_path=path,
                                  overlay=overlay)
+
+    @property
+    def dataflow_ready(self) -> bool:
+        """Whether the overlay dataflow tier is already in the open index. Callers that
+        cache ``store.index`` can watch this to tell when they have gone stale."""
+        return bool(getattr(self, "_enriched", True))
+
+    def ensure_dataflow_tier(self) -> "GraphStore":
+        """Guarantee the overlay dataflow tier is present, building it if needed.
+
+        Idempotent, and a no-op for a store that was built with ``--enrich`` or for an
+        in-memory graph. Otherwise: materialize the core, fold the four overlay
+        registries over it (``enriched = f(core_graph, languages, capabilities)`` —
+        pure, so this is exactly what a build-time enrich would have produced), write
+        the result to a sibling ``<store>.enriched`` cache keyed by the core's content
+        hash, and reopen against it.
+
+        The honest cost: enrichment is a whole-graph in-RAM operation, so the first call
+        re-materializes the RAM the columnar store exists to avoid. This *moves* that
+        cost off every build and onto one first query per graph, and caches it
+        permanently. It does not eliminate it.
+
+        The manifest is written last, so a cache torn by a crash (or by a second
+        process rebuilding concurrently) carries no matching hash and is rejected on the
+        next load rather than served half-built.
+
+        Callers must invoke this **before** constructing anything that caches
+        ``store.index`` (``Reachability`` does, at construction), because this rebinds
+        the index rather than mutating it in place."""
+        if getattr(self, "_enriched", True):
+            return self
+        from Lachesis.kuzu_store import (graph_content_hash, manifest_capabilities,
+                                         manifest_languages, read_store_manifest,
+                                         write_kuzu_graph)
+        from Lachesis.pipeline import enrich_graph
+        from nav.kuzu_index import materialize_graph
+
+        core_path = self._core_path
+        manifest = read_store_manifest(core_path)
+        core = materialize_graph(self.index)
+        core_hash = (manifest.get("core_content_hash")
+                     or graph_content_hash(core["nodes"], core["edges"]))
+        enriched = enrich_graph(core, manifest_languages(manifest),
+                               manifest_capabilities(manifest))
+        cache = enriched_store_path(core_path)
+        # prune/elide are already decided by the core store: whatever it holds is what
+        # was materialized, so re-pruning here would silently drop more than the build did.
+        write_kuzu_graph(enriched, None, cache, prune=False,
+                         enriched=True, core_content_hash=core_hash)
+        _copy_frontend_inventory(core_path, cache)
+        fresh = type(self)._open(cache, overlay_path=self._overlay_path)
+        self.overlay = fresh.overlay
+        self.graph = fresh.graph
+        self.gl = fresh.gl
+        self.index = fresh.index
+        self._entries = None
+        self._enriched = True
+        return self
 
     # -- name entry / teleport ----------------------------------------------
 
@@ -187,6 +306,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     store = GraphStore.load(args.graph, overlay_path=args.overlay)
+    if args.stat:
+        # --stat reports node/edge counts, which are tier-dependent; --resolve is a name
+        # lookup and stays on whatever tier the store already has.
+        store.ensure_dataflow_tier()
     if args.resolve:
         hits = store.resolve(args.resolve)
         print(json.dumps(hits, indent=2, ensure_ascii=False))

@@ -71,10 +71,23 @@ python3 -m Lachesis.cli.analyze \
 ```
 
 ```
-Composed 1 frontends into 3307 nodes and 6078 edges: /tmp/example.kuzu
+Composed 1 frontends into 3026 nodes and 5158 edges: /tmp/example.kuzu
+Tier: core-only (nav rebuilds the dataflow tier on first use)
 Frontends: typescript-compiler-api
-Node kinds: allocation=9, argument=31, ... sink=3, source=4, ... taint-reach=6, ...
+Node kinds: allocation=9, argument=31, ... token=1034, value=209, variable=48, write=26
 ```
+
+The store holds the core tier. The dataflow tier on top of it (taint, control flow,
+points-to, routes) is a pure function of the core graph plus the store manifest, so
+the build leaves it out and the first query rebuilds it and caches it in a sibling
+`/tmp/example.kuzu.enriched` directory. Every command below therefore answers exactly
+as it would from an eagerly enriched store; the first one just pays for the tier once.
+Pass `--enrich` (or set `LACHESIS_ENRICH_AT_BUILD=1`) to fold it in at build time
+instead, which prints `3307 nodes and 6078 edges` and node kinds including `sink=3`,
+`source=4`, `taint-reach=6`.
+
+This moves the cost, it does not remove it: enrichment is a whole-graph in-memory
+operation either way.
 
 The console scripts `lachesis-analyze` and `lachesis-query` are aliases for these
 module invocations once the package is installed. The `python3 -m` form works

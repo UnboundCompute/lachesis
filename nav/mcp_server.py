@@ -81,15 +81,50 @@ def log(*a):
 
 
 class _Ctx:
+    """The loaded store plus the analysis objects, all built on first use.
+
+    Lazy for two reasons. A store built without ``--enrich`` grows its dataflow tier on
+    demand, and that rebinds ``store.index``; every analysis object here caches the
+    index at construction, so anything built before the enrich would silently keep
+    answering off the core tier. And orientation tools (`hubs`, `search`, `guards_top`)
+    never touch dataflow, so they should never pay for it."""
+
     def __init__(self, graph_path, overlay_path):
         self.store = GraphStore.load(graph_path, overlay_path=overlay_path)
-        self.reach = Reachability(self.store)
-        self.guards = GuardProfiles(self.store)
-        self.roles = CallRoles(self.store, guards=self.guards)
-        self.siblings = SiblingDiff(self.store)
-        self.hubs = Hubs(self.store.gl)
+        self._built = {}
+        self._tier = self.store.dataflow_ready
         log(f"loaded {len(self.store.gl.nodes)} nodes; "
-            f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges")
+            f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges; "
+            f"dataflow tier: {'present' if self._tier else 'on demand'}")
+
+    def _analysis(self, key, build):
+        if self._tier != self.store.dataflow_ready:
+            self._built.clear()  # the index moved under them; every cache is stale
+            self._tier = self.store.dataflow_ready
+        if key not in self._built:
+            self._built[key] = build()
+        return self._built[key]
+
+    @property
+    def reach(self):
+        self.store.ensure_dataflow_tier()
+        return self._analysis("reach", lambda: Reachability(self.store))
+
+    @property
+    def guards(self):
+        return self._analysis("guards", lambda: GuardProfiles(self.store))
+
+    @property
+    def roles(self):
+        return self._analysis("roles", lambda: CallRoles(self.store, guards=self.guards))
+
+    @property
+    def siblings(self):
+        return self._analysis("siblings", lambda: SiblingDiff(self.store))
+
+    @property
+    def hubs(self):
+        return self._analysis("hubs", lambda: Hubs(self.store.gl))
 
 
 def ctx():
@@ -274,6 +309,12 @@ def call_tool(name, args, format=None):
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
                                      "'comprehension' profile (security tool)"}, fmt)
     c = ctx()
+    # Every tool, not just the dataflow ones. The overlay tier is not confined to taint
+    # and points-to: the control-flow and async overlays add EXCEPTION_BRANCH/TRY_BODY/
+    # HANDLED_BY edges that guard profiling counts, and hub ranking is degree-based over
+    # the whole graph. Enriching selectively would make an answer depend on which tool
+    # you called first, so a core-only store pays once, here, and is cached from then on.
+    c.store.ensure_dataflow_tier()
     store, gl = c.store, c.store.gl
     text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
 

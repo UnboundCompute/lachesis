@@ -114,7 +114,16 @@ def _combined_capabilities(snapshots: Sequence[FrontendSnapshot]) -> dict[str, s
     }
 
 
-def _enrich_graph(graph: CodeGraph, snapshots: Sequence[FrontendSnapshot]) -> CodeGraph:
+def enrich_graph(
+    graph: CodeGraph, languages: Iterable[str], capabilities: Dict[str, str],
+) -> CodeGraph:
+    """Fold the four overlay registries over a core graph to produce the dataflow tier.
+
+    Pure and deterministic: ``enriched = f(core_graph, languages, capabilities)``. The
+    package inventory the ecosystem registry needs is derived from the graph, so those
+    two values are the *only* inputs beyond the graph itself — which is exactly why
+    this can run at load time from a core-only store, given a manifest.
+    """
     from .core.overlays import (
         default_model_overlay_registry,
         default_overlay_registry,
@@ -126,13 +135,18 @@ def _enrich_graph(graph: CodeGraph, snapshots: Sequence[FrontendSnapshot]) -> Co
     graph = default_overlay_registry().enrich(graph)
     index = GraphIndex(graph)
     graph = default_ecosystem_registry().enrich(
-        graph,
-        index.package_inventory(),
-        {language for snapshot in snapshots for language in snapshot.languages},
-        _combined_capabilities(snapshots),
+        graph, index.package_inventory(), set(languages), capabilities,
     )
     graph = default_model_overlay_registry().enrich(graph)
     return default_security_overlay_registry().enrich(graph)
+
+
+def _enrich_graph(graph: CodeGraph, snapshots: Sequence[FrontendSnapshot]) -> CodeGraph:
+    return enrich_graph(
+        graph,
+        {language for snapshot in snapshots for language in snapshot.languages},
+        _combined_capabilities(snapshots),
+    )
 
 
 def run_project(
@@ -141,12 +155,18 @@ def run_project(
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
     include_tests: bool = False,
+    *,
+    enrich: bool = True,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
     """Run selected frontends and enrich their canonical facts directly.
 
     Discovery (``source_inventory``) drops test files by default; the filtered
     per-frontend file list is handed to each frontend as its explicit root set, so a
-    frontend that re-walks the tree cannot re-introduce the tests we excluded."""
+    frontend that re-walks the tree cannot re-introduce the tests we excluded.
+
+    ``enrich=False`` returns the compact core graph (T0-T3) without the overlay
+    dataflow tier, which the nav layer can rebuild on demand from a store manifest.
+    The default stays ``True`` so every library caller is unaffected."""
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
     groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
@@ -170,7 +190,7 @@ def run_project(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
-    return _enrich_graph(graph, snapshots), snapshots
+    return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots
 
 
 def _file_digest(path: str) -> str:
@@ -223,6 +243,8 @@ def run_project_incremental(
     timeout_seconds: int = 300,
     include_tests: bool = False,
     manifest_path: Optional[str] = None,
+    *,
+    enrich: bool = True,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
     """Like ``run_project`` but reuse a frontend's prior on-disk bundle when none of
     its source files changed, recompiling only the frontends that did.
@@ -268,9 +290,9 @@ def run_project_incremental(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
-    enriched = _enrich_graph(graph, snapshots)
+    result = _enrich_graph(graph, snapshots) if enrich else graph
     _write_manifest(manifest_path, manifest)
-    return enriched, snapshots
+    return result, snapshots
 
 
 def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:

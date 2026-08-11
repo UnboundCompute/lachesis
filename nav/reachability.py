@@ -250,6 +250,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     store = GraphStore.load(args.graph, overlay_path=args.overlay)
+    store.ensure_dataflow_tier()  # a core-only store grows its overlay tier here
     r = Reachability(store)
     if args.frm:
         seed = _seed_from(store, args.frm)

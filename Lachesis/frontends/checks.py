@@ -1421,6 +1421,101 @@ class CompilerFrontendTests(unittest.TestCase):
                     _norm(guard_memory[label]), _norm(guard_kuzu[label]),
                     f"{label}: Kùzu must match the in-memory store on the nonzero guard-count path")
 
+    @requires_corpus
+    def test_core_only_store_defers_the_overlay_tier_and_nav_rebuilds_it(self) -> None:
+        # Lever 1. A default build writes the core tier only; the overlay dataflow tier
+        # is a pure function of that core plus the store manifest, so nav rebuilds it on
+        # first use and caches it beside the store. Three claims:
+        #   1. the core store holds *zero* overlay-tier nodes and edges, by kind;
+        #   2. the lazily rebuilt tier equals the eagerly enriched one node for node and
+        #      edge for edge — deferring costs no precision;
+        #   3. the second load hits the cache, and a cache that does not match the
+        #      core's content hash is rejected rather than served stale.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from nav.graph_store import GraphStore, enriched_store_path
+        from nav.kuzu_index import materialize_graph
+        from Lachesis.kuzu_store import (read_store_manifest, store_manifest_file,
+                                         write_kuzu_graph)
+        from Lachesis.pipeline import _enrich_graph
+
+        overlay_node_kinds = {
+            "source", "sink", "taint-reach", "heap-object", "heap-location",
+            "call-context", "context-parameter", "context-return", "phi", "route",
+            "async-event", "boundary", "module-state", "singleton",
+            "unreachable-region", "function-effect", "taint-budget-note",
+        }
+        # Overlay-*exclusive* kinds only. MAY_INVOKE and VALUE_FLOWS_TO look like
+        # dataflow but the TypeScript frontend emits them in the core tier as well, so
+        # asserting their absence would assert something false.
+        overlay_edge_kinds = {
+            "TAINT_SOURCE", "TAINT_SINK", "TAINT_FLOWS_TO", "TAINT_REACHES",
+            "ROUTE_HANDLED_BY", "POINTS_TO", "CONTEXT_CALLS", "CONTEXT_RETURNS",
+            "CONTEXTUALIZES", "BINDS_PARAMETER", "READS_HEAP", "WRITES_HEAP",
+            "APPLIES_EFFECT", "ENTRY_POINT_OF",
+        }
+
+        with tempfile.TemporaryDirectory() as output:
+            core_dir = os.path.join(output, "core.kuzu")
+            eager_dir = os.path.join(output, "eager.kuzu")
+            # one compile, two consumers: the same core graph is both what the store
+            # holds and what the eager reference is enriched from, so the comparison
+            # isolates *when* enrichment runs and nothing else.
+            core, snapshots = run_project(str(CORPUS), os.path.join(output, "fe"),
+                                          enrich=False)
+            write_kuzu_graph(core, snapshots, core_dir, prune=False, enriched=False)
+            write_kuzu_graph(_enrich_graph(core, snapshots), snapshots, eager_dir,
+                             prune=False, enriched=True)
+
+            def _kinds(path):
+                graph = materialize_graph(_open_index(path))
+                return ({node["kind"] for node in graph["nodes"]},
+                        {edge["kind"] for edge in graph["edges"]})
+
+            def _open_index(path):
+                from nav.kuzu_index import KuzuGraphIndex
+                return KuzuGraphIndex(path)
+
+            node_kinds, edge_kinds = _kinds(core_dir)
+            self.assertEqual(set(), node_kinds & overlay_node_kinds)
+            self.assertEqual([], [k for k in node_kinds if k.startswith("cfg-")])
+            self.assertEqual(set(), edge_kinds & overlay_edge_kinds)
+            # and the eager store is a real positive control: the kinds above are not
+            # simply absent from this corpus.
+            eager_node_kinds, eager_edge_kinds = _kinds(eager_dir)
+            self.assertTrue(eager_node_kinds & overlay_node_kinds)
+            self.assertTrue(eager_edge_kinds & overlay_edge_kinds)
+
+            manifest = read_store_manifest(core_dir)
+            self.assertFalse(manifest["enriched"])
+            self.assertTrue(manifest["core_content_hash"])
+
+            def _rebuild():
+                store = GraphStore.load(core_dir)
+                self.assertFalse(store.dataflow_ready)
+                store.ensure_dataflow_tier()
+                self.assertTrue(store.dataflow_ready)
+                return materialize_graph(store.index)
+
+            lazy = _rebuild()
+            reference = materialize_graph(_open_index(eager_dir))
+            self.assertEqual(reference["nodes"], lazy["nodes"])
+            self.assertEqual(reference["edges"], lazy["edges"])
+
+            # the cache is keyed to this core, and a second load opens it directly
+            cache = enriched_store_path(core_dir)
+            self.assertEqual(manifest["core_content_hash"],
+                             read_store_manifest(cache)["core_content_hash"])
+            self.assertTrue(GraphStore.load(core_dir).dataflow_ready)
+
+            # a cache that does not describe this core is a miss, not a stale hit
+            tampered = read_store_manifest(cache)
+            tampered["core_content_hash"] = "0" * 64
+            with open(store_manifest_file(cache), "w", encoding="utf-8") as handle:
+                json.dump(tampered, handle)
+            self.assertFalse(GraphStore.load(core_dir).dataflow_ready)
+
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
             str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "semantics")

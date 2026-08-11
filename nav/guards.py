@@ -188,6 +188,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     store = GraphStore.load(args.graph, overlay_path=args.overlay)
+    store.ensure_dataflow_tier()  # a core-only store grows its overlay tier here
     gp = GuardProfiles(store)
     if args.fn:
         fn = _resolve_fn(store, args.fn)

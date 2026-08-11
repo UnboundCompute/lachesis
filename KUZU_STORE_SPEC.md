@@ -138,6 +138,22 @@ CREATE REL TABLE EDGE (FROM Node TO Node, kind STRING, props STRING);
 
 > **Fallback if the hybrid is too much surface for v1:** a single `EDGE(kind, props)` table for *everything* + a secondary index on `kind`. Simpler port, but the dataflow multi-hop (the moat) pays a `kind`-filter per hop. Start hybrid; the ~12 hot tables are cheap and it's the differentiated path.
 
+### Store manifest (`lachesis-manifest.json`, beside `graph.kuzu`)
+
+Not a table — a small JSON file the writer emits with the store. It carries the
+per-frontend inventory (`frontend_id`, `languages`, `capabilities`, counts), the store's
+own `node_count`/`edge_count`, and two fields that make deferred enrichment possible:
+
+- `enriched` — whether the store holds the overlay dataflow tier or only the core tier.
+- `core_content_hash` — a digest over sorted node ids and `(kind, source, target)`
+  triples of what was actually stored. A core-only store stamps its own; the derived
+  `<store>.enriched` cache stamps the hash of the core it was built from, and a load
+  serves that cache only when the two agree.
+
+The languages and capabilities in the inventory are exactly the two inputs overlay
+enrichment needs beyond the graph itself, which is why the tier can be rebuilt from a
+core-only store with no re-compile.
+
 ---
 
 ## 3. Ingest / write path
