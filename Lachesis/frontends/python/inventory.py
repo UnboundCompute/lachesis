@@ -221,13 +221,25 @@ class ModuleIndex:
 
 
 class FileFacts(NamedTuple):
-    """What pass one learned about a file, minus its AST."""
+    """What pass one learned about a file, minus its AST.
+
+    The last two maps are filled by ``emit_imports`` during pass two, because a
+    base class named ``mod.Base`` is only resolvable once the import clause that
+    binds ``mod`` has been pointed at a file.
+    """
     source: SourceFile
     path: Path
     file_id: str
     imports: List[ImportRecord]
     exported_names: Optional[List[str]]
     module_bindings: Dict[str, List[str]]
+    class_members: Dict[str, Dict[str, str]]
+    class_bases: Dict[str, List[Tuple[str, str]]]
+    function_ids: List[str]
+    # import node id -> the declaration it names, when the clause named one.
+    import_targets: Dict[str, str]
+    # import node id -> the in-tree file the clause resolved to.
+    import_modules: Dict[str, Path]
 
 
 def external_module(graph: Graph, specifier: str) -> str:
@@ -299,6 +311,7 @@ def emit_imports(
 
         if target_path is not None:
             target_id = file_ids[target_path]
+            facts.import_modules[import_id] = target_path
             graph.edge(
                 "DEPENDS_ON", facts.file_id, target_id,
                 specifier=specifier, line=record.position["start_line"],
@@ -317,6 +330,7 @@ def emit_imports(
                 bindings = all_facts[target_path].module_bindings.get(member, [])
                 if len(bindings) == 1:
                     graph.edge("REFERS_TO", import_id, bindings[0], member=member)
+                    facts.import_targets[import_id] = bindings[0]
         else:
             external_id = external_module(graph, absolute or specifier or record.alias)
             graph.edge(

@@ -1404,6 +1404,144 @@ class CompilerFrontendTests(unittest.TestCase):
                 },
             )
 
+    def test_python_scopes_closures_and_overrides(self) -> None:
+        # symtable is CPython's own binding resolver, so `is_free` and
+        # `is_declared_global` are facts rather than heuristics. What this test
+        # pins is that the AST scope tree and the symtable block tree stay in
+        # lockstep, since every classification below is wrong if they desync.
+        fixtures = ROOT / "Lachesis" / "frontends" / "python" / "fixtures"
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(fixtures), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            manifest = snapshot.manifest
+            self.assertEqual(0, manifest["scope_uncorrelated_file_count"])
+            self.assertEqual(
+                manifest["analyzed_file_count"],
+                manifest["scope_correlated_file_count"],
+            )
+            by_id = {node["id"]: node for node in snapshot.nodes}
+
+            bindings = {
+                (node["properties"]["file"], node["label"]): node
+                for node in snapshot.nodes if node["kind"] == "binding"
+            }
+            classification = {
+                name: node["properties"]["binding_scope"]
+                for (file, name), node in bindings.items()
+                if file == "app/closures.py"
+            }
+            # One row per rule symtable decides and the AST cannot: a `global`
+            # declaration, a `nonlocal` declaration, a plain function local, a
+            # class bound inside a function, and a comprehension's own target.
+            self.assertEqual("global", classification["COUNTER"])
+            self.assertEqual("nonlocal", classification["total"])
+            self.assertEqual("local", classification["advance"])
+            self.assertEqual("local", classification["Holder"])
+            self.assertEqual(
+                "comprehension",
+                bindings[("app/closures.py", "value")]["properties"]["scope_kind"],
+            )
+            # Every binding carries the attribution spine the navigation layer
+            # climbs; a binding with no owning function would be unreachable.
+            for (file, _name), node in bindings.items():
+                if file != "app/closures.py":
+                    continue
+                self.assertIn("owner_function_id", node["properties"])
+
+            captures = {
+                (by_id[edge["source"]]["label"], by_id[edge["target"]]["label"]):
+                    by_id[edge["target"]]
+                for edge in snapshot.edges if edge["kind"] == "CAPTURES"
+            }
+            # A closure over an enclosing local, and over an enclosing parameter.
+            self.assertIn(("advance", "total"), captures)
+            self.assertIn(("advance", "step"), captures)
+            self.assertEqual("binding", captures[("advance", "total")]["kind"])
+            self.assertEqual("parameter", captures[("advance", "step")]["kind"])
+            self.assertTrue(captures[("advance", "total")]["properties"]["is_captured"])
+            # A class body is not a closure scope: `value` reaches the method from
+            # the enclosing function directly, never through Holder.
+            self.assertIn(("read", "value"), captures)
+            self.assertEqual("parameter", captures[("read", "value")]["kind"])
+            self.assertEqual(
+                "shadowing",
+                by_id[
+                    captures[("read", "value")]["properties"]["owner_function_id"]
+                ]["label"],
+            )
+            # Two levels of nesting: the innermost function captures across the one
+            # between it and the binding.
+            self.assertIn(("inner", "prefix"), captures)
+            self.assertIn(("outer", "prefix"), captures)
+
+            overrides = {
+                (by_id[edge["source"]]["properties"]["owner_id"],
+                 by_id[edge["source"]]["label"]): edge
+                for edge in snapshot.edges if edge["kind"] == "OVERRIDES"
+            }
+            classes = {
+                node["label"]: node["id"] for node in snapshot.nodes
+                if node["kind"] == "class"
+                and node["properties"]["file"] == "app/repository.py"
+            }
+            caching = classes["CachingRepository"]
+            base = classes["Repository"]
+            for member in ("fetch", "__init__"):
+                edge = overrides[(caching, member)]
+                # Single inheritance through a base the layout resolved is decided,
+                # not guessed, so it is exact.
+                self.assertEqual("exact", edge["properties"]["confidence"])
+                self.assertEqual(base, by_id[edge["target"]]["properties"]["owner_id"])
+            # A method with no inherited peer emits nothing.
+            self.assertNotIn((base, "store"), overrides)
+
+    def test_python_scope_correlation_gap_degrades_instead_of_crashing(self) -> None:
+        # Correlation is advisory. The scope tree comes from the AST's own nesting
+        # and is always complete; symtable only supplies classification. Feeding a
+        # deliberately mismatched block tree is the honest way to force the gap,
+        # because every module that ast.parse accepts, symtable also accepts.
+        import ast
+
+        from Lachesis.frontends.python.declarations import DeclarationWalk
+        from Lachesis.frontends.python.emit import Graph, SourceFile, stable_id
+        from Lachesis.frontends.python.scopes import ScopeWalk, build_symbol_table
+
+        text = "def holder(seed):\n    total = seed\n    return total\n"
+        source = SourceFile(Path("mismatch.py"), "mismatch.py", text)
+        module = ast.parse(text)
+        graph = Graph()
+        file_id = stable_id("file", source.display)
+        graph.node(file_id, "file", source.display, **source.whole_file_position())
+        walker = DeclarationWalk(graph, source, file_id, is_stub=False)
+        walker.run(module)
+
+        scopes = ScopeWalk(
+            graph, source, file_id,
+            walker.declarations_by_node, walker.parameters_by_function,
+        )
+        # A block tree built from different source: the keys cannot match.
+        scopes.run(module, build_symbol_table("def other():\n    pass\n", Path("x.py")))
+
+        self.assertFalse(scopes.correlated)
+        self.assertEqual(1, scopes.uncorrelated_scopes)
+        self.assertFalse(graph.nodes[file_id]["properties"]["symtable_correlated"])
+        holder = walker.declarations_by_node[module.body[0]]
+        self.assertFalse(graph.nodes[holder]["properties"]["symtable_correlated"])
+        # Nothing is dropped. The AST-derived binding survives, and says plainly
+        # that it is a fallback rather than symtable's answer.
+        fallback = {
+            node["label"]: node["properties"] for node in graph.nodes.values()
+            if node["kind"] == "binding"
+        }
+        self.assertIn("total", fallback)
+        self.assertEqual("conservative", fallback["total"]["confidence"])
+        self.assertFalse(fallback["total"]["symtable_correlated"])
+        self.assertEqual(holder, fallback["total"]["owner_function_id"])
+
     def test_python_unparseable_file_keeps_its_file_node(self) -> None:
         # A syntax error must not evict the file: it still has to appear in search,
         # open_file and open_folder. Written to a temporary tree rather than

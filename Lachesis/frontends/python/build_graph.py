@@ -27,6 +27,7 @@ from .emit import (
 from .inventory import (
     FileFacts, ModuleIndex, collect_imports, dunder_all, emit_exports, emit_imports,
 )
+from .scopes import ScopeWalk, build_symbol_table, emit_overrides
 
 SOURCE_SUFFIXES = {".py", ".pyi"}
 
@@ -153,6 +154,9 @@ def build(source_dir: Path, output_dir: Path) -> int:
     failed_files: List[Path] = []
     file_ids: Dict[Path, str] = {}
     facts_by_path: Dict[Path, FileFacts] = {}
+    uncorrelated_files: List[Path] = []
+    binding_count = 0
+    capture_count = 0
 
     # Pass one: parse each file on its own and emit everything that is decidable
     # from that file alone. The AST is dropped at the end of each iteration; what
@@ -193,11 +197,35 @@ def build(source_dir: Path, output_dir: Path) -> int:
             graph, source, file_id, is_stub=path.suffix.lower() == ".pyi",
         )
         walker.run(module)
+
+        scopes = ScopeWalk(
+            graph, source, file_id,
+            walker.declarations_by_node, walker.parameters_by_function,
+        )
+        scopes.run(module, build_symbol_table(text, path))
+        binding_count += scopes.binding_count
+        capture_count += scopes.capture_count
+        if not scopes.correlated:
+            uncorrelated_files.append(path)
+            diagnostics.append(emit_diagnostic(graph, source, file_id, {
+                "category": "scope-correlation",
+                "message": (
+                    "symtable blocks could not be matched to the AST scope tree; "
+                    "bindings for this file are AST-derived and conservative"
+                ),
+                "line": 1, "column": 1,
+            }))
+
         facts_by_path[path] = FileFacts(
             source=source, path=path, file_id=file_id,
             imports=collect_imports(source, module),
             exported_names=dunder_all(module),
             module_bindings=walker.module_bindings,
+            class_members=walker.class_members,
+            class_bases=walker.class_bases,
+            function_ids=walker.function_ids,
+            import_targets={},
+            import_modules={},
         )
 
     # Pass two: everything that needs the whole tree. Module names come from the
@@ -213,6 +241,9 @@ def build(source_dir: Path, output_dir: Path) -> int:
         # Exports run after every import, because a re-export names a binding that
         # only exists once the importing file's import nodes have been emitted.
         export_count += emit_exports(graph, index, facts_by_path[path], file_ids)
+    # Overrides run last: a base class named through an import is only resolvable
+    # once that import clause has been pointed at a file.
+    override_count = emit_overrides(graph, facts_by_path)
 
     payloads = graph.tier_payloads()
     analyzed = len(files) - len(failed_files)
@@ -234,6 +265,11 @@ def build(source_dir: Path, output_dir: Path) -> int:
         "diagnostic_count": len(diagnostics),
         "import_count": import_count,
         "export_count": export_count,
+        "binding_count": binding_count,
+        "capture_count": capture_count,
+        "override_count": override_count,
+        "scope_correlated_file_count": len(facts_by_path) - len(uncorrelated_files),
+        "scope_uncorrelated_file_count": len(uncorrelated_files),
         "dropped_edge_count": graph.dropped_edges,
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
         "tiers": [

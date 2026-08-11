@@ -221,6 +221,22 @@ class Graph:
         self.node_tier[node_id] = TIER_OF_KIND[kind]
         return node_id
 
+    def annotate(self, node_id: str, **properties) -> None:
+        """Add properties to an already-emitted node.
+
+        A later pass often learns something about a node the declaration pass had
+        no way to know (that a local is captured by a closure, that a scope could
+        not be correlated). Annotating in place keeps that fact on the node the
+        navigation layer will actually load, rather than in a parallel structure
+        nothing reads.
+        """
+        node = self.nodes.get(node_id)
+        if node is None:
+            return
+        node["properties"].update({
+            name: value for name, value in properties.items() if value is not None
+        })
+
     def edge(
         self, kind: str, source: Optional[str], target: Optional[str], **properties
     ) -> None:

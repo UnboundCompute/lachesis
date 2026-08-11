@@ -97,10 +97,12 @@ class DeclarationWalk:
         # Module-level binding name -> [graph ids]. More than one id means the name
         # is rebound, which the call resolver must not treat as a unique target.
         self.module_bindings: Dict[str, List[str]] = {}
-        # Class label -> {method name: graph id}, the lexical MRO input.
+        # Class graph id -> {member name: graph id}, the lexical MRO input.
         self.class_members: Dict[str, Dict[str, str]] = {}
-        # Class graph id -> its base-class expressions as written.
-        self.class_bases: Dict[str, List[str]] = {}
+        # Class graph id -> its base-class references, resolvable in step 3.
+        self.class_bases: Dict[str, List[Tuple[str, str]]] = {}
+        # Function graph id -> {parameter name: graph id}, for the scope layer.
+        self.parameters_by_function: Dict[str, Dict[str, str]] = {}
         self.function_ids: List[str] = []
 
     # -- emission helpers ----------------------------------------------------
@@ -182,6 +184,7 @@ class DeclarationWalk:
         self._body(node.body, owner_id=node_id, owner_kind="function", function_id=node_id)
 
     def _parameters(self, node: ast.AST, function_id: str) -> None:
+        slots = self.parameters_by_function.setdefault(function_id, {})
         for index, (argument, form, has_default) in enumerate(_parameter_slots(node.args)):
             position = self.source.position(argument)
             parameter_id = stable_id(
@@ -196,6 +199,7 @@ class DeclarationWalk:
                 owner_function_id=function_id,
             )
             self.graph.edge("DECLARES_VALUE", function_id, parameter_id, index=index)
+            slots.setdefault(argument.arg, parameter_id)
 
     def _class(
         self, node: ast.ClassDef, owner_id: Optional[str], owner_kind: str,
@@ -217,7 +221,7 @@ class DeclarationWalk:
             visibility="private" if node.name.startswith("_") else "public",
         )
         self.declarations_by_node[node] = node_id
-        self.class_bases[node_id] = [compact(self.source.excerpt(base)) for base in node.bases]
+        self.class_bases[node_id] = [base_reference(base) for base in node.bases]
         self.class_members.setdefault(node_id, {})
         self._declare(owner_id, owner_kind, node_id)
         self._bind(
@@ -264,6 +268,27 @@ class DeclarationWalk:
                     self.class_members.setdefault(owner_id, {}).setdefault(
                         name_node.id, node_id,
                     )
+
+
+def base_reference(expression: ast.expr) -> Tuple[str, str]:
+    """A base-class expression reduced to something resolvable across files.
+
+    ``(form, text)`` where form is ``name`` for a bare ``Base``, ``dotted`` for a
+    fully qualified ``pkg.module.Base``, and ``expression`` for anything computed
+    (``Generic[T]``, a metaclass call, a conditional base). A computed base is
+    recorded and never resolved, because deciding it would mean executing it.
+    """
+    if isinstance(expression, ast.Name):
+        return ("name", expression.id)
+    parts: List[str] = []
+    cursor: ast.expr = expression
+    while isinstance(cursor, ast.Attribute):
+        parts.append(cursor.attr)
+        cursor = cursor.value
+    if parts and isinstance(cursor, ast.Name):
+        parts.append(cursor.id)
+        return ("dotted", ".".join(reversed(parts)))
+    return ("expression", type(expression).__name__)
 
 
 def _bound_names(target: ast.AST) -> List[ast.Name]:
