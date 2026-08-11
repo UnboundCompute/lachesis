@@ -13,8 +13,9 @@ Design: everything rides on three primitives, so nothing materializes the whole 
 load — only light, index-shaped maps and per-node fetches:
 
   * ``_node(id)``  — PK lookup, reconstructs the canonical ``{id,label,kind,properties}``
-    dict from the ``props`` JSON blob (promoted columns are query-only duplicates and are
-    never read back). Cached.
+    dict by unioning the promoted columns with the ``props`` JSON blob, which carries
+    only the tail (see ``_stored_props``: a property in a typed column is not stored a
+    second time in the blob). Cached.
   * ``_edges(id, reverse)`` — one generic traversal query per node; reconstructs edge
     dicts ``{source,target,kind,properties}``. ``label(e)`` gives the kind for a hot rel
     table; the catch-all ``EDGE`` table carries ``kind``/``semantic_kind`` columns. Cached.
@@ -35,6 +36,7 @@ from Lachesis.core.query import GraphIndex
 from Lachesis.kuzu_store import (
     CONSTANT_PROP_DEFAULTS,
     HOT_REL_KINDS,
+    PROMOTED_NODE_PROPS,
     _HOT_SET,
     db_file,
 )
@@ -60,6 +62,32 @@ def _restore(props_json: Optional[str]) -> dict:
     return props
 
 
+# The columns the writer may omit from the ``props`` tail, in the order they are
+# selected. ``unit`` is excluded: it is derived from ``file`` rather than being a
+# property of its own, so merging it back would invent a key on every node.
+_MERGED_COLUMNS = tuple(c for c in PROMOTED_NODE_PROPS if c != "unit")
+_MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
+
+
+def _restore_node_props(columns, props_json: Optional[str]) -> dict:
+    """Union the promoted columns with the ``props`` tail.
+
+    The tail wins on any overlap. Nothing overlaps in a store this version wrote —
+    the writer drops exactly what the column carries faithfully — but a store written
+    before that (whole dict in the blob) reads back correctly for the same reason, so
+    tail-wins is the format-compatibility rule, not a rollout crutch.
+
+    A NULL column is skipped rather than restored as ``None``: SQL NULL means either
+    "absent" or "held null", and the writer keeps the held-null ones in the tail
+    precisely so this can treat NULL as absent.
+    """
+    properties = {name: value
+                  for name, value in zip(_MERGED_COLUMNS, columns)
+                  if value is not None}
+    properties.update(_restore(props_json))
+    return properties
+
+
 def materialize_graph(index: "KuzuGraphIndex") -> dict:
     """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
 
@@ -76,12 +104,14 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
     """
     nodes = []
     res = index._conn.execute(
-        "MATCH (n:Node) RETURN n.id, n.kind, n.label, n.props ORDER BY n.id"
+        f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props "
+        "ORDER BY n.id"
     )
     while res.has_next():
-        nid, kind, label, props = res.get_next()
+        row = res.get_next()
+        nid, kind, label = row[:3]
         nodes.append({"id": nid, "kind": kind, "label": label,
-                      "properties": _restore(props)})
+                      "properties": _restore_node_props(row[3:-1], row[-1])})
     edges = []
     for kind in HOT_REL_KINDS:
         res = index._conn.execute(
@@ -258,12 +288,14 @@ class KuzuGraphIndex:
         if node_id in self._node_cache:
             return self._node_cache[node_id]
         res = self._conn.execute(
-            "MATCH (n:Node {id: $id}) RETURN n.kind, n.label, n.props", {"id": node_id}
+            f"MATCH (n:Node {{id: $id}}) RETURN n.kind, n.label, {_MERGED_SELECT}, "
+            "n.props", {"id": node_id}
         )
         node = None
         if res.has_next():
-            kind, label, props = res.get_next()
-            properties = _restore(props)
+            row = res.get_next()
+            kind, label = row[:2]
+            properties = _restore_node_props(row[2:-1], row[-1])
             if self._overlay is not None:
                 properties.update(self._overlay.node_props.get(node_id) or {})
             node = {"id": node_id, "kind": kind, "label": label,

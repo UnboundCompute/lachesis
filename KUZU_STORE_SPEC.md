@@ -150,6 +150,16 @@ own `node_count`/`edge_count`, and two fields that make deferred enrichment poss
   `<store>.enriched` cache stamps the hash of the core it was built from, and a load
   serves that cache only when the two agree.
 
+It also carries `version`, the on-disk format. **v2** stores the full properties dict in
+every `props` blob, so the promoted typed columns are duplicates the reader never touches.
+**v3** stores only the tail in `props` and has the reader union the promoted columns back
+in. A v3 reader reads a v2 store correctly, because the tail is a superset and wins on
+merge; a v2 reader reads a v3 store *quietly wrong*, losing the promoted keys from every
+node. Detecting that is the only reason the stamp exists. The `<store>.enriched` cache
+needs no invalidation across the bump: `core_content_hash` covers ids and edge triples and
+deliberately excludes properties, and an old-format cache read by the new reader
+reconstructs correctly by the same tail-wins rule.
+
 The languages and capabilities in the inventory are exactly the two inputs overlay
 enrichment needs beyond the graph itself, which is why the tier can be rebuilt from a
 core-only store with no re-compile.

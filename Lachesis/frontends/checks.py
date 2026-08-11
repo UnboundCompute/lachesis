@@ -1262,6 +1262,62 @@ class CompilerFrontendTests(unittest.TestCase):
                     if stream and not stream.closed:
                         stream.close()
 
+    def test_kuzu_store_round_trips_the_source_graph_property_for_property(self) -> None:
+        # The store's contract, stated at its strongest: what comes back out of
+        # `materialize_graph` is what went in. Every other store test compares two
+        # stores to each other (a bug symmetric across both writes passes clean) or
+        # compares nav *tool output* (a lost property only shows if some tool happens
+        # to surface it). This one compares against the source graph itself, so it is
+        # the guardrail for any change to how properties are laid out on disk —
+        # notably the promoted-column de-dup, where `props` no longer carries the
+        # whole dict and the reader unions the typed columns back in.
+        #
+        # A parity build (prune + constant elision OFF) is the lossless setting: no
+        # node is dropped and no constant is elided, so the reconstruction must be
+        # exact. Key *order* inside `properties` is deliberately not asserted — dicts
+        # compare order-insensitively and nothing in-tree depends on the order, but a
+        # column-union reader does not preserve it.
+        import os as _os
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from nav.graph_store import GraphStore
+        from nav.kuzu_index import materialize_graph
+        from Lachesis.kuzu_store import write_kuzu_graph
+
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures_opsreg", output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            graph = {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)}
+
+            store_dir = _os.path.join(output, "kuzu_roundtrip")
+            write_kuzu_graph(graph, None, store_dir,
+                             prune=False, elide_constants=False)
+            restored = materialize_graph(GraphStore.load(store_dir).index)
+
+            self.assertEqual(len(graph["nodes"]), len(restored["nodes"]))
+            by_id = {node["id"]: node for node in restored["nodes"]}
+            self.assertEqual(set(by_id), {node["id"] for node in graph["nodes"]})
+            for node in graph["nodes"]:
+                back = by_id[node["id"]]
+                for field in ("kind", "label"):
+                    self.assertEqual(node.get(field), back.get(field),
+                                     f"{node['id']}: {field} changed in the store")
+                self.assertEqual(node.get("properties") or {}, back["properties"],
+                                 f"{node['id']}: properties changed in the store")
+
+            def edge_key(edge):
+                return (edge["kind"], edge["source"], edge["target"],
+                        json.dumps(edge.get("properties") or {}, sort_keys=True))
+
+            self.assertEqual(sorted(edge_key(e) for e in graph["edges"]),
+                             sorted(edge_key(e) for e in restored["edges"]),
+                             "edges changed in the store")
+
     def test_nav_parity_in_memory_graph_vs_kuzu_store(self) -> None:
         # The Kùzu store answers every nav tool identically to the same graph held in
         # memory as a dict. A parity build (prune + constant elision OFF) must

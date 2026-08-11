@@ -60,8 +60,9 @@ except Exception:  # pragma: no cover - falls back to per-row inserts if absent
 
 # -- schema shared with the read side (single source of truth) ----------------
 
-# node property -> promoted column. `props` always carries the full properties dict
-# (minus elided constants); these columns are duplicates used only for WHERE/index.
+# node property -> promoted column. `props` carries the *tail*: every property not
+# already stored in one of these typed columns (and minus the elided constants). The
+# read side unions the columns back in, so nothing is lost and nothing is stored twice.
 PROMOTED_NODE_PROPS = (
     "symbol_name", "file", "absolute_file", "start_line", "end_line",
     "start_offset", "end_offset", "owner_function_id", "function_id",
@@ -70,6 +71,10 @@ PROMOTED_NODE_PROPS = (
 _INT_COLUMNS = frozenset({
     "start_line", "end_line", "start_offset", "end_offset",
 })
+# The keys a node's `props` blob may omit. `unit` is not among them: it is *derived*
+# (from `file`, see `_promoted_value`) rather than a property key of its own, so there
+# is nothing to omit and a reader that merged it back would invent a key.
+_COLUMN_KEYS = frozenset(PROMOTED_NODE_PROPS) - {"unit"}
 
 # the traversal-critical kinds get their own typed rel table (columnar, no kind filter
 # on the hot path); everything else lands in the catch-all EDGE table.
@@ -101,6 +106,14 @@ KUZU_DB_FILENAME = "graph.kuzu"
 # two would collide the moment anyone points one at the other.
 STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 
+# On-disk format of the store, stamped into the manifest.
+#   2 — `props` carries the whole properties dict; promoted columns are duplicates.
+#   3 — `props` carries only the tail; the reader unions the promoted columns back in.
+# A v3 reader reads a v2 store correctly (the tail is a superset and wins on merge);
+# a v2 reader silently loses the promoted keys from a v3 store, which is what this
+# stamp exists to let a reader detect.
+STORE_FORMAT_VERSION = 3
+
 
 def db_file(db_dir: str) -> str:
     return os.path.join(db_dir, KUZU_DB_FILENAME)
@@ -124,7 +137,7 @@ def manifest_payload(graph: dict, snapshots: Optional[Sequence[object]]) -> dict
     dropped them could not have its dataflow tier recomputed.
     """
     return {
-        "version": 2,
+        "version": STORE_FORMAT_VERSION,
         "frontends": [{
             "frontend_id": item.frontend_id,
             "languages": list(item.languages),
@@ -142,7 +155,8 @@ def read_store_manifest(db_dir: str) -> dict:
     """The store's manifest, or an empty inventory when it predates one."""
     path = store_manifest_file(db_dir)
     if not os.path.isfile(path):
-        return {"version": 2, "frontends": [], "node_count": 0, "edge_count": 0}
+        return {"version": STORE_FORMAT_VERSION, "frontends": [],
+                "node_count": 0, "edge_count": 0}
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -196,11 +210,36 @@ def _semantic_kind(edge: dict) -> str:
     return kind
 
 
-def _stored_props(properties: dict, elide: bool) -> str:
-    if elide and properties:
-        properties = {k: v for k, v in properties.items()
-                      if k not in CONSTANT_PROP_DEFAULTS}
-    return json.dumps(properties or {})
+def _column_faithful(key: str, value) -> bool:
+    """True when the typed column stores ``value`` back exactly as it came in.
+
+    Decided per *value*, not per key, and that distinction is the whole trick. On the
+    reference store `owner_function_id` is a string on 179k nodes and a real ``null``
+    on 31k of them; `file` is a path on 205,091 nodes and ``null`` on exactly one. The
+    faithful ones drop out of the blob because the column carries them; the rest stay,
+    because an absent key and a key holding ``null`` both reach the column as SQL NULL
+    and are indistinguishable on the way back.
+
+    The type check is exact rather than ``isinstance``: `_cell` coerces anything else
+    with ``str()``/``int()``, which is only harmless while the blob is still the
+    authority.
+    """
+    if key in _INT_COLUMNS:
+        return type(value) is int and -(2 ** 63) <= value < 2 ** 63
+    return type(value) is str
+
+
+def _stored_props(properties: dict, elide: bool,
+                  drop: frozenset = frozenset()) -> str:
+    """The `props` blob: the properties a typed column is not already carrying."""
+    properties = properties or {}
+    if properties and (elide or drop):
+        properties = {
+            k: v for k, v in properties.items()
+            if not (elide and k in CONSTANT_PROP_DEFAULTS)
+            and not (k in drop and _column_faithful(k, v))
+        }
+    return json.dumps(properties)
 
 
 def _is_test_file(path: Optional[str]) -> bool:
@@ -358,9 +397,12 @@ def _arrow_type(column: str):
 
 
 def _cell(column: str, value):
-    """Coerce a promoted-column value to its Parquet type. Promoted columns are
-    query-only duplicates (the read side reconstructs from the ``props`` blob), so
-    stringifying a stray non-string here never affects reconstructed dicts."""
+    """Coerce a promoted-column value to its Parquet type.
+
+    A value this has to coerce is one `_column_faithful` refused, so it is still in
+    the ``props`` tail and the tail wins on read: the coercion stays invisible in
+    reconstructed dicts. That is now a two-sided invariant — loosen the check there
+    and this silently starts rewriting properties."""
     if value is None:
         return None
     if column in _INT_COLUMNS:
@@ -387,7 +429,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str) ->
         data["label"].append(node.get("label"))
         for prop in PROMOTED_NODE_PROPS:
             data[prop].append(_promoted_value(props, prop))
-        data["props"].append(_stored_props(props, elide))
+        data["props"].append(_stored_props(props, elide, _COLUMN_KEYS))
     table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
                       for c in columns})
     path = os.path.join(stage_dir, "node.parquet")
@@ -462,7 +504,7 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool) -> None:
                       "label": node.get("label")}
             for prop in PROMOTED_NODE_PROPS:
                 params[prop] = _promoted_value(props, prop)
-            params["props"] = _stored_props(props, elide)
+            params["props"] = _stored_props(props, elide, _COLUMN_KEYS)
             conn.execute(stmt, params)
         conn.execute("COMMIT")
     except Exception:
