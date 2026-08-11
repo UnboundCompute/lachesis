@@ -6,7 +6,7 @@
   "capabilities": {
     "lexical": "partial",
     "syntax": "complete",
-    "modules": "none",
+    "modules": "partial",
     "dependency_sources": "none",
     "symbols": "partial",
     "scopes": "partial",

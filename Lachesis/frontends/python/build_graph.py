@@ -24,6 +24,9 @@ from .declarations import DeclarationWalk
 from .emit import (
     CONTRACT_VERSION, FRONTEND_ID, LANGUAGE, TIERS, Graph, SourceFile, stable_id,
 )
+from .inventory import (
+    FileFacts, ModuleIndex, collect_imports, dunder_all, emit_exports, emit_imports,
+)
 
 SOURCE_SUFFIXES = {".py", ".pyi"}
 
@@ -148,7 +151,13 @@ def build(source_dir: Path, output_dir: Path) -> int:
     graph = Graph()
     diagnostics: List[str] = []
     failed_files: List[Path] = []
+    file_ids: Dict[Path, str] = {}
+    facts_by_path: Dict[Path, FileFacts] = {}
 
+    # Pass one: parse each file on its own and emit everything that is decidable
+    # from that file alone. The AST is dropped at the end of each iteration; what
+    # pass two needs (import clauses, the export list, the module binding table) is
+    # kept as plain records, so the whole tree's ASTs are never resident at once.
     for path in files:
         try:
             text = read_source(path)
@@ -161,6 +170,7 @@ def build(source_dir: Path, output_dir: Path) -> int:
 
         source = SourceFile(path, display_path(path, source_dir), text)
         file_id = stable_id("file", source.display)
+        file_ids[path] = file_id
         graph.node(
             file_id, "file", source.display,
             **source.whole_file_position(),
@@ -168,7 +178,7 @@ def build(source_dir: Path, output_dir: Path) -> int:
             provenance="application", is_external=False, is_system=False,
             included_because="project-root",
             is_stub=path.suffix.lower() == ".pyi",
-            is_package_init=path.name == "__init__.py",
+            is_package_init=path.name in ("__init__.py", "__init__.pyi"),
         )
 
         module, failure = parse_module(text, path)
@@ -179,9 +189,30 @@ def build(source_dir: Path, output_dir: Path) -> int:
             # still findable in search, open_file and open_folder.
             continue
 
-        DeclarationWalk(
+        walker = DeclarationWalk(
             graph, source, file_id, is_stub=path.suffix.lower() == ".pyi",
-        ).run(module)
+        )
+        walker.run(module)
+        facts_by_path[path] = FileFacts(
+            source=source, path=path, file_id=file_id,
+            imports=collect_imports(source, module),
+            exported_names=dunder_all(module),
+            module_bindings=walker.module_bindings,
+        )
+
+    # Pass two: everything that needs the whole tree. Module names come from the
+    # directory layout only, never from the running interpreter's sys.path.
+    index = ModuleIndex(sorted(facts_by_path), source_dir)
+    import_count = 0
+    for path in sorted(facts_by_path):
+        import_count += emit_imports(
+            graph, index, facts_by_path[path], file_ids, facts_by_path,
+        )
+    export_count = 0
+    for path in sorted(facts_by_path):
+        # Exports run after every import, because a re-export names a binding that
+        # only exists once the importing file's import nodes have been emitted.
+        export_count += emit_exports(graph, index, facts_by_path[path], file_ids)
 
     payloads = graph.tier_payloads()
     analyzed = len(files) - len(failed_files)
@@ -201,6 +232,8 @@ def build(source_dir: Path, output_dir: Path) -> int:
         "failed_file_count": len(failed_files),
         "node_count": len(graph.nodes), "edge_count": len(graph.edges),
         "diagnostic_count": len(diagnostics),
+        "import_count": import_count,
+        "export_count": export_count,
         "dropped_edge_count": graph.dropped_edges,
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
         "tiers": [
@@ -242,7 +275,12 @@ def capabilities(complete_if_parsed: str) -> Dict[str, str]:
     return {
         "lexical": "partial",
         "syntax": complete_if_parsed,
-        "modules": "none",
+        # In-tree imports resolve from the directory layout; namespace packages
+        # resolve only when unambiguous, and sys.path games and importlib do not
+        # resolve at all, so the claim is partial and not complete.
+        "modules": "partial",
+        # Nothing outside the root set is ever read, so dependency source code is
+        # honestly absent rather than partially modelled.
         "dependency_sources": "none",
         "symbols": "partial",
         "scopes": "partial",

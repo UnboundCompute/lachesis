@@ -1268,6 +1268,142 @@ class CompilerFrontendTests(unittest.TestCase):
                     ],
                 )
 
+    def test_python_import_resolution_and_open_file(self) -> None:
+        # Python has no compiler-supplied module map, so resolution is a function of
+        # the directory layout and the root file set alone. The interpreter's
+        # sys.path is never probed: the graph must not depend on the analyst's
+        # virtualenv. Each row below is one resolution rule.
+        from nav.graphlib import GraphLib
+        from nav.file_graph import _find_file_node, build_file_graph
+
+        fixtures = ROOT / "Lachesis" / "frontends" / "python" / "fixtures"
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(fixtures), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            self.assertEqual("partial", snapshot.capabilities["modules"])
+            by_id = {node["id"]: node for node in snapshot.nodes}
+            imports = {
+                (node["properties"]["file"], node["properties"]["specifier"]): node
+                for node in snapshot.nodes if node["kind"] == "import"
+            }
+
+            def resolved_of(file: str, specifier: str) -> tuple[str, str]:
+                node = imports[(file, specifier)]
+                path = node["properties"].get("resolved_path") or ""
+                return node["properties"]["resolution"], Path(path).name
+
+            # absolute import of an in-tree module, through an __init__.py chain
+            self.assertEqual(
+                ("exact", "repository.py"),
+                resolved_of("app/service.py", "app.repository :: Repository"),
+            )
+            # relative level 1, naming a submodule rather than a binding
+            self.assertEqual(
+                ("exact", "repository.py"),
+                resolved_of("app/relative.py", ". :: repository"),
+            )
+            # relative level 2 out of a nested package, and level 3 back to the root
+            self.assertEqual(
+                ("exact", "text.py"),
+                resolved_of("app/util/nested/deep.py", "..text :: normalize"),
+            )
+            self.assertEqual(
+                ("exact", "__init__.py"),
+                resolved_of("app/util/nested/deep.py", "... :: PACKAGE_NAME"),
+            )
+            # PEP 420 namespace layout: no __init__.py on the path, so the dotted
+            # name is only an alias and the hit is conservative, never exact.
+            self.assertEqual(
+                ("conservative", "leaf.py"),
+                resolved_of("entry.py", "namespace.inner.leaf :: identify"),
+            )
+            # Out of tree stays out of tree. Nothing is invented for it, and the
+            # standard library is distinguished from an unresolved dependency by
+            # CPython's own static name list, not by reading anything from disk.
+            for specifier, package, provenance in (
+                ("json", "json", "stdlib"),
+                ("acme.vendor.client :: Client", "acme", "unresolved-dependency"),
+            ):
+                node = imports[("entry.py", specifier)]
+                self.assertEqual("external", node["properties"]["resolution"])
+                self.assertIsNone(node["properties"].get("resolved_path"))
+                external = next(
+                    by_id[edge["target"]] for edge in snapshot.edges
+                    if edge["kind"] == "REFERS_TO" and edge["source"] == node["id"]
+                )
+                self.assertEqual("external-module", external["kind"])
+                self.assertEqual(package, external["properties"]["package_name"])
+                self.assertEqual(provenance, external["properties"]["provenance"])
+
+            # `from a.b import c` where c is a name, not a submodule: the import
+            # points at the declaration itself, which is what makes the call
+            # resolver able to follow an aliased import to its definition.
+            aliased = imports[("app/service.py", "app.util.text :: greet")]
+            targets = [
+                by_id[edge["target"]] for edge in snapshot.edges
+                if edge["kind"] == "REFERS_TO" and edge["source"] == aliased["id"]
+            ]
+            self.assertEqual(
+                {"file", "function"}, {node["kind"] for node in targets},
+            )
+            self.assertEqual("say_hello", aliased["label"])  # bound under its alias
+            # A name the target module does not bind resolves to the module only.
+            absent = imports[("app/util/nested/deep.py", "..text :: missing_symbol")]
+            self.assertEqual(
+                ["file"],
+                [
+                    by_id[edge["target"]]["kind"] for edge in snapshot.edges
+                    if edge["kind"] == "REFERS_TO" and edge["source"] == absent["id"]
+                ],
+            )
+
+            # __all__ on a package names submodules, not bindings; without __all__
+            # the export surface is every public module-level name, which is what
+            # `from module import *` binds.
+            exports: dict[str, set[str]] = {}
+            for edge in snapshot.edges:
+                if edge["kind"] != "EXPORTS":
+                    continue
+                source = by_id[edge["source"]]["properties"]["file"]
+                exports.setdefault(source, set()).add(edge["properties"]["name"])
+            self.assertEqual({"service", "repository"}, exports["app/__init__.py"])
+            self.assertEqual(
+                {"greet", "shout", "normalize", "banner",
+                 "SEPARATOR", "GREETING", "ARROW", "POINTER"},
+                exports["app/util/text.py"],
+            )
+            # A class nested inside a class is not a module-level binding, so it is
+            # not part of the module's export surface.
+            self.assertIn("Shapes", exports["syntax_matrix.py"])
+            self.assertNotIn("Nested", exports["syntax_matrix.py"])
+
+            # open_file: the tool this step exists to unlock.
+            gl = GraphLib({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            file_node = _find_file_node(gl, path="app/service.py", file_id=None)
+            self.assertIsNotNone(file_node)
+            view = build_file_graph(gl, file_node)
+            specifiers = {
+                edge["properties"]["specifier"] for edge in view["edges"]
+                if edge["kind"] == "DEPENDS_ON"
+            }
+            self.assertEqual(
+                {"app.repository :: Repository", "app.repository :: open_repository",
+                 "app.util.text :: greet", "app.util :: text"},
+                specifiers,
+            )
+            self.assertEqual(
+                {"Service", "build_service", "run", "unused_helper", "welcome",
+                 "describe", "__init__"},
+                {
+                    node["label"] for node in view["nodes"]
+                    if node["kind"] in ("function", "method", "class", "constructor")
+                },
+            )
+
     def test_python_unparseable_file_keeps_its_file_node(self) -> None:
         # A syntax error must not evict the file: it still has to appear in search,
         # open_file and open_folder. Written to a temporary tree rather than

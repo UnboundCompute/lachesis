@@ -220,7 +220,11 @@ class DeclarationWalk:
         self.class_bases[node_id] = [compact(self.source.excerpt(base)) for base in node.bases]
         self.class_members.setdefault(node_id, {})
         self._declare(owner_id, owner_kind, node_id)
-        self._bind(node.name, node_id, None, function_id)
+        self._bind(
+            node.name, node_id, owner_id if owner_kind == "class" else None, function_id,
+        )
+        if owner_kind == "class" and owner_id is not None:
+            self.class_members.setdefault(owner_id, {})[node.name] = node_id
         self._body(node.body, owner_id=node_id, owner_kind="class", function_id=function_id)
 
     def _binding(
