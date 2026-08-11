@@ -155,13 +155,41 @@ every `props` blob, so the promoted typed columns are duplicates the reader neve
 **v3** stores only the tail in `props` and has the reader union the promoted columns back
 in. **v4** promotes six more keys and writes the tail with compact JSON separators. **v5**
 deflates the tail into a `BLOB` rather than storing it as JSON text. **v6** runs that
-deflate against a preset dictionary shared by every row in the store.
+deflate against a preset dictionary shared by every row in the store. **v7** codes
+`compiler_node_id` against a prefix table, and **v8** codes the `id` primary key against
+that same table.
 
 That dictionary lives in this manifest, under `props_dict`, base64 of about 32 KB built
 from the store's own most frequent tails. It is part of the store rather than metadata
 about it: without it every `props` blob is unreadable, which is why it does not live in a
 sidecar file. A store whose tails held nothing worth sharing gets an empty dictionary, and
 that is the same code path as plain deflate on both sides.
+
+The prefix table sits beside it under `id_prefixes`, and is there for the same reason: a
+coded id names its prefix by index into that list, so losing the list makes every id in
+the store unreadable. Kùzu dictionary-encodes a `STRING` column by storing each distinct
+value once, which is free and total for `language` or `frontend_id` and does nothing at
+all for a column whose values are all distinct, which `id` and `compiler_node_id` are by
+construction. What repeats in them is the prefix, not the value, so the codec replaces the
+prefix with a base36 index and respells the 20 hex characters of content hash as base64url
+of the same ten bytes: about 62 characters down to about 17. Values that are not id-shaped
+are stored with a one-character escape, so the coding is total over the column and its
+inverse needs nothing but the table.
+
+Coding the primary key is worth more than coding an ordinary column, because a key is
+charged twice. A column value is charged once in `<col>_data`, which is allocated a
+power-of-two count of pages and so only pays when a boundary is crossed. A key is charged
+again in the primary-key index, which holds the key string, and that charge is linear in
+key length: measured at roughly 0.31 MB per character across a store of this size, with
+no boundary to wait for.
+
+Above the storage boundary none of this is visible: the reader decodes as it scans and
+encodes the ids it looks up, so every map, cache and returned dict holds the real id. Two
+things inside the reader do change with it. Neither scan can use `ORDER BY n.id` any more,
+since coded order is not real order, so the ordering moves to Python where it runs on the
+decoded id. And edge ordering can no longer rest on the scan order, which Kùzu does not
+promise: two edges may share `(kind, source, target)` and differ only in properties, so the
+properties are part of the sort key rather than a tie left to storage layout.
 
 Up to v3 the column set was fixed, so a newer reader could read an older store: the older
 `props` was a superset and won on merge. v4 adds columns, so its reader selects names the
