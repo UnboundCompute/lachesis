@@ -63,13 +63,24 @@ except Exception:  # pragma: no cover - falls back to per-row inserts if absent
 # node property -> promoted column. `props` carries the *tail*: every property not
 # already stored in one of these typed columns (and minus the elided constants). The
 # read side unions the columns back in, so nothing is lost and nothing is stored twice.
+#
+# Which keys belong here is a *disk* question with a sharp answer, not a matter of taste.
+# Kùzu allocates each column's data chunk a power-of-two number of 4 KB pages, per
+# 131,072-row node group, and writes that allocation into the file. So bytes are free
+# until they cross a boundary, and then a whole bucket is free at once. Promoting a key
+# moves its name out of ~200k JSON blobs and into one dictionary-encoded column, which
+# is what walks `props` down toward the next boundary. See STORE_COMPRESSION_SPEC.md 0.2;
+# the six keys after `unit` below are the ones that measurement picked.
 PROMOTED_NODE_PROPS = (
     "symbol_name", "file", "absolute_file", "start_line", "end_line",
     "start_offset", "end_offset", "owner_function_id", "function_id",
     "type", "package_name", "content_hash", "unit",
+    "frontend_id", "frontend_tier", "language", "compiler_node_id",
+    "start_column", "end_column",
 )
 _INT_COLUMNS = frozenset({
     "start_line", "end_line", "start_offset", "end_offset",
+    "start_column", "end_column",
 })
 # The keys a node's `props` blob may omit. `unit` is not among them: it is *derived*
 # (from `file`, see `_promoted_value`) rather than a property key of its own, so there
@@ -109,10 +120,16 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # On-disk format of the store, stamped into the manifest.
 #   2 — `props` carries the whole properties dict; promoted columns are duplicates.
 #   3 — `props` carries only the tail; the reader unions the promoted columns back in.
-# A v3 reader reads a v2 store correctly (the tail is a superset and wins on merge);
-# a v2 reader silently loses the promoted keys from a v3 store, which is what this
-# stamp exists to let a reader detect.
-STORE_FORMAT_VERSION = 3
+#   4 — six more keys promoted to columns; `props` uses compact JSON separators.
+# v4 is the first version that is not backward compatible, and the tail-wins rule is why
+# the earlier ones were. Up to v3 the column set was fixed, so a newer reader could read
+# an older store: the older store's `props` was a superset and won on merge. v4 *adds*
+# columns, so its reader selects names a v2 or v3 schema does not have and the query
+# fails. Both directions are now hard failures, and the load path checks this stamp so
+# they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
+# is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
+# migration.
+STORE_FORMAT_VERSION = 4
 
 
 def db_file(db_dir: str) -> str:
@@ -239,7 +256,10 @@ def _stored_props(properties: dict, elide: bool,
             if not (elide and k in CONSTANT_PROP_DEFAULTS)
             and not (k in drop and _column_faithful(k, v))
         }
-    return json.dumps(properties)
+    # Compact separators: `json.dumps` defaults to ", " and ": ", which is two bytes of
+    # whitespace per key on every row and nothing else. `json.loads` cannot tell the
+    # difference, so this is invisible above the column.
+    return json.dumps(properties, separators=(",", ":"))
 
 
 def _is_test_file(path: Optional[str]) -> bool:

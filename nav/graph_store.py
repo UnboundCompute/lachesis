@@ -81,12 +81,20 @@ def _cache_matches(cache_path: str, core_hash: str | None) -> bool:
 
     A missing hash on either side is a miss, never a match: an unkeyed cache cannot be
     proven to describe the current core, and serving a stale dataflow tier is worse
-    than rebuilding one."""
-    from Lachesis.kuzu_store import is_kuzu_dir, read_store_manifest
+    than rebuilding one.
+
+    A cache written by an older store format is a miss too, and it has to be caught
+    here rather than at open: ``core_content_hash`` covers node ids and edge triples
+    and deliberately excludes properties, so an outdated cache still hashes as a hit
+    and would be opened by a reader whose columns it does not have."""
+    from Lachesis.kuzu_store import (STORE_FORMAT_VERSION, is_kuzu_dir,
+                                     read_store_manifest)
     if not core_hash or not is_kuzu_dir(cache_path):
         return False
     cached = read_store_manifest(cache_path)
-    return bool(cached.get("enriched")) and cached.get("core_content_hash") == core_hash
+    return (cached.get("version") == STORE_FORMAT_VERSION
+            and bool(cached.get("enriched"))
+            and cached.get("core_content_hash") == core_hash)
 
 
 def _copy_frontend_inventory(core_path: str, cache_path: str) -> None:
@@ -148,13 +156,24 @@ class GraphStore:
         overlay dataflow tier is materialized lazily by ``ensure_dataflow_tier`` on the
         first tool that needs it, and a previously built cache beside the store is
         opened directly here so the steady state costs nothing extra."""
-        from Lachesis.kuzu_store import is_kuzu_dir, read_store_manifest
+        from Lachesis.kuzu_store import (STORE_FORMAT_VERSION, is_kuzu_dir,
+                                         read_store_manifest)
         if not is_kuzu_dir(graph_path):
             raise ValueError(
                 f"{graph_path} is not a Lachesis graph store; build one with "
                 f"`lachesis-analyze <source_dir> {graph_path}`"
             )
         core_manifest = read_store_manifest(graph_path)
+        # Checked here rather than deeper down because the failure it replaces is a
+        # Cypher error naming a column, which says nothing about what to do. A store is
+        # a rebuildable artifact, so the fix is always the same sentence.
+        found = core_manifest.get("version")
+        if found != STORE_FORMAT_VERSION:
+            raise ValueError(
+                f"{graph_path} is a v{found} graph store and this build reads "
+                f"v{STORE_FORMAT_VERSION}; rebuild it with "
+                f"`lachesis-analyze <source_dir> {graph_path}`"
+            )
         open_path = graph_path
         if not core_manifest.get("enriched", True):
             cached = enriched_store_path(graph_path)

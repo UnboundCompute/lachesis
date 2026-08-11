@@ -153,12 +153,18 @@ own `node_count`/`edge_count`, and two fields that make deferred enrichment poss
 It also carries `version`, the on-disk format. **v2** stores the full properties dict in
 every `props` blob, so the promoted typed columns are duplicates the reader never touches.
 **v3** stores only the tail in `props` and has the reader union the promoted columns back
-in. A v3 reader reads a v2 store correctly, because the tail is a superset and wins on
-merge; a v2 reader reads a v3 store *quietly wrong*, losing the promoted keys from every
-node. Detecting that is the only reason the stamp exists. The `<store>.enriched` cache
-needs no invalidation across the bump: `core_content_hash` covers ids and edge triples and
-deliberately excludes properties, and an old-format cache read by the new reader
-reconstructs correctly by the same tail-wins rule.
+in. **v4** promotes six more keys and writes the tail with compact JSON separators.
+
+Up to v3 the column set was fixed, so a newer reader could read an older store: the older
+`props` was a superset and won on merge. v4 adds columns, so its reader selects names the
+older schema does not have and the query fails. Both directions are now incompatible, and
+`GraphStore.load` checks the stamp so this arrives as a sentence telling you to rebuild
+rather than as a Cypher error naming a column.
+
+That check has to cover the `<store>.enriched` cache too, and `_cache_matches` is where it
+goes: `core_content_hash` covers node ids and edge triples and deliberately excludes
+properties, so a cache written by an older format still hashes as a hit and would
+otherwise be opened by a reader whose columns it does not have.
 
 The languages and capabilities in the inventory are exactly the two inputs overlay
 enrichment needs beyond the graph itself, which is why the tier can be rebuilt from a
