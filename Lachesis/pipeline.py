@@ -104,7 +104,15 @@ def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
     test predicate is the single source of truth in ``nav.symbol_index`` (imported
     lazily to avoid an import cycle), so build-time exclusion can never drift from any
     query-time notion of "is a test"."""
-    ignored = {".git", "node_modules", "graph_out", "dist", "build"}
+    # node_modules has a Python counterpart in every direction: an installed
+    # virtualenv, a build cache, and a tool cache. Walking any of them analyses
+    # somebody else's source as if it were the project's, which is both slow and
+    # wrong; site-packages alone can outweigh the repository several times over.
+    ignored = {
+        ".git", "node_modules", "graph_out", "dist", "build",
+        ".venv", "venv", "__pycache__", ".tox", ".nox",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages", ".eggs",
+    }
     is_test = None
     if not include_tests:
         from nav.symbol_index import is_test_path as is_test
