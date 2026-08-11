@@ -67,7 +67,8 @@ def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileI
     if unsupported:
         raise ValueError(
             "FileInfo semantic overlays currently support TS/JS paths; use "
-        "run_project() for mixed-language/C canonical graphs. "
+        "run_project() for mixed-language canonical graphs, which is how C and "
+        "Python are analysed. "
             f"First unsupported path: {unsupported[0]}"
         )
     from ..pipeline import run_project

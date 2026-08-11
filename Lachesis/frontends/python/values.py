@@ -436,9 +436,22 @@ class ValueWalk:
             self.allocation(node, frame, ALLOCATION_KIND[type(node)])
 
     def call_result(self, node: ast.Call, call_id: str, frame, constructed) -> None:
-        """What a call hands back, and the object a constructor creates."""
+        """What a call hands back, and the object a constructor creates.
+
+        ``value_id`` and ``receiver_value_id`` are stamped on the call site
+        because the runtime models read them from there
+        (Lachesis/ecosystems/common/runtime.py:146,154): without them a modelled
+        call can say what it does but not flow anything through it.
+        """
         value_id = self.value_of(node, frame)
         self.graph.edge("VALUE_FLOWS_TO", call_id, value_id, reason="call-result")
+        receiver_value_id = (
+            self.value_of(node.func.value, frame)
+            if isinstance(node.func, ast.Attribute) else None
+        )
+        self.graph.annotate(
+            call_id, value_id=value_id, receiver_value_id=receiver_value_id,
+        )
         if constructed is not None:
             self.allocation(
                 node, frame, "class-instance",
