@@ -108,6 +108,18 @@ The Kùzu backend is the one you want at scale. On a real whole-package graph of
 
 The [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) covers the on-disk layout, the incremental unit key, and the trade-offs we measured. The short version: columnar scans give up a little warm-query latency in exchange for a large win on RAM and startup time.
 
+## Documentation
+
+- [`examples/README.md`](./examples/README.md) is the five-minute walkthrough:
+  build a graph and read a guard differential and a taint path out of it.
+- [`docs/graph-model.md`](./docs/graph-model.md) is the reference for what the
+  graph contains: the node kinds, the edge kinds, and the tiers, generated from
+  the canonical contract.
+- [`docs/queries.md`](./docs/queries.md) is the reference for asking the graph
+  questions, both the `lachesis-query` command line and the `lachesis-mcp` tools.
+- [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) covers the embedded columnar store:
+  the on-disk layout, the incremental unit key, and the trade-offs measured.
+
 ## Status
 
 Lachesis is early and moving fast. The graph model, the Kùzu store, and the navigation and MCP layer all work today, and they are covered by a parity test suite in `Lachesis/frontends/checks.py`.
