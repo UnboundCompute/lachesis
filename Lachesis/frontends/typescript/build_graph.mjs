@@ -209,11 +209,18 @@ const applicationRootNames = rootsFile ? readRoots(rootsFile) : walk(sourceDir);
 if (!applicationRootNames.length) throw new Error(`No TypeScript/JavaScript files found under ${sourceDir}`);
 const rootSet = new Set(applicationRootNames.map(normalize));
 const config = compilerOptions();
+// First-party-only analysis (default ON; set LACHESIS_INCLUDE_DEP_TYPES=1 to restore old behavior).
+// When on, we do NOT pull 3rd-party dependency source into the analysis roots and we resolve external
+// bare imports to nothing (=> `any`). This bounds memory to first-party size — the transitive SDK
+// source/type universe (e.g. the whole MS Graph API) is what blows the heap, and for taint/dataflow
+// an external value is opaque/untrusted anyway.
+const firstPartyOnly = process.env.LACHESIS_INCLUDE_DEP_TYPES !== "1";
+const defaultDependencyLimit = firstPartyOnly ? "0" : "500";
 const configuredDependencyLimit = Number.parseInt(
-  process.env.LACHESIS_MAX_DEPENDENCY_FILES || "500", 10,
+  process.env.LACHESIS_MAX_DEPENDENCY_FILES || defaultDependencyLimit, 10,
 );
 const dependencyLimit = Number.isFinite(configuredDependencyLimit) && configuredDependencyLimit >= 0
-  ? configuredDependencyLimit : 500;
+  ? configuredDependencyLimit : (firstPartyOnly ? 0 : 500);
 
 function sourceSpecifiers(fileName) {
   let text;
@@ -271,7 +278,47 @@ function discoverRuntimeDependencies(entries) {
 const runtimeDependencyNames = discoverRuntimeDependencies(applicationRootNames);
 const compilerRootNames = [...new Set([...applicationRootNames, ...runtimeDependencyNames])];
 const compilerRootSet = new Set(compilerRootNames.map(normalize));
-const program = ts.createProgram({ rootNames: compilerRootNames, options: config.options });
+
+// First-party-only type resolution (default ON; set LACHESIS_INCLUDE_DEP_TYPES=1 to restore).
+// tsc otherwise auto-loads the full transitive .d.ts closure of every imported 3rd-party SDK
+// (e.g. @microsoft/teams.graph-endpoints = the whole MS Graph API as types), which is the real
+// heap blow-up — not first-party file count. For taint/dataflow a value from an external dep is
+// opaque/untrusted anyway, so resolving external bare imports to nothing (=> `any`) is both
+// memory-bounded and semantically fine. Workspace packages realpath to first-party source (not
+// node_modules), so they stay precise; only true externals (node_modules / pnpm .pnpm store) drop.
+const firstPartyTypesOnly = firstPartyOnly;
+const isExternalResolved = (fileName) =>
+  /[\\/](?:node_modules|\.pnpm|\.yarn[\\/]cache)[\\/]/.test(normalize(fileName));
+
+let compilerHost;
+let compilerOptionsForProgram = config.options;
+if (firstPartyTypesOnly) {
+  // Never auto-include ambient @types/* global packages — another unbounded source.
+  compilerOptionsForProgram = { ...config.options, types: [] };
+  compilerHost = ts.createCompilerHost(compilerOptionsForProgram, true);
+  const resolveOne = (name, containingFile, redirected) => {
+    const { resolvedModule } = ts.resolveModuleName(
+      name, containingFile, compilerOptionsForProgram, compilerHost, undefined, redirected,
+    );
+    if (!resolvedModule) return undefined;
+    // Drop external resolutions so their .d.ts universe is never parsed (=> import types to `any`).
+    if (isExternalResolved(resolvedModule.resolvedFileName)) return undefined;
+    return resolvedModule;
+  };
+  // Support both the classic and the TS5 resolution hooks so we work across versions.
+  compilerHost.resolveModuleNames = (names, containingFile, _r, redirected) =>
+    names.map((name) => resolveOne(name, containingFile, redirected));
+  compilerHost.resolveModuleNameLiterals = (literals, containingFile, redirected) =>
+    literals.map((lit) => ({
+      resolvedModule: resolveOne(lit.text, containingFile, redirected),
+    }));
+}
+
+const program = firstPartyTypesOnly
+  ? ts.createProgram({
+      rootNames: compilerRootNames, options: compilerOptionsForProgram, host: compilerHost,
+    })
+  : ts.createProgram({ rootNames: compilerRootNames, options: config.options });
 const checker = program.getTypeChecker();
 const compilerRootSources = compilerRootNames
   .map((fileName) => program.getSourceFile(fileName))
