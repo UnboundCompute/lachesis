@@ -133,7 +133,12 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 #   4 — six more keys promoted to columns; `props` uses compact JSON separators.
 #   5 — `props` is a deflated BLOB rather than a JSON STRING.
 #   6 — the deflate uses a preset dictionary shared by every row, kept in the manifest.
-#   7 — the all-distinct id columns are coded against a prefix table in the manifest.
+#   7 — `compiler_node_id` is coded against a prefix table in the manifest.
+#   8 — the `id` primary key is coded against that same table.
+# v8 is a separate version from v7 and not a refinement of it: a v7 store carries the
+# prefix table but an *uncoded* `id`, so a v8 reader handed one would decode a value
+# that was never encoded. The stamp is what turns that into a sentence rather than a
+# base64 error from somewhere deep in the read path.
 # v4 is the first version that is not backward compatible, and the tail-wins rule is why
 # the earlier ones were. Up to v3 the column set was fixed, so a newer reader could read
 # an older store: the older store's `props` was a superset and won on merge. v4 *adds*
@@ -142,7 +147,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 7
+STORE_FORMAT_VERSION = 8
 
 
 def db_file(db_dir: str) -> str:
@@ -296,15 +301,20 @@ PROPS_DICT_KEY = "props_dict"
 # Manifest key holding the prefix table the coded id columns are written against.
 ID_PREFIX_KEY = "id_prefixes"
 
-# The columns coded against it: node ids held as an ordinary property. They are the one
-# shape in this store that every other lever misses. Kùzu dictionary-encodes a STRING
-# column by storing each *distinct* value once, which is free and total for a column
-# like `language`; it does nothing at all for a column whose values are all distinct,
-# and on the reference store `compiler_node_id` has 203,367 values and 203,367 distinct
-# ones. What repeats there is not the value but its *prefix* — 24 of them across those
-# 203,367 rows — and a prefix is not something a per-value dictionary can factor out.
-CODED_ID_COLUMNS = ("compiler_node_id",)
-_CODED_SET = frozenset(CODED_ID_COLUMNS)
+# The columns coded against it: the primary key, and node ids held as an ordinary
+# property. They are the one shape in this store that every other lever misses. Kùzu
+# dictionary-encodes a STRING column by storing each *distinct* value once, which is
+# free and total for a column like `language`; it does nothing at all for a column
+# whose values are all distinct, and on the reference store `id` has 244,954 values and
+# `compiler_node_id` 203,367, every one of them distinct. What repeats there is not the
+# value but its *prefix* — 49 and 24 respectively — and a prefix is not something a
+# per-value dictionary can factor out.
+CODED_ID_COLUMNS = ("id", "compiler_node_id")
+
+# Just the promoted-property ones. `id` is a leading column of its own rather than a
+# props key, so it is coded at the column and never appears in a properties dict.
+CODED_PROP_COLUMNS = tuple(c for c in CODED_ID_COLUMNS if c != "id")
+_CODED_SET = frozenset(CODED_PROP_COLUMNS)
 
 # A node id: a hierarchical prefix, a colon, then 20 hex characters of content hash.
 # The prefix group is greedy, so the hash is the *last* 20 hex characters and a prefix
@@ -571,12 +581,15 @@ def write_kuzu_graph(
     ))
 
     # The other manifest-carried table: the id prefixes the coded columns are written
-    # against. Nodes only — the coded columns are node properties — and the whole table
-    # has to exist before the first row is written, since a code is an index into it.
-    id_prefixes = build_id_prefixes(
-        (n.get("properties") or {}).get(column)
-        for n in nodes for column in CODED_ID_COLUMNS
-    )
+    # against. Nodes only — every coded column is on the node table — and the whole
+    # table has to exist before the first row is written, since a code is an index into
+    # it. Edge endpoints need no pass of their own: an endpoint is a node id, so its
+    # prefix is already here by way of that node's own `id`.
+    id_prefixes = build_id_prefixes(itertools.chain(
+        (n.get("id") for n in nodes),
+        ((n.get("properties") or {}).get(column)
+         for n in nodes for column in CODED_PROP_COLUMNS),
+    ))
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(id_prefixes)}
 
     if pa is not None and pq is not None:
@@ -584,12 +597,13 @@ def write_kuzu_graph(
             _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir,
                              zdict=props_dict, id_codes=id_codes)
             _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
-                             node_units=node_units, zdict=props_dict)
+                             node_units=node_units, zdict=props_dict,
+                             id_codes=id_codes)
     else:  # pragma: no cover - exercised only without pyarrow
         _load_nodes_rowwise(conn, nodes, elide=elide_constants, zdict=props_dict,
                             id_codes=id_codes)
         _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units,
-                            zdict=props_dict)
+                            zdict=props_dict, id_codes=id_codes)
     # counts describe what the store actually holds, which is the pruned set, not the
     # composed input — a reader comparing them against a scan should find them equal.
     payload = manifest_payload(graph, snapshots)
@@ -676,7 +690,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
     data: dict[str, list] = {c: [] for c in columns}
     for node in nodes:
         props = node.get("properties") or {}
-        data["id"].append(node["id"])
+        data["id"].append(encode_id(node["id"], id_codes or {}))
         data["kind"].append(node.get("kind"))
         data["label"].append(node.get("label"))
         for prop in PROMOTED_NODE_PROPS:
@@ -691,7 +705,8 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
 
 
 def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
-                     node_units: dict, zdict: bytes = b"") -> None:
+                     node_units: dict, zdict: bytes = b"",
+                     id_codes: Optional[dict] = None) -> None:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
     hot: dict[str, dict[str, list]] = {
@@ -700,20 +715,24 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
     }
     cold: dict[str, list] = {"src": [], "tgt": [], "kind": [], "sem": [],
                              "unit": [], "props": []}
+    # An endpoint is matched against the `id` column, so it has to be coded the same way
+    # that column was — the staged Parquet holds coded ids, not the graph's own.
+    codes = id_codes or {}
     for edge in edges:
         kind = edge.get("kind")
         props = edge.get("properties") or {}
         unit = _edge_unit(edge, node_units)
         stored = _stored_props(props, elide, zdict=zdict)
+        src, tgt = encode_id(edge["source"], codes), encode_id(edge["target"], codes)
         if kind in _HOT_SET:
             bucket = hot[kind]
-            bucket["src"].append(edge["source"])
-            bucket["tgt"].append(edge["target"])
+            bucket["src"].append(src)
+            bucket["tgt"].append(tgt)
             bucket["unit"].append(unit)
             bucket["props"].append(stored)
         else:
-            cold["src"].append(edge["source"])
-            cold["tgt"].append(edge["target"])
+            cold["src"].append(src)
+            cold["tgt"].append(tgt)
             cold["kind"].append(kind)
             cold["sem"].append(_semantic_kind(edge))
             cold["unit"].append(unit)
@@ -755,7 +774,8 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
     try:
         for node in nodes:
             props = node.get("properties") or {}
-            params = {"id": node["id"], "kind": node.get("kind"),
+            params = {"id": encode_id(node["id"], id_codes or {}),
+                      "kind": node.get("kind"),
                       "label": node.get("label")}
             for prop in PROMOTED_NODE_PROPS:
                 params[prop] = _coded_cell(prop, _promoted_value(props, prop),
@@ -769,7 +789,8 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
 
 
 def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dict,
-                        zdict: bytes = b"") -> None:
+                        zdict: bytes = b"",
+                        id_codes: Optional[dict] = None) -> None:
     hot_stmt = {
         kind: (f"MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
                f"CREATE (a)-[:{kind} {{unit: $unit, props: $props}}]->(b)")
@@ -783,7 +804,8 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
         for edge in edges:
             kind = edge.get("kind")
             props = edge.get("properties") or {}
-            base = {"s": edge["source"], "t": edge["target"],
+            base = {"s": encode_id(edge["source"], id_codes or {}),
+                    "t": encode_id(edge["target"], id_codes or {}),
                     "unit": _edge_unit(edge, node_units),
                     "props": _stored_props(props, elide, zdict=zdict)}
             if kind in _HOT_SET:

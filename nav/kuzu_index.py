@@ -36,13 +36,15 @@ from typing import Iterable, Optional, Sequence
 
 from Lachesis.core.query import GraphIndex
 from Lachesis.kuzu_store import (
-    CODED_ID_COLUMNS,
+    CODED_PROP_COLUMNS,
     CONSTANT_PROP_DEFAULTS,
     HOT_REL_KINDS,
     PROMOTED_NODE_PROPS,
     _HOT_SET,
+    _prefix_code,
     db_file,
     decode_id,
+    encode_id,
     manifest_id_prefixes,
     manifest_props_dictionary,
     read_store_manifest,
@@ -53,7 +55,21 @@ try:  # 3.10+ only
 except Exception:  # pragma: no cover
     kuzu = None
 
-_EDGE_SORT = lambda e: (e.get("kind") or "", e.get("source") or "", e.get("target") or "")
+def _EDGE_SORT(edge: dict) -> tuple:
+    """Total order on edges, ``(kind, source, target)`` plus the properties.
+
+    The properties are in the key for the same reason ``materialize_graph`` puts them
+    in its own tie-break: two edges can share all three of ``(kind, source, target)``
+    and differ only in props — two ``CALLS`` from one constructor to one method, from
+    different callsites, is the common case — and without them the tie is resolved by
+    whatever order Kùzu happened to scan in. Kùzu promises no scan order, so that made
+    the output of ``_edges`` and ``edges_of_kind`` a function of storage layout: coding
+    the primary key reordered the scan and the same store answered the same query in a
+    different order. Same edges either way, but a navigation tool that lists callers
+    twice should list them the same way twice.
+    """
+    return (edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
+            json.dumps(edge.get("properties") or {}, sort_keys=True))
 
 
 def _overlay_edge_key(edge: dict) -> str:
@@ -96,7 +112,8 @@ _MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
 # Positions in that tuple holding a coded node id, resolved once rather than per row:
 # this runs 244,954 times on a materialize and a set lookup per column per node is not
 # free at that count.
-_CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS) if c in CODED_ID_COLUMNS)
+_CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
+                      if c in CODED_PROP_COLUMNS)
 
 
 def _restore_node_props(columns, props_blob: Optional[bytes],
@@ -138,17 +155,23 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
     materialized graph compares equal to a freshly composed one.
     """
     nodes = []
+    # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
+    # order is not the real one — the prefix sorts as a base36 code and the hash as
+    # base64, neither of which is order-preserving. Sorting the decoded ids in Python
+    # is what keeps this equal to ``combine_graphs``, and it also drops the Cypher sort.
     res = index._conn.execute(
-        f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props "
-        "ORDER BY n.id"
+        f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props"
     )
     while res.has_next():
         row = res.get_next()
         nid, kind, label = row[:3]
+        nid = decode_id(nid, index._id_prefixes)
         nodes.append({"id": nid, "kind": kind, "label": label,
                       "properties": _restore_node_props(row[3:-1], row[-1],
                                                         index._props_dict,
                                                         index._id_prefixes)})
+    nodes.sort(key=lambda n: n["id"])
+    prefixes = index._id_prefixes
     edges = []
     for kind in HOT_REL_KINDS:
         res = index._conn.execute(
@@ -156,14 +179,16 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         )
         while res.has_next():
             src, tgt, props = res.get_next()
-            edges.append({"source": src, "target": tgt, "kind": kind,
+            edges.append({"source": decode_id(src, prefixes),
+                          "target": decode_id(tgt, prefixes), "kind": kind,
                           "properties": _restore(props, index._props_dict)})
     res = index._conn.execute(
         "MATCH (a:Node)-[e:EDGE]->(b:Node) RETURN a.id, b.id, e.kind, e.props"
     )
     while res.has_next():
         src, tgt, kind, props = res.get_next()
-        edges.append({"source": src, "target": tgt, "kind": kind,
+        edges.append({"source": decode_id(src, prefixes),
+                      "target": decode_id(tgt, prefixes), "kind": kind,
                       "properties": _restore(props, index._props_dict)})
     # Kùzu does not promise a scan order, and two edges can share
     # ``(kind, source, target)`` while differing in props, so the tie-break folds the
@@ -246,6 +271,11 @@ class KuzuGraphIndex:
         manifest = read_store_manifest(db_dir)
         self._props_dict = manifest_props_dictionary(manifest)
         self._id_prefixes = manifest_id_prefixes(manifest)
+        # The same table inverted, for the lookup direction: `_node`/`_edges` take a
+        # real id and have to match it against the coded `id` column. Built once at
+        # open rather than per lookup — nav does hundreds of thousands of these.
+        self._id_codes = {prefix: _prefix_code(i)
+                          for i, prefix in enumerate(self._id_prefixes)}
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}
@@ -265,12 +295,16 @@ class KuzuGraphIndex:
         self.by_file: dict = defaultdict(list)
         self.by_owner: dict = defaultdict(list)
         self._ids: list[str] = []
+        # Decoded here and nowhere below: every map this builds is keyed by, and holds,
+        # the real id, so the coding stops at this loop and the rest of the index — and
+        # every nav tool above it — never sees a coded value.
         res = self._conn.execute(
             "MATCH (n:Node) RETURN n.id, n.kind, n.label, n.file, n.absolute_file, "
-            "n.owner_function_id, n.function_id ORDER BY n.id"
+            "n.owner_function_id, n.function_id"
         )
         while res.has_next():
             nid, kind, label, file, abs_file, owner, fn = res.get_next()
+            nid = decode_id(nid, self._id_prefixes)
             self._ids.append(nid)
             self.by_kind[kind].append(nid)
             self.by_label[label].append(nid)
@@ -280,6 +314,14 @@ class KuzuGraphIndex:
             owner_key = owner or fn
             if owner_key:
                 self.by_owner[owner_key].append(nid)
+        # The scan used to arrive in id order from `ORDER BY n.id`, which every bucket
+        # inherited by construction; the stored id is coded now and that order is not
+        # the real one, so sort what the order was doing for us. Buckets included: a
+        # tool that lists a file's nodes should list them the same way twice.
+        self._ids.sort()
+        for buckets in (self.by_kind, self.by_label, self.by_file, self.by_owner):
+            for ids in buckets.values():
+                ids.sort()
 
     # -- sidecar overlay ----------------------------------------------------
 
@@ -333,7 +375,7 @@ class KuzuGraphIndex:
             return self._node_cache[node_id]
         res = self._conn.execute(
             f"MATCH (n:Node {{id: $id}}) RETURN n.kind, n.label, {_MERGED_SELECT}, "
-            "n.props", {"id": node_id}
+            "n.props", {"id": encode_id(node_id, self._id_codes)}
         )
         node = None
         if res.has_next():
@@ -358,11 +400,12 @@ class KuzuGraphIndex:
         else:
             cypher = ("MATCH (a:Node {id: $id})-[e]->(b:Node) "
                       "RETURN label(e), b.id, e.kind, e.semantic_kind, e.props")
-        res = self._conn.execute(cypher, {"id": node_id})
+        res = self._conn.execute(cypher, {"id": encode_id(node_id, self._id_codes)})
         edges = []
         while res.has_next():
             label, other, kind_col, sem_col, props = res.get_next()
             kind = kind_col if label == "EDGE" else label
+            other = decode_id(other, self._id_prefixes)
             src, tgt = (other, node_id) if reverse else (node_id, other)
             edges.append({"source": src, "target": tgt, "kind": kind,
                           "properties": _restore(props, self._props_dict)})
@@ -436,7 +479,9 @@ class KuzuGraphIndex:
             )
             while res.has_next():
                 src, tgt, props = res.get_next()
-                edges.append({"source": src, "target": tgt, "kind": kind,
+                edges.append({"source": decode_id(src, self._id_prefixes),
+                              "target": decode_id(tgt, self._id_prefixes),
+                              "kind": kind,
                               "properties": _restore(props, self._props_dict)})
         res = self._conn.execute(
             "MATCH (a:Node)-[e:EDGE]->(b:Node) WHERE e.semantic_kind IN $kinds "
@@ -444,7 +489,8 @@ class KuzuGraphIndex:
         )
         while res.has_next():
             src, tgt, kind, props = res.get_next()
-            edges.append({"source": src, "target": tgt, "kind": kind,
+            edges.append({"source": decode_id(src, self._id_prefixes),
+                          "target": decode_id(tgt, self._id_prefixes), "kind": kind,
                           "properties": _restore(props, self._props_dict)})
         if self._overlay is not None:
             edges.extend(dict(e) for e in self._overlay.derived_edges
