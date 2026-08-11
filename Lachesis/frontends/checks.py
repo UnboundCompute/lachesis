@@ -1137,6 +1137,169 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertIn("driver_ops", [c["name"] for c in callers_of])
             self.assertTrue(all(c["via"].startswith("indirect") for c in callers_of))
 
+    def test_python_declarations_and_byte_exact_read_body(self) -> None:
+        # The CPython AST frontend, at its declaration layer: the nodes `search`,
+        # `read_body` and `open_folder` navigate by. The offset assertions are the
+        # point of the test — `ast` reports column offsets as UTF-8 byte counts into
+        # the physical line while nav slices decoded text by character, so on any
+        # file with one non-ASCII character an unconverted offset silently returns
+        # the wrong source. app/util/text.py is written to expose exactly that.
+        import ast as ast_module
+        import tokenize as tokenize_module
+
+        from nav.graphlib import GraphLib
+        from nav.symbol_index import build_index, _resolve
+
+        fixtures = ROOT / "Lachesis" / "frontends" / "python" / "fixtures"
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(fixtures), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            self.assertEqual(2, snapshot.contract_version)
+            self.assertEqual(("python",), tuple(snapshot.languages))
+            self.assertTrue(all(
+                node["id"].startswith("v2:frontend:cpython-ast:")
+                for node in snapshot.nodes
+            ))
+            self.assertEqual(0, snapshot.manifest["failed_file_count"])
+            # Nothing may be silently discarded: every edge's endpoints exist.
+            self.assertEqual(0, snapshot.manifest["dropped_edge_count"])
+
+            by_kind: dict[str, dict[str, dict]] = {}
+            for node in snapshot.nodes:
+                by_kind.setdefault(node["kind"], {})[node["label"]] = node
+            # def inside a class is a method, __init__ is a constructor, and a def
+            # at module level (or nested in one) is a plain function.
+            self.assertIn("open_repository", by_kind["function"])
+            self.assertIn("fetch", by_kind["method"])
+            self.assertIn("__init__", by_kind["constructor"])
+            self.assertIn("Repository", by_kind["class"])
+            self.assertIn("CachingRepository", by_kind["class"])
+            self.assertIn("Nested", by_kind["class"])
+            self.assertNotIn("fetch", by_kind["function"])
+            self.assertNotIn("open_repository", by_kind["method"])
+            # A nested def belongs to the function that declares it, not the module.
+            self.assertEqual(
+                by_kind["function"]["outer"]["id"],
+                by_kind["function"]["inner"]["properties"]["owner_function_id"],
+            )
+            self.assertTrue(by_kind["function"]["counter"]["properties"]["is_generator"])
+            self.assertFalse(by_kind["function"]["outer"]["properties"]["is_generator"])
+            self.assertTrue(by_kind["function"]["fetch_all"]["properties"]["is_async"])
+            self.assertEqual(
+                "full_parameter_matrix(positional, standard, defaulted=..., *rest, "
+                "keyword, keyword_defaulted=..., **extra)",
+                by_kind["function"]["full_parameter_matrix"]["properties"]["signature"],
+            )
+            parameter_forms = {
+                node["label"]: node["properties"]["parameter_form"]
+                for node in snapshot.nodes
+                if node["kind"] == "parameter"
+                and node["properties"]["owner_function_id"]
+                == by_kind["function"]["full_parameter_matrix"]["id"]
+            }
+            self.assertEqual({
+                "positional": "positional-only", "standard": "positional-or-keyword",
+                "defaulted": "positional-or-keyword", "rest": "var-positional",
+                "keyword": "keyword-only", "keyword_defaulted": "keyword-only",
+                "extra": "var-keyword",
+            }, parameter_forms)
+            # file -> declaration is a cross-tier structural link, surfaced as
+            # EXPANDS_TO(via=DECLARES) exactly as the C frontend surfaces its own.
+            repository_id = by_kind["class"]["Repository"]["id"]
+            self.assertTrue(any(
+                edge["kind"] == "EXPANDS_TO" and edge["target"] == repository_id
+                and edge["properties"].get("via") == "DECLARES"
+                for edge in snapshot.edges
+            ))
+            # class -> method stays within T1, so it is a plain DECLARES_MEMBER and
+            # is not wrapped. `fetch` is declared twice (base and override), so the
+            # edge is matched by owner, never by label alone.
+            base_fetch = next(
+                node for node in snapshot.nodes
+                if node["kind"] == "method" and node["label"] == "fetch"
+                and node["properties"]["owner_id"] == repository_id
+            )
+            self.assertTrue(any(
+                edge["kind"] == "DECLARES_MEMBER" and edge["source"] == repository_id
+                and edge["target"] == base_fetch["id"]
+                for edge in snapshot.edges
+            ))
+
+            # read_body, on the file built to break naive offsets. Every declaration
+            # in it must slice back to exactly what the compiler itself reports.
+            gl = GraphLib({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            index = build_index(gl)
+            unicode_file = fixtures / "app" / "util" / "text.py"
+            with tokenize_module.open(str(unicode_file)) as handle:
+                text = handle.read()
+            tree = ast_module.parse(text)
+            expected = {
+                statement.name: ast_module.get_source_segment(text, statement)
+                for statement in tree.body
+                if isinstance(statement, ast_module.FunctionDef)
+            }
+            self.assertEqual({"greet", "shout", "normalize", "banner"}, set(expected))
+            for name, segment in expected.items():
+                resolved = _resolve(gl, index, name)
+                self.assertTrue(resolved, f"search found no node named {name!r}")
+                node = gl.nodes[resolved[0]["node_id"]]
+                self.assertEqual(segment, gl.source_text(node), f"read_body({name})")
+            # `banner`'s parameters sit to the right of a non-ASCII default on the
+            # same line, which is where a byte column and a character column part
+            # ways; both must still slice to their own name.
+            for node in snapshot.nodes:
+                if node["kind"] != "parameter":
+                    continue
+                properties = node["properties"]
+                if properties["absolute_file"] != str(unicode_file):
+                    continue
+                self.assertEqual(
+                    node["label"],
+                    text[properties["start_offset"]:properties["end_offset"]],
+                )
+                self.assertEqual(
+                    node["label"][0],
+                    text.split("\n")[properties["start_line"] - 1][
+                        properties["start_column"] - 1
+                    ],
+                )
+
+    def test_python_unparseable_file_keeps_its_file_node(self) -> None:
+        # A syntax error must not evict the file: it still has to appear in search,
+        # open_file and open_folder. Written to a temporary tree rather than
+        # committed, so run_project(ROOT) never walks a deliberately broken file.
+        with tempfile.TemporaryDirectory() as project, \
+                tempfile.TemporaryDirectory() as output:
+            root = Path(project)
+            (root / "good.py").write_text("def kept():\n    return 1\n", encoding="utf-8")
+            (root / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(root), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            self.assertEqual(2, snapshot.manifest["root_file_count"])
+            self.assertEqual(1, snapshot.manifest["analyzed_file_count"])
+            self.assertEqual(1, snapshot.manifest["failed_file_count"])
+            self.assertEqual(1, snapshot.manifest["diagnostic_count"])
+            files = {
+                node["properties"]["file"] for node in snapshot.nodes
+                if node["kind"] == "file"
+            }
+            self.assertEqual({"good.py", "broken.py"}, files)
+            diagnostic = next(
+                node for node in snapshot.nodes if node["kind"] == "diagnostic"
+            )
+            self.assertEqual("syntax-error", diagnostic["properties"]["category"])
+            self.assertEqual("broken.py", diagnostic["properties"]["file"])
+            # One unparseable file collapses the parse-dependent capability claim.
+            self.assertEqual("partial", snapshot.capabilities["syntax"])
+
     def test_nav_compact_render_and_mcp_format(self) -> None:
         # Spec 1 + Spec 2: the MCP nav tools render compact text for LLM consumers
         # (no node_id / absolute paths / null; lists paginated), preserve byte-identical

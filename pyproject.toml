@@ -52,6 +52,7 @@ include = ["Lachesis*", "nav*"]
 # JSON, and the test suite runs against the shipped fixture trees.
 "Lachesis.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*"]
 "Lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
+"Lachesis.frontends.python" = ["*.json", "fixtures/**/*"]
 "Lachesis.core" = ["*.json"]
 
 [tool.pytest.ini_options]

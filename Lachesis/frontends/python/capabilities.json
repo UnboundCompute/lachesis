@@ -1,0 +1,28 @@
+{
+  "frontend_id": "cpython-ast",
+  "languages": ["python"],
+  "extensions": [".py", ".pyi"],
+  "contract_version": 2,
+  "capabilities": {
+    "lexical": "partial",
+    "syntax": "complete",
+    "modules": "none",
+    "dependency_sources": "none",
+    "symbols": "partial",
+    "scopes": "partial",
+    "types": "none",
+    "calls": "none",
+    "control_flow": "none",
+    "direct_data_flow": "none",
+    "heap_identity": "none",
+    "context_sensitivity": "none",
+    "branch_histories": "none",
+    "taint_policy": "none",
+    "runtime_models": "none",
+    "effects": "none",
+    "async_events": "none",
+    "dynamic_behavior": "none",
+    "framework_wiring": "none",
+    "security_roles": "none"
+  }
+}
