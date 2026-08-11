@@ -18,20 +18,22 @@ exact reconstruction of the canonical node/edge dicts:
     ``props`` blob. The read side restores them via ``setdefault`` (they are genuinely
     constant), so reconstruction is exact.
 
-Storage contract (kept deliberately simple for v1 correctness + parity):
-  * one generic ``Node`` table; the columns nav actually filters on are promoted, and the
-    **full** original ``properties`` dict (minus elided constants) rides in a ``props``
-    JSON string — reconstruction reads ``props`` only, so promoted columns are never a
-    second source of truth.
+Storage contract:
+  * one generic ``Node`` table; the columns nav filters on are promoted to typed columns,
+    and ``props`` carries the *tail*, the properties no column holds. Reconstruction
+    unions the two, so nothing is stored twice and nothing is lost.
+  * ``props`` is deflated UTF-8 JSON in a ``BLOB``, not a ``STRING``. That costs
+    readability in a raw Cypher dump and buys the last easy allocation boundary; see
+    ``STORE_COMPRESSION_SPEC.md`` 0.2 for why boundaries are the unit of account here.
   * one typed rel table per *hot* edge kind (the traversal moat), each just
-    ``(FROM Node TO Node, props STRING)`` — the kind is the table name. Per-property typed
-    columns (the spec's ``context_id`` etc.) are a future query optimization; carrying the
-    whole ``props`` blob is sufficient for the current accessors, which return whole edge
-    dicts and read properties in Python.
-  * one catch-all ``EDGE(kind, semantic_kind, props)`` for the cold long tail. ``kind`` is
-    the raw kind (e.g. ``EXPANDS_TO``); ``semantic_kind`` is the unwrapped relationship
-    (``properties.via`` for ``EXPANDS_TO``, else ``kind``) so the read side can match on
-    the semantic kind without parsing JSON in Cypher.
+    ``(FROM Node TO Node, unit STRING, props BLOB)`` — the kind is the table name.
+    Per-property typed columns (the spec's ``context_id`` etc.) are a future query
+    optimization; carrying the whole ``props`` blob is sufficient for the current
+    accessors, which return whole edge dicts and read properties in Python.
+  * one catch-all ``EDGE(kind, semantic_kind, unit, props)`` for the cold long tail.
+    ``kind`` is the raw kind (e.g. ``EXPANDS_TO``); ``semantic_kind`` is the unwrapped
+    relationship (``properties.via`` for ``EXPANDS_TO``, else ``kind``) so the read side
+    can match on the semantic kind without inflating a blob in Cypher.
 
 ``import kuzu`` is deferred so the module still imports if the dependency is somehow
 absent; the writer then raises a clear error.
@@ -43,6 +45,7 @@ import json
 import os
 import shutil
 import tempfile
+import zlib
 from typing import Iterable, Optional, Sequence
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
@@ -121,6 +124,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 #   2 — `props` carries the whole properties dict; promoted columns are duplicates.
 #   3 — `props` carries only the tail; the reader unions the promoted columns back in.
 #   4 — six more keys promoted to columns; `props` uses compact JSON separators.
+#   5 — `props` is a deflated BLOB rather than a JSON STRING.
 # v4 is the first version that is not backward compatible, and the tail-wins rule is why
 # the earlier ones were. Up to v3 the column set was fixed, so a newer reader could read
 # an older store: the older store's `props` was a superset and won on merge. v4 *adds*
@@ -129,7 +133,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 4
+STORE_FORMAT_VERSION = 5
 
 
 def db_file(db_dir: str) -> str:
@@ -246,9 +250,18 @@ def _column_faithful(key: str, value) -> bool:
     return type(value) is str
 
 
+# deflate level for the `props` blob. Measured across levels 1 to 9 on the reference
+# store the ratio moves 0.631 to 0.624 and the whole-build cost 4.5s to 4.9s, so the
+# level is very nearly irrelevant here and this is the stdlib default rather than a
+# tuned value. Kùzu's own page compression does not reach inside a BLOB, which is why
+# this is the one place where general-purpose compression is not already spent.
+_PROPS_ZLIB_LEVEL = 6
+
+
 def _stored_props(properties: dict, elide: bool,
-                  drop: frozenset = frozenset()) -> str:
-    """The `props` blob: the properties a typed column is not already carrying."""
+                  drop: frozenset = frozenset()) -> bytes:
+    """The `props` blob: the properties a typed column is not already carrying,
+    as deflated UTF-8 JSON."""
     properties = properties or {}
     if properties and (elide or drop):
         properties = {
@@ -259,7 +272,8 @@ def _stored_props(properties: dict, elide: bool,
     # Compact separators: `json.dumps` defaults to ", " and ": ", which is two bytes of
     # whitespace per key on every row and nothing else. `json.loads` cannot tell the
     # difference, so this is invisible above the column.
-    return json.dumps(properties, separators=(",", ":"))
+    text = json.dumps(properties, separators=(",", ":"))
+    return zlib.compress(text.encode("utf-8"), _PROPS_ZLIB_LEVEL)
 
 
 def _is_test_file(path: Optional[str]) -> bool:
@@ -290,7 +304,7 @@ def _node_ddl() -> str:
     cols = ["id STRING", "kind STRING", "label STRING"]
     for prop in PROMOTED_NODE_PROPS:
         cols.append(f"{prop} {'INT64' if prop in _INT_COLUMNS else 'STRING'}")
-    cols.append("props STRING")
+    cols.append("props BLOB")
     cols.append("PRIMARY KEY (id)")
     return "CREATE NODE TABLE Node(" + ", ".join(cols) + ")"
 
@@ -299,10 +313,10 @@ def _rel_ddl() -> list[str]:
     # `unit` (= emitting source file) is the §5 incremental key, carried on every
     # edge as well as every node. Column order is the rel-COPY contract: the two
     # endpoint PKs come first, then the properties in this definition order.
-    stmts = [f"CREATE REL TABLE {kind}(FROM Node TO Node, unit STRING, props STRING)"
+    stmts = [f"CREATE REL TABLE {kind}(FROM Node TO Node, unit STRING, props BLOB)"
              for kind in HOT_REL_KINDS]
     stmts.append("CREATE REL TABLE EDGE(FROM Node TO Node, "
-                 "kind STRING, semantic_kind STRING, unit STRING, props STRING)")
+                 "kind STRING, semantic_kind STRING, unit STRING, props BLOB)")
     return stmts
 
 
@@ -413,6 +427,8 @@ def _edge_unit(edge: dict, node_units: dict) -> Optional[str]:
 # -- bulk load: stage one Parquet per table, then `COPY FROM` -------------------
 
 def _arrow_type(column: str):
+    if column == "props":
+        return pa.binary()
     return pa.int64() if column in _INT_COLUMNS else pa.string()
 
 
@@ -425,6 +441,8 @@ def _cell(column: str, value):
     and this silently starts rewriting properties."""
     if value is None:
         return None
+    if column == "props":
+        return value  # already bytes from `_stored_props`; str() would corrupt it
     if column in _INT_COLUMNS:
         try:
             return int(value)
@@ -492,7 +510,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
         table = pa.table({
             "src": _str_col(bucket["src"]), "tgt": _str_col(bucket["tgt"]),
             "unit": _str_col(bucket["unit"]),
-            "props": pa.array(bucket["props"], pa.string()),
+            "props": pa.array(bucket["props"], pa.binary()),
         })
         path = os.path.join(stage_dir, f"rel_{kind}.parquet")
         pq.write_table(table, path)
@@ -503,7 +521,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             "src": _str_col(cold["src"]), "tgt": _str_col(cold["tgt"]),
             "kind": _str_col(cold["kind"]), "sem": _str_col(cold["sem"]),
             "unit": _str_col(cold["unit"]),
-            "props": pa.array(cold["props"], pa.string()),
+            "props": pa.array(cold["props"], pa.binary()),
         })
         path = os.path.join(stage_dir, "rel_EDGE.parquet")
         pq.write_table(table, path)
