@@ -158,6 +158,59 @@ control family (`CFG_NEXT`, `CONDITION`, `TRUE_BRANCH`, `FALSE_BRANCH`,
 graph. See `STRUCTURE_EDGE_KINDS` and `CONTROL_EDGE_KINDS` in the schema for the
 full members.
 
+## The Python frontend
+
+Python is read by CPython's own compiler front half, `ast` plus `symtable`, with
+no third-party parser and no type checker. `ast` gives exact spans, `symtable`
+gives the binding classification (local, global, free, parameter, imported) that
+decides which declaration a name in a body actually refers to. The frontend id is
+`cpython-ast` and every node it emits is namespaced
+`v2:frontend:cpython-ast:<kind>:<digest>`.
+
+`ast` reports column offsets as UTF-8 byte offsets into the line while the nav
+layer slices decoded text by character, so the frontend converts every offset
+before it emits one. Without that, one non-ASCII character anywhere above a
+function silently shifts the body every offset-driven tool returns.
+
+How Python constructs land in the model:
+
+| construct | what is emitted |
+|---|---|
+| `def`, `async def`, `lambda` | `function`, or `method`/`constructor` inside a class, with `owner_function_id` on everything under it |
+| `class` | `class` plus `DECLARES`, and `OVERRIDES` to the base's method of the same name |
+| `import`, `from ... import`, relative imports | `import` and `external-module` nodes, `DEPENDS_ON`, and `EXPORTS` from `__all__` |
+| assignment, walrus, augmented assignment | `definition` plus `VALUE_FLOWS_TO` with reason `initializer` or `assignment`, chained by `PREVIOUS_VERSION` |
+| parameter binding | one `definition` per parameter with `origin="parameter"`, which is what the heap overlay keys on |
+| `self.x = param` | `property-path`, `write`, `WRITES_TO`, and `WRITES_PARAMETER_PROPERTY` |
+| f-strings | `VALUE_FLOWS_TO` with reason `template-substitution`, the edge most Python injection paths run through |
+| list, dict, set, tuple displays, comprehensions, `Foo()` | `allocation` with `allocation_kind` and `allocated_type`, which is what makes `points_to` and `aliases` non-trivial |
+| `if`, `while`, ternaries, comprehension `if`s, `match` guards | `CONDITION` |
+| `and`, `or` | `SHORT_CIRCUIT_LEFT` and `SHORT_CIRCUIT_RIGHT` |
+| `raise` | `THROWS_VALUE` |
+| `try`, `except`, `finally` | `TRY_BODY` and `EXCEPTION_BRANCH` |
+| `getattr`, `setattr`, `eval`, `exec` | a `dynamic-behavior` node and no call edge, because inventing one would be a guess |
+
+Call resolution is lexical, and the encoding says so. A module-level `def` bound
+exactly once, or an import resolved to an in-tree declaration, gets `INVOKES` and
+`CALLS` at `exact`. `self.m()` found once in the lexical MRO is `high`, not
+`exact`, and the dispatch overlay fans it out to every subclass override through
+`OVERRIDES`. An attribute call on a value of unknown type gets `MAY_INVOKE` to
+each in-tree method of that name while the candidates stay few, and above the cap
+gets no edge at all and a `method_candidate_count` on the call site instead.
+
+What Python does not resolve, stated plainly: anything through `**kwargs`,
+`getattr`, metaclasses, `functools.partial`, `__getattr__`, C extensions,
+monkey-patching, or a star-import from outside the tree. The frontend also never
+reads outside the root set and never probes the running interpreter's `sys.path`,
+so the graph does not change when the analyst's virtualenv does.
+
+Three deliberate omissions in the control tier. `with` gets a plain statement and
+no invented control kind, because the branch it really introduces lives in
+`__enter__` and `__exit__`. `assert` is not modelled as an `if`, which would put
+a phantom branch in every function that uses one. `yield` folds onto a return
+value with `return_kind="yield"`, which loses the resumption point, and is part of
+why `control_flow` stays `partial`.
+
 ## Contract rules worth knowing
 
 A few properties of the contract shape what you can trust in the graph.

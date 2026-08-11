@@ -37,7 +37,7 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
 
 ## What makes a good contribution
 
-- New language frontends are the highest-value area. A frontend emits the layered graph for a language or ecosystem, going from syntax to symbols to calls to dataflow overlays. Follow an existing frontend under `Lachesis/frontends/` as your template, and include the dataflow tier: `VALUE_FLOWS_TO`, `POINTS_TO`, `TAINT_FLOWS_TO`, and `ALIASES`. That tier is the whole point of Lachesis, not an optional extra.
+- New language frontends are the highest-value area. A frontend emits the layered graph for a language or ecosystem, going from syntax to symbols to calls to dataflow overlays. Follow an existing frontend under `Lachesis/frontends/` as your template, and include the dataflow tier: `DEFINES`, `VALUE_FLOWS_TO`, `READS_FROM`, `WRITES_TO`, `ALIASES`, and `allocation` nodes. That tier is the whole point of Lachesis, not an optional extra. `POINTS_TO`, `TAINT_FLOWS_TO` and the rest of the derived set are overlay-owned and rejected from a frontend snapshot by the validator (`FRONTEND_FORBIDDEN_EDGE_KINDS` in `Lachesis/core/schema.py`): emit the allocation sites and the value flow, and the overlays derive the heap and the taint from them.
 - Store and nav improvements, like indexing for the warm-query paths, memory or latency wins, or better reachability and guard reasoning.
 - Bug fixes with a regression test that fails before your change and passes after.
 

@@ -80,6 +80,29 @@ linearly with worker count: a workspace whose weight sits in one big package
 gains almost nothing. `--parallel-packages` cannot be combined with
 `--incremental`, whose manifest keys bundles by frontend rather than by package.
 
+## Languages
+
+Three frontends ship in the repo. Each one is backed by a real compiler or by the
+language's own parser, never by a regex or a heuristic grammar.
+
+| language | frontend | engine | extensions |
+|---|---|---|---|
+| TypeScript, JavaScript | `typescript-compiler-api` | the TypeScript compiler API, with the type checker | `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` |
+| C | `clang-c` | `clang -Xclang -ast-dump=json` | `.c` `.h` |
+| Python | `cpython-ast` | CPython's own `ast` and `symtable`, standard library only | `.py` `.pyi` |
+
+A frontend declares what it actually knows in its snapshot manifest, and the
+validator holds it to that. Two honest limits worth stating up front: the Python
+frontend has no type checker, so it reports `types: none` and resolves attribute
+calls lexically rather than by type; and the C frontend reads a single translation
+unit at a time, so it does not follow a call through a function pointer table it
+never sees.
+
+Mixed-language trees are one graph, not three. `run_project` picks a frontend per
+file by extension, composes the snapshots into a single node and edge set, and
+runs the same overlays over the result, so a Python caller and a TypeScript callee
+sit in one store and the same navigation tools answer over both.
+
 ## See it work
 
 Before you point it at your own code, watch the dataflow tier catch something on
