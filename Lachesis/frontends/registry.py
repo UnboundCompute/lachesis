@@ -1,6 +1,7 @@
 """Register language frontends without exposing them to the analysis core."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -82,7 +83,11 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
         languages=("c",),
         extensions=(".c", ".h"),
         command=(
-            "python3", str(root / "Lachesis" / "frontends" / "c" / "build_graph.py"),
+            # sys.executable, not "python3": whatever "python3" resolves to on the
+            # analyst's PATH may be older than pyproject.toml requires, and a
+            # frontend run on the wrong interpreter fails in ways that read as a
+            # bug in the source it was pointed at.
+            sys.executable, str(root / "Lachesis" / "frontends" / "c" / "build_graph.py"),
             "{source_dir}", "{output_dir}",
         ),
         working_directory=str(root),
@@ -90,9 +95,28 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     )
 
 
+def cpython_ast_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
+    root = _workspace_root(workspace_root)
+    return FrontendSpec(
+        frontend_id="cpython-ast",
+        languages=("python",),
+        extensions=(".py", ".pyi"),
+        # Run as a module, not as a script path: the frontend is a package of nine
+        # modules and importing it by path would put the package's own directory
+        # on sys.path ahead of the workspace.
+        command=(
+            sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+            "{source_dir}", "{output_dir}",
+        ),
+        working_directory=str(root),
+        priority=30,
+    )
+
+
 def default_registry(workspace_root: Optional[str] = None) -> FrontendRegistry:
     registry = FrontendRegistry()
     registry.register(typescript_compiler_frontend(workspace_root))
     registry.register(clang_c_frontend(workspace_root))
+    registry.register(cpython_ast_frontend(workspace_root))
     return registry
 

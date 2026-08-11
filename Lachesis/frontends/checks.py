@@ -2854,13 +2854,15 @@ class CompilerFrontendTests(unittest.TestCase):
     def test_mixed_language_registry_composes_one_graph(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             graph, snapshots = run_project(str(ROOT), output)
-            self.assertEqual({"typescript-compiler-api", "clang-c"}, {
+            self.assertEqual({"typescript-compiler-api", "clang-c", "cpython-ast"}, {
                 snapshot.frontend_id for snapshot in snapshots
             })
             frontend_ids = {
                 node["properties"].get("frontend_id") for node in graph["nodes"]
             }
-            self.assertTrue({"typescript-compiler-api", "clang-c"}.issubset(frontend_ids))
+            self.assertTrue(
+                {"typescript-compiler-api", "clang-c", "cpython-ast"}
+                .issubset(frontend_ids))
             self.assertTrue(all(
                 node["id"].startswith("v2:") for node in graph["nodes"]
             ))
@@ -2922,7 +2924,8 @@ class CompilerFrontendTests(unittest.TestCase):
             ))
             overview = ReasoningQuery(graph).overview()["manifest"]
             self.assertTrue(
-                {"c", "typescript"}.issubset(overview["project"]["languages"]),
+                {"c", "typescript", "python"}.issubset(
+                    overview["project"]["languages"]),
             )
             self.assertEqual(
                 len(graph["nodes"]), overview["node_index"]["count"],
