@@ -11,14 +11,13 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
 ## Getting started
 
 1. Fork the repo and create a branch off `main`.
-2. Install it. The base install is pure-stdlib; the TypeScript frontend shells out to
-   the real compiler, so it needs the npm dev dependency:
+2. Install it. Python 3.10 or newer is required, because the embedded Kuzu store is
+   the graph store. The TypeScript frontend shells out to the real compiler, so it
+   also needs the npm dev dependency:
    ```
    pip install -e ".[dev]"
    npm install
    ```
-   Add the `kuzu` extra (`pip install -e ".[kuzu,dev]"`) on Python 3.10+ if you want
-   the columnar store, and the parity test that covers it, to actually run.
 3. Make your change, with tests where it makes sense.
 4. Run the parity and checks suite before you open a PR:
    ```
@@ -52,7 +51,7 @@ Open a GitHub issue with what you did, what you expected, what actually happened
 
 - Match the style of the code around you, including naming, structure, and comment density.
 - Prefer clarity over cleverness. Program analysis is subtle, and readable code is safer.
-- No new hard dependencies without discussion. `pyarrow` and `kuzu` are optional at runtime and guarded, and we want to keep it that way.
+- No new runtime dependencies without discussion. `kuzu` and `pyarrow` are the only two, and everything else is standard library. Keep it that way.
 
 ## Licensing and the DCO
 

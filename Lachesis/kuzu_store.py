@@ -1,12 +1,11 @@
-"""Kùzu writer for a composed Lachesis graph — the disk-backed alternative to the
-one-big-JSON store written by ``pipeline.write_project_graph``.
+"""Kùzu writer for a composed Lachesis graph — the graph store.
 
-Why (see ``KUZU_STORE_SPEC.md``): the JSON store repeats every ~50-byte content-hash
-id on both endpoints of ~1M edges and stamps constant ``fact_origin``/``confidence``/
-``evidence_ids`` on nearly every node and edge; loading it parses the whole thing into
-RAM. Kùzu dictionary-encodes the string PK (the id is stored once), low-cardinality
-columns compress away, and columnar+mmap removes the RAM ceiling that blocks whole-repo
-graphs. This module is the *ingest* half; ``nav/kuzu_index.py`` is the read half that
+Why (see ``KUZU_STORE_SPEC.md``): the one-big-JSON store this replaced repeats every
+~50-byte content-hash id on both endpoints of ~1M edges and stamps constant
+``fact_origin``/``confidence``/``evidence_ids`` on nearly every node and edge; loading
+it parses the whole thing into RAM. Kùzu dictionary-encodes the string PK (the id is
+stored once), low-cardinality columns compress away, and columnar+mmap removes the RAM
+ceiling that blocks whole-repo graphs. This module is the *ingest* half; ``nav/kuzu_index.py`` is the read half that
 satisfies the existing ``GraphIndex`` accessor surface so no nav tool changes.
 
 Two shrink levers, both flag-gated so a parity harness can disable them and get an
@@ -34,8 +33,8 @@ Storage contract (kept deliberately simple for v1 correctness + parity):
     (``properties.via`` for ``EXPANDS_TO``, else ``kind``) so the read side can match on
     the semantic kind without parsing JSON in Cypher.
 
-``import kuzu`` is deferred so this module imports under Python 3.9 (Kùzu needs
-3.10+); the writer raises a clear error if kuzu is missing.
+``import kuzu`` is deferred so the module still imports if the dependency is somehow
+absent; the writer then raises a clear error.
 """
 from __future__ import annotations
 
@@ -47,7 +46,7 @@ from typing import Iterable, Optional, Sequence
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
     import kuzu  # type: ignore
-except Exception:  # pragma: no cover - absent under 3.9
+except Exception:  # pragma: no cover - a broken install, not a supported mode
     kuzu = None
 
 try:  # optional; enables the fast bulk `COPY FROM` staged-Parquet load path
@@ -91,19 +90,60 @@ CONSTANT_PROP_DEFAULTS = {
 }
 
 
-# the Kùzu store is a *directory* holding this DB file (+ room for a future
-# unit→content_hash manifest); the JSON store is a plain file. The marker file lets the
-# loader branch without a magic byte and is robust to Kùzu using a single-file DB.
+# the Kùzu store is a *directory* holding this DB file plus the store manifest. The
+# marker file lets the loader branch without a magic byte and is robust to Kùzu using a
+# single-file DB.
 KUZU_DB_FILENAME = "graph.kuzu"
+
+# Deliberately NOT `manifest.json`: that name is already taken by the per-frontend
+# bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
+# two would collide the moment anyone points one at the other.
+STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 
 
 def db_file(db_dir: str) -> str:
     return os.path.join(db_dir, KUZU_DB_FILENAME)
 
 
+def store_manifest_file(db_dir: str) -> str:
+    return os.path.join(db_dir, STORE_MANIFEST_FILENAME)
+
+
 def is_kuzu_dir(path: str) -> bool:
     """True when ``path`` is a Kùzu store directory (contains the DB file)."""
     return bool(path) and os.path.isdir(path) and os.path.exists(db_file(path))
+
+
+def manifest_payload(graph: dict, snapshots: Optional[Sequence[object]]) -> dict:
+    """The frontend/capability inventory that travels with a store.
+
+    Every field here was previously carried by the JSON graph's ``manifest`` block.
+    ``capabilities`` and ``languages`` in particular are load-bearing: they are the
+    only two inputs overlay enrichment needs beyond the graph itself, so a store that
+    dropped them could not have its dataflow tier recomputed.
+    """
+    return {
+        "version": 2,
+        "frontends": [{
+            "frontend_id": item.frontend_id,
+            "languages": list(item.languages),
+            "capabilities": item.capabilities,
+            "node_count": len(item.nodes),
+            "edge_count": len(item.edges),
+            "diagnostic_count": item.manifest.get("diagnostic_count", 0),
+        } for item in (snapshots or [])],
+        "node_count": len(graph.get("nodes", [])),
+        "edge_count": len(graph.get("edges", [])),
+    }
+
+
+def read_store_manifest(db_dir: str) -> dict:
+    """The store's manifest, or an empty inventory when it predates one."""
+    path = store_manifest_file(db_dir)
+    if not os.path.isfile(path):
+        return {"version": 2, "frontends": [], "node_count": 0, "edge_count": 0}
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _semantic_kind(edge: dict) -> str:
@@ -177,12 +217,12 @@ def write_kuzu_graph(
     drop_tests: bool = False,
     overwrite: bool = True,
 ) -> str:
-    """Write the composed ``graph`` dict (post-enrich, same shape
-    ``write_project_graph`` receives) into a Kùzu DB directory. Returns the path.
+    """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
-    ``snapshots`` is accepted for call-site symmetry with ``write_project_graph`` but
-    unused (the manifest is not needed by the store). Set ``prune=False,
-    elide_constants=False`` for an exact-reconstruction parity build.
+    ``snapshots`` supplies the store manifest (``lachesis-manifest.json`` beside the DB
+    file): the frontend inventory, and with it the capabilities and languages that
+    overlay enrichment needs. Set ``prune=False, elide_constants=False`` for an
+    exact-reconstruction parity build.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -223,6 +263,14 @@ def write_kuzu_graph(
     else:  # pragma: no cover - exercised only without pyarrow
         _load_nodes_rowwise(conn, nodes, elide=elide_constants)
         _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units)
+    # counts describe what the store actually holds, which is the pruned set, not the
+    # composed input — a reader comparing them against a scan should find them equal.
+    payload = manifest_payload(graph, snapshots)
+    payload["node_count"] = len(nodes)
+    payload["edge_count"] = len(edges)
+    with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
     return db_dir
 
 

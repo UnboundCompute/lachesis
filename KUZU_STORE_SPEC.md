@@ -1,6 +1,10 @@
 # Lachesis graph store: JSON → Kùzu migration spec
 
-**Status:** validated by PoC, ready to build.
+**Status:** landed, and the migration is finished. The Kùzu store is now the only
+graph store: the JSON writer and the JSON load path have been removed, so the
+"current-state map" in §1 and the dual-write instruction in §3 describe the
+before-state this spec was written against, not the code today. Everything about
+the on-disk layout, the prune levers, and the incremental unit key still holds.
 **Audience:** the engine session that writes Lachesis/nav code.
 **Author of spec:** referee session (validation + design only).
 
@@ -138,7 +142,7 @@ CREATE REL TABLE EDGE (FROM Node TO Node, kind STRING, props STRING);
 
 ## 3. Ingest / write path
 
-Add a new writer alongside the JSON one — **dual-write during migration**, don't delete `write_project_graph`.
+Add a new writer alongside the JSON one — **dual-write during migration**, don't delete `write_project_graph`. *(Historical: the migration is complete and `write_project_graph` has since been deleted; `write_kuzu_graph` is the only writer.)*
 
 - **New:** `Lachesis/kuzu_store.py` : `write_kuzu_graph(graph, snapshots, db_dir)`.
   - Consumes the **same composed `graph` dict** that `write_project_graph` gets (post `_enrich_graph`), so it slots in at `Lachesis/cli/analyze.py:25` behind a flag / second output path.

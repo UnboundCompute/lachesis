@@ -30,27 +30,23 @@ pip install -e .          # the graph builder, the nav layer and the MCP server
 npm install               # the TypeScript compiler the TS frontend loads
 ```
 
-The base install has **no Python dependencies** — the builder, the JSON store, the
-navigation layer and the MCP server are pure standard library. The embedded Kùzu
-store is opt-in and needs Python 3.10+:
-
-```bash
-pip install -e ".[kuzu]"  # adds kuzu + pyarrow for the columnar store
-```
+Python 3.10 or newer is required. The only runtime dependencies are `kuzu` and
+`pyarrow`, which back the embedded columnar store the graph lives in; the builder,
+the navigation layer and the MCP server are otherwise pure standard library.
 
 Then build a graph and ask it questions:
 
 ```bash
-lachesis-analyze path/to/your/source graph.json   # parse a tree into a layered graph
-lachesis-query graph.json overview                # what's in it
-lachesis-query graph.json function handleRequest  # a budgeted slice of one function
-lachesis-mcp graph.json                           # serve the nav tools over MCP (stdio)
+lachesis-analyze path/to/your/source graph.kuzu   # parse a tree into a layered graph
+lachesis-query graph.kuzu overview                # what's in it
+lachesis-query graph.kuzu function handleRequest  # a budgeted slice of one function
+lachesis-mcp graph.kuzu                           # serve the nav tools over MCP (stdio)
 ```
 
-`lachesis-analyze` dual-writes by default: `graph.json` plus a sibling `graph.kuzu`
-directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
-`lachesis-mcp` speaks MCP over stdio, so point an MCP-capable client at
-`lachesis-mcp /abs/path/to/graph.json` and the navigation tools show up as tools.
+`graph.kuzu` is a directory: an embedded Kùzu database plus the store manifest. It
+is the graph, and every tool reads it directly. `lachesis-mcp` speaks MCP over
+stdio, so point an MCP-capable client at `lachesis-mcp /abs/path/to/graph.kuzu` and
+the navigation tools show up as tools.
 
 ## See it work
 
@@ -108,39 +104,46 @@ Lachesis builds the full layered graph, including the dataflow tier, at roughly
 one thousand source lines per second, or ten to eleven thousand graph elements
 (nodes plus edges) per second, and it stays near-linear as the input grows.
 
-| Package (`packages/<name>/src`) | TS LOC | Nodes | Edges | Build time | JSON size |
+| Package (`packages/<name>/src`) | TS LOC | Nodes | Edges | Build time | Serialized graph |
 |---|---:|---:|---:|---:|---:|
 | `anthropic` | 30,577 | 133,903 | 227,662 | 31.9 s | 265 MB |
 | `openai` | 44,890 | 210,164 | 361,406 | 49.6 s | 422 MB |
 | `ai` | 164,607 | 504,246 | 920,708 | 140.9 s | 1.0 GB |
 
 ```bash
-python -m Lachesis.cli.analyze path/to/vercel-ai/packages/ai/src ai.json --no-kuzu
+python -m Lachesis.cli.analyze path/to/vercel-ai/packages/ai/src ai.kuzu
 ```
 
-### Storage and open time: JSON or Kùzu
+These build times and sizes were measured when the builder also wrote the whole
+graph out as indented JSON, which it no longer does. The last column is that JSON
+dump, kept here because it is the most direct measure of how much graph each
+package produces. Both columns are therefore an upper bound on what the command
+above costs today.
 
-Lachesis dual-writes by default: a JSON graph, which is portable and diff-friendly,
-and a sibling `.kuzu` directory, which is columnar and easy on RAM. The navigation
-layer figures out which one to load and behaves the same over either backend. The
-two are kept at byte-identical parity across the navigation and MCP tools, and a
-test suite enforces that.
+### Storage and open time
 
-The Kùzu backend is the one you want at scale. On the `ai` graph above (504,246
-nodes / 920,708 edges), here is how opening and holding the graph compares, loading
-each backend through the navigation layer:
+The store is columnar and easy on RAM, which is the property that lets a
+half-million-node graph open in under a second. On the `ai` graph above (504,246
+nodes / 920,708 edges), against the one-big-JSON representation the builder used to
+emit, loading each through the navigation layer:
 
-| | JSON | Kùzu | change |
+| | One-big-JSON | Kùzu store | change |
 |---|---:|---:|---|
 | On-disk size | 1.0 GB | 368 MB | 63% smaller |
 | Open time (load into nav) | 11.1 s | 0.58 s | about 19x faster |
 | Load peak RSS | 3511 MB | 362 MB | 90% smaller |
 | Warm query (hubs top-10) | about 1 ms | about 4 ms | parity |
 
+That store was built with `--prune`, which drops the pure-lexical `token` and
+`source-span` nodes. Pruning is lossless for every navigation tool (source excerpts
+are read from the file by offset, not from those nodes) but it does drop real T0
+graph content, so it is opt-in and the default store keeps everything.
+
 The [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) covers the on-disk layout, the
 incremental unit key, and the trade-offs we measured. The short version: columnar
 scans give up a little warm-query latency in exchange for a large win on RAM and
-startup time, which is what lets a half-million-node graph open in under a second.
+startup time. A test suite enforces that the store answers every navigation and MCP
+tool identically to the same graph held whole in memory.
 
 ## Documentation
 

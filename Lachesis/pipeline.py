@@ -276,27 +276,3 @@ def run_project_incremental(
 def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
     """Enrich one already-loaded snapshot without a FileInfo round trip."""
     return _enrich_graph(snapshot_graph(snapshot), [snapshot])
-
-
-def write_project_graph(
-    graph: CodeGraph, snapshots: Sequence[FrontendSnapshot], output_path: str,
-) -> str:
-    """Persist a composed graph with its frontend/capability inventory."""
-    output = Path(output_path).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "manifest": {
-            "version": 2,
-            "frontends": [{
-                "frontend_id": item.frontend_id,
-                "languages": list(item.languages),
-                "capabilities": item.capabilities,
-                "node_count": len(item.nodes), "edge_count": len(item.edges),
-                "diagnostic_count": item.manifest.get("diagnostic_count", 0),
-            } for item in snapshots],
-            "node_count": len(graph["nodes"]), "edge_count": len(graph["edges"]),
-        },
-        "nodes": graph["nodes"], "edges": graph["edges"],
-    }
-    output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return str(output)

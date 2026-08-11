@@ -2,7 +2,7 @@
 """The sidecar overlay — where derived reasoning signals live, off the canonical graph.
 
 The user's decision (locked): derived signals are **non-invasive**. The canonical
-Lachesis graph (`graph.json`) is never rewritten; everything this reasoning layer
+Lachesis graph (`graph.kuzu`) is never rewritten; everything this reasoning layer
 *infers* — per-function `guard_signal` (Fix 2), first-class `GUARDED`/`UNGUARDED`
 edges (0 in the base graph), `CALLS` callee security-roles (Fix 4) — is written to
 a companion JSON next to the graph and merged back in memory at load time. This
@@ -14,7 +14,7 @@ Shape on disk::
 
     {
       "overlay_id": "nav-reasoning",
-      "source": "graph.json",
+      "source": "graph.kuzu",
       "node_props": { "<node id>": { "guard_signal": {...} }, ... },
       "edge_props": { "<edge key>": { "role": "verify" }, ... },
       "derived_edges": [ { "source","target","kind","properties" }, ... ],
@@ -26,8 +26,8 @@ mutate the file — `graph_store` applies them to the in-memory copy). `derived_
 are brand-new elements this layer materializes (e.g. a `GUARDED` edge that has no
 counterpart in the base graph).
 
-  python3 nav/overlay.py graph.json --show           # summarize an existing sidecar
-  python3 nav/overlay.py graph.json --init            # write an empty sidecar
+  python3 nav/overlay.py graph.kuzu --show           # summarize an existing sidecar
+  python3 nav/overlay.py graph.kuzu --init            # write an empty sidecar
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ DERIVED_EDGE_KINDS = frozenset({"GUARDED", "UNGUARDED"})
 
 
 def sidecar_path(graph_path: str | Path) -> Path:
-    """The overlay file that pairs with a graph: `foo.json` -> `foo.nav-overlay.json`."""
+    """The overlay file that pairs with a graph: `foo.kuzu` -> `foo.nav-overlay.json`."""
     p = Path(graph_path)
     return p.with_name(p.stem + ".nav-overlay.json")
 
@@ -134,18 +134,19 @@ class Overlay:
         edges = list(graph.get("edges", []))
 
         if self.node_props:
-            by_id = {n["id"]: n for n in nodes}
+            # position map, not `nodes.index(node)`: this runs over whole-repo graphs,
+            # where a linear scan per overlaid node is quadratic.
+            position = {n["id"]: i for i, n in enumerate(nodes)}
             for node_id, props in self.node_props.items():
-                node = by_id.get(node_id)
-                if node is None:
+                idx = position.get(node_id)
+                if idx is None:
                     continue
+                node = nodes[idx]
                 merged = dict(node.get("properties") or {})
                 merged.update(props)
                 # replace the node with a copy carrying merged props (no mutation
                 # of the original dict the caller may still hold)
-                idx = nodes.index(node)
                 nodes[idx] = {**node, "properties": merged}
-                by_id[node_id] = nodes[idx]
 
         if self.edge_props:
             for i, edge in enumerate(edges):

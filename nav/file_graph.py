@@ -12,8 +12,8 @@ Everything an agent needs to reason about a single file, in one graph:
 Output is a canonical `{nodes, edges, manifest}` graph; every edge carries a
 `properties.display` verb so a renderer can label it in plain language.
 
-  python3 nav/file_graph.py graph.json --file src/http/webhook.ts --out l1.json
-  python3 nav/file_graph.py graph.json --file-id <file-node-id> --out l1.json
+  python3 nav/file_graph.py graph.kuzu --file src/http/webhook.ts --out l1.json
+  python3 nav/file_graph.py graph.kuzu --file-id <file-node-id> --out l1.json
 """
 from __future__ import annotations
 

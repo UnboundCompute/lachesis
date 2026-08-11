@@ -29,8 +29,8 @@ Output is negative-space aware: a flagged outlier is shown *with* the guard its 
 have and it lacks. `--build-overlay` materializes the flag as a first-class
 `UNGUARDED` edge.
 
-  python3 nav/siblings.py graph.json --sym deleteMysqlRecord
-  python3 nav/siblings.py graph.json --sym deleteMysqlRecord --build-overlay
+  python3 nav/siblings.py graph.kuzu --sym deleteMysqlRecord
+  python3 nav/siblings.py graph.kuzu --sym deleteMysqlRecord --build-overlay
 """
 from __future__ import annotations
 

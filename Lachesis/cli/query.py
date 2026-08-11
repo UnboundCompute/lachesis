@@ -13,18 +13,29 @@ from Lachesis.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
 
 
 def load_graph(path: str) -> tuple[dict, dict]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload.get("nodes"), list) or not isinstance(payload.get("edges"), list):
-        raise ValueError("input must contain canonical `nodes` and `edges` arrays")
+    """Materialize a Kùzu store into the whole-graph dict ``ReasoningQuery`` needs.
+
+    ``ReasoningQuery`` builds an in-RAM ``GraphIndex`` over the full graph, so unlike
+    nav (which navigates the store lazily, node by node) this path genuinely has to
+    pay the materialization. The frontend capability inventory comes from the store
+    manifest written beside the DB file.
+    """
+    from Lachesis.kuzu_store import is_kuzu_dir, read_store_manifest
+    from nav.kuzu_index import KuzuGraphIndex, materialize_graph
+
+    if not is_kuzu_dir(path):
+        raise ValueError(
+            f"{path} is not a Lachesis graph store; build one with "
+            f"`lachesis-analyze <source_dir> {path}`"
+        )
+    graph = materialize_graph(KuzuGraphIndex(path))
+    manifest = read_store_manifest(path)
     frontend_capabilities = {
         item["frontend_id"]: item.get("capabilities", {})
-        for item in payload.get("manifest", {}).get("frontends", [])
+        for item in manifest.get("frontends", [])
         if item.get("frontend_id")
     }
-    return (
-        {"nodes": payload["nodes"], "edges": payload["edges"]},
-        {"frontend_capabilities": frontend_capabilities},
-    )
+    return graph, {"frontend_capabilities": frontend_capabilities}
 
 
 def resolve_function(
@@ -88,7 +99,7 @@ def render_text(result: dict) -> str:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument("graph", help="canonical project graph JSON")
+    root.add_argument("graph", help="Lachesis graph store directory (.kuzu)")
     root.add_argument(
         "--budget-tokens", type=int, default=DEFAULT_BUDGET_TOKENS,
         help=f"approximate slice budget (default: {DEFAULT_BUDGET_TOKENS})",

@@ -1,9 +1,8 @@
 """Shared substrate for the navigation primitives.
 
 Wraps the canonical Lachesis graph with the typed helpers the nav layer needs.
-Reuses ``Lachesis.core.query.GraphIndex`` for adjacency/indexing and
-``Lachesis.cli.query.load_graph`` for loading — this module only adds what the
-nav movers need on top: offset-accurate source excerpts, owner-function climb,
+Reuses ``Lachesis.core.query.GraphIndex`` for adjacency/indexing — this module only
+adds what the nav movers need on top: offset-accurate source excerpts, owner-function climb,
 structural family builders, and a generic security-lexicon *scoring* helper.
 
 Design invariant (non-negotiable): nothing here is hardcoded to a codebase under
@@ -20,7 +19,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from Lachesis.cli.query import load_graph
 from Lachesis.core.query import GraphIndex
 
 
@@ -102,8 +100,10 @@ class GraphLib:
 
     @classmethod
     def load(cls, path: str) -> "GraphLib":
-        graph, _metadata = load_graph(path)
-        return cls(graph)
+        """Open a Kùzu store directory without materializing it: every ``GraphLib``
+        method reads through the index, so the store answers them directly."""
+        from nav.kuzu_index import KuzuGraphIndex
+        return cls.from_index(KuzuGraphIndex(path))
 
     # -- basic node access ---------------------------------------------------
 

@@ -13,8 +13,8 @@ drill-down. Search a name, land on a node, and get back:
 Each move is an **adapter** — flow.py hands back the exact command that drives
 the already-built machinery, it does not re-derive it.
 
-  python3 nav/flow.py graph.json --find handleRequest
-  python3 nav/flow.py graph.json --find handleRequest --json
+  python3 nav/flow.py graph.kuzu --find handleRequest
+  python3 nav/flow.py graph.kuzu --find handleRequest --json
 """
 from __future__ import annotations
 

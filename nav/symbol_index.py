@@ -12,11 +12,11 @@ so the caller knows which view a jump lands in, and a real `node_id` so it feeds
 straight into the flow view or the reasoning layer as a focus node.
 
 Usage:
-  python3 nav/symbol_index.py graph.json --build index.json
-  python3 nav/symbol_index.py graph.json --search readWebhook
-  python3 nav/symbol_index.py graph.json --search verify --exact
-  python3 nav/symbol_index.py graph.json --refs readWebhookBody      # who calls it
-  python3 nav/symbol_index.py graph.json --callees readWebhookBody   # what it calls
+  python3 nav/symbol_index.py graph.kuzu --build index.json
+  python3 nav/symbol_index.py graph.kuzu --search readWebhook
+  python3 nav/symbol_index.py graph.kuzu --search verify --exact
+  python3 nav/symbol_index.py graph.kuzu --refs readWebhookBody      # who calls it
+  python3 nav/symbol_index.py graph.kuzu --callees readWebhookBody   # what it calls
 """
 from __future__ import annotations
 

@@ -7,7 +7,7 @@ This is the seam the whole reasoning layer (and, last, the MCP server) sits on:
     (`GraphIndex` adjacency + `by_kind`/`by_label`/`by_file`/`by_owner`), the name
     index is built once, and the **sidecar overlay** (`overlay.py`) is merged in
     memory so derived `guard_signal` / `GUARDED` / `role` signals are queryable
-    right alongside the base facts. The on-disk `graph.json` is never rewritten.
+    right alongside the base facts. The store on disk is never rewritten.
 
   * **one output shape** — `path_shape(nodes, edges)` renders any traversal result
     into the same labeled-path envelope so every move (`flow`, `reaches`,
@@ -20,49 +20,21 @@ This is the seam the whole reasoning layer (and, last, the MCP server) sits on:
 Query scoping by `owner_function_id` (`scope_owner`) gives cheap function-local
 slices without a re-parse.
 
-  python3 nav/graph_store.py graph.json --stat
-  python3 nav/graph_store.py graph.json --resolve verifySignature
+  python3 nav/graph_store.py graph.kuzu --stat
+  python3 nav/graph_store.py graph.kuzu --resolve verifySignature
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from Lachesis.cli.query import load_graph
 from nav.graphlib import GraphLib
 from nav import symbol_index as si
 from nav.overlay import Overlay, sidecar_path
-
-
-def resolve_graph_path(graph_path: str) -> str:
-    """Prefer a sibling Kùzu store over a JSON graph when one has been built.
-
-    The Kùzu path opens in seconds at a fraction of the RAM of parsing the JSON
-    (the ceiling that blocked whole-repo graphs), so once a sibling ``<stem>.kuzu``
-    directory exists next to a ``.json`` graph, nav serves from it by default.
-
-      * ``LACHESIS_FORCE_JSON`` (any truthy value) forces the JSON path — for
-        debugging, or when the derived-signal overlay sidecar is needed (the
-        Kùzu path serves base facts; the security tools recompute either way).
-      * A path that is already a Kùzu dir, or a ``.json`` with no sibling store,
-        is returned unchanged.
-    """
-    from Lachesis.kuzu_store import is_kuzu_dir
-    if os.environ.get("LACHESIS_FORCE_JSON"):
-        return graph_path
-    if is_kuzu_dir(graph_path):
-        return graph_path
-    candidate = Path(graph_path)
-    if candidate.suffix == ".json":
-        sibling = str(candidate.with_suffix(".kuzu"))
-        if is_kuzu_dir(sibling):
-            return sibling
-    return graph_path
 
 
 def node_view(node: dict) -> dict:
@@ -114,11 +86,13 @@ class GraphStore:
         self._entries: list[dict] | None = None
 
     @classmethod
-    def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None) -> "GraphStore":
+    def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None,
+                      overlay: Overlay | None = None) -> "GraphStore":
         """Build a store around an already-constructed ``GraphLib`` (the disk-backed
-        Kùzu path), bypassing the dict + overlay merge that the JSON path needs."""
+        store path), bypassing the dict merge an in-memory graph needs. The overlay is
+        folded into the index itself rather than into a dict, so nothing materializes."""
         self = cls.__new__(cls)
-        self.overlay = Overlay()
+        self.overlay = overlay or Overlay()
         self.graph = None
         self.gl = gl
         self.index = gl.index
@@ -128,23 +102,22 @@ class GraphStore:
 
     @classmethod
     def load(cls, graph_path: str, overlay_path: str | None = None) -> "GraphStore":
-        # A Kùzu store is a directory; the JSON store is a file. The disk-backed index
-        # satisfies the same accessor surface, so GraphLib/every tool is unchanged. The
-        # derived-signal overlay is a JSON-path enrichment; the Kùzu path serves base
-        # facts directly — the security tools recompute those signals from base facts
-        # either way (proven by test_nav_parity_json_store_vs_kuzu_store).
+        """Open a Kùzu store directory. The disk-backed index satisfies the same
+        accessor surface as the in-RAM one, so ``GraphLib`` and every nav tool are
+        unchanged, and nothing loads the whole graph into memory."""
         from Lachesis.kuzu_store import is_kuzu_dir
-        # prefer a sibling Kùzu store when one exists (low-RAM default); an explicit
-        # Kùzu dir or LACHESIS_FORCE_JSON both pass through resolve_graph_path unchanged.
-        graph_path = resolve_graph_path(graph_path)
-        if is_kuzu_dir(graph_path):
-            from nav.kuzu_index import KuzuGraphIndex
-            gl = GraphLib.from_index(KuzuGraphIndex(graph_path))
-            return cls.from_graphlib(gl, graph_path=graph_path)
-        graph, _meta = load_graph(graph_path)
+        from nav.kuzu_index import KuzuGraphIndex
+        if not is_kuzu_dir(graph_path):
+            raise ValueError(
+                f"{graph_path} is not a Lachesis graph store; build one with "
+                f"`lachesis-analyze <source_dir> {graph_path}`"
+            )
+        index = KuzuGraphIndex(graph_path)
         ov_path = Path(overlay_path) if overlay_path else sidecar_path(graph_path)
         overlay = Overlay.load(ov_path)
-        return cls(graph, overlay=overlay, graph_path=graph_path)
+        index.attach_overlay(overlay)
+        return cls.from_graphlib(GraphLib.from_index(index), graph_path=graph_path,
+                                 overlay=overlay)
 
     # -- name entry / teleport ----------------------------------------------
 

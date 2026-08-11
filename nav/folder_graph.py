@@ -10,8 +10,8 @@ Output is a canonical `{nodes, edges, manifest}` graph so any renderer can draw
 it unchanged — every edge carries a `properties.display` verb (contains / declares)
 so it reads like a sentence.
 
-  python3 nav/folder_graph.py graph.json --out l0.json
-  python3 nav/folder_graph.py graph.json --root src/resources --files-only --out l0.json
+  python3 nav/folder_graph.py graph.kuzu --out l0.json
+  python3 nav/folder_graph.py graph.kuzu --root src/resources --files-only --out l0.json
 """
 from __future__ import annotations
 

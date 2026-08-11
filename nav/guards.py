@@ -23,8 +23,8 @@ score and the class — not a magic number:
 Nothing here is target-specific: counts come from graph structure and the score's
 security term reuses `graphlib.security_weight` (the blessed generic lexicon).
 
-  python3 nav/guards.py graph.json --fn <function-id|name>
-  python3 nav/guards.py graph.json --top 20        # most guard-shaped functions
+  python3 nav/guards.py graph.kuzu --fn <function-id|name>
+  python3 nav/guards.py graph.kuzu --top 20        # most guard-shaped functions
 """
 from __future__ import annotations
 

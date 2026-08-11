@@ -22,7 +22,7 @@ Profiles (additive): the default "all" exposes every tool (TS surface unchanged)
 opt-in "comprehension" profile (env LACHESIS_MCP_PROFILE=comprehension, or a 3rd argv)
 hides the four security tools for a focused understanding run — nothing else changes.
 
-  python3 nav/mcp_server.py <graph.json> [overlay.json] [profile]
+  python3 nav/mcp_server.py <graph.kuzu> [overlay.json] [profile]
 """
 import json
 import os
@@ -423,8 +423,8 @@ def main():
     # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
     _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")
     if not _GRAPH_PATH:
-        print("usage: mcp_server.py <graph.json> [overlay.json] [profile]\n"
-              "   or: LACHESIS_GRAPH=<graph.json> mcp_server.py", file=sys.stderr)
+        print("usage: mcp_server.py <graph.kuzu> [overlay.json] [profile]\n"
+              "   or: LACHESIS_GRAPH=<graph.kuzu> mcp_server.py", file=sys.stderr)
         return 2
     _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
     # Profile: explicit 3rd argv wins, else env (LACHESIS_PROFILE, back-compat

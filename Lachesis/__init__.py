@@ -6,8 +6,8 @@ from .pipeline import (
     semantic_snapshot_graph,
     snapshot_graph,
     source_inventory,
-    write_project_graph,
 )
+from .kuzu_store import write_kuzu_graph
 from .types import CodeGraph, GraphEdge, GraphNode
 
 __all__ = [
@@ -19,5 +19,5 @@ __all__ = [
     "semantic_snapshot_graph",
     "snapshot_graph",
     "source_inventory",
-    "write_project_graph",
+    "write_kuzu_graph",
 ]

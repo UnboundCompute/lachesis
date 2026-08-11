@@ -26,8 +26,8 @@ role onto each CALLS edge (edge_props), and a first-class **GUARDED** edge from 
 function to every guard-family call it makes — so "what guards this function" is a
 one-hop query and the previously-empty GUARDED relation is populated.
 
-  python3 nav/call_roles.py graph.json --fn <function-id|name>
-  python3 nav/call_roles.py graph.json --build-overlay
+  python3 nav/call_roles.py graph.kuzu --fn <function-id|name>
+  python3 nav/call_roles.py graph.kuzu --build-overlay
 """
 from __future__ import annotations
 

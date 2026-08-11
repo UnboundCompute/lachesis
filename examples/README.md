@@ -61,17 +61,17 @@ graph.
 ## Step 1: build the graph
 
 Assuming you have installed the package (see the [Quick start](../README.md#quick-start)
-in the top-level README), build a graph from the fixture. `--no-kuzu` keeps this
-to a single portable JSON file with no extra dependencies.
+in the top-level README), build a graph from the fixture. The output is a store
+directory holding the embedded database and its manifest.
 
 ```bash
 python3 -m Lachesis.cli.analyze \
   Lachesis/frontends/typescript/fixtures/project \
-  /tmp/example.json --no-kuzu
+  /tmp/example.kuzu
 ```
 
 ```
-Composed 1 frontends into 3307 nodes and 6078 edges: /tmp/example.json
+Composed 1 frontends into 3307 nodes and 6078 edges: /tmp/example.kuzu
 Frontends: typescript-compiler-api
 Node kinds: allocation=9, argument=31, ... sink=3, source=4, ... taint-reach=6, ...
 ```
@@ -83,7 +83,7 @@ straight from a clone.
 ## Step 2: get your bearings
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.json overview
+python3 -m Lachesis.cli.query --format text /tmp/example.kuzu overview
 ```
 
 ```
@@ -106,7 +106,7 @@ Ask about the guarded handler first. The `--format text` flag prints a readable
 digest; the underlying records are full JSON.
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.json handler-security getInvoice
+python3 -m Lachesis.cli.query --format text /tmp/example.kuzu handler-security getInvoice
 ```
 
 ```
@@ -136,7 +136,7 @@ the `principalKey()` call that establishes the tenant before `findById` runs. No
 the sibling:
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.json handler-security getDocument
+python3 -m Lachesis.cli.query --format text /tmp/example.kuzu handler-security getDocument
 ```
 
 ```
@@ -174,7 +174,7 @@ The unguarded path from Step 3 has an ID you can drill into. Pull the full
 source-to-sink chain:
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.json \
+python3 -m Lachesis.cli.query --format text /tmp/example.kuzu \
   security-path v2:core:taint-propagation:taint-reach:4607b639d02e2fdf14d9
 ```
 
@@ -211,7 +211,7 @@ Everything above is also available to an LLM agent through the MCP server. Point
 an MCP-capable client at the graph:
 
 ```bash
-lachesis-mcp /tmp/example.json
+lachesis-mcp /tmp/example.kuzu
 ```
 
 The server speaks MCP over stdio and registers the navigation tools (`search`,
@@ -223,7 +223,7 @@ client that reads a JSON config, the entry looks like this:
   "mcpServers": {
     "lachesis": {
       "command": "lachesis-mcp",
-      "args": ["/tmp/example.json"]
+      "args": ["/tmp/example.kuzu"]
     }
   }
 }
@@ -237,11 +237,9 @@ line, one graph hop at a time, without loading the whole project into its contex
 Swap the fixture path for a real TypeScript tree and run the same commands:
 
 ```bash
-python3 -m Lachesis.cli.analyze path/to/your/source graph.json
-python3 -m Lachesis.cli.query --format text graph.json overview
+python3 -m Lachesis.cli.analyze path/to/your/source graph.kuzu
+python3 -m Lachesis.cli.query --format text graph.kuzu overview
 ```
 
-If you have installed the `[kuzu]` extra, drop `--no-kuzu` and the analyzer also
-writes a sibling `graph.kuzu` directory, the columnar store that the navigation
-layer prefers at scale. See [`KUZU_STORE_SPEC.md`](../KUZU_STORE_SPEC.md) for what
-that buys you on a large graph.
+See [`KUZU_STORE_SPEC.md`](../KUZU_STORE_SPEC.md) for what the columnar store buys
+you on a large graph, and how it is laid out on disk.

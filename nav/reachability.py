@@ -23,9 +23,9 @@ both `POINTS_TO` the same heap-object, so we walk `POINTS_TO` forward (value→h
 exact destructuring shape where the taint overlay gives up — as an explicit
 `alias-via-heap` hop in the returned path.
 
-  python3 nav/reachability.py graph.json --from <value-id>
-  python3 nav/reachability.py graph.json --reaches <src-id> <sink-id>
-  python3 nav/reachability.py graph.json --sources-of <sink-id>
+  python3 nav/reachability.py graph.kuzu --from <value-id>
+  python3 nav/reachability.py graph.kuzu --reaches <src-id> <sink-id>
+  python3 nav/reachability.py graph.kuzu --sources-of <sink-id>
 """
 from __future__ import annotations
 

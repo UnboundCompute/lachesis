@@ -14,8 +14,8 @@ Both surfaces read the same canonical graph and speak in terms of the
 lachesis-query [--budget-tokens N] [--format json|text] <graph> <command> [args]
 ```
 
-`<graph>` is the canonical JSON graph (or a `.kuzu` directory; the loader
-auto-detects). Two global flags apply to every command:
+`<graph>` is a store directory built by `lachesis-analyze`. Two global flags apply
+to every command:
 
 - `--format json` (default) emits the full result dict. `--format text` emits a
   compact human-readable digest. The flag goes before the graph path.
@@ -50,7 +50,7 @@ taint-reach node prints the four-hop path from the public parameter to the
 ## The `lachesis-mcp` server
 
 ```
-lachesis-mcp <graph.json> [overlay.json] [profile]
+lachesis-mcp <graph.kuzu> [overlay.json] [profile]
 ```
 
 The server speaks MCP over stdio as `nav-reasoning`. It loads the graph once at
@@ -63,7 +63,7 @@ config entry like:
   "mcpServers": {
     "lachesis": {
       "command": "lachesis-mcp",
-      "args": ["/abs/path/to/graph.json"]
+      "args": ["/abs/path/to/graph.kuzu"]
     }
   }
 }

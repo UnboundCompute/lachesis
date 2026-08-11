@@ -1,9 +1,8 @@
 name: CI
 
-# Runs the parity/checks suite across the supported Python versions and
-# install profiles. The base install has no Python dependencies; the Kuzu
-# columnar store is an opt-in extra that needs Python 3.10+, so the 3.9 job
-# runs JSON-only and the newer jobs run the full [kuzu,dev] profile.
+# Runs the parity/checks suite across the supported Python versions. The Kuzu
+# columnar store is the graph store and a required dependency, so every job
+# installs it and the floor is Python 3.10.
 
 on:
   push:
@@ -24,14 +23,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Base profile: pure standard library, JSON store only.
-          - python-version: "3.9"
+          - python-version: "3.10"
             extras: "dev"
-          # Full profile: the embedded Kuzu columnar store (needs 3.10+).
           - python-version: "3.11"
-            extras: "kuzu,dev"
+            extras: "dev"
           - python-version: "3.12"
-            extras: "kuzu,dev"
+            extras: "dev"
 
     steps:
       - uses: actions/checkout@v4

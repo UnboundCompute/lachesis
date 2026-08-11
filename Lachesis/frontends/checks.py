@@ -175,15 +175,15 @@ class CompilerFrontendTests(unittest.TestCase):
     @requires_corpus
     def test_cli_canonical_views_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as output:
-            graph_path = Path(output) / "canonical.json"
+            graph_path = Path(output) / "canonical.kuzu"
             layered_path = Path(output) / "layered"
             self.run_command(
                 sys.executable, "Lachesis/cli/analyze.py", str(CORPUS), str(graph_path),
-                "--no-kuzu",
                 "--frontend-out", str(Path(output) / "frontends"),
                 "--layered-out", str(layered_path),
             )
-            self.assertTrue(graph_path.is_file())
+            self.assertTrue((graph_path / "graph.kuzu").exists())
+            self.assertTrue((graph_path / "lachesis-manifest.json").is_file())
             self.assertTrue((layered_path / "manifest.json").is_file())
             self.assertTrue((layered_path / "node_index.json").is_file())
             overview = subprocess.run(
@@ -1213,8 +1213,10 @@ class CompilerFrontendTests(unittest.TestCase):
                                      if ln.strip().startswith(tuple("0123456789"))))
 
             # -- Spec 2: real stdio JSON-RPC server, scripted client ---------------
-            canon = _Path(output) / "canonical.json"
-            canon.write_text(json.dumps(graph), encoding="utf-8")
+            canon = _Path(output) / "canonical.kuzu"
+            from Lachesis.kuzu_store import write_kuzu_graph
+            write_kuzu_graph(graph, [], str(canon),
+                             prune=False, elide_constants=False)
             env = dict(__import__("os").environ, LACHESIS_GRAPH=str(canon),
                        LACHESIS_FORMAT="text")
             proc = subprocess.Popen(
@@ -1253,18 +1255,14 @@ class CompilerFrontendTests(unittest.TestCase):
                     if stream and not stream.closed:
                         stream.close()
 
-    def test_nav_parity_json_store_vs_kuzu_store(self) -> None:
-        # Step 3 (KUZU_STORE_SPEC): the Kùzu-backed store answers every nav tool
-        # identically to the JSON-backed store. A parity build (prune + constant
-        # elision OFF) must reconstruct the canonical node/edge dicts exactly, so
-        # the full nav set matches byte-for-byte (order-normalized — the two
-        # backends may enumerate a set in a different order, but the *content* is
-        # identical). A pruned build must still answer the lossless nav set
-        # (read_body reads source by offset, not the dropped token/span nodes).
-        # Skip-guarded: kuzu needs Python 3.10+, so the 3.9 suite stays green.
-        import importlib.util as _ilu
-        if _ilu.find_spec("kuzu") is None:
-            self.skipTest("kuzu not installed (3.9 env)")
+    def test_nav_parity_in_memory_graph_vs_kuzu_store(self) -> None:
+        # The Kùzu store answers every nav tool identically to the same graph held in
+        # memory as a dict. A parity build (prune + constant elision OFF) must
+        # reconstruct the canonical node/edge dicts exactly, so the full nav set
+        # matches byte-for-byte (order-normalized — the two backends may enumerate a
+        # set in a different order, but the *content* is identical). A pruned build
+        # must still answer the lossless nav set (read_body reads source by offset,
+        # not the dropped token/span nodes).
         import os as _os
         import sys as _sys
         import types as _types
@@ -1283,7 +1281,7 @@ class CompilerFrontendTests(unittest.TestCase):
             # each store drives the same global nav dispatch, one at a time. The
             # security tools (guards/guards_top/call_roles/siblings) recompute from
             # base facts, so the injected context mirrors the real `_Ctx` — a Kùzu
-            # store with an empty overlay must answer them identically to the JSON
+            # store with an empty overlay must answer them identically to the in-memory
             # store, proving the overlay is a cache, not a dependency.
             guards = GuardProfiles(store)
             mcp_server._CTX = _types.SimpleNamespace(
@@ -1319,10 +1317,10 @@ class CompilerFrontendTests(unittest.TestCase):
             validate_snapshot(snapshot)
             graph = {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)}
 
-            json_store = GraphStore(graph)
+            memory_store = GraphStore(graph)
             # derive valid file / folder targets from the graph itself, so the
             # same args exercise a real answer on both backends.
-            file_node = next(iter(json_store.index.nodes_of_kind("file")), None)
+            file_node = next(iter(memory_store.index.nodes_of_kind("file")), None)
             self.assertIsNotNone(file_node, "fixture must contain a file node")
             file_path = (file_node.get("properties") or {}).get("file")
             self.assertTrue(file_path, "file node must carry its path")
@@ -1349,7 +1347,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 ("call_roles", "call_roles", {"fn": "drv_start"}),
                 ("siblings", "siblings", {"sym": "drv_start"}),
             ]
-            json_out = _run_nav(json_store, calls)
+            memory_out = _run_nav(memory_store, calls)
 
             # -- parity build (prune + elide OFF): full nav set identical ----------
             parity_dir = _os.path.join(output, "kuzu_parity")
@@ -1358,8 +1356,8 @@ class CompilerFrontendTests(unittest.TestCase):
             parity_out = _run_nav(GraphStore.load(parity_dir), calls)
             for label, _tool, _args in calls:
                 self.assertEqual(
-                    _norm(json_out[label]), _norm(parity_out[label]),
-                    f"{label}: Kùzu parity store must match the JSON store")
+                    _norm(memory_out[label]), _norm(parity_out[label]),
+                    f"{label}: Kùzu parity store must match the in-memory store")
 
             # -- pruned build: the lossless nav set still answers identically ------
             # prune drops pure-lexical token/source-span nodes (and dangling edges);
@@ -1374,8 +1372,8 @@ class CompilerFrontendTests(unittest.TestCase):
                 self.assertNotIn('"error"', pruned_out[label],
                                  f"{label}: pruned Kùzu store must still answer")
                 self.assertEqual(
-                    _norm(json_out[label]), _norm(pruned_out[label]),
-                    f"{label}: pruned Kùzu store must match the JSON store")
+                    _norm(memory_out[label]), _norm(pruned_out[label]),
+                    f"{label}: pruned Kùzu store must match the in-memory store")
 
             # -- guard-rich synthetic graph: exercise the NONZERO guard-count path --
             # The C fixtures emit no CONDITION/THROWS_VALUE edges (those come from
@@ -1383,7 +1381,7 @@ class CompilerFrontendTests(unittest.TestCase):
             # guard path. Guard kinds are cold (not HOT_REL_KINDS): they live in the
             # catch-all EDGE table and edges_of_kind matches them by `semantic_kind`.
             # This synthetic graph drives real, nonzero guard counts through that
-            # path so a Kùzu vs JSON divergence in guard attribution would show.
+            # path so a store vs in-memory divergence in guard attribution would show.
             fn = {"id": "fn1", "kind": "function", "label": "validate_input",
                   "properties": {"file": "g.c", "start_line": 1}}
             stmt = {"id": "s1", "kind": "statement", "label": "if",
@@ -1407,9 +1405,9 @@ class CompilerFrontendTests(unittest.TestCase):
                 ("guards", "guards", {"fn": "validate_input"}),
                 ("call_roles", "call_roles", {"fn": "validate_input"}),
             ]
-            guard_json = _run_nav(GraphStore(guard_graph), guard_calls)
+            guard_memory = _run_nav(GraphStore(guard_graph), guard_calls)
             # sanity: the counting path actually fired (not a vacuous all-zero match)
-            gsig = json.loads(guard_json["guards"])["guard_signal"]
+            gsig = json.loads(guard_memory["guards"])["guard_signal"]
             self.assertEqual("guard", gsig["class"])
             self.assertGreaterEqual(gsig["conditions"], 1)
             self.assertGreaterEqual(gsig["throws"], 1)
@@ -1420,8 +1418,8 @@ class CompilerFrontendTests(unittest.TestCase):
             guard_kuzu = _run_nav(GraphStore.load(guard_dir), guard_calls)
             for label, _tool, _args in guard_calls:
                 self.assertEqual(
-                    _norm(guard_json[label]), _norm(guard_kuzu[label]),
-                    f"{label}: Kùzu must match JSON on the nonzero guard-count path")
+                    _norm(guard_memory[label]), _norm(guard_kuzu[label]),
+                    f"{label}: Kùzu must match the in-memory store on the nonzero guard-count path")
 
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(

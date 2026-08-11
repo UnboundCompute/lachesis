@@ -47,12 +47,64 @@ except Exception:  # pragma: no cover
 _EDGE_SORT = lambda e: (e.get("kind") or "", e.get("source") or "", e.get("target") or "")
 
 
+def _overlay_edge_key(edge: dict) -> str:
+    from nav.overlay import edge_key
+    return edge_key(edge)
+
+
 def _restore(props_json: Optional[str]) -> dict:
     props = json.loads(props_json) if props_json else {}
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
             props[key] = list(default) if isinstance(default, list) else default
     return props
+
+
+def materialize_graph(index: "KuzuGraphIndex") -> dict:
+    """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
+
+    The rest of this module exists precisely to avoid this — the per-node primitives
+    keep a whole-repo graph off the heap. But two callers genuinely need the dict:
+    ``ReasoningQuery`` (``Lachesis/cli/query.py``), which builds an in-RAM
+    ``GraphIndex``, and overlay enrichment, which folds the graph whole. Both pay the
+    peak once, deliberately; no nav navigation tool calls this.
+
+    Two columnar scans rather than ``_node``/``_edges`` per id: a per-id primary-key
+    lookup repeated a million times is the slow way to read a columnar store. Ordering
+    matches ``combine_graphs`` (nodes by id, edges by ``(kind, source, target)``) so a
+    materialized graph compares equal to a freshly composed one.
+    """
+    nodes = []
+    res = index._conn.execute(
+        "MATCH (n:Node) RETURN n.id, n.kind, n.label, n.props ORDER BY n.id"
+    )
+    while res.has_next():
+        nid, kind, label, props = res.get_next()
+        nodes.append({"id": nid, "kind": kind, "label": label,
+                      "properties": _restore(props)})
+    edges = []
+    for kind in HOT_REL_KINDS:
+        res = index._conn.execute(
+            f"MATCH (a:Node)-[e:{kind}]->(b:Node) RETURN a.id, b.id, e.props"
+        )
+        while res.has_next():
+            src, tgt, props = res.get_next()
+            edges.append({"source": src, "target": tgt, "kind": kind,
+                          "properties": _restore(props)})
+    res = index._conn.execute(
+        "MATCH (a:Node)-[e:EDGE]->(b:Node) RETURN a.id, b.id, e.kind, e.props"
+    )
+    while res.has_next():
+        src, tgt, kind, props = res.get_next()
+        edges.append({"source": src, "target": tgt, "kind": kind,
+                      "properties": _restore(props)})
+    # Kùzu does not promise a scan order, and two edges can share
+    # ``(kind, source, target)`` while differing in props, so the tie-break folds the
+    # props in: materializing the same store twice must give byte-identical output, or
+    # a downstream enrich is not reproducible.
+    edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
+                              json.dumps(e["properties"], sort_keys=True)))
+    return {"nodes": nodes, "edges": edges}
 
 
 class _NodeMap:
@@ -123,6 +175,9 @@ class KuzuGraphIndex:
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}
+        self._overlay = None
+        self._derived_out: dict = {}
+        self._derived_in: dict = {}
         self.nodes = _NodeMap(self)
         self.outgoing = _Adjacency(self, reverse=False)
         self.incoming = _Adjacency(self, reverse=True)
@@ -152,6 +207,45 @@ class KuzuGraphIndex:
             if owner_key:
                 self.by_owner[owner_key].append(nid)
 
+    # -- sidecar overlay ----------------------------------------------------
+
+    def attach_overlay(self, overlay) -> None:
+        """Merge a derived-signal sidecar (``nav/overlay.py``) into the live index.
+
+        The store on disk is never rewritten; the overlay's node props, derived nodes
+        and derived ``GUARDED``/``UNGUARDED`` edges are folded in as the index answers
+        queries, which is the store-backed equivalent of ``Overlay.apply_to`` on a
+        graph dict. Must run before any fetch, so it drops the caches.
+        """
+        if not (overlay.node_props or overlay.edge_props
+                or overlay.derived_nodes or overlay.derived_edges):
+            return
+        self._overlay = overlay
+        self._node_cache.clear()
+        self._out_cache.clear()
+        self._in_cache.clear()
+        self._derived_out = defaultdict(list)
+        self._derived_in = defaultdict(list)
+        for edge in overlay.derived_edges:
+            self._derived_out[edge["source"]].append(edge)
+            self._derived_in[edge["target"]].append(edge)
+        for node in overlay.derived_nodes:
+            nid = node["id"]
+            if nid in self._node_cache:
+                continue
+            self._ids.append(nid)
+            self.by_kind[node.get("kind")].append(nid)
+            self.by_label[node.get("label")].append(nid)
+            props = node.get("properties") or {}
+            path = props.get("absolute_file") or props.get("file")
+            if path:
+                self.by_file[path].append(nid)
+            owner = props.get("owner_function_id") or props.get("function_id")
+            if owner:
+                self.by_owner[owner].append(nid)
+            self._node_cache[nid] = node
+        self._ids.sort()
+
     def _node_count(self) -> int:
         return len(self._ids)
 
@@ -169,8 +263,11 @@ class KuzuGraphIndex:
         node = None
         if res.has_next():
             kind, label, props = res.get_next()
+            properties = _restore(props)
+            if self._overlay is not None:
+                properties.update(self._overlay.node_props.get(node_id) or {})
             node = {"id": node_id, "kind": kind, "label": label,
-                    "properties": _restore(props)}
+                    "properties": properties}
         self._node_cache[node_id] = node
         return node
 
@@ -192,6 +289,15 @@ class KuzuGraphIndex:
             src, tgt = (other, node_id) if reverse else (node_id, other)
             edges.append({"source": src, "target": tgt, "kind": kind,
                           "properties": _restore(props)})
+        if self._overlay is not None:
+            for edge in edges:
+                extra = self._overlay.edge_props.get(_overlay_edge_key(edge))
+                if extra:
+                    edge["properties"].update(extra)
+            derived = self._derived_in if reverse else self._derived_out
+            edges.extend({"source": e["source"], "target": e["target"],
+                          "kind": e["kind"], "properties": dict(e.get("properties") or {})}
+                         for e in derived.get(node_id, ()))
         edges.sort(key=_EDGE_SORT)
         cache[node_id] = edges
         return edges
@@ -263,6 +369,9 @@ class KuzuGraphIndex:
             src, tgt, kind, props = res.get_next()
             edges.append({"source": src, "target": tgt, "kind": kind,
                           "properties": _restore(props)})
+        if self._overlay is not None:
+            edges.extend(dict(e) for e in self._overlay.derived_edges
+                         if e.get("kind") in accepted)
         edges.sort(key=_EDGE_SORT)
         return edges
 
