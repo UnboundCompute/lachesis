@@ -764,11 +764,24 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
 
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
 
+def _blob_param(blob: bytes) -> str:
+    """A ``props`` blob as something a Cypher parameter can actually carry.
+
+    Kùzu 0.11.3 binds no Python type to ``BLOB``: ``bytes`` and ``bytearray`` both come
+    back as "Unknown parameter type". So the parameter is a string of ``\\xHH`` escapes
+    and the statement casts it, which round-trips all 256 byte values. Only the rowwise
+    path needs this; the bulk path hands Kùzu an Arrow binary column and never binds a
+    parameter at all.
+    """
+    return "".join("\\x%02X" % byte for byte in blob)
+
 def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
                         zdict: bytes = b"",
                         id_codes: Optional[dict] = None) -> None:
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
-    placeholders = ", ".join(f"{c}: ${c}" for c in columns)
+    placeholders = ", ".join(
+        f"{c}: CAST($props AS BLOB)" if c == "props" else f"{c}: ${c}"
+        for c in columns)
     stmt = f"CREATE (n:Node {{{placeholders}}})"
     conn.execute("BEGIN TRANSACTION")
     try:
@@ -780,7 +793,8 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
             for prop in PROMOTED_NODE_PROPS:
                 params[prop] = _coded_cell(prop, _promoted_value(props, prop),
                                            id_codes or {})
-            params["props"] = _stored_props(props, elide, _COLUMN_KEYS, zdict)
+            params["props"] = _blob_param(
+                _stored_props(props, elide, _COLUMN_KEYS, zdict))
             conn.execute(stmt, params)
         conn.execute("COMMIT")
     except Exception:
@@ -793,12 +807,13 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
                         id_codes: Optional[dict] = None) -> None:
     hot_stmt = {
         kind: (f"MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
-               f"CREATE (a)-[:{kind} {{unit: $unit, props: $props}}]->(b)")
+               f"CREATE (a)-[:{kind} "
+               f"{{unit: $unit, props: CAST($props AS BLOB)}}]->(b)")
         for kind in HOT_REL_KINDS
     }
     edge_stmt = ("MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
                  "CREATE (a)-[:EDGE {kind: $kind, semantic_kind: $sem, "
-                 "unit: $unit, props: $props}]->(b)")
+                 "unit: $unit, props: CAST($props AS BLOB)}]->(b)")
     conn.execute("BEGIN TRANSACTION")
     try:
         for edge in edges:
@@ -807,7 +822,7 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
             base = {"s": encode_id(edge["source"], id_codes or {}),
                     "t": encode_id(edge["target"], id_codes or {}),
                     "unit": _edge_unit(edge, node_units),
-                    "props": _stored_props(props, elide, zdict=zdict)}
+                    "props": _blob_param(_stored_props(props, elide, zdict=zdict))}
             if kind in _HOT_SET:
                 conn.execute(hot_stmt[kind], base)
             else:
