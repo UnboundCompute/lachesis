@@ -94,19 +94,53 @@ tier exists.
 - `reachability.py`, `hubs.py`, `guards.py`, `call_roles.py`, `siblings.py`, `flow.py`, and `symbol_index.py` are the reasoning primitives.
 - `mcp_server.py` exposes the navigation tools over MCP, so an LLM agent can drive the graph directly.
 
-## Storage: JSON or Kùzu
+## Benchmarks
 
-Lachesis dual-writes by default. You get a JSON graph, which is portable and diff-friendly, and a sibling `.kuzu` directory, which is columnar and easy on RAM. The navigation layer figures out which one to load and behaves the same over either backend. The two are kept at byte-identical parity across the navigation and MCP tools, and there is a test suite that enforces that.
+All numbers below come from one public, reproducible target: the TypeScript
+packages in the [`vercel/ai`](https://github.com/vercel/ai) monorepo (`ai@7.0.55`),
+built with the TypeScript frontend on an Apple M4 (16 GB), single process, Python
+3.9, Kùzu 0.11.3. Clone the repo and point the analyzer at any package's `src`
+directory to reproduce them.
 
-The Kùzu backend is the one you want at scale. On a real whole-package graph of roughly 500K nodes and 926K edges, here is how the two compare:
+### Build throughput
+
+Lachesis builds the full layered graph, including the dataflow tier, at roughly
+one thousand source lines per second, or ten to eleven thousand graph elements
+(nodes plus edges) per second, and it stays near-linear as the input grows.
+
+| Package (`packages/<name>/src`) | TS LOC | Nodes | Edges | Build time | JSON size |
+|---|---:|---:|---:|---:|---:|
+| `anthropic` | 30,577 | 133,903 | 227,662 | 31.9 s | 265 MB |
+| `openai` | 44,890 | 210,164 | 361,406 | 49.6 s | 422 MB |
+| `ai` | 164,607 | 504,246 | 920,708 | 140.9 s | 1.0 GB |
+
+```bash
+python -m Lachesis.cli.analyze path/to/vercel-ai/packages/ai/src ai.json --no-kuzu
+```
+
+### Storage and open time: JSON or Kùzu
+
+Lachesis dual-writes by default: a JSON graph, which is portable and diff-friendly,
+and a sibling `.kuzu` directory, which is columnar and easy on RAM. The navigation
+layer figures out which one to load and behaves the same over either backend. The
+two are kept at byte-identical parity across the navigation and MCP tools, and a
+test suite enforces that.
+
+The Kùzu backend is the one you want at scale. On the `ai` graph above (504,246
+nodes / 920,708 edges), here is how opening and holding the graph compares, loading
+each backend through the navigation layer:
 
 | | JSON | Kùzu | change |
 |---|---:|---:|---|
 | On-disk size | 1.0 GB | 368 MB | 63% smaller |
-| Load-time peak RSS | 3394 MB | 357 MB | 90% smaller |
-| Open time | about 10 s | about 0.5 s | roughly 20x faster |
+| Open time (load into nav) | 11.1 s | 0.58 s | about 19x faster |
+| Load peak RSS | 3511 MB | 362 MB | 90% smaller |
+| Warm query (hubs top-10) | about 1 ms | about 4 ms | parity |
 
-The [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) covers the on-disk layout, the incremental unit key, and the trade-offs we measured. The short version: columnar scans give up a little warm-query latency in exchange for a large win on RAM and startup time.
+The [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) covers the on-disk layout, the
+incremental unit key, and the trade-offs we measured. The short version: columnar
+scans give up a little warm-query latency in exchange for a large win on RAM and
+startup time, which is what lets a half-million-node graph open in under a second.
 
 ## Documentation
 
