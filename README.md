@@ -52,6 +52,16 @@ directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
 `lachesis-mcp` speaks MCP over stdio, so point an MCP-capable client at
 `lachesis-mcp /abs/path/to/graph.json` and the navigation tools show up as tools.
 
+## See it work
+
+Before you point it at your own code, watch the dataflow tier catch something on
+a project that ships in the repo. [`examples/README.md`](./examples/README.md) is
+a five-minute walkthrough: build a graph from the bundled fixture, then watch
+Lachesis tell two sibling functions apart because one authorizes a database
+lookup and the other reaches the identical call with no check. That is the kind
+of question a symbol index cannot answer, and it is the whole reason the dataflow
+tier exists.
+
 ## How it fits together
 
 ```

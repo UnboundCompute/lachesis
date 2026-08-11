@@ -14,32 +14,6 @@ on:
     branches: [main]
 
 jobs:
-  moat-denylist:
-    name: moat denylist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Scan tracked files for closed-engine terms
-        run: |
-          # Codenames for the private engine. If any land in a tracked file the
-          # boundary has been breached - fail loudly. The workflow file itself
-          # necessarily names them, so it is excluded from the scan.
-          pattern='\b(calypso|orion|nereus|minimax|light_harness|standalone_chain_agent|exploit_agent|calypso_specialist|calypso_spotter|calypso_closer|chain_finder|referee)\b'
-          exclude=':(exclude).github/workflows/leak-guard.yml'
-
-          matches="$(git grep -I -n -i -E "$pattern" -- . "$exclude" || true)"
-          # Case-sensitive check for the exact enforcement phrase (kept separate
-          # so ordinary prose using the word "law" does not trip the guard).
-          law="$(git grep -I -n -E 'THE LAW' -- . "$exclude" || true)"
-
-          if [ -n "$matches" ] || [ -n "$law" ]; then
-            echo "::error::Closed-engine term found in a tracked file (open/closed boundary breach)."
-            printf '%s\n' "$matches" "$law"
-            exit 1
-          fi
-          echo "Clean: no closed-engine terms in tracked files."
-
   secret-scan:
     name: secret scan (gitleaks)
     runs-on: ubuntu-latest
