@@ -1,0 +1,61 @@
+name: CI
+
+# Runs the parity/checks suite across the supported Python versions and
+# install profiles. The base install has no Python dependencies; the Kuzu
+# columnar store is an opt-in extra that needs Python 3.10+, so the 3.9 job
+# runs JSON-only and the newer jobs run the full [kuzu,dev] profile.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a fast-follow push doesn't queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks (py${{ matrix.python-version }}, ${{ matrix.extras }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Base profile: pure standard library, JSON store only.
+          - python-version: "3.9"
+            extras: "dev"
+          # Full profile: the embedded Kuzu columnar store (needs 3.10+).
+          - python-version: "3.11"
+            extras: "kuzu,dev"
+          - python-version: "3.12"
+            extras: "kuzu,dev"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install the TypeScript compiler the TS frontend loads
+        run: npm ci
+
+      - name: Upgrade pip (editable installs need pip >= 21.3)
+        run: python -m pip install --upgrade pip
+
+      - name: Install Lachesis (${{ matrix.extras }})
+        run: pip install -e ".[${{ matrix.extras }}]"
+
+      - name: Run the parity / checks suite
+        run: python -m pytest Lachesis/frontends/checks.py -v

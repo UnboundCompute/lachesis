@@ -1,0 +1,66 @@
+name: leak-guard
+
+# Two guards that protect the open/closed boundary:
+#   1. moat-denylist - fails if any closed-engine codename appears in a tracked
+#      file. Lachesis is the open infrastructure; the detection/exploitation
+#      engine that consumes it stays private. This catches an accidental paste
+#      or an over-broad copy before it ever reaches a reviewer.
+#   2. secret-scan - gitleaks over the full history for credentials/keys.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  moat-denylist:
+    name: moat denylist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tracked files for closed-engine terms
+        run: |
+          # Codenames for the private engine. If any land in a tracked file the
+          # boundary has been breached - fail loudly. The workflow file itself
+          # necessarily names them, so it is excluded from the scan.
+          pattern='\b(calypso|orion|nereus|minimax|light_harness|standalone_chain_agent|exploit_agent|calypso_specialist|calypso_spotter|calypso_closer|chain_finder|referee)\b'
+          exclude=':(exclude).github/workflows/leak-guard.yml'
+
+          matches="$(git grep -I -n -i -E "$pattern" -- . "$exclude" || true)"
+          # Case-sensitive check for the exact enforcement phrase (kept separate
+          # so ordinary prose using the word "law" does not trip the guard).
+          law="$(git grep -I -n -E 'THE LAW' -- . "$exclude" || true)"
+
+          if [ -n "$matches" ] || [ -n "$law" ]; then
+            echo "::error::Closed-engine term found in a tracked file (open/closed boundary breach)."
+            printf '%s\n' "$matches" "$law"
+            exit 1
+          fi
+          echo "Clean: no closed-engine terms in tracked files."
+
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan covers every commit, not just the tip.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          version="$(curl -sSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
+            | grep -oE '"tag_name": *"v[^"]+"' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          echo "Installing gitleaks v${version}"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan history for secrets
+        # git-aware scan: gitignored/untracked build artifacts (graph_out/, etc.)
+        # are not scanned, which is why the generated-graph false positives that
+        # tripped an earlier manual run do not appear here.
+        run: gitleaks detect --no-banner --redact --source .
