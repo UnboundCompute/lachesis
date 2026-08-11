@@ -3,7 +3,7 @@
 
 This is the last piece: it wraps the *already-proven* reasoning library (graph_store,
 reachability, guards, call_roles, siblings) as MCP tools so an agent can navigate and
-reason over the canonical Arachne graph directly. No SDK, no new dependency — just a
+reason over the canonical Lachesis graph directly. No SDK, no new dependency — just a
 hand-rolled stdio JSON-RPC loop, with the usual discipline that makes that safe
 (stdout is the protocol channel and carries nothing but JSON-RPC; all logs go to
 stderr).
@@ -19,7 +19,7 @@ Tools:
   reasoning  — flow, reaches, sources_of, points_to, aliases, guards, call_roles, siblings
 
 Profiles (additive): the default "all" exposes every tool (TS surface unchanged). The
-opt-in "comprehension" profile (env ARACHNE_MCP_PROFILE=comprehension, or a 3rd argv)
+opt-in "comprehension" profile (env LACHESIS_MCP_PROFILE=comprehension, or a 3rd argv)
 hides the four security tools for a focused understanding run — nothing else changes.
 
   python3 nav/mcp_server.py <graph.json> [overlay.json] [profile]
@@ -48,7 +48,7 @@ _CTX = None  # lazily-built bundle of store + engines, loaded once
 _PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
 # Process-wide default output format for tools/call when a call omits `format`.
 # "text" = compact LLM-facing rendering (Spec 1); "json" = the full result dict.
-# Set from ARACHNE_FORMAT in main(); defaults to text.
+# Set from LACHESIS_FORMAT in main(); defaults to text.
 _DEFAULT_FORMAT = "text"
 
 # The security-hunting tools. Under the DEFAULT "all" profile every one is exposed
@@ -420,22 +420,22 @@ def send(obj):
 def main():
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _DEFAULT_FORMAT
     # Config precedence: explicit argv wins, else env. The graph path may come from
-    # argv[1] or ARACHNE_GRAPH; a session can also (re)attach at runtime via load_graph.
-    _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ARACHNE_GRAPH")
+    # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
+    _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")
     if not _GRAPH_PATH:
         print("usage: mcp_server.py <graph.json> [overlay.json] [profile]\n"
-              "   or: ARACHNE_GRAPH=<graph.json> mcp_server.py", file=sys.stderr)
+              "   or: LACHESIS_GRAPH=<graph.json> mcp_server.py", file=sys.stderr)
         return 2
     _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
-    # Profile: explicit 3rd argv wins, else env (ARACHNE_PROFILE, back-compat
-    # ARACHNE_MCP_PROFILE), else the default "all". Only "comprehension" narrows the
+    # Profile: explicit 3rd argv wins, else env (LACHESIS_PROFILE, back-compat
+    # LACHESIS_MCP_PROFILE), else the default "all". Only "comprehension" narrows the
     # surface; any other value falls back to "all".
     profile = (sys.argv[3] if len(sys.argv) > 3
-               else os.environ.get("ARACHNE_PROFILE")
-               or os.environ.get("ARACHNE_MCP_PROFILE", "all"))
+               else os.environ.get("LACHESIS_PROFILE")
+               or os.environ.get("LACHESIS_MCP_PROFILE", "all"))
     _PROFILE = "comprehension" if profile == "comprehension" else "all"
     # Default output format when a tools/call omits `format`: text (compact) unless
-    # ARACHNE_FORMAT=json flips the whole server back to full JSON.
+    # LACHESIS_FORMAT=json flips the whole server back to full JSON.
     _DEFAULT_FORMAT = render_mod.default_format()
     log(f"starting; graph = {_GRAPH_PATH}; profile = {_PROFILE}; format = {_DEFAULT_FORMAT}")
     for line in sys.stdin:

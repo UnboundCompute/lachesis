@@ -19,7 +19,7 @@ def run_frontend(
 ) -> FrontendSnapshot:
     temporary = None
     if output_dir is None:
-        temporary = tempfile.TemporaryDirectory(prefix="arachne-frontend-")
+        temporary = tempfile.TemporaryDirectory(prefix="lachesis-frontend-")
         output_dir = temporary.name
     os.makedirs(output_dir, exist_ok=True)
     environment = os.environ.copy()
@@ -28,10 +28,10 @@ def run_frontend(
     # write it beside the output and point the frontend at it so a frontend that
     # re-walks the tree compiles exactly this list — one discovery, no drift.
     if roots is not None:
-        roots_file = os.path.join(output_dir, "arachne-roots.txt")
+        roots_file = os.path.join(output_dir, "lachesis-roots.txt")
         with open(roots_file, "w", encoding="utf-8") as handle:
             handle.write("\n".join(roots))
-        environment["ARACHNE_ROOTS_FILE"] = roots_file
+        environment["LACHESIS_ROOTS_FILE"] = roots_file
     command = frontend.render_command(source_dir, output_dir)
     try:
         completed = subprocess.run(

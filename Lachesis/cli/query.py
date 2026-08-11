@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Query a canonical Arachne project graph and emit an LLM reasoning slice."""
+"""Query a canonical Lachesis project graph and emit an LLM reasoning slice."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from Arachne.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
+from Lachesis.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
 
 
 def load_graph(path: str) -> tuple[dict, dict]:
@@ -47,7 +47,7 @@ def resolve_function(
 
 
 def render_text(result: dict) -> str:
-    lines = [f"# {result.get('query', 'Arachne query')}"]
+    lines = [f"# {result.get('query', 'Lachesis query')}"]
     focus = result.get("focus") or result.get("node")
     if focus:
         location = focus.get("location") or {}

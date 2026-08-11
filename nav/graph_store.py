@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from Arachne.cli.query import load_graph
+from Lachesis.cli.query import load_graph
 from nav.graphlib import GraphLib
 from nav import symbol_index as si
 from nav.overlay import Overlay, sidecar_path
@@ -46,14 +46,14 @@ def resolve_graph_path(graph_path: str) -> str:
     (the ceiling that blocked whole-repo graphs), so once a sibling ``<stem>.kuzu``
     directory exists next to a ``.json`` graph, nav serves from it by default.
 
-      * ``ARACHNE_FORCE_JSON`` (any truthy value) forces the JSON path — for
+      * ``LACHESIS_FORCE_JSON`` (any truthy value) forces the JSON path — for
         debugging, or when the derived-signal overlay sidecar is needed (the
         Kùzu path serves base facts; the security tools recompute either way).
       * A path that is already a Kùzu dir, or a ``.json`` with no sibling store,
         is returned unchanged.
     """
-    from Arachne.kuzu_store import is_kuzu_dir
-    if os.environ.get("ARACHNE_FORCE_JSON"):
+    from Lachesis.kuzu_store import is_kuzu_dir
+    if os.environ.get("LACHESIS_FORCE_JSON"):
         return graph_path
     if is_kuzu_dir(graph_path):
         return graph_path
@@ -133,9 +133,9 @@ class GraphStore:
         # derived-signal overlay is a JSON-path enrichment; the Kùzu path serves base
         # facts directly — the security tools recompute those signals from base facts
         # either way (proven by test_nav_parity_json_store_vs_kuzu_store).
-        from Arachne.kuzu_store import is_kuzu_dir
+        from Lachesis.kuzu_store import is_kuzu_dir
         # prefer a sibling Kùzu store when one exists (low-RAM default); an explicit
-        # Kùzu dir or ARACHNE_FORCE_JSON both pass through resolve_graph_path unchanged.
+        # Kùzu dir or LACHESIS_FORCE_JSON both pass through resolve_graph_path unchanged.
         graph_path = resolve_graph_path(graph_path)
         if is_kuzu_dir(graph_path):
             from nav.kuzu_index import KuzuGraphIndex

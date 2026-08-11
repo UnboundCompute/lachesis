@@ -5,8 +5,8 @@ It returns JSON-ready, evidence-backed slices; it never reparses source or chang
 canonical facts.
 
 ```python
-from Arachne.pipeline import run_project
-from Arachne.reasoning import ReasoningQuery
+from Lachesis.pipeline import run_project
+from Lachesis.reasoning import ReasoningQuery
 
 graph, snapshots = run_project("path/to/source")
 query = ReasoningQuery(graph)
@@ -20,14 +20,14 @@ characters divided by four. When lower-priority records do not fit, the result
 contains an `expand` continuation handle pointing at the first omitted node.
 
 The JSON-first CLI reads the canonical project JSON written by
-`Arachne/cli/analyze.py`:
+`Lachesis/cli/analyze.py`:
 
 ```sh
-python3 Arachne/cli/query.py graph.json overview
-python3 Arachne/cli/query.py graph.json function getDocument --file document-service.ts
-python3 Arachne/cli/query.py graph.json security-path NODE_ID
-python3 Arachne/cli/query.py graph.json --budget-tokens 6000 unresolved
-python3 Arachne/cli/query.py graph.json --format text call NODE_ID
+python3 Lachesis/cli/query.py graph.json overview
+python3 Lachesis/cli/query.py graph.json function getDocument --file document-service.ts
+python3 Lachesis/cli/query.py graph.json security-path NODE_ID
+python3 Lachesis/cli/query.py graph.json --budget-tokens 6000 unresolved
+python3 Lachesis/cli/query.py graph.json --format text call NODE_ID
 ```
 
 Names are never guessed. A non-unique function name returns typed candidates;
@@ -62,7 +62,7 @@ back to an unstructured or fabricated investigation.
 
 ### Bring your own provider
 
-Arachne ships no LLM client and depends on no provider SDK. `InvestigationAgent`
+Lachesis ships no LLM client and depends on no provider SDK. `InvestigationAgent`
 takes any object satisfying a two-method duck type, so you wire it to whatever you
 already use:
 
@@ -88,12 +88,12 @@ class MyProvider:
             prompt=request.task, context=request.context, schema=request.schema)
         return SimpleNamespace(data=reply, status="ok", usage={})
 
-from Arachne.reasoning import InvestigationAgent, ReasoningQuery
+from Lachesis.reasoning import InvestigationAgent, ReasoningQuery
 
 agent = InvestigationAgent(ReasoningQuery(graph), MyProvider(), max_steps=8)
 investigation = await agent.run(focus_id=None)
 ```
 
-`Arachne/frontends/checks.py` drives the agent with a scripted stub of exactly this
+`Lachesis/frontends/checks.py` drives the agent with a scripted stub of exactly this
 shape, so the contract is exercised by the test suite on every run — no provider
 required.

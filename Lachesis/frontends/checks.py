@@ -16,21 +16,21 @@ sys.path.insert(0, str(ROOT))
 
 # The multi-file TypeScript project the end-to-end tests analyze. Defaults to the
 # fixture corpus shipped in-tree so a fresh clone can run the whole suite; point
-# ARACHNE_CORPUS at any other TypeScript tree to re-run these tests against it.
+# LACHESIS_CORPUS at any other TypeScript tree to re-run these tests against it.
 CORPUS = Path(os.environ.get(
-    "ARACHNE_CORPUS",
-    ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "project",
+    "LACHESIS_CORPUS",
+    ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "project",
 ))
 requires_corpus = unittest.skipIf(
-    not CORPUS.is_dir(), f"corpus not present at {CORPUS} (set ARACHNE_CORPUS)",
+    not CORPUS.is_dir(), f"corpus not present at {CORPUS} (set LACHESIS_CORPUS)",
 )
 
 # The shipped corpus is pinned by identity, not by magic totals: the exact files it
 # contributes, the exact functions it declares, and the exact number of calls the
 # frontend recovers from them. A count alone passes when the graph loses one entry
-# and gains another; these sets do not. When ARACHNE_CORPUS points somewhere else
+# and gains another; these sets do not. When LACHESIS_CORPUS points somewhere else
 # the identity assertions are skipped and the structural ones still run.
-CORPUS_IS_FIXTURE = "ARACHNE_CORPUS" not in os.environ
+CORPUS_IS_FIXTURE = "LACHESIS_CORPUS" not in os.environ
 CORPUS_FILES = {
     "auth/principal.ts", "data/cache.ts", "data/repository.ts", "http/router.ts",
     "http/webhook.ts", "index.ts", "regress/backtick-in-regex.ts",
@@ -45,22 +45,22 @@ CORPUS_FUNCTIONS = {
 }
 CORPUS_FUNCTION_CALLS = 32
 
-from Arachne.compatibility.file_view import analyze_files, read_file, walk
-from Arachne.compatibility.projector import (
+from Lachesis.compatibility.file_view import analyze_files, read_file, walk
+from Lachesis.compatibility.projector import (
     compatibility_taint_path as taint_path, graph_file_infos,
 )
-from Arachne.pipeline import run_project, semantic_snapshot_graph, snapshot_graph
-from Arachne.projections import build_layered_graph
-from Arachne.reasoning import InvestigationAgent, ReasoningQuery
-from Arachne.reasoning.agent import ACTION_SCHEMA, AgentRequest
-from Arachne.core.snapshot import load_snapshot
-from Arachne.core.validation import validate_snapshot
-from Arachne.core.contract import ContractError, FrontendSnapshot
-from Arachne.core.boundaries import import_boundary_violations
-from Arachne.core.identities import stable_id
-from Arachne.core.query import GraphIndex
-from Arachne.ecosystems import EcosystemRegistry
-from Arachne.ecosystems.common import GenericRouteModel
+from Lachesis.pipeline import run_project, semantic_snapshot_graph, snapshot_graph
+from Lachesis.projections import build_layered_graph
+from Lachesis.reasoning import InvestigationAgent, ReasoningQuery
+from Lachesis.reasoning.agent import ACTION_SCHEMA, AgentRequest
+from Lachesis.core.snapshot import load_snapshot
+from Lachesis.core.validation import validate_snapshot
+from Lachesis.core.contract import ContractError, FrontendSnapshot
+from Lachesis.core.boundaries import import_boundary_violations
+from Lachesis.core.identities import stable_id
+from Lachesis.core.query import GraphIndex
+from Lachesis.ecosystems import EcosystemRegistry
+from Lachesis.ecosystems.common import GenericRouteModel
 
 
 class CompilerFrontendTests(unittest.TestCase):
@@ -124,7 +124,7 @@ class CompilerFrontendTests(unittest.TestCase):
             validate_snapshot(snapshot)
 
     def test_core_has_no_frontend_ecosystem_or_compatibility_imports(self) -> None:
-        self.assertEqual([], import_boundary_violations(ROOT / "Arachne"))
+        self.assertEqual([], import_boundary_violations(ROOT / "Lachesis"))
 
     def test_parser_migration_has_one_compiler_native_path(self) -> None:
         removed = {
@@ -138,14 +138,14 @@ class CompilerFrontendTests(unittest.TestCase):
         }
         self.assertEqual([], sorted(
             str(path.relative_to(ROOT))
-            for path in (ROOT / "Arachne").rglob("*.py")
+            for path in (ROOT / "Lachesis").rglob("*.py")
             if path.name in removed and path.parent.name != "overlays"
         ))
         c_frontend = (
-            ROOT / "Arachne" / "frontends" / "c" / "build_graph.py"
+            ROOT / "Lachesis" / "frontends" / "c" / "build_graph.py"
         ).read_text(encoding="utf-8")
         typescript_frontend = (
-            ROOT / "Arachne" / "frontends" / "typescript" / "build_graph.mjs"
+            ROOT / "Lachesis" / "frontends" / "typescript" / "build_graph.mjs"
         ).read_text(encoding="utf-8")
         self.assertNotIn("import re", c_frontend)
         self.assertNotIn("TOKEN_RE", c_frontend)
@@ -178,7 +178,7 @@ class CompilerFrontendTests(unittest.TestCase):
             graph_path = Path(output) / "canonical.json"
             layered_path = Path(output) / "layered"
             self.run_command(
-                sys.executable, "Arachne/cli/analyze.py", str(CORPUS), str(graph_path),
+                sys.executable, "Lachesis/cli/analyze.py", str(CORPUS), str(graph_path),
                 "--no-kuzu",
                 "--frontend-out", str(Path(output) / "frontends"),
                 "--layered-out", str(layered_path),
@@ -188,7 +188,7 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertTrue((layered_path / "node_index.json").is_file())
             overview = subprocess.run(
                 [
-                    sys.executable, "Arachne/cli/query.py", str(graph_path),
+                    sys.executable, "Lachesis/cli/query.py", str(graph_path),
                     "overview",
                 ],
                 cwd=ROOT, text=True, capture_output=True, check=False,
@@ -208,7 +208,7 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             function = subprocess.run(
                 [
-                    sys.executable, "Arachne/cli/query.py", str(graph_path),
+                    sys.executable, "Lachesis/cli/query.py", str(graph_path),
                     "--budget-tokens", "1000", "function", "getDocument",
                     "--file", "document-service.ts",
                 ],
@@ -220,7 +220,7 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertLessEqual(function_payload["budget"]["estimated_tokens"], 1000)
             self.assertNotIn(
                 "FileInfo",
-                (ROOT / "Arachne" / "cli" / "query.py").read_text(encoding="utf-8"),
+                (ROOT / "Lachesis" / "cli" / "query.py").read_text(encoding="utf-8"),
             )
 
     @requires_corpus
@@ -429,7 +429,7 @@ class CompilerFrontendTests(unittest.TestCase):
     def test_typescript_contextual_tokens_and_library_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                "node", "Arachne/frontends/typescript/build_graph.mjs", str(CORPUS), output,
+                "node", "Lachesis/frontends/typescript/build_graph.mjs", str(CORPUS), output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -470,13 +470,13 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_typescript_optional_catch_binding_is_null_safe(self) -> None:
         frontend = (
-            ROOT / "Arachne" / "frontends" / "typescript" / "build_graph.mjs"
+            ROOT / "Lachesis" / "frontends" / "typescript" / "build_graph.mjs"
         ).read_text(encoding="utf-8")
         self.assertNotIn("ts.isCatchClause(current?.parent)", frontend)
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                "node", "Arachne/frontends/typescript/build_graph.mjs",
-                "Arachne/frontends/typescript/fixtures/optional_catch", output,
+                "node", "Lachesis/frontends/typescript/build_graph.mjs",
+                "Lachesis/frontends/typescript/fixtures/optional_catch", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -490,8 +490,8 @@ class CompilerFrontendTests(unittest.TestCase):
     def test_typescript_reachable_framework_runtime_sources(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                "node", "Arachne/frontends/typescript/build_graph.mjs",
-                "Arachne/frontends/typescript/fixtures/framework", output,
+                "node", "Lachesis/frontends/typescript/build_graph.mjs",
+                "Lachesis/frontends/typescript/fixtures/framework", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -576,7 +576,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 for edge in modeled["edges"]
             ))
             composed, _ = run_project(
-                str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "framework"),
+                str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "framework"),
             )
             files = graph_file_infos(composed)
             handler = next(
@@ -596,8 +596,8 @@ class CompilerFrontendTests(unittest.TestCase):
     def test_typescript_compiler_emits_structured_type_and_receiver_facts(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                "node", "Arachne/frontends/typescript/build_graph.mjs",
-                "Arachne/frontends/typescript/fixtures/semantics", output,
+                "node", "Lachesis/frontends/typescript/build_graph.mjs",
+                "Lachesis/frontends/typescript/fixtures/semantics", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -709,13 +709,13 @@ class CompilerFrontendTests(unittest.TestCase):
                 refinement.get("compiler_node_id")
                 for info in compatibility for refinement in info["type_refinements"]
             ))
-            self.assertFalse((ROOT / "Arachne" / "type_system_analysis.py").exists())
+            self.assertFalse((ROOT / "Lachesis" / "type_system_analysis.py").exists())
 
     def test_typescript_compiler_emits_dispatch_mutation_and_runtime_facts(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                "node", "Arachne/frontends/typescript/build_graph.mjs",
-                "Arachne/frontends/typescript/fixtures/semantics", output,
+                "node", "Lachesis/frontends/typescript/build_graph.mjs",
+                "Lachesis/frontends/typescript/fixtures/semantics", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -779,8 +779,8 @@ class CompilerFrontendTests(unittest.TestCase):
     def test_c_header_declarations_and_calls(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                sys.executable, "Arachne/frontends/c/build_graph.py",
-                "Arachne/frontends/c/fixtures", output,
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -875,7 +875,7 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             with tempfile.TemporaryDirectory() as output:
                 self.run_command(
-                    sys.executable, "Arachne/frontends/c/build_graph.py",
+                    sys.executable, "Lachesis/frontends/c/build_graph.py",
                     str(root), output,
                 )
                 snapshot = load_snapshot(output)
@@ -906,7 +906,7 @@ class CompilerFrontendTests(unittest.TestCase):
             )
             with tempfile.TemporaryDirectory() as output:
                 self.run_command(
-                    sys.executable, "Arachne/frontends/c/build_graph.py",
+                    sys.executable, "Lachesis/frontends/c/build_graph.py",
                     str(root), output,
                 )
                 snapshot = load_snapshot(output)
@@ -938,7 +938,7 @@ class CompilerFrontendTests(unittest.TestCase):
             (root / "broken.c").write_text("int broken( { this is not valid C ;;;\n", encoding="utf-8")
             with tempfile.TemporaryDirectory() as output:
                 self.run_command(
-                    sys.executable, "Arachne/frontends/c/build_graph.py",
+                    sys.executable, "Lachesis/frontends/c/build_graph.py",
                     str(root), output,
                 )
                 snapshot = load_snapshot(output)
@@ -977,8 +977,8 @@ class CompilerFrontendTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                sys.executable, "Arachne/frontends/c/build_graph.py",
-                "Arachne/frontends/c/fixtures_crosstu", output,
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures_crosstu", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -1056,8 +1056,8 @@ class CompilerFrontendTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                sys.executable, "Arachne/frontends/c/build_graph.py",
-                "Arachne/frontends/c/fixtures_opsreg", output,
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures_opsreg", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -1103,8 +1103,8 @@ class CompilerFrontendTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                sys.executable, "Arachne/frontends/c/build_graph.py",
-                "Arachne/frontends/c/fixtures_opsreg_hdr/src", output,
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures_opsreg_hdr/src", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -1152,8 +1152,8 @@ class CompilerFrontendTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                sys.executable, "Arachne/frontends/c/build_graph.py",
-                "Arachne/frontends/c/fixtures_opsreg", output,
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures_opsreg", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -1215,8 +1215,8 @@ class CompilerFrontendTests(unittest.TestCase):
             # -- Spec 2: real stdio JSON-RPC server, scripted client ---------------
             canon = _Path(output) / "canonical.json"
             canon.write_text(json.dumps(graph), encoding="utf-8")
-            env = dict(__import__("os").environ, ARACHNE_GRAPH=str(canon),
-                       ARACHNE_FORMAT="text")
+            env = dict(__import__("os").environ, LACHESIS_GRAPH=str(canon),
+                       LACHESIS_FORMAT="text")
             proc = subprocess.Popen(
                 [sys.executable, "nav/mcp_server.py"], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1277,7 +1277,7 @@ class CompilerFrontendTests(unittest.TestCase):
         from nav.call_roles import CallRoles
         from nav.siblings import SiblingDiff
         from nav import mcp_server
-        from Arachne.kuzu_store import write_kuzu_graph
+        from Lachesis.kuzu_store import write_kuzu_graph
 
         def _run_nav(store, calls):
             # each store drives the same global nav dispatch, one at a time. The
@@ -1312,8 +1312,8 @@ class CompilerFrontendTests(unittest.TestCase):
             # fixtures_opsreg carries an ops-struct dispatch table, so the nav set
             # exercises MAY_INVOKE / reverse-dispatch alongside CALLS and flow.
             self.run_command(
-                sys.executable, "Arachne/frontends/c/build_graph.py",
-                "Arachne/frontends/c/fixtures_opsreg", output,
+                sys.executable, "Lachesis/frontends/c/build_graph.py",
+                "Lachesis/frontends/c/fixtures_opsreg", output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -1425,7 +1425,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_canonical_module_initialization_overlay(self) -> None:
         semantics, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "semantics")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "semantics")
         )
         core_singletons = [
             node for node in semantics["nodes"]
@@ -1449,7 +1449,7 @@ class CompilerFrontendTests(unittest.TestCase):
         ))
 
         cycle_graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "module_cycle")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "module_cycle")
         )
         cycle = next(
             node for node in cycle_graph["nodes"]
@@ -1465,7 +1465,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_canonical_control_flow_overlay(self) -> None:
         graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "control_flow")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "control_flow")
         )
         function = next(
             node for node in graph["nodes"]
@@ -1499,7 +1499,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_canonical_branch_history_overlay(self) -> None:
         graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "branch_history")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "branch_history")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
         function = next(
@@ -1532,7 +1532,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_canonical_heap_identity_overlay(self) -> None:
         graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "heap")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "heap")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
         variables = {
@@ -1601,7 +1601,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_canonical_runtime_and_async_event_overlays(self) -> None:
         graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "async_events")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "async_events")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
         effects = [
@@ -1647,7 +1647,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_canonical_dynamic_dispatch_overlay(self) -> None:
         graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "dispatch")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "dispatch")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
         action = next(
@@ -1698,7 +1698,7 @@ class CompilerFrontendTests(unittest.TestCase):
 
     def test_compiler_dynamic_facts_and_core_boundaries(self) -> None:
         graph, _ = run_project(
-            str(ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "dynamic")
+            str(ROOT / "Lachesis" / "frontends" / "typescript" / "fixtures" / "dynamic")
         )
         nodes = {node["id"]: node for node in graph["nodes"]}
         compiler_behaviors = [
@@ -1920,9 +1920,9 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertGreater(
                 max(map(len, request_to_document["properties"]["context_trace"])), 0,
             )
-            self.assertFalse((ROOT / "Arachne" / "variable_analysis.py").exists())
-            self.assertFalse((ROOT / "Arachne" / "scope_utils.py").exists())
-            self.assertFalse((ROOT / "Arachne" / "dynamic_analysis.py").exists())
+            self.assertFalse((ROOT / "Lachesis" / "variable_analysis.py").exists())
+            self.assertFalse((ROOT / "Lachesis" / "scope_utils.py").exists())
+            self.assertFalse((ROOT / "Lachesis" / "dynamic_analysis.py").exists())
             self.assertTrue(all(
                 behavior.get("compiler_node_id")
                 for info in files for behavior in info["dynamic_behaviors"]

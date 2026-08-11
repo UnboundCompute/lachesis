@@ -1,4 +1,4 @@
-"""A small, constrained LLM investigation loop over Arachne reasoning queries."""
+"""A small, constrained LLM investigation loop over Lachesis reasoning queries."""
 from __future__ import annotations
 
 import json
@@ -260,7 +260,7 @@ class InvestigationAgent:
 
         while state.step_count < self.max_steps and state.status == "RUNNING":
             request = self.request_factory(
-                task="arachne_security_investigation",
+                task="lachesis_security_investigation",
                 schema=ACTION_SCHEMA,
                 max_items=1,
                 context={

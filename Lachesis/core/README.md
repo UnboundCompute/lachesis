@@ -1,11 +1,11 @@
 # Canonical graph contract v2
 
-`Arachne.core` is language-agnostic. It defines graph identities, canonical
+`Lachesis.core` is language-agnostic. It defines graph identities, canonical
 node/edge kinds, capability vocabulary, provenance rules, validation and graph
 composition. It must not import a language frontend, an ecosystem model or the
 compatibility API.
 
-Language-neutral semantic analyses live under `Arachne.core.overlays`. They are
+Language-neutral semantic analyses live under `Lachesis.core.overlays`. They are
 registered and applied sequentially to canonical graphs, returning additive
 `GraphDelta` facts with core-owned v2 identities and evidence. An overlay must
 not mutate or relabel a compiler fact: alternate dispatch, contextual bindings,
@@ -75,8 +75,8 @@ there is no parser-era migration path inside the canonical pipeline.
 
 ## LLM exposure
 
-The canonical graph remains the source of truth. `Arachne.projections` organizes
+The canonical graph remains the source of truth. `Lachesis.projections` organizes
 it into the T0–T4 layered-v2 artifacts and a complete node locator;
-`Arachne.reasoning` returns budgeted, typed slices with evidence and unresolved
+`Lachesis.reasoning` returns budgeted, typed slices with evidence and unresolved
 boundaries. Neither layer reparses source or feeds presentation facts back into
 semantic construction.

@@ -2,12 +2,12 @@
 """The sidecar overlay — where derived reasoning signals live, off the canonical graph.
 
 The user's decision (locked): derived signals are **non-invasive**. The canonical
-Arachne graph (`graph.json`) is never rewritten; everything this reasoning layer
+Lachesis graph (`graph.json`) is never rewritten; everything this reasoning layer
 *infers* — per-function `guard_signal` (Fix 2), first-class `GUARDED`/`UNGUARDED`
 edges (0 in the base graph), `CALLS` callee security-roles (Fix 4) — is written to
 a companion JSON next to the graph and merged back in memory at load time. This
-matches the `Arachne/core/overlays/` convention (an overlay is a `GraphDelta` of
-derived nodes/edges), but stays a plain sidecar file so nothing in `Arachne/` has
+matches the `Lachesis/core/overlays/` convention (an overlay is a `GraphDelta` of
+derived nodes/edges), but stays a plain sidecar file so nothing in `Lachesis/` has
 to change.
 
 Shape on disk::

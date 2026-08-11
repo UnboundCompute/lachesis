@@ -1,8 +1,8 @@
 """Shared substrate for the navigation primitives.
 
-Wraps the canonical Arachne graph with the typed helpers the nav layer needs.
-Reuses ``Arachne.core.query.GraphIndex`` for adjacency/indexing and
-``Arachne.cli.query.load_graph`` for loading — this module only adds what the
+Wraps the canonical Lachesis graph with the typed helpers the nav layer needs.
+Reuses ``Lachesis.core.query.GraphIndex`` for adjacency/indexing and
+``Lachesis.cli.query.load_graph`` for loading — this module only adds what the
 nav movers need on top: offset-accurate source excerpts, owner-function climb,
 structural family builders, and a generic security-lexicon *scoring* helper.
 
@@ -20,8 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from Arachne.cli.query import load_graph
-from Arachne.core.query import GraphIndex
+from Lachesis.cli.query import load_graph
+from Lachesis.core.query import GraphIndex
 
 
 CALLABLE_KINDS = ("function", "method", "constructor")

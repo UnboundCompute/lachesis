@@ -1,4 +1,4 @@
-"""Kùzu writer for a composed Arachne graph — the disk-backed alternative to the
+"""Kùzu writer for a composed Lachesis graph — the disk-backed alternative to the
 one-big-JSON store written by ``pipeline.write_project_graph``.
 
 Why (see ``KUZU_STORE_SPEC.md``): the JSON store repeats every ~50-byte content-hash

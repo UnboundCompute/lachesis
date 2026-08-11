@@ -1,16 +1,16 @@
-# Arachne
+# Lachesis
 
 A compiler-precise code property graph (CPG) with an embedded columnar graph store and a navigation layer built for security reasoning over source code.
 
-Arachne parses a codebase into a layered graph. It captures syntax, symbols, calls, and a full dataflow tier (value-flow, points-to, taint, and aliasing). It then writes that graph to an embedded [Kùzu](https://kuzudb.com/) database and hands it to tools and LLM agents through a navigation API and an MCP server.
+Lachesis parses a codebase into a layered graph. It captures syntax, symbols, calls, and a full dataflow tier (value-flow, points-to, taint, and aliasing). It then writes that graph to an embedded [Kùzu](https://kuzudb.com/) database and hands it to tools and LLM agents through a navigation API and an MCP server.
 
 It exists to do one thing well: let a program, or an agent, ask precise questions about how data and control move through real source code. Things like who calls this function, what reaches this sink, which sibling function guards this input, and what flows into here. And it answers them with compiler-level fidelity instead of regex or heuristic matching.
 
-## Why Arachne exists
+## Why Lachesis exists
 
 Most code-graph tools stop at symbols and references. That is the SCIP and LSIF layer, and it is useful, but it can only tell you where a name is used. It cannot tell you how a value moves.
 
-Arachne's whole point is the dataflow tier, because those are the edges that actually matter when you are reasoning about security:
+Lachesis's whole point is the dataflow tier, because those are the edges that actually matter when you are reasoning about security:
 
 - `VALUE_FLOWS_TO` for value and def-use flow
 - `POINTS_TO` for points-to and pointer analysis
@@ -23,7 +23,7 @@ A symbol index cannot give you any of these. They are what let a downstream tool
 ## Quick start
 
 ```bash
-git clone https://github.com/UnboundCompute/arachne && cd arachne
+git clone https://github.com/UnboundCompute/lachesis && cd lachesis
 
 python -m pip install --upgrade pip   # editable installs need pip >= 21.3
 pip install -e .          # the graph builder, the nav layer and the MCP server
@@ -41,16 +41,16 @@ pip install -e ".[kuzu]"  # adds kuzu + pyarrow for the columnar store
 Then build a graph and ask it questions:
 
 ```bash
-arachne-analyze path/to/your/source graph.json   # parse a tree into a layered graph
-arachne-query graph.json overview                # what's in it
-arachne-query graph.json function handleRequest  # a budgeted slice of one function
-arachne-mcp graph.json                           # serve the nav tools over MCP (stdio)
+lachesis-analyze path/to/your/source graph.json   # parse a tree into a layered graph
+lachesis-query graph.json overview                # what's in it
+lachesis-query graph.json function handleRequest  # a budgeted slice of one function
+lachesis-mcp graph.json                           # serve the nav tools over MCP (stdio)
 ```
 
-`arachne-analyze` dual-writes by default: `graph.json` plus a sibling `graph.kuzu`
+`lachesis-analyze` dual-writes by default: `graph.json` plus a sibling `graph.kuzu`
 directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
-`arachne-mcp` speaks MCP over stdio, so point an MCP-capable client at
-`arachne-mcp /abs/path/to/graph.json` and the navigation tools show up as tools.
+`lachesis-mcp` speaks MCP over stdio, so point an MCP-capable client at
+`lachesis-mcp /abs/path/to/graph.json` and the navigation tools show up as tools.
 
 ## How it fits together
 
@@ -58,7 +58,7 @@ directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
   source tree
       |
       v
-  Arachne (builder)      language frontends parse each ecosystem and emit
+  Lachesis (builder)      language frontends parse each ecosystem and emit
       |                  syntax + symbols + calls + dataflow overlays
       |  layered graph
       v
@@ -69,7 +69,7 @@ directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
                          siblings, flow, symbol_index, and an MCP server
 ```
 
-### `Arachne/`, the graph builder
+### `Lachesis/`, the graph builder
 
 - `pipeline.py` orchestrates project partitioning and the per-frontend runs.
 - `frontends/` holds the language frontends. Each one is parser or compiler backed and emits the graph.
@@ -86,7 +86,7 @@ directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
 
 ## Storage: JSON or Kùzu
 
-Arachne dual-writes by default. You get a JSON graph, which is portable and diff-friendly, and a sibling `.kuzu` directory, which is columnar and easy on RAM. The navigation layer figures out which one to load and behaves the same over either backend. The two are kept at byte-identical parity across the navigation and MCP tools, and there is a test suite that enforces that.
+Lachesis dual-writes by default. You get a JSON graph, which is portable and diff-friendly, and a sibling `.kuzu` directory, which is columnar and easy on RAM. The navigation layer figures out which one to load and behaves the same over either backend. The two are kept at byte-identical parity across the navigation and MCP tools, and there is a test suite that enforces that.
 
 The Kùzu backend is the one you want at scale. On a real whole-package graph of roughly 500K nodes and 926K edges, here is how the two compare:
 
@@ -100,17 +100,17 @@ The [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) covers the on-disk layout, the 
 
 ## Status
 
-Arachne is early and moving fast. The graph model, the Kùzu store, and the navigation and MCP layer all work today, and they are covered by a parity test suite in `Arachne/frontends/checks.py`.
+Lachesis is early and moving fast. The graph model, the Kùzu store, and the navigation and MCP layer all work today, and they are covered by a parity test suite in `Lachesis/frontends/checks.py`.
 
 There are known rough edges, and they live in the issue tracker. Two worth calling out: a tail-recursive control-flow walk can hit Python's recursion limit on very deep functions, and whole-repo multi-package builds currently need per-package compilation to stay inside a single Node process's heap.
 
 ## License
 
-Arachne is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See [`LICENSE`](./LICENSE).
+Lachesis is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See [`LICENSE`](./LICENSE).
 
-The short version: you are free to use, study, modify, and share it, including commercially. But if you run a modified version as a network service, you have to make your modified source available to the people using that service. That is the deal that keeps Arachne and its improvements open.
+The short version: you are free to use, study, modify, and share it, including commercially. But if you run a modified version as a network service, you have to make your modified source available to the people using that service. That is the deal that keeps Lachesis and its improvements open.
 
-If the AGPL does not fit your use case, say you want to embed Arachne in a closed-source product, a separate commercial license may be available. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how licensing and contributions are handled, or open an issue to start the conversation.
+If the AGPL does not fit your use case, say you want to embed Lachesis in a closed-source product, a separate commercial license may be available. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how licensing and contributions are handled, or open an issue to start the conversation.
 
 ## Security
 

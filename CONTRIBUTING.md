@@ -1,6 +1,6 @@
-# Contributing to Arachne
+# Contributing to Lachesis
 
-Thanks for your interest in Arachne. Contributions are welcome, whether that is a bug report, a fix, a new language frontend, or docs.
+Thanks for your interest in Lachesis. Contributions are welcome, whether that is a bug report, a fix, a new language frontend, or docs.
 
 ## Ground rules
 
@@ -22,23 +22,23 @@ Thanks for your interest in Arachne. Contributions are welcome, whether that is 
 3. Make your change, with tests where it makes sense.
 4. Run the parity and checks suite before you open a PR:
    ```
-   python3 -m pytest Arachne/frontends/checks.py
+   python3 -m pytest Lachesis/frontends/checks.py
    ```
    The graph has to stay at byte-identical parity between the JSON and Kùzu backends for the navigation and MCP tools, and the checks suite enforces that. If your change touches the store or the nav layer, make sure that test still passes.
 
    The end-to-end tests analyze the fixture corpus at
-   `Arachne/frontends/typescript/fixtures/project/`. It is deliberately small — a
+   `Lachesis/frontends/typescript/fixtures/project/`. It is deliberately small — a
    dozen files — and it exercises the same code paths as a production codebase
    (public parameter to repository lookup, a guarded/unguarded sibling pair, a
    dynamic-code frontier, a route registration) without the same scale. Point
-   `ARACHNE_CORPUS` at a larger TypeScript tree to re-run the same tests against it;
+   `LACHESIS_CORPUS` at a larger TypeScript tree to re-run the same tests against it;
    the assertions that pin the fixture's exact file and function sets step aside
    automatically, and the structural ones still run.
 5. Open a pull request that says what changed, why, and how you verified it.
 
 ## What makes a good contribution
 
-- New language frontends are the highest-value area. A frontend emits the layered graph for a language or ecosystem, going from syntax to symbols to calls to dataflow overlays. Follow an existing frontend under `Arachne/frontends/` as your template, and include the dataflow tier: `VALUE_FLOWS_TO`, `POINTS_TO`, `TAINT_FLOWS_TO`, and `ALIASES`. That tier is the whole point of Arachne, not an optional extra.
+- New language frontends are the highest-value area. A frontend emits the layered graph for a language or ecosystem, going from syntax to symbols to calls to dataflow overlays. Follow an existing frontend under `Lachesis/frontends/` as your template, and include the dataflow tier: `VALUE_FLOWS_TO`, `POINTS_TO`, `TAINT_FLOWS_TO`, and `ALIASES`. That tier is the whole point of Lachesis, not an optional extra.
 - Store and nav improvements, like indexing for the warm-query paths, memory or latency wins, or better reachability and guard reasoning.
 - Bug fixes with a regression test that fails before your change and passes after.
 
@@ -56,7 +56,7 @@ Open a GitHub issue with what you did, what you expected, what actually happened
 
 ## Licensing and the DCO
 
-Arachne is licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](./LICENSE). By contributing, you agree that your contributions are licensed under those same AGPL-3.0 terms.
+Lachesis is licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](./LICENSE). By contributing, you agree that your contributions are licensed under those same AGPL-3.0 terms.
 
 ### Developer Certificate of Origin
 
@@ -76,8 +76,8 @@ Use your real name and a valid email. If a commit is not signed off, you may be 
 
 ### A note on commercial licensing
 
-Arachne is offered under the AGPL, and it may also be offered under a separate commercial license for people who cannot comply with the AGPL's network-copyleft terms. To keep that option open for the project, substantial contributions may be asked to agree to a Contributor License Agreement (CLA) on top of the DCO. If that ends up applying to your PR, a maintainer will tell you and point you to the CLA before anything merges. For typical bug fixes and small improvements, the DCO sign-off above is all you need.
+Lachesis is offered under the AGPL, and it may also be offered under a separate commercial license for people who cannot comply with the AGPL's network-copyleft terms. To keep that option open for the project, substantial contributions may be asked to agree to a Contributor License Agreement (CLA) on top of the DCO. If that ends up applying to your PR, a maintainer will tell you and point you to the CLA before anything merges. For typical bug fixes and small improvements, the DCO sign-off above is all you need.
 
 ## Questions
 
-Open a GitHub issue or start a discussion. Thanks for helping make Arachne better.
+Open a GitHub issue or start a discussion. Thanks for helping make Lachesis better.

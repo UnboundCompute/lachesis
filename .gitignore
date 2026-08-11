@@ -14,7 +14,7 @@ venv/
 # Node (root-only, so the checked-in fixture node_modules stubs stay tracked)
 /node_modules/
 
-# Arachne build artifacts / graphs
+# Lachesis build artifacts / graphs
 *.kuzu/
 *.kuzu
 *.db-shm

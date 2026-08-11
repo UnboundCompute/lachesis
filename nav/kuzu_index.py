@@ -1,4 +1,4 @@
-"""Read side of the Kùzu store: a drop-in for ``Arachne.core.query.GraphIndex`` backed
+"""Read side of the Kùzu store: a drop-in for ``Lachesis.core.query.GraphIndex`` backed
 by a Kùzu DB directory instead of an in-RAM dict.
 
 It satisfies the exact accessor surface ``GraphLib`` and the nav tools use — ``.nodes``
@@ -31,8 +31,8 @@ import json
 from collections import defaultdict
 from typing import Iterable, Optional
 
-from Arachne.core.query import GraphIndex
-from Arachne.kuzu_store import (
+from Lachesis.core.query import GraphIndex
+from Lachesis.kuzu_store import (
     CONSTANT_PROP_DEFAULTS,
     HOT_REL_KINDS,
     _HOT_SET,

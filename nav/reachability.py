@@ -5,7 +5,7 @@ The canonical taint overlay materializes almost nothing end-to-end (`TAINT_REACH
 = 4): it only propagates from graph-declared `source`/`sink` role nodes, so any
 value that isn't pre-tagged has no reach answer. But the *substrate* it walks is
 fully present — `VALUE_FLOWS_TO` (67k), `POINTS_TO` (19k), the alias/heap edges —
-and `Arachne/core/overlays/taint.py` already encodes the correct traversal
+and `Lachesis/core/overlays/taint.py` already encodes the correct traversal
 (context-sensitive worklist with `context-parameter`/`context-return` push-pop for
 interprocedural transitivity, per-source budget, predecessor witnesses).
 
@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from Arachne.core.overlays.taint import FLOW_EDGE_KINDS
+from Lachesis.core.overlays.taint import FLOW_EDGE_KINDS
 from nav.graph_store import GraphStore
 
 # Same fail-open valve as taint.py, but per *query* (one seed) instead of per source.

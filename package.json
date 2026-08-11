@@ -1,8 +1,8 @@
 {
-  "name": "arachne-ts-frontend",
+  "name": "lachesis-ts-frontend",
   "version": "0.1.0",
   "private": true,
-  "description": "TypeScript compiler-API frontend for Arachne. `npm install` provides the TypeScript compiler that Arachne/frontends/typescript/build_graph.mjs loads.",
+  "description": "TypeScript compiler-API frontend for Lachesis. `npm install` provides the TypeScript compiler that Lachesis/frontends/typescript/build_graph.mjs loads.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "devDependencies": {

@@ -1,4 +1,4 @@
-"""Mechanical dependency-boundary checks for the Arachne package."""
+"""Mechanical dependency-boundary checks for the Lachesis package."""
 from __future__ import annotations
 
 import ast
@@ -7,7 +7,7 @@ from typing import Iterable, List
 
 
 CORE_FORBIDDEN_IMPORTS = (
-    "Arachne.frontends", "Arachne.ecosystems", "Arachne.compatibility",
+    "Lachesis.frontends", "Lachesis.ecosystems", "Lachesis.compatibility",
 )
 
 
@@ -51,5 +51,5 @@ def import_boundary_violations(package_root: str | Path) -> List[str]:
 def assert_import_boundaries(package_root: str | Path) -> None:
     violations = import_boundary_violations(package_root)
     if violations:
-        raise AssertionError("forbidden Arachne dependencies:\n" + "\n".join(violations))
+        raise AssertionError("forbidden Lachesis dependencies:\n" + "\n".join(violations))
 

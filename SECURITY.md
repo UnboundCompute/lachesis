@@ -4,18 +4,18 @@
 
 Please do not report security vulnerabilities through public GitHub issues, discussions, or pull requests.
 
-Arachne is a program-analysis tool. It parses untrusted source code and builds a graph from it, so bugs in that path are treated as security issues. That includes things like a crafted input tree that causes resource exhaustion, path traversal during ingestion, or code execution inside a frontend.
+Lachesis is a program-analysis tool. It parses untrusted source code and builds a graph from it, so bugs in that path are treated as security issues. That includes things like a crafted input tree that causes resource exhaustion, path traversal during ingestion, or code execution inside a frontend.
 
 If you think you have found a security vulnerability, report it privately using one of these:
 
 - GitHub Private Vulnerability Reporting. Go to the Security tab, then Report a vulnerability. This is the preferred route because it keeps everything in one place.
-- Email riyandhiman14@gmail.com with the subject line `SECURITY: Arachne`.
+- Email riyandhiman14@gmail.com with the subject line `SECURITY: Lachesis`.
 
 Please include:
 
 - A description of the vulnerability and its impact.
 - Steps to reproduce it, ideally with a minimal input or codebase snippet.
-- The affected component, whether that is the Arachne builder, a specific frontend, `kuzu_store`, or `nav` and the MCP server, plus the version or commit.
+- The affected component, whether that is the Lachesis builder, a specific frontend, `kuzu_store`, or `nav` and the MCP server, plus the version or commit.
 - A suggested fix, if you have one.
 
 ## What to expect
@@ -35,10 +35,10 @@ In scope:
 
 Out of scope:
 
-- Vulnerabilities in third-party dependencies. Report those upstream. Do tell us if Arachne uses one of them in an unsafe way, though.
+- Vulnerabilities in third-party dependencies. Report those upstream. Do tell us if Lachesis uses one of them in an unsafe way, though.
 - Findings that need an already-privileged local attacker who gains no additional privilege.
-- The content of the graphs Arachne produces about your code. That is your data, not an Arachne vulnerability.
+- The content of the graphs Lachesis produces about your code. That is your data, not an Lachesis vulnerability.
 
 ## Supported versions
 
-Arachne is pre-1.0 and moves fast. Security fixes land on the latest `main`. If you need stability, pin a commit, and upgrade to pick up fixes.
+Lachesis is pre-1.0 and moves fast. Security fixes land on the latest `main`. If you need stability, pin a commit, and upgrade to pick up fixes.

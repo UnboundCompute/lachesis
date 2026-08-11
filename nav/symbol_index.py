@@ -100,7 +100,7 @@ def _via_label(edge: dict) -> str:
 _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 # Generic test/spec-file conventions (not vendor/interface literals). This is the
 # SINGLE SOURCE OF TRUTH for "is this a test file": the graph builder imports the same
-# predicate to exclude tests at file-discovery (Arachne/pipeline.source_inventory), so
+# predicate to exclude tests at file-discovery (Lachesis/pipeline.source_inventory), so
 # "in the graph" and "not a test" can never drift apart.
 # Generic test/spec conventions across languages (no vendor/interface literals):
 #  - JS/TS: *.test.*, *.spec.*, *.integration.*, *.e2e.*, __tests__/, test(s)/

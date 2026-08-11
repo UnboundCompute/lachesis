@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "arachne-cpg"
+name = "lachesis-cpg"
 version = "0.1.0"
 description = "A compiler-precise code property graph with an embedded columnar store and a navigation layer for security reasoning over source code."
 readme = "README.md"
@@ -31,29 +31,29 @@ dependencies = []
 
 [project.optional-dependencies]
 # The embedded columnar store. Kùzu needs Python 3.10+; without this extra
-# Arachne writes and reads the JSON graph instead. Floors track the current
+# Lachesis writes and reads the JSON graph instead. Floors track the current
 # releases the parity suite is verified against (kuzu 0.11.x, pyarrow 25.x).
 kuzu = ["kuzu>=0.11", "pyarrow>=17"]
 dev = ["pytest>=8"]
 
 [project.scripts]
-arachne-analyze = "Arachne.cli.analyze:main"
-arachne-query = "Arachne.cli.query:main"
-arachne-mcp = "nav.mcp_server:main"
+lachesis-analyze = "Lachesis.cli.analyze:main"
+lachesis-query = "Lachesis.cli.query:main"
+lachesis-mcp = "nav.mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/UnboundCompute/arachne"
-Source = "https://github.com/UnboundCompute/arachne"
+Homepage = "https://github.com/UnboundCompute/lachesis"
+Source = "https://github.com/UnboundCompute/lachesis"
 
 [tool.setuptools.packages.find]
-include = ["Arachne*", "nav*"]
+include = ["Lachesis*", "nav*"]
 
 [tool.setuptools.package-data]
 # The TypeScript frontend is a Node script, the frontends declare capabilities in
 # JSON, and the test suite runs against the shipped fixture trees.
-"Arachne.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*"]
-"Arachne.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
-"Arachne.core" = ["*.json"]
+"Lachesis.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*"]
+"Lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
+"Lachesis.core" = ["*.json"]
 
 [tool.pytest.ini_options]
 python_files = ["checks.py", "test_*.py"]

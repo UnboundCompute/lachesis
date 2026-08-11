@@ -3,7 +3,7 @@
 
 The frontend intentionally shells out to the installed compiler instead of
 reimplementing C preprocessing or parsing.  It accepts a source directory and
-an output directory, matching every other Arachne command frontend.
+an output directory, matching every other Lachesis command frontend.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 try:  # run as a script (sys.path[0] is this directory) …
     from macros import parse_macro_definitions
 except ImportError:  # … or imported as a package module.
-    from Arachne.frontends.c.macros import parse_macro_definitions
+    from Lachesis.frontends.c.macros import parse_macro_definitions
 
 
 CONTRACT_VERSION = 2
@@ -73,7 +73,7 @@ def compact(value: object, limit: int = 300) -> str:
 def read_roots(roots_file: str) -> List[Path]:
     """Ingest exactly the discovery-provided root list.
 
-    The Python driver (Arachne/core/runner.py) writes ARACHNE_ROOTS_FILE after it
+    The Python driver (Lachesis/core/runner.py) writes LACHESIS_ROOTS_FILE after it
     has already pruned vendor directories and excluded tests via
     nav.symbol_index.is_test_path.  Honoring it means the C frontend inherits that
     single discovery instead of re-walking the tree and re-introducing what was
@@ -96,10 +96,10 @@ def read_roots(roots_file: str) -> List[Path]:
 
 def walk(source_dir: Path) -> List[Path]:
     # Discovery owns file selection: when the driver hands us an explicit root set
-    # (ARACHNE_ROOTS_FILE — vendor/test files already excluded), ingest exactly that
+    # (LACHESIS_ROOTS_FILE — vendor/test files already excluded), ingest exactly that
     # list so the walker can't re-introduce what was filtered out.  Absent the env
     # var (standalone CLI run), fall back to a full source-tree walk.
-    roots_file = os.environ.get("ARACHNE_ROOTS_FILE")
+    roots_file = os.environ.get("LACHESIS_ROOTS_FILE")
     if roots_file:
         roots = read_roots(roots_file)
         if roots:
@@ -210,10 +210,10 @@ def load_compile_commands(source_dir: Path) -> Dict[Path, List[str]]:
 
     Real multi-directory C projects need each file's own include paths / defines /
     std to parse; a single global -I mis-parses them. Looked up at
-    ARACHNE_COMPILE_COMMANDS or <source_dir>/compile_commands.json; absent, callers
+    LACHESIS_COMPILE_COMMANDS or <source_dir>/compile_commands.json; absent, callers
     fall back to the global flag model.
     """
-    location = os.environ.get("ARACHNE_COMPILE_COMMANDS")
+    location = os.environ.get("LACHESIS_COMPILE_COMMANDS")
     candidates = [Path(location)] if location else [source_dir / "compile_commands.json"]
     db_path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if not db_path:
@@ -246,7 +246,7 @@ def clang_command(
     if file_flags is not None:
         base = list(file_flags)
     else:
-        base = ["-I", str(source_dir)] + shlex.split(os.environ.get("ARACHNE_CFLAGS", ""))
+        base = ["-I", str(source_dir)] + shlex.split(os.environ.get("LACHESIS_CFLAGS", ""))
     return configured + base + language + list(arguments) + [str(path)]
 
 
@@ -511,7 +511,7 @@ class AstStore:
 def main() -> int:
     if len(sys.argv) < 2:
         raise SystemExit(
-            "Usage: python3 Arachne/frontends/c/build_graph.py SRC_DIR [OUT_DIR]")
+            "Usage: python3 Lachesis/frontends/c/build_graph.py SRC_DIR [OUT_DIR]")
     source_dir = Path(sys.argv[1]).resolve()
     output_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "graph_out/clang_layered").resolve()
     files = walk(source_dir)
@@ -536,7 +536,7 @@ def main() -> int:
     declarations_by_raw_id: Dict[str, str] = {}
     declarations_by_name: Dict[Tuple[str, str], List[str]] = defaultdict(list)
     function_parameters: Dict[str, List[str]] = defaultdict(list)
-    ast_spill = tempfile.TemporaryDirectory(prefix="arachne-c-ast-")
+    ast_spill = tempfile.TemporaryDirectory(prefix="lachesis-c-ast-")
     asts = AstStore(Path(ast_spill.name))
     diagnostics: List[Tuple[Path, str]] = []
     failed_files: Set[Path] = set()

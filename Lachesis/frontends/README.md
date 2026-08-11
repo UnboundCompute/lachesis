@@ -1,12 +1,12 @@
 # Compiler-backed layered graph frontends
 
 Language-specific compiler processes live here. The language-neutral contract
-and semantic overlays live in `Arachne/core`, project orchestration lives in
-`Arachne/pipeline.py`, and optional presentation views live in
-`Arachne/compatibility` and `Arachne/projections`.
+and semantic overlays live in `Lachesis/core`, project orchestration lives in
+`Lachesis/pipeline.py`, and optional presentation views live in
+`Lachesis/compatibility` and `Lachesis/projections`.
 
 ```sh
-node Arachne/frontends/typescript/build_graph.mjs path/to/source graph_out/compiler_layered
+node Lachesis/frontends/typescript/build_graph.mjs path/to/source graph_out/compiler_layered
 ```
 
 Run every compiler plugin needed by a mixed-language tree, apply the available
@@ -14,20 +14,20 @@ language-neutral semantic/security overlays, and compose the results without
 converting them back into parser-specific objects:
 
 ```sh
-python3 Arachne/cli/analyze.py . graph_out/compiler_project.json
+python3 Lachesis/cli/analyze.py . graph_out/compiler_project.json
 ```
 
 The default registry currently contains the official TypeScript Compiler API
 frontend (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`) and a Clang frontend for
 C (`.c`, `.h`). The Clang frontend accepts normal include flags through
-`ARACHNE_CFLAGS`; `CLANG` may select another compatible compiler command.
+`LACHESIS_CFLAGS`; `CLANG` may select another compatible compiler command.
 
 The generator prefers a normal local `typescript` dependency. You can point it at
 another installation without changing the repository:
 
 ```sh
 TYPESCRIPT_PATH=/absolute/path/to/typescript \
-  node Arachne/frontends/typescript/build_graph.mjs path/to/source graph_out/compiler_layered
+  node Lachesis/frontends/typescript/build_graph.mjs path/to/source graph_out/compiler_layered
 ```
 
 It emits `manifest.json` and one JSON file per tier:
@@ -39,9 +39,9 @@ It emits `manifest.json` and one JSON file per tier:
 - `T4 proof`: exact source spans and compiler diagnostics.
 
 Each native frontend snapshot stores direct facts only. The composed project
-graph additionally contains Arachne overlays such as bounded taint closure,
+graph additionally contains Lachesis overlays such as bounded taint closure,
 context-specific heap effects, framework wiring, and effect-resolved dispatch.
-The layered-v2 manifest is the compact LLM entry card; `Arachne.reasoning`
+The layered-v2 manifest is the compact LLM entry card; `Lachesis.reasoning`
 calculates focused slices instead of loading the entire graph into a prompt.
 
 Control flow follows the same ownership boundary. Frontends emit exact AST,
@@ -55,7 +55,7 @@ Cross-tier relationships are split into:
 - `links`: semantic relationships such as a body identifier referring to a path value.
 
 Compiler frontends replace lexical, declaration, module and type discovery—not
-Arachne's security overlays. Framework wiring, runtime models, heap identity,
+Lachesis's security overlays. Framework wiring, runtime models, heap identity,
 taint policy and exploit reasoning are layered over compiler-backed facts.
 Frontends therefore do not tag attacker sources or security sinks. The generic
 security-role runtime model consumes exported functions, parameters and
@@ -81,11 +81,11 @@ of `node_modules`. `RUNTIME_DEPENDS_ON` preserves the executable module target,
 `IMPLEMENTED_BY` bridges `.d.ts` API entities to matching implementations, and
 calls retain both the compiler-selected declaration and runtime candidates. The
 bounded traversal defaults to 500 dependency files and can be changed with
-`ARACHNE_MAX_DEPENDENCY_FILES`.
+`LACHESIS_MAX_DEPENDENCY_FILES`.
 
 C include edges retain header ownership, and AST declarations from headers
 participate in call resolution. Framework semantic wiring (routes, dependency
-injection, decorators, ORM metadata) remains an Arachne overlay over these
+injection, decorators, ORM metadata) remains an Lachesis overlay over these
 compiler-backed declarations and implementation bodies rather than a parser
 special case.
 
@@ -95,7 +95,7 @@ and can resolve later function-pointer member calls through the recorded write.
 
 ## Generic frontend boundary
 
-[`Arachne/core/`](../core/) defines the language-neutral
+[`Lachesis/core/`](../core/) defines the language-neutral
 frontend contract, plugin registry, capability negotiation and snapshot validator.
 TypeScript/JavaScript and C are the currently registered command frontends.
 
@@ -108,6 +108,6 @@ the same manifest and tier files. For example:
 - Go: `go/packages`, `go/types` and SSA.
 
 Capabilities are explicitly marked `complete`, `partial` or `none`. A manual
-Arachne discovery pass is replaceable only when the selected frontend reports the
+Lachesis discovery pass is replaceable only when the selected frontend reports the
 corresponding frontend-owned capability as `complete`. Heap, context sensitivity,
 taint policy, runtime models, framework wiring and security roles remain overlays.

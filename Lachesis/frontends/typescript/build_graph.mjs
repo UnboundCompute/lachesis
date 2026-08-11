@@ -2,12 +2,12 @@
 /**
  * Standalone TypeScript-Compiler-API graph prototype.
  *
- * This intentionally does not import or modify Arachne. It tests whether the
- * compiler can provide the precise low-level facts while preserving Arachne's
+ * This intentionally does not import or modify Lachesis. It tests whether the
+ * compiler can provide the precise low-level facts while preserving Lachesis's
  * five-tier, LLM-drillable shape.
  *
  * Usage:
- *   node Arachne/frontends/typescript/build_graph.mjs SRC_DIR [OUT_DIR]
+ *   node Lachesis/frontends/typescript/build_graph.mjs SRC_DIR [OUT_DIR]
  *
  * TypeScript lookup order:
  *   1. TYPESCRIPT_PATH=/path/to/typescript (package directory or JS entrypoint)
@@ -46,7 +46,7 @@ const FRONTEND_ID = "typescript-compiler-api";
 const CONTRACT_VERSION = 2;
 if (!process.argv[2]) {
   throw new Error(
-    "Usage: node Arachne/frontends/typescript/build_graph.mjs SRC_DIR [OUT_DIR]",
+    "Usage: node Lachesis/frontends/typescript/build_graph.mjs SRC_DIR [OUT_DIR]",
   );
 }
 const sourceDir = path.resolve(process.argv[2]);
@@ -189,7 +189,7 @@ function compilerOptions() {
 }
 
 // Discovery is owned by the Python driver: when it hands us an explicit root set
-// (via ARACHNE_ROOTS_FILE — test files already excluded there), compile exactly that
+// (via LACHESIS_ROOTS_FILE — test files already excluded there), compile exactly that
 // list instead of re-walking, so the walker can't re-introduce what was filtered out.
 function readRoots(rootsFile) {
   const names = [];
@@ -204,13 +204,13 @@ function readRoots(rootsFile) {
   return names.sort();
 }
 
-const rootsFile = process.env.ARACHNE_ROOTS_FILE;
+const rootsFile = process.env.LACHESIS_ROOTS_FILE;
 const applicationRootNames = rootsFile ? readRoots(rootsFile) : walk(sourceDir);
 if (!applicationRootNames.length) throw new Error(`No TypeScript/JavaScript files found under ${sourceDir}`);
 const rootSet = new Set(applicationRootNames.map(normalize));
 const config = compilerOptions();
 const configuredDependencyLimit = Number.parseInt(
-  process.env.ARACHNE_MAX_DEPENDENCY_FILES || "500", 10,
+  process.env.LACHESIS_MAX_DEPENDENCY_FILES || "500", 10,
 );
 const dependencyLimit = Number.isFinite(configuredDependencyLimit) && configuredDependencyLimit >= 0
   ? configuredDependencyLimit : 500;

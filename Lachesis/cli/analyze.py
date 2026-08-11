@@ -9,10 +9,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from Arachne.pipeline import (
+from Lachesis.pipeline import (
     run_project, run_project_incremental, write_project_graph,
 )
-from Arachne.projections import build_layered_graph, write_layered_graph
+from Lachesis.projections import build_layered_graph, write_layered_graph
 
 
 def main() -> None:
@@ -55,7 +55,7 @@ def main() -> None:
         layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)
         print(f"Layered projection: {len(layered_files)} files in {args.layered_out}")
     # Dual-write by default: the JSON stays the canonical artifact (and the
-    # ARACHNE_FORCE_JSON fallback), while the sibling Kùzu store becomes the
+    # LACHESIS_FORCE_JSON fallback), while the sibling Kùzu store becomes the
     # low-RAM default nav serves from. Best-effort — a 3.9 env without kuzu still
     # produces the JSON.
     if not args.no_kuzu:
@@ -65,7 +65,7 @@ def main() -> None:
             print("Kùzu store skipped (needs Python 3.10+ with kuzu); wrote JSON only.",
                   file=sys.stderr)
         else:
-            from Arachne.kuzu_store import write_kuzu_graph
+            from Lachesis.kuzu_store import write_kuzu_graph
             kuzu_dir = write_kuzu_graph(graph, snapshots, kuzu_out)
             print(f"Kùzu store: {kuzu_dir}")
     kinds = Counter(node["kind"] for node in graph["nodes"])

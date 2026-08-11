@@ -357,6 +357,6 @@ def render(tool_name: str, result: dict, root: Optional[str] = None,
 
 
 def default_format() -> str:
-    """The process-wide default output format (env ARACHNE_FORMAT, else 'text')."""
-    fmt = os.environ.get("ARACHNE_FORMAT", "text").lower()
+    """The process-wide default output format (env LACHESIS_FORMAT, else 'text')."""
+    fmt = os.environ.get("LACHESIS_FORMAT", "text").lower()
     return "json" if fmt == "json" else "text"

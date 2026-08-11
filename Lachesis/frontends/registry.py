@@ -52,7 +52,7 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
         languages=("typescript", "javascript"),
         extensions=(".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"),
         command=(
-            "node", str(root / "Arachne" / "frontends" / "typescript" / "build_graph.mjs"),
+            "node", str(root / "Lachesis" / "frontends" / "typescript" / "build_graph.mjs"),
             "{source_dir}", "{output_dir}",
         ),
         working_directory=str(root),
@@ -67,7 +67,7 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
         languages=("c",),
         extensions=(".c", ".h"),
         command=(
-            "python3", str(root / "Arachne" / "frontends" / "c" / "build_graph.py"),
+            "python3", str(root / "Lachesis" / "frontends" / "c" / "build_graph.py"),
             "{source_dir}", "{output_dir}",
         ),
         working_directory=str(root),

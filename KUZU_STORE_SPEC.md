@@ -1,7 +1,7 @@
-# Arachne graph store: JSON → Kùzu migration spec
+# Lachesis graph store: JSON → Kùzu migration spec
 
 **Status:** validated by PoC, ready to build.
-**Audience:** the engine session that writes Arachne/nav code.
+**Audience:** the engine session that writes Lachesis/nav code.
 **Author of spec:** referee session (validation + design only).
 
 ---
@@ -42,16 +42,16 @@ Net: this is what makes **whole-repo** graphs viable, which is a *correctness* r
 
 ## 1. Current-state map (what you're changing — real file:lines)
 
-### Writer (`Arachne/pipeline.py`)
+### Writer (`Lachesis/pipeline.py`)
 - `snapshot_graph` (`:15`) → one frontend snapshot to canonical `{"nodes":[...], "edges":[...]}`; stamps `frontend_id`/`frontend_tier` into node props (`:24-27`).
 - `combine_graphs` (`:43`) → unions per-frontend graphs; dedupes edges by `(kind, source, target, json.dumps(properties, sort_keys=True))` (`:55-58`); rejects conflicting node ids + dangling edges.
 - `_enrich_graph` (`:115`) → overlay/ecosystem/security enrichment before write.
 - `write_project_graph` (`:179`) → builds `payload = {"manifest": {...v2 inventory...}, "nodes":[...], "edges":[...]}`; **disk write is `pipeline.py:199`**: `output.write_text(json.dumps(payload, indent=2) + "\n")`.
-- CLI entry: `Arachne/cli/analyze.py:25`.
+- CLI entry: `Lachesis/cli/analyze.py:25`.
 
 ### Loader / store (`nav/`)
-- `GraphStore` (`nav/graph_store.py:75`); `.load(graph_path, overlay_path)` (`:90`) → `load_graph` (`Arachne/cli/query.py:15`, `json.loads`).
-- In-memory index: `GraphIndex` (`Arachne/core/query.py:8`), wrapped by `GraphLib` (`nav/graphlib.py`). Builds once:
+- `GraphStore` (`nav/graph_store.py:75`); `.load(graph_path, overlay_path)` (`:90`) → `load_graph` (`Lachesis/cli/query.py:15`, `json.loads`).
+- In-memory index: `GraphIndex` (`Lachesis/core/query.py:8`), wrapped by `GraphLib` (`nav/graphlib.py`). Builds once:
   - `self.nodes = {node["id"]: node}` — **dict by id**
   - `self.outgoing` / `self.incoming` — **adjacency lists** keyed by `edge["source"]` / `edge["target"]` (the core seam Kùzu replaces)
   - secondary: `by_kind`, `by_label`, `by_file`, `by_owner`
@@ -68,12 +68,12 @@ Dispatch: `call_tool` (`:266`). **Two classes of tool:**
 
 ### Id scheme (the incremental enabler)
 - Content-hash ids, generated **in the frontends**, passed through unchanged.
-- `Arachne/core/identities.py:18` `stable_id(owner, namespace, kind, *parts)` → `sha256("v2\0{owner}\0{namespace}\0{kind}\0{parts}")[:20]`, formatted `v2:{owner}:{namespace}:{kind}:{digest}`. Parts = **file path + start/end offsets + name** (C: `frontends/c/build_graph.py:662`; TS: `frontends/typescript/build_graph.mjs:97`). Per-file `content_hash` stamped into props.
+- `Lachesis/core/identities.py:18` `stable_id(owner, namespace, kind, *parts)` → `sha256("v2\0{owner}\0{namespace}\0{kind}\0{parts}")[:20]`, formatted `v2:{owner}:{namespace}:{kind}:{digest}`. Parts = **file path + start/end offsets + name** (C: `frontends/c/build_graph.py:662`; TS: `frontends/typescript/build_graph.mjs:97`). Per-file `content_hash` stamped into props.
 - **Consequence:** a node's id is stable iff its content is unchanged → re-ingesting a changed file yields new ids only for changed nodes, identical ids for unchanged ones. This is what makes incremental re-ingest tractable.
 - Base-graph edges have **no id**; identity is the `(kind, source, target, props)` tuple.
 
 ### Existing re-ingestable unit
-- No cross-run composed-graph cache. But each frontend already writes a **layered bundle** (`manifest.json` + per-tier JSON) via `write_layered_graph` (`Arachne/projections/layered.py:668`), re-loaded independently by `load_snapshot` (`Arachne/core/snapshot.py:23`). `semantic_snapshot_graph` (`pipeline.py:174`) re-enriches a single snapshot. **This per-frontend/per-package bundle is the coarse incremental unit that exists today.**
+- No cross-run composed-graph cache. But each frontend already writes a **layered bundle** (`manifest.json` + per-tier JSON) via `write_layered_graph` (`Lachesis/projections/layered.py:668`), re-loaded independently by `load_snapshot` (`Lachesis/core/snapshot.py:23`). `semantic_snapshot_graph` (`pipeline.py:174`) re-enriches a single snapshot. **This per-frontend/per-package bundle is the coarse incremental unit that exists today.**
 
 ---
 
@@ -140,8 +140,8 @@ CREATE REL TABLE EDGE (FROM Node TO Node, kind STRING, props STRING);
 
 Add a new writer alongside the JSON one — **dual-write during migration**, don't delete `write_project_graph`.
 
-- **New:** `Arachne/kuzu_store.py` : `write_kuzu_graph(graph, snapshots, db_dir)`.
-  - Consumes the **same composed `graph` dict** that `write_project_graph` gets (post `_enrich_graph`), so it slots in at `Arachne/cli/analyze.py:25` behind a flag / second output path.
+- **New:** `Lachesis/kuzu_store.py` : `write_kuzu_graph(graph, snapshots, db_dir)`.
+  - Consumes the **same composed `graph` dict** that `write_project_graph` gets (post `_enrich_graph`), so it slots in at `Lachesis/cli/analyze.py:25` behind a flag / second output path.
   - **Ingest-time prune (Lever A), gated by a flag so parity tests can disable it:**
     - drop nodes where `kind ∈ {token, source-span}`;
     - drop edges with a dropped endpoint (auto-kills `HAS_TOKEN` 171K + `NEXT_TOKEN` 171K + token-targeted `EXPANDS_TO`/`AST_CHILD`);
@@ -158,7 +158,7 @@ Acceptance for this step: the reference graph writes a Kùzu DB dir; **measured 
 
 **Principle: swap the storage, keep the algorithms.** Do not port `Reachability` to Cypher.
 
-- **New:** `KuzuGraphIndex` implementing the **exact accessor surface** of `GraphIndex` (`Arachne/core/query.py`): `nodes[id]`, `targets(src,*kinds)`, `sources(tgt,*kinds)`, `outgoing_of_kind`, `incoming_of_kind`, `nodes_owned_by`, `by_kind`/`by_label`/`by_file`/`by_owner`, `semantic_edge_kind`. Backed by Kùzu queries, with:
+- **New:** `KuzuGraphIndex` implementing the **exact accessor surface** of `GraphIndex` (`Lachesis/core/query.py`): `nodes[id]`, `targets(src,*kinds)`, `sources(tgt,*kinds)`, `outgoing_of_kind`, `incoming_of_kind`, `nodes_owned_by`, `by_kind`/`by_label`/`by_file`/`by_owner`, `semantic_edge_kind`. Backed by Kùzu queries, with:
   - node fetch by id → PK lookup;
   - `targets/sources` of given kinds → hot-rel-table query (or `EDGE WHERE kind IN …` for cold);
   - the small secondary maps (`by_kind` etc.) can be materialized once at load from cheap aggregate queries — they're index-shaped, not the whole graph.
@@ -197,7 +197,7 @@ An edge F→G (e.g. `CALLS` into a symbol defined in G) is emitted while parsing
 
 ## 6. Rollout — revertible commits (per repo directive: every step auditable)
 
-1. `Arachne/kuzu_store.py` writer + prune + dual-write behind a flag. JSON writer untouched. **Commit.**
+1. `Lachesis/kuzu_store.py` writer + prune + dual-write behind a flag. JSON writer untouched. **Commit.**
    *(Done — writer uses `COPY FROM` staged Parquet, ~24× faster than the initial per-row loader; also carries the `unit` incremental key on every node/edge.)*
 2. `KuzuGraphIndex` + `GraphStore.load` branch. `Reachability` unchanged, flow-subgraph sourced from one Kùzu query. **Commit.**
 3. **Parity harness** (`tests/`): run all nav tools (`hubs`/`search`/`callers`/`callees`/`read_body`/`open_file`/`open_folder`/`flow`/`reaches`/`sources_of`/`points_to`/`aliases`) against JSON-backed vs Kùzu-backed store on the reference graph; assert **identical** results (modulo the deliberate Lever-A prune — run parity with prune OFF first, then confirm the pruned graph still answers the nav set). **Commit.**
