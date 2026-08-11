@@ -21,6 +21,28 @@ FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 CONSTRUCTOR_NAME = "__init__"
 
 
+def nested_bodies(statement: ast.stmt) -> List[List[ast.stmt]]:
+    """The statement lists a compound statement holds, in source order.
+
+    A ``def`` guarded by ``if TYPE_CHECKING:`` or wrapped in ``try/except
+    ImportError:`` is an ordinary declaration that happens to be conditional, and
+    a walk that only looks at the top level of a body never sees it. Nothing here
+    opens a new scope, so the owner and the enclosing function carry through
+    unchanged.
+    """
+    bodies: List[List[ast.stmt]] = []
+    for field in ("body", "orelse", "finalbody"):
+        # A function's or class's own ``body`` is a new scope and is descended
+        # separately; this helper is only ever handed the compound statements.
+        block = getattr(statement, field, None)
+        if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+            bodies.append(block)
+    for group in ("handlers", "cases"):
+        for clause in getattr(statement, group, ()) or ():
+            bodies.append(clause.body)
+    return bodies
+
+
 def annotation_text(source: SourceFile, node: Optional[ast.AST]) -> Optional[str]:
     """An annotation as written. There is no type checker here, so an annotation
     is recorded as source text and never as a resolved type."""
@@ -61,6 +83,28 @@ def signature(source: SourceFile, node: ast.AST) -> str:
             text += "=..."
         rendered.append(text)
     return f"{node.name}({', '.join(rendered)})"
+
+
+def declaration_kind(node: ast.AST, owner_kind: str) -> str:
+    """What a ``def`` is called here, given what encloses it."""
+    if owner_kind != "class":
+        return "function"
+    return "constructor" if node.name == CONSTRUCTOR_NAME else "method"
+
+
+def declaration_id(source: SourceFile, node: ast.AST, kind: str) -> str:
+    """The graph id of a ``def``/``class``, as a pure function of its position.
+
+    Later passes re-parse a file rather than hold every AST in memory, so they
+    need to name a declaration without having the object the declaration pass saw.
+    Deriving the id from the span and the name makes that exact instead of a
+    lookup that could silently miss.
+    """
+    position = source.position(node)
+    return stable_id(
+        kind, source.display, position["start_offset"], position["end_offset"],
+        node.name,
+    )
 
 
 def is_stub_body(body: List[ast.stmt]) -> bool:
@@ -137,26 +181,26 @@ class DeclarationWalk:
             self._function(statement, owner_id, owner_kind, function_id)
         elif isinstance(statement, ast.ClassDef):
             self._class(statement, owner_id, owner_kind, function_id)
-        elif owner_kind in ("module", "class"):
-            # Only module- and class-level bindings become addressable `variable`
-            # nodes. Function locals are dataflow, not navigation: they are emitted
-            # as `definition` nodes by the value pass, where they belong.
-            self._binding(statement, owner_id, owner_kind, function_id)
+        else:
+            if owner_kind in ("module", "class"):
+                # Only module- and class-level bindings become addressable
+                # `variable` nodes. Function locals are dataflow, not navigation:
+                # they are emitted as `definition` nodes by the value pass, where
+                # they belong.
+                self._binding(statement, owner_id, owner_kind, function_id)
+            # if / for / while / with / try / match introduce no scope, so a
+            # declaration inside one belongs to the same owner as its neighbours.
+            for block in nested_bodies(statement):
+                self._body(block, owner_id, owner_kind, function_id)
 
     def _function(
         self, node: ast.AST, owner_id: Optional[str], owner_kind: str,
         function_id: Optional[str],
     ) -> None:
         name = node.name
-        if owner_kind == "class":
-            kind = "constructor" if name == CONSTRUCTOR_NAME else "method"
-        else:
-            kind = "function"
+        kind = declaration_kind(node, owner_kind)
         position = self.source.position(node)
-        node_id = stable_id(
-            kind, self.source.display, position["start_offset"],
-            position["end_offset"], name,
-        )
+        node_id = declaration_id(self.source, node, kind)
         stub = self.is_stub or is_stub_body(node.body)
         self.graph.node(
             node_id, kind, name, **position,
@@ -206,10 +250,7 @@ class DeclarationWalk:
         function_id: Optional[str],
     ) -> None:
         position = self.source.position(node)
-        node_id = stable_id(
-            "class", self.source.display, position["start_offset"],
-            position["end_offset"], node.name,
-        )
+        node_id = declaration_id(self.source, node, "class")
         self.graph.node(
             node_id, "class", node.name, **position,
             syntax_kind="ClassDef",

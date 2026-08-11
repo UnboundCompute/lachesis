@@ -27,6 +27,8 @@ from .emit import (
 from .inventory import (
     FileFacts, ModuleIndex, collect_imports, dunder_all, emit_exports, emit_imports,
 )
+from .bodies import BodyWalk
+from .resolve import Resolver
 from .scopes import ScopeWalk, build_symbol_table, emit_overrides
 
 SOURCE_SUFFIXES = {".py", ".pyi"}
@@ -224,6 +226,7 @@ def build(source_dir: Path, output_dir: Path) -> int:
             class_members=walker.class_members,
             class_bases=walker.class_bases,
             function_ids=walker.function_ids,
+            parameters_by_function=walker.parameters_by_function,
             import_targets={},
             import_modules={},
         )
@@ -245,6 +248,23 @@ def build(source_dir: Path, output_dir: Path) -> int:
     # once that import clause has been pointed at a file.
     override_count = emit_overrides(graph, facts_by_path)
 
+    # Pass three: call sites. Resolution needs every file's binding table, which
+    # only exists now, so the file is re-parsed rather than held from pass one:
+    # a bounded second parse in exchange for never holding the whole tree's ASTs.
+    resolver = Resolver(facts_by_path)
+    call_count = construct_count = resolved_call_count = dynamic_count = 0
+    for path in sorted(facts_by_path):
+        facts = facts_by_path[path]
+        module, failure = parse_module(facts.source.text, path)
+        if module is None:
+            continue
+        walker = BodyWalk(graph, facts.source, facts.file_id, facts, resolver)
+        walker.run(module)
+        call_count += walker.call_count
+        construct_count += walker.construct_count
+        resolved_call_count += walker.resolved_count
+        dynamic_count += walker.dynamic_count
+
     payloads = graph.tier_payloads()
     analyzed = len(files) - len(failed_files)
     # Honest coverage: a file that failed to parse contributes only its file node,
@@ -261,13 +281,21 @@ def build(source_dir: Path, output_dir: Path) -> int:
         "root_file_count": len(files),
         "analyzed_file_count": analyzed,
         "failed_file_count": len(failed_files),
-        "node_count": len(graph.nodes), "edge_count": len(graph.edges),
+        # An edge whose endpoint never became a node is not in any tier file, so
+        # counting it here would make the manifest disagree with what was written.
+        # It is reported on its own line instead, never silently.
+        "node_count": len(graph.nodes),
+        "edge_count": len(graph.edges) - graph.dropped_edges,
         "diagnostic_count": len(diagnostics),
         "import_count": import_count,
         "export_count": export_count,
         "binding_count": binding_count,
         "capture_count": capture_count,
         "override_count": override_count,
+        "call_count": call_count,
+        "construct_count": construct_count,
+        "resolved_call_count": resolved_call_count,
+        "dynamic_behavior_count": dynamic_count,
         "scope_correlated_file_count": len(facts_by_path) - len(uncorrelated_files),
         "scope_uncorrelated_file_count": len(uncorrelated_files),
         "dropped_edge_count": graph.dropped_edges,
@@ -321,13 +349,15 @@ def capabilities(complete_if_parsed: str) -> Dict[str, str]:
         "symbols": "partial",
         "scopes": "partial",
         "types": "none",
-        "calls": "none",
+        # Lexically and import-resolved calls are decided by the layout; attribute
+        # dispatch on an unannotated value is not, so the claim stops at partial.
+        "calls": "partial",
         "control_flow": "none",
         "direct_data_flow": "none",
         "heap_identity": "none", "context_sensitivity": "none",
         "branch_histories": "none", "taint_policy": "none",
         "runtime_models": "none", "effects": "none", "async_events": "none",
-        "dynamic_behavior": "none", "framework_wiring": "none",
+        "dynamic_behavior": "partial", "framework_wiring": "none",
         "security_roles": "none",
     }
 

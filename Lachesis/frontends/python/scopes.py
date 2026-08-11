@@ -190,7 +190,7 @@ def _take(
     return None
 
 
-def _bound_occurrences(regions: Sequence[ast.AST]) -> Dict[str, ast.AST]:
+def bound_occurrences(regions: Sequence[ast.AST]) -> Dict[str, ast.AST]:
     """Name -> first AST node that binds it in these regions.
 
     Used for two things: the position a `binding` node needs (it is source-derived,
@@ -360,7 +360,7 @@ class ScopeWalk:
     # -- bindings ------------------------------------------------------------
 
     def _emit_bindings(self, scope: Scope, regions: Sequence[ast.AST]) -> None:
-        occurrences = _bound_occurrences(regions)
+        occurrences = bound_occurrences(regions)
         parameters = self.parameters_by_function.get(scope.declaration_id or "", {})
         if scope.block is not None:
             entries = [

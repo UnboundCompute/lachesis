@@ -236,6 +236,9 @@ class FileFacts(NamedTuple):
     class_members: Dict[str, Dict[str, str]]
     class_bases: Dict[str, List[Tuple[str, str]]]
     function_ids: List[str]
+    # function graph id -> {parameter name: parameter graph id}, in declaration
+    # order, so a resolved call can bind its arguments to the slots they fill.
+    parameters_by_function: Dict[str, Dict[str, str]]
     # import node id -> the declaration it names, when the clause named one.
     import_targets: Dict[str, str]
     # import node id -> the in-tree file the clause resolved to.

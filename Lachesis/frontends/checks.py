@@ -1542,6 +1542,252 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertFalse(fallback["total"]["symtable_correlated"])
         self.assertEqual(holder, fallback["total"]["owner_function_id"])
 
+    def test_python_call_resolution_table_and_call_navigation(self) -> None:
+        # One assertion per row of the resolution table. The discipline being tested
+        # is not "how many edges" but *which claim is made*: a decided target is an
+        # INVOKES, an undecided one is either a capped set of MAY_INVOKE maybes or
+        # no edge at all with the reason recorded on the call node. `confidence:
+        # unresolved` describes an edge emitted on a guess; a missing edge is the
+        # absence of a claim and is expressed through `resolution`.
+        from nav.graphlib import GraphLib
+        from nav.hubs import Hubs
+        from nav.symbol_index import build_index, _resolve, callers, callees
+
+        fixtures = ROOT / "Lachesis" / "frontends" / "python" / "fixtures"
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(fixtures), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            self.assertEqual(0, snapshot.manifest["dropped_edge_count"])
+            self.assertEqual("partial", snapshot.capabilities["calls"])
+            self.assertEqual("partial", snapshot.capabilities["dynamic_behavior"])
+
+            by_id = {node["id"]: node for node in snapshot.nodes}
+            edges = list(snapshot.edges)
+
+            def site(file: str, line: int, label: str) -> dict:
+                found = [
+                    node for node in snapshot.nodes
+                    if node["kind"] in {"call", "construct"}
+                    and node["properties"]["file"] == file
+                    and node["properties"]["start_line"] == line
+                    and node["label"] == label
+                ]
+                self.assertEqual(1, len(found), f"{file}:{line} {label}")
+                return found[0]
+
+            def targets_of(node: dict) -> set:
+                # (edge kind, confidence, callee label, owning class or None)
+                out = set()
+                for edge in edges:
+                    if edge["source"] != node["id"]:
+                        continue
+                    if edge["kind"] not in {"INVOKES", "MAY_INVOKE"}:
+                        continue
+                    target = by_id[edge["target"]]
+                    owner = by_id.get(target["properties"].get("owner_id"))
+                    out.add((
+                        edge["kind"], edge["properties"]["confidence"],
+                        target["label"], owner["label"] if owner else None,
+                    ))
+                return out
+
+            # Every call site carries the attribution spine hubs and the indirect
+            # half of callers/callees climb. Without it the ranking is garbage.
+            for node in snapshot.nodes:
+                if node["kind"] in {"call", "construct"}:
+                    self.assertTrue(node["properties"]["owner_function_id"]
+                                    or node["properties"]["owner_id"],
+                                    f"{node['label']} has no owner")
+                    self.assertTrue(node["properties"]["resolution"])
+
+            # row: a module-level def bound exactly once, called from another module
+            # through an import. Decided by the layout, so INVOKES at exact.
+            welcome = site("app/service.py", 20, "say_hello")
+            self.assertEqual("exact", welcome["properties"]["resolution"])
+            self.assertEqual(
+                {("INVOKES", "exact", "greet", None)}, targets_of(welcome))
+            # ...and the caller declaration gets the decl->decl CALLS edge that
+            # `callers`/`callees` read, only ever for a decided target.
+            owner = welcome["properties"]["owner_function_id"]
+            greet = next(node for node in snapshot.nodes
+                         if node["label"] == "greet" and node["kind"] == "function")
+            self.assertTrue(any(
+                edge["kind"] == "CALLS" and edge["source"] == owner
+                and edge["target"] == greet["id"] for edge in edges))
+
+            # row: `Foo()` where Foo is an in-tree class. The site is a `construct`,
+            # the call edge lands on __init__, and the class itself is named through
+            # REFERS_TO rather than an invented edge kind no reader knows.
+            built = site("app/repository.py", 46, "CachingRepository")
+            self.assertEqual("construct", built["kind"])
+            self.assertEqual(
+                {("INVOKES", "exact", "__init__", "CachingRepository")},
+                targets_of(built))
+            self.assertTrue(any(
+                edge["kind"] == "REFERS_TO" and edge["source"] == built["id"]
+                and edge["properties"].get("reason") == "constructed-type"
+                and by_id[edge["target"]]["label"] == "CachingRepository"
+                for edge in edges))
+
+            # row: the same name bound more than once at module level. Any binding
+            # could be live at the call, so each is a maybe and none is the answer.
+            rebound = site("app/dynamic.py", 52, "pick")
+            self.assertEqual("rebound", rebound["properties"]["resolution"])
+            self.assertEqual({("MAY_INVOKE", "conservative", "pick", None)},
+                             targets_of(rebound))
+            self.assertEqual(2, len(
+                [e for e in edges if e["source"] == rebound["id"]
+                 and e["kind"] == "MAY_INVOKE"]))
+
+            # row: `self.m()` resolved through the lexical MRO. Left-to-right depth
+            # first approximates a C3 linearization computed at run time from
+            # objects this frontend never builds, so it is `high` and not `exact`.
+            through_self = site("app/dynamic.py", 40, "self.fetch")
+            self.assertEqual("lexical-mro", through_self["properties"]["resolution"])
+            self.assertEqual(
+                {("INVOKES", "high", "fetch", "RetryingRepository")},
+                targets_of(through_self))
+
+            # row: `super().m()` names the base implementation, which the layout
+            # does decide. The bare `super` call beside it resolves to nothing,
+            # which is the honest answer for a builtin with no in-tree definition.
+            through_super = site("app/dynamic.py", 32, "super().fetch")
+            self.assertEqual("super", through_super["properties"]["resolution"])
+            self.assertEqual({("INVOKES", "exact", "fetch", "Repository")},
+                             targets_of(through_super))
+
+            # row: obj.m() on a value of unknown type, at or below the cap. The
+            # method name is all there is to go on, so every in-tree m is a maybe.
+            under = site("app/duck.py", 69, "handler.settle")
+            self.assertEqual("candidates", under["properties"]["resolution"])
+            self.assertEqual(2, under["properties"]["method_candidate_count"])
+            self.assertEqual(
+                {("MAY_INVOKE", "conservative", "settle", "Pair"),
+                 ("MAY_INVOKE", "conservative", "settle", "Peer")},
+                targets_of(under))
+
+            # row: ...and above the cap, where "any of these nine" buries the
+            # question instead of answering it. No edge, and the count on the node
+            # so the silence is explained rather than merely absent.
+            over = site("app/duck.py", 65, "handler.dispatch")
+            self.assertEqual("over-cap", over["properties"]["resolution"])
+            self.assertEqual(9, over["properties"]["method_candidate_count"])
+            self.assertEqual(set(), targets_of(over))
+
+            # row: getattr/eval/exec reach a name the source does not spell out. A
+            # call edge would be fiction, so the site is located and marked for
+            # Lachesis/core/overlays/dynamic_behavior.py to consume.
+            dynamic_sites = {}
+            for label, line in (("getattr", 12), ("eval", 17), ("exec", 21)):
+                node = site("app/dynamic.py", line, label)
+                self.assertEqual("dynamic", node["properties"]["resolution"])
+                self.assertEqual(set(), targets_of(node))
+                dynamic_sites[label] = node["id"]
+            marked = {
+                node["properties"]["site_id"] for node in snapshot.nodes
+                if node["kind"] == "dynamic-behavior"
+            }
+            self.assertEqual(set(dynamic_sites.values()), marked)
+            self.assertTrue(all(any(
+                edge["kind"] == "DYNAMIC_BEHAVIOR_AT" and edge["target"] == site_id
+                for edge in edges) for site_id in dynamic_sites.values()))
+            # The value getattr handed back is called on the next line. Nothing is
+            # known about it, so no edge — but the local binding is named.
+            indirect = site("app/dynamic.py", 13, "handler")
+            self.assertEqual("local-value", indirect["properties"]["resolution"])
+            self.assertEqual(set(), targets_of(indirect))
+
+            # A def nested in a compound statement is an ordinary declaration:
+            # nothing between it and the module opens a scope. Resolving a call to
+            # it is the cheapest proof that it got a node at all, which a walk
+            # reading only the top level of each body would not have given it.
+            conditional = [node for node in snapshot.nodes
+                           if node["kind"] == "function"
+                           and node["label"] == "conditionally_declared"]
+            self.assertEqual(1, len(conditional))
+            conditional_call = [node for node in snapshot.nodes
+                                if node["kind"] == "call"
+                                and node["label"] == "conditionally_declared"]
+            self.assertEqual(1, len(conditional_call))
+            self.assertEqual(
+                {("INVOKES", "exact", "conditionally_declared", None)},
+                targets_of(conditional_call[0]))
+
+            # Arguments bind to parameters positionally, the shape the shared
+            # overlays and the TypeScript frontend already agree on.
+            arguments = {
+                node["properties"]["position"]: node for node in snapshot.nodes
+                if node["kind"] == "argument"
+                and node["properties"]["callsite_id"] == welcome["id"]
+            }
+            self.assertEqual({0}, set(arguments))
+            # call (T2) -> argument (T3) crosses a tier, so the mechanical rule
+            # wraps it as EXPANDS_TO(via=HAS_ARGUMENT); the position rides along.
+            self.assertTrue(any(
+                edge["kind"] == "EXPANDS_TO"
+                and edge["properties"].get("via") == "HAS_ARGUMENT"
+                and edge["source"] == welcome["id"]
+                and edge["target"] == arguments[0]["id"]
+                and edge["properties"]["position"] == 0 for edge in edges))
+            bound = [by_id[edge["target"]] for edge in edges
+                     if edge["kind"] == "ARGUMENT_BINDS_PARAMETER"
+                     and edge["source"] == arguments[0]["id"]]
+            self.assertEqual(["name"], [node["label"] for node in bound])
+            self.assertEqual(greet["id"], bound[0]["properties"]["owner_function_id"])
+
+            # dispatch.py transitively closes OVERRIDES and fans MAY_INVOKE out to
+            # every implementation of a resolved target. That is what lets a
+            # dynamically typed language resolve to the nearest definition and still
+            # see the full override set, without the frontend guessing at any of it.
+            enriched = semantic_snapshot_graph(snapshot)
+            enriched_by_id = {node["id"]: node for node in enriched["nodes"]}
+            fanned = set()
+            for edge in enriched["edges"]:
+                if edge["source"] != through_super["id"]:
+                    continue
+                if edge["properties"].get("reason") != \
+                        "override-or-interface-implementation":
+                    continue
+                target = enriched_by_id[edge["target"]]
+                owner = enriched_by_id.get(target["properties"].get("owner_id"))
+                fanned.add((edge["kind"], target["label"],
+                            owner["label"] if owner else None))
+            self.assertEqual(
+                {("MAY_INVOKE", "fetch", "CachingRepository"),
+                 ("MAY_INVOKE", "fetch", "RetryingRepository")}, fanned)
+
+            # The tools this step exists to unlock, across a module boundary.
+            gl = GraphLib({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            index = build_index(gl)
+
+            def node_id_of(name: str) -> str:
+                resolved = _resolve(gl, index, name)
+                self.assertTrue(resolved, f"search found no node named {name!r}")
+                return resolved[0]["node_id"]
+
+            self.assertEqual(
+                {("welcome", "app/service.py", "direct")},
+                {(row["name"], row["file"], row["via"])
+                 for row in callers(gl, node_id_of("greet"))})
+            self.assertEqual(
+                {("build_service", "app/service.py", "direct"),
+                 ("welcome", "app/service.py", "indirect(may_invoke)")},
+                {(row["name"], row["file"], row["via"])
+                 for row in callees(gl, node_id_of("run"))})
+            # normalize is called from three modules, one of them through a
+            # relative import, so its callers prove resolution is not per-file.
+            self.assertEqual(
+                {"app/relative.py", "app/service.py", "app/util/nested/deep.py"},
+                {row["file"] for row in callers(gl, node_id_of("normalize"))})
+            # hubs ranks by call traffic, so the fixture chain has to appear at all
+            # — an empty ranking is what a missing owner_function_id looks like.
+            ranked = {row["name"] for row in Hubs(gl).top(20)}
+            self.assertTrue({"run", "build_service", "open_repository"} <= ranked)
+
     def test_python_unparseable_file_keeps_its_file_node(self) -> None:
         # A syntax error must not evict the file: it still has to appear in search,
         # open_file and open_folder. Written to a temporary tree rather than

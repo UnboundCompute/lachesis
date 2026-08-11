@@ -1,6 +1,7 @@
 """Every declaration form the frontend must classify, in one file."""
 
 import asyncio
+from typing import TYPE_CHECKING
 
 MODULE_CONSTANT = 7
 FIRST, SECOND = 1, 2
@@ -66,3 +67,25 @@ class Shapes:
     class Nested:
         def deep(self):
             return 1
+
+
+if TYPE_CHECKING:
+    def conditionally_declared(value):
+        """A def under a compound statement is still an ordinary declaration.
+
+        Nothing between it and the module opens a scope, so it is a module-level
+        binding like any other and a walk that reads only the top level of each
+        body misses it entirely.
+        """
+        return value
+
+
+try:
+    from json import dumps as serialize
+except ImportError:  # pragma: no cover  the stdlib is always there
+    def serialize(value):
+        return str(value)
+
+
+def calls_a_conditional_declaration(value):
+    return conditionally_declared(value)
