@@ -29,3 +29,5 @@ graph_out/
 *.swp
 .idea/
 .vscode/
+
+*.md
