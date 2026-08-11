@@ -1898,6 +1898,109 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual("delete_mysql_record",
                              diff["flagged"][0]["peer_guard"]["name"])
 
+    def test_python_dataflow_carries_taint_end_to_end_and_answers_points_to(self) -> None:
+        # The flow half of the navigation surface. `reaches` walks VALUE_FLOWS_TO
+        # between value nodes, and `points_to`/`aliases` walk POINTS_TO, which no
+        # frontend may emit: Lachesis/core/overlays/heap.py derives it, and only
+        # runs at all when an `allocation` node exists (heap.py:31-32). So the
+        # assertion worth making is not that the right node kinds are present but
+        # that the tools answer, which is why this drives them directly.
+        from nav.graph_store import GraphStore
+        from nav.reachability import Reachability
+
+        fixtures = ROOT / "Lachesis" / "frontends" / "python" / "fixtures"
+        with tempfile.TemporaryDirectory() as output:
+            self.run_command(
+                sys.executable, "-m", "Lachesis.frontends.python.build_graph",
+                str(fixtures), output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            self.assertEqual(0, snapshot.manifest["dropped_edge_count"])
+            self.assertEqual("partial", snapshot.capabilities["direct_data_flow"])
+
+            # heap_identity stays `none` on purpose: the overlay owns the result,
+            # and a frontend claiming it would be claiming someone else's work.
+            self.assertEqual("none", snapshot.capabilities["heap_identity"])
+
+            graph = semantic_snapshot_graph(snapshot)
+            store = GraphStore({"nodes": graph["nodes"], "edges": graph["edges"]})
+            reach = Reachability(store)
+
+            def find(kind, label, path="app/flow.py"):
+                return [node for node in graph["nodes"]
+                        if node["kind"] == kind and node["label"] == label
+                        and node["properties"].get("file") == path]
+
+            # A parameter through an f-string into a call argument, which is how
+            # SQL injection is written in Python and the one path that has to work.
+            source = find("parameter", "user_input")
+            self.assertEqual(1, len(source))
+            sink = find("argument", "query")
+            self.assertEqual(1, len(sink))
+            path = reach.reaches(source[0]["id"], sink[0]["id"])
+            self.assertTrue(path["nodes"], "no path from user_input to the argument")
+            reasons = {edge.get("reason") for edge in path["edges"]}
+            self.assertIn("template-substitution", reasons)
+            kinds = [node["kind"] for node in path["nodes"]]
+            for expected in ("value", "definition", "read", "argument"):
+                self.assertIn(expected, kinds)
+
+            # sources_of is the same question asked backwards, and has to name the
+            # parameter rather than stopping at the local it was copied into.
+            origins = reach.sources_of(sink[0]["id"])
+            self.assertIn(source[0]["id"],
+                          {node["id"] for node in origins["nodes"]})
+
+            # points_to: an allocation site gives the definition an object, which
+            # is the answer no frontend outside TypeScript currently produces.
+            rows = find("definition", "rows")
+            self.assertTrue(rows)
+            objects = list(store.index.targets(rows[0]["id"], "POINTS_TO"))
+            self.assertTrue(objects, "points_to returned nothing for an allocation")
+            self.assertEqual({"heap-object"}, {node["kind"] for node in objects})
+
+            # A class instantiation is allocated and typed, so the object carries
+            # the name of the class it is an instance of.
+            instances = [node for node in graph["nodes"]
+                         if node["kind"] == "allocation"
+                         and node["properties"].get("allocation_kind") == "class-instance"
+                         and node["properties"].get("file") == "app/flow.py"]
+            self.assertEqual({"Row"},
+                             {node["properties"]["allocated_type"] for node in instances})
+
+            # aliases: `same = row` then `also = same` are three names for one
+            # object, so each definition reaches the other two through the heap.
+            names = {}
+            for label in ("row", "same", "also"):
+                found = [node for node in find("definition", label)
+                         if node["properties"].get("origin") != "unknown"]
+                self.assertTrue(found, f"no definition of {label}")
+                names[label] = found[0]["id"]
+            for label, node_id in names.items():
+                siblings = {
+                    other["id"]
+                    for heap in store.index.targets(node_id, "POINTS_TO")
+                    for other in store.index.sources(heap["id"], "POINTS_TO")
+                }
+                for peer, peer_id in names.items():
+                    if peer != label:
+                        self.assertIn(peer_id, siblings,
+                                      f"{label} is not aliased with {peer}")
+
+            # A parameter's definition says `parameter` exactly, because
+            # branch_history.py:173 and heap.py:100 both key on that literal string.
+            definitions = [node for node in graph["nodes"]
+                           if node["kind"] == "definition"
+                           and node["properties"].get("origin") == "parameter"]
+            self.assertTrue(definitions)
+
+            # self.x = param in a constructor, the shape the C frontend emits and
+            # this file already asserts of it.
+            stores = [edge for edge in graph["edges"]
+                      if edge["kind"] == "WRITES_PARAMETER_PROPERTY"]
+            self.assertTrue(stores, "no WRITES_PARAMETER_PROPERTY was emitted")
+
     def test_python_unparseable_file_keeps_its_file_node(self) -> None:
         # A syntax error must not evict the file: it still has to appear in search,
         # open_file and open_folder. Written to a temporary tree rather than

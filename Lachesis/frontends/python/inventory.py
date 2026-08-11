@@ -243,6 +243,10 @@ class FileFacts(NamedTuple):
     import_targets: Dict[str, str]
     # import node id -> the in-tree file the clause resolved to.
     import_modules: Dict[str, Path]
+    # (start_offset, end_offset) of a binding scope -> {name: binding node id}, so
+    # the body pass can point a name at the node that binds it without rebuilding
+    # the scope tree. Keyed by span because that pass re-parses the file.
+    bindings_by_span: Dict[Tuple[int, int], Dict[str, str]]
 
 
 def external_module(graph: Graph, specifier: str) -> str:

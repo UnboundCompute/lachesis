@@ -59,6 +59,19 @@ def build_symbol_table(text: str, path: Path) -> Optional[symtable.SymbolTable]:
         return None
 
 
+def scope_span(source: SourceFile, node: ast.AST) -> Tuple[int, int]:
+    """The character span of a scope, usable as a key across two parses.
+
+    A module carries no position of its own, so it is keyed by the whole file.
+    Everything else is keyed by its own span, which two parses of the same text
+    agree on even though they share no AST objects.
+    """
+    if isinstance(node, ast.Module):
+        return (0, len(source.text))
+    position = source.position(node)
+    return (position["start_offset"], position["end_offset"])
+
+
 def scope_key(node: ast.AST) -> Tuple[str, str]:
     """The (block type, block name) symtable will have used for this AST node."""
     if isinstance(node, FUNCTION_NODES):
@@ -309,6 +322,10 @@ class ScopeWalk:
         self.parameters_by_function = parameters_by_function
         self.scopes: List[Scope] = []
         self.scope_of_node: Dict[ast.AST, Scope] = {}
+        # (start_offset, end_offset) of a scope -> {name: binding node id}. Keyed by
+        # span rather than by AST node because the body pass re-parses the file and
+        # its nodes are different objects; the span is the same in both trees.
+        self.bindings_by_span: Dict[Tuple[int, int], Dict[str, str]] = {}
         self.correlated = True
         self.uncorrelated_scopes = 0
         self.binding_count = 0
@@ -343,6 +360,7 @@ class ScopeWalk:
         regions = own_regions(node)
         if kind in BINDING_SCOPE_KINDS:
             self._emit_bindings(scope, regions)
+            self.bindings_by_span[scope_span(self.source, node)] = scope.bindings
 
         queue = _expand_blocks(block.get_children()) if block is not None else []
         for child_node in _collect_scopes(regions):

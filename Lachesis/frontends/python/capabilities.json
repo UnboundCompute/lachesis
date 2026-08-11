@@ -11,9 +11,9 @@
     "symbols": "partial",
     "scopes": "partial",
     "types": "none",
-    "calls": "none",
-    "control_flow": "none",
-    "direct_data_flow": "none",
+    "calls": "partial",
+    "control_flow": "partial",
+    "direct_data_flow": "partial",
     "heap_identity": "none",
     "context_sensitivity": "none",
     "branch_histories": "none",
@@ -21,7 +21,7 @@
     "runtime_models": "none",
     "effects": "none",
     "async_events": "none",
-    "dynamic_behavior": "none",
+    "dynamic_behavior": "partial",
     "framework_wiring": "none",
     "security_roles": "none"
   }

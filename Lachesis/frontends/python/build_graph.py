@@ -229,6 +229,7 @@ def build(source_dir: Path, output_dir: Path) -> int:
             parameters_by_function=walker.parameters_by_function,
             import_targets={},
             import_modules={},
+            bindings_by_span=scopes.bindings_by_span,
         )
 
     # Pass two: everything that needs the whole tree. Module names come from the
@@ -299,6 +300,10 @@ def build(source_dir: Path, output_dir: Path) -> int:
         "short_circuit_count": body_totals["short_circuit_count"],
         "throw_count": body_totals["throw_count"],
         "exception_branch_count": body_totals["exception_branch_count"],
+        "definition_count": body_totals["definition_count"],
+        "read_count": body_totals["read_count"],
+        "write_count": body_totals["write_count"],
+        "allocation_count": body_totals["allocation_count"],
         "scope_correlated_file_count": len(facts_by_path) - len(uncorrelated_files),
         "scope_uncorrelated_file_count": len(uncorrelated_files),
         "dropped_edge_count": graph.dropped_edges,
@@ -360,7 +365,14 @@ def capabilities(complete_if_parsed: str) -> Dict[str, str]:
         # the point control comes back to) and neither is the with protocol, whose
         # branch lives in __enter__ and __exit__, so this stops at partial.
         "control_flow": "partial",
-        "direct_data_flow": "none",
+        # Assignments, parameters, arguments and returns are exact. A for target
+        # is an element of something never evaluated, a with binding is whatever
+        # __enter__ returned, and a starred target is a slice of unknown length,
+        # so those three are emitted conservative and this stops at partial.
+        "direct_data_flow": "partial",
+        # heap_identity stays none because it is overlay-owned: what is emitted
+        # here is the allocation sites the overlay derives POINTS_TO from, not
+        # the identity result itself, which a frontend may not claim.
         "heap_identity": "none", "context_sensitivity": "none",
         "branch_histories": "none", "taint_policy": "none",
         "runtime_models": "none", "effects": "none", "async_events": "none",

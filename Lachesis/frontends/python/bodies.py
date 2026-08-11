@@ -27,15 +27,16 @@ to get them would trade a bounded second parse for unbounded memory.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .declarations import declaration_id, declaration_kind
 from .emit import Graph, SourceFile, compact, stable_id
 from .resolve import DYNAMIC_CALLEES, NOTHING, Resolution, Resolver
 from .scopes import (
     COMPREHENSIONS, FUNCTION_NODES, SCOPE_NODES, bound_occurrences, own_regions,
-    outer_regions, scope_kind,
+    outer_regions, scope_kind, scope_span,
 )
+from .values import ValueWalk
 
 # 3.11 added ``except*``; on 3.10 there is no such node and the tuple is empty.
 TRY_NODES = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
@@ -77,6 +78,7 @@ BODY_COUNTERS = (
     "call_count", "construct_count", "resolved_count", "dynamic_count",
     "statement_count", "condition_count", "short_circuit_count",
     "throw_count", "exception_branch_count",
+    "definition_count", "read_count", "write_count", "allocation_count",
 )
 
 
@@ -95,6 +97,10 @@ class Frame(NamedTuple):
     self_name: Optional[str]
     locals: Set[str]
     declarations: Dict[str, str]
+    # The spans of this scope and every scope around it, innermost first, which
+    # is how a name is resolved to the node that binds it. Spans rather than AST
+    # nodes because the table they key was built during a different parse.
+    scope_spans: Tuple[Tuple[int, int], ...] = ()
 
 
 class BodyWalk:
@@ -122,6 +128,19 @@ class BodyWalk:
         # tree outlives the walk; the first visit owns the parent edge, so a node
         # pre-created as a branch target is not re-parented when it is reached.
         self._bodies: Dict[int, str] = {}
+        # Dataflow rides on this traversal rather than walking the tree again:
+        # both need the same frame and the same body node, and two descents would
+        # be two chances for the attribution to disagree with itself.
+        self.values = ValueWalk(graph, source, file_id, facts)
+        self.values.bodies = self._bodies
+
+    def __getattr__(self, name: str) -> int:
+        # The value counters live on the collaborator; the manifest sums them off
+        # the walker, so they are readable from here under their own names.
+        if name in ("definition_count", "read_count", "write_count",
+                    "allocation_count"):
+            return getattr(self.values, name)
+        raise AttributeError(name)
 
     # -- the walk ------------------------------------------------------------
 
@@ -182,9 +201,15 @@ class BodyWalk:
                     # A name declared global is not a local, whatever else the
                     # body does with it, so it must not shadow the module binding.
                     locals_of_scope.difference_update(statement.names)
+        # A class body is left in the chain even though it binds nothing a nested
+        # function can see: no class span is ever recorded as a binding scope, so
+        # keeping it costs one miss and losing it would need a special case.
+        spans = (scope_span(self.source, node),) + (
+            parent.scope_spans if parent is not None else ()
+        )
         return Frame(
             kind, graph_id, owner_function_id, class_id, self_name,
-            locals_of_scope, declarations,
+            locals_of_scope, declarations, spans,
         )
 
     def _visit(self, node: ast.AST, frame: Frame, parent: Optional[str]) -> None:
@@ -202,6 +227,11 @@ class BodyWalk:
                 self._comprehension(node, child, parent)
                 if isinstance(node, COMPREHENSIONS) else None
             )
+            # The scope node is a value in the enclosing scope (a list display
+            # allocates there, a lambda is an object there), while its parameters
+            # are bound inside, so the two hooks take different frames.
+            self.values.visit(node, frame)
+            self.values.parameters(node, child)
             for region in own_regions(node):
                 self._visit(region, child, inner)
             return
@@ -215,6 +245,9 @@ class BodyWalk:
             parent = self._conditional_expression(node, frame, parent)
         elif isinstance(node, (ast.Yield, ast.YieldFrom)):
             self._yield(node, frame, parent)
+        # After the body node exists, so a value can be evidenced by it, and
+        # before the descent, so a definition is in place for the reads under it.
+        self.values.visit(node, frame)
         for child in ast.iter_child_nodes(node):
             self._visit(child, frame, parent)
 
@@ -432,6 +465,8 @@ class BodyWalk:
             owner_function_id=frame.owner_function_id,
         )
         self.graph.edge("RETURN_EVIDENCED_BY", return_id, node_id)
+        if value is not None:
+            self.values.returned(value, return_id, frame)
         if frame.owner_function_id:
             if return_kind == "throw":
                 self.graph.edge("THROWS_VALUE", return_id, frame.owner_function_id)
@@ -616,6 +651,7 @@ class BodyWalk:
         if resolution.resolution == "dynamic":
             self._dynamic_behavior(node, node_id, callee, frame, position)
         self._arguments(node, node_id, resolution, frame)
+        self.values.call_result(node, node_id, frame, constructed)
         return node_id
 
     def _dynamic_behavior(
@@ -678,6 +714,9 @@ class BodyWalk:
                     position=index, callsite=call_id,
                     confidence=resolution.confidence,
                 )
+            self.values.argument(
+                expression, argument_id, parameter, frame, resolution.confidence,
+            )
 
     def _parameters_of(self, resolution: Resolution) -> Optional[List[tuple]]:
         """The target's parameter slots, when exactly one target was decided."""
