@@ -15,7 +15,8 @@ load — only light, index-shaped maps and per-node fetches:
   * ``_node(id)``  — PK lookup, reconstructs the canonical ``{id,label,kind,properties}``
     dict by unioning the promoted columns with the ``props`` blob, which carries only
     the tail (see ``_stored_props``: a property in a typed column is not stored a second
-    time in the blob) as deflated JSON. Cached.
+    time in the blob) as deflated JSON, against the store's shared preset dictionary
+    (``manifest_props_dictionary``, read once at open). Cached.
   * ``_edges(id, reverse)`` — one generic traversal query per node; reconstructs edge
     dicts ``{source,target,kind,properties}``. ``label(e)`` gives the kind for a hot rel
     table; the catch-all ``EDGE`` table carries ``kind``/``semantic_kind`` columns. Cached.
@@ -40,6 +41,8 @@ from Lachesis.kuzu_store import (
     PROMOTED_NODE_PROPS,
     _HOT_SET,
     db_file,
+    manifest_props_dictionary,
+    read_store_manifest,
 )
 
 try:  # 3.10+ only
@@ -55,12 +58,26 @@ def _overlay_edge_key(edge: dict) -> str:
     return edge_key(edge)
 
 
-def _restore(props_blob: Optional[bytes]) -> dict:
+def _inflate(props_blob: bytes, zdict: bytes) -> bytes:
+    """Undo ``kuzu_store._deflate``.
+
+    ``zdict`` is the store's shared preset dictionary, from its manifest. zlib only
+    consults it when the stream says it needs one, so the wrong dictionary is not a
+    silent corruption: a stream written without one inflates regardless, and a stream
+    written with a different one raises rather than returning plausible bytes.
+    """
+    if not zdict:
+        return zlib.decompress(props_blob)
+    obj = zlib.decompressobj(zlib.MAX_WBITS, zdict)
+    return obj.decompress(props_blob) + obj.flush()
+
+
+def _restore(props_blob: Optional[bytes], zdict: bytes) -> dict:
     """Inflate a stored ``props`` blob back into a properties dict.
 
     The blob is deflated UTF-8 JSON (see ``kuzu_store._stored_props``). Inflating all
     244,954 nodes of the reference store costs 0.34s, against a materialize of ~5.5s."""
-    props = json.loads(zlib.decompress(props_blob)) if props_blob else {}
+    props = json.loads(_inflate(props_blob, zdict)) if props_blob else {}
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
             props[key] = list(default) if isinstance(default, list) else default
@@ -74,7 +91,8 @@ _MERGED_COLUMNS = tuple(c for c in PROMOTED_NODE_PROPS if c != "unit")
 _MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
 
 
-def _restore_node_props(columns, props_blob: Optional[bytes]) -> dict:
+def _restore_node_props(columns, props_blob: Optional[bytes],
+                        zdict: bytes) -> dict:
     """Union the promoted columns with the ``props`` tail.
 
     The tail wins on any overlap. Nothing overlaps in a store this version wrote —
@@ -89,7 +107,7 @@ def _restore_node_props(columns, props_blob: Optional[bytes]) -> dict:
     properties = {name: value
                   for name, value in zip(_MERGED_COLUMNS, columns)
                   if value is not None}
-    properties.update(_restore(props_blob))
+    properties.update(_restore(props_blob, zdict))
     return properties
 
 
@@ -116,7 +134,8 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         row = res.get_next()
         nid, kind, label = row[:3]
         nodes.append({"id": nid, "kind": kind, "label": label,
-                      "properties": _restore_node_props(row[3:-1], row[-1])})
+                      "properties": _restore_node_props(row[3:-1], row[-1],
+                                                        index._props_dict)})
     edges = []
     for kind in HOT_REL_KINDS:
         res = index._conn.execute(
@@ -125,14 +144,14 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         while res.has_next():
             src, tgt, props = res.get_next()
             edges.append({"source": src, "target": tgt, "kind": kind,
-                          "properties": _restore(props)})
+                          "properties": _restore(props, index._props_dict)})
     res = index._conn.execute(
         "MATCH (a:Node)-[e:EDGE]->(b:Node) RETURN a.id, b.id, e.kind, e.props"
     )
     while res.has_next():
         src, tgt, kind, props = res.get_next()
         edges.append({"source": src, "target": tgt, "kind": kind,
-                      "properties": _restore(props)})
+                      "properties": _restore(props, index._props_dict)})
     # Kùzu does not promise a scan order, and two edges can share
     # ``(kind, source, target)`` while differing in props, so the tie-break folds the
     # props in: materializing the same store twice must give byte-identical output, or
@@ -207,6 +226,11 @@ class KuzuGraphIndex:
             )
         self._db = kuzu.Database(db_file(db_dir), read_only=True)
         self._conn = kuzu.Connection(self._db)
+        # Read once at open, not per blob: it is a fixed 32 KB and every `props` in the
+        # store needs it. ``GraphStore.load`` has already checked the format stamp in
+        # this same manifest, so a store whose dictionary this reader could not use has
+        # been rejected before here.
+        self._props_dict = manifest_props_dictionary(read_store_manifest(db_dir))
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}
@@ -300,7 +324,7 @@ class KuzuGraphIndex:
         if res.has_next():
             row = res.get_next()
             kind, label = row[:2]
-            properties = _restore_node_props(row[2:-1], row[-1])
+            properties = _restore_node_props(row[2:-1], row[-1], self._props_dict)
             if self._overlay is not None:
                 properties.update(self._overlay.node_props.get(node_id) or {})
             node = {"id": node_id, "kind": kind, "label": label,
@@ -325,7 +349,7 @@ class KuzuGraphIndex:
             kind = kind_col if label == "EDGE" else label
             src, tgt = (other, node_id) if reverse else (node_id, other)
             edges.append({"source": src, "target": tgt, "kind": kind,
-                          "properties": _restore(props)})
+                          "properties": _restore(props, self._props_dict)})
         if self._overlay is not None:
             for edge in edges:
                 extra = self._overlay.edge_props.get(_overlay_edge_key(edge))
@@ -397,7 +421,7 @@ class KuzuGraphIndex:
             while res.has_next():
                 src, tgt, props = res.get_next()
                 edges.append({"source": src, "target": tgt, "kind": kind,
-                              "properties": _restore(props)})
+                              "properties": _restore(props, self._props_dict)})
         res = self._conn.execute(
             "MATCH (a:Node)-[e:EDGE]->(b:Node) WHERE e.semantic_kind IN $kinds "
             "RETURN a.id, b.id, e.kind, e.props", {"kinds": list(accepted)}
@@ -405,7 +429,7 @@ class KuzuGraphIndex:
         while res.has_next():
             src, tgt, kind, props = res.get_next()
             edges.append({"source": src, "target": tgt, "kind": kind,
-                          "properties": _restore(props)})
+                          "properties": _restore(props, self._props_dict)})
         if self._overlay is not None:
             edges.extend(dict(e) for e in self._overlay.derived_edges
                          if e.get("kind") in accepted)

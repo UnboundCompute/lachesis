@@ -25,6 +25,9 @@ Storage contract:
   * ``props`` is deflated UTF-8 JSON in a ``BLOB``, not a ``STRING``. That costs
     readability in a raw Cypher dump and buys the last easy allocation boundary; see
     ``STORE_COMPRESSION_SPEC.md`` 0.2 for why boundaries are the unit of account here.
+    The deflate runs against a preset dictionary built from this store's own most
+    frequent tails and kept in the manifest, so each blob stays independently
+    addressable while still paying only a reference for what every row repeats.
   * one typed rel table per *hot* edge kind (the traversal moat), each just
     ``(FROM Node TO Node, unit STRING, props BLOB)`` — the kind is the table name.
     Per-property typed columns (the spec's ``context_id`` etc.) are a future query
@@ -40,7 +43,10 @@ absent; the writer then raises a clear error.
 """
 from __future__ import annotations
 
+import base64
+import collections
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -125,6 +131,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 #   3 — `props` carries only the tail; the reader unions the promoted columns back in.
 #   4 — six more keys promoted to columns; `props` uses compact JSON separators.
 #   5 — `props` is a deflated BLOB rather than a JSON STRING.
+#   6 — the deflate uses a preset dictionary shared by every row, kept in the manifest.
 # v4 is the first version that is not backward compatible, and the tail-wins rule is why
 # the earlier ones were. Up to v3 the column set was fixed, so a newer reader could read
 # an older store: the older store's `props` was a superset and won on merge. v4 *adds*
@@ -133,7 +140,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 5
+STORE_FORMAT_VERSION = 6
 
 
 def db_file(db_dir: str) -> str:
@@ -180,6 +187,16 @@ def read_store_manifest(db_dir: str) -> dict:
                 "node_count": 0, "edge_count": 0}
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def manifest_props_dictionary(manifest: dict) -> bytes:
+    """The shared deflate dictionary this store's `props` blobs were written against.
+
+    Empty for a store whose tails held nothing worth sharing (a tiny fixture), which is
+    also the plain-deflate path in ``_deflate``, so the empty case needs no branch of
+    its own on either side.
+    """
+    return base64.b64decode(manifest.get(PROPS_DICT_KEY) or "")
 
 
 def manifest_languages(manifest: dict) -> set:
@@ -257,11 +274,17 @@ def _column_faithful(key: str, value) -> bool:
 # this is the one place where general-purpose compression is not already spent.
 _PROPS_ZLIB_LEVEL = 6
 
+# Size of the preset deflate dictionary shared by every `props` blob in the store.
+# 32 KB is deflate's whole window, so a larger one cannot be referenced anyway.
+PROPS_DICT_SIZE = 32 * 1024
 
-def _stored_props(properties: dict, elide: bool,
-                  drop: frozenset = frozenset()) -> bytes:
-    """The `props` blob: the properties a typed column is not already carrying,
-    as deflated UTF-8 JSON."""
+# Manifest key holding that dictionary, base64 of the raw bytes.
+PROPS_DICT_KEY = "props_dict"
+
+
+def _props_text(properties: dict, elide: bool,
+                drop: frozenset = frozenset()) -> bytes:
+    """The properties a typed column is not already carrying, as UTF-8 JSON."""
     properties = properties or {}
     if properties and (elide or drop):
         properties = {
@@ -272,8 +295,51 @@ def _stored_props(properties: dict, elide: bool,
     # Compact separators: `json.dumps` defaults to ", " and ": ", which is two bytes of
     # whitespace per key on every row and nothing else. `json.loads` cannot tell the
     # difference, so this is invisible above the column.
-    text = json.dumps(properties, separators=(",", ":"))
-    return zlib.compress(text.encode("utf-8"), _PROPS_ZLIB_LEVEL)
+    return json.dumps(properties, separators=(",", ":")).encode("utf-8")
+
+
+def _deflate(text: bytes, zdict: bytes = b"") -> bytes:
+    """Deflate one `props` tail, against the store's shared dictionary if it has one."""
+    if not zdict:
+        return zlib.compress(text, _PROPS_ZLIB_LEVEL)
+    obj = zlib.compressobj(_PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
+                           zlib.DEF_MEM_LEVEL, 0, zdict)
+    return obj.compress(text) + obj.flush()
+
+
+def _stored_props(properties: dict, elide: bool,
+                  drop: frozenset = frozenset(), zdict: bytes = b"") -> bytes:
+    """The `props` blob: the tail, as deflated UTF-8 JSON."""
+    return _deflate(_props_text(properties, elide, drop), zdict)
+
+
+def build_props_dictionary(texts: Iterable[bytes]) -> bytes:
+    """A preset deflate dictionary for this store's `props` tails.
+
+    Deflate can only match against the 32 KB behind the byte it is coding, so a blob
+    of a few hundred bytes compresses almost entirely on its own contents and pays for
+    the same key names and the same repeated values on every row. Seeding the window
+    with material shared across rows is what buys cross-row dedup without giving up
+    per-row addressability, which a single concatenated stream would.
+
+    Filled with the most *frequent* whole tails rather than the most frequent tokens:
+    both were measured, and whole values won by a wide margin (the compressed tail
+    lands at 19% of raw against 32%), because a repeated tail then costs a reference
+    rather than a re-encoding. Ordered by frequency and then by value so a rebuild of
+    the same graph produces the same dictionary, byte for byte, and put in *reverse*
+    order because deflate's window looks backwards: the most useful material has to
+    sit at the end, nearest the data.
+    """
+    counts = collections.Counter(texts)
+    parts, total = [], 0
+    for value, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if total + len(value) > PROPS_DICT_SIZE:
+            continue  # skip, don't stop: a later, smaller value may still fit
+        parts.append(value)
+        total += len(value)
+        if total >= PROPS_DICT_SIZE:
+            break
+    return b"".join(reversed(parts))[-PROPS_DICT_SIZE:]
 
 
 def _is_test_file(path: Optional[str]) -> bool:
@@ -378,20 +444,38 @@ def write_kuzu_graph(
     # Bulk `COPY FROM` staged Parquet is the fast path (per-row inserts measured
     # ~9.4 min/package — too slow for whole-repo). When pyarrow is absent we fall
     # back to per-row inserts so the module still works everywhere.
+    # One pre-pass over both sides to build the shared deflate dictionary. It has to
+    # come first, and it has to see nodes *and* edges: the dictionary is a property of
+    # the store, not of a table, and the two sides repeat different material (nodes
+    # repeat `frontend_id`/`language`, edges repeat `relationship_class`/`source_tier`),
+    # so a dictionary built from either alone serves the other poorly. Only the counts
+    # are kept, not the texts, which is why this is cheap enough to pay twice.
+    props_dict = build_props_dictionary(itertools.chain(
+        (_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
+         for n in nodes),
+        (_props_text(e.get("properties") or {}, elide_constants) for e in edges),
+    ))
+
     if pa is not None and pq is not None:
         with tempfile.TemporaryDirectory(prefix="kuzu_stage_") as stage_dir:
-            _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir)
+            _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir,
+                             zdict=props_dict)
             _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
-                             node_units=node_units)
+                             node_units=node_units, zdict=props_dict)
     else:  # pragma: no cover - exercised only without pyarrow
-        _load_nodes_rowwise(conn, nodes, elide=elide_constants)
-        _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units)
+        _load_nodes_rowwise(conn, nodes, elide=elide_constants, zdict=props_dict)
+        _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units,
+                            zdict=props_dict)
     # counts describe what the store actually holds, which is the pruned set, not the
     # composed input — a reader comparing them against a scan should find them equal.
     payload = manifest_payload(graph, snapshots)
     payload["node_count"] = len(nodes)
     payload["edge_count"] = len(edges)
     payload["enriched"] = bool(enriched)
+    # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
+    # rather than a sidecar file because losing it makes every `props` blob in the
+    # store unreadable: it is part of the store, not metadata about it.
+    payload[PROPS_DICT_KEY] = base64.b64encode(props_dict).decode("ascii")
     # The hash describes what was *stored*, so pruning is inside the key: a pruned core
     # and a lossless one are different cores and must not share a derived cache.
     payload["core_content_hash"] = (
@@ -455,7 +539,8 @@ def _str_col(values: list) -> "pa.Array":
     return pa.array([None if v is None else str(v) for v in values], pa.string())
 
 
-def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str) -> None:
+def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
+                     zdict: bytes = b"") -> None:
     if not nodes:
         return
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
@@ -467,7 +552,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str) ->
         data["label"].append(node.get("label"))
         for prop in PROMOTED_NODE_PROPS:
             data[prop].append(_promoted_value(props, prop))
-        data["props"].append(_stored_props(props, elide, _COLUMN_KEYS))
+        data["props"].append(_stored_props(props, elide, _COLUMN_KEYS, zdict))
     table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
                       for c in columns})
     path = os.path.join(stage_dir, "node.parquet")
@@ -476,7 +561,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str) ->
 
 
 def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
-                     node_units: dict) -> None:
+                     node_units: dict, zdict: bytes = b"") -> None:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
     hot: dict[str, dict[str, list]] = {
@@ -489,7 +574,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
         kind = edge.get("kind")
         props = edge.get("properties") or {}
         unit = _edge_unit(edge, node_units)
-        stored = _stored_props(props, elide)
+        stored = _stored_props(props, elide, zdict=zdict)
         if kind in _HOT_SET:
             bucket = hot[kind]
             bucket["src"].append(edge["source"])
@@ -530,7 +615,8 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
 
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
 
-def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool) -> None:
+def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
+                        zdict: bytes = b"") -> None:
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     placeholders = ", ".join(f"{c}: ${c}" for c in columns)
     stmt = f"CREATE (n:Node {{{placeholders}}})"
@@ -542,7 +628,7 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool) -> None:
                       "label": node.get("label")}
             for prop in PROMOTED_NODE_PROPS:
                 params[prop] = _promoted_value(props, prop)
-            params["props"] = _stored_props(props, elide, _COLUMN_KEYS)
+            params["props"] = _stored_props(props, elide, _COLUMN_KEYS, zdict)
             conn.execute(stmt, params)
         conn.execute("COMMIT")
     except Exception:
@@ -550,7 +636,8 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool) -> None:
         raise
 
 
-def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dict) -> None:
+def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dict,
+                        zdict: bytes = b"") -> None:
     hot_stmt = {
         kind: (f"MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
                f"CREATE (a)-[:{kind} {{unit: $unit, props: $props}}]->(b)")
@@ -566,7 +653,7 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
             props = edge.get("properties") or {}
             base = {"s": edge["source"], "t": edge["target"],
                     "unit": _edge_unit(edge, node_units),
-                    "props": _stored_props(props, elide)}
+                    "props": _stored_props(props, elide, zdict=zdict)}
             if kind in _HOT_SET:
                 conn.execute(hot_stmt[kind], base)
             else:

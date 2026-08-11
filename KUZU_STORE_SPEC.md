@@ -153,7 +153,15 @@ own `node_count`/`edge_count`, and two fields that make deferred enrichment poss
 It also carries `version`, the on-disk format. **v2** stores the full properties dict in
 every `props` blob, so the promoted typed columns are duplicates the reader never touches.
 **v3** stores only the tail in `props` and has the reader union the promoted columns back
-in. **v4** promotes six more keys and writes the tail with compact JSON separators.
+in. **v4** promotes six more keys and writes the tail with compact JSON separators. **v5**
+deflates the tail into a `BLOB` rather than storing it as JSON text. **v6** runs that
+deflate against a preset dictionary shared by every row in the store.
+
+That dictionary lives in this manifest, under `props_dict`, base64 of about 32 KB built
+from the store's own most frequent tails. It is part of the store rather than metadata
+about it: without it every `props` blob is unreadable, which is why it does not live in a
+sidecar file. A store whose tails held nothing worth sharing gets an empty dictionary, and
+that is the same code path as plain deflate on both sides.
 
 Up to v3 the column set was fixed, so a newer reader could read an older store: the older
 `props` was a superset and won on merge. v4 adds columns, so its reader selects names the
