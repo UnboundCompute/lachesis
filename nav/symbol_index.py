@@ -105,11 +105,15 @@ _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 # Generic test/spec conventions across languages (no vendor/interface literals):
 #  - JS/TS: *.test.*, *.spec.*, *.integration.*, *.e2e.*, __tests__/, test(s)/
 #  - C/kernel: *_test.c (KUnit), selftests/ and tools/testing/ (kernel test trees).
+#  - Python: pytest's own default globs, test_*.py and conftest.py. The *_test.py
+#    half is already covered by the language-neutral `_test.` alternative.
 # The `(^|/)tests?/` anchor requires a slash before "test", so it does NOT catch
-# "selftests/" — that needs its own alternative.
+# "selftests/" — that needs its own alternative. `test_` is anchored the same way
+# for the same reason: unanchored it would swallow "latest_snapshot.py".
 _TEST_PATH = re.compile(
     r"\.(test|spec)\.|\.integration\.|\.e2e\.|(^|/)__tests__/|(^|/)tests?/|_test\."
-    r"|(^|/)selftests/|(^|/)tools/testing/",
+    r"|(^|/)selftests/|(^|/)tools/testing/"
+    r"|(^|/)test_[^/]*\.py$|(^|/)conftest\.py$",
     re.I)
 
 
