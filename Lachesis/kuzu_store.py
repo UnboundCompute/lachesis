@@ -49,6 +49,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import shutil
 import tempfile
 import zlib
@@ -132,6 +133,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 #   4 — six more keys promoted to columns; `props` uses compact JSON separators.
 #   5 — `props` is a deflated BLOB rather than a JSON STRING.
 #   6 — the deflate uses a preset dictionary shared by every row, kept in the manifest.
+#   7 — the all-distinct id columns are coded against a prefix table in the manifest.
 # v4 is the first version that is not backward compatible, and the tail-wins rule is why
 # the earlier ones were. Up to v3 the column set was fixed, so a newer reader could read
 # an older store: the older store's `props` was a superset and won on merge. v4 *adds*
@@ -140,7 +142,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 6
+STORE_FORMAT_VERSION = 7
 
 
 def db_file(db_dir: str) -> str:
@@ -197,6 +199,16 @@ def manifest_props_dictionary(manifest: dict) -> bytes:
     its own on either side.
     """
     return base64.b64decode(manifest.get(PROPS_DICT_KEY) or "")
+
+
+def manifest_id_prefixes(manifest: dict) -> list:
+    """The prefix table this store's coded id columns were written against.
+
+    Empty for a store whose id columns held nothing prefix-shaped, which is the
+    identity path on both sides — same arrangement as the deflate dictionary above,
+    so neither end needs a branch for the trivial case.
+    """
+    return list(manifest.get(ID_PREFIX_KEY) or ())
 
 
 def manifest_languages(manifest: dict) -> set:
@@ -280,6 +292,108 @@ PROPS_DICT_SIZE = 32 * 1024
 
 # Manifest key holding that dictionary, base64 of the raw bytes.
 PROPS_DICT_KEY = "props_dict"
+
+# Manifest key holding the prefix table the coded id columns are written against.
+ID_PREFIX_KEY = "id_prefixes"
+
+# The columns coded against it: node ids held as an ordinary property. They are the one
+# shape in this store that every other lever misses. Kùzu dictionary-encodes a STRING
+# column by storing each *distinct* value once, which is free and total for a column
+# like `language`; it does nothing at all for a column whose values are all distinct,
+# and on the reference store `compiler_node_id` has 203,367 values and 203,367 distinct
+# ones. What repeats there is not the value but its *prefix* — 24 of them across those
+# 203,367 rows — and a prefix is not something a per-value dictionary can factor out.
+CODED_ID_COLUMNS = ("compiler_node_id",)
+_CODED_SET = frozenset(CODED_ID_COLUMNS)
+
+# A node id: a hierarchical prefix, a colon, then 20 hex characters of content hash.
+# The prefix group is greedy, so the hash is the *last* 20 hex characters and a prefix
+# that itself ends in something hex-shaped is not misread as part of it.
+_ID_SHAPE = re.compile(r"\A(.*):([0-9a-f]{20})\Z", re.DOTALL)
+
+# The two forms a coded value can take, told apart by the first character. Neither is a
+# legal start for a raw id, but the codec does not depend on that: every value goes
+# through one branch or the other, so `decode_id` is total and exactly inverse even for
+# a value that starts with one of these itself.
+_ID_CODED = "~"    # `~<code>:<base64url of the 10 hash bytes>`
+_ID_ESCAPE = "="   # `=<the value verbatim>`, for anything not id-shaped
+
+_CODE_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _prefix_code(index: int) -> str:
+    """A prefix's index as base36 — 1 character for the first 36, 2 for the next 1296."""
+    code = ""
+    while True:
+        code = _CODE_DIGITS[index % 36] + code
+        index //= 36
+        if not index:
+            return code
+
+
+def build_id_prefixes(values: Iterable[object]) -> list:
+    """The distinct id prefixes in this store, as the manifest's code table.
+
+    Sorted so that rebuilding the same graph assigns the same code to the same prefix,
+    byte for byte: a store is a rebuildable artifact and two builds of one graph should
+    differ in no byte at all.
+    """
+    return sorted({match.group(1) for value in values
+                   if type(value) is str
+                   for match in [_ID_SHAPE.match(value)] if match})
+
+
+def encode_id(value: Optional[str], codes: dict) -> Optional[str]:
+    """A node id as it is stored: prefix replaced by its code, hash by raw base64.
+
+    Two independent cuts, both on a value that averages 62 characters. The prefix —
+    `v2:frontend:typescript-compiler-api:<kind>` and 48 others — becomes one or two
+    characters. The 20 hex characters are 10 bytes of content hash spelled at half a
+    byte per character, and base64url spells the same 10 bytes in 14. Together that is
+    62 characters down to about 17.
+
+    Worth doing here and nowhere else because of what the id costs. A column value is
+    charged twice: once in `<col>_data`, which is quantized to a power of two pages and
+    so only pays at a boundary, and again in the primary-key index, which holds the key
+    string itself and — measured, see ``STORE_COMPRESSION_SPEC.md`` — grows at roughly
+    0.31 MB per character of key across a store this size, *linearly*, with no boundary
+    to reach. That second charge is why shortening an id is the only lever here that
+    pays continuously rather than all at once.
+    """
+    if value is None or not codes:
+        return value
+    match = _ID_SHAPE.match(value)
+    code = codes.get(match.group(1)) if match else None
+    if code is None:
+        return _ID_ESCAPE + value
+    packed = base64.urlsafe_b64encode(bytes.fromhex(match.group(2)))
+    # rstrip the padding: 10 bytes is 14 base64 characters plus two `=` that carry no
+    # information, and `decode_id` puts them back.
+    return _ID_CODED + code + ":" + packed.decode("ascii").rstrip("=")
+
+
+def decode_id(value: Optional[str], prefixes: Sequence[str]) -> Optional[str]:
+    """Undo ``encode_id``. Exactly inverse, including for values it did not code."""
+    if value is None or not prefixes:
+        return value
+    if value.startswith(_ID_ESCAPE):
+        return value[1:]
+    code, _, packed = value[1:].partition(":")
+    suffix = base64.urlsafe_b64decode(packed + "==").hex()
+    return f"{prefixes[int(code, 36)]}:{suffix}"
+
+
+def _coded_cell(column: str, value, codes: dict):
+    """A promoted column's value on the way to disk, coded if the column is an id one.
+
+    Coerces to ``str`` first so the coding is total over the column: a non-string here
+    is one ``_column_faithful`` refused, so the real value is still in the ``props``
+    tail and wins on read — but the column still has to hold something ``decode_id``
+    can invert, or reading the column becomes conditional on data it cannot see.
+    """
+    if column not in _CODED_SET or value is None:
+        return value
+    return encode_id(value if type(value) is str else str(value), codes)
 
 
 def _props_text(properties: dict, elide: bool,
@@ -456,14 +570,24 @@ def write_kuzu_graph(
         (_props_text(e.get("properties") or {}, elide_constants) for e in edges),
     ))
 
+    # The other manifest-carried table: the id prefixes the coded columns are written
+    # against. Nodes only — the coded columns are node properties — and the whole table
+    # has to exist before the first row is written, since a code is an index into it.
+    id_prefixes = build_id_prefixes(
+        (n.get("properties") or {}).get(column)
+        for n in nodes for column in CODED_ID_COLUMNS
+    )
+    id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(id_prefixes)}
+
     if pa is not None and pq is not None:
         with tempfile.TemporaryDirectory(prefix="kuzu_stage_") as stage_dir:
             _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir,
-                             zdict=props_dict)
+                             zdict=props_dict, id_codes=id_codes)
             _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
                              node_units=node_units, zdict=props_dict)
     else:  # pragma: no cover - exercised only without pyarrow
-        _load_nodes_rowwise(conn, nodes, elide=elide_constants, zdict=props_dict)
+        _load_nodes_rowwise(conn, nodes, elide=elide_constants, zdict=props_dict,
+                            id_codes=id_codes)
         _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units,
                             zdict=props_dict)
     # counts describe what the store actually holds, which is the pruned set, not the
@@ -476,6 +600,11 @@ def write_kuzu_graph(
     # rather than a sidecar file because losing it makes every `props` blob in the
     # store unreadable: it is part of the store, not metadata about it.
     payload[PROPS_DICT_KEY] = base64.b64encode(props_dict).decode("ascii")
+    # Plain JSON strings, not base64: the prefix table is short, and leaving it legible
+    # means a coded column can be read by hand from a Cypher dump. Same reason as the
+    # dictionary for living here rather than in a sidecar — a code is an index into
+    # this list, so losing it makes every coded value unreadable.
+    payload[ID_PREFIX_KEY] = id_prefixes
     # The hash describes what was *stored*, so pruning is inside the key: a pruned core
     # and a lossless one are different cores and must not share a derived cache.
     payload["core_content_hash"] = (
@@ -540,7 +669,7 @@ def _str_col(values: list) -> "pa.Array":
 
 
 def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
-                     zdict: bytes = b"") -> None:
+                     zdict: bytes = b"", id_codes: Optional[dict] = None) -> None:
     if not nodes:
         return
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
@@ -551,7 +680,8 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
         data["kind"].append(node.get("kind"))
         data["label"].append(node.get("label"))
         for prop in PROMOTED_NODE_PROPS:
-            data[prop].append(_promoted_value(props, prop))
+            data[prop].append(_coded_cell(prop, _promoted_value(props, prop),
+                                          id_codes or {}))
         data["props"].append(_stored_props(props, elide, _COLUMN_KEYS, zdict))
     table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
                       for c in columns})
@@ -616,7 +746,8 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
 
 def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
-                        zdict: bytes = b"") -> None:
+                        zdict: bytes = b"",
+                        id_codes: Optional[dict] = None) -> None:
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     placeholders = ", ".join(f"{c}: ${c}" for c in columns)
     stmt = f"CREATE (n:Node {{{placeholders}}})"
@@ -627,7 +758,8 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
             params = {"id": node["id"], "kind": node.get("kind"),
                       "label": node.get("label")}
             for prop in PROMOTED_NODE_PROPS:
-                params[prop] = _promoted_value(props, prop)
+                params[prop] = _coded_cell(prop, _promoted_value(props, prop),
+                                           id_codes or {})
             params["props"] = _stored_props(props, elide, _COLUMN_KEYS, zdict)
             conn.execute(stmt, params)
         conn.execute("COMMIT")

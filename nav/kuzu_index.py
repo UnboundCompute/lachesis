@@ -32,15 +32,18 @@ from __future__ import annotations
 import json
 import zlib
 from collections import defaultdict
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from Lachesis.core.query import GraphIndex
 from Lachesis.kuzu_store import (
+    CODED_ID_COLUMNS,
     CONSTANT_PROP_DEFAULTS,
     HOT_REL_KINDS,
     PROMOTED_NODE_PROPS,
     _HOT_SET,
     db_file,
+    decode_id,
+    manifest_id_prefixes,
     manifest_props_dictionary,
     read_store_manifest,
 )
@@ -90,9 +93,14 @@ def _restore(props_blob: Optional[bytes], zdict: bytes) -> dict:
 _MERGED_COLUMNS = tuple(c for c in PROMOTED_NODE_PROPS if c != "unit")
 _MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
 
+# Positions in that tuple holding a coded node id, resolved once rather than per row:
+# this runs 244,954 times on a materialize and a set lookup per column per node is not
+# free at that count.
+_CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS) if c in CODED_ID_COLUMNS)
+
 
 def _restore_node_props(columns, props_blob: Optional[bytes],
-                        zdict: bytes) -> dict:
+                        zdict: bytes, prefixes: Sequence[str]) -> dict:
     """Union the promoted columns with the ``props`` tail.
 
     The tail wins on any overlap. Nothing overlaps in a store this version wrote —
@@ -103,9 +111,13 @@ def _restore_node_props(columns, props_blob: Optional[bytes],
     A NULL column is skipped rather than restored as ``None``: SQL NULL means either
     "absent" or "held null", and the writer keeps the held-null ones in the tail
     precisely so this can treat NULL as absent.
+
+    The id columns are stored coded against ``prefixes`` (``kuzu_store.encode_id``) and
+    are decoded on the way out, so the coding is invisible above this function — which
+    is the point of doing it in a column the reader already funnels through here.
     """
-    properties = {name: value
-                  for name, value in zip(_MERGED_COLUMNS, columns)
+    properties = {name: (decode_id(value, prefixes) if i in _CODED_AT else value)
+                  for i, (name, value) in enumerate(zip(_MERGED_COLUMNS, columns))
                   if value is not None}
     properties.update(_restore(props_blob, zdict))
     return properties
@@ -135,7 +147,8 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         nid, kind, label = row[:3]
         nodes.append({"id": nid, "kind": kind, "label": label,
                       "properties": _restore_node_props(row[3:-1], row[-1],
-                                                        index._props_dict)})
+                                                        index._props_dict,
+                                                        index._id_prefixes)})
     edges = []
     for kind in HOT_REL_KINDS:
         res = index._conn.execute(
@@ -230,7 +243,9 @@ class KuzuGraphIndex:
         # store needs it. ``GraphStore.load`` has already checked the format stamp in
         # this same manifest, so a store whose dictionary this reader could not use has
         # been rejected before here.
-        self._props_dict = manifest_props_dictionary(read_store_manifest(db_dir))
+        manifest = read_store_manifest(db_dir)
+        self._props_dict = manifest_props_dictionary(manifest)
+        self._id_prefixes = manifest_id_prefixes(manifest)
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}
@@ -324,7 +339,8 @@ class KuzuGraphIndex:
         if res.has_next():
             row = res.get_next()
             kind, label = row[:2]
-            properties = _restore_node_props(row[2:-1], row[-1], self._props_dict)
+            properties = _restore_node_props(row[2:-1], row[-1], self._props_dict,
+                                             self._id_prefixes)
             if self._overlay is not None:
                 properties.update(self._overlay.node_props.get(node_id) or {})
             node = {"id": node_id, "kind": kind, "label": label,
