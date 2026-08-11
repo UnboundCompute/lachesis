@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import security_weight
+from nav.graphlib import security_weight
 from nav.graph_store import GraphStore
 
 # guard-shaped edge kinds, grouped by the signal they carry.

@@ -10,9 +10,9 @@ Everything an agent needs to reason about a single file, in one graph:
                        that file's L1 instead of inlining a foreign body.
 
 Output is a canonical `{nodes, edges, manifest}` graph; every edge carries a
-`properties.display` verb so `render_graph.py` labels it in plain language.
+`properties.display` verb so a renderer can label it in plain language.
 
-  python3 nav/file_graph.py graph.json --file adapter-slack/src/webhook/verify.ts --out l1.json
+  python3 nav/file_graph.py graph.json --file src/http/webhook.ts --out l1.json
   python3 nav/file_graph.py graph.json --file-id <file-node-id> --out l1.json
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import GraphLib
+from nav.graphlib import GraphLib
 from nav import edge_names
 from nav.symbol_index import _file_provenance, _is_external
 

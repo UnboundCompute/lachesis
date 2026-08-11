@@ -2,13 +2,14 @@
 """Fix 3 — peer differential with guard transitivity (kills the centralized-helper FP).
 
 A sibling family is a set of functions that do the *same job* across parallel
-modules — `deleteTeamsMessage` / `deleteSlackMessage` / `deleteDiscordMessage`.
+modules — `deleteMysqlRecord` / `deletePostgresRecord` / `deleteSqliteRecord`.
 When most of a family guards an operation and one member doesn't, that outlier is a
-strong, structure-derived anomaly (the differential the nereus prior art proved).
+strong, structure-derived anomaly: the family itself supplies the baseline, so no
+rule has to say what "guarded" means for this codebase.
 
-The trap the old sweep fell into is **centralized guards**: a member can look
+The trap a naive sweep falls into is **centralized guards**: a member can look
 unguarded *locally* while its guard lives one hop away in a shared helper
-(`deleteTeamsMessage` → `callTeamsConnectorApi`, which does the auth). Flagging it is
+(`deleteMysqlRecord` → `withMysqlConnection`, which does the auth). Flagging it is
 a false positive. So before flagging, guardedness is resolved **transitively**: a
 member is guarded if it guards locally *or* any callee within a small radius is a
 guard (Fix 2 `class == guard`) or makes a guard-family call (Fix 4 role). A member
@@ -28,8 +29,8 @@ Output is negative-space aware: a flagged outlier is shown *with* the guard its 
 have and it lacks. `--build-overlay` materializes the flag as a first-class
 `UNGUARDED` edge.
 
-  python3 nav/siblings.py graph.json --sym deleteTeamsMessage
-  python3 nav/siblings.py graph.json --sym deleteTeamsMessage --build-overlay
+  python3 nav/siblings.py graph.json --sym deleteMysqlRecord
+  python3 nav/siblings.py graph.json --sym deleteMysqlRecord --build-overlay
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import camel_tokens, segment_tokens
+from nav.graphlib import camel_tokens, segment_tokens
 from nav.graph_store import GraphStore
 from nav.guards import GuardProfiles
 from nav.call_roles import CallRoles, GUARD_FAMILY_ROLES, role_from_name
@@ -53,8 +54,8 @@ GUARD_RADIUS = 2
 def _residual_tokens(entry: dict) -> frozenset[str]:
     """Identifier tokens minus the function's own directory-segment tokens.
 
-    `deleteTeamsMessage` in `adapter-teams/...` -> {delete, message} (the `teams`
-    platform token drops out), so it aligns with `deleteSlackMessage` etc."""
+    `deleteMysqlRecord` in `driver-mysql/...` -> {delete, record} (the `mysql`
+    backend token drops out), so it aligns with `deletePostgresRecord` etc."""
     dir_tokens: set[str] = set()
     for seg in (entry.get("file") or "").split("/")[:-1]:
         dir_tokens |= segment_tokens(seg)

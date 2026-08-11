@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,37 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+# The multi-file TypeScript project the end-to-end tests analyze. Defaults to the
+# fixture corpus shipped in-tree so a fresh clone can run the whole suite; point
+# ARACHNE_CORPUS at any other TypeScript tree to re-run these tests against it.
+CORPUS = Path(os.environ.get(
+    "ARACHNE_CORPUS",
+    ROOT / "Arachne" / "frontends" / "typescript" / "fixtures" / "project",
+))
+requires_corpus = unittest.skipIf(
+    not CORPUS.is_dir(), f"corpus not present at {CORPUS} (set ARACHNE_CORPUS)",
+)
+
+# The shipped corpus is pinned by identity, not by magic totals: the exact files it
+# contributes, the exact functions it declares, and the exact number of calls the
+# frontend recovers from them. A count alone passes when the graph loses one entry
+# and gains another; these sets do not. When ARACHNE_CORPUS points somewhere else
+# the identity assertions are skipped and the structural ones still run.
+CORPUS_IS_FIXTURE = "ARACHNE_CORPUS" not in os.environ
+CORPUS_FILES = {
+    "auth/principal.ts", "data/cache.ts", "data/repository.ts", "http/router.ts",
+    "http/webhook.ts", "index.ts", "regress/backtick-in-regex.ts",
+    "resources/document-service.ts", "resources/invoice-service.ts",
+    "runtime/plugins.ts", "types.ts", "util/ids.ts",
+}
+CORPUS_FUNCTIONS = {
+    "after", "decodeSession", "dispatch", "findById", "get", "getDocument",
+    "getInvoice", "handleWebhook", "isBlank", "loadPlugin", "markHit",
+    "normalizeId", "principalKey", "recall", "remember", "resolvePrincipal",
+    "save", "strip",
+}
+CORPUS_FUNCTION_CALLS = 32
 
 from Arachne.compatibility.file_view import analyze_files, read_file, walk
 from Arachne.compatibility.projector import (
@@ -140,13 +172,15 @@ class CompilerFrontendTests(unittest.TestCase):
         )
         self.assertEqual(("test-routes",), tuple(model.model_id for model in selected))
 
+    @requires_corpus
     def test_cli_canonical_views_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             graph_path = Path(output) / "canonical.json"
             layered_path = Path(output) / "layered"
             self.run_command(
-                sys.executable, "read_files.py", "src", "--taint",
-                "--graph-json", str(graph_path),
+                sys.executable, "Arachne/cli/analyze.py", str(CORPUS), str(graph_path),
+                "--no-kuzu",
+                "--frontend-out", str(Path(output) / "frontends"),
                 "--layered-out", str(layered_path),
             )
             self.assertTrue(graph_path.is_file())
@@ -189,8 +223,9 @@ class CompilerFrontendTests(unittest.TestCase):
                 (ROOT / "Arachne" / "cli" / "query.py").read_text(encoding="utf-8"),
             )
 
+    @requires_corpus
     def test_layered_v2_exposes_cross_tier_navigation(self) -> None:
-        graph, _ = run_project(str(ROOT / "src"))
+        graph, _ = run_project(str(CORPUS))
         layered = build_layered_graph(graph)
         manifest = layered["manifest"]
         self.assertEqual(2, manifest["schema_version"])
@@ -252,8 +287,9 @@ class CompilerFrontendTests(unittest.TestCase):
             for node in paths for step in node["details"]["steps"]
         ))
 
+    @requires_corpus
     def test_reasoning_queries_are_typed_contextual_and_budgeted(self) -> None:
-        graph, _ = run_project(str(ROOT / "src"))
+        graph, _ = run_project(str(CORPUS))
         query = ReasoningQuery(graph)
         manifest = query.overview()["manifest"]
         self.assertEqual(2, manifest["schema_version"])
@@ -308,6 +344,7 @@ class CompilerFrontendTests(unittest.TestCase):
             "via" in record for record in small["sections"]["history"]
         ))
 
+    @requires_corpus
     def test_lightweight_agent_uses_observed_evidence_and_rejects_repeats(self) -> None:
         class Response:
             def __init__(self, data):
@@ -324,7 +361,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 self.requests.append(request)
                 return Response(self.decisions.pop(0))
 
-        graph, _ = run_project(str(ROOT / "src"))
+        graph, _ = run_project(str(CORPUS))
         query = ReasoningQuery(graph)
         function_id = query.find_entity(
             "getDocument", kind="function",
@@ -388,10 +425,11 @@ class CompilerFrontendTests(unittest.TestCase):
             for request in llm.requests
         ))
 
+    @requires_corpus
     def test_typescript_contextual_tokens_and_library_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
-                "node", "Arachne/frontends/typescript/build_graph.mjs", "src", output,
+                "node", "Arachne/frontends/typescript/build_graph.mjs", str(CORPUS), output,
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -932,7 +970,7 @@ class CompilerFrontendTests(unittest.TestCase):
         import sys as _sys
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
-        from tier1_flag.graphlib import GraphLib
+        from nav.graphlib import GraphLib
         from nav.symbol_index import build_index, _resolve, callees
         from nav.file_graph import _find_file_node
         from nav.folder_graph import build_folder_graph
@@ -1013,7 +1051,7 @@ class CompilerFrontendTests(unittest.TestCase):
         import sys as _sys
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
-        from tier1_flag.graphlib import GraphLib
+        from nav.graphlib import GraphLib
         from nav.symbol_index import build_index, _resolve, callers
 
         with tempfile.TemporaryDirectory() as output:
@@ -1060,7 +1098,7 @@ class CompilerFrontendTests(unittest.TestCase):
         import sys as _sys
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
-        from tier1_flag.graphlib import GraphLib
+        from nav.graphlib import GraphLib
         from nav.symbol_index import build_index, _resolve, callers
 
         with tempfile.TemporaryDirectory() as output:
@@ -1103,7 +1141,7 @@ class CompilerFrontendTests(unittest.TestCase):
         import types as _types
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
-        from tier1_flag.graphlib import GraphLib
+        from nav.graphlib import GraphLib
         from nav.graph_store import GraphStore
         from nav.reachability import Reachability
         from nav.hubs import Hubs
@@ -1772,9 +1810,10 @@ class CompilerFrontendTests(unittest.TestCase):
                 len(graph["nodes"]), overview["node_index"]["count"],
             )
 
+    @requires_corpus
     def test_typescript_compiler_facts_feed_semantic_overlays(self) -> None:
         with tempfile.TemporaryDirectory() as output:
-            graph, snapshots = run_project(str(ROOT / "src"), output)
+            graph, snapshots = run_project(str(CORPUS), output)
             files = graph_file_infos(graph)
             snapshot = next(
                 item for item in snapshots
@@ -1791,8 +1830,19 @@ class CompilerFrontendTests(unittest.TestCase):
                     "dynamic_behaviors", "wiring_boundaries",
                 )
             }
-            self.assertEqual(22, totals["functions"])
-            self.assertEqual(74, totals["function_calls"])
+            if CORPUS_IS_FIXTURE:
+                self.assertEqual(CORPUS_FUNCTIONS, {
+                    function["name"]
+                    for info in files for function in info["functions"]
+                })
+                self.assertEqual(CORPUS_FUNCTION_CALLS, totals["function_calls"])
+            callee_names = {
+                call.get("callee") for info in files
+                for call in info["function_calls"]
+            }
+            self.assertLessEqual(
+                {"findById", "principalKey", "decodeSession"}, callee_names,
+            )
             self.assertEqual(0, sum(len(info["unreachable"]) for info in files))
             self.assertTrue(all(
                 function.get("scope_id")
@@ -1908,13 +1958,22 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(tainted["source_id"], witness[0])
             self.assertEqual(tainted["call_id"], witness[-1])
 
+    @requires_corpus
     def test_file_compatibility_view_is_compiler_backed(self) -> None:
-        paths = walk(str(ROOT / "src"))
+        paths = walk(str(CORPUS))
         files = analyze_files(paths)
-        principal = read_file(str(ROOT / "src" / "auth" / "principal.ts"))
-        self.assertEqual(14, len(files))
-        self.assertEqual(22, sum(len(info["functions"]) for info in files))
-        self.assertEqual(74, sum(len(info["function_calls"]) for info in files))
+        principal = read_file(str(CORPUS / "auth" / "principal.ts"))
+        if CORPUS_IS_FIXTURE:
+            self.assertEqual(CORPUS_FILES, {
+                os.path.relpath(info["path"], CORPUS) for info in files
+            })
+            self.assertEqual(CORPUS_FUNCTIONS, {
+                function["name"] for info in files for function in info["functions"]
+            })
+            self.assertEqual(
+                CORPUS_FUNCTION_CALLS,
+                sum(len(info["function_calls"]) for info in files),
+            )
         self.assertEqual(
             {"decodeSession", "resolvePrincipal", "principalKey"},
             {function["name"] for function in principal["functions"]},

@@ -6,7 +6,7 @@ and semantic overlays live in `Arachne/core`, project orchestration lives in
 `Arachne/compatibility` and `Arachne/projections`.
 
 ```sh
-node Arachne/frontends/typescript/build_graph.mjs src graph_out/compiler_layered
+node Arachne/frontends/typescript/build_graph.mjs path/to/source graph_out/compiler_layered
 ```
 
 Run every compiler plugin needed by a mixed-language tree, apply the available
@@ -27,7 +27,7 @@ another installation without changing the repository:
 
 ```sh
 TYPESCRIPT_PATH=/absolute/path/to/typescript \
-  node Arachne/frontends/typescript/build_graph.mjs src graph_out/compiler_layered
+  node Arachne/frontends/typescript/build_graph.mjs path/to/source graph_out/compiler_layered
 ```
 
 It emits `manifest.json` and one JSON file per tier:

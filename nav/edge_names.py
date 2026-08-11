@@ -8,7 +8,7 @@ This module is the single place that turns a canonical edge kind (plus role /
 strings only** — no target/package/vendor literal ever appears here, so the map
 works for any graph the frontends emit.
 
-`display_name(edge)` is what the L0/L1 builders and `render_graph.py` call to
+`display_name(edge)` is what the L0/L1 builders and any renderer call to
 label an edge; `verb(kind, ...)` is the lower-level lookup.
 """
 from __future__ import annotations

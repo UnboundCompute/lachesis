@@ -20,6 +20,38 @@ Arachne's whole point is the dataflow tier, because those are the edges that act
 
 A symbol index cannot give you any of these. They are what let a downstream tool reason about reachability, guard coverage, and tainted flows, rather than just "where does this name appear."
 
+## Quick start
+
+```bash
+git clone https://github.com/UnboundCompute/arachne && cd arachne
+
+python -m pip install --upgrade pip   # editable installs need pip >= 21.3
+pip install -e .          # the graph builder, the nav layer and the MCP server
+npm install               # the TypeScript compiler the TS frontend loads
+```
+
+The base install has **no Python dependencies** — the builder, the JSON store, the
+navigation layer and the MCP server are pure standard library. The embedded Kùzu
+store is opt-in and needs Python 3.10+:
+
+```bash
+pip install -e ".[kuzu]"  # adds kuzu + pyarrow for the columnar store
+```
+
+Then build a graph and ask it questions:
+
+```bash
+arachne-analyze path/to/your/source graph.json   # parse a tree into a layered graph
+arachne-query graph.json overview                # what's in it
+arachne-query graph.json function handleRequest  # a budgeted slice of one function
+arachne-mcp graph.json                           # serve the nav tools over MCP (stdio)
+```
+
+`arachne-analyze` dual-writes by default: `graph.json` plus a sibling `graph.kuzu`
+directory when the `[kuzu]` extra is installed. Pass `--no-kuzu` for JSON only.
+`arachne-mcp` speaks MCP over stdio, so point an MCP-capable client at
+`arachne-mcp /abs/path/to/graph.json` and the navigation tools show up as tools.
+
 ## How it fits together
 
 ```

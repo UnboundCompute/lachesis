@@ -62,7 +62,13 @@ Return only the schema-shaped decision."""
 
 @dataclass
 class AgentRequest:
-    """The subset of the Raven LLMRequest contract required by llmseam clients."""
+    """The request the agent hands its LLM each turn.
+
+    Deliberately minimal and provider-agnostic: a task string, the JSON-ready graph
+    context for this step, an optional JSON Schema the reply must match, and the
+    number of items expected. Pass ``request_factory=`` to ``InvestigationAgent`` to
+    build your provider's own request type from the same four fields instead.
+    """
 
     task: str
     context: dict = field(default_factory=dict)
@@ -267,7 +273,7 @@ class InvestigationAgent:
             )
             try:
                 response = await self.llm.complete(request)
-            except Exception as exc:  # the seam normally absorbs provider failures
+            except Exception as exc:  # a provider adapter normally absorbs its own failures
                 state.status = "LLM_ERROR"
                 state.errors.append({
                     "step": state.step_count + 1,

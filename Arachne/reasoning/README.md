@@ -8,7 +8,7 @@ canonical facts.
 from Arachne.pipeline import run_project
 from Arachne.reasoning import ReasoningQuery
 
-graph, snapshots = run_project("src")
+graph, snapshots = run_project("path/to/source")
 query = ReasoningQuery(graph)
 overview = query.overview()
 matches = query.find_entity("getDocument", kind="function")
@@ -54,15 +54,46 @@ model turn chooses one validated reasoning query or a terminal outcome. Python
 rejects unknown IDs, repeated actions, and confirmed findings whose evidence was
 not observed in a previous slice.
 
-The live CLI uses the repository's `llmseam.py` and emits one JSON investigation:
+The default is eight model calls with a 2,500-token budget for each graph slice.
+Agent slices are capped at 3,000 tokens so state plus observation stays inside a
+typical model context envelope; larger standalone reasoning queries remain
+available. Provider absence is reported as `LLM_UNAVAILABLE`; it does not fall
+back to an unstructured or fabricated investigation.
 
-```sh
-python3 Arachne/cli/investigate.py graph.json --max-steps 8
-python3 Arachne/cli/investigate.py graph.json --focus-id NODE_ID
+### Bring your own provider
+
+Arachne ships no LLM client and depends on no provider SDK. `InvestigationAgent`
+takes any object satisfying a two-method duck type, so you wire it to whatever you
+already use:
+
+```python
+async def complete(request) -> Response
 ```
 
-The default is eight model calls with a 2,500-token budget for each graph slice.
-Agent slices are capped at 3,000 tokens so state plus observation stays inside the
-`llmseam` context envelope; larger standalone reasoning queries remain available.
-Provider absence is reported as `LLM_UNAVAILABLE`; it does not fall back to an
-unstructured or fabricated investigation.
+- `request` is an `AgentRequest` — `task` (str), `context` (dict), `schema`
+  (optional JSON Schema for the expected reply), `max_items` (int). Pass your own
+  `request_factory=` to `InvestigationAgent` if your provider wants a different
+  request object; the agent only constructs it, it never inspects it.
+- The returned object needs `.data` — the parsed reply as a `dict` matching
+  `schema`; anything else ends the loop as `LLM_UNAVAILABLE`, or as
+  `BUDGET_EXHAUSTED_WITH_LEADS` if `.status == "budget"`. It also reads `.status`
+  and `.usage` (a dict), both recorded per step in the investigation output.
+
+That is the entire contract. A minimal adapter:
+
+```python
+class MyProvider:
+    async def complete(self, request):
+        reply = await my_client.json_call(
+            prompt=request.task, context=request.context, schema=request.schema)
+        return SimpleNamespace(data=reply, status="ok", usage={})
+
+from Arachne.reasoning import InvestigationAgent, ReasoningQuery
+
+agent = InvestigationAgent(ReasoningQuery(graph), MyProvider(), max_steps=8)
+investigation = await agent.run(focus_id=None)
+```
+
+`Arachne/frontends/checks.py` drives the agent with a scripted stub of exactly this
+shape, so the contract is exercised by the test suite on every run — no provider
+required.

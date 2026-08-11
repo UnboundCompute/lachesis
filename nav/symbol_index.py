@@ -9,14 +9,14 @@ file's functional view, open the body CFG, list callers, list callees).
 
 Every result carries a `granularity` (folder | file | type | function | method)
 so the caller knows which view a jump lands in, and a real `node_id` so it feeds
-straight into investigate.py --focus-id or render_graph.py --owner.
+straight into the flow view or the reasoning layer as a focus node.
 
 Usage:
   python3 nav/symbol_index.py graph.json --build index.json
-  python3 nav/symbol_index.py graph.json --search readTeams
+  python3 nav/symbol_index.py graph.json --search readWebhook
   python3 nav/symbol_index.py graph.json --search verify --exact
-  python3 nav/symbol_index.py graph.json --refs readTeamsWebhook      # who calls it
-  python3 nav/symbol_index.py graph.json --callees readTeamsWebhook   # what it calls
+  python3 nav/symbol_index.py graph.json --refs readWebhookBody      # who calls it
+  python3 nav/symbol_index.py graph.json --callees readWebhookBody   # what it calls
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import GraphLib, CALLABLE_KINDS
+from nav.graphlib import GraphLib, CALLABLE_KINDS
 
 # node kinds that are addressable jump targets, mapped to a granularity label. Kinds
 # are a normalized cross-language vocabulary, so this is a language-agnostic superset:

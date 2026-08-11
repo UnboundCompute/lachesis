@@ -8,7 +8,7 @@
 
 ## 0. Why (the validated basis — don't re-litigate)
 
-Measured on the `ai` package L graph (the largest single package):
+Measured on a real single-package L graph (the largest package in the reference workload):
 
 | | nodes | edges | on-disk |
 |---|---|---|---|
@@ -51,7 +51,7 @@ Net: this is what makes **whole-repo** graphs viable, which is a *correctness* r
 
 ### Loader / store (`nav/`)
 - `GraphStore` (`nav/graph_store.py:75`); `.load(graph_path, overlay_path)` (`:90`) → `load_graph` (`Arachne/cli/query.py:15`, `json.loads`).
-- In-memory index: `GraphIndex` (`Arachne/core/query.py:8`), wrapped by `GraphLib` (`tier1_flag/graphlib.py:77`). Builds once:
+- In-memory index: `GraphIndex` (`Arachne/core/query.py:8`), wrapped by `GraphLib` (`nav/graphlib.py`). Builds once:
   - `self.nodes = {node["id"]: node}` — **dict by id**
   - `self.outgoing` / `self.incoming` — **adjacency lists** keyed by `edge["source"]` / `edge["target"]` (the core seam Kùzu replaces)
   - secondary: `by_kind`, `by_label`, `by_file`, `by_owner`
@@ -150,7 +150,7 @@ Add a new writer alongside the JSON one — **dual-write during migration**, don
   - **Set `unit`** on every node/edge = the emitting source file (`properties.file`). This is the incremental key (§5).
   - Bulk load via Kùzu **`COPY FROM` staged Parquet** (one typed columnar file per table; endpoint PKs first, then props in table order). This is the perf-critical path: the initial per-row `conn.execute` loader measured **~9.4 min/package** (too slow for whole-repo); the `COPY FROM` rewrite is **~24× faster** (measured). Route each edge to its hot rel table by `kind`, else to `EDGE`.
 
-Acceptance for this step: `ai` graph writes a Kùzu DB dir; **measured DB size = 433 MB (−49% vs 879 MB JSON)** — *not* the earlier ≤~250 MB target, which was too optimistic (the JSON-string props column + page overhead dominate; see §0 correction). Disk is a secondary benefit — the acceptance that matters is the **RAM ceiling removed** (385 MB RSS / 1.6 s open). Node/edge counts match the pruned expectation (246,633 / 495,622).
+Acceptance for this step: the reference graph writes a Kùzu DB dir; **measured DB size = 433 MB (−49% vs 879 MB JSON)** — *not* the earlier ≤~250 MB target, which was too optimistic (the JSON-string props column + page overhead dominate; see §0 correction). Disk is a secondary benefit — the acceptance that matters is the **RAM ceiling removed** (385 MB RSS / 1.6 s open). Node/edge counts match the pruned expectation (246,633 / 495,622).
 
 ---
 
@@ -163,7 +163,7 @@ Acceptance for this step: `ai` graph writes a Kùzu DB dir; **measured DB size =
   - `targets/sources` of given kinds → hot-rel-table query (or `EDGE WHERE kind IN …` for cold);
   - the small secondary maps (`by_kind` etc.) can be materialized once at load from cheap aggregate queries — they're index-shaped, not the whole graph.
 - `GraphStore.load` (`nav/graph_store.py:90`) gains a branch: **if `graph_path` is a Kùzu DB dir → build `KuzuGraphIndex`; else the existing JSON path.** `GraphStore`/`GraphLib`'s public surface is unchanged, so `mcp_server.py` and every tool are untouched.
-- **`Reachability` stays byte-for-byte.** Its `_build` (`nav/reachability.py:76`) pulls the `FLOW_EDGE_KINDS` adjacency once — back that single build with **one Kùzu query** returning all `VALUE_FLOWS_TO` + `POINTS_TO` edges (`source, target, context_id`) into the existing in-memory adjacency dicts. The context-sensitive `_walk`, push/pop, and alias-via-heap bridging then run **exactly as today** over that adjacency. The flow subgraph is small (~105K edges on `ai`), so materializing it on demand is cheap and preserves behavior precisely. Kùzu removes the RAM ceiling for the *full* node/edge set; the BFS only ever holds the flow slice.
+- **`Reachability` stays byte-for-byte.** Its `_build` (`nav/reachability.py:76`) pulls the `FLOW_EDGE_KINDS` adjacency once — back that single build with **one Kùzu query** returning all `VALUE_FLOWS_TO` + `POINTS_TO` edges (`source, target, context_id`) into the existing in-memory adjacency dicts. The context-sensitive `_walk`, push/pop, and alias-via-heap bridging then run **exactly as today** over that adjacency. The flow subgraph is small (~105K edges on the reference graph), so materializing it on demand is cheap and preserves behavior precisely. Kùzu removes the RAM ceiling for the *full* node/edge set; the BFS only ever holds the flow slice.
 
 This is the whole reason the port is safe: the expensive-but-correct traversal logic never touches Cypher; only the bulk store and the single-hop index lookups move.
 
@@ -171,7 +171,7 @@ This is the whole reason the port is safe: the expensive-but-correct traversal l
 
 ## 5. Incremental update
 
-**Goal:** re-analyze a changed file in seconds instead of rebuilding the whole graph — this is what turns the engine from point-in-time into **continuous** (re-hunt on every commit/PR), which is both where the market is and the data pump for the exploit corpus.
+**Goal:** re-analyze a changed file in seconds instead of rebuilding the whole graph — this is what turns the engine from point-in-time into **continuous**, so it can re-analyze on every commit or PR instead of on demand.
 
 **Unit key:** `unit` column = source file rel path. All nodes/edges from parsing file F carry `unit = F`.
 
@@ -200,7 +200,7 @@ An edge F→G (e.g. `CALLS` into a symbol defined in G) is emitted while parsing
 1. `Arachne/kuzu_store.py` writer + prune + dual-write behind a flag. JSON writer untouched. **Commit.**
    *(Done — writer uses `COPY FROM` staged Parquet, ~24× faster than the initial per-row loader; also carries the `unit` incremental key on every node/edge.)*
 2. `KuzuGraphIndex` + `GraphStore.load` branch. `Reachability` unchanged, flow-subgraph sourced from one Kùzu query. **Commit.**
-3. **Parity harness** (`tests/`): run all nav tools (`hubs`/`search`/`callers`/`callees`/`read_body`/`open_file`/`open_folder`/`flow`/`reaches`/`sources_of`/`points_to`/`aliases`) against JSON-backed vs Kùzu-backed store on the `ai` graph; assert **identical** results (modulo the deliberate Lever-A prune — run parity with prune OFF first, then confirm the pruned graph still answers the nav set). **Commit.**
+3. **Parity harness** (`tests/`): run all nav tools (`hubs`/`search`/`callers`/`callees`/`read_body`/`open_file`/`open_folder`/`flow`/`reaches`/`sources_of`/`points_to`/`aliases`) against JSON-backed vs Kùzu-backed store on the reference graph; assert **identical** results (modulo the deliberate Lever-A prune — run parity with prune OFF first, then confirm the pruned graph still answers the nav set). **Commit.**
 4. Incremental v1 (per-package unit swap + `unit→content_hash` manifest + dangling sweep). **Commit.**
 5. Flip nav default to Kùzu; keep JSON export behind a debug flag. **Commit.**
 6. (Later) Incremental v2 (file + importers).
@@ -209,11 +209,11 @@ An edge F→G (e.g. `CALLS` into a symbol defined in G) is emitted while parsing
 
 ## 7. Acceptance criteria / benchmarks
 
-- **Size:** `ai` Kùzu DB **measured 433 MB (−49% vs 879 MB JSON)** — disk is a secondary benefit, not the ceiling (the earlier ≤~250 MB target was too optimistic; see §0). Report actual on re-measure.
+- **Size:** the reference Kùzu DB **measured 433 MB (−49% vs 879 MB JSON)** — disk is a secondary benefit, not the ceiling (the earlier ≤~250 MB target was too optimistic; see §0). Report actual on re-measure.
 - **RAM:** nav server opens whole-repo graph without loading it all into memory; RSS bounded well under the old 16 GB ceiling.
 - **Load:** open DB + build the small secondary maps in < a few seconds; no 124 s full-JSON parse.
-- **Parity:** 100% identical nav results vs JSON on `ai` for the full tool set (prune-off), and the pruned graph answers the nav set intact (already PoC-verified for hubs/search/callers/callees/read_body).
-- **Whole-repo:** the multi-package graph (9-package scope, then full repo) opens and serves without OOM — the thing that's impossible today.
+- **Parity:** 100% identical nav results vs JSON on the reference graph for the full tool set (prune-off), and the pruned graph answers the nav set intact (already PoC-verified for hubs/search/callers/callees/read_body).
+- **Whole-repo:** the multi-package graph (a several-package scope first, then the full repo) opens and serves without OOM — the thing that's impossible today.
 - **Incremental:** re-ingest one changed package in seconds; dangling-edge sweep clean.
 
 ---

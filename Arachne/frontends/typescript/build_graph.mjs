@@ -7,12 +7,11 @@
  * five-tier, LLM-drillable shape.
  *
  * Usage:
- *   node Arachne/frontends/typescript/build_graph.mjs [SRC_DIR] [OUT_DIR]
+ *   node Arachne/frontends/typescript/build_graph.mjs SRC_DIR [OUT_DIR]
  *
  * TypeScript lookup order:
  *   1. TYPESCRIPT_PATH=/path/to/typescript (package directory or JS entrypoint)
- *   2. a normal local `typescript` dependency
- *   3. the existing raven4/nereus TypeScript frontend dependency
+ *   2. a normal local `typescript` dependency (`npm install` at the repo root)
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -27,9 +26,6 @@ function loadTypeScript() {
   const candidates = [];
   if (process.env.TYPESCRIPT_PATH) candidates.push(process.env.TYPESCRIPT_PATH);
   candidates.push("typescript");
-  candidates.push(
-    path.resolve(scriptDir, "../../../../nereus/v3/ts_frontend/node_modules/typescript"),
-  );
   const failures = [];
   for (const candidate of candidates) {
     try {
@@ -39,7 +35,8 @@ function loadTypeScript() {
     }
   }
   throw new Error(
-    "Unable to load TypeScript. Install it locally or set TYPESCRIPT_PATH.\n" +
+    "Unable to load TypeScript. Run `npm install` at the repo root, or set " +
+      "TYPESCRIPT_PATH to a TypeScript package directory.\n" +
       failures.join("\n"),
   );
 }
@@ -47,7 +44,12 @@ function loadTypeScript() {
 const { ts, loadedFrom } = loadTypeScript();
 const FRONTEND_ID = "typescript-compiler-api";
 const CONTRACT_VERSION = 2;
-const sourceDir = path.resolve(process.argv[2] || "src");
+if (!process.argv[2]) {
+  throw new Error(
+    "Usage: node Arachne/frontends/typescript/build_graph.mjs SRC_DIR [OUT_DIR]",
+  );
+}
+const sourceDir = path.resolve(process.argv[2]);
 const outputDir = path.resolve(
   process.argv[3] || "graph_out/compiler_layered",
 );

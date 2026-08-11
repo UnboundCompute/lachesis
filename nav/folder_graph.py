@@ -6,12 +6,12 @@ from file path strings; the file->function containment the graph also lacks a li
 edge for is recovered by grouping declaration nodes on their `file` property (the
 one mechanism that covers every function/method/class, not just top-level ones).
 
-Output is a canonical `{nodes, edges, manifest}` graph so `render_graph.py` draws
+Output is a canonical `{nodes, edges, manifest}` graph so any renderer can draw
 it unchanged — every edge carries a `properties.display` verb (contains / declares)
 so it reads like a sentence.
 
   python3 nav/folder_graph.py graph.json --out l0.json
-  python3 nav/folder_graph.py graph.json --root adapter-slack --files-only --out l0.json
+  python3 nav/folder_graph.py graph.json --root src/resources --files-only --out l0.json
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import GraphLib
+from nav.graphlib import GraphLib
 from nav import edge_names
 from nav.file_graph import _norm, file_node_keys
 from nav.symbol_index import _file_provenance, _is_external

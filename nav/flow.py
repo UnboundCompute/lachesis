@@ -4,19 +4,17 @@
 This is the seam that makes L0–L3 a *free-traversal* graph rather than a fixed
 drill-down. Search a name, land on a node, and get back:
   * a small **named-edge neighborhood** (its file, who calls it, what it calls) —
-    "the graph flow, with the edges named", ready for `render_graph.py`; and
+    "the graph flow, with the edges named"; and
   * an explicit **move list** — the concrete next hops available from here
-    (open the folder = L0, open the file = L1, open the body CFG = L2, list
-    callers / callees, jump through a stub, open the proof = L3). The agent may
-    take any move in any order (L1→L1→L3→L2 is legal); nothing forces a hierarchy.
+    (open the folder = L0, open the file = L1, list callers / callees, jump
+    through a stub). The agent may take any move in any order (L1→L1→L0 is
+    legal); nothing forces a hierarchy.
 
-L2 (body) and L3 (proof) are **adapters** — flow.py hands back the exact command
-that drives the already-built machinery (`render_graph.py --owner`, the T4 proof
-tier), it does not re-derive them.
+Each move is an **adapter** — flow.py hands back the exact command that drives
+the already-built machinery, it does not re-derive it.
 
-  python3 nav/flow.py graph.json --find verifySlackSignature
-  python3 nav/flow.py graph.json --find verifySlackSignature --render flow.html
-  python3 nav/flow.py graph.json --find verifySlackSignature --json
+  python3 nav/flow.py graph.json --find handleRequest
+  python3 nav/flow.py graph.json --find handleRequest --json
 """
 from __future__ import annotations
 
@@ -27,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import GraphLib
+from nav.graphlib import GraphLib
 from nav import edge_names
 from nav import symbol_index as si
 
@@ -61,11 +59,6 @@ def moves_for(gl: GraphLib, graph_path: str, entry: dict) -> list[dict]:
             })
     if granularity in ("function", "method"):
         moves.append({
-            "move": "open_body", "level": "L2",
-            "why": "open this function's control-flow (body) graph",
-            "cmd": f"python3 tier1_flag/render_graph.py {graph_path} --owner {node_id} --out body.html",
-        })
-        moves.append({
             "move": "callers", "level": "L1",
             "why": "who calls this — reverse-jump to call sites",
             "cmd": f"python3 nav/symbol_index.py {graph_path} --refs {name}",
@@ -76,9 +69,9 @@ def moves_for(gl: GraphLib, graph_path: str, entry: dict) -> list[dict]:
             "cmd": f"python3 nav/symbol_index.py {graph_path} --callees {name}",
         })
         moves.append({
-            "move": "open_proof", "level": "L3",
-            "why": "hand this node to the proof/investigation tier (held = T4)",
-            "cmd": f"python3 Arachne/cli/investigate.py {graph_path} --focus-id {node_id}",
+            "move": "guard_differential", "level": "L1",
+            "why": "compare this against its sibling functions — who guards, who does not",
+            "cmd": f"python3 nav/siblings.py {graph_path} --sym {name}",
         })
     return moves
 
@@ -136,8 +129,6 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("graph")
     p.add_argument("--find", metavar="NAME", required=True,
                    help="resolve a name and show its flow + available moves")
-    p.add_argument("--render", metavar="OUT.html",
-                   help="also render the named-edge neighborhood graph here")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     p.add_argument("--limit", type=int, default=5, help="max name candidates to consider")
     return p
@@ -166,13 +157,6 @@ def main(argv: list[str]) -> int:
     entry = hits[0]
     hood = neighborhood(gl, entry)
     moves = moves_for(gl, args.graph, entry)
-
-    if args.render:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tier1_flag"))
-        import render_graph
-        tmp = Path(args.render).with_suffix(".flow.json")
-        tmp.write_text(json.dumps(hood, ensure_ascii=False), encoding="utf-8")
-        render_graph.main([str(tmp), "--out", args.render])
 
     if args.json:
         print(json.dumps({"resolved": entry, "flow": hood, "moves": moves},

@@ -1,0 +1,9 @@
+{
+  "name": "arachne-fixture-project",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "tiny-store": "1.0.0"
+  }
+}

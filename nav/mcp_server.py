@@ -3,9 +3,10 @@
 
 This is the last piece: it wraps the *already-proven* reasoning library (graph_store,
 reachability, guards, call_roles, siblings) as MCP tools so an agent can navigate and
-reason over the canonical Arachne graph directly. No SDK, no new dependency — the same
-hand-rolled stdio JSON-RPC loop shrude-memory uses (stdout = protocol channel, all logs
-to stderr).
+reason over the canonical Arachne graph directly. No SDK, no new dependency — just a
+hand-rolled stdio JSON-RPC loop, with the usual discipline that makes that safe
+(stdout is the protocol channel and carries nothing but JSON-RPC; all logs go to
+stderr).
 
 The graph + sidecar overlay load **once** at startup; every tool is then O(neighbors),
 not a re-parse. Each reasoning tool returns the shared `path_shape` envelope (nodes

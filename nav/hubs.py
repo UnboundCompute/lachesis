@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tier1_flag.graphlib import GraphLib, CALLABLE_KINDS
+from nav.graphlib import GraphLib, CALLABLE_KINDS
 from nav.symbol_index import (
     CALL_EDGES, INDIRECT_CALL_EDGES, _caller_decl, _file_provenance, _is_external,
 )

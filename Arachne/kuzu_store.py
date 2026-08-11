@@ -34,7 +34,7 @@ Storage contract (kept deliberately simple for v1 correctness + parity):
     (``properties.via`` for ``EXPANDS_TO``, else ``kind``) so the read side can match on
     the semantic kind without parsing JSON in Cypher.
 
-``import kuzu`` is deferred so this module imports under the repo's Python 3.9 (Kùzu needs
+``import kuzu`` is deferred so this module imports under Python 3.9 (Kùzu needs
 3.10+); the writer raises a clear error if kuzu is missing.
 """
 from __future__ import annotations

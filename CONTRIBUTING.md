@@ -11,13 +11,30 @@ Thanks for your interest in Arachne. Contributions are welcome, whether that is 
 ## Getting started
 
 1. Fork the repo and create a branch off `main`.
-2. Make your change, with tests where it makes sense.
-3. Run the parity and checks suite before you open a PR:
+2. Install it. The base install is pure-stdlib; the TypeScript frontend shells out to
+   the real compiler, so it needs the npm dev dependency:
+   ```
+   pip install -e ".[dev]"
+   npm install
+   ```
+   Add the `kuzu` extra (`pip install -e ".[kuzu,dev]"`) on Python 3.10+ if you want
+   the columnar store, and the parity test that covers it, to actually run.
+3. Make your change, with tests where it makes sense.
+4. Run the parity and checks suite before you open a PR:
    ```
    python3 -m pytest Arachne/frontends/checks.py
    ```
    The graph has to stay at byte-identical parity between the JSON and Kùzu backends for the navigation and MCP tools, and the checks suite enforces that. If your change touches the store or the nav layer, make sure that test still passes.
-4. Open a pull request that says what changed, why, and how you verified it.
+
+   The end-to-end tests analyze the fixture corpus at
+   `Arachne/frontends/typescript/fixtures/project/`. It is deliberately small — a
+   dozen files — and it exercises the same code paths as a production codebase
+   (public parameter to repository lookup, a guarded/unguarded sibling pair, a
+   dynamic-code frontier, a route registration) without the same scale. Point
+   `ARACHNE_CORPUS` at a larger TypeScript tree to re-run the same tests against it;
+   the assertions that pin the fixture's exact file and function sets step aside
+   automatically, and the structural ones still run.
+5. Open a pull request that says what changed, why, and how you verified it.
 
 ## What makes a good contribution
 

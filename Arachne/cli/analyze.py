@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from Arachne.pipeline import (
     run_project, run_project_incremental, write_project_graph,
 )
+from Arachne.projections import build_layered_graph, write_layered_graph
 
 
 def main() -> None:
@@ -33,6 +34,12 @@ def main() -> None:
         help="skip the Kùzu store (JSON only). Nav then serves from the JSON graph.",
     )
     parser.add_argument(
+        "--layered-out", metavar="DIR", default=None,
+        help="also write the layered-v2 projection here: one file per tier (T0-T4) "
+             "plus node_index.json and manifest.json. This is the progressive, "
+             "LLM-drillable view of the same canonical graph.",
+    )
+    parser.add_argument(
         "--incremental", action="store_true",
         help="reuse each frontend's prior on-disk bundle (under --frontend-out) when "
              "none of its source files changed, recompiling only the ones that did; "
@@ -44,6 +51,9 @@ def main() -> None:
     else:
         graph, snapshots = run_project(args.source_dir, args.frontend_out)
     written = write_project_graph(graph, snapshots, args.output_path)
+    if args.layered_out:
+        layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)
+        print(f"Layered projection: {len(layered_files)} files in {args.layered_out}")
     # Dual-write by default: the JSON stays the canonical artifact (and the
     # ARACHNE_FORCE_JSON fallback), while the sibling Kùzu store becomes the
     # low-RAM default nav serves from. Best-effort — a 3.9 env without kuzu still

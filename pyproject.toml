@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arachne-cpg"
+version = "0.1.0"
+description = "A compiler-precise code property graph with an embedded columnar store and a navigation layer for security reasoning over source code."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Riyan Dhiman" }]
+keywords = [
+    "code-property-graph", "static-analysis", "dataflow", "taint-analysis",
+    "kuzu", "mcp", "program-analysis",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+]
+
+# No runtime dependencies on purpose. The graph builder, the JSON store, the nav
+# layer and the MCP server are pure standard library; `kuzu`/`pyarrow` are guarded
+# optional imports with JSON fallbacks. Keep it that way (see CONTRIBUTING.md).
+dependencies = []
+
+[project.optional-dependencies]
+# The embedded columnar store. Kùzu needs Python 3.10+; without this extra
+# Arachne writes and reads the JSON graph instead. Floors track the current
+# releases the parity suite is verified against (kuzu 0.11.x, pyarrow 25.x).
+kuzu = ["kuzu>=0.11", "pyarrow>=17"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+arachne-analyze = "Arachne.cli.analyze:main"
+arachne-query = "Arachne.cli.query:main"
+arachne-mcp = "nav.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/UnboundCompute/arachne"
+Source = "https://github.com/UnboundCompute/arachne"
+
+[tool.setuptools.packages.find]
+include = ["Arachne*", "nav*"]
+
+[tool.setuptools.package-data]
+# The TypeScript frontend is a Node script, the frontends declare capabilities in
+# JSON, and the test suite runs against the shipped fixture trees.
+"Arachne.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*"]
+"Arachne.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
+"Arachne.core" = ["*.json"]
+
+[tool.pytest.ini_options]
+python_files = ["checks.py", "test_*.py"]

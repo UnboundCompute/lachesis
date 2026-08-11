@@ -21,7 +21,7 @@ Query scoping by `owner_function_id` (`scope_owner`) gives cheap function-local
 slices without a re-parse.
 
   python3 nav/graph_store.py graph.json --stat
-  python3 nav/graph_store.py graph.json --resolve verifySlackSignature
+  python3 nav/graph_store.py graph.json --resolve verifySignature
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from Arachne.cli.query import load_graph
-from tier1_flag.graphlib import GraphLib
+from nav.graphlib import GraphLib
 from nav import symbol_index as si
 from nav.overlay import Overlay, sidecar_path
 

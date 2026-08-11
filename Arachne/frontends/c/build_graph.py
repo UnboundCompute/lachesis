@@ -509,7 +509,10 @@ class AstStore:
 
 
 def main() -> int:
-    source_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "src").resolve()
+    if len(sys.argv) < 2:
+        raise SystemExit(
+            "Usage: python3 Arachne/frontends/c/build_graph.py SRC_DIR [OUT_DIR]")
+    source_dir = Path(sys.argv[1]).resolve()
     output_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "graph_out/clang_layered").resolve()
     files = walk(source_dir)
     translation_units = [path for path in files if path.suffix.lower() == ".c"]

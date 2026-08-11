@@ -14,7 +14,7 @@ Shape on disk::
 
     {
       "overlay_id": "nav-reasoning",
-      "source": "webhook_graph.json",
+      "source": "graph.json",
       "node_props": { "<node id>": { "guard_signal": {...} }, ... },
       "edge_props": { "<edge key>": { "role": "verify" }, ... },
       "derived_edges": [ { "source","target","kind","properties" }, ... ],
