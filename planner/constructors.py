@@ -43,8 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nav.graph_store import GraphStore
 from nav.siblings import SiblingDiff
 from planner import capsule as cap
-from planner.dominance import (CALL_DEPTH, COMPLETENESS_OPAQUE, Dominance,
-                               STATE_PRESERVED)
+from planner.dominance import (CALL_DEPTH, COMPLETENESS_OPAQUE,
+                               COMPLETENESS_PARTIAL, Dominance, STATE_PRESERVED)
 from planner.entrypoints import EntryPoints
 from planner.guard_recognition import GuardSet
 from planner.rank import ranked
@@ -111,6 +111,7 @@ class GuardDifferential:
                                    entry_points=self.entry_points)
         self.siblings = SiblingDiff(store)
         self._effects: dict[str, list[dict]] | None = None
+        self._effect_sites: dict[str, str] = {}
         self._inputs: dict[str, list[dict]] | None = None
         self._entry_by_id: dict[str, dict] | None = None
         self._peer: dict[str, dict | None] = {}
@@ -142,6 +143,10 @@ class GuardDifferential:
                     "kind": kind, "file": file, "line": line,
                     "confidence": props.get("confidence") or "conservative",
                 })
+                # kept beside the effect rather than on them: the capsule's
+                # `sensitive_effect` is a closed shape, and A2 needs the call site
+                # to ask whether a guard dominates *this* effect.
+                self._effect_sites[sink["id"]] = callsite["id"]
             self._effects = index
         return self._effects
 
@@ -261,10 +266,11 @@ class GuardDifferential:
         if not suppressed:
             for note, names in sorted(by_reason.items()):
                 uncertainty.append(f"{', '.join(sorted(names))}: {note}")
-        if suppressed:
+        if suppressed and verdict["completeness"] == COMPLETENESS_PARTIAL:
             uncertainty.append(
                 "the guard is present on the call path; whether it dominates every "
-                "branch inside its host is not decided until CFG dominance lands")
+                "branch inside its host was not decidable from the regions the "
+                "graph carries")
 
         verb = _EFFECT_VERB.get(effect["kind"], "reach")
         claim = {
@@ -342,9 +348,12 @@ class GuardDifferential:
                 inert += 1
                 continue
             for effect_fn_id in reached:
-                verdict = self.dominance.verdict(handler_id, effect_fn_id,
-                                                 depth=self.depth)
                 for effect in effects[effect_fn_id]:
+                    # per effect, not per effect function: whether a guard dominates
+                    # depends on where in the host this particular call sits.
+                    verdict = self.dominance.verdict(
+                        handler_id, effect_fn_id, depth=self.depth,
+                        effect_site_id=self._effect_sites.get(effect["node_id"]))
                     capsule = self._capsule(anchor, handler, effect_fn_id, effect,
                                             verdict, declarative)
                     if capsule["state"] == STATE_PRESERVED:

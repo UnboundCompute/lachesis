@@ -34,7 +34,10 @@ GOLDEN = ROOT / "planner" / "fixtures" / "capsule_golden.json"
 from nav.graph_store import GraphStore
 from planner import capsule as cap
 from planner.constructors import GuardDifferential
-from planner.dominance import STATE_PRESERVED, STATE_UNPROVEN
+from planner.dominance import (
+    COMPLETENESS_DETERMINISTIC, ConditionalRegions, SKIPPABLE,
+    STATE_PRESERVED, STATE_UNPROVEN, UNDECIDED,
+)
 from planner.rank import ranked, score
 
 
@@ -84,7 +87,8 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "renameRecord",
                                     "deleteRecord", "touchRecord", "exportRecords",
                                     "importRecord", "submitRecord",
-                                    "cleanupRecord", "dropRecord", "wipeRecord"})
+                                    "cleanupRecord", "dropRecord", "wipeRecord",
+                                    "pruneRecord", "sealRecord"})
 
     def test_implementation_is_anchored_at_its_registered_wrapper(self):
         # archiveRecordRow is never registered; the route reaches it through
@@ -223,6 +227,56 @@ class PlannerTests(unittest.TestCase):
                              "input validation is not authorization")
             self.assertTrue(any("authorization" in note
                                 for note in capsule["uncertainty"]))
+
+    # -- A2, does the guard dominate inside its host --------------------------
+
+    def test_a_dominating_guard_upgrades_the_suppression(self):
+        # checkPermission runs unconditionally before the call that carries the
+        # effect, so nothing about this host's branching is left to assume.
+        suppressed = [c for c in self.result["suppressions"]
+                      if c["entrypoint"]["symbol"] == "archiveRecord"]
+        self.assertTrue(suppressed, "the guarded handler produced no suppression")
+        for capsule in suppressed:
+            self.assertEqual(capsule["completeness"], COMPLETENESS_DETERMINISTIC)
+            self.assertEqual(capsule["uncertainty"], [])
+
+    def test_a_guard_inside_a_branch_the_effect_is_not_in_withdraws(self):
+        # `if (req.userId) checkPermission(...)` then delete outside the branch: a
+        # caller with no userId skips the check and still deletes. Suppressing
+        # this is the missed bug A2 exists to prevent.
+        queued = [c for c in self.result["queue"]
+                  if c["entrypoint"]["symbol"] == "pruneRecord"]
+        self.assertTrue(queued, "a skippable guard still suppressed the candidate")
+        for capsule in queued:
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            self.assertFalse(any(g["dominates"] for g in capsule["guards_present"]))
+            self.assertTrue(
+                any("conditional region" in note for note in capsule["uncertainty"]),
+                "the region that makes the guard skippable must be named")
+
+    def test_a_guard_that_runs_after_the_effect_withdraws(self):
+        # Order is the other half of dominance. The guard is on the path, is
+        # authorization, and protects nothing because the effect already happened.
+        queued = [c for c in self.result["queue"]
+                  if c["entrypoint"]["symbol"] == "sealRecord"]
+        self.assertTrue(queued, "a guard called after the effect still suppressed")
+        for capsule in queued:
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            self.assertTrue(
+                any("after the effect" in note for note in capsule["uncertainty"]),
+                "the ordering that makes the guard useless must reach the consumer")
+
+    def test_an_undecidable_position_is_neither_upgraded_nor_withdrawn(self):
+        # A span the graph does not carry is the third answer, and it has to stay
+        # the third answer: no upgrade, and no withdrawal either.
+        regions = ConditionalRegions(self.store)
+        host = self.function_id("pruneRecord")
+        answer, why = regions.relation(host, None, ("a.ts", 10, 20))
+        self.assertEqual((answer, why), (UNDECIDED, None))
+        # and a guard in a file the effect is not in is undecidable too
+        answer, _ = regions.relation(host, ("a.ts", 1, 2), ("b.ts", 1, 2))
+        self.assertEqual(answer, UNDECIDED)
+        self.assertNotEqual(answer, SKIPPABLE)
 
     # -- the sink catalog ------------------------------------------------------
 

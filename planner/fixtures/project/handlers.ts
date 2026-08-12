@@ -93,6 +93,30 @@ function executeRecordCleanup(recordId: string): string {
   return "cleaned";
 }
 
+// The guard is real, is authorization, and is inside a branch the effect is not
+// in: a caller with no `req.userId` skips the check entirely and still deletes.
+// Suppressing this is the missed bug A2 exists to prevent.
+export function pruneRecord(req: Request): string {
+  if (req.userId) {
+    checkPermission(req.userId, "prune-record");
+  }
+  store.deleteMany(req.recordId);
+  return "pruned";
+}
+
+// The guard is on the path and runs after the effect it would have to protect.
+// Order is the other half of dominance, and this one fails it.
+export function sealRecord(req: Request): string {
+  const sealed = sealRecordRow(req.recordId);
+  checkPermission(req.userId, "seal-record");
+  return sealed;
+}
+
+function sealRecordRow(recordId: string): string {
+  store.deleteMany(recordId);
+  return "sealed";
+}
+
 function validateRecordId(recordId: string): void {
   if (!recordId) {
     throw new Error("bad request");
