@@ -1,0 +1,140 @@
+{
+  "id": "cap_9dc95ae7cec04de9",
+  "schema_version": 1,
+  "constructor": "GUARD_DIFFERENTIAL",
+  "claim": {
+    "subject": "anonymous_caller",
+    "action": "delete",
+    "object": "User",
+    "constraint": "without an authorization check on the call path"
+  },
+  "entrypoint": {
+    "node_id": "v2:frontend:typescript-compiler-api:method:bfd41807c179bda1dd5b",
+    "symbol": "deleteUser",
+    "file": "meteor-methods/users/deleteUser.ts",
+    "line": 49,
+    "how": "callback-registration",
+    "anchor": null
+  },
+  "attacker_inputs": [],
+  "sensitive_effect": {
+    "node_id": "v2:frontend:typescript-compiler-api:function:5d696bdaa671d035fbb8",
+    "symbol": "deleteUser",
+    "kind": "database",
+    "file": "lib/users/deleteUser.ts",
+    "line": 34,
+    "confidence": "medium"
+  },
+  "dataflow": [
+    "deleteUser (meteor-methods/users/deleteUser.ts:49)",
+    "executeDeleteUser (meteor-methods/users/deleteUser.ts:18)",
+    "deleteUser (lib/users/deleteUser.ts:34)"
+  ],
+  "guards_present": [
+    {
+      "predicate": "hasPermissionAsync",
+      "dominates": true,
+      "how": "named",
+      "node_id": "v2:frontend:typescript-compiler-api:function:78a01ff1ce8d0a702e6a",
+      "host": "deleteUser",
+      "file": "lib/authorization/hasPermission.ts",
+      "line": 15,
+      "confidence": "medium"
+    },
+    {
+      "predicate": "deleteUser",
+      "dominates": true,
+      "how": "structural",
+      "node_id": "v2:frontend:typescript-compiler-api:method:bfd41807c179bda1dd5b",
+      "host": "deleteUser",
+      "file": "meteor-methods/users/deleteUser.ts",
+      "line": 49,
+      "confidence": "medium"
+    },
+    {
+      "predicate": "executeDeleteUser",
+      "dominates": true,
+      "how": "structural",
+      "node_id": "v2:frontend:typescript-compiler-api:function:afae0b9f3b771b304b46",
+      "host": "executeDeleteUser",
+      "file": "meteor-methods/users/deleteUser.ts",
+      "line": 18,
+      "confidence": "medium"
+    },
+    {
+      "predicate": "deleteUser",
+      "dominates": true,
+      "how": "structural",
+      "node_id": "v2:frontend:typescript-compiler-api:function:5d696bdaa671d035fbb8",
+      "host": "deleteUser",
+      "file": "lib/users/deleteUser.ts",
+      "line": 34,
+      "confidence": "medium"
+    }
+  ],
+  "missing_guard": null,
+  "cross_reference": null,
+  "uncertainty": [
+    "call-path presence over-approximates dominance; a branch inside a host function could route around the guard until CFG dominance lands"
+  ],
+  "objective": "prove or kill: a caller with no permission can reach the User delete effect from this entrypoint",
+  "suggested_actors": [
+    "judge"
+  ],
+  "state": "PROVEN_PRESERVED",
+  "provenance": "STATIC_PROVEN",
+  "completeness": "PARTIAL",
+  "rank": 0.0,
+  "rank_reasons": [],
+  "witness": {
+    "nodes": [
+      {
+        "id": "v2:frontend:typescript-compiler-api:method:bfd41807c179bda1dd5b",
+        "name": "deleteUser",
+        "kind": "method",
+        "file": "meteor-methods/users/deleteUser.ts",
+        "line": 49
+      },
+      {
+        "id": "v2:frontend:typescript-compiler-api:function:afae0b9f3b771b304b46",
+        "name": "executeDeleteUser",
+        "kind": "function",
+        "file": "meteor-methods/users/deleteUser.ts",
+        "line": 18
+      },
+      {
+        "id": "v2:frontend:typescript-compiler-api:function:5d696bdaa671d035fbb8",
+        "name": "deleteUser",
+        "kind": "function",
+        "file": "lib/users/deleteUser.ts",
+        "line": 34
+      }
+    ],
+    "edges": [
+      {
+        "src": "v2:frontend:typescript-compiler-api:method:bfd41807c179bda1dd5b",
+        "tgt": "v2:frontend:typescript-compiler-api:function:afae0b9f3b771b304b46",
+        "kind": "CALLS",
+        "via": "direct",
+        "reason": "call-path dominance witness",
+        "role": null,
+        "confidence": "exact",
+        "fact_origin": "call-graph"
+      },
+      {
+        "src": "v2:frontend:typescript-compiler-api:function:afae0b9f3b771b304b46",
+        "tgt": "v2:frontend:typescript-compiler-api:function:5d696bdaa671d035fbb8",
+        "kind": "CALLS",
+        "via": "direct",
+        "reason": "call-path dominance witness",
+        "role": null,
+        "confidence": "exact",
+        "fact_origin": "call-graph"
+      }
+    ],
+    "counts": {
+      "nodes": 3,
+      "edges": 2
+    }
+  }
+}

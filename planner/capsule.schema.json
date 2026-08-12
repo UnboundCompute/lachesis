@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/UnboundCompute/lachesis/planner/capsule.schema.json",
+  "title": "Investigation capsule, v1",
+  "description": "A bounded, falsifiable security question with its structural evidence pre-attached. The planner emits these; a downstream reasoner consumes one at a time and must return prove / kill / need-runtime. A capsule is never a vulnerability report: `state` is the whole claim it makes, and static analysis can only ever set it to UNPROVEN or PROVEN_PRESERVED.",
+  "type": "object",
+  "required": [
+    "id", "schema_version", "claim", "entrypoint", "sensitive_effect",
+    "objective", "state", "provenance", "completeness", "rank", "constructor"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^cap_[0-9a-f]{16}$",
+      "description": "Content-derived identity: the same claim over the same entrypoint and effect always yields the same id, so capsules dedupe and re-runs are comparable."
+    },
+    "schema_version": {"const": 1},
+    "constructor": {
+      "type": "string",
+      "description": "Which candidate constructor emitted this capsule (e.g. GUARD_DIFFERENTIAL)."
+    },
+    "claim": {
+      "type": "object",
+      "description": "The falsifiable proposition, as (subject, action, object, constraint).",
+      "required": ["subject", "action", "object", "constraint"],
+      "additionalProperties": false,
+      "properties": {
+        "subject": {"type": "string"},
+        "action": {"type": "string"},
+        "object": {"type": "string"},
+        "constraint": {"type": "string"}
+      }
+    },
+    "entrypoint": {"$ref": "#/$defs/location"},
+    "attacker_inputs": {
+      "type": "array",
+      "description": "Externally controlled values that reach this entrypoint, with where they come from.",
+      "items": {
+        "type": "object",
+        "required": ["param", "origin"],
+        "additionalProperties": false,
+        "properties": {
+          "param": {"type": "string"},
+          "origin": {"type": "string"},
+          "node_id": {"type": "string"},
+          "confidence": {"$ref": "#/$defs/confidence"}
+        }
+      }
+    },
+    "sensitive_effect": {
+      "type": "object",
+      "required": ["node_id", "symbol", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "node_id": {"type": "string"},
+        "symbol": {"type": "string"},
+        "kind": {"type": "string"},
+        "file": {"type": ["string", "null"]},
+        "line": {"type": ["integer", "null"]},
+        "confidence": {"$ref": "#/$defs/confidence"}
+      }
+    },
+    "dataflow": {
+      "type": "array",
+      "description": "The witness path, rendered one hop per line for a human reader.",
+      "items": {"type": "string"}
+    },
+    "witness": {
+      "type": "object",
+      "description": "The same witness in the shared labeled-path envelope every nav move returns, so a consumer can walk it rather than parse prose."
+    },
+    "guards_present": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["predicate", "dominates", "how"],
+        "additionalProperties": false,
+        "properties": {
+          "predicate": {"type": "string"},
+          "dominates": {"type": "boolean"},
+          "how": {"enum": ["named", "structural", "declarative"]},
+          "node_id": {"type": "string"},
+          "host": {"type": ["string", "null"]},
+          "file": {"type": ["string", "null"]},
+          "line": {"type": ["integer", "null"]},
+          "confidence": {"$ref": "#/$defs/confidence"},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "missing_guard": {
+      "type": ["object", "null"],
+      "required": ["predicate", "expected_from"],
+      "additionalProperties": false,
+      "properties": {
+        "predicate": {"type": "string"},
+        "expected_from": {"enum": ["family", "invariant"]},
+        "why": {"type": "string"}
+      }
+    },
+    "cross_reference": {
+      "type": ["object", "null"],
+      "description": "A peer that does have the guard this candidate lacks. The differential is the evidence; without it the claim is just an absence.",
+      "required": ["sibling_id", "why"],
+      "additionalProperties": false,
+      "properties": {
+        "sibling_id": {"type": "string"},
+        "symbol": {"type": "string"},
+        "at": {"type": ["string", "null"]},
+        "why": {"type": "string"}
+      }
+    },
+    "uncertainty": {
+      "type": "array",
+      "description": "What this capsule does not know, stated so a consumer does not read silence as certainty.",
+      "items": {"type": "string"}
+    },
+    "objective": {
+      "type": "string",
+      "description": "One sentence: prove or kill what, exactly."
+    },
+    "suggested_actors": {
+      "type": "array",
+      "description": "Generic capability roles, not product names: who should take this next.",
+      "items": {"enum": ["judge", "runtime-probe", "browser"]}
+    },
+    "state": {
+      "enum": ["UNPROVEN", "PROVEN_PRESERVED", "PROVEN_VIOLATED"],
+      "description": "PROVEN_VIOLATED exists in the vocabulary for a downstream reasoner with runtime evidence. Static analysis never sets it, and the planner cannot emit it."
+    },
+    "provenance": {
+      "enum": ["STATIC_PROVEN", "AGENT_INFERRED", "RUNTIME_OBSERVED"]
+    },
+    "completeness": {
+      "enum": ["DETERMINISTIC", "RESOLVED", "PARTIAL", "OPAQUE", "CONFLICTING"]
+    },
+    "rank": {"type": "number"},
+    "rank_reasons": {
+      "type": "array",
+      "description": "The terms that produced the rank, each with its contribution, so an ordering can be argued with.",
+      "items": {
+        "type": "object",
+        "required": ["term", "value", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "term": {"type": "string"},
+          "value": {"type": "number"},
+          "why": {"type": "string"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "location": {
+      "type": "object",
+      "required": ["node_id", "symbol"],
+      "additionalProperties": false,
+      "properties": {
+        "node_id": {"type": "string"},
+        "symbol": {"type": "string"},
+        "file": {"type": ["string", "null"]},
+        "line": {"type": ["integer", "null"]},
+        "how": {"type": "string"},
+        "anchor": {"type": ["string", "null"]}
+      }
+    },
+    "confidence": {
+      "enum": ["exact", "high", "medium", "conservative", "low"]
+    }
+  }
+}

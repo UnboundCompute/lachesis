@@ -45,7 +45,7 @@ Homepage = "https://github.com/UnboundCompute/lachesis"
 Source = "https://github.com/UnboundCompute/lachesis"
 
 [tool.setuptools.packages.find]
-include = ["Lachesis*", "nav*"]
+include = ["Lachesis*", "nav*", "planner*"]
 
 [tool.setuptools.package-data]
 # The TypeScript frontend is a Node script, the frontends declare capabilities in
@@ -54,6 +54,9 @@ include = ["Lachesis*", "nav*"]
 "Lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
 "Lachesis.frontends.python" = ["*.json", "fixtures/**/*"]
 "Lachesis.core" = ["*.json"]
+# The capsule schema is the artifact an external consumer validates against, and the
+# golden capsule is what the planner's own suite checks the serializer round-trips.
+"planner" = ["*.json", "fixtures/*.json"]
 
 [tool.pytest.ini_options]
 python_files = ["checks.py", "test_*.py"]
