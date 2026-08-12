@@ -106,6 +106,22 @@ class Dominance:
         self.guard_set = guard_set or GuardSet(store, entry_points=self.entry_points)
         self._closures: dict[tuple[str, int], Closure] = {}
         self._guards: dict[str, list[dict]] = {}
+        self._callees: dict[str, tuple[dict, ...]] = {}
+
+    # -- the call graph ------------------------------------------------------
+
+    def callees_of(self, fn_id: str) -> tuple[dict, ...]:
+        """``symbol_index.callees``, memoized for the life of this object.
+
+        Closures from thousands of entrypoints converge on the same utility and
+        service functions, so without the memo the same expansion is paid once per
+        entrypoint that reaches it. This is a per-run cache only: nothing is written
+        to disk, and a rebuilt store starts cold."""
+        cached = self._callees.get(fn_id)
+        if cached is None:
+            cached = tuple(si.callees(self.gl, fn_id))
+            self._callees[fn_id] = cached
+        return cached
 
     # -- the closure ---------------------------------------------------------
 
@@ -125,7 +141,7 @@ class Dominance:
         for level in range(depth):
             nxt: list[str] = []
             for current in frontier:
-                for callee in si.callees(self.gl, current):
+                for callee in self.callees_of(current):
                     callee_id = callee["node_id"]
                     if callee_id in closure.depth_of:
                         continue
