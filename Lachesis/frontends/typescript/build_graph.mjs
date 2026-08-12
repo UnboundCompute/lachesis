@@ -3202,11 +3202,48 @@ const manifest = {
   })),
 };
 
+// One `JSON.stringify(tier)` per file is the obvious way to write these, and it caps
+// the size of tree this frontend can analyse: V8 refuses to build a string past about
+// 512MB, so a large scope died with `RangeError: Invalid string length` after the whole
+// analysis had already succeeded. Serializing element by element keeps every
+// intermediate string in the kilobytes, whatever the total comes to.
+//
+// The file is the same JSON object it always was, same keys in the same order and the
+// same already-sorted element order, so `Lachesis/core/snapshot.py` reads it unchanged.
+// Only the whitespace differs: one compact element per line instead of an indented tree.
+function writeTierStreaming(filePath, tier) {
+  // Batched rather than one write per element, because the syscall, not the string
+  // building, is what a million-element tier would otherwise spend its time on.
+  const BATCH = 1000;
+  const handle = fs.openSync(filePath, "w");
+  try {
+    fs.writeSync(handle, `{"tier":${JSON.stringify(tier.tier)},`);
+    fs.writeSync(handle, `"name":${JSON.stringify(tier.name)}`);
+    for (const collection of ["nodes", "edges", "expands_to", "links"]) {
+      fs.writeSync(handle, `,${JSON.stringify(collection)}:[`);
+      const elements = tier[collection];
+      let buffered = "";
+      for (let index = 0; index < elements.length; index += 1) {
+        buffered += `${index ? "," : ""}\n${JSON.stringify(elements[index])}`;
+        if (index % BATCH === BATCH - 1) {
+          fs.writeSync(handle, buffered);
+          buffered = "";
+        }
+      }
+      if (buffered) fs.writeSync(handle, buffered);
+      fs.writeSync(handle, elements.length ? "\n]" : "]");
+    }
+    fs.writeSync(handle, "}\n");
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
 fs.mkdirSync(outputDir, { recursive: true });
 for (const tier of TIER_ORDER) {
-  fs.writeFileSync(
+  writeTierStreaming(
     path.join(outputDir, `${tier.toLowerCase()}_${TIER_NAMES[tier]}.json`),
-    `${JSON.stringify(tiers[tier], null, 2)}\n`,
+    tiers[tier],
   );
 }
 fs.writeFileSync(path.join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
