@@ -81,7 +81,8 @@ class PlannerTests(unittest.TestCase):
     def test_registered_handlers_are_the_entrypoints(self):
         handlers = {self.store.gl.label(self.store.gl.nodes.get(h))
                     for h in self.planner.entry_points.by_handler()}
-        self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "exportRecords"})
+        self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "renameRecord",
+                                    "exportRecords"})
 
     def test_implementation_is_anchored_at_its_registered_wrapper(self):
         # archiveRecordRow is never registered; the route reaches it through
@@ -120,6 +121,19 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(capsule["state"], STATE_UNPROVEN)
             self.assertEqual(capsule["guards_present"], [])
             self.assertEqual(capsule["sensitive_effect"]["kind"], "database")
+
+    def test_a_validator_is_reported_but_does_not_clear_the_candidate(self):
+        queued = [c for c in self.result["queue"]
+                  if c["entrypoint"]["symbol"] == "renameRecord"]
+        self.assertTrue(queued, "a validated but unauthorized handler was suppressed")
+        for capsule in queued:
+            names = {g["predicate"] for g in capsule["guards_present"]}
+            self.assertIn("validateRecordId", names,
+                          "the validator has to reach the consumer as evidence")
+            self.assertFalse(any(g["dominates"] for g in capsule["guards_present"]),
+                             "input validation is not authorization")
+            self.assertTrue(any("authorization" in note
+                                for note in capsule["uncertainty"]))
 
     # -- declarative recognition ---------------------------------------------
 

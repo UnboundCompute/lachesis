@@ -161,19 +161,22 @@ class Dominance:
 
     # -- guards on a path ----------------------------------------------------
 
-    def _guards_on(self, fn_id: str) -> list[dict]:
-        """Suppressing guard recognitions hosted by one function (memoized).
+    def _recognitions_on(self, fn_id: str) -> list[dict]:
+        """Every guard recognition hosted by one function (memoized).
 
         Declarative recognitions are absent by construction: they are recognized on
-        a registration, not on a function, and they never suppress."""
+        a registration, not on a function."""
         cached = self._guards.get(fn_id)
         if cached is None:
             cached = [{**g, "host_id": fn_id,
                        "host_name": self.gl.label(self.gl.nodes.get(fn_id) or {})}
-                      for g in self.guard_set.for_function(fn_id)
-                      if g.get("can_suppress")]
+                      for g in self.guard_set.for_function(fn_id)]
             self._guards[fn_id] = cached
         return cached
+
+    def _guards_on(self, fn_id: str) -> list[dict]:
+        """Only the recognitions allowed to answer an authorization question."""
+        return [g for g in self._recognitions_on(fn_id) if g.get("can_suppress")]
 
     def _branches(self, fn_id: str) -> bool:
         profile = self.guard_set.guards.profile(fn_id)
@@ -198,8 +201,11 @@ class Dominance:
                                 closure, [])
 
         found: list[dict] = []
+        others: list[dict] = []
         for fn_id in chain:
-            found.extend(self._guards_on(fn_id))
+            for recognition in self._recognitions_on(fn_id):
+                (found if recognition.get("can_suppress") else others).append(
+                    recognition)
 
         if not found:
             # Absence is the sound direction: if no function on the path guards, then
@@ -208,11 +214,15 @@ class Dominance:
             # over-approximation. A truncated closure proves nothing either way.
             completeness = (COMPLETENESS_OPAQUE if closure.exhausted
                             else COMPLETENESS_DETERMINISTIC)
-            reason = ("no guard was recognized on any function of the call path"
-                      if not closure.exhausted else
-                      "no guard was recognized, and the closure was truncated")
+            reason = ("no authorization guard was recognized on any function of the "
+                      "call path" if not closure.exhausted else
+                      "no authorization guard was recognized, and the closure was "
+                      "truncated")
+            if others:
+                reason += (f"; {len(others)} non-authorization guard(s) are present "
+                           f"and do not answer the question")
             return self._result(STATE_UNPROVEN, completeness, [], reason,
-                                closure, chain)
+                                closure, chain, others)
 
         # A guard reached through a branching function can be branched around, so the
         # strongest label its host allows is PARTIAL until CFG dominance (A2) lands.
@@ -220,18 +230,20 @@ class Dominance:
         completeness = (COMPLETENESS_DETERMINISTIC if deterministic
                         else COMPLETENESS_PARTIAL)
         names = ", ".join(sorted({g["guard_name"] for g in found}))
-        reason = (f"guard(s) on the call path from the entrypoint to the effect: "
-                  f"{names}")
+        reason = (f"authorization guard(s) on the call path from the entrypoint to "
+                  f"the effect: {names}")
         return self._result(STATE_PRESERVED, completeness, found, reason,
-                            closure, chain)
+                            closure, chain, others)
 
     def _result(self, state: str, completeness: str, guards: list[dict],
-                reason: str, closure: Closure, chain: list[str]) -> dict:
+                reason: str, closure: Closure, chain: list[str],
+                others: list[dict] | None = None) -> dict:
         return {
             "state": state,
             "completeness": completeness,
             "provenance": "STATIC_PROVEN",
             "guards": guards,
+            "other_guards": others or [],
             "reason": reason,
             "closure": closure.summary(),
             "witness": self._witness(closure, chain),

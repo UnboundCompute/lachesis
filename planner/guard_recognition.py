@@ -19,7 +19,14 @@ was recognized** — never a bare boolean:
     Recognized from graph structure (the registration call's argument expression
     and its identifier children), not from source text.
 
-**Two honest limits, both reported rather than hidden.**
+**Recognizing a guard and clearing a candidate are different questions.** Every
+recognition above is reported; only the ones in an authorization family
+(``authz``, ``verify``) may *suppress*. A validator, a sanitizer and a bare
+guard shape all prove that something was checked, and none of them proves that the
+caller was allowed, so they lower a rank and stay in the evidence rather than
+answering the question. ``can_suppress`` carries that distinction on every row.
+
+**Three honest limits, all reported rather than hidden.**
 
 *Relational and ownership guards* — ``if (doc.owner !== userId) throw`` — are real
 guards that none of these three recognitions names. Some are caught incidentally by
@@ -54,6 +61,17 @@ from planner.entrypoints import EntryPoints
 # Recognitions, strongest first. Order is the tie-break when a function is guarded
 # several ways, and it is also the order a reader should read the evidence in.
 RECOGNITIONS = ("named", "structural", "declarative")
+
+# Which recognized roles are allowed to *suppress* an authorization question. A
+# permission check and a signature check answer "is this caller allowed"; a
+# validator and a sanitizer answer "is this input well formed", and a function that
+# merely branches and throws answers "something was checked". The last two are real
+# guards and belong in the evidence, but treating them as authorization is how a
+# missing-authorization bug gets suppressed by a null check. Everything else lowers
+# a rank and stays on the queue.
+SUPPRESSING_ROLES = frozenset({"authz", "verify"})
+_NOT_AUTHZ = ("this is a guard, but not an authorization one, so it is evidence "
+              "against the candidate without answering it")
 
 # Whole tokens that mean "this names an authorization requirement". Deliberately
 # narrower than the general security lexicon: this list is read against the
@@ -105,14 +123,18 @@ class GuardSet:
             # separate is what makes "how was this recognized" answerable.
             if not role_from_name(rec["callee"]):
                 continue
-            out.append({
+            suppresses = rec["role"] in SUPPRESSING_ROLES
+            row = {
                 "how": "named", "role": rec["role"],
                 "guard_id": rec["callee_id"], "guard_name": rec["callee"],
                 "file": rec["file"], "line": rec["line"],
-                "confidence": "medium", "can_suppress": True,
+                "confidence": "medium", "can_suppress": suppresses,
                 "fact_origin": rec["fact_origin"],
                 "evidence_ids": [fn_id, rec["callee_id"]],
-            })
+            }
+            if not suppresses:
+                row["note"] = _NOT_AUTHZ
+            out.append(row)
         return out
 
     def _structural(self, fn_id: str) -> list[dict]:
@@ -125,11 +147,14 @@ class GuardSet:
             "how": "structural", "role": "validate",
             "guard_id": fn_id, "guard_name": self.gl.label(node) if node else fn_id,
             "file": file, "line": line,
-            "confidence": "medium", "can_suppress": True,
+            "confidence": "medium", "can_suppress": False,
             "fact_origin": "guard-profile",
             "evidence_ids": [fn_id],
             "counts": {k: profile[k] for k in
                        ("conditions", "short_circuits", "throws")},
+            "note": "guard-shaped: it branches and throws. What it checks is not "
+                    "recoverable from the shape, so it may lower a rank and never "
+                    "suppress an authorization question",
         }]
 
     def _arguments_of(self, callsite_id: str) -> list[dict]:

@@ -24,6 +24,21 @@ export function purgeRecord(req: Request): string {
   return "purged";
 }
 
+// Checked, but not authorized: a shape validator answers "is this input well
+// formed", never "is this caller allowed". It belongs in the evidence and must not
+// clear the candidate.
+export function renameRecord(req: Request): string {
+  validateRecordId(req.recordId);
+  store.deleteMany(req.recordId);
+  return "renamed";
+}
+
+function validateRecordId(recordId: string): void {
+  if (!recordId) {
+    throw new Error("bad request");
+  }
+}
+
 // The requirement for this one is declared on the registration in index.ts, so
 // nothing in this body calls a guard and no call-graph method can see it.
 export function exportRecords(req: Request): string {

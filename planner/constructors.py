@@ -23,9 +23,11 @@ consumer can read the two side by side. Family formation is delegated to
 ``nav.siblings``, unchanged and unmodified.
 
 Three things this constructor deliberately does not do: it does not declare a
-violation (see ``planner.capsule``), it does not let a declarative guard suppress
-(its value is unreadable — see ``planner.guard_recognition``), and it does not treat
-a truncated search as a clean one (an ``OPAQUE`` verdict stays on the queue).
+violation (see ``planner.capsule``), it does not let a non-authorization guard
+suppress an authorization question — a validator, a bare guard shape and a
+declarative requirement are all reported and none of them clears the candidate (see
+``planner.guard_recognition``) — and it does not treat a truncated search as a clean
+one (an ``OPAQUE`` verdict stays on the queue).
 
   python3 planner/constructors.py graph.kuzu --limit 50
 """
@@ -216,12 +218,18 @@ class GuardDifferential:
             "host": guard.get("host_name"), "file": guard.get("file"),
             "line": guard.get("line"), "confidence": guard.get("confidence"),
         } for guard in verdict["guards"]]
+        # Recognized, reported, and not allowed to answer the question: a validator, a
+        # bare guard shape, a requirement declared on the registration. They are the
+        # difference between "nothing checks this" and "something checks this and it
+        # is not authorization", which is exactly what a consumer needs to know.
+        non_dominating = list(verdict.get("other_guards") or ()) + declarative
         guards_present += [{
             "predicate": guard["guard_name"], "dominates": False,
             "how": guard["how"], "node_id": guard["guard_id"],
-            "host": None, "file": guard.get("file"), "line": guard.get("line"),
+            "host": guard.get("host_name"), "file": guard.get("file"),
+            "line": guard.get("line"),
             "confidence": guard.get("confidence"), "note": guard.get("note", ""),
-        } for guard in declarative]
+        } for guard in non_dominating]
 
         peer = None if suppressed else self.guarded_peer(effect_fn_id)
         witness = verdict["witness"]
@@ -240,6 +248,13 @@ class GuardDifferential:
                 "a declarative requirement is present on the registration "
                 f"({', '.join(g['guard_name'] for g in declarative)}) but its value "
                 "is not readable from the graph, so it did not suppress")
+        if not suppressed and verdict.get("other_guards"):
+            names = ", ".join(sorted({g["guard_name"]
+                                      for g in verdict["other_guards"]}))
+            uncertainty.append(
+                f"guards are present on the path ({names}) but none of them is an "
+                f"authorization check, so they lower the rank without answering the "
+                f"question")
         if suppressed:
             uncertainty.append(
                 "the guard is present on the call path; whether it dominates every "
