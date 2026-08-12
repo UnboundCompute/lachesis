@@ -39,6 +39,7 @@ dev = ["pytest>=8"]
 lachesis-analyze = "Lachesis.cli.analyze:main"
 lachesis-query = "Lachesis.cli.query:main"
 lachesis-mcp = "nav.mcp_server:main"
+lachesis-plan = "planner.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/UnboundCompute/lachesis"
@@ -56,7 +57,7 @@ include = ["Lachesis*", "nav*", "planner*"]
 "Lachesis.core" = ["*.json"]
 # The capsule schema is the artifact an external consumer validates against, and the
 # golden capsule is what the planner's own suite checks the serializer round-trips.
-"planner" = ["*.json", "fixtures/*.json"]
+"planner" = ["*.json", "fixtures/*.json", "fixtures/project/*"]
 
 [tool.pytest.ini_options]
 python_files = ["checks.py", "test_*.py"]

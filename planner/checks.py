@@ -1,0 +1,196 @@
+"""Executable checks for the planner, on the fixture project shipped in-tree.
+
+  python -m unittest planner.checks
+
+The suite builds ``planner/fixtures/project`` into a real store once, then asserts
+the four behaviours the layer exists for, each of which is a case some simpler
+implementation gets wrong:
+
+  * a guard on the registered wrapper suppresses an effect one hop down
+    (the wrapper-anchoring false positive),
+  * a handler with no guard anywhere on the path stays on the queue,
+  * a requirement declared on the registration is recognized even though nothing
+    calls it, and does **not** suppress, because its value is not readable,
+  * nothing static is ever emitted as ``PROVEN_VIOLATED``.
+
+The fixture is four small TypeScript files and no dependencies, so the whole suite
+runs in seconds and never needs a large application checked out.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+FIXTURE = ROOT / "planner" / "fixtures" / "project"
+GOLDEN = ROOT / "planner" / "fixtures" / "capsule_golden.json"
+
+from nav.graph_store import GraphStore
+from planner import capsule as cap
+from planner.constructors import GuardDifferential
+from planner.dominance import STATE_PRESERVED, STATE_UNPROVEN
+from planner.rank import ranked, score
+
+
+def _build(destination: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "Lachesis.cli.analyze", str(FIXTURE),
+         str(destination), "--enrich", "--prune"],
+        cwd=ROOT, text=True, capture_output=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise unittest.SkipTest(
+            f"could not build the planner fixture graph:\n{completed.stderr}")
+
+
+class PlannerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        store_path = Path(cls._tmp.name) / "planner-fixture.kuzu"
+        _build(store_path)
+        cls.store = GraphStore.load(str(store_path))
+        cls.store.ensure_dataflow_tier()
+        cls.planner = GuardDifferential(cls.store)
+        cls.result = cls.planner.run()
+        cls.capsules = cls.result["queue"] + cls.result["suppressions"]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    # -- helpers -------------------------------------------------------------
+
+    def capsules_from(self, entrypoint: str) -> list[dict]:
+        return [c for c in self.capsules
+                if c["entrypoint"]["symbol"] == entrypoint]
+
+    def function_id(self, name: str) -> str:
+        hits = [h for h in self.store.resolve(name) if h.get("name") == name]
+        self.assertTrue(hits, f"no declaration named {name!r} in the fixture graph")
+        return hits[0]["node_id"]
+
+    # -- anchoring -----------------------------------------------------------
+
+    def test_registered_handlers_are_the_entrypoints(self):
+        handlers = {self.store.gl.label(self.store.gl.nodes.get(h))
+                    for h in self.planner.entry_points.by_handler()}
+        self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "exportRecords"})
+
+    def test_implementation_is_anchored_at_its_registered_wrapper(self):
+        # archiveRecordRow is never registered; the route reaches it through
+        # archiveRecord. Without the climb its guard is invisible.
+        anchors = self.planner.entry_points.anchors_for(
+            self.function_id("archiveRecordRow"))
+        self.assertTrue(anchors, "the implementation found no anchor at all")
+        self.assertEqual(anchors[0]["how"], "route")
+        self.assertEqual(anchors[0]["distance"], 1)
+        self.assertEqual(anchors[0]["anchor_label"], "POST /records.archive")
+
+    # -- dominance -----------------------------------------------------------
+
+    def test_guard_on_the_wrapper_suppresses_the_effect_below_it(self):
+        suppressed = [c for c in self.capsules_from("archiveRecord")
+                      if c["state"] == STATE_PRESERVED]
+        self.assertTrue(suppressed, "the guarded handler produced no suppression")
+        for capsule in suppressed:
+            names = [g["predicate"] for g in capsule["guards_present"]
+                     if g["dominates"]]
+            self.assertIn("checkPermission", names,
+                          "a suppression that does not name its guard is not auditable")
+
+    def test_the_implementation_alone_carries_no_guard(self):
+        # The point of the previous test: the suppression comes from the anchor,
+        # not from the function that performs the effect.
+        guards = self.planner.guard_set.for_function(
+            self.function_id("archiveRecordRow"))
+        self.assertEqual(guards, [])
+
+    def test_unguarded_handler_stays_on_the_queue(self):
+        queued = [c for c in self.result["queue"]
+                  if c["entrypoint"]["symbol"] == "purgeRecord"]
+        self.assertTrue(queued, "the unguarded handler was not queued")
+        for capsule in queued:
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            self.assertEqual(capsule["guards_present"], [])
+            self.assertEqual(capsule["sensitive_effect"]["kind"], "database")
+
+    # -- declarative recognition ---------------------------------------------
+
+    def test_declarative_requirement_is_recognized_and_does_not_suppress(self):
+        capsules = self.capsules_from("exportRecords")
+        self.assertTrue(capsules, "the declaratively guarded route produced nothing")
+        for capsule in capsules:
+            names = {g["predicate"] for g in capsule["guards_present"]}
+            self.assertTrue(
+                {"authRequired", "permissionsRequired"} & names,
+                f"the declared requirement was not recognized: {names}")
+            self.assertFalse(any(g["dominates"] for g in capsule["guards_present"]),
+                             "a declared requirement whose value is unreadable must "
+                             "not suppress")
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            self.assertTrue(any("not observable" in note or "not readable" in note
+                                for note in capsule["uncertainty"]),
+                            "the reason it did not suppress must reach the consumer")
+
+    # -- the capsule contract -------------------------------------------------
+
+    def test_every_capsule_validates_against_the_schema(self):
+        schema = cap.load_schema()
+        for capsule in self.capsules:
+            problems = cap.validate(capsule, schema)
+            self.assertEqual(problems, [], f"{capsule['id']}: {problems}")
+
+    def test_nothing_static_claims_a_violation(self):
+        for capsule in self.capsules:
+            self.assertNotEqual(capsule["state"], "PROVEN_VIOLATED")
+        with self.assertRaises(ValueError):
+            cap.new_capsule(
+                constructor="GUARD_DIFFERENTIAL", claim={}, entrypoint={},
+                sensitive_effect={}, objective="", state="PROVEN_VIOLATED",
+                provenance="STATIC_PROVEN", completeness="DETERMINISTIC")
+
+    def test_capsule_identity_is_content_derived(self):
+        again = GuardDifferential(self.store).run()
+        self.assertEqual([c["id"] for c in again["queue"]],
+                         [c["id"] for c in self.result["queue"]])
+
+    def test_golden_capsule_round_trips(self):
+        golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
+        self.assertEqual(cap.validate(golden), [])
+        self.assertEqual(
+            golden["id"],
+            cap.capsule_id(golden["claim"], golden["entrypoint"]["node_id"],
+                           golden["sensitive_effect"]["node_id"]))
+
+    # -- ranking --------------------------------------------------------------
+
+    def test_ranking_is_explained_and_ordered(self):
+        queue = self.result["queue"]
+        self.assertEqual([c["rank"] for c in queue],
+                         sorted((c["rank"] for c in queue), reverse=True))
+        for capsule in queue:
+            self.assertTrue(capsule["rank_reasons"])
+            self.assertTrue(all(r.get("why") for r in capsule["rank_reasons"]))
+
+    def test_an_uncertain_capsule_is_lowered_and_not_removed(self):
+        base = {"id": "cap_0000000000000000",
+                "sensitive_effect": {"kind": "database"}, "attacker_inputs": [],
+                "guards_present": [], "cross_reference": None, "dataflow": [],
+                "completeness": "DETERMINISTIC", "provenance": "STATIC_PROVEN"}
+        certain, _ = score(base)
+        opaque, _ = score({**base, "completeness": "OPAQUE",
+                           "provenance": "AGENT_INFERRED"})
+        self.assertLess(opaque, certain)
+        self.assertGreater(opaque, 0.0)
+        self.assertEqual(len(ranked([base])), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
