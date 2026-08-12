@@ -130,7 +130,7 @@ tier exists.
                          siblings, flow, symbol_index, and an MCP server
 ```
 
-### `Lachesis/`, the graph builder
+### `lachesis/`, the graph builder
 
 - `pipeline.py` orchestrates project partitioning and the per-frontend runs.
 - `frontends/` holds the language frontends. Each one is parser or compiler backed and emits the graph.
@@ -138,7 +138,7 @@ tier exists.
 - `kuzu_store.py` is the bulk writer. It stages the graph to Parquet and copies it into a Kùzu database using typed hot-relation tables plus a cold generic edge table. The [`KUZU_STORE_SPEC.md`](./KUZU_STORE_SPEC.md) has the full layout.
 - `cli/` holds the command-line entry points for build, analyze, and export.
 
-### `nav/`, navigation and MCP
+### `lachesis/nav/`, navigation and MCP
 
 - `graph_store.py` loads a graph from either JSON or a Kùzu directory. It auto-detects which one it is looking at and gives you one API over both.
 - `kuzu_index.py` is the Kùzu-backed graph index.
@@ -166,7 +166,7 @@ one thousand source lines per second, or ten to eleven thousand graph elements
 | `ai` | 164,607 | 504,246 | 920,708 | 140.9 s | 1.0 GB |
 
 ```bash
-python -m Lachesis.cli.analyze path/to/vercel-ai/packages/ai/src ai.kuzu
+python -m lachesis.cli.analyze path/to/vercel-ai/packages/ai/src ai.kuzu
 ```
 
 These build times and sizes were measured when the builder also wrote the whole
@@ -216,7 +216,7 @@ tool identically to the same graph held whole in memory.
 
 ## Status
 
-Lachesis is early and moving fast. The graph model, the Kùzu store, and the navigation and MCP layer all work today, and they are covered by a parity test suite in `Lachesis/frontends/checks.py`.
+Lachesis is early and moving fast. The graph model, the Kùzu store, and the navigation and MCP layer all work today, and they are covered by a parity test suite in `lachesis/frontends/checks.py`.
 
 There are known rough edges, and they live in the issue tracker. Two worth calling out: a tail-recursive control-flow walk can hit Python's recursion limit on very deep functions, and whole-repo multi-package builds currently need per-package compilation to stay inside a single Node process's heap.
 

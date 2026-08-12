@@ -13,7 +13,7 @@ following the data, not by matching a name.
 
 ## The code under analysis
 
-The fixture lives at `Lachesis/frontends/typescript/fixtures/project`. Three of
+The fixture lives at `lachesis/frontends/typescript/fixtures/project`. Three of
 its files carry the story.
 
 One attacker-reachable entry point takes a public request and lifts an identifier
@@ -65,8 +65,8 @@ in the top-level README), build a graph from the fixture. The output is a store
 directory holding the embedded database and its manifest.
 
 ```bash
-python3 -m Lachesis.cli.analyze \
-  Lachesis/frontends/typescript/fixtures/project \
+python3 -m lachesis.cli.analyze \
+  lachesis/frontends/typescript/fixtures/project \
   /tmp/example.kuzu
 ```
 
@@ -96,7 +96,7 @@ straight from a clone.
 ## Step 2: get your bearings
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.kuzu overview
+python3 -m lachesis.cli.query --format text /tmp/example.kuzu overview
 ```
 
 ```
@@ -119,7 +119,7 @@ Ask about the guarded handler first. The `--format text` flag prints a readable
 digest; the underlying records are full JSON.
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.kuzu handler-security getInvoice
+python3 -m lachesis.cli.query --format text /tmp/example.kuzu handler-security getInvoice
 ```
 
 ```
@@ -149,7 +149,7 @@ the `principalKey()` call that establishes the tenant before `findById` runs. No
 the sibling:
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.kuzu handler-security getDocument
+python3 -m lachesis.cli.query --format text /tmp/example.kuzu handler-security getDocument
 ```
 
 ```
@@ -187,7 +187,7 @@ The unguarded path from Step 3 has an ID you can drill into. Pull the full
 source-to-sink chain:
 
 ```bash
-python3 -m Lachesis.cli.query --format text /tmp/example.kuzu \
+python3 -m lachesis.cli.query --format text /tmp/example.kuzu \
   security-path v2:core:taint-propagation:taint-reach:4607b639d02e2fdf14d9
 ```
 
@@ -250,8 +250,8 @@ line, one graph hop at a time, without loading the whole project into its contex
 Swap the fixture path for a real TypeScript tree and run the same commands:
 
 ```bash
-python3 -m Lachesis.cli.analyze path/to/your/source graph.kuzu
-python3 -m Lachesis.cli.query --format text graph.kuzu overview
+python3 -m lachesis.cli.analyze path/to/your/source graph.kuzu
+python3 -m lachesis.cli.query --format text graph.kuzu overview
 ```
 
 See [`KUZU_STORE_SPEC.md`](../KUZU_STORE_SPEC.md) for what the columnar store buys

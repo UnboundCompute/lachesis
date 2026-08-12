@@ -3,7 +3,7 @@
 This is the reference for what Lachesis actually puts in the graph: the node
 kinds, the edge kinds, and the tiers they live in. Everything here is the
 canonical contract defined in
-[`Lachesis/core/schema.py`](../Lachesis/core/schema.py), so if this page and the
+[`lachesis/core/schema.py`](../lachesis/core/schema.py), so if this page and the
 code ever disagree, the code is right and this page is stale. The contract is
 versioned (`CURRENT_CONTRACT_VERSION = 2`).
 

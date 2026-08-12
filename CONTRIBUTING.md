@@ -21,12 +21,12 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
 3. Make your change, with tests where it makes sense.
 4. Run the parity and checks suite before you open a PR:
    ```
-   python3 -m pytest Lachesis/frontends/checks.py
+   python3 -m pytest lachesis/frontends/checks.py
    ```
    The graph has to stay at byte-identical parity between the JSON and Kùzu backends for the navigation and MCP tools, and the checks suite enforces that. If your change touches the store or the nav layer, make sure that test still passes.
 
    The end-to-end tests analyze the fixture corpus at
-   `Lachesis/frontends/typescript/fixtures/project/`. It is deliberately small — a
+   `lachesis/frontends/typescript/fixtures/project/`. It is deliberately small — a
    dozen files — and it exercises the same code paths as a production codebase
    (public parameter to repository lookup, a guarded/unguarded sibling pair, a
    dynamic-code frontier, a route registration) without the same scale. Point
@@ -37,7 +37,7 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
 
 ## What makes a good contribution
 
-- New language frontends are the highest-value area. A frontend emits the layered graph for a language or ecosystem, going from syntax to symbols to calls to dataflow overlays. Follow an existing frontend under `Lachesis/frontends/` as your template, and include the dataflow tier: `DEFINES`, `VALUE_FLOWS_TO`, `READS_FROM`, `WRITES_TO`, `ALIASES`, and `allocation` nodes. That tier is the whole point of Lachesis, not an optional extra. `POINTS_TO`, `TAINT_FLOWS_TO` and the rest of the derived set are overlay-owned and rejected from a frontend snapshot by the validator (`FRONTEND_FORBIDDEN_EDGE_KINDS` in `Lachesis/core/schema.py`): emit the allocation sites and the value flow, and the overlays derive the heap and the taint from them.
+- New language frontends are the highest-value area. A frontend emits the layered graph for a language or ecosystem, going from syntax to symbols to calls to dataflow overlays. Follow an existing frontend under `lachesis/frontends/` as your template, and include the dataflow tier: `DEFINES`, `VALUE_FLOWS_TO`, `READS_FROM`, `WRITES_TO`, `ALIASES`, and `allocation` nodes. That tier is the whole point of Lachesis, not an optional extra. `POINTS_TO`, `TAINT_FLOWS_TO` and the rest of the derived set are overlay-owned and rejected from a frontend snapshot by the validator (`FRONTEND_FORBIDDEN_EDGE_KINDS` in `lachesis/core/schema.py`): emit the allocation sites and the value flow, and the overlays derive the heap and the taint from them.
 - Store and nav improvements, like indexing for the warm-query paths, memory or latency wins, or better reachability and guard reasoning.
 - Bug fixes with a regression test that fails before your change and passes after.
 
