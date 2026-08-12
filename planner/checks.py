@@ -82,7 +82,8 @@ class PlannerTests(unittest.TestCase):
         handlers = {self.store.gl.label(self.store.gl.nodes.get(h))
                     for h in self.planner.entry_points.by_handler()}
         self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "renameRecord",
-                                    "deleteRecord", "touchRecord", "exportRecords"})
+                                    "deleteRecord", "touchRecord", "exportRecords",
+                                    "importRecord", "submitRecord"})
 
     def test_implementation_is_anchored_at_its_registered_wrapper(self):
         # archiveRecordRow is never registered; the route reaches it through
@@ -157,6 +158,32 @@ class PlannerTests(unittest.TestCase):
                           "the call still has to reach the consumer as evidence")
             self.assertFalse(any(g["dominates"] for g in capsule["guards_present"]))
             self.assertTrue(any("never branched on" in note
+                                for note in capsule["uncertainty"]),
+                            "the reason it did not suppress must reach the consumer")
+
+    def test_verifying_an_authentication_object_suppresses(self):
+        suppressed = [c for c in self.result["suppressions"]
+                      if c["entrypoint"]["symbol"] == "importRecord"]
+        self.assertTrue(suppressed, "a branched-on signature check did not suppress")
+        for capsule in suppressed:
+            basis = {g["predicate"]: g.get("suppression_basis")
+                     for g in capsule["guards_present"] if g["dominates"]}
+            self.assertEqual(basis.get("verifySignature"), "branch")
+
+    def test_verifying_the_payload_is_not_authorization(self):
+        # Same family, same branch shape as importRecord above. Only the object
+        # being verified differs, and that is the whole distinction.
+        queued = [c for c in self.result["queue"]
+                  if c["entrypoint"]["symbol"] == "submitRecord"]
+        self.assertTrue(queued,
+                        "a required-fields check cleared an authorization question")
+        for capsule in queued:
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            reported = {g["predicate"] for g in capsule["guards_present"]}
+            self.assertIn("verifyRequiredFields", reported,
+                          "the check still has to reach the consumer as evidence")
+            self.assertFalse(any(g["dominates"] for g in capsule["guards_present"]))
+            self.assertTrue(any("authentication object" in note
                                 for note in capsule["uncertainty"]),
                             "the reason it did not suppress must reach the consumer")
 

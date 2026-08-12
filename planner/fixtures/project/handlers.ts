@@ -1,7 +1,10 @@
 // Three handlers, one per case the planner has to get right.
 
 import { Request } from "./router.js";
-import { checkPermission, isPermitted, refreshPermissionCache } from "./guards.js";
+import {
+  checkPermission, isPermitted, refreshPermissionCache, verifyRequiredFields,
+  verifySignature,
+} from "./guards.js";
 import { store } from "./store.js";
 
 // Guarded at the registered wrapper, effect one hop down. Read from the
@@ -50,6 +53,25 @@ export function touchRecord(req: Request): string {
   refreshPermissionCache(req.userId);
   store.deleteMany(req.recordId);
   return "touched";
+}
+
+// Verifies an authentication object and acts on the answer: this one authorizes.
+export function importRecord(req: Request): string {
+  if (!verifySignature(req.userId, req.recordId)) {
+    throw new Error("forbidden");
+  }
+  store.deleteMany(req.recordId);
+  return "imported";
+}
+
+// Same family, same branch, different object: a required-fields check says nothing
+// about who is calling, so this candidate has to stay on the queue.
+export function submitRecord(req: Request): string {
+  if (!verifyRequiredFields(req.recordId)) {
+    throw new Error("bad request");
+  }
+  store.deleteMany(req.recordId);
+  return "submitted";
 }
 
 function validateRecordId(recordId: string): void {

@@ -19,3 +19,14 @@ export function isPermitted(userId: string, permission: string): boolean {
 export function refreshPermissionCache(userId: string): number {
   return userId.length;
 }
+
+// Verification of an authentication object: the answer is about the caller.
+export function verifySignature(userId: string, signature: string): boolean {
+  return signature.length > 0 && userId.length > 0;
+}
+
+// The same name family, verifying the payload rather than the caller. Branched on
+// exactly like the one above, so only the object it names can tell them apart.
+export function verifyRequiredFields(recordId: string): boolean {
+  return recordId.length > 0;
+}

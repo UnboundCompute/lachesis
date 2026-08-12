@@ -26,7 +26,13 @@ checked, and none of them proves that the caller was allowed, so they lower a ra
 and stay in the evidence rather than answering the question. ``can_suppress`` carries
 the distinction on every row and ``suppression_basis`` says which way it was earned.
 
-  1. *It is an authorization family* — ``authz`` or ``verify``.
+  1. *It is an authorization family* — ``authz``, or ``verify`` **and it names what it
+     verifies**. The ``verify`` family is a name bucket, not a semantic one: it holds
+     ``verifySignature`` and ``verifyRequiredFields`` equally. A verification only
+     answers "is this caller allowed" when the thing verified is an authentication
+     object, so a ``verify`` recognition suppresses only when its own name carries one
+     (signature, token, credential, session, ...). A required-fields check is a
+     validator wearing the word "verify".
   2. *Its answer is acted on* — the call's result reaches a branch condition in the
      caller (directly, or through a variable it was assigned to), **or** the callee
      is itself guard-shaped, which is the throwing guard that needs no branch at the
@@ -85,8 +91,23 @@ RECOGNITIONS = ("named", "structural", "declarative")
 # missing-authorization bug gets suppressed by a null check. Everything else lowers
 # a rank and stays on the queue.
 SUPPRESSING_ROLES = frozenset({"authz", "verify"})
+
+# What a `verify` has to be verifying before it counts as authorization. The role
+# itself is matched from `verif|hmac|sign|hash`, which is a vocabulary about the *act*
+# of checking and says nothing about the object: `verifySignature` and
+# `_verifyRequiredFields` land in the same bucket. These are the objects whose
+# verification is an authentication of the caller. Generic words, no target literals.
+AUTHENTICATION_OBJECTS = frozenset({
+    "signature", "signatures", "hmac", "token", "tokens",
+    "credential", "credentials", "password", "secret", "secrets",
+    "session", "jwt", "otp", "challenge", "certificate", "cert",
+    "nonce", "key", "keys",
+})
 _NOT_AUTHZ = ("this is a guard, but not an authorization one, so it is evidence "
               "against the candidate without answering it")
+_VERIFIES_NOTHING_AUTHENTICATING = (
+    "its name is in the verification family but it does not name an authentication "
+    "object, so what it verifies is not the caller's right to be here")
 _NOT_ACTED_ON = ("its name lands in an authorization family but its answer is never "
                  "branched on here and it does not throw, so nothing is enforced by "
                  "calling it")
@@ -116,6 +137,19 @@ PERMISSION_TOKENS = frozenset({
 # The authentication-required flag shape (`authRequired: true`), which is a pair of
 # tokens rather than one distinctive word.
 _AUTH_FLAG = frozenset({"auth", "required"})
+
+
+def authorizing_name(role: str, name: str) -> bool:
+    """Does this recognition ask an authorization question, by role and by name?
+
+    ``authz`` is one by role. ``verify`` is one only when the name says what is being
+    verified and that object is an authentication object; otherwise it is a validator
+    that happens to be spelled with the word "verify"."""
+    if role not in SUPPRESSING_ROLES:
+        return False
+    if role != "verify":
+        return True
+    return bool(set(camel_tokens(name or "")) & AUTHENTICATION_OBJECTS)
 
 
 def declarative_tokens(name: str) -> frozenset[str]:
@@ -252,7 +286,7 @@ class GuardSet:
             # separate is what makes "how was this recognized" answerable.
             if not role_from_name(rec["callee"]):
                 continue
-            authorizing = rec["role"] in SUPPRESSING_ROLES
+            authorizing = authorizing_name(rec["role"], rec["callee"])
             basis = self.branch_use.basis(fn_id, rec["callee_id"]) if authorizing \
                 else None
             row = {
@@ -265,7 +299,8 @@ class GuardSet:
                 "evidence_ids": [fn_id, rec["callee_id"]],
             }
             if not authorizing:
-                row["note"] = _NOT_AUTHZ
+                row["note"] = (_VERIFIES_NOTHING_AUTHENTICATING
+                               if rec["role"] == "verify" else _NOT_AUTHZ)
             elif not basis:
                 row["note"] = _NOT_ACTED_ON
             out.append(row)
