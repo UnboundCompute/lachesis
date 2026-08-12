@@ -56,6 +56,7 @@ SENSITIVE_CALLS = {
     "writeFileSync": "filesystem-write",
     "query": "database",
     "execute": "database",
+    "rename": "filesystem-write",
     "findById": "database",
     "findOne": "database",
     "send": "response",
@@ -69,12 +70,20 @@ SENSITIVE_CALLS = {
 # 15 exact names) still materialize sinks. Deliberately targeted — no ultra-common
 # verbs (get/map/parse) — so the graph doesn't drown. Graded confidence; the strict
 # judge adjudicates. First match wins; exact SENSITIVE_CALLS takes precedence.
+#
+# A family alternative has to stay a *substring of an operation name*, not of any
+# name that contains the verb. `execute` and `rename` unanchored matched
+# `executeArchiveRoom` and `renameRoom`, which are application functions that
+# delegate: the real query is inside them and is already a sink of its own, so each
+# match manufactured a duplicate sink whose "operation" was a function call. Both
+# verbs keep an exact entry above, which is what covers `fs.rename(...)` and a bare
+# `execute(...)`, so the tightening costs no real sink.
 SINK_FAMILIES = [
     (re.compile(r"\beval\b|^Function$|runInContext|runInNewContext|createFunction"), "dynamic-code", "high"),
     (re.compile(r"^exec$|execSync|execFile|spawn(Sync)?|\bfork\b|execa"), "process", "high"),
-    (re.compile(r"writeFile|appendFile|createWriteStream|unlink|rmdir|^rm$|mkdir|rename|copyFile|chmod|symlink"), "filesystem-write", "medium"),
+    (re.compile(r"writeFile|appendFile|createWriteStream|unlink|rmdir|^rm$|mkdir|rename(Sync|File|Dir|Path)|copyFile|chmod|symlink"), "filesystem-write", "medium"),
     (re.compile(r"\bfetch\b|axios|\bgot\b|https?Request|createConnection|sendBeacon|XMLHttpRequest|\bky\b"), "network", "medium"),
-    (re.compile(r"findOne|findById|findMany|\bfindAll\b|\bquery\b|execute|rawQuery|\.raw\b|aggregate|deleteMany|updateMany|insertMany|createQueryBuilder"), "database", "medium"),
+    (re.compile(r"findOne|findById|findMany|\bfindAll\b|\bquery\b|execute(Query|Sql|SQL|Statement|Raw|Batch)|rawQuery|\.raw\b|aggregate|deleteMany|updateMany|insertMany|createQueryBuilder"), "database", "medium"),
     (re.compile(r"readFile|createReadStream|readdir|realpath"), "filesystem-read", "low"),
     (re.compile(r"deserialize|unserialize|parseXml|loadYaml|fromJSON"), "deserialize", "low"),
 ]

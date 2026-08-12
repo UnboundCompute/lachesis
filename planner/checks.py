@@ -83,7 +83,8 @@ class PlannerTests(unittest.TestCase):
                     for h in self.planner.entry_points.by_handler()}
         self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "renameRecord",
                                     "deleteRecord", "touchRecord", "exportRecords",
-                                    "importRecord", "submitRecord"})
+                                    "importRecord", "submitRecord",
+                                    "cleanupRecord"})
 
     def test_implementation_is_anchored_at_its_registered_wrapper(self):
         # archiveRecordRow is never registered; the route reaches it through
@@ -199,6 +200,25 @@ class PlannerTests(unittest.TestCase):
                              "input validation is not authorization")
             self.assertTrue(any("authorization" in note
                                 for note in capsule["uncertainty"]))
+
+    # -- the sink catalog ------------------------------------------------------
+
+    def test_a_delegating_call_is_not_itself_a_sensitive_effect(self):
+        # `renameRecordRow` and `executeRecordCleanup` read like sink names and
+        # perform nothing; the operations are one hop down and are candidates
+        # there. Matching the delegator manufactures a duplicate candidate whose
+        # named effect is a function call.
+        effects = self.planner.effects()
+        delegating = {"renameRecordRow", "executeRecordCleanup"}
+        named = {e["symbol"].split("(")[0]
+                 for rows in effects.values() for e in rows}
+        self.assertEqual(named & delegating, set(),
+                         f"a delegating call was materialized as a sink: {named}")
+        # and the real operations inside it still are effects
+        performed = {e["symbol"].split("(")[0] for e in
+                     effects.get(self.function_id("executeRecordCleanup"), [])}
+        self.assertIn("store.deleteMany", performed)
+        self.assertIn("store.executeStatement", performed)
 
     # -- declarative recognition ---------------------------------------------
 

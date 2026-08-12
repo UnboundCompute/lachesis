@@ -74,6 +74,25 @@ export function submitRecord(req: Request): string {
   return "submitted";
 }
 
+// Delegation, not effect. Both callees read like a sink name and neither performs
+// an operation: the real ones are one hop down and are candidates there. A sink
+// catalog that matches these manufactures a duplicate candidate whose named effect
+// is a function call.
+export function cleanupRecord(req: Request): string {
+  renameRecordRow(req.recordId);
+  return executeRecordCleanup(req.recordId);
+}
+
+function renameRecordRow(recordId: string): string | undefined {
+  return store.findOne(recordId);
+}
+
+function executeRecordCleanup(recordId: string): string {
+  store.deleteMany(recordId);
+  store.executeStatement("delete from records");
+  return "cleaned";
+}
+
 function validateRecordId(recordId: string): void {
   if (!recordId) {
     throw new Error("bad request");

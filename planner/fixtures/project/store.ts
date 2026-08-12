@@ -12,4 +12,7 @@ export const store = {
     rows.delete(recordId);
     return 1;
   },
+  executeStatement(sql: string): number {
+    return sql.length;
+  },
 };
