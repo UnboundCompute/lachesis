@@ -82,7 +82,7 @@ class PlannerTests(unittest.TestCase):
         handlers = {self.store.gl.label(self.store.gl.nodes.get(h))
                     for h in self.planner.entry_points.by_handler()}
         self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "renameRecord",
-                                    "exportRecords"})
+                                    "deleteRecord", "touchRecord", "exportRecords"})
 
     def test_implementation_is_anchored_at_its_registered_wrapper(self):
         # archiveRecordRow is never registered; the route reaches it through
@@ -121,6 +121,44 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(capsule["state"], STATE_UNPROVEN)
             self.assertEqual(capsule["guards_present"], [])
             self.assertEqual(capsule["sensitive_effect"]["kind"], "database")
+
+    def test_a_checked_answer_that_is_branched_on_suppresses(self):
+        # isPermitted throws nothing; the suppression has to come from the caller
+        # acting on the answer, and it has to say so.
+        suppressed = [c for c in self.result["suppressions"]
+                      if c["entrypoint"]["symbol"] == "deleteRecord"]
+        self.assertTrue(suppressed, "a branched-on permission check did not suppress")
+        for capsule in suppressed:
+            basis = {g["predicate"]: g.get("suppression_basis")
+                     for g in capsule["guards_present"] if g["dominates"]}
+            self.assertEqual(basis.get("isPermitted"), "branch")
+
+    def test_a_throwing_guard_suppresses_without_a_branch_at_the_call_site(self):
+        suppressed = [c for c in self.result["suppressions"]
+                      if c["entrypoint"]["symbol"] == "archiveRecord"]
+        self.assertTrue(suppressed)
+        for capsule in suppressed:
+            basis = {g["predicate"]: g.get("suppression_basis")
+                     for g in capsule["guards_present"] if g["dominates"]}
+            self.assertEqual(basis.get("checkPermission"), "callee-throws")
+
+    def test_an_authorization_name_whose_answer_is_ignored_does_not_suppress(self):
+        # The whole point of the rule: refreshPermissionCache lands in the authz
+        # family by name, checks nothing, and must not clear anything.
+        queued = [c for c in self.result["queue"]
+                  if c["entrypoint"]["symbol"] == "touchRecord"]
+        self.assertTrue(queued,
+                        "a call that only looks like authorization suppressed a "
+                        "candidate")
+        for capsule in queued:
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            reported = {g["predicate"] for g in capsule["guards_present"]}
+            self.assertIn("refreshPermissionCache", reported,
+                          "the call still has to reach the consumer as evidence")
+            self.assertFalse(any(g["dominates"] for g in capsule["guards_present"]))
+            self.assertTrue(any("never branched on" in note
+                                for note in capsule["uncertainty"]),
+                            "the reason it did not suppress must reach the consumer")
 
     def test_a_validator_is_reported_but_does_not_clear_the_candidate(self):
         queued = [c for c in self.result["queue"]

@@ -20,13 +20,22 @@ was recognized** — never a bare boolean:
     and its identifier children), not from source text.
 
 **Recognizing a guard and clearing a candidate are different questions.** Every
-recognition above is reported; only the ones in an authorization family
-(``authz``, ``verify``) may *suppress*. A validator, a sanitizer and a bare
-guard shape all prove that something was checked, and none of them proves that the
-caller was allowed, so they lower a rank and stay in the evidence rather than
-answering the question. ``can_suppress`` carries that distinction on every row.
+recognition above is reported; a recognition may *suppress* only when both of these
+hold. A validator, a sanitizer and a bare guard shape all prove that something was
+checked, and none of them proves that the caller was allowed, so they lower a rank
+and stay in the evidence rather than answering the question. ``can_suppress`` carries
+the distinction on every row and ``suppression_basis`` says which way it was earned.
 
-**Three honest limits, all reported rather than hidden.**
+  1. *It is an authorization family* — ``authz`` or ``verify``.
+  2. *Its answer is acted on* — the call's result reaches a branch condition in the
+     caller (directly, or through a variable it was assigned to), **or** the callee
+     is itself guard-shaped, which is the throwing guard that needs no branch at the
+     call site. A name alone is not a check: ``upsertPermissions()`` and
+     ``allowOAuthMiddleware(provider)`` both land in the ``authz`` family by name and
+     neither answers a question about the current caller. On a real build this rule is
+     the difference between a plausible suppression count and an honest one.
+
+**Four honest limits, all reported rather than hidden.**
 
 *Relational and ownership guards* — ``if (doc.owner !== userId) throw`` — are real
 guards that none of these three recognitions names. Some are caught incidentally by
@@ -41,7 +50,13 @@ set to ``true`` or ``false``. A declarative recognition therefore carries
 and it may never flip one to ``PROVEN_PRESERVED``. Suppressing on an unread value
 would trade a false positive for a missed bug, which is the wrong direction.
 
-  python3 planner/guard_recognition.py graph.kuzu --fn executeArchiveRoom
+*Branch consumption is recognized syntactically*, from the condition expressions the
+graph already carries. A result stored on an object and branched on three functions
+later is a real check that this rule does not see. The consequence is that the guard
+does not suppress and the candidate stays on the queue, which is the direction an
+enumerator is allowed to be wrong in.
+
+  python3 planner/guard_recognition.py graph.kuzu --fn <function-id|name>
 """
 from __future__ import annotations
 
@@ -72,6 +87,21 @@ RECOGNITIONS = ("named", "structural", "declarative")
 SUPPRESSING_ROLES = frozenset({"authz", "verify"})
 _NOT_AUTHZ = ("this is a guard, but not an authorization one, so it is evidence "
               "against the candidate without answering it")
+_NOT_ACTED_ON = ("its name lands in an authorization family but its answer is never "
+                 "branched on here and it does not throw, so nothing is enforced by "
+                 "calling it")
+
+# Edge kinds that hold a condition's own expression. `CONDITION` points from the
+# branching statement *to* the expression it tests, so the expression subtree is what
+# "acted on" means; the statement itself is the whole `if`, body included, and reading
+# that as consumption would make every call inside any branch look enforced.
+CONDITION_EDGES = ("CONDITION",)
+SHORT_CIRCUIT_EDGES = ("SHORT_CIRCUIT_LEFT", "SHORT_CIRCUIT_RIGHT")
+# How far up the expression tree a call may sit from the condition that tests it.
+# `!(await guard(x))` is three, and the wrappers are shallow by construction; a deeper
+# walk stops meaning "this call is the condition".
+CONSUMPTION_HOPS = 5
+_UP_EDGES = ("AST_CHILD", "EXPANDS_TO")
 
 # Whole tokens that mean "this names an authorization requirement". Deliberately
 # narrower than the general security lexicon: this list is read against the
@@ -97,6 +127,104 @@ def declarative_tokens(name: str) -> frozenset[str]:
     return frozenset(hits)
 
 
+class BranchUse:
+    """Is a guard call's answer acted on, or is it only called?
+
+    Two shapes count, and they are the two ways a check can actually enforce
+    something. Either the call's result reaches a branch condition in the caller,
+    directly (``if (!await allowed(u))``) or through the variable it was assigned to
+    (``const ok = await allowed(u); if (!ok) throw``), or the callee is itself
+    guard-shaped, in which case it throws on failure and the caller is enforced by
+    calling it at all.
+
+    Everything else is a call whose name happens to read like authorization. Reading
+    those as guards is what makes a suppression count look good and be wrong."""
+
+    def __init__(self, store: GraphStore, guards: GuardProfiles | None = None) -> None:
+        self.gl = store.gl
+        self.index = store.index
+        self.guards = guards or GuardProfiles(store)
+        self._conditions: frozenset[str] | None = None
+        self._sites: dict[str, dict[str, list[str]]] = {}
+        self._consumed: dict[str, bool] = {}
+
+    def condition_expressions(self) -> frozenset[str]:
+        """Every expression a branch tests, in one pass over the guard edges."""
+        if self._conditions is None:
+            found: set[str] = set()
+            for edge in self.index.edges_of_kind(*CONDITION_EDGES):
+                found.add(edge["target"])
+            for edge in self.index.edges_of_kind(*SHORT_CIRCUIT_EDGES):
+                found.add(edge["source"])
+                found.add(edge["target"])
+            self._conditions = frozenset(found)
+        return self._conditions
+
+    def call_sites(self, fn_id: str) -> dict[str, list[str]]:
+        """callee id -> the call nodes inside ``fn_id`` that invoke it."""
+        cached = self._sites.get(fn_id)
+        if cached is not None:
+            return cached
+        sites: dict[str, list[str]] = {}
+        for node in self.index.nodes_owned_by(fn_id):
+            if self.gl.kind(node["id"]) != "call":
+                continue
+            for callee in self.index.targets(node["id"], "INVOKES", "MAY_INVOKE"):
+                sites.setdefault(callee["id"], []).append(node["id"])
+        self._sites[fn_id] = sites
+        return sites
+
+    def _reaches_a_condition(self, call_id: str) -> bool:
+        """Climb the expression tree from a call site to a condition it is tested in."""
+        if call_id in self._consumed:
+            return self._consumed[call_id]
+        conditions = self.condition_expressions()
+        frontier, seen = [call_id], {call_id}
+        answer = False
+        for _ in range(CONSUMPTION_HOPS):
+            following: list[str] = []
+            for node_id in frontier:
+                for edge in self.index.incoming_of_kind(node_id, *_UP_EDGES):
+                    parent = edge["source"]
+                    if parent in conditions:
+                        answer = True
+                        break
+                    if parent in seen:
+                        continue
+                    seen.add(parent)
+                    following.append(parent)
+                    # `const ok = guard(x)` — follow the assignment to the reads of
+                    # the variable, which is where the branch actually is.
+                    if self.gl.kind(parent) == "write":
+                        following.extend(self._reads_of(parent, seen))
+                if answer:
+                    break
+            if answer or not following:
+                break
+            frontier = following
+        self._consumed[call_id] = answer
+        return answer
+
+    def _reads_of(self, write_id: str, seen: set[str]) -> list[str]:
+        out: list[str] = []
+        for variable in self.index.targets(write_id, "WRITES_TO"):
+            for reference in self.index.sources(variable["id"], "REFERS_TO"):
+                if reference["id"] not in seen:
+                    seen.add(reference["id"])
+                    out.append(reference["id"])
+        return out
+
+    def basis(self, fn_id: str, callee_id: str) -> str | None:
+        """Why this call may suppress: ``callee-throws``, ``branch``, or not at all."""
+        # cheapest signal first: a guard-shaped callee enforces itself.
+        if self.guards.profile(callee_id)["class"] == "guard":
+            return "callee-throws"
+        for call_id in self.call_sites(fn_id).get(callee_id, ()):
+            if self._reaches_a_condition(call_id):
+                return "branch"
+        return None
+
+
 class GuardSet:
     """Every guard recognizable on a function, with its recognition attached."""
 
@@ -107,6 +235,7 @@ class GuardSet:
         self.index = store.index
         self.guards = guards or GuardProfiles(store)
         self.roles = CallRoles(store, guards=self.guards)
+        self.branch_use = BranchUse(store, guards=self.guards)
         self.entry_points = entry_points or EntryPoints(store)
         self._args_by_call: dict[str, list[dict]] | None = None
 
@@ -123,17 +252,22 @@ class GuardSet:
             # separate is what makes "how was this recognized" answerable.
             if not role_from_name(rec["callee"]):
                 continue
-            suppresses = rec["role"] in SUPPRESSING_ROLES
+            authorizing = rec["role"] in SUPPRESSING_ROLES
+            basis = self.branch_use.basis(fn_id, rec["callee_id"]) if authorizing \
+                else None
             row = {
                 "how": "named", "role": rec["role"],
                 "guard_id": rec["callee_id"], "guard_name": rec["callee"],
                 "file": rec["file"], "line": rec["line"],
-                "confidence": "medium", "can_suppress": suppresses,
+                "confidence": "medium", "can_suppress": bool(basis),
+                "suppression_basis": basis,
                 "fact_origin": rec["fact_origin"],
                 "evidence_ids": [fn_id, rec["callee_id"]],
             }
-            if not suppresses:
+            if not authorizing:
                 row["note"] = _NOT_AUTHZ
+            elif not basis:
+                row["note"] = _NOT_ACTED_ON
             out.append(row)
         return out
 

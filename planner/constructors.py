@@ -217,6 +217,7 @@ class GuardDifferential:
             "how": guard["how"], "node_id": guard["guard_id"],
             "host": guard.get("host_name"), "file": guard.get("file"),
             "line": guard.get("line"), "confidence": guard.get("confidence"),
+            "suppression_basis": guard.get("suppression_basis"),
         } for guard in verdict["guards"]]
         # Recognized, reported, and not allowed to answer the question: a validator, a
         # bare guard shape, a requirement declared on the registration. They are the
@@ -248,13 +249,18 @@ class GuardDifferential:
                 "a declarative requirement is present on the registration "
                 f"({', '.join(g['guard_name'] for g in declarative)}) but its value "
                 "is not readable from the graph, so it did not suppress")
-        if not suppressed and verdict.get("other_guards"):
-            names = ", ".join(sorted({g["guard_name"]
-                                      for g in verdict["other_guards"]}))
-            uncertainty.append(
-                f"guards are present on the path ({names}) but none of them is an "
-                f"authorization check, so they lower the rank without answering the "
-                f"question")
+        # One line per *reason* a recognized guard did not answer, naming the guards
+        # it applies to. A single "none of these is authorization" sentence would be
+        # wrong now that a guard can also fail to clear a candidate by being an
+        # authorization call whose answer is never acted on.
+        by_reason: dict[str, set[str]] = {}
+        for guard in verdict.get("other_guards") or ():
+            note = guard.get("note")
+            if note:
+                by_reason.setdefault(note, set()).add(guard["guard_name"])
+        if not suppressed:
+            for note, names in sorted(by_reason.items()):
+                uncertainty.append(f"{', '.join(sorted(names))}: {note}")
         if suppressed:
             uncertainty.append(
                 "the guard is present on the call path; whether it dominates every "

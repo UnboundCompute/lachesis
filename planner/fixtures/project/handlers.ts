@@ -1,7 +1,7 @@
 // Three handlers, one per case the planner has to get right.
 
 import { Request } from "./router.js";
-import { checkPermission } from "./guards.js";
+import { checkPermission, isPermitted, refreshPermissionCache } from "./guards.js";
 import { store } from "./store.js";
 
 // Guarded at the registered wrapper, effect one hop down. Read from the
@@ -31,6 +31,25 @@ export function renameRecord(req: Request): string {
   validateRecordId(req.recordId);
   store.deleteMany(req.recordId);
   return "renamed";
+}
+
+// The check answers a question and the handler acts on the answer. Nothing throws
+// inside isPermitted, so this only suppresses because the result reaches a branch.
+export function deleteRecord(req: Request): string {
+  const allowed = isPermitted(req.userId, "delete-record");
+  if (!allowed) {
+    throw new Error("forbidden");
+  }
+  store.deleteMany(req.recordId);
+  return "deleted";
+}
+
+// Calls something that reads like authorization and acts on nothing. This is the
+// candidate a name-only rule suppresses and this one has to keep.
+export function touchRecord(req: Request): string {
+  refreshPermissionCache(req.userId);
+  store.deleteMany(req.recordId);
+  return "touched";
 }
 
 function validateRecordId(recordId: string): void {
