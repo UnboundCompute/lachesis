@@ -676,8 +676,14 @@ def main() -> int:
         current_owner = owner
         if not node.get("isImplicit") and not is_included and kind in ENTITY_KINDS:
             entity_kind = ENTITY_KINDS[kind]
-            name = node.get("name") or f"<anonymous@{node.get('id', '')}>"
             position = position_from_ast(node, path, texts, line_starts_cache)
+            # An unnamed record or enum still needs something to be named by, and it
+            # must not be clang's `id`: that is the AST node's *address*, which moves
+            # between runs under ASLR. An identity built from it is not reproducible,
+            # so two builds of unchanged source disagree and any fact anchored to the
+            # declaration cannot be rejoined after a rebuild. The declaration's own
+            # source span is stable and is already part of the identity below.
+            name = node.get("name") or f"<anonymous@{position['start_offset']}>"
             entity_id = stable_id(entity_kind, path, position["start_offset"], position["end_offset"], name)
             graph.node(
                 "T1", entity_id, entity_kind, name, **position,
