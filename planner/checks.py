@@ -13,8 +13,8 @@ implementation gets wrong:
     calls it, and does **not** suppress, because its value is not readable,
   * nothing static is ever emitted as ``PROVEN_VIOLATED``.
 
-The fixture is four small TypeScript files and no dependencies, so the whole suite
-runs in seconds and never needs a large application checked out.
+The fixture is a handful of small TypeScript files and no dependencies, so the
+whole suite runs in seconds and never needs a large application checked out.
 """
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(handlers, {"archiveRecord", "purgeRecord", "renameRecord",
                                     "deleteRecord", "touchRecord", "exportRecords",
                                     "importRecord", "submitRecord",
-                                    "cleanupRecord"})
+                                    "cleanupRecord", "dropRecord", "wipeRecord"})
 
     def test_implementation_is_anchored_at_its_registered_wrapper(self):
         # archiveRecordRow is never registered; the route reaches it through
@@ -95,6 +95,29 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(anchors[0]["how"], "route")
         self.assertEqual(anchors[0]["distance"], 1)
         self.assertEqual(anchors[0]["anchor_label"], "POST /records.archive")
+
+    def test_object_literal_registration_is_an_anchor(self):
+        # Neither shape passes a callback positionally and neither is a route, so
+        # without this recognition both handlers are never scanned at all.
+        anchored = {}
+        for handler_id, anchors in self.planner.entry_points.by_handler().items():
+            for anchor in anchors:
+                if anchor["how"] == "object-literal-registration":
+                    anchored[self.store.gl.label(
+                        self.store.gl.nodes[handler_id])] = anchor["property_shape"]
+        self.assertEqual(anchored, {"dropRecord": "shorthand-reference",
+                                    "wipeRecord": "declared-inline"})
+
+    def test_a_registered_method_is_scanned_like_any_other_entrypoint(self):
+        guarded = [c for c in self.result["suppressions"]
+                   if c["entrypoint"]["symbol"] == "dropRecord"]
+        self.assertTrue(guarded, "the guarded registered method produced no capsule")
+        unguarded = [c for c in self.result["queue"]
+                     if c["entrypoint"]["symbol"] == "wipeRecord"]
+        self.assertTrue(unguarded, "the unguarded registered method was not queued")
+        for capsule in unguarded:
+            self.assertEqual(capsule["state"], STATE_UNPROVEN)
+            self.assertEqual(capsule["sensitive_effect"]["kind"], "database")
 
     # -- dominance -----------------------------------------------------------
 

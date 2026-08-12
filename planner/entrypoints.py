@@ -15,6 +15,12 @@ This module resolves, for any function, the set of **anchors** it is reachable f
   * ``callback-registration`` — a function handed to a registration call as a
     callback (``PASSES_CALLBACK``). Method-style registration (``register(name, fn)``)
     appears this way and has no route node.
+  * ``object-literal-registration`` — a function registered as a *property* of an
+    object literal handed to a registration call (``register({ deleteUser })``,
+    ``register({ deleteUser() { ... } })``). The frontend's callback resolution does
+    not descend into object-literal properties, so these emit no ``PASSES_CALLBACK``
+    and no route: without this recognition a whole method-registration convention is
+    invisible and every handler in it is silently never scanned.
   * ``exported-entry`` — an exported callable with no in-repo caller. Something
     outside the analyzed tree must be calling it, so it is an entry by elimination.
     Conservative by construction: absence of a caller is absence of *evidence* of a
@@ -53,7 +59,8 @@ ANCHOR_RADIUS = 2
 # Anchor recognitions, strongest first. The order is the tie-break used when one
 # function is anchored several ways: a framework-named handler beats a callback
 # passed to an unknown callee, which beats "nothing in the tree calls it".
-ANCHOR_KINDS = ("route", "callback-registration", "exported-entry")
+ANCHOR_KINDS = ("route", "callback-registration", "object-literal-registration",
+                "exported-entry")
 
 _CONFIDENCE_RANK = {"exact": 0, "high": 1, "medium": 2, "conservative": 3, "low": 4}
 
@@ -67,8 +74,10 @@ class EntryPoints:
         self.index = store.index
         self._by_handler: dict[str, list[dict]] | None = None
         self._called: frozenset[str] | None = None
+        self._spans: dict[str, list] | None = None
+        self._by_name: dict[str, list[dict]] = {}
 
-    # -- the three recognitions ---------------------------------------------
+    # -- the four recognitions ----------------------------------------------
 
     def _route_anchors(self) -> list[dict]:
         """Routes the framework model already resolved to a handler."""
@@ -123,6 +132,116 @@ class EntryPoints:
                 [anchor["id"], argument["id"], handler_id],
             ))
         return out
+
+    def _object_literal_anchors(self, claimed: set[str]) -> list[dict]:
+        """Handlers registered as properties of an object literal argument.
+
+        Two property shapes occur and both are read from structure, never from
+        source text: a callable *declared inside* the literal (``{ deleteUser() {}
+        }``, ``{ deleteUser: async () => {} }``), found by span containment in the
+        literal's allocation, and a *shorthand reference* to a callable declared
+        elsewhere (``{ deleteUser }``), found from the literal expression's
+        identifier children and resolved by name.
+
+        The shorthand route resolves by name and so is only taken when exactly one
+        callable declaration answers to it, preferring the file the registration is
+        in. An ambiguous name is left unanchored rather than anchored at a guess:
+        a wrong anchor would import a stranger's guard."""
+        out: list[dict] = []
+        spans = self._callable_spans()
+        for argument in self.index.nodes_of_kind("argument"):
+            props = argument.get("properties") or {}
+            if props.get("literal"):
+                continue
+            callsite_id = props.get("callsite_id")
+            anchor = self.gl.nodes.get(callsite_id) if callsite_id else None
+            if anchor is None or self.gl.kind(callsite_id) not in ("call", "construct"):
+                continue
+            for expression in self.index.targets(argument["id"], "EXPANDS_TO"):
+                for allocation in self.index.targets(expression["id"], "ALLOCATES"):
+                    allocated = allocation.get("properties") or {}
+                    if allocated.get("allocation_kind") != "object":
+                        continue
+                    for handler, how in self._literal_handlers(expression, allocated,
+                                                               spans):
+                        if handler["id"] in claimed:
+                            continue
+                        claimed.add(handler["id"])
+                        out.append(self._row(
+                            anchor, handler["id"], "object-literal-registration",
+                            "conservative",
+                            [callsite_id, argument["id"], handler["id"]],
+                            extra={"registered_as": self.gl.label(handler),
+                                   "property_shape": how},
+                        ))
+        return out
+
+    def _literal_handlers(self, expression: dict, allocated: dict, spans) -> list:
+        """(callable, shape) for every property of one object literal."""
+        found: list = []
+        seen: set[str] = set()
+        for callable_node in self._declared_inside(allocated, spans):
+            seen.add(callable_node["id"])
+            found.append((callable_node, "declared-inline"))
+        for child in self.index.targets(expression["id"], "AST_CHILD"):
+            if self.gl.kind(child["id"]) != "identifier":
+                continue
+            resolved = self._one_callable_named(self.gl.label(child),
+                                                (child.get("properties") or {}))
+            if resolved is not None and resolved["id"] not in seen:
+                seen.add(resolved["id"])
+                found.append((resolved, "shorthand-reference"))
+        return found
+
+    def _declared_inside(self, allocated: dict, spans) -> list[dict]:
+        """Callables whose source span sits inside the literal, outermost only.
+
+        Outermost only because an inner arrow function inside a registered handler
+        is not a second registration; it is part of the first."""
+        path = allocated.get("absolute_file")
+        start, end = allocated.get("start_offset"), allocated.get("end_offset")
+        if not path or start is None or end is None:
+            return []
+        inside = [(s, e, node) for s, e, node in spans.get(path, ())
+                  if s > start and e <= end]
+        out: list[dict] = []
+        for s, e, node in inside:
+            if any(os_ < s and e <= oe for os_, oe, _ in inside):
+                continue  # nested in another property's callable
+            out.append(node)
+        return out
+
+    def _callable_spans(self):
+        """absolute file -> (start_offset, end_offset, node) for every callable."""
+        if self._spans is None:
+            spans: dict[str, list] = {}
+            for node in self.index.nodes_of_kind(*CALLABLE_KINDS):
+                props = node.get("properties") or {}
+                path = props.get("absolute_file")
+                start, end = props.get("start_offset"), props.get("end_offset")
+                if path and start is not None and end is not None:
+                    spans.setdefault(path, []).append((start, end, node))
+            self._spans = spans
+        return self._spans
+
+    def _one_callable_named(self, name: str, near: dict) -> dict | None:
+        """The single callable declaration a shorthand property names, or None."""
+        if not name:
+            return None
+        cached = self._by_name.get(name)
+        if cached is None:
+            cached = [self.gl.nodes[hit["node_id"]]
+                      for hit in self.store.resolve(name)
+                      if hit.get("name") == name
+                      and hit["node_id"] in self.gl.nodes
+                      and self.gl.kind(hit["node_id"]) in CALLABLE_KINDS]
+            self._by_name[name] = cached
+        if len(cached) == 1:
+            return cached[0]
+        here = [node for node in cached
+                if (node.get("properties") or {}).get("absolute_file")
+                == near.get("absolute_file")]
+        return here[0] if len(here) == 1 else None
 
     def _exported_anchors(self, claimed: set[str]) -> list[dict]:
         """Exported callables nothing in the tree calls — entries by elimination."""
@@ -181,6 +300,7 @@ class EntryPoints:
             route_handlers = {r["handler_id"] for r in rows}
             rows += self._callback_anchors(route_handlers)
             claimed = {r["handler_id"] for r in rows}
+            rows += self._object_literal_anchors(claimed)
             rows += self._exported_anchors(claimed)
             index: dict[str, list[dict]] = {}
             for row in rows:
