@@ -68,7 +68,13 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
         languages=("typescript", "javascript"),
         extensions=(".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"),
         command=(
-            "node", str(root / "Lachesis" / "frontends" / "typescript" / "build_graph.mjs"),
+            # Node's default old-space is around 4GB, which a mid-sized application
+            # tree exhausts during analysis, before serialization is even reached: the
+            # node map, the edge list and the per-tier arrays are all live at once. The
+            # flag is advisory, so a small build still uses only what it needs, and it
+            # is spelled here rather than in NODE_OPTIONS so it shows up in `ps`.
+            "node", "--max-old-space-size=8192",
+            str(root / "Lachesis" / "frontends" / "typescript" / "build_graph.mjs"),
             "{source_dir}", "{output_dir}",
         ),
         working_directory=str(root),
