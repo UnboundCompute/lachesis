@@ -26,7 +26,7 @@ verdict is ``UNPROVEN`` with completeness ``OPAQUE``. A search that ran out of r
 has not proven anything, and turning "I stopped looking" into "it is guarded" is the
 one failure this layer must never have.
 
-  python3 planner/dominance.py graph.kuzu --entry channels.archive --effect archiveRoom
+  python3 planner/dominance.py graph.kuzu --entry <handler> --effect <function>
 """
 from __future__ import annotations
 

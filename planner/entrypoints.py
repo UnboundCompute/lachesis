@@ -29,7 +29,7 @@ Every anchor row carries how it was recognized and the graph ids that witness it
 nothing here returns a bare boolean.
 
   python3 planner/entrypoints.py graph.kuzu --stat
-  python3 planner/entrypoints.py graph.kuzu --fn executeArchiveRoom
+  python3 planner/entrypoints.py graph.kuzu --fn <function-id|name>
 """
 from __future__ import annotations
 
