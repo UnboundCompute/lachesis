@@ -52,6 +52,14 @@ def main() -> None:
              "build. Set LACHESIS_ENRICH_AT_BUILD=1 for the same effect.",
     )
     parser.add_argument(
+        "--timeout", type=int, default=300, metavar="SECONDS",
+        help="how long one frontend subprocess may run before the build gives up on "
+             "it (default 300). This bounds a single compile, not the whole build, so "
+             "a project with three frontends can legitimately take three times this. "
+             "Raise it for a large tree: a frontend killed mid-analysis reports as a "
+             "contract error, which reads like a bug in the source it was pointed at.",
+    )
+    parser.add_argument(
         "--incremental", action="store_true",
         help="reuse each frontend's prior on-disk bundle (under --frontend-out) when "
              "none of its source files changed, recompiling only the ones that did; "
@@ -84,13 +92,15 @@ def main() -> None:
     if args.parallel_packages:
         graph, snapshots, dropped = run_project_parallel(
             args.source_dir, args.frontend_out, enrich=enrich,
-            max_workers=args.max_workers,
+            max_workers=args.max_workers, timeout_seconds=args.timeout,
         )
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, args.frontend_out,
-                                                   enrich=enrich)
+                                                   enrich=enrich,
+                                                   timeout_seconds=args.timeout)
     else:
-        graph, snapshots = run_project(args.source_dir, args.frontend_out, enrich=enrich)
+        graph, snapshots = run_project(args.source_dir, args.frontend_out, enrich=enrich,
+                                       timeout_seconds=args.timeout)
     written = write_kuzu_graph(graph, snapshots, args.output_path, prune=args.prune,
                                enriched=enrich)
     if args.layered_out:
