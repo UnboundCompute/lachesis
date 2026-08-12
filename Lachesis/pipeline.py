@@ -108,10 +108,23 @@ def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
     # virtualenv, a build cache, and a tool cache. Walking any of them analyses
     # somebody else's source as if it were the project's, which is both slow and
     # wrong; site-packages alone can outweigh the repository several times over.
+    # A framework's build directory is the same problem wearing a different name, and
+    # it is worse than a dependency tree: the files in it are *generated bundles* of
+    # code already in the repository, so walking them analyses the project twice, once
+    # as source and once as minified output. A single bundled file also concentrates a
+    # whole application into one enormous line, which is what actually exhausts a
+    # compiler's heap. Measured on `vercel-chat/apps`: 809 of 909 discovered files were
+    # Next.js output under `.next`, and the TypeScript frontend ran out of memory at a
+    # 12 GB heap. Only unambiguously generated directory names belong here; `out` and
+    # `vendor` are deliberately absent because a project may legitimately keep source
+    # under either.
     ignored = {
         ".git", "node_modules", "graph_out", "dist", "build",
         ".venv", "venv", "__pycache__", ".tox", ".nox",
         ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages", ".eggs",
+        ".next", ".nuxt", ".svelte-kit", ".output", ".turbo", ".angular",
+        ".parcel-cache", ".docusaurus", ".vercel", ".cache", "coverage",
+        "bower_components",
     }
     is_test = None
     if not include_tests:
