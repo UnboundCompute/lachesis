@@ -304,6 +304,22 @@ def line_starts(path: Path, text: str, cache: Dict[Path, List[int]]) -> List[int
     return starts
 
 
+def token_source_length(token_text: str) -> int:
+    """How many source characters a dumped token spelling occupies.
+
+    `-dump-tokens` prints a token's spelling with C escapes still in it, so the
+    printed length overstates the source length whenever the token contains one.
+    Undoing the escapes recovers the real span, but the dump is a *partial* view
+    of a preprocessed stream: a spelling can be truncated mid-escape, and then
+    there is nothing to undo. Fall back to the printed length rather than fail
+    the whole frontend over one token's end offset.
+    """
+    try:
+        return len(token_text.encode("utf-8").decode("unicode_escape"))
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return len(token_text)
+
+
 def parse_clang_token(line: str) -> Optional[Tuple[str, str, Path, int, int]]:
     """Decode one compiler token-dump record without interpreting C source."""
     location_marker = "Loc=<"
@@ -1086,7 +1102,7 @@ def main() -> int:
             text = source_text(path, texts)
             starts = line_starts(path, text, line_starts_cache)
             start = starts[line_number - 1] + column - 1 if line_number <= len(starts) else 0
-            end = start + len(token_text.encode("utf-8").decode("unicode_escape"))
+            end = start + token_source_length(token_text)
             token_id = stable_id("token", path, start, end, token_kind)
             graph.node(
                 "T4", token_id, "token", token_text,
