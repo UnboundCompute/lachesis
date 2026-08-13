@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -74,6 +75,86 @@ def edge_view(edge: dict) -> dict:
 def enriched_store_path(graph_path: str) -> str:
     """The derived overlay-tier cache that sits beside a core-only store."""
     return str(graph_path).rstrip("/") + ".enriched"
+
+
+def joined_store_path(graph_path: str) -> str:
+    """The rejoined store that sits beside a reduced one, once its bodies are back."""
+    return str(graph_path).rstrip("/") + ".joined"
+
+
+def _joined_cache_matches(cache_path: str, source_hash: str | None) -> bool:
+    """True when ``cache_path`` is a rejoin of exactly this source tree.
+
+    Same rule as ``_cache_matches`` one function down, keyed on the source instead of on
+    the core graph: a reduced store's missing half comes from a compile, so what has to
+    be unchanged is the thing that was compiled. A missing hash on either side is a miss.
+    """
+    from lachesis.kuzu_store import (STORE_FORMAT_VERSION, is_kuzu_dir,
+                                     read_store_manifest)
+    if not source_hash or not is_kuzu_dir(cache_path):
+        return False
+    cached = read_store_manifest(cache_path)
+    return (cached.get("version") == STORE_FORMAT_VERSION
+            and bool(cached.get("enriched"))
+            and cached.get("source_content_hash") == source_hash)
+
+
+def _rejoin(graph_path: str, manifest: dict) -> str:
+    """Give a reduced store its bodies back, and return the path to open instead.
+
+    A reduced store holds the spine and the semantic layer and nothing from inside a
+    function. Those bodies are a pure function of the source, so they are recompiled here
+    and the stored semantics are joined onto them by content-addressed id. The result is
+    written to a ``<store>.joined`` cache keyed by the source hash, so only the first
+    load of a given tree pays the compile.
+
+    Refuses rather than degrades. A body-less graph does not answer approximately, it
+    answers *confidently wrong*: measured on this repo, ``guards`` reported a real guard
+    function as class ``passthrough`` with score 0.0 and zero conditions, where the truth
+    was ``guard``, 0.5, and three. So a missing or changed source tree is an error with
+    the recorded path in it, not a warning over a thinner answer.
+
+    Worth being plain about the trade: the reduction is a win on the artifact you build,
+    ship and transfer. After a first load the machine also holds the full-size join, so
+    disk at rest is not smaller.
+    """
+    from lachesis.kuzu_store import write_kuzu_graph
+    from lachesis.partition import join_graphs
+    from lachesis.pipeline import run_project_incremental, source_content_hash
+    from lachesis.nav.kuzu_index import KuzuGraphIndex, materialize_graph
+
+    source_dir = manifest.get("source_dir")
+    if not source_dir or not os.path.isdir(source_dir):
+        raise ValueError(
+            f"{graph_path} is a reduced store: it holds no function bodies and gets "
+            f"them back by recompiling the source it was built from, which it records "
+            f"as {source_dir!r}. That directory is not there. Point it at the source "
+            f"again, or rebuild the store without --reduced."
+        )
+    recorded = manifest.get("source_content_hash")
+    current = source_content_hash(source_dir)
+    if recorded and recorded != current:
+        raise ValueError(
+            f"{graph_path} is a reduced store built from {source_dir}, which has "
+            f"changed since (recorded {recorded[:12]}, now {current[:12]}). Its stored "
+            f"semantics describe source that is no longer there; rebuild it with "
+            f"`lachesis-analyze {source_dir} {graph_path} --reduced`."
+        )
+    cache = joined_store_path(graph_path)
+    if _joined_cache_matches(cache, current):
+        return cache
+
+    stored = materialize_graph(KuzuGraphIndex(graph_path))
+    # Incremental so that a rebuild after a source change recompiles only what moved;
+    # the bundles live beside the cache they feed, not in a temporary directory.
+    fresh, snapshots = run_project_incremental(
+        source_dir, cache + ".frontends", enrich=False)
+    joined = join_graphs(fresh, stored)
+    # prune=False: whatever the reduced store held is already the decision the build made,
+    # and the recompiled half must not be pruned to a different shape than the stored one.
+    write_kuzu_graph(joined, snapshots, cache, prune=False, enriched=True,
+                     source_content_hash=current)
+    return cache
 
 
 def _cache_matches(cache_path: str, core_hash: str | None) -> bool:
@@ -175,7 +256,13 @@ class GraphStore:
                 f"`lachesis-analyze <source_dir> {graph_path}`"
             )
         open_path = graph_path
-        if not core_manifest.get("enriched", True):
+        # A reduced store is opened through its rejoin, never directly: without the
+        # bodies the graph is half of itself, and no caller should have to know that.
+        # Same shape as the `.enriched` redirect below, and for the same reason — the
+        # missing tier is derivable, so deriving it is the loader's job.
+        if core_manifest.get("reduced"):
+            open_path = _rejoin(graph_path, core_manifest)
+        elif not core_manifest.get("enriched", True):
             cached = enriched_store_path(graph_path)
             if _cache_matches(cached, core_manifest.get("core_content_hash")):
                 open_path = cached

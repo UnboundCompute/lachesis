@@ -18,6 +18,10 @@ application.
 """
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -179,6 +183,115 @@ class PartitionTests(unittest.TestCase):
         for node in self.core["nodes"][:200]:
             if node["id"] in by_id:
                 self.assertEqual(node["label"], by_id[node["id"]]["label"])
+
+
+def _build(source: Path, destination: Path, *reduced: str) -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "lachesis.cli.analyze", str(source), str(destination),
+         "--frontend-out", str(destination) + ".frontends", "--enrich", *reduced],
+        cwd=ROOT, text=True, capture_output=True, check=False,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    if completed.returncode != 0:                        # pragma: no cover - environment
+        raise unittest.SkipTest(f"could not build the fixture:\n{completed.stderr}")
+
+
+class LoadTests(unittest.TestCase):
+    """The other half: what a reduced store is like to open.
+
+    The producer's job is proven above. This is the consumer's — that a caller which
+    knows nothing about the split gets the same answers from a store with no bodies in
+    it, because the loader put them back before handing the store over.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        root = Path(cls._tmp.name)
+        # A copy, so a check can edit a source file without touching the repo.
+        cls.source = root / "src"
+        shutil.copytree(FIXTURE, cls.source)
+        cls.whole = root / "whole.kuzu"
+        cls.reduced_store = root / "reduced.kuzu"
+        _build(cls.source, cls.whole)
+        _build(cls.source, cls.reduced_store, "--reduced")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _guard_rows(self, store) -> dict:
+        from lachesis.nav.guards import GuardProfiles
+        return {row["name"]: row["guard_signal"]
+                for row in GuardProfiles(store).top(50)}
+
+    def test_a_reduced_store_answers_like_a_whole_one(self) -> None:
+        from lachesis.nav.graph_store import GraphStore
+        from lachesis.nav.kuzu_index import materialize_graph
+
+        whole = materialize_graph(GraphStore.load(str(self.whole)).index)
+        rejoined = materialize_graph(GraphStore.load(str(self.reduced_store)).index)
+        self.assertEqual(
+            sorted(n["id"] for n in whole["nodes"]),
+            sorted(n["id"] for n in rejoined["nodes"]),
+        )
+        self.assertEqual(
+            {edge_identity(e) for e in whole["edges"]},
+            {edge_identity(e) for e in rejoined["edges"]},
+        )
+
+    def test_guard_profiles_survive_the_round_trip(self) -> None:
+        # Named specifically because this is the tool that failed loudest when the
+        # rejoin was missing: a body-less store reported a real guard as class
+        # "passthrough" with score 0.0 and zero conditions. Every counted field comes
+        # from a body edge, so if the bodies did not come back this inverts rather than
+        # thins out.
+        from lachesis.nav.graph_store import GraphStore
+
+        whole = self._guard_rows(GraphStore.load(str(self.whole)))
+        rejoined = self._guard_rows(GraphStore.load(str(self.reduced_store)))
+        self.assertTrue(any(row["score"] > 0 for row in whole.values()),
+                        "the fixture should contain at least one guard-shaped function")
+        self.assertEqual(whole, rejoined)
+
+    def test_the_second_load_does_not_recompile(self) -> None:
+        from lachesis.nav.graph_store import GraphStore, joined_store_path
+
+        GraphStore.load(str(self.reduced_store))
+        cache = Path(joined_store_path(str(self.reduced_store)))
+        self.assertTrue(cache.is_dir())
+        stamp = (cache / "graph.kuzu").stat().st_mtime_ns
+        GraphStore.load(str(self.reduced_store))
+        self.assertEqual(stamp, (cache / "graph.kuzu").stat().st_mtime_ns)
+
+    def test_a_changed_source_tree_is_refused(self) -> None:
+        # Not degraded, refused. The stored semantics describe source that is no longer
+        # there, and answering from them anyway is the confident-wrong-answer failure.
+        from lachesis.nav.graph_store import GraphStore
+
+        edited = next(self.source.rglob("*.ts"))
+        original = edited.read_text(encoding="utf-8")
+        edited.write_text(original + "\nexport const added = 1;\n", encoding="utf-8")
+        try:
+            with self.assertRaises(ValueError) as caught:
+                GraphStore.load(str(self.reduced_store))
+            self.assertIn("--reduced", str(caught.exception))
+        finally:
+            edited.write_text(original, encoding="utf-8")
+
+    def test_a_missing_source_tree_names_the_path_it_wanted(self) -> None:
+        from lachesis.kuzu_store import read_store_manifest, store_manifest_file
+        from lachesis.nav.graph_store import GraphStore
+
+        moved = Path(self._tmp.name) / "moved.kuzu"
+        shutil.copytree(self.reduced_store, moved)
+        manifest = read_store_manifest(str(moved))
+        manifest["source_dir"] = "/nowhere/at/all"
+        with open(store_manifest_file(str(moved)), "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        with self.assertRaises(ValueError) as caught:
+            GraphStore.load(str(moved))
+        self.assertIn("/nowhere/at/all", str(caught.exception))
 
 
 if __name__ == "__main__":                               # pragma: no cover
