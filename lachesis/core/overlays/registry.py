@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Protocol, Tuple
 
-from ..composition import GraphDelta, compose
+from ..composition import GraphAccumulator, GraphDelta
 from ..contract import ContractError
 
 
@@ -31,14 +31,26 @@ class OverlayRegistry:
         return tuple(self._overlays)
 
     def enrich(self, graph: dict) -> dict:
+        """Fold every applicable overlay's facts into one graph.
+
+        The accumulator is what makes this affordable. Recomposing the whole graph after
+        each overlay charges every later overlay for every earlier overlay's output, and
+        the overlays that contribute least pay the most, since the bill tracks the size
+        of the accumulated graph rather than the size of the contribution.
+
+        It is created lazily so that a registry where nothing applies hands back the
+        caller's own graph rather than a re-sorted copy of it, and so that the first
+        overlay to apply still sees the graph exactly as it arrived.
+        """
         current = graph
+        accumulator = None
         for overlay in self._overlays:
             if not overlay.applies(current):
                 continue
             delta = overlay.enrich(current)
-            current = compose((
-                GraphDelta("canonical-input", current["nodes"], current["edges"]),
-                delta,
-            ))
+            if accumulator is None:
+                accumulator = GraphAccumulator(graph["nodes"], graph["edges"])
+            accumulator.apply(delta)
+            current = accumulator.view()
         return current
 

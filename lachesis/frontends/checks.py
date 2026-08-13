@@ -3314,5 +3314,176 @@ class CompilerFrontendTests(unittest.TestCase):
         )
 
 
+def _node(node_id: str, kind: str = "function") -> dict:
+    return {"id": node_id, "kind": kind, "label": node_id, "properties": {}}
+
+
+def _edge(kind: str, source: str, target: str, **properties: object) -> dict:
+    return {"kind": kind, "source": source, "target": target,
+            "properties": dict(properties)}
+
+
+def _fold_with_compose(seed: dict, deltas) -> dict:
+    """What ``OverlayRegistry.enrich`` did before the accumulator: recompose per delta."""
+    from lachesis.core.composition import GraphDelta, compose
+
+    current = seed
+    for delta in deltas:
+        current = compose((
+            GraphDelta("canonical-input", current["nodes"], current["edges"]), delta,
+        ))
+    return current
+
+
+class GraphAccumulatorTests(unittest.TestCase):
+    """The accumulator is a folding of ``compose``, so ``compose`` is the oracle.
+
+    Every claim here is the same claim: for any sequence of deltas, the two agree — on
+    the graph when they accept, and on the message when they refuse.
+    """
+
+    def _deltas(self):
+        from lachesis.core.composition import GraphDelta
+
+        return [
+            # Rebinds an existing node to an identical value, which is allowed, and
+            # repeats an edge the seed already carries, which dedups away.
+            GraphDelta("first", [_node("a"), _node("c", "call")],
+                       [_edge("CALLS", "a", "b"), _edge("CALLS", "a", "c")]),
+            # Contributes no node at all. The real dynamic-dispatch overlay does this,
+            # and it is what the node ordering cache exists for.
+            GraphDelta("second", [], [_edge("INVOKES", "c", "b")]),
+            # Same triple as an edge already present, different properties, so both
+            # survive: the dedup key is not the triple alone.
+            GraphDelta("third", [_node("d", "allocation")],
+                       [_edge("CALLS", "a", "c", confidence="high"),
+                        _edge("ALLOCATES", "c", "d")]),
+        ]
+
+    def _seed(self) -> dict:
+        return {
+            "nodes": [_node("b"), _node("a")],
+            "edges": [_edge("CALLS", "a", "b")],
+        }
+
+    def test_the_accumulator_folds_to_exactly_what_compose_builds(self) -> None:
+        from lachesis.core.composition import GraphAccumulator
+
+        seed, deltas = self._seed(), self._deltas()
+        accumulator = GraphAccumulator(seed["nodes"], seed["edges"])
+        for delta in deltas:
+            accumulator.apply(delta)
+
+        self.assertEqual(_fold_with_compose(seed, deltas), accumulator.result())
+        # Not a vacuous comparison: the fold has to have done the three things the
+        # deltas were built to exercise.
+        folded = accumulator.result()
+        self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in folded["nodes"]])
+        self.assertEqual(3, sum(1 for e in folded["edges"] if e["kind"] == "CALLS"))
+
+    def test_a_view_taken_mid_fold_matches_compose_at_that_point(self) -> None:
+        """Overlays read the accumulated graph between deltas, so the intermediate
+        states have to agree too, not only the final one."""
+        from lachesis.core.composition import GraphAccumulator
+
+        seed, deltas = self._seed(), self._deltas()
+        accumulator = GraphAccumulator(seed["nodes"], seed["edges"])
+        for index, delta in enumerate(deltas):
+            accumulator.apply(delta)
+            self.assertEqual(
+                _fold_with_compose(seed, deltas[:index + 1]), accumulator.view(),
+            )
+
+    def test_an_edge_the_first_delta_completes_is_not_called_dangling(self) -> None:
+        """``compose`` sees the caller's graph and the first delta in one pass, so a
+        seed edge whose target the first delta supplies is legal. The accumulator takes
+        the seed and the delta in two steps, so it has to hold the seed's edges back
+        rather than judge them against a node set that is not finished yet."""
+        from lachesis.core.composition import GraphAccumulator, GraphDelta
+
+        seed = {"nodes": [_node("a")], "edges": [_edge("CALLS", "a", "late")]}
+        delta = GraphDelta("supplier", [_node("late")], [])
+
+        accumulator = GraphAccumulator(seed["nodes"], seed["edges"])
+        accumulator.apply(delta)
+        self.assertEqual(_fold_with_compose(seed, [delta]), accumulator.result())
+
+    def test_a_seed_edge_with_no_supplier_still_fails_and_says_the_same_thing(self) -> None:
+        from lachesis.core.composition import GraphAccumulator, GraphDelta, compose
+
+        seed = {"nodes": [_node("a")], "edges": [_edge("CALLS", "a", "missing")]}
+        accumulator = GraphAccumulator(seed["nodes"], seed["edges"])
+        with self.assertRaises(ContractError) as held:
+            accumulator.result()
+        with self.assertRaises(ContractError) as expected:
+            compose((GraphDelta("canonical-input", seed["nodes"], seed["edges"]),))
+        self.assertEqual(str(expected.exception), str(held.exception))
+
+    def test_the_accumulator_refuses_what_compose_refuses(self) -> None:
+        from lachesis.core.composition import GraphAccumulator, GraphDelta
+
+        seed = self._seed()
+        cases = {
+            "node conflict": GraphDelta(
+                "rebinder", [dict(_node("a"), label="renamed")], [],
+            ),
+            "dangling edge": GraphDelta("stray", [], [_edge("CALLS", "a", "nowhere")]),
+        }
+        for name, delta in cases.items():
+            with self.subTest(name):
+                accumulator = GraphAccumulator(seed["nodes"], seed["edges"])
+                with self.assertRaises(ContractError) as held:
+                    accumulator.apply(delta)
+                with self.assertRaises(ContractError) as expected:
+                    _fold_with_compose(seed, [delta])
+                self.assertEqual(str(expected.exception), str(held.exception))
+
+    def test_a_registry_where_nothing_applies_returns_the_graph_it_was_given(self) -> None:
+        """The accumulator is built lazily precisely so this stays true: a registry
+        that adds nothing must not silently re-sort or re-key the caller's graph."""
+        from lachesis.core.composition import GraphDelta
+        from lachesis.core.overlays import OverlayRegistry
+
+        class Inapplicable:
+            overlay_id = "inapplicable"
+
+            def applies(self, graph: dict) -> bool:
+                return False
+
+            def enrich(self, graph: dict) -> GraphDelta:  # pragma: no cover
+                raise AssertionError("enrich must not run when applies said no")
+
+        registry = OverlayRegistry()
+        registry.register(Inapplicable())
+        graph = self._seed()
+        self.assertIs(graph, registry.enrich(graph))
+
+    def test_each_overlay_sees_what_the_overlay_before_it_produced(self) -> None:
+        from lachesis.core.composition import GraphDelta
+        from lachesis.core.overlays import OverlayRegistry
+
+        seen: list[set[str]] = []
+
+        class Recording:
+            def __init__(self, overlay_id: str, delta: GraphDelta) -> None:
+                self.overlay_id = overlay_id
+                self._delta = delta
+
+            def applies(self, graph: dict) -> bool:
+                return True
+
+            def enrich(self, graph: dict) -> GraphDelta:
+                seen.append({node["id"] for node in graph["nodes"]})
+                return self._delta
+
+        registry = OverlayRegistry()
+        registry.register(Recording("first", GraphDelta("first", [_node("c")], [])))
+        registry.register(Recording("second", GraphDelta("second", [_node("d")], [])))
+        enriched = registry.enrich(self._seed())
+
+        self.assertEqual([{"a", "b"}, {"a", "b", "c"}], seen)
+        self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
+
+
 if __name__ == "__main__":
     unittest.main()
