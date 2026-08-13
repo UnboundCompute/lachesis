@@ -440,21 +440,32 @@ class PropsCodec:
     Not shared across builds and not cached at module level: a prototype belongs to the
     dictionary it was primed with, and one process may well write two stores. It is also
     not safe to clone from concurrently, so a parallel writer needs one prototype each.
+
+    `texts` is the second amortisation: the tails the dictionary pre-pass already built,
+    kept rather than discarded, so no row's properties are serialised to JSON twice. It
+    is positional against the collection it was built from, which is what makes a codec
+    belong to exactly one of `nodes` / `edges` / `deferred` — the three are serialised
+    with different arguments and a codec handed the wrong list would write the wrong
+    rows. Without it the codec builds each tail on demand, which is the path a caller
+    outside the writer gets.
     """
 
-    __slots__ = ("_prototype",)
+    __slots__ = ("_prototype", "_texts")
 
-    def __init__(self, zdict: bytes = b"") -> None:
+    def __init__(self, zdict: bytes = b"",
+                 texts: Optional[Sequence[bytes]] = None) -> None:
         # No dictionary is the honest empty case, not a degenerate one: `zlib.compress`
         # is what a reader without a dictionary inflates against.
         self._prototype = zlib.compressobj(
             _PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
             zlib.DEF_MEM_LEVEL, 0, zdict) if zdict else None
+        self._texts = texts
 
-    def blob(self, properties: dict, elide: bool,
+    def blob(self, index: int, properties: dict, elide: bool,
              drop: frozenset = frozenset()) -> bytes:
-        """The `props` blob for one row: its tail, as deflated UTF-8 JSON."""
-        text = _props_text(properties, elide, drop)
+        """The `props` blob for row `index`: its tail, as deflated UTF-8 JSON."""
+        text = (self._texts[index] if self._texts is not None
+                else _props_text(properties, elide, drop))
         if self._prototype is None:
             return zlib.compress(text, _PROPS_ZLIB_LEVEL)
         obj = self._prototype.copy()
@@ -638,18 +649,29 @@ def write_kuzu_graph(
     # come first, and it has to see nodes *and* edges: the dictionary is a property of
     # the store, not of a table, and the two sides repeat different material (nodes
     # repeat `frontend_id`/`language`, edges repeat `relationship_class`/`source_tier`),
-    # so a dictionary built from either alone serves the other poorly. Only the counts
-    # are kept, not the texts, which is why this is cheap enough to pay twice.
-    props_dict = build_props_dictionary(itertools.chain(
-        (_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
-         for n in nodes),
-        (_props_text(e.get("properties") or {}, elide_constants)
-         for e in itertools.chain(edges, deferred)),
-    ))
-    # The compressor is primed with that dictionary once, here, and cloned per row by
-    # the loaders below. It can only be built after the pre-pass, since priming is what
-    # it is for.
-    codec = PropsCodec(props_dict)
+    # so a dictionary built from either alone serves the other poorly.
+    #
+    # The two passes are inherent and stay: picking the most frequent tails needs counts
+    # over the whole corpus, so the first row cannot be compressed until the last has
+    # been seen. What does not have to stay is *rebuilding* the tails for the second
+    # pass, so they are kept here and handed to the loaders. On a graph of this repo that
+    # is ~740k tails and about 90 MB held for the length of the write, and it grows with
+    # the graph — the trade is memory against a second full JSON serialisation of every
+    # row.
+    node_texts = [_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
+                  for n in nodes]
+    edge_texts = [_props_text(e.get("properties") or {}, elide_constants)
+                  for e in edges]
+    deferred_texts = [_props_text(e.get("properties") or {}, elide_constants)
+                      for e in deferred]
+    props_dict = build_props_dictionary(
+        itertools.chain(node_texts, edge_texts, deferred_texts))
+    # One codec per collection, each primed with that dictionary and cloned per row by
+    # the loaders below. They can only be built after the pre-pass: the priming is the
+    # point, and the dictionary is its input.
+    node_codec = PropsCodec(props_dict, node_texts)
+    edge_codec = PropsCodec(props_dict, edge_texts)
+    deferred_codec = PropsCodec(props_dict, deferred_texts)
 
     # The other manifest-carried table: the id prefixes the coded columns are written
     # against. Nodes only — every coded column is on the node table — and the whole
@@ -670,20 +692,20 @@ def write_kuzu_graph(
     if pa is not None and pq is not None:
         with tempfile.TemporaryDirectory(prefix="kuzu_stage_") as stage_dir:
             _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir,
-                             codec=codec, id_codes=id_codes)
+                             codec=node_codec, id_codes=id_codes)
             _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
-                             node_units=node_units, codec=codec,
+                             node_units=node_units, codec=edge_codec,
                              id_codes=id_codes)
             _load_deferred_bulk(conn, deferred, elide=elide_constants,
                                 stage_dir=stage_dir, node_units=node_units,
-                                codec=codec, id_codes=id_codes)
+                                codec=deferred_codec, id_codes=id_codes)
     else:  # pragma: no cover - exercised only without pyarrow
-        _load_nodes_rowwise(conn, nodes, elide=elide_constants, codec=codec,
+        _load_nodes_rowwise(conn, nodes, elide=elide_constants, codec=node_codec,
                             id_codes=id_codes)
         _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units,
-                            codec=codec, id_codes=id_codes)
+                            codec=edge_codec, id_codes=id_codes)
         _load_deferred_rowwise(conn, deferred, elide=elide_constants,
-                               node_units=node_units, codec=codec,
+                               node_units=node_units, codec=deferred_codec,
                                id_codes=id_codes)
     # counts describe what the store actually holds, which is the pruned set, not the
     # composed input — a reader comparing them against a scan should find them equal.
@@ -786,7 +808,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
         return
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     data: dict[str, list] = {c: [] for c in columns}
-    for node in nodes:
+    for index, node in enumerate(nodes):
         props = node.get("properties") or {}
         data["id"].append(encode_id(node["id"], id_codes or {}))
         data["kind"].append(node.get("kind"))
@@ -794,7 +816,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
         for prop in PROMOTED_NODE_PROPS:
             data[prop].append(_coded_cell(prop, _promoted_value(props, prop),
                                           id_codes or {}))
-        data["props"].append(codec.blob(props, elide, _COLUMN_KEYS))
+        data["props"].append(codec.blob(index, props, elide, _COLUMN_KEYS))
     table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
                       for c in columns})
     path = os.path.join(stage_dir, "node.parquet")
@@ -816,11 +838,11 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
     # An endpoint is matched against the `id` column, so it has to be coded the same way
     # that column was — the staged Parquet holds coded ids, not the graph's own.
     codes = id_codes or {}
-    for edge in edges:
+    for index, edge in enumerate(edges):
         kind = edge.get("kind")
         props = edge.get("properties") or {}
         unit = _edge_unit(edge, node_units)
-        stored = codec.blob(props, elide)
+        stored = codec.blob(index, props, elide)
         src, tgt = encode_id(edge["source"], codes), encode_id(edge["target"], codes)
         if kind in _HOT_SET:
             bucket = hot[kind]
@@ -873,7 +895,8 @@ def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: s
         columns["src"].append(encode_id(edge["source"], codes))
         columns["tgt"].append(encode_id(edge["target"], codes))
         columns["unit"].append(_edge_unit(edge, node_units))
-        columns["props"].append(codec.blob(edge.get("properties") or {}, elide))
+        columns["props"].append(
+            codec.blob(seq, edge.get("properties") or {}, elide))
     table = pa.table({
         "seq": pa.array(columns["seq"], pa.int64()),
         "kind": _str_col(columns["kind"]), "src": _str_col(columns["src"]),
@@ -908,7 +931,7 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
     stmt = f"CREATE (n:Node {{{placeholders}}})"
     conn.execute("BEGIN TRANSACTION")
     try:
-        for node in nodes:
+        for index, node in enumerate(nodes):
             props = node.get("properties") or {}
             params = {"id": encode_id(node["id"], id_codes or {}),
                       "kind": node.get("kind"),
@@ -916,7 +939,8 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
             for prop in PROMOTED_NODE_PROPS:
                 params[prop] = _coded_cell(prop, _promoted_value(props, prop),
                                            id_codes or {})
-            params["props"] = _blob_param(codec.blob(props, elide, _COLUMN_KEYS))
+            params["props"] = _blob_param(
+                codec.blob(index, props, elide, _COLUMN_KEYS))
             conn.execute(stmt, params)
         conn.execute("COMMIT")
     except Exception:
@@ -938,13 +962,13 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
                  "unit: $unit, props: CAST($props AS BLOB)}]->(b)")
     conn.execute("BEGIN TRANSACTION")
     try:
-        for edge in edges:
+        for index, edge in enumerate(edges):
             kind = edge.get("kind")
             props = edge.get("properties") or {}
             base = {"s": encode_id(edge["source"], id_codes or {}),
                     "t": encode_id(edge["target"], id_codes or {}),
                     "unit": _edge_unit(edge, node_units),
-                    "props": _blob_param(codec.blob(props, elide))}
+                    "props": _blob_param(codec.blob(index, props, elide))}
             if kind in _HOT_SET:
                 conn.execute(hot_stmt[kind], base)
             else:
@@ -974,7 +998,7 @@ def _load_deferred_rowwise(conn, deferred: list[dict], *, elide: bool,
                 "tgt": encode_id(edge["target"], codes),
                 "unit": _edge_unit(edge, node_units),
                 "props": _blob_param(
-                    codec.blob(edge.get("properties") or {}, elide)),
+                    codec.blob(seq, edge.get("properties") or {}, elide)),
             })
         conn.execute("COMMIT")
     except Exception:

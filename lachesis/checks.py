@@ -193,17 +193,23 @@ class PartitionTests(unittest.TestCase):
             _props_text(props, True, drop) for props, drop in rows)
         self.assertTrue(zdict, "the fixture should share enough to fill a dictionary")
 
-        codec, plain = PropsCodec(zdict), PropsCodec()
-        for props, drop in rows:
-            text = _props_text(props, True, drop)
+        texts = [_props_text(props, True, drop) for props, drop in rows]
+        # `cached` is how the writer runs: the tails the dictionary pre-pass built,
+        # handed back rather than rebuilt. `codec` recomputes them. The two have to
+        # agree, or the saved pass has quietly changed what is stored.
+        cached, codec, plain = (PropsCodec(zdict, texts), PropsCodec(zdict),
+                                PropsCodec())
+        for index, (props, drop) in enumerate(rows):
+            text = texts[index]
             fresh = zlib.compressobj(_PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
                                      zlib.DEF_MEM_LEVEL, 0, zdict)
-            self.assertEqual(fresh.compress(text) + fresh.flush(),
-                             codec.blob(props, True, drop))
+            expected = fresh.compress(text) + fresh.flush()
+            self.assertEqual(expected, codec.blob(index, props, True, drop))
+            self.assertEqual(expected, cached.blob(index, props, True, drop))
             # and the no-dictionary path is still plain deflate, which is what a reader
             # holding an empty dictionary inflates against.
             self.assertEqual(zlib.compress(text, _PROPS_ZLIB_LEVEL),
-                             plain.blob(props, True, drop))
+                             plain.blob(index, props, True, drop))
 
     def test_the_join_prefers_the_fresh_compile_over_the_store(self) -> None:
         # A store can be stale; the source in front of us cannot. Where both describe the
