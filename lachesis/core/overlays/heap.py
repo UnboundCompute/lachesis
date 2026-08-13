@@ -303,9 +303,14 @@ class HeapIdentity:
             }
 
         # Property reads and writes can reveal new aliases. Iterate location
-        # contents and identity propagation to a fixed point.
-        changed = True
-        while changed:
+        # contents and identity propagation to a fixed point, then emit once over
+        # the converged state. Every edge below is a function of that state and of
+        # nothing a later round can take away, since points and location_values
+        # only grow, so the rounds before convergence were re-deriving edges the
+        # dedup set immediately discarded. The propagation itself is unchanged, and
+        # so are the nodes and POINTS_TO edges that target_locations creates as a
+        # side effect of walking a prefix, which have to keep pace with the rounds.
+        def propagate(emit: bool) -> bool:
             changed = False
             for path in property_paths:
                 properties = path.get("properties", {})
@@ -324,11 +329,12 @@ class HeapIdentity:
                             before = len(location_values[location_id])
                             location_values[location_id].update(value_objects)
                             changed |= len(location_values[location_id]) != before
-                            add_edge(
-                                "WRITES_HEAP", write["id"], location_id,
-                                [write["id"], path["id"], location_id],
-                                property_path_id=path["id"],
-                            )
+                            if emit:
+                                add_edge(
+                                    "WRITES_HEAP", write["id"], location_id,
+                                    [write["id"], path["id"], location_id],
+                                    property_path_id=path["id"],
+                                )
                         abstract_object = parameter_objects.get(base_id)
                         function_id = write.get("properties", {}).get("owner_function_id")
                         if abstract_object and function_id:
@@ -337,7 +343,7 @@ class HeapIdentity:
                                 function_id, base_id, segments, write["id"],
                             )
                             effect_evidence = [function_id, base_id, path["id"], write["id"]]
-                            if effect_id not in effects:
+                            if emit and effect_id not in effects:
                                 effects.add(effect_id)
                                 add_node({
                                     "id": effect_id, "kind": "function-effect",
@@ -372,28 +378,36 @@ class HeapIdentity:
                                         before = len(location_values[caller_location])
                                         location_values[caller_location].update(contextual_values)
                                         changed |= len(location_values[caller_location]) != before
-                                        add_edge(
-                                            "APPLIES_EFFECT", context_id, caller_location,
-                                            [effect_id, context_id, caller_location],
-                                            effect_id=effect_id,
-                                        )
-                                        add_edge(
-                                            "WRITES_HEAP", write["id"], caller_location,
-                                            [effect_id, context_id, write["id"], caller_location],
-                                            effect_id=effect_id, context_id=context_id,
-                                        )
+                                        if emit:
+                                            add_edge(
+                                                "APPLIES_EFFECT", context_id, caller_location,
+                                                [effect_id, context_id, caller_location],
+                                                effect_id=effect_id,
+                                            )
+                                            add_edge(
+                                                "WRITES_HEAP", write["id"], caller_location,
+                                                [effect_id, context_id, write["id"],
+                                                 caller_location],
+                                                effect_id=effect_id, context_id=context_id,
+                                            )
                     for read in reads_by_target.get(path["id"], []):
                         for location_id in target_ids:
                             changed |= add_points(
                                 read["id"], location_values.get(location_id, set()),
                             )
-                            add_edge(
-                                "READS_HEAP", location_id, read["id"],
-                                [read["id"], path["id"], location_id],
-                                property_path_id=path["id"],
-                            )
+                            if emit:
+                                add_edge(
+                                    "READS_HEAP", location_id, read["id"],
+                                    [read["id"], path["id"], location_id],
+                                    property_path_id=path["id"],
+                                )
             for source, target in identity_edges:
                 changed |= add_points(target, points.get(source, set()))
+            return changed
+
+        while propagate(emit=False):
+            pass
+        propagate(emit=True)
 
         for value_id, object_ids in sorted(points.items()):
             if value_id not in index.nodes and value_id not in emitted_nodes:
