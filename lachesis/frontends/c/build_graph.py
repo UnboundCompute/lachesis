@@ -14,7 +14,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -258,6 +259,76 @@ def run_clang(
         clang_command(source_dir, path, *arguments, file_flags=file_flags),
         text=True, capture_output=True, check=False,
     )
+
+
+def clang_jobs() -> int:
+    """How many clang processes this frontend keeps in flight at once.
+
+    Deliberately below the core count. Each pass holds one whole ``stdout`` per
+    in-flight file, and for the AST pass that is the biggest buffer in the build — a
+    real kernel translation unit re-expands its headers into hundreds of MB of JSON
+    before the prune below trims it. Concurrency multiplies that peak, so the default
+    trades some of the available parallelism for a resident set that does not grow with
+    the machine. ``LACHESIS_C_JOBS`` overrides it, ``1`` restores the serial build.
+    """
+    configured = os.environ.get("LACHESIS_C_JOBS")
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            pass
+    return max(1, min(4, (os.cpu_count() or 1) // 2))
+
+
+def run_clang_over(
+    paths: Iterable[Path], source_dir: Path, *arguments: str,
+    file_flags_of: Optional[Dict[Path, List[str]]] = None,
+    jobs: Optional[int] = None,
+) -> Iterator[Tuple[Path, subprocess.CompletedProcess]]:
+    """Run one clang invocation per path, several at a time, yielding in ``paths`` order.
+
+    Every pass below is a serial loop whose per-file work is one ``run_clang`` — a pure
+    function of (path, flags) that spends nearly all of its wall time inside a
+    subprocess, doing nothing this interpreter needs the GIL for. So the compiles
+    overlap on threads while the *consumption* stays exactly as serial and exactly as
+    ordered as it was: results come back in the order the paths went in, never the order
+    the compiles finished. The emitted graph is therefore byte-identical to the serial
+    build, which matters here more than usual — node ids are content digests and the
+    manifest hashes what was emitted, so a scheduling-dependent order would show up as a
+    changed store.
+
+    At most ``jobs`` compiles are in flight, so the window bounds memory as well as CPU:
+    the pool is never handed the whole file list to buffer.
+    """
+    paths = list(paths)
+    flags = file_flags_of or {}
+    jobs = jobs or clang_jobs()
+    if jobs <= 1 or len(paths) <= 1:
+        for path in paths:
+            yield path, run_clang(source_dir, path, *arguments,
+                                  file_flags=flags.get(path))
+        return
+    upcoming = iter(paths)
+    pending: deque = deque()
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        def submit_next() -> bool:
+            path = next(upcoming, None)
+            if path is None:
+                return False
+            pending.append((path, pool.submit(
+                run_clang, source_dir, path, *arguments, file_flags=flags.get(path),
+            )))
+            return True
+
+        for _ in range(jobs):
+            if not submit_next():
+                break
+        while pending:
+            path, future = pending.popleft()
+            result = future.result()
+            # refill only after one result is retired, so the window stays at `jobs`
+            submit_next()
+            yield path, result
 
 
 def source_text(path: Path, cache: Dict[Path, str]) -> str:
@@ -572,8 +643,8 @@ def main() -> int:
         )
 
     # Compiler dependency extraction makes framework/header ownership explicit.
-    for path in translation_units:
-        dependency = run_clang(source_dir, path, "-MM", file_flags=compile_commands.get(path))
+    for path, dependency in run_clang_over(translation_units, source_dir, "-MM",
+                                           file_flags_of=compile_commands):
         flattened = dependency.stdout.replace("\\\n", " ")
         dependencies = flattened.split(":", 1)[1].split() if ":" in flattened else []
         for raw in dependencies:
@@ -598,8 +669,10 @@ def main() -> int:
     # Parse headers independently as compiler roots. This retains their exact
     # offsets; Clang otherwise reports included declarations using header-local
     # offsets but only the including-file provenance.
-    for path in files:
-        result = run_clang(source_dir, path, "-Xclang", "-ast-dump=json", "-fsyntax-only", "-Wno-everything", file_flags=compile_commands.get(path))
+    for path, result in run_clang_over(
+        files, source_dir, "-Xclang", "-ast-dump=json", "-fsyntax-only",
+        "-Wno-everything", file_flags_of=compile_commands,
+    ):
         # Clang emits a COMPLETE AST on stdout even when it exits nonzero from
         # residual (cross-config) diagnostics — routine for real kernel TUs, which
         # almost always have a few. Gating on returncode would discard that entire
@@ -1091,8 +1164,10 @@ def main() -> int:
     # Preprocessor-aware compiler tokens. These are deliberately partial: the
     # stream represents compiled tokens, while comments and inactive #if arms
     # require a separate raw-source trivia pass.
-    for path in files:
-        result = run_clang(source_dir, path, "-Xclang", "-dump-tokens", "-fsyntax-only", "-Wno-everything", file_flags=compile_commands.get(path))
+    for path, result in run_clang_over(
+        files, source_dir, "-Xclang", "-dump-tokens", "-fsyntax-only",
+        "-Wno-everything", file_flags_of=compile_commands,
+    ):
         previous = None
         for line in result.stderr.splitlines():
             parsed = parse_clang_token(line)
@@ -1126,10 +1201,10 @@ def main() -> int:
     # are reconstructed from a dedicated -E -dD pass (macros.py) and made
     # addressable. Preprocessing is lexical, so this succeeds even for a file
     # whose C body failed to parse — its #defines are still real.
-    for path in files:
-        if path not in file_ids:
-            continue
-        result = run_clang(source_dir, path, "-E", "-dD", file_flags=compile_commands.get(path))
+    for path, result in run_clang_over(
+        [path for path in files if path in file_ids], source_dir, "-E", "-dD",
+        file_flags_of=compile_commands,
+    ):
         if result.returncode != 0:
             continue
         for macro in parse_macro_definitions(result.stdout, path):
