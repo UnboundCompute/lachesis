@@ -10,6 +10,13 @@ from __future__ import annotations
 CURRENT_CONTRACT_VERSION = 2
 SUPPORTED_CONTRACT_VERSIONS = frozenset({CURRENT_CONTRACT_VERSION})
 
+# Deprecated. Tiers were meant to make a graph progressively drillable — read T0 for
+# the perimeter, descend when you need more — but nothing came to depend on them. The
+# navigation layer selects no tier property, and the only code that reads one is the
+# placement check in validation.py, which exists to check the tier a frontend was
+# obliged to pick because of that check. Kept because they are stamped into every
+# stored graph and into the layered projection, so removing them is a format change
+# and not a cleanup. See docs/DEPRECATED.md before building anything new on them.
 TIERS = frozenset({"T0", "T1", "T2", "T3", "T4"})
 FACT_ORIGINS = frozenset({
     "compiler", "runtime-model", "framework-model", "core-inference",
@@ -58,6 +65,10 @@ CANONICAL_NODE_KINDS = frozenset().union(
     SECURITY_EVIDENCE_NODE_KINDS,
 )
 
+# Deprecated with TIERS above: the legal tiers per node kind, and so the table that
+# decides whether a frontend's tier choice is accepted. A new node kind still needs an
+# entry here or its nodes are rejected, which is the maintenance cost the deprecation
+# is about.
 NODE_KIND_TIERS = {
     **{kind: frozenset({"T0"}) for kind in PROJECT_STRUCTURE_NODE_KINDS},
     **{kind: frozenset({"T1"}) for kind in {

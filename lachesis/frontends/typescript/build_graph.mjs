@@ -71,6 +71,9 @@ const outputDir = path.resolve(
 
 const SUPPORTED = new Set([".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"]);
 const IGNORED_DIRS = new Set([".git", "node_modules", "graph_out", "dist", "build"]);
+// Deprecated along with the tier concept; see docs/DEPRECATED.md. Nothing reads a
+// node's tier back, and these two tables survive because they name the files in
+// every bundle written so far and because core validation still checks placement.
 const TIER_NAMES = {
   T0: "perimeter",
   T1: "reachability",

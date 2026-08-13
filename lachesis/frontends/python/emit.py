@@ -14,6 +14,8 @@ CONTRACT_VERSION = 2
 FRONTEND_ID = "cpython-ast"
 LANGUAGE = "python"
 
+# Deprecated along with the tier concept itself; see docs/DEPRECATED.md. Still here
+# because the names are the tier file names in every bundle ever written.
 TIERS = {
     "T0": "perimeter", "T1": "reachability", "T2": "path",
     "T3": "body", "T4": "proof",
@@ -25,7 +27,8 @@ TIERS = {
 # even select one), so tier placement buys navigation nothing. It exists only
 # because lachesis/core/validation.py rejects a node whose tier is not a member of
 # schema.NODE_KIND_TIERS[kind]. Each kind therefore gets its one legal tier from
-# this table and no further design attention.
+# this table and no further design attention. Deprecated for that reason: a new
+# node kind needs a line here to satisfy a check that protects nothing.
 TIER_OF_KIND = {
     # T0 project structure
     "file": "T0", "module": "T0", "import": "T0", "export": "T0",

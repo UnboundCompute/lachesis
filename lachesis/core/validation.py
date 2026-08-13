@@ -1,6 +1,8 @@
 """Strict validation for canonical v2 frontend snapshots."""
 from __future__ import annotations
 
+import os
+import sys
 from collections import Counter
 from typing import Iterable
 
@@ -77,8 +79,48 @@ def _validate_common(snapshot: FrontendSnapshot) -> None:
         )
 
 
+TIER_VALIDATION_MODES = ("strict", "warn", "off")
+
+_tier_warned = False
+
+
+def tier_validation_mode() -> str:
+    """How hard to enforce the deprecated T0-T4 placement rules.
+
+    ``strict`` is the default and is what has always shipped: a misplaced tier is a
+    ContractError. ``warn`` reports the first violation and keeps the graph.
+    ``off`` skips the two checks entirely.
+
+    The knob exists because tiers are on their way out (docs/DEPRECATED.md) and the
+    honest way to retire a rule is to be able to run without it and see what breaks,
+    rather than to argue about it. Read per snapshot rather than cached, so a test
+    can set it around one call.
+    """
+    mode = os.environ.get("LACHESIS_TIER_VALIDATION", "strict").strip().lower()
+    if mode not in TIER_VALIDATION_MODES:
+        raise ContractError(
+            f"LACHESIS_TIER_VALIDATION must be one of "
+            f"{', '.join(TIER_VALIDATION_MODES)}; got {mode!r}"
+        )
+    return mode
+
+
+def _tier_violation(mode: str, message: str) -> None:
+    global _tier_warned
+    if mode == "strict":
+        raise ContractError(message)
+    if not _tier_warned:
+        _tier_warned = True
+        print(
+            f"lachesis: {message} (LACHESIS_TIER_VALIDATION={mode}; further tier "
+            f"violations in this process are not reported)",
+            file=sys.stderr,
+        )
+
+
 def _validate_v2(snapshot: FrontendSnapshot) -> None:
     _validate_common(snapshot)
+    tier_mode = tier_validation_mode()
     node_ids = {node["id"] for node in snapshot.nodes}
     for node in snapshot.nodes:
         node_id = node["id"]
@@ -91,12 +133,20 @@ def _validate_v2(snapshot: FrontendSnapshot) -> None:
             raise ContractError(
                 f"v2 frontend node {node_id} uses core/model-owned kind {kind!r}"
             )
-        if tier not in TIERS:
-            raise ContractError(f"v2 node {node_id} has invalid tier {tier!r}")
-        if tier not in NODE_KIND_TIERS.get(kind, frozenset()):
-            raise ContractError(
-                f"v2 node {node_id} kind {kind!r} cannot be placed in {tier}"
-            )
+        # Deprecated, and the only thing keeping tiers alive. See docs/DEPRECATED.md:
+        # nothing downstream reads a node's tier, so these two checks are the entire
+        # reason a frontend has to decide one. LACHESIS_TIER_VALIDATION exists to
+        # measure what removing them would cost, not to be turned off in a build
+        # whose output anyone keeps.
+        if tier_mode != "off":
+            if tier not in TIERS:
+                _tier_violation(
+                    tier_mode, f"v2 node {node_id} has invalid tier {tier!r}")
+            elif tier not in NODE_KIND_TIERS.get(kind, frozenset()):
+                _tier_violation(
+                    tier_mode,
+                    f"v2 node {node_id} kind {kind!r} cannot be placed in {tier}",
+                )
         if not validate_identity(node_id, "frontend"):
             raise ContractError(f"v2 frontend node has non-frontend identity: {node_id}")
         if identity_namespace(node_id) != snapshot.frontend_id:

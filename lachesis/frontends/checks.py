@@ -150,6 +150,69 @@ class CompilerFrontendTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "compiler_node_id"):
             validate_snapshot(snapshot)
 
+    def test_tier_validation_is_strict_until_asked_otherwise(self) -> None:
+        # Tiers are deprecated (docs/DEPRECATED.md) and this check is the only thing
+        # that reads one back, so LACHESIS_TIER_VALIDATION exists to measure what
+        # dropping it would cost. What matters is that measuring is opt-in: with the
+        # variable unset, a misplaced tier is the ContractError it has always been.
+        from lachesis.core.validation import tier_validation_mode
+
+        file_id = stable_id("frontend", "cpython-ast", "file", "/app.py")
+        snapshot = FrontendSnapshot(
+            frontend_id="cpython-ast",
+            contract_version=2,
+            languages=("python",),
+            capabilities={"syntax": "complete"},
+            manifest={"node_count": 1, "edge_count": 0},
+            nodes=[{
+                "id": file_id, "kind": "file", "label": "app.py",
+                "tier": "T3",  # a file is T0 and nothing else
+                "properties": {
+                    "fact_origin": "compiler", "confidence": "exact",
+                    "evidence_ids": [],
+                },
+            }],
+            edges=[],
+        )
+
+        environment = dict(os.environ)
+        os.environ.pop("LACHESIS_TIER_VALIDATION", None)
+        try:
+            self.assertEqual("strict", tier_validation_mode())
+            with self.assertRaisesRegex(ContractError, "cannot be placed in T3"):
+                validate_snapshot(snapshot)
+
+            os.environ["LACHESIS_TIER_VALIDATION"] = "off"
+            validate_snapshot(snapshot)  # the rest of the contract still applies
+            snapshot.nodes[0]["tier"] = "T9"
+            validate_snapshot(snapshot)  # including a tier that is not a tier
+
+            os.environ["LACHESIS_TIER_VALIDATION"] = "warn"
+            import io
+
+            from lachesis.core import validation
+
+            validation._tier_warned = False  # once per process, so start from unwarned
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                validate_snapshot(snapshot)
+                validate_snapshot(snapshot)
+            self.assertIn("invalid tier 'T9'", captured.getvalue())
+            self.assertEqual(1, captured.getvalue().count("invalid tier"),
+                             "warn reports once per process, not once per node")
+
+            os.environ["LACHESIS_TIER_VALIDATION"] = "loose"
+            with self.assertRaisesRegex(ContractError, "LACHESIS_TIER_VALIDATION"):
+                validate_snapshot(snapshot)
+        finally:
+            os.environ.clear()
+            os.environ.update(environment)
+
+        # Nothing above may have loosened anything else: putting the tier back makes
+        # the same snapshot valid again under the default.
+        snapshot.nodes[0]["tier"] = "T0"
+        validate_snapshot(snapshot)
+
     def test_core_has_no_frontend_ecosystem_or_compatibility_imports(self) -> None:
         self.assertEqual([], import_boundary_violations(ROOT / "lachesis"))
 
