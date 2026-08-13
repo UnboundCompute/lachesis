@@ -553,8 +553,16 @@ def write_kuzu_graph(
     nodes = _kept_nodes(graph.get("nodes", []), prune=prune,
                         drop_diagnostics=drop_diagnostics, drop_tests=drop_tests)
     kept_ids = {n["id"] for n in nodes}
+    # An edge whose endpoints are not both resident cannot be stored: `Node` is the only
+    # node table and both ends are foreign keys into it. Dropping such an edge is right,
+    # but dropping it *quietly* is not — the counts below describe what was stored, so a
+    # caller comparing them against its input graph learns that something went missing
+    # without learning how much. Every partial store (pruned, test-filtered, or holding
+    # only part of a layered graph) crosses this line, so the number is worth naming.
     edges = [e for e in graph.get("edges", [])
              if e.get("source") in kept_ids and e.get("target") in kept_ids]
+    unresolved_edge_count = len(graph.get("edges", [])) - len(edges)
+    dropped_node_count = len(graph.get("nodes", [])) - len(nodes)
     # id -> owning file, so an edge (which carries no `file` of its own) can inherit
     # its source node's unit as the §5 incremental key.
     node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
@@ -609,6 +617,11 @@ def write_kuzu_graph(
     payload = manifest_payload(graph, snapshots)
     payload["node_count"] = len(nodes)
     payload["edge_count"] = len(edges)
+    # What the input had and the store does not. Zero for an ordinary lossless write; a
+    # reader that finds these non-zero knows the store is a projection of a larger graph
+    # rather than the whole of one, which is a different thing to reason about.
+    payload["dropped_node_count"] = dropped_node_count
+    payload["unresolved_edge_count"] = unresolved_edge_count
     payload["enriched"] = bool(enriched)
     # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
     # rather than a sidecar file because losing it makes every `props` blob in the

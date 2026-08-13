@@ -150,6 +150,18 @@ own `node_count`/`edge_count`, and two fields that make deferred enrichment poss
   `<store>.enriched` cache stamps the hash of the core it was built from, and a load
   serves that cache only when the two agree.
 
+Two more fields say what the input graph had and the store does not:
+
+- `dropped_node_count` — input nodes the writer did not keep, which is what `prune`,
+  `drop_diagnostics` and `drop_tests` removed.
+- `unresolved_edge_count` — input edges whose endpoints are not both resident. `Node` is
+  the only node table and both ends are foreign keys into it, so an edge into a node the
+  store does not hold cannot be written. Dropping it is right; dropping it quietly is not.
+
+Both are zero for an ordinary lossless write. A reader that finds either non-zero knows
+the store is a projection of a larger graph rather than the whole of one, which is a
+different thing to reason about.
+
 It also carries `version`, the on-disk format. **v2** stores the full properties dict in
 every `props` blob, so the promoted typed columns are duplicates the reader never touches.
 **v3** stores only the tail in `props` and has the reader union the promoted columns back
