@@ -3485,6 +3485,82 @@ class GraphAccumulatorTests(unittest.TestCase):
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 
+class EdgeKeyDeduplicationTests(unittest.TestCase):
+    """``_EdgeKeys`` defers serializing properties, so it has to answer identically.
+
+    The oracle is the thing it replaced: a set of full ``_edge_key`` tuples. Every case
+    below is a case where the triple alone would give the wrong answer, or where the
+    deferral has to fire late rather than not at all.
+    """
+
+    def _oracle(self, edges) -> list:
+        """Which edges a full-key set would have accepted, in order."""
+        from lachesis.core.composition import _edge_key
+
+        seen, accepted = set(), []
+        for edge in edges:
+            key = _edge_key(edge)
+            if key not in seen:
+                seen.add(key)
+                accepted.append(edge)
+        return accepted
+
+    def _run(self, edges) -> list:
+        from lachesis.core.composition import _EdgeKeys
+
+        keys = _EdgeKeys()
+        return [edge for edge in edges if keys.add(edge)]
+
+    def test_it_accepts_exactly_what_a_full_key_set_accepts(self) -> None:
+        edges = [
+            _edge("CALLS", "a", "b"),
+            _edge("CALLS", "a", "b"),                      # exact repeat, dropped
+            _edge("CALLS", "a", "b", confidence="high"),   # same triple, kept
+            _edge("CALLS", "a", "b", confidence="high"),   # now a repeat, dropped
+            _edge("CALLS", "a", "c"),                      # untied triple, kept
+            _edge("INVOKES", "a", "b"),                    # differs only in kind
+            _edge("CALLS", "b", "a"),                      # differs only in direction
+        ]
+        self.assertEqual(self._oracle(edges), self._run(edges))
+        self.assertEqual(5, len(self._run(edges)))
+
+    def test_the_first_edge_of_a_tie_is_the_one_kept(self) -> None:
+        """The deferral must not cost first-wins: the surviving edge is the earlier
+        object, not an equal-looking later one."""
+        first = _edge("CALLS", "a", "b", confidence="exact")
+        later = _edge("CALLS", "a", "b", confidence="exact")
+        kept = self._run([first, later])
+        self.assertEqual(1, len(kept))
+        self.assertIs(first, kept[0])
+
+    def test_property_order_does_not_make_two_edges_look_different(self) -> None:
+        """``sort_keys=True`` is load-bearing, and it is only reached on a tie, so a tie
+        is the only place this can regress."""
+        edges = [
+            _edge("CALLS", "a", "b", confidence="high", reason="call"),
+            _edge("CALLS", "a", "b", reason="call", confidence="high"),
+        ]
+        self.assertEqual(1, len(self._run(edges)))
+        self.assertEqual(self._oracle(edges), self._run(edges))
+
+    def test_an_edge_with_no_properties_ties_with_an_empty_one(self) -> None:
+        bare = {"kind": "CALLS", "source": "a", "target": "b"}
+        empty = {"kind": "CALLS", "source": "a", "target": "b", "properties": {}}
+        self.assertEqual(1, len(self._run([bare, empty])))
+        self.assertEqual(1, len(self._run([empty, bare])))
+
+    def test_a_third_edge_on_a_tied_triple_is_still_judged(self) -> None:
+        """Once a triple is tied it takes a different path, so it needs its own case."""
+        edges = [
+            _edge("CALLS", "a", "b", confidence="exact"),
+            _edge("CALLS", "a", "b", confidence="high"),
+            _edge("CALLS", "a", "b", confidence="exact"),   # repeat of the first
+            _edge("CALLS", "a", "b", confidence="low"),     # genuinely new
+        ]
+        self.assertEqual(self._oracle(edges), self._run(edges))
+        self.assertEqual(3, len(self._run(edges)))
+
+
 class GraphIndexOrderingTests(unittest.TestCase):
     """Ordering a bucket on first read has to be invisible to every reader.
 

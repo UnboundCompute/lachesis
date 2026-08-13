@@ -25,11 +25,60 @@ def _edge_key(edge: dict) -> tuple:
     0.488s for this, over the same 279,046 edges and producing the same number of
     distinct keys. The C implementation wins; the cost that matters is how often this
     is called, not what it costs once.
+
+    Kept as the reference definition of edge identity. ``_EdgeKeys`` is what the two
+    composition paths actually use, and it computes this same key only for the edges
+    that need it.
     """
     return (
         edge["kind"], edge["source"], edge["target"],
         json.dumps(edge.get("properties", {}), sort_keys=True),
     )
+
+
+class _EdgeKeys:
+    """The set of edge identities seen so far, serializing properties only on a tie.
+
+    Two edges can only be duplicates if they agree on ``(kind, source, target)``, so
+    the properties are what settles a question that the triple has already almost
+    always answered. Measured over the 488,261 edges of one real composition: 487,364
+    distinct triples, and 1,291 edges (0.264%) sharing a triple with anything at all.
+    Keying every edge by ``json.dumps`` therefore pays a full serialization per edge to
+    discriminate a quarter of a percent of them, and it costs 0.88s against 0.10s for
+    the triples alone.
+
+    So the first edge of a triple is remembered as itself, and the properties of that
+    first edge are serialized only if a second edge ever arrives on the same triple.
+    The predicate is unchanged: an edge is new exactly when no earlier edge had the
+    same ``_edge_key``. First occurrence still wins, since acceptance order is
+    untouched. Nothing derived is retained for the 99.7% that never collide, which is
+    also the point at which the JSON text stopped being the largest thing held live
+    across a fold.
+    """
+
+    __slots__ = ("_first", "_tied")
+
+    def __init__(self) -> None:
+        self._first: dict = {}
+        self._tied: dict = {}
+
+    def add(self, edge: dict) -> bool:
+        """Record the edge, and say whether it was one we had not seen."""
+        triple = (edge["kind"], edge["source"], edge["target"])
+        first = self._first.get(triple)
+        if first is None:
+            self._first[triple] = edge
+            return True
+        properties = self._tied.get(triple)
+        if properties is None:
+            # The tie is real, so the first edge finally has to be serialized too.
+            properties = {json.dumps(first.get("properties", {}), sort_keys=True)}
+            self._tied[triple] = properties
+        key = json.dumps(edge.get("properties", {}), sort_keys=True)
+        if key in properties:
+            return False
+        properties.add(key)
+        return True
 
 
 def _dangling(edges: Iterable[dict], known) -> None:
@@ -49,7 +98,7 @@ def compose(deltas: Iterable[GraphDelta]) -> dict:
     """Union graph deltas while rejecting conflicting stable identities."""
     nodes = {}
     edges = []
-    edge_keys = set()
+    edge_keys = _EdgeKeys()
     for delta in deltas:
         for node in delta.nodes:
             existing = nodes.get(node["id"])
@@ -59,9 +108,7 @@ def compose(deltas: Iterable[GraphDelta]) -> dict:
                 )
             nodes[node["id"]] = node
         for edge in delta.edges:
-            key = _edge_key(edge)
-            if key not in edge_keys:
-                edge_keys.add(key)
+            if edge_keys.add(edge):
                 edges.append(edge)
 
     _dangling(edges, nodes)
@@ -104,7 +151,7 @@ class GraphAccumulator:
     def __init__(self, nodes: Iterable[dict] = (), edges: Iterable[dict] = ()) -> None:
         self._nodes: dict = {}
         self._edges: List[dict] = []
-        self._edge_keys: set = set()
+        self._edge_keys = _EdgeKeys()
         self._sorted_nodes: Optional[List[dict]] = None
         self._sorted_edges: Optional[List[dict]] = None
         self._unchecked: List[dict] = self._absorb(
@@ -124,9 +171,7 @@ class GraphAccumulator:
             self._nodes[node["id"]] = node
         fresh = []
         for edge in delta.edges:
-            key = _edge_key(edge)
-            if key not in self._edge_keys:
-                self._edge_keys.add(key)
+            if self._edge_keys.add(edge):
                 fresh.append(edge)
         if fresh:
             self._edges.extend(fresh)
