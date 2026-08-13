@@ -11,8 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lachesis.kuzu_store import write_kuzu_graph
-from lachesis.pipeline import (run_project, run_project_incremental,
-                               run_project_parallel)
+from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
+                                reduce_graph)
+from lachesis.pipeline import (enrich_project_graph, run_project,
+                               run_project_incremental, run_project_parallel,
+                               source_content_hash)
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
@@ -52,6 +55,15 @@ def main() -> None:
              "build. Set LACHESIS_ENRICH_AT_BUILD=1 for the same effect.",
     )
     parser.add_argument(
+        "--reduced", action="store_true",
+        help="store only the spine (files, declarations, scopes, call sites) and the "
+             "semantic layer that enrichment derived, leaving out the intra-function "
+             "bodies. A frontend hands the bodies back from the same source in seconds "
+             "and node ids are content-addressed, so nav recompiles them at load and "
+             "rejoins the stored semantics onto them. Implies --enrich, since there is "
+             "no semantic layer to keep without it.",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=300, metavar="SECONDS",
         help="how long one frontend subprocess may run before the build gives up on "
              "it (default 300). This bounds a single compile, not the whole build, so "
@@ -87,31 +99,53 @@ def main() -> None:
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
-    enrich = args.enrich or bool(args.layered_out)
+    enrich = args.enrich or bool(args.layered_out) or args.reduced
+    # A reduced store is defined by the difference between the two tiers — an edge is
+    # carried because the core graph does *not* contain it — so the two have to exist as
+    # separate values. The compile runs unenriched and this folds the overlay itself.
+    compile_enrich = enrich and not args.reduced
     dropped = 0
     if args.parallel_packages:
         graph, snapshots, dropped = run_project_parallel(
-            args.source_dir, args.frontend_out, enrich=enrich,
+            args.source_dir, args.frontend_out, enrich=compile_enrich,
             max_workers=args.max_workers, timeout_seconds=args.timeout,
         )
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, args.frontend_out,
-                                                   enrich=enrich,
+                                                   enrich=compile_enrich,
                                                    timeout_seconds=args.timeout)
     else:
-        graph, snapshots = run_project(args.source_dir, args.frontend_out, enrich=enrich,
+        graph, snapshots = run_project(args.source_dir, args.frontend_out,
+                                       enrich=compile_enrich,
                                        timeout_seconds=args.timeout)
-    written = write_kuzu_graph(graph, snapshots, args.output_path, prune=args.prune,
-                               enriched=enrich)
+    stored = graph
+    if args.reduced:
+        enriched = enrich_project_graph(graph, snapshots)
+        stored = reduce_graph(graph, enriched)
+        counts = partition_counts(enriched)
+        print(f"Reduced store: kept {counts[SPINE]} spine + {counts[SEMANTIC]} semantic "
+              f"nodes, left {counts[BODY]} body nodes to the recompile")
+        graph = enriched
+    written = write_kuzu_graph(
+        stored, snapshots, args.output_path, prune=args.prune, enriched=enrich,
+        carry_unresolved_edges=args.reduced,
+        source_dir=args.source_dir if args.reduced else None,
+        # Hashed rather than assumed: the store records what the tree was at build time,
+        # so a load can tell whether an already-joined cache still describes it.
+        source_content_hash=(source_content_hash(args.source_dir)
+                             if args.reduced else None),
+    )
     if args.layered_out:
         layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)
         print(f"Layered projection: {len(layered_files)} files in {args.layered_out}")
-    kinds = Counter(node["kind"] for node in graph["nodes"])
+    # The census describes the artifact, not the analysis: with --reduced the two differ,
+    # and the number a reader wants beside the store path is what the store holds.
+    kinds = Counter(node["kind"] for node in stored["nodes"])
     # a parallel build runs one frontend per package, so snapshots counts units, not frontends
     unit = "package units" if args.parallel_packages else "frontends"
     print(
-        f"Composed {len(snapshots)} {unit} into {len(graph['nodes'])} nodes "
-        f"and {len(graph['edges'])} edges: {written}"
+        f"Composed {len(snapshots)} {unit} into {len(stored['nodes'])} nodes "
+        f"and {len(stored['edges'])} edges: {written}"
     )
     if args.parallel_packages:
         print(f"Dropped {dropped} cross-package edges (parallel build)")

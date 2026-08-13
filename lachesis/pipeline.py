@@ -179,12 +179,23 @@ def enrich_graph(
     return default_security_overlay_registry().enrich(graph)
 
 
-def _enrich_graph(graph: CodeGraph, snapshots: Sequence[FrontendSnapshot]) -> CodeGraph:
+def enrich_project_graph(
+    graph: CodeGraph, snapshots: Sequence[FrontendSnapshot],
+) -> CodeGraph:
+    """``enrich_graph`` with the languages and capabilities read off the snapshots.
+
+    The public form of what ``run_project(enrich=True)`` does internally, for a caller
+    that needs the core graph and the enriched one as two separate values rather than
+    only the second.
+    """
     return enrich_graph(
         graph,
         {language for snapshot in snapshots for language in snapshot.languages},
         _combined_capabilities(snapshots),
     )
+
+
+_enrich_graph = enrich_project_graph
 
 
 def run_project(
@@ -247,6 +258,27 @@ def _group_digests(files: Iterable[str], source_dir: str) -> Dict[str, str]:
     ``source_dir`` so the manifest is portable across checkout locations."""
     return {os.path.relpath(path, source_dir): _file_digest(path)
             for path in sorted(files)}
+
+
+def source_content_hash(source_dir: str, include_tests: bool = False) -> str:
+    """One digest over every source file a build of ``source_dir`` would see.
+
+    The validity key for anything derived from a compile of this tree. A reduced store
+    holds no bodies and gets them back by recompiling, which is the expensive part of a
+    load, so the joined result is cached and this is what says whether the cache still
+    describes the source in front of us. Reading the bytes costs a fraction of a compile,
+    and unlike an mtime it does not go stale in either direction: a touched file with
+    unchanged content keeps the cache, and a restored older file loses it.
+    """
+    digests = _group_digests(source_inventory(source_dir, include_tests=include_tests),
+                            os.path.abspath(source_dir))
+    digest = hashlib.sha256()
+    for path in sorted(digests):
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(digests[path].encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:

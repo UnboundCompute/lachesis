@@ -539,6 +539,8 @@ def write_kuzu_graph(
     enriched: bool = True,
     core_content_hash: Optional[str] = None,
     carry_unresolved_edges: bool = False,
+    source_dir: Optional[str] = None,
+    source_content_hash: Optional[str] = None,
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
@@ -558,6 +560,11 @@ def write_kuzu_graph(
     node the store deliberately does not hold, and it becomes attachable again the moment
     the bodies are recompiled. Off by default, because for an ordinary whole-graph store
     an edge with a missing endpoint is a bug and silence about it would hide one.
+
+    ``source_dir`` and ``source_content_hash`` say which source tree this store was built
+    from and what it hashed to. A reduced store cannot be read without them: getting the
+    bodies back means compiling that tree again, and the hash is what says whether an
+    already-joined cache still describes it.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -664,6 +671,14 @@ def write_kuzu_graph(
     # to give them their far endpoint back. Equal to `unresolved_edge_count` for a
     # deferred store, zero for every other one.
     payload["deferred_edge_count"] = len(deferred)
+    # A reduced store is not a smaller graph, it is half of one: the bodies are missing on
+    # purpose and a load has to recompile them. Saying so in the manifest is what lets a
+    # reader tell that apart from a store that simply holds less.
+    payload["reduced"] = bool(carry_unresolved_edges)
+    if source_dir:
+        payload["source_dir"] = os.path.abspath(source_dir)
+    if source_content_hash:
+        payload["source_content_hash"] = source_content_hash
     payload["enriched"] = bool(enriched)
     # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
     # rather than a sidecar file because losing it makes every `props` blob in the

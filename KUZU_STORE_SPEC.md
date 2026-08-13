@@ -180,7 +180,19 @@ Two more fields say what the input graph had and the store does not:
   way, zero for every other one. The reader consults this field rather than probing for
   the table, so an ordinary store costs no query to learn it has none.
 
-The first two are zero for an ordinary lossless write. A reader that finds either non-zero knows
+A store built that way stamps three more fields, and it cannot be read without them:
+
+- `reduced` — this store is not a smaller graph, it is half of one. The bodies are absent
+  on purpose and a load has to recompile them before any tool can answer.
+- `source_dir` — the tree that was compiled, absolute. A reduced store is only readable
+  where that tree is present.
+- `source_content_hash` — one SHA-256 over every file `source_inventory` would discover
+  (`pipeline.source_content_hash`, reusing the incremental path's per-file digests).
+  Content rather than mtime, so a touched-but-unchanged file keeps the derived cache and a
+  restored older file loses it. The `<store>.joined` cache stamps the same hash, and a
+  load serves that cache only when the two agree.
+
+The first two counts are zero for an ordinary lossless write. A reader that finds either non-zero knows
 the store is a projection of a larger graph rather than the whole of one, which is a
 different thing to reason about.
 
