@@ -171,6 +171,40 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(0, manifest["deferred_edge_count"])
         self.assertEqual(0, manifest["unresolved_edge_count"])
 
+    def test_the_primed_compressor_writes_what_a_fresh_one_would(self) -> None:
+        # `PropsCodec` clones one compressor primed with the store's dictionary rather
+        # than constructing one per row, which is worth ~4x on the write phase and is
+        # only worth anything if the bytes are the same bytes. zlib documents `.copy()`
+        # as duplicating the compression state, but "the store is byte-identical" is a
+        # claim about this store, so it is checked here against real props rather than
+        # inherited from the manual.
+        import zlib
+
+        from lachesis.kuzu_store import (
+            PropsCodec, _COLUMN_KEYS, _PROPS_ZLIB_LEVEL, _props_text,
+            build_props_dictionary,
+        )
+
+        rows = [(n.get("properties") or {}, _COLUMN_KEYS)
+                for n in self.enriched["nodes"]]
+        rows += [(e.get("properties") or {}, frozenset())
+                 for e in self.enriched["edges"]]
+        zdict = build_props_dictionary(
+            _props_text(props, True, drop) for props, drop in rows)
+        self.assertTrue(zdict, "the fixture should share enough to fill a dictionary")
+
+        codec, plain = PropsCodec(zdict), PropsCodec()
+        for props, drop in rows:
+            text = _props_text(props, True, drop)
+            fresh = zlib.compressobj(_PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
+                                     zlib.DEF_MEM_LEVEL, 0, zdict)
+            self.assertEqual(fresh.compress(text) + fresh.flush(),
+                             codec.blob(props, True, drop))
+            # and the no-dictionary path is still plain deflate, which is what a reader
+            # holding an empty dictionary inflates against.
+            self.assertEqual(zlib.compress(text, _PROPS_ZLIB_LEVEL),
+                             plain.blob(props, True, drop))
+
     def test_the_join_prefers_the_fresh_compile_over_the_store(self) -> None:
         # A store can be stale; the source in front of us cannot. Where both describe the
         # same id, the compile wins.

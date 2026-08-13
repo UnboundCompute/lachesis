@@ -14,7 +14,7 @@ load — only light, index-shaped maps and per-node fetches:
 
   * ``_node(id)``  — PK lookup, reconstructs the canonical ``{id,label,kind,properties}``
     dict by unioning the promoted columns with the ``props`` blob, which carries only
-    the tail (see ``_stored_props``: a property in a typed column is not stored a second
+    the tail (see ``PropsCodec``: a property in a typed column is not stored a second
     time in the blob) as deflated JSON, against the store's shared preset dictionary
     (``manifest_props_dictionary``, read once at open). Cached.
   * ``_edges(id, reverse)`` — one generic traversal query per node; reconstructs edge
@@ -78,7 +78,7 @@ def _overlay_edge_key(edge: dict) -> str:
 
 
 def _inflate(props_blob: bytes, zdict: bytes) -> bytes:
-    """Undo ``kuzu_store._deflate``.
+    """Undo ``kuzu_store.PropsCodec.blob``.
 
     ``zdict`` is the store's shared preset dictionary, from its manifest. zlib only
     consults it when the stream says it needs one, so the wrong dictionary is not a
@@ -94,7 +94,7 @@ def _inflate(props_blob: bytes, zdict: bytes) -> bytes:
 def _restore(props_blob: Optional[bytes], zdict: bytes) -> dict:
     """Inflate a stored ``props`` blob back into a properties dict.
 
-    The blob is deflated UTF-8 JSON (see ``kuzu_store._stored_props``). Inflating all
+    The blob is deflated UTF-8 JSON (see ``kuzu_store.PropsCodec``). Inflating all
     244,954 nodes of the reference store costs 0.34s, against a materialize of ~5.5s."""
     props = json.loads(_inflate(props_blob, zdict)) if props_blob else {}
     for key, default in CONSTANT_PROP_DEFAULTS.items():

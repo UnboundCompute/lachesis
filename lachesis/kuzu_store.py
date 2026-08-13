@@ -200,7 +200,7 @@ def manifest_props_dictionary(manifest: dict) -> bytes:
     """The shared deflate dictionary this store's `props` blobs were written against.
 
     Empty for a store whose tails held nothing worth sharing (a tiny fixture), which is
-    also the plain-deflate path in ``_deflate``, so the empty case needs no branch of
+    also the plain-deflate path in ``PropsCodec``, so the empty case needs no branch of
     its own on either side.
     """
     return base64.b64decode(manifest.get(PROPS_DICT_KEY) or "")
@@ -422,19 +422,43 @@ def _props_text(properties: dict, elide: bool,
     return json.dumps(properties, separators=(",", ":")).encode("utf-8")
 
 
-def _deflate(text: bytes, zdict: bytes = b"") -> bytes:
-    """Deflate one `props` tail, against the store's shared dictionary if it has one."""
-    if not zdict:
-        return zlib.compress(text, _PROPS_ZLIB_LEVEL)
-    obj = zlib.compressobj(_PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
-                           zlib.DEF_MEM_LEVEL, 0, zdict)
-    return obj.compress(text) + obj.flush()
+class PropsCodec:
+    """Deflates one `props` tail per row, against the store's shared dictionary.
 
+    Every row is its own compressed unit, because `props` is a BLOB column read back
+    one row at a time: a shared stream would make row N depend on row N-1 and there
+    would be no random access left. That is not the part worth amortising.
 
-def _stored_props(properties: dict, elide: bool,
-                  drop: frozenset = frozenset(), zdict: bytes = b"") -> bytes:
-    """The `props` blob: the tail, as deflated UTF-8 JSON."""
-    return _deflate(_props_text(properties, elide, drop), zdict)
+    The part worth amortising is the priming. The dictionary is 32 KB, and a fresh
+    `zlib.compressobj` has to allocate deflate state and run that whole window through
+    it before it can code the ~130-byte tail that follows, so the setup dominates the
+    work by a wide margin. zlib compressors can be cloned, so one prototype is primed
+    when the dictionary is known and each row gets a `.copy()` of it. A clone starts
+    from the same state a fresh compressor would, so the bytes it emits are the same
+    bytes, which is a guarantee `lachesis.checks` pins rather than assumes.
+
+    Not shared across builds and not cached at module level: a prototype belongs to the
+    dictionary it was primed with, and one process may well write two stores. It is also
+    not safe to clone from concurrently, so a parallel writer needs one prototype each.
+    """
+
+    __slots__ = ("_prototype",)
+
+    def __init__(self, zdict: bytes = b"") -> None:
+        # No dictionary is the honest empty case, not a degenerate one: `zlib.compress`
+        # is what a reader without a dictionary inflates against.
+        self._prototype = zlib.compressobj(
+            _PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
+            zlib.DEF_MEM_LEVEL, 0, zdict) if zdict else None
+
+    def blob(self, properties: dict, elide: bool,
+             drop: frozenset = frozenset()) -> bytes:
+        """The `props` blob for one row: its tail, as deflated UTF-8 JSON."""
+        text = _props_text(properties, elide, drop)
+        if self._prototype is None:
+            return zlib.compress(text, _PROPS_ZLIB_LEVEL)
+        obj = self._prototype.copy()
+        return obj.compress(text) + obj.flush()
 
 
 def build_props_dictionary(texts: Iterable[bytes]) -> bytes:
@@ -622,6 +646,10 @@ def write_kuzu_graph(
         (_props_text(e.get("properties") or {}, elide_constants)
          for e in itertools.chain(edges, deferred)),
     ))
+    # The compressor is primed with that dictionary once, here, and cloned per row by
+    # the loaders below. It can only be built after the pre-pass, since priming is what
+    # it is for.
+    codec = PropsCodec(props_dict)
 
     # The other manifest-carried table: the id prefixes the coded columns are written
     # against. Nodes only — every coded column is on the node table — and the whole
@@ -642,20 +670,20 @@ def write_kuzu_graph(
     if pa is not None and pq is not None:
         with tempfile.TemporaryDirectory(prefix="kuzu_stage_") as stage_dir:
             _load_nodes_bulk(conn, nodes, elide=elide_constants, stage_dir=stage_dir,
-                             zdict=props_dict, id_codes=id_codes)
+                             codec=codec, id_codes=id_codes)
             _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
-                             node_units=node_units, zdict=props_dict,
+                             node_units=node_units, codec=codec,
                              id_codes=id_codes)
             _load_deferred_bulk(conn, deferred, elide=elide_constants,
                                 stage_dir=stage_dir, node_units=node_units,
-                                zdict=props_dict, id_codes=id_codes)
+                                codec=codec, id_codes=id_codes)
     else:  # pragma: no cover - exercised only without pyarrow
-        _load_nodes_rowwise(conn, nodes, elide=elide_constants, zdict=props_dict,
+        _load_nodes_rowwise(conn, nodes, elide=elide_constants, codec=codec,
                             id_codes=id_codes)
         _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units,
-                            zdict=props_dict, id_codes=id_codes)
+                            codec=codec, id_codes=id_codes)
         _load_deferred_rowwise(conn, deferred, elide=elide_constants,
-                               node_units=node_units, zdict=props_dict,
+                               node_units=node_units, codec=codec,
                                id_codes=id_codes)
     # counts describe what the store actually holds, which is the pruned set, not the
     # composed input — a reader comparing them against a scan should find them equal.
@@ -739,7 +767,7 @@ def _cell(column: str, value):
     if value is None:
         return None
     if column == "props":
-        return value  # already bytes from `_stored_props`; str() would corrupt it
+        return value  # already bytes from `PropsCodec.blob`; str() would corrupt it
     if column in _INT_COLUMNS:
         try:
             return int(value)
@@ -753,7 +781,7 @@ def _str_col(values: list) -> "pa.Array":
 
 
 def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
-                     zdict: bytes = b"", id_codes: Optional[dict] = None) -> None:
+                     codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
     if not nodes:
         return
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
@@ -766,7 +794,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
         for prop in PROMOTED_NODE_PROPS:
             data[prop].append(_coded_cell(prop, _promoted_value(props, prop),
                                           id_codes or {}))
-        data["props"].append(_stored_props(props, elide, _COLUMN_KEYS, zdict))
+        data["props"].append(codec.blob(props, elide, _COLUMN_KEYS))
     table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
                       for c in columns})
     path = os.path.join(stage_dir, "node.parquet")
@@ -775,7 +803,7 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
 
 
 def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
-                     node_units: dict, zdict: bytes = b"",
+                     node_units: dict, codec: PropsCodec,
                      id_codes: Optional[dict] = None) -> None:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
@@ -792,7 +820,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
         kind = edge.get("kind")
         props = edge.get("properties") or {}
         unit = _edge_unit(edge, node_units)
-        stored = _stored_props(props, elide, zdict=zdict)
+        stored = codec.blob(props, elide)
         src, tgt = encode_id(edge["source"], codes), encode_id(edge["target"], codes)
         if kind in _HOT_SET:
             bucket = hot[kind]
@@ -833,7 +861,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
 
 
 def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: str,
-                        node_units: dict, zdict: bytes = b"",
+                        node_units: dict, codec: PropsCodec,
                         id_codes: Optional[dict] = None) -> None:
     if not deferred:
         return
@@ -845,8 +873,7 @@ def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: s
         columns["src"].append(encode_id(edge["source"], codes))
         columns["tgt"].append(encode_id(edge["target"], codes))
         columns["unit"].append(_edge_unit(edge, node_units))
-        columns["props"].append(
-            _stored_props(edge.get("properties") or {}, elide, zdict=zdict))
+        columns["props"].append(codec.blob(edge.get("properties") or {}, elide))
     table = pa.table({
         "seq": pa.array(columns["seq"], pa.int64()),
         "kind": _str_col(columns["kind"]), "src": _str_col(columns["src"]),
@@ -872,7 +899,7 @@ def _blob_param(blob: bytes) -> str:
     return "".join("\\x%02X" % byte for byte in blob)
 
 def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
-                        zdict: bytes = b"",
+                        codec: PropsCodec,
                         id_codes: Optional[dict] = None) -> None:
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     placeholders = ", ".join(
@@ -889,8 +916,7 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
             for prop in PROMOTED_NODE_PROPS:
                 params[prop] = _coded_cell(prop, _promoted_value(props, prop),
                                            id_codes or {})
-            params["props"] = _blob_param(
-                _stored_props(props, elide, _COLUMN_KEYS, zdict))
+            params["props"] = _blob_param(codec.blob(props, elide, _COLUMN_KEYS))
             conn.execute(stmt, params)
         conn.execute("COMMIT")
     except Exception:
@@ -899,7 +925,7 @@ def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
 
 
 def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dict,
-                        zdict: bytes = b"",
+                        codec: PropsCodec,
                         id_codes: Optional[dict] = None) -> None:
     hot_stmt = {
         kind: (f"MATCH (a:Node), (b:Node) WHERE a.id = $s AND b.id = $t "
@@ -918,7 +944,7 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
             base = {"s": encode_id(edge["source"], id_codes or {}),
                     "t": encode_id(edge["target"], id_codes or {}),
                     "unit": _edge_unit(edge, node_units),
-                    "props": _blob_param(_stored_props(props, elide, zdict=zdict))}
+                    "props": _blob_param(codec.blob(props, elide))}
             if kind in _HOT_SET:
                 conn.execute(hot_stmt[kind], base)
             else:
@@ -932,7 +958,7 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
 
 
 def _load_deferred_rowwise(conn, deferred: list[dict], *, elide: bool,
-                           node_units: dict, zdict: bytes = b"",
+                           node_units: dict, codec: PropsCodec,
                            id_codes: Optional[dict] = None) -> None:
     if not deferred:
         return
@@ -948,7 +974,7 @@ def _load_deferred_rowwise(conn, deferred: list[dict], *, elide: bool,
                 "tgt": encode_id(edge["target"], codes),
                 "unit": _edge_unit(edge, node_units),
                 "props": _blob_param(
-                    _stored_props(edge.get("properties") or {}, elide, zdict=zdict)),
+                    codec.blob(edge.get("properties") or {}, elide)),
             })
         conn.execute("COMMIT")
     except Exception:
