@@ -14,7 +14,7 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 if __package__ in (None, ""):  # invoked as a bare script path, not with -m
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -40,19 +40,13 @@ SOURCE_SUFFIXES = {".py", ".pyi"}
 RETRY_FEATURE_VERSIONS = [(3, minor) for minor in range(12, 5, -1)]
 
 
-def read_roots(roots_file: str) -> List[Path]:
-    """Ingest exactly the discovery-provided root list.
+def select_roots(lines: Iterable[str]) -> List[Path]:
+    """The Python files in a discovery-provided root list, sorted and deduplicated.
 
-    lachesis/core/runner.py writes LACHESIS_ROOTS_FILE after it has already pruned
-    vendor directories and excluded tests, so honoring it means this frontend
-    inherits that one discovery instead of re-walking and re-introducing what was
-    filtered out.
+    Applied to the list however it arrived, so that a caller in this process and a
+    caller writing LACHESIS_ROOTS_FILE compile exactly the same set.
     """
     roots: List[Path] = []
-    try:
-        lines = Path(roots_file).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return roots
     for line in lines:
         trimmed = line.strip()
         if not trimmed:
@@ -63,12 +57,38 @@ def read_roots(roots_file: str) -> List[Path]:
     return sorted(set(roots))
 
 
-def walk(source_dir: Path) -> List[Path]:
+def read_roots(roots_file: str) -> List[Path]:
+    """Ingest exactly the discovery-provided root list.
+
+    lachesis/core/runner.py writes LACHESIS_ROOTS_FILE after it has already pruned
+    vendor directories and excluded tests, so honoring it means this frontend
+    inherits that one discovery instead of re-walking and re-introducing what was
+    filtered out.
+    """
+    try:
+        lines = Path(roots_file).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return select_roots(lines)
+
+
+def walk(source_dir: Path, roots: Optional[Sequence[str]] = None) -> List[Path]:
+    """The files to compile: the caller's root set if it has one, else the tree.
+
+    The same discovery reaches this frontend two ways. A subprocess is handed a file
+    to read; a caller in this process passes the list straight down. Neither is more
+    authoritative than the other, so both go through `select_roots` and an empty
+    result falls back to walking, exactly as it always has.
+    """
+    if roots is not None:
+        selected = select_roots(roots)
+        if selected:
+            return selected
     roots_file = os.environ.get("LACHESIS_ROOTS_FILE")
     if roots_file:
-        roots = read_roots(roots_file)
-        if roots:
-            return roots
+        from_file = read_roots(roots_file)
+        if from_file:
+            return from_file
     return sorted(
         path.resolve() for path in source_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES
@@ -149,8 +169,26 @@ def emit_diagnostic(graph: Graph, source: SourceFile, file_id: str, facts: dict)
     return diagnostic_id
 
 
-def build(source_dir: Path, output_dir: Path) -> int:
-    files = walk(source_dir)
+class Analysis(NamedTuple):
+    """One pass over a source tree, before any of it has been serialised.
+
+    ``build`` is this plus a write, and on a real tree the write is by far the
+    expensive half: parsing is a small fraction of this frontend's wall time and
+    ``json.dumps`` of these payloads is most of the rest. Handing the payloads back
+    instead of the exit code lets a caller inside this process take them directly
+    and never pay for bytes it would only parse straight back.
+
+    ``summary`` is what ``build`` prints, without the destination clause ``build``
+    appends — there is no destination when nothing is written.
+    """
+
+    payloads: Dict[str, dict]
+    manifest: dict
+    summary: str
+
+
+def analyze(source_dir: Path, roots: Optional[Sequence[str]] = None) -> Analysis:
+    files = walk(source_dir, roots)
     graph = Graph()
     diagnostics: List[str] = []
     failed_files: List[Path] = []
@@ -320,21 +358,26 @@ def build(source_dir: Path, output_dir: Path) -> int:
             for tier in TIERS
         ],
     }
+    return Analysis(payloads, manifest, (
+        f"CPython ast analyzed {analyzed} of {len(files)} Python files; emitted "
+        f"{len(graph.nodes)} nodes and {len(graph.edges)} edges"
+    ))
+
+
+def build(source_dir: Path, output_dir: Path) -> int:
+    analysis = analyze(source_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for tier, payload in payloads.items():
+    for tier, payload in analysis.payloads.items():
         (output_dir / f"{tier.lower()}_{TIERS[tier]}.json").write_text(
             json.dumps(payload, indent=2) + "\n", encoding="utf-8",
         )
     (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8",
+        json.dumps(analysis.manifest, indent=2) + "\n", encoding="utf-8",
     )
-    print(
-        f"CPython ast analyzed {analyzed} of {len(files)} Python files; emitted "
-        f"{len(graph.nodes)} nodes and {len(graph.edges)} edges to {output_dir}"
-    )
+    print(f"{analysis.summary} to {output_dir}")
     # A non-zero exit is a ContractError that kills the whole multi-language build,
     # so it is reserved for "nothing at all was ingested".
-    return 0 if files else 1
+    return 0 if analysis.manifest["root_file_count"] else 1
 
 
 def capabilities(complete_if_parsed: str) -> Dict[str, str]:

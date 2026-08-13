@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from ..core.contract import ContractError, FrontendSpec
+from ..core.contract import ContractError, FrontendSnapshot, FrontendSpec
+from ..core.snapshot import snapshot_from_payloads
 
 
 class FrontendRegistry:
@@ -101,6 +102,25 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     )
 
 
+def _cpython_ast_here(
+    source_dir: str, roots: Optional[Sequence[str]] = None,
+) -> FrontendSnapshot:
+    """Analyze `source_dir` in this process and return the snapshot directly.
+
+    Same code the subprocess runs, minus the serialisation between the two. The
+    import is deferred because it pulls in the whole Python frontend package, and a
+    caller that only wants the registry to partition file paths should not pay for
+    that.
+    """
+    from .python.build_graph import analyze
+
+    analysis = analyze(Path(source_dir).resolve(), roots)
+    return snapshot_from_payloads(
+        analysis.manifest, analysis.payloads,
+        stdout=f"{analysis.summary} in process",
+    )
+
+
 def cpython_ast_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     root = _workspace_root(workspace_root)
     return FrontendSpec(
@@ -116,6 +136,7 @@ def cpython_ast_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
         ),
         working_directory=str(root),
         priority=30,
+        in_process=_cpython_ast_here,
     )
 
 

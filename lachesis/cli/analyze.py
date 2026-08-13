@@ -28,8 +28,12 @@ def main() -> None:
              "manifest). This is the graph: nav and lachesis-query both read it.",
     )
     parser.add_argument(
-        "--frontend-out", default="graph_out/frontends",
-        help="directory retaining each compiler's native layered snapshot",
+        "--frontend-out", metavar="DIR", default=None,
+        help="also retain each compiler's native layered snapshot here. Off by "
+             "default: nothing in a normal build reads these bundles back, and a "
+             "frontend that can run in this process skips serialising them at all, "
+             "which is most of what the Python frontend spends its time on. Name a "
+             "directory to keep them for inspection or for an incremental rebuild.",
     )
     parser.add_argument(
         "--layered-out", metavar="DIR", default=None,
@@ -111,18 +115,26 @@ def main() -> None:
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
     compile_enrich = enrich and not args.reduced
+    frontend_out = args.frontend_out
+    if frontend_out is None and (args.parallel_packages or args.incremental):
+        # These two keep state on disk by construction: the parallel path gives every
+        # (frontend, package) job its own directory to write into, and the incremental
+        # path reuses the bundles and the change manifest it wrote last time. Neither
+        # means anything without a directory, so they keep the default a plain build
+        # no longer needs.
+        frontend_out = "graph_out/frontends"
     dropped = 0
     if args.parallel_packages:
         graph, snapshots, dropped = run_project_parallel(
-            args.source_dir, args.frontend_out, enrich=compile_enrich,
+            args.source_dir, frontend_out, enrich=compile_enrich,
             max_workers=args.max_workers, timeout_seconds=args.timeout,
         )
     elif args.incremental:
-        graph, snapshots = run_project_incremental(args.source_dir, args.frontend_out,
+        graph, snapshots = run_project_incremental(args.source_dir, frontend_out,
                                                    enrich=compile_enrich,
                                                    timeout_seconds=args.timeout)
     else:
-        graph, snapshots = run_project(args.source_dir, args.frontend_out,
+        graph, snapshots = run_project(args.source_dir, frontend_out,
                                        enrich=compile_enrich,
                                        timeout_seconds=args.timeout)
     stored = graph

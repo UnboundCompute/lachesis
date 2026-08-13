@@ -10,6 +10,36 @@ from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from .snapshot import load_snapshot
 
 
+def _in_process_applies(
+    frontend: FrontendSpec, output_dir: Optional[str],
+) -> bool:
+    """Whether this frontend may be run here instead of as a child process.
+
+    The subprocess is the contract and the in-process route is an optimisation, so
+    each condition below is a reason the two could differ, and any one of them sends
+    the work to the child, where the behaviour is the one that has always shipped.
+
+    ``output_dir is None`` is the caller saying it wants the graph and not the
+    bundle. When it names a directory it expects files in it, and not writing them
+    is the whole saving.
+
+    An empty ``environment`` matters because a spec that sets variables for its child
+    is saying something about how that child must run, and this process is not it.
+    Roots need no such condition: they go down as an argument rather than through
+    ``LACHESIS_ROOTS_FILE``, so both routes compile the same set without this process
+    having to mutate its own environment to say so.
+
+    ``LACHESIS_INPROCESS=0`` forces the child unconditionally, so a difference
+    between the two routes can be bisected without reverting anything.
+    """
+    return (
+        output_dir is None
+        and frontend.in_process is not None
+        and not frontend.environment
+        and os.environ.get("LACHESIS_INPROCESS") != "0"
+    )
+
+
 def run_frontend(
     frontend: FrontendSpec,
     source_dir: str,
@@ -17,6 +47,8 @@ def run_frontend(
     timeout_seconds: int = 300,
     roots: Optional[Sequence[str]] = None,
 ) -> FrontendSnapshot:
+    if _in_process_applies(frontend, output_dir):
+        return frontend.in_process(source_dir, roots)
     temporary = None
     if output_dir is None:
         temporary = tempfile.TemporaryDirectory(prefix="lachesis-frontend-")

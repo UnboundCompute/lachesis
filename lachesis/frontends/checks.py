@@ -1354,6 +1354,70 @@ class CompilerFrontendTests(unittest.TestCase):
                     ],
                 )
 
+    def test_the_in_process_python_frontend_agrees_with_its_subprocess(self) -> None:
+        # `cpython-ast` can run inside this process and hand its payloads straight to
+        # `snapshot_from_payloads`, skipping a serialisation nobody between the two
+        # ends wants. That is only allowed to be a speed difference.
+        #
+        # The comparison is deliberately one-sided: the subprocess snapshot has been
+        # through `json.dumps` and back, and the in-process one has not, so anything
+        # the round trip would have quietly normalised — a tuple flattened to a list,
+        # an int key stringified — survives on this side and shows up as inequality.
+        # Round-tripping both first would hide exactly the bug this exists to catch.
+        from lachesis.core.runner import run_frontend
+        from lachesis.frontends.registry import cpython_ast_frontend
+
+        frontend = cpython_ast_frontend()
+        self.assertIsNotNone(frontend.in_process)
+        fixtures = str(ROOT / "lachesis" / "frontends" / "python" / "fixtures")
+
+        here = run_frontend(frontend, fixtures, output_dir=None)
+        environment = dict(os.environ)
+        os.environ["LACHESIS_INPROCESS"] = "0"  # the escape hatch, forcing the child
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                child = run_frontend(frontend, fixtures, output)
+                self.assertTrue(
+                    (Path(output) / "manifest.json").is_file(),
+                    "the subprocess route still writes the bundle it always wrote",
+                )
+        finally:
+            os.environ.clear()
+            os.environ.update(environment)
+
+        # A caller-supplied root set has to survive the change of route too. It
+        # reaches the subprocess as a file and this process as an argument, and if
+        # those two selected different files the graphs would differ in what they
+        # contain rather than in how they were produced.
+        subset = sorted(str(path) for path in Path(fixtures).rglob("*.py"))[:2]
+        self.assertEqual(2, len(subset), "the fixture tree should hold several files")
+        rooted_here = run_frontend(frontend, fixtures, None, roots=subset)
+        os.environ["LACHESIS_INPROCESS"] = "0"
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                rooted_child = run_frontend(frontend, fixtures, output, roots=subset)
+        finally:
+            os.environ.clear()
+            os.environ.update(environment)
+        self.assertEqual(rooted_child.nodes, rooted_here.nodes)
+        self.assertEqual(rooted_child.edges, rooted_here.edges)
+        self.assertEqual(2, rooted_here.manifest["root_file_count"])
+        self.assertLess(len(rooted_here.nodes), len(here.nodes))
+
+        self.assertEqual(child.nodes, here.nodes)
+        self.assertEqual(child.edges, here.edges)
+        self.assertTrue(here.nodes, "the fixture tree should produce nodes")
+        self.assertEqual(child.frontend_id, here.frontend_id)
+        self.assertEqual(child.contract_version, here.contract_version)
+        self.assertEqual(child.languages, here.languages)
+        self.assertEqual(child.capabilities, here.capabilities)
+        # `source_dir` is the one manifest key allowed to differ: the subprocess is
+        # handed a resolved path and this process resolves its own.
+        self.assertEqual(
+            {k: v for k, v in child.manifest.items() if k != "source_dir"},
+            {k: v for k, v in here.manifest.items() if k != "source_dir"},
+        )
+
     def test_python_import_resolution_and_open_file(self) -> None:
         # Python has no compiler-supplied module map, so resolution is a function of
         # the directory layout and the root file set alone. The interpreter's

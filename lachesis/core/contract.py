@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .capabilities import (
     CAPABILITY_COMPLETE,
@@ -26,6 +26,16 @@ class FrontendSpec:
     working_directory: str
     environment: Mapping[str, str] = field(default_factory=dict)
     priority: int = 100
+    # An optional shortcut for a frontend that is importable here: given a source
+    # directory and the caller's root set, return the snapshot its subprocess would
+    # have produced. It is a shortcut and never a replacement — `command` stays
+    # authoritative, every frontend must still work as a subprocess, and
+    # lachesis/core/runner.py takes this route only when the caller has said it does
+    # not want the bundle written. A frontend in another language leaves it None and
+    # loses nothing.
+    in_process: Optional[
+        Callable[[str, Optional[Sequence[str]]], "FrontendSnapshot"]
+    ] = None
 
     def supports(self, path: str) -> bool:
         return Path(path).suffix.lower() in self.extensions
