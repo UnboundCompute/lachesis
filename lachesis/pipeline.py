@@ -281,6 +281,25 @@ def source_content_hash(source_dir: str, include_tests: bool = False) -> str:
     return digest.hexdigest()
 
 
+# Environment that changes what a frontend *emits*, as opposed to how fast it gets
+# there. A bundle is only reusable for a build whose settings match, so these are part
+# of the incremental key alongside the file digests: without them, a `--prune` build's
+# token-less bundle would be handed to an ordinary build, which would then be quietly
+# missing its whole lexical tier. LACHESIS_ROOTS_FILE is absent because the runner
+# rewrites it per build and the roots it names are already covered by the digests, and
+# LACHESIS_C_JOBS is absent because it is a scheduling knob whose output is identical.
+_OUTPUT_BEARING_ENVIRONMENT = (
+    "LACHESIS_EMIT_TOKENS", "LACHESIS_CFLAGS", "LACHESIS_COMPILE_COMMANDS",
+    "LACHESIS_INCLUDE_DEP_TYPES", "LACHESIS_MAX_DEPENDENCY_FILES",
+)
+
+
+def _build_options() -> Dict[str, str]:
+    """The output-bearing environment, as it stands, for the incremental key."""
+    return {name: os.environ[name]
+            for name in _OUTPUT_BEARING_ENVIRONMENT if name in os.environ}
+
+
 def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
     if not manifest_path or not os.path.isfile(manifest_path):
         return {}
@@ -333,12 +352,15 @@ def run_project_incremental(
 
     snapshots: List[FrontendSnapshot] = []
     manifest: Dict[str, dict] = {}
+    options = _build_options()
     for frontend_id in sorted(groups):
         frontend_output = os.path.join(output_root, frontend_id)
         digests = _group_digests(groups[frontend_id], source_dir)
         prior_entry = prior.get(frontend_id) or {}
         can_reuse = (
             prior_entry.get("files") == digests
+            # a bundle built under different settings answers a different question
+            and (prior_entry.get("options") or {}) == options
             and Path(frontend_output, "manifest.json").is_file()
         )
         if can_reuse:
@@ -349,7 +371,8 @@ def run_project_incremental(
                 frontend, source_dir, frontend_output, timeout_seconds,
                 roots=groups[frontend_id],
             ))
-        manifest[frontend_id] = {"bundle_dir": frontend_output, "files": digests}
+        manifest[frontend_id] = {"bundle_dir": frontend_output, "files": digests,
+                                 "options": options}
 
     if not snapshots:
         supported = sorted({

@@ -280,6 +280,24 @@ def clang_jobs() -> int:
     return max(1, min(4, (os.cpu_count() or 1) // 2))
 
 
+def emit_tokens() -> bool:
+    """Whether to run the token pass at all. ``LACHESIS_EMIT_TOKENS=0`` turns it off.
+
+    The pass is a whole extra clang parse of every file — a quarter of this frontend's
+    compiles — and it exists to produce ``token`` nodes and their ``HAS_TOKEN`` /
+    ``NEXT_TOKEN`` edges. Those are exactly what the store's ``prune`` lever deletes on
+    the way in, so a pruned build was parsing the tree a fourth time to fill a bundle,
+    load it, compose it, and then throw it away. A caller that knows it is pruning sets
+    this to 0 and the parse never happens.
+
+    Off is a real reduction in what the bundle contains, not a scheduling change, so it
+    is recorded: ``lexical_tokens`` goes into the manifest and the ``lexical``
+    capability drops from ``partial`` to ``none``. A consumer that wants tokens can
+    therefore see that this bundle has none, rather than concluding the file had none.
+    """
+    return os.environ.get("LACHESIS_EMIT_TOKENS", "1") != "0"
+
+
 def run_clang_over(
     paths: Iterable[Path], source_dir: Path, *arguments: str,
     file_flags_of: Optional[Dict[Path, List[str]]] = None,
@@ -1164,9 +1182,10 @@ def main() -> int:
     # Preprocessor-aware compiler tokens. These are deliberately partial: the
     # stream represents compiled tokens, while comments and inactive #if arms
     # require a separate raw-source trivia pass.
+    tokens_wanted = emit_tokens()
     for path, result in run_clang_over(
-        files, source_dir, "-Xclang", "-dump-tokens", "-fsyntax-only",
-        "-Wno-everything", file_flags_of=compile_commands,
+        files if tokens_wanted else [], source_dir, "-Xclang", "-dump-tokens",
+        "-fsyntax-only", "-Wno-everything", file_flags_of=compile_commands,
     ):
         previous = None
         for line in result.stderr.splitlines():
@@ -1336,8 +1355,13 @@ def main() -> int:
     manifest = {
         "version": 2, "frontend_contract_version": CONTRACT_VERSION,
         "frontend_id": FRONTEND_ID, "generator": FRONTEND_ID, "languages": ["c"],
+        # A bundle built without the token pass holds no lexical stream at all, so the
+        # claim is "none", not a weaker "partial". The distinction is the difference
+        # between "this file had no tokens" and "nobody looked".
+        "lexical_tokens": tokens_wanted,
         "capabilities": {
-            "lexical": "partial", "syntax": complete_if_parsed, "modules": complete_if_parsed,
+            "lexical": "partial" if tokens_wanted else "none",
+            "syntax": complete_if_parsed, "modules": complete_if_parsed,
             "dependency_sources": complete_if_parsed,
             "symbols": "partial", "types": "partial", "calls": "partial",
             "control_flow": "partial", "direct_data_flow": "partial",

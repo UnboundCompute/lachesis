@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -71,9 +72,10 @@ from lachesis.ecosystems.common import GenericRouteModel
 
 
 class CompilerFrontendTests(unittest.TestCase):
-    def run_command(self, *command: str) -> None:
+    def run_command(self, *command: str, environment: Optional[dict] = None) -> None:
         completed = subprocess.run(
             command, cwd=ROOT, text=True, capture_output=True, check=False,
+            env={**os.environ, **environment} if environment else None,
         )
         self.assertEqual(
             completed.returncode, 0,
@@ -855,6 +857,44 @@ class CompilerFrontendTests(unittest.TestCase):
                 and edge["properties"].get("via") == "DECLARES"
                 for edge in snapshot.edges
             ))
+
+    def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
+        """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
+
+        The saving is only legitimate if what it removes is exactly what the store's
+        ``prune`` lever would have deleted anyway. So this compares the two bundles as
+        sets rather than as counts: every non-token node and every edge that does not
+        touch a token must survive byte-identically, and the bundle must say ``lexical:
+        none`` so a consumer can tell an absent stream from an empty one.
+        """
+        def bundle(directory: str, tokens: str) -> FrontendSnapshot:
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py",
+                "lachesis/frontends/c/fixtures", directory,
+                environment={"LACHESIS_EMIT_TOKENS": tokens},
+            )
+            snapshot = load_snapshot(directory)
+            validate_snapshot(snapshot)
+            return snapshot
+
+        with tempfile.TemporaryDirectory() as full, tempfile.TemporaryDirectory() as lean:
+            with_tokens = bundle(full, "1")
+            without = bundle(lean, "0")
+
+        self.assertTrue(any(node["kind"] == "token" for node in with_tokens.nodes))
+        self.assertFalse(any(node["kind"] == "token" for node in without.nodes))
+        self.assertEqual("partial", with_tokens.capability("lexical"))
+        self.assertEqual("none", without.capability("lexical"))
+
+        def keep(snapshot: FrontendSnapshot):
+            tokens = {node["id"] for node in snapshot.nodes if node["kind"] == "token"}
+            nodes = {json.dumps(node, sort_keys=True)
+                     for node in snapshot.nodes if node["id"] not in tokens}
+            edges = {json.dumps(edge, sort_keys=True) for edge in snapshot.edges
+                     if edge["source"] not in tokens and edge["target"] not in tokens}
+            return nodes, edges
+
+        self.assertEqual(keep(with_tokens), keep(without))
 
     def test_c_compile_commands_supply_per_file_flags(self) -> None:
         # A two-directory project whose header lives outside the source dir fails to

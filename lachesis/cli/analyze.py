@@ -100,6 +100,13 @@ def main() -> None:
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
     enrich = args.enrich or bool(args.layered_out) or args.reduced
+    # --prune deletes the pure-lexical nodes on the way into the store, so asking a
+    # frontend for them is work whose entire output is discarded a step later. Telling
+    # the frontends up front turns that into work not done: for C the token stream costs
+    # a whole extra clang parse of every file. setdefault, not assignment, so an explicit
+    # LACHESIS_EMIT_TOKENS from the caller still wins in either direction.
+    if args.prune:
+        os.environ.setdefault("LACHESIS_EMIT_TOKENS", "0")
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
