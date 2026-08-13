@@ -23,7 +23,16 @@ def _fact(evidence_ids: list[str], confidence: str = "high") -> dict:
 
 
 def _copy(environment: dict[str, set[str]]) -> dict[str, set[str]]:
-    return {target: set(versions) for target, versions in environment.items()}
+    """Copy the mapping, not the version sets, which nobody mutates in place.
+
+    Both callers only ever rebind a whole target to a fresh single-element set
+    (``transfer`` at the phi and definition lines, and the event walk when a
+    definition is reached), and ``_merge`` reads its inputs into a new dict. So no
+    version set is ever added to after it is stored, and rebuilding every one of
+    them per copy allocates a set per live target per visit of every node in every
+    round of the fixpoint, only to have it compared and dropped.
+    """
+    return dict(environment)
 
 
 def _merge(environments) -> dict[str, set[str]]:

@@ -68,6 +68,7 @@ from lachesis.core.contract import ContractError, FrontendSnapshot
 from lachesis.core.boundaries import import_boundary_violations
 from lachesis.core.identities import stable_id
 from lachesis.core.query import GraphIndex
+from lachesis.core.overlays import branch_history
 from lachesis.ecosystems import EcosystemRegistry
 from lachesis.ecosystems.common import GenericRouteModel
 
@@ -3483,6 +3484,59 @@ class GraphAccumulatorTests(unittest.TestCase):
 
         self.assertEqual([{"a", "b"}, {"a", "b", "c"}], seen)
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
+
+
+class BranchHistoryCopyTests(unittest.TestCase):
+    """The reaching-definition environment is copied shallowly, so nothing may mutate it.
+
+    ``_copy`` used to rebuild every version set on every copy, which is one set per
+    live target per visit of every node in every round of the fixpoint. That is only
+    wasted work if no set is ever added to after it is stored, so the property under
+    test is exactly that: copying shallowly has to produce the same delta as copying
+    deeply. If some future edit starts mutating an environment in place, the two
+    stop agreeing and this fails.
+    """
+
+    @staticmethod
+    def _deep(environment):
+        return {target: set(versions) for target, versions in environment.items()}
+
+    def _delta(self, graph, copy_implementation):
+        original = branch_history._copy
+        branch_history._copy = copy_implementation
+        try:
+            return branch_history.BranchHistory().enrich(graph)
+        finally:
+            branch_history._copy = original
+
+    @staticmethod
+    def _shape(delta):
+        return (
+            [(node["id"], json.dumps(node, sort_keys=True)) for node in delta.nodes],
+            [(edge["kind"], edge["source"], edge["target"],
+              json.dumps(edge, sort_keys=True)) for edge in delta.edges],
+        )
+
+    def test_a_shallow_copy_produces_the_same_delta_as_a_deep_one(self) -> None:
+        graph, _ = run_project(
+            str(ROOT / "lachesis" / "frontends" / "typescript" / "fixtures"
+                / "branch_history")
+        )
+        shallow = self._delta(graph, branch_history._copy)
+        deep = self._delta(graph, self._deep)
+        self.assertEqual(self._shape(deep), self._shape(shallow))
+        self.assertTrue(any(edge["kind"] == "BRANCH_READS_FROM" for edge in shallow.edges))
+
+    def test_the_copy_is_shallow(self) -> None:
+        versions = {"a"}
+        copied = branch_history._copy({"target": versions})
+        self.assertIs(versions, copied["target"])
+
+    def test_rebinding_a_target_does_not_reach_the_environment_copied_from(self) -> None:
+        source = {"target": {"one"}}
+        copied = branch_history._copy(source)
+        copied["target"] = {"two"}
+        self.assertEqual({"target": {"one"}}, source)
 
 
 class EcosystemIndexSharingTests(unittest.TestCase):
