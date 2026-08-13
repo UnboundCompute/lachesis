@@ -13,3 +13,26 @@ for more details.
 
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------
+Third-party components redistributed with this software
+--------------------------------------------------------------------------
+
+TypeScript
+Copyright (c) Microsoft Corporation.
+Licensed under the Apache License, Version 2.0.
+
+The TypeScript frontend is backed by the TypeScript compiler API, so a copy of
+the compiler is included in the built distribution at
+lachesis/frontends/typescript/vendor/typescript, which is what lets an installed
+package analyse TypeScript without a separate `npm install`. Only the compiler
+API (lib/typescript.js) and the default library declaration files (lib/lib.*.d.ts)
+are included; the tsc and tsserver executables and the localized diagnostic
+catalogues are not.
+
+The Apache 2.0 license text as shipped by that project is retained alongside it
+at lachesis/frontends/typescript/vendor/typescript/LICENSE.txt, together with its
+own third-party notices in ThirdPartyNoticeText.txt.
+
+The pinned version and the script that fetches it are in
+tools/vendor_typescript.py. Upstream: https://github.com/microsoft/TypeScript

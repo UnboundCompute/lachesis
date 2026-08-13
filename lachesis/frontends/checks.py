@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -81,6 +82,23 @@ class CompilerFrontendTests(unittest.TestCase):
             completed.returncode, 0,
             f"command failed: {' '.join(command)}\n{completed.stdout}\n{completed.stderr}",
         )
+
+    @contextlib.contextmanager
+    def dependency_analysis_enabled(self):
+        """Run the body with dependency source analysis turned on.
+
+        For the in-process entry points, which spawn the frontend with this process's
+        environment rather than one the caller can pass in.
+        """
+        previous = os.environ.get("LACHESIS_INCLUDE_DEP_TYPES")
+        os.environ["LACHESIS_INCLUDE_DEP_TYPES"] = "1"
+        try:
+            yield
+        finally:
+            if previous is None:
+                del os.environ["LACHESIS_INCLUDE_DEP_TYPES"]
+            else:
+                os.environ["LACHESIS_INCLUDE_DEP_TYPES"] = previous
 
     def test_contract_v2_enforces_ownership_provenance_and_extensions(self) -> None:
         file_id = stable_id("frontend", "typescript-compiler-api", "file", "/app.ts")
@@ -496,11 +514,33 @@ class CompilerFrontendTests(unittest.TestCase):
                 {"parseOptional", "continuesAfterCatch"}, functions,
             )
 
-    def test_typescript_reachable_framework_runtime_sources(self) -> None:
+    def test_typescript_runtime_dependency_sources_are_off_by_default(self) -> None:
+        """A dependency's runtime source is not analysed unless it is asked for.
+
+        The default is first-party-only, because the transitive source and type closure
+        of a real dependency tree is what exhausts the compiler's heap, and a value
+        arriving from an external package is opaque and untrusted to taint analysis
+        either way. Pinned here so the pairing with the test below stays visible: the
+        capability exists, it is simply not what an unconfigured build pays for.
+        """
         with tempfile.TemporaryDirectory() as output:
             self.run_command(
                 "node", "lachesis/frontends/typescript/build_graph.mjs",
                 "lachesis/frontends/typescript/fixtures/framework", output,
+            )
+            snapshot = load_snapshot(output)
+            self.assertEqual(1, snapshot.manifest["root_file_count"])
+            self.assertEqual(0, snapshot.manifest["runtime_dependency_file_count"])
+
+    def test_typescript_reachable_framework_runtime_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            # LACHESIS_INCLUDE_DEP_TYPES=1 is what turns dependency analysis on; see the
+            # test above for why it is off by default. Without it this fixture resolves
+            # zero runtime dependencies and there is nothing here to assert about.
+            self.run_command(
+                "node", "lachesis/frontends/typescript/build_graph.mjs",
+                "lachesis/frontends/typescript/fixtures/framework", output,
+                environment={"LACHESIS_INCLUDE_DEP_TYPES": "1"},
             )
             snapshot = load_snapshot(output)
             validate_snapshot(snapshot)
@@ -584,9 +624,15 @@ class CompilerFrontendTests(unittest.TestCase):
                 and edge["source"] == route_source["id"]
                 for edge in modeled["edges"]
             ))
-            composed, _ = run_project(
-                str(ROOT / "lachesis" / "frontends" / "typescript" / "fixtures" / "framework"),
-            )
+            # `run_project` spawns the frontend as a subprocess, which inherits this
+            # environment, so the opt-in has to be set here too -- otherwise the
+            # composed graph is a first-party-only build and holds none of the runtime
+            # functions asserted below.
+            with self.dependency_analysis_enabled():
+                composed, _ = run_project(
+                    str(ROOT / "lachesis" / "frontends" / "typescript" / "fixtures"
+                        / "framework"),
+                )
             files = graph_file_infos(composed)
             handler = next(
                 function for info in files for function in info["functions"]
@@ -2175,7 +2221,7 @@ class CompilerFrontendTests(unittest.TestCase):
                     return json.loads(proc.stdout.readline())
 
                 init = rpc(1, "initialize", {"protocolVersion": "2024-11-05"})
-                self.assertEqual("nav-reasoning", init["result"]["serverInfo"]["name"])
+                self.assertEqual("lachesis", init["result"]["serverInfo"]["name"])
                 tools = rpc(2, "tools/list")["result"]["tools"]
                 names = [t["name"] for t in tools]
                 self.assertIn("load_graph", names)

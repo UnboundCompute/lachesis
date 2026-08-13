@@ -126,12 +126,27 @@ def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
         ".parcel-cache", ".docusaurus", ".vercel", ".cache", "coverage",
         "bower_components",
     }
+    # The one `vendor` directory that is never the analysed project's own source: the
+    # copy of the TypeScript compiler Lachesis ships so an installed wheel can analyse
+    # TypeScript without an `npm install`. Any tree containing a Lachesis install --
+    # this repository analysing itself, or a site-packages directory -- would otherwise
+    # hand the compiler its own implementation and 100 default-library declarations to
+    # parse as first-party code. Pruned by resolved path rather than by name, so a
+    # project's own `vendor/` is untouched, exactly as the note above promises.
+    vendored_typescript = os.path.realpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "frontends", "typescript", "vendor",
+    ))
     is_test = None
     if not include_tests:
         from lachesis.nav.symbol_index import is_test_path as is_test
     result = []
     for root, directories, files in os.walk(os.path.abspath(source_dir)):
-        directories[:] = sorted(name for name in directories if name not in ignored)
+        directories[:] = sorted(
+            name for name in directories
+            if name not in ignored
+            and os.path.realpath(os.path.join(root, name)) != vendored_typescript
+        )
         for name in sorted(files):
             path = os.path.join(root, name)
             if is_test is not None and is_test(path):

@@ -18,6 +18,10 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
    pip install -e ".[dev]"
    npm install
    ```
+   A built distribution carries its own copy of the compiler instead, fetched by
+   `tools/vendor_typescript.py`; a checkout does not need that and prefers its own
+   `node_modules`, so the TypeScript version you develop against is the one
+   `package.json` pins. See [`RELEASING.md`](./RELEASING.md).
 3. Make your change, with tests where it makes sense.
 4. Run the parity and checks suite before you open a PR:
    ```

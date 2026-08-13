@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nav-reasoning — a dependency-free MCP (stdio JSON-RPC) server: the LLM's hands on the graph.
+"""lachesis — a dependency-free MCP (stdio JSON-RPC) server: the LLM's hands on the graph.
 
 This is the last piece: it wraps the *already-proven* reasoning library (graph_store,
 reachability, guards, call_roles, siblings) as MCP tools so an agent can navigate and
@@ -77,7 +77,23 @@ def _visible_tools():
 
 
 def log(*a):
-    print("[nav-reasoning]", *a, file=sys.stderr, flush=True)
+    print("[lachesis-mcp]", *a, file=sys.stderr, flush=True)
+
+
+# What this server calls itself when a client asks. It is the name the user sees in
+# their client's server list, so it is the product's name -- not `nav-reasoning`, which
+# is an internal overlay identifier that happens to be where this code grew up. The
+# overlay keeps that identifier: it is written into graph provenance, and renaming it
+# would change what already-built stores say about themselves.
+SERVER_NAME = "lachesis"
+# Reported straight from the installed distribution, so the version a client sees is the
+# version that is actually running rather than a literal that drifts at the next release.
+try:
+    from importlib.metadata import PackageNotFoundError, version as _distribution_version
+
+    SERVER_VERSION = _distribution_version("lachesis-cpg")
+except (ImportError, PackageNotFoundError):  # a source checkout that was never installed
+    SERVER_VERSION = "0+unknown"
 
 
 class _Ctx:
@@ -493,7 +509,7 @@ def main():
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "nav-reasoning", "version": "0.1.0"}}})
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}}})
         elif method == "notifications/initialized":
             pass
         elif method == "tools/list":

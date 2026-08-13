@@ -18,10 +18,17 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
 ]
 
 # The embedded columnar store is the graph store, so `kuzu` is required, and with it
@@ -44,14 +51,19 @@ lachesis-plan = "lachesis.planner.cli:main"
 [project.urls]
 Homepage = "https://github.com/UnboundCompute/lachesis"
 Source = "https://github.com/UnboundCompute/lachesis"
+Issues = "https://github.com/UnboundCompute/lachesis/issues"
+Changelog = "https://github.com/UnboundCompute/lachesis/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["lachesis*"]
 
 [tool.setuptools.package-data]
 # The TypeScript frontend is a Node script, the frontends declare capabilities in
-# JSON, and the test suite runs against the shipped fixture trees.
-"lachesis.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*"]
+# JSON, and the test suite runs against the shipped fixture trees. `vendor/` is the
+# TypeScript compiler itself: it is absent from the repository and put in place by
+# `tools/vendor_typescript.py` before a release build, so a wheel built without that
+# step ships without it (see RELEASING.md).
+"lachesis.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*", "vendor/**/*"]
 "lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
 "lachesis.frontends.python" = ["*.json", "fixtures/**/*"]
 "lachesis.core" = ["*.json"]

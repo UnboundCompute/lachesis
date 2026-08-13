@@ -1,0 +1,108 @@
+# Releasing Lachesis
+
+Lachesis publishes to PyPI as [`lachesis-cpg`](https://pypi.org/project/lachesis-cpg/).
+This is the checklist for cutting a release. It exists because one step — vendoring the
+TypeScript compiler — is invisible from the repository, and a wheel built without it
+installs fine and then fails on the first TypeScript project it sees.
+
+## What ships
+
+The distribution is pure Python plus two things that are not Python:
+
+- `lachesis/frontends/typescript/build_graph.mjs`, the Node frontend, and the copy of
+  the TypeScript compiler next to it under `vendor/`. The compiler is **not in version
+  control** (see `.gitignore`); `tools/vendor_typescript.py` fetches the pinned version
+  and `MANIFEST.in` carries it into the sdist.
+- the fixture corpora under each frontend, so the parity suite can run from an install.
+
+The C frontend has no vendored component. It shells out to whatever `clang` is on the
+machine, and degrades to "no C analysis" when there is none.
+
+## Before you tag
+
+1. Working tree is clean, and you are on `main` with everything merged.
+2. Bump `version` in `pyproject.toml`. Lachesis is pre-1.0, so the graph schema and the
+   nav tool surface may still change between minor versions; say so in the changelog
+   entry rather than in a patch release note nobody reads.
+3. Run the parity suite against a clean checkout:
+   ```
+   pip install -e ".[dev]" && npm install
+   python3 -m pytest lachesis/frontends/checks.py
+   ```
+   It must be fully green. The suite is the release gate — there is no separate one.
+
+## Build
+
+```
+python3 tools/vendor_typescript.py          # fetch the pinned compiler
+python3 tools/vendor_typescript.py --check  # confirm it landed
+rm -rf dist build *.egg-info
+python3 -m build                            # sdist + wheel
+```
+
+`--check` is not ceremony. Everything else in the build fails loudly when it goes
+wrong; a missing vendor directory does not, and the symptom surfaces on a stranger's
+machine rather than yours.
+
+## Verify the artifacts, not the repo
+
+The point of this section is that a passing test suite in a checkout proves nothing
+about a wheel. Test the built artifacts, in a virtualenv that has no relationship to
+this repository, from a directory that is not this repository.
+
+```
+python3 -m twine check dist/*
+
+cd $(mktemp -d)
+python3 -m venv v && ./v/bin/pip install /path/to/dist/lachesis_cpg-*.whl
+```
+
+Then confirm all four of these:
+
+- **The namespace is one name.** `unzip -l dist/*.whl | grep -c '^.*lachesis/'` should
+  account for every module, and nothing outside `lachesis/` should be installed.
+  ```
+  ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner"
+  ```
+- **The console scripts exist and run**: `lachesis-analyze`, `lachesis-query`,
+  `lachesis-mcp`, `lachesis-plan`.
+- **TypeScript analysis works with no `npm install` anywhere.** This is the vendoring
+  check, and it is the one that fails when the vendor step was skipped:
+  ```
+  mkdir -p src && printf 'export function f(x: string) { return x; }\n' > src/a.ts
+  ./v/bin/lachesis-analyze src /tmp/rel.kuzu
+  ./v/bin/lachesis-query --format text /tmp/rel.kuzu overview
+  ```
+  The output must name `typescript-compiler-api` among its frontends.
+- **The MCP server starts and lists its tools** over stdio against that graph.
+
+`tools/verify_wheel.sh` runs this whole sequence. CI runs it on every push and pull
+request in the `package` job, which also builds the distribution and installs from
+the sdist, so a packaging mistake surfaces long before release day.
+
+## Publish
+
+Upload to TestPyPI first, install from it, and repeat the four checks above against
+*that* install — it is the only way to catch a packaging problem that only appears
+after a round trip through an index.
+
+```
+python3 -m twine upload --repository testpypi dist/*
+python3 -m twine upload dist/*
+```
+
+Use an API token scoped to this project, via `~/.pypirc` or `TWINE_PASSWORD`. Then tag
+and push the tag:
+
+```
+git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+```
+
+Tag after a successful upload, not before. A version on PyPI cannot be replaced, so the
+upload is the irreversible step and the tag should record what actually shipped.
+
+## If a release is broken
+
+Yank it (`pip` stops resolving to it, existing pins keep working) and release a patch
+version. Do not delete it: deletion frees the version number for reuse, which means two
+different sets of bytes can answer to the same name.

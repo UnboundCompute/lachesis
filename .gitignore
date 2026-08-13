@@ -30,4 +30,10 @@ graph_out/
 .idea/
 .vscode/
 
+# The TypeScript compiler vendored into the distribution. Fetched by
+# `tools/vendor_typescript.py` at release time and shipped inside the sdist and
+# wheel, but not carried in the repository: it is 12 MB of generated JavaScript
+# that would land again, in full, on every version bump.
+lachesis/frontends/typescript/vendor/
+
 *.md

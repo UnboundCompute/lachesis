@@ -23,16 +23,20 @@ A symbol index cannot give you any of these. They are what let a downstream tool
 ## Quick start
 
 ```bash
-git clone https://github.com/UnboundCompute/lachesis && cd lachesis
-
-python -m pip install --upgrade pip   # editable installs need pip >= 21.3
-pip install -e .          # the graph builder, the nav layer and the MCP server
-npm install               # the TypeScript compiler the TS frontend loads
+pip install lachesis-cpg
 ```
 
-Python 3.10 or newer is required. The only runtime dependencies are `kuzu` and
-`pyarrow`, which back the embedded columnar store the graph lives in; the builder,
-the navigation layer and the MCP server are otherwise pure standard library.
+That is the whole installation. Python 3.10 or newer is required. The only runtime
+dependencies are `kuzu` and `pyarrow`, which back the embedded columnar store the graph
+lives in; the builder, the navigation layer and the MCP server are otherwise pure
+standard library.
+
+There is no second step for TypeScript. The TypeScript frontend analyses with the real
+compiler API rather than a reimplementation of it, so a copy of the compiler ships
+inside the distribution and is used automatically — no Node package to install, no
+network access at analysis time. Node itself does need to be on your PATH for the
+TypeScript frontend to run. Analysing C additionally needs `clang`; without it, C files
+are simply not analysed and every other language still is.
 
 Then build a graph and ask it questions:
 
@@ -47,6 +51,22 @@ lachesis-mcp graph.kuzu                           # serve the nav tools over MCP
 is the graph, and every tool reads it directly. `lachesis-mcp` speaks MCP over
 stdio, so point an MCP-capable client at `lachesis-mcp /abs/path/to/graph.kuzu` and
 the navigation tools show up as tools.
+
+### Installing from a clone
+
+Working on Lachesis itself, or running from source:
+
+```bash
+git clone https://github.com/UnboundCompute/lachesis && cd lachesis
+python -m pip install --upgrade pip   # editable installs need pip >= 21.3
+pip install -e ".[dev]"               # builder, nav layer, MCP server, test deps
+npm install                           # the TypeScript compiler the TS frontend loads
+```
+
+A checkout does need `npm install`, because the vendored compiler is a build-time
+artifact and is not kept in version control. A checkout prefers its own `node_modules`
+copy anyway, so the TypeScript version you develop against is the one your `package.json`
+pins. See [`RELEASING.md`](./RELEASING.md) for how it gets into a distribution.
 
 The build writes the core tier. The dataflow tier is `f(core graph, languages,
 capabilities)` — pure and deterministic — so it is rebuilt on the first query and

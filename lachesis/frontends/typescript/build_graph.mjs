@@ -11,7 +11,14 @@
  *
  * TypeScript lookup order:
  *   1. TYPESCRIPT_PATH=/path/to/typescript (package directory or JS entrypoint)
- *   2. a normal local `typescript` dependency (`npm install` at the repo root)
+ *   2. a normal local `typescript` dependency (`npm install` in a repo checkout)
+ *   3. the copy vendored next to this script, which ships inside the wheel
+ *
+ * The vendored copy is what makes `pip install lachesis-cpg` self-sufficient: an
+ * installed package has no node_modules above it, so steps 1 and 2 both miss and
+ * the analysis would otherwise fail on a tree it can perfectly well parse. The
+ * local dependency is still preferred over it, so a checkout keeps analysing with
+ * whatever TypeScript it has pinned rather than with ours.
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -21,11 +28,13 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const VENDORED_TYPESCRIPT = path.join(scriptDir, "vendor", "typescript");
 
 function loadTypeScript() {
   const candidates = [];
   if (process.env.TYPESCRIPT_PATH) candidates.push(process.env.TYPESCRIPT_PATH);
   candidates.push("typescript");
+  candidates.push(VENDORED_TYPESCRIPT);
   const failures = [];
   for (const candidate of candidates) {
     try {
@@ -34,10 +43,16 @@ function loadTypeScript() {
       failures.push(`${candidate}: ${error.code || error.message}`);
     }
   }
+  // Reaching here means even the vendored copy is missing, so either this is a
+  // checkout that has never run `npm install` or `tools/vendor_typescript.py`, or
+  // an install that arrived incomplete. Name every path tried: "run npm install"
+  // is unfollowable advice for someone who installed a wheel and has no checkout.
   throw new Error(
-    "Unable to load TypeScript. Run `npm install` at the repo root, or set " +
-      "TYPESCRIPT_PATH to a TypeScript package directory.\n" +
-      failures.join("\n"),
+    "Unable to load TypeScript. In a repo checkout run `npm install` or " +
+      "`python3 tools/vendor_typescript.py`; from an installed package this " +
+      "means the install is incomplete, so reinstall lachesis-cpg. Either way " +
+      "TYPESCRIPT_PATH overrides the search.\nTried:\n  " +
+      failures.join("\n  "),
   );
 }
 
@@ -83,13 +98,24 @@ const ASSIGNMENT_KINDS = new Set([
   ts.SyntaxKind.QuestionQuestionEqualsToken,
 ]);
 
+// Lachesis ships a copy of the TypeScript compiler next to this script, so any tree
+// that contains a Lachesis install -- this repository analysing itself, or a
+// site-packages directory -- would otherwise hand the compiler its own 9 MB
+// implementation and 100 default-library declarations to analyse as if they were the
+// project's source. That is not a heuristic about vendored code in general, which is
+// often exactly the code someone wants analysed; it is this frontend declining to
+// analyse the very compiler it is running on, which no analysed project can want.
+const VENDOR_ROOT = path.resolve(path.join(scriptDir, "vendor"));
+
 function walk(directory) {
   const result = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     if (entry.isDirectory() && IGNORED_DIRS.has(entry.name)) continue;
     const absolute = path.join(directory, entry.name);
-    if (entry.isDirectory()) result.push(...walk(absolute));
-    else if (entry.isFile() && SUPPORTED.has(path.extname(entry.name))) {
+    if (entry.isDirectory()) {
+      if (path.resolve(absolute) === VENDOR_ROOT) continue;
+      result.push(...walk(absolute));
+    } else if (entry.isFile() && SUPPORTED.has(path.extname(entry.name))) {
       result.push(path.resolve(absolute));
     }
   }
