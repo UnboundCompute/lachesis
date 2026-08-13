@@ -3485,5 +3485,95 @@ class GraphAccumulatorTests(unittest.TestCase):
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 
+class GraphIndexOrderingTests(unittest.TestCase):
+    """Ordering a bucket on first read has to be invisible to every reader.
+
+    The graph below is built so that no bucket arrives in the order it must leave in:
+    the nodes are supplied in reverse id order and share a label, a file and an owner,
+    and the edges out of one source are supplied out of ``(kind, source, target)``
+    order. Anything that skipped a sort would show up here.
+    """
+
+    def _index(self):
+        nodes = [
+            {"id": f"v2:n:{letter}", "kind": "call", "label": "run",
+             "properties": {"file": "m.py", "owner_function_id": "v2:f"}}
+            for letter in ("d", "c", "b", "a")
+        ]
+        nodes.append({"id": "v2:f", "kind": "function", "label": "f", "properties": {}})
+        edges = [
+            {"kind": "CALLS", "source": "v2:f", "target": "v2:n:d", "properties": {}},
+            {"kind": "CALLS", "source": "v2:f", "target": "v2:n:a", "properties": {}},
+            {"kind": "AWAITS", "source": "v2:f", "target": "v2:n:c", "properties": {}},
+        ]
+        return GraphIndex({"nodes": nodes, "edges": edges}), nodes, edges
+
+    def test_every_bucket_comes_out_ordered_however_it_went_in(self):
+        index, _nodes, _edges = self._index()
+        for name in ("by_label", "by_file", "by_owner"):
+            with self.subTest(collection=name):
+                bucket = getattr(index, name)
+                key = {"by_label": "run", "by_file": "m.py", "by_owner": "v2:f"}[name]
+                self.assertEqual(
+                    ["v2:n:a", "v2:n:b", "v2:n:c", "v2:n:d"],
+                    [node["id"] for node in bucket[key]],
+                )
+        self.assertEqual(
+            ["v2:n:a", "v2:n:b", "v2:n:c", "v2:n:d"],
+            [node["id"] for node in index.by_kind["call"]],
+        )
+        self.assertEqual(
+            [("AWAITS", "v2:n:c"), ("CALLS", "v2:n:a"), ("CALLS", "v2:n:d")],
+            [(e["kind"], e["target"]) for e in index.outgoing["v2:f"]],
+        )
+        self.assertEqual(
+            [("CALLS", "v2:f")],
+            [(e["kind"], e["source"]) for e in index.incoming["v2:n:a"]],
+        )
+
+    def test_reading_one_bucket_twice_gives_the_same_object_and_sorts_once(self):
+        index, _nodes, _edges = self._index()
+        first = index.outgoing
+        self.assertIs(first, index.outgoing)
+        self.assertIn("outgoing", index.__dict__)
+        self.assertNotIn("by_file", index.__dict__)
+
+    def test_reading_one_bucket_does_not_order_another(self):
+        index, _nodes, _edges = self._index()
+        index.by_kind
+        self.assertEqual(
+            ["v2:n:d", "v2:n:c", "v2:n:b", "v2:n:a"],
+            [node["id"] for node in index._buckets["by_file"]["m.py"]],
+        )
+
+    def test_an_unknown_attribute_is_still_an_attribute_error(self):
+        index, _nodes, _edges = self._index()
+        with self.assertRaises(AttributeError):
+            index.by_planet
+
+    def test_the_accessors_agree_with_the_buckets_they_read(self):
+        index, _nodes, _edges = self._index()
+        self.assertEqual(
+            ["v2:n:a", "v2:n:b", "v2:n:c", "v2:n:d"],
+            [node["id"] for node in index.nodes_of_kind("call")],
+        )
+        self.assertEqual(
+            ["v2:n:a", "v2:n:b", "v2:n:c", "v2:n:d"],
+            [node["id"] for node in index.nodes_named("run")],
+        )
+        self.assertEqual(
+            ["v2:n:a", "v2:n:b", "v2:n:c", "v2:n:d"],
+            [node["id"] for node in index.nodes_in_file("m.py")],
+        )
+        self.assertEqual(
+            ["v2:n:a", "v2:n:b", "v2:n:c", "v2:n:d"],
+            [node["id"] for node in index.nodes_owned_by("v2:f")],
+        )
+        self.assertEqual(
+            ["v2:n:a", "v2:n:d"],
+            [edge["target"] for edge in index.outgoing_of_kind("v2:f", "CALLS")],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

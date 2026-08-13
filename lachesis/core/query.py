@@ -5,37 +5,76 @@ from collections import defaultdict
 from typing import Iterable, Optional
 
 
+def _bucket_order(item: dict) -> tuple:
+    """The order every bucket is kept in, node or edge.
+
+    One key serves both because the two field sets do not overlap: a node answers to
+    ``id`` and nothing else, an edge to ``kind``/``source``/``target``.
+    """
+    return (
+        item.get("id", ""), item.get("kind", ""),
+        item.get("source", ""), item.get("target", ""),
+    )
+
+
 class GraphIndex:
+    """Six lookups over a canonical graph, each sorted the first time it is read.
+
+    Population is eager and cheap. Sorting is neither, and it is what dominates: an
+    index over the enriched graph spends most of its construction ordering buckets, and
+    an overlay reads one or two of the six. The enrich path never reads ``by_label``,
+    ``by_file`` or ``by_owner`` at all, yet paid to order them once per overlay, on a
+    graph that grows as the overlays run. Sorting on first read charges each caller only
+    for what it asks about, and charges it once.
+
+    This is not a weaker guarantee. Every bucket a caller can observe is ordered exactly
+    as before, since the only way to reach one is through the property that orders it.
+    The buckets are never written to after construction, so a sort can never go stale.
+    """
+
+    _COLLECTIONS = ("by_kind", "by_label", "by_file", "by_owner", "outgoing", "incoming")
+
     def __init__(self, graph: dict) -> None:
         self.nodes = {node["id"]: node for node in graph.get("nodes", [])}
-        self.outgoing = defaultdict(list)
-        self.incoming = defaultdict(list)
-        self.by_kind = defaultdict(list)
-        self.by_label = defaultdict(list)
-        self.by_file = defaultdict(list)
-        self.by_owner = defaultdict(list)
+        self._buckets = {name: defaultdict(list) for name in self._COLLECTIONS}
+        by_kind = self._buckets["by_kind"]
+        by_label = self._buckets["by_label"]
+        by_file = self._buckets["by_file"]
+        by_owner = self._buckets["by_owner"]
+        outgoing = self._buckets["outgoing"]
+        incoming = self._buckets["incoming"]
         for node in self.nodes.values():
-            self.by_kind[node.get("kind")].append(node)
-            self.by_label[node.get("label")].append(node)
+            by_kind[node.get("kind")].append(node)
+            by_label[node.get("label")].append(node)
             properties = node.get("properties", {})
             path = properties.get("absolute_file") or properties.get("file")
             if path:
-                self.by_file[path].append(node)
+                by_file[path].append(node)
             owner = properties.get("owner_function_id") or properties.get("function_id")
             if owner:
-                self.by_owner[owner].append(node)
+                by_owner[owner].append(node)
         for edge in graph.get("edges", []):
-            self.outgoing[edge["source"]].append(edge)
-            self.incoming[edge["target"]].append(edge)
-        for collection in (
-            self.by_kind, self.by_label, self.by_file, self.by_owner,
-            self.outgoing, self.incoming,
-        ):
-            for values in collection.values():
-                values.sort(key=lambda item: (
-                    item.get("id", ""), item.get("kind", ""),
-                    item.get("source", ""), item.get("target", ""),
-                ))
+            outgoing[edge["source"]].append(edge)
+            incoming[edge["target"]].append(edge)
+
+    def __getattr__(self, name: str):
+        """Order a bucket on its first mention and then get out of the way.
+
+        ``__getattr__`` runs only when normal lookup fails, so binding the ordered
+        collection onto the instance here means this is consulted once per collection
+        per index. Everything after that is a plain attribute read, which matters
+        because ``targets`` and ``outgoing_of_kind`` reach for ``outgoing`` inside loops
+        that run millions of times per enrich; a property would tax every one of them.
+        """
+        if name not in self._COLLECTIONS:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+        collection = self._buckets[name]
+        for values in collection.values():
+            values.sort(key=_bucket_order)
+        setattr(self, name, collection)
+        return collection
 
     def nodes_of_kind(self, *kinds: str) -> Iterable[dict]:
         return (
