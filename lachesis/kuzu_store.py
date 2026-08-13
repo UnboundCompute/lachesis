@@ -510,6 +510,20 @@ def _rel_ddl() -> list[str]:
     return stmts
 
 
+def _deferred_ddl() -> str:
+    """The table for edges whose endpoints this store does not hold.
+
+    A rel table cannot express them: both ends are foreign keys into ``Node``, and the
+    whole point of a spine-and-semantic store is that one end is a body node it dropped
+    on purpose, to be recompiled at load. So the endpoints are carried as coded strings
+    in a node table that is never traversed, only read out whole and rejoined once the
+    bodies are back. ``seq`` is a primary key because Kùzu needs one, and nothing means
+    anything by it beyond insertion order.
+    """
+    return ("CREATE NODE TABLE DeferredEdge(seq INT64, kind STRING, src STRING, "
+            "tgt STRING, unit STRING, props BLOB, PRIMARY KEY (seq))")
+
+
 # -- writer -------------------------------------------------------------------
 
 def write_kuzu_graph(
@@ -524,6 +538,7 @@ def write_kuzu_graph(
     overwrite: bool = True,
     enriched: bool = True,
     core_content_hash: Optional[str] = None,
+    carry_unresolved_edges: bool = False,
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
@@ -536,6 +551,13 @@ def write_kuzu_graph(
     core-only store also gets its own ``core_content_hash`` stamped, which is the key a
     derived ``<store>.enriched`` cache validates itself against; pass that same hash
     explicitly when writing the derived store so the two manifests agree.
+
+    ``carry_unresolved_edges`` keeps the edges whose endpoints are not both resident,
+    in a table of their own, instead of dropping them. That is what a spine-and-semantic
+    store needs: a semantic fact about a value inside a function is an edge into a body
+    node the store deliberately does not hold, and it becomes attachable again the moment
+    the bodies are recompiled. Off by default, because for an ordinary whole-graph store
+    an edge with a missing endpoint is a bug and silence about it would hide one.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -559,10 +581,13 @@ def write_kuzu_graph(
     # caller comparing them against its input graph learns that something went missing
     # without learning how much. Every partial store (pruned, test-filtered, or holding
     # only part of a layered graph) crosses this line, so the number is worth naming.
-    edges = [e for e in graph.get("edges", [])
-             if e.get("source") in kept_ids and e.get("target") in kept_ids]
-    unresolved_edge_count = len(graph.get("edges", [])) - len(edges)
+    edges, unresolved = [], []
+    for edge in graph.get("edges", []):
+        resident = edge.get("source") in kept_ids and edge.get("target") in kept_ids
+        (edges if resident else unresolved).append(edge)
+    unresolved_edge_count = len(unresolved)
     dropped_node_count = len(graph.get("nodes", [])) - len(nodes)
+    deferred = unresolved if carry_unresolved_edges else []
     # id -> owning file, so an edge (which carries no `file` of its own) can inherit
     # its source node's unit as the §5 incremental key.
     node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
@@ -572,6 +597,8 @@ def write_kuzu_graph(
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
         conn.execute(stmt)
+    if deferred:
+        conn.execute(_deferred_ddl())
 
     # Bulk `COPY FROM` staged Parquet is the fast path (per-row inserts measured
     # ~9.4 min/package — too slow for whole-repo). When pyarrow is absent we fall
@@ -585,7 +612,8 @@ def write_kuzu_graph(
     props_dict = build_props_dictionary(itertools.chain(
         (_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
          for n in nodes),
-        (_props_text(e.get("properties") or {}, elide_constants) for e in edges),
+        (_props_text(e.get("properties") or {}, elide_constants)
+         for e in itertools.chain(edges, deferred)),
     ))
 
     # The other manifest-carried table: the id prefixes the coded columns are written
@@ -593,10 +621,14 @@ def write_kuzu_graph(
     # table has to exist before the first row is written, since a code is an index into
     # it. Edge endpoints need no pass of their own: an endpoint is a node id, so its
     # prefix is already here by way of that node's own `id`.
+    # The one exception is a deferred edge: its far endpoint is a node this store does not
+    # hold, so no pass over `nodes` will ever have seen that prefix, and leaving it out
+    # would store the longest ids in the file uncoded.
     id_prefixes = build_id_prefixes(itertools.chain(
         (n.get("id") for n in nodes),
         ((n.get("properties") or {}).get(column)
          for n in nodes for column in CODED_PROP_COLUMNS),
+        (end for e in deferred for end in (e.get("source"), e.get("target"))),
     ))
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(id_prefixes)}
 
@@ -607,11 +639,17 @@ def write_kuzu_graph(
             _load_edges_bulk(conn, edges, elide=elide_constants, stage_dir=stage_dir,
                              node_units=node_units, zdict=props_dict,
                              id_codes=id_codes)
+            _load_deferred_bulk(conn, deferred, elide=elide_constants,
+                                stage_dir=stage_dir, node_units=node_units,
+                                zdict=props_dict, id_codes=id_codes)
     else:  # pragma: no cover - exercised only without pyarrow
         _load_nodes_rowwise(conn, nodes, elide=elide_constants, zdict=props_dict,
                             id_codes=id_codes)
         _load_edges_rowwise(conn, edges, elide=elide_constants, node_units=node_units,
                             zdict=props_dict, id_codes=id_codes)
+        _load_deferred_rowwise(conn, deferred, elide=elide_constants,
+                               node_units=node_units, zdict=props_dict,
+                               id_codes=id_codes)
     # counts describe what the store actually holds, which is the pruned set, not the
     # composed input — a reader comparing them against a scan should find them equal.
     payload = manifest_payload(graph, snapshots)
@@ -622,6 +660,10 @@ def write_kuzu_graph(
     # rather than the whole of one, which is a different thing to reason about.
     payload["dropped_node_count"] = dropped_node_count
     payload["unresolved_edge_count"] = unresolved_edge_count
+    # How many of those unresolved edges are still in the store, waiting for a recompile
+    # to give them their far endpoint back. Equal to `unresolved_edge_count` for a
+    # deferred store, zero for every other one.
+    payload["deferred_edge_count"] = len(deferred)
     payload["enriched"] = bool(enriched)
     # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
     # rather than a sidecar file because losing it makes every `props` blob in the
@@ -775,6 +817,32 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
         conn.execute(f"COPY EDGE FROM '{path}'")
 
 
+def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: str,
+                        node_units: dict, zdict: bytes = b"",
+                        id_codes: Optional[dict] = None) -> None:
+    if not deferred:
+        return
+    codes = id_codes or {}
+    columns = {"seq": [], "kind": [], "src": [], "tgt": [], "unit": [], "props": []}
+    for seq, edge in enumerate(deferred):
+        columns["seq"].append(seq)
+        columns["kind"].append(edge.get("kind"))
+        columns["src"].append(encode_id(edge["source"], codes))
+        columns["tgt"].append(encode_id(edge["target"], codes))
+        columns["unit"].append(_edge_unit(edge, node_units))
+        columns["props"].append(
+            _stored_props(edge.get("properties") or {}, elide, zdict=zdict))
+    table = pa.table({
+        "seq": pa.array(columns["seq"], pa.int64()),
+        "kind": _str_col(columns["kind"]), "src": _str_col(columns["src"]),
+        "tgt": _str_col(columns["tgt"]), "unit": _str_col(columns["unit"]),
+        "props": pa.array(columns["props"], pa.binary()),
+    })
+    path = os.path.join(stage_dir, "deferred.parquet")
+    pq.write_table(table, path)
+    conn.execute(f"COPY DeferredEdge FROM '{path}'")
+
+
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
 
 def _blob_param(blob: bytes) -> str:
@@ -842,6 +910,31 @@ def _load_edges_rowwise(conn, edges: list[dict], *, elide: bool, node_units: dic
                 base["kind"] = kind
                 base["sem"] = _semantic_kind(edge)
                 conn.execute(edge_stmt, base)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _load_deferred_rowwise(conn, deferred: list[dict], *, elide: bool,
+                           node_units: dict, zdict: bytes = b"",
+                           id_codes: Optional[dict] = None) -> None:
+    if not deferred:
+        return
+    stmt = ("CREATE (d:DeferredEdge {seq: $seq, kind: $kind, src: $src, tgt: $tgt, "
+            "unit: $unit, props: CAST($props AS BLOB)})")
+    codes = id_codes or {}
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for seq, edge in enumerate(deferred):
+            conn.execute(stmt, {
+                "seq": seq, "kind": edge.get("kind"),
+                "src": encode_id(edge["source"], codes),
+                "tgt": encode_id(edge["target"], codes),
+                "unit": _edge_unit(edge, node_units),
+                "props": _blob_param(
+                    _stored_props(edge.get("properties") or {}, elide, zdict=zdict)),
+            })
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

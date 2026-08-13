@@ -194,9 +194,36 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
     # ``(kind, source, target)`` while differing in props, so the tie-break folds the
     # props in: materializing the same store twice must give byte-identical output, or
     # a downstream enrich is not reproducible.
+    edges.extend(deferred_edges(index))
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
                               json.dumps(e["properties"], sort_keys=True)))
     return {"nodes": nodes, "edges": edges}
+
+
+def deferred_edges(index: "KuzuGraphIndex") -> list:
+    """The edges this store holds but cannot attach: one endpoint is not resident.
+
+    Empty for every ordinary store. A spine-and-semantic store has many, and they are
+    the reason it is worth writing: a semantic fact about a value inside a function is
+    an edge into a body node the store dropped on purpose. They become ordinary edges
+    again the moment the bodies are recompiled and joined back in, which is why they
+    ride in a table of their own rather than as rows nothing can traverse.
+
+    Returned unsorted; ``materialize_graph`` sorts the union.
+    """
+    if not index._deferred_edge_count:
+        return []
+    prefixes = index._id_prefixes
+    res = index._conn.execute(
+        "MATCH (d:DeferredEdge) RETURN d.kind, d.src, d.tgt, d.props"
+    )
+    out = []
+    while res.has_next():
+        kind, src, tgt, props = res.get_next()
+        out.append({"source": decode_id(src, prefixes),
+                    "target": decode_id(tgt, prefixes), "kind": kind,
+                    "properties": _restore(props, index._props_dict)})
+    return out
 
 
 class _NodeMap:
@@ -276,6 +303,10 @@ class KuzuGraphIndex:
         # open rather than per lookup — nav does hundreds of thousands of these.
         self._id_codes = {prefix: _prefix_code(i)
                           for i, prefix in enumerate(self._id_prefixes)}
+        # Whether this store carries edges awaiting a recompiled endpoint. Read from the
+        # manifest rather than probed for, so an ordinary store costs no query to find
+        # out that it has none.
+        self._deferred_edge_count = int(manifest.get("deferred_edge_count") or 0)
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}

@@ -35,6 +35,17 @@ from lachesis.pipeline import _combined_capabilities, enrich_graph, run_project
 FIXTURE = ROOT / "lachesis" / "planner" / "fixtures" / "project"
 
 
+def _round_trip(reduced, snapshots, db_dir: Path):
+    """Write a reduced graph to a real store and read it back out."""
+    from lachesis.kuzu_store import write_kuzu_graph
+    from lachesis.nav.kuzu_index import KuzuGraphIndex, materialize_graph
+
+    write_kuzu_graph(reduced, snapshots, db_dir=str(db_dir), overwrite=True,
+                     prune=False, elide_constants=False,
+                     carry_unresolved_edges=True)
+    return materialize_graph(KuzuGraphIndex(str(db_dir)))
+
+
 class PartitionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -53,6 +64,7 @@ class PartitionTests(unittest.TestCase):
             _combined_capabilities(snapshots),
         )
         cls.reduced = reduce_graph(core, cls.enriched)
+        cls.snapshots = snapshots
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -112,6 +124,48 @@ class PartitionTests(unittest.TestCase):
             {edge_identity(e) for e in self.enriched["edges"]},
             {edge_identity(e) for e in joined["edges"]},
         )
+
+    def test_the_store_survives_a_real_write_and_read(self) -> None:
+        # The claim, but through Kùzu rather than in memory: an edge into a body node
+        # cannot be a rel row (both rel endpoints are foreign keys into `Node`), so it
+        # rides in a table of its own, and the round trip has to bring it back intact
+        # along with its properties.
+        import json as _json
+
+        from lachesis.kuzu_store import read_store_manifest
+
+        db_dir = Path(self._tmp.name) / "reduced.kuzu"
+        read_back = _round_trip(self.reduced, self.snapshots, db_dir)
+        manifest = read_store_manifest(str(db_dir))
+        self.assertGreater(manifest["deferred_edge_count"], 0)
+        self.assertEqual(manifest["unresolved_edge_count"],
+                         manifest["deferred_edge_count"])
+        self.assertEqual(
+            {edge_identity(e) for e in self.reduced["edges"]},
+            {edge_identity(e) for e in read_back["edges"]},
+        )
+        joined = join_graphs(self.core, read_back)
+        self.assertEqual(
+            {edge_identity(e) for e in self.enriched["edges"]},
+            {edge_identity(e) for e in joined["edges"]},
+        )
+        self.assertEqual(
+            _json.dumps(sorted(n["id"] for n in self.enriched["nodes"])),
+            _json.dumps(sorted(n["id"] for n in joined["nodes"])),
+        )
+
+    def test_an_ordinary_store_defers_nothing(self) -> None:
+        # The lever is off by default, and it has to stay off: for a whole-graph store an
+        # edge with a missing endpoint is a bug, and a table quietly absorbing it hides
+        # one.
+        from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph
+
+        db_dir = Path(self._tmp.name) / "whole.kuzu"
+        write_kuzu_graph(self.enriched, self.snapshots, db_dir=str(db_dir),
+                         overwrite=True, prune=False, elide_constants=False)
+        manifest = read_store_manifest(str(db_dir))
+        self.assertEqual(0, manifest["deferred_edge_count"])
+        self.assertEqual(0, manifest["unresolved_edge_count"])
 
     def test_the_join_prefers_the_fresh_compile_over_the_store(self) -> None:
         # A store can be stale; the source in front of us cannot. Where both describe the

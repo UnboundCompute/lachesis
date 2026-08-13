@@ -136,6 +136,23 @@ CREATE REL TABLE EDGE (FROM Node TO Node, kind STRING, props STRING);
 ```
 `AST_CHILD`, `NEXT_TOKEN`, `EXPANDS_TO`, CFG edges, structural/type edges, etc. Queried with a `kind` filter only when a tool needs them; they're not on any multi-hop hot path.
 
+### Deferred edges (written only when asked for)
+```cypher
+CREATE NODE TABLE DeferredEdge(seq INT64, kind STRING, src STRING, tgt STRING,
+                               unit STRING, props BLOB, PRIMARY KEY (seq));
+```
+A rel table cannot hold an edge whose endpoints are not both in `Node`, because both ends
+are foreign keys into it. A store that deliberately drops the intra-function bodies and
+recompiles them at load has many such edges, and they are the reason it is worth writing:
+a semantic fact about a value inside a function is an edge into a node that store does not
+hold. So they are carried here, as coded endpoint strings in a table nothing traverses,
+read out whole and rejoined once the bodies are back.
+
+Written only when `write_kuzu_graph(..., carry_unresolved_edges=True)`. Off by default: in
+an ordinary whole-graph store an edge with a missing endpoint is a bug, and a table quietly
+absorbing it hides one. The table is not created at all when there is nothing to put in it,
+so an ordinary store's schema is unchanged.
+
 > **Fallback if the hybrid is too much surface for v1:** a single `EDGE(kind, props)` table for *everything* + a secondary index on `kind`. Simpler port, but the dataflow multi-hop (the moat) pays a `kind`-filter per hop. Start hybrid; the ~12 hot tables are cheap and it's the differentiated path.
 
 ### Store manifest (`lachesis-manifest.json`, beside `graph.kuzu`)
@@ -158,7 +175,12 @@ Two more fields say what the input graph had and the store does not:
   the only node table and both ends are foreign keys into it, so an edge into a node the
   store does not hold cannot be written. Dropping it is right; dropping it quietly is not.
 
-Both are zero for an ordinary lossless write. A reader that finds either non-zero knows
+- `deferred_edge_count` — how many of those unresolved edges the store kept anyway, in
+  the `DeferredEdge` table above. Equal to `unresolved_edge_count` for a store built that
+  way, zero for every other one. The reader consults this field rather than probing for
+  the table, so an ordinary store costs no query to learn it has none.
+
+The first two are zero for an ordinary lossless write. A reader that finds either non-zero knows
 the store is a projection of a larger graph rather than the whole of one, which is a
 different thing to reason about.
 
