@@ -3486,6 +3486,79 @@ class GraphAccumulatorTests(unittest.TestCase):
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 
+class SnapshotNodeIdPassTests(unittest.TestCase):
+    """One pass over the nodes has to report exactly what three passes reported.
+
+    Validation used to build a list of every node id, a Counter over that list and
+    then a set over it again, and then _validate_v2 rebuilt the set a fourth time.
+    Folding those into one set is only safe if it says the same thing in the same
+    order, so what is pinned here is the order: a missing id outranks a duplicate
+    one even when the duplicate is seen first, and the duplicate report is still
+    the first three distinct offenders rather than every repeat of them.
+    """
+
+    @staticmethod
+    def _snapshot(nodes, edges=()):
+        return FrontendSnapshot(
+            frontend_id="cpython-ast",
+            contract_version=2,
+            languages=("python",),
+            capabilities={"syntax": "complete"},
+            manifest={},
+            nodes=list(nodes),
+            edges=list(edges),
+        )
+
+    @staticmethod
+    def _file(path):
+        node_id = stable_id("frontend", "cpython-ast", "file", path)
+        return {
+            "id": node_id, "kind": "file", "label": path, "tier": "T0",
+            "properties": {
+                "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
+            },
+        }
+
+    def test_a_valid_snapshot_still_validates(self) -> None:
+        validate_snapshot(self._snapshot([self._file("/a.py"), self._file("/b.py")]))
+
+    def test_a_node_without_an_id_is_reported(self) -> None:
+        node = self._file("/a.py")
+        del node["id"]
+        with self.assertRaisesRegex(ContractError, "must all have ids"):
+            validate_snapshot(self._snapshot([self._file("/b.py"), node]))
+
+    def test_a_missing_id_is_reported_before_a_duplicate_seen_earlier(self) -> None:
+        node = self._file("/a.py")
+        del node["id"]
+        snapshot = self._snapshot([
+            self._file("/b.py"), self._file("/b.py"), node,
+        ])
+        with self.assertRaisesRegex(ContractError, "must all have ids"):
+            validate_snapshot(snapshot)
+
+    def test_duplicates_are_reported_as_three_distinct_ids(self) -> None:
+        nodes = []
+        for path in ("/a.py", "/b.py", "/c.py", "/d.py"):
+            nodes.extend([self._file(path), self._file(path), self._file(path)])
+        with self.assertRaises(ContractError) as raised:
+            validate_snapshot(self._snapshot(nodes))
+        message = str(raised.exception)
+        self.assertIn("duplicate frontend node ids", message)
+        self.assertEqual(3, message.count("v2:frontend:cpython-ast:file:"))
+
+    def test_an_edge_that_lands_on_no_node_is_still_dangling(self) -> None:
+        first, second = self._file("/a.py"), self._file("/b.py")
+        snapshot = self._snapshot([first], edges=[{
+            "kind": "DECLARES", "source": first["id"], "target": second["id"],
+            "properties": {
+                "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
+            },
+        }])
+        with self.assertRaisesRegex(ContractError, "1 dangling relationships"):
+            validate_snapshot(snapshot)
+
+
 class BranchHistoryCopyTests(unittest.TestCase):
     """The reaching-definition environment is copied shallowly, so nothing may mutate it.
 

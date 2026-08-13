@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import sys
-from collections import Counter
 from typing import Iterable
 
 from .capabilities import ALL_CAPABILITIES, VALID_CAPABILITY_LEVELS
@@ -32,7 +31,12 @@ def validate_snapshot(snapshot: FrontendSnapshot) -> None:
     _validate_v2(snapshot)
 
 
-def _validate_common(snapshot: FrontendSnapshot) -> None:
+def _validate_common(snapshot: FrontendSnapshot) -> set:
+    """Check what every snapshot version shares, and hand back the node ids.
+
+    The ids are returned rather than discarded because the caller needs exactly the
+    same set and was building its own copy of it.
+    """
     if not snapshot.frontend_id:
         raise ContractError("snapshot has no frontend_id")
     if not snapshot.languages:
@@ -47,15 +51,27 @@ def _validate_common(snapshot: FrontendSnapshot) -> None:
     if invalid_levels:
         raise ContractError(f"invalid capability levels: {invalid_levels}")
 
-    node_ids = [node.get("id") for node in snapshot.nodes]
-    if any(node_id is None for node_id in node_ids):
+    # One pass and one set. This used to build a list of every id, a Counter over
+    # that list, and then a set over it again, three structures the size of the
+    # snapshot to answer two questions that a single set answers on the way past.
+    # The order the two failures are reported in is preserved: a missing id is
+    # raised before a duplicate one even when the duplicate comes first.
+    known: set = set()
+    duplicates: list = []
+    missing = False
+    for node in snapshot.nodes:
+        node_id = node.get("id")
+        if node_id is None:
+            missing = True
+        elif node_id in known:
+            if len(duplicates) < 3 and node_id not in duplicates:
+                duplicates.append(node_id)
+        else:
+            known.add(node_id)
+    if missing:
         raise ContractError("frontend nodes must all have ids")
-    duplicates = [
-        node_id for node_id, count in Counter(node_ids).items() if count > 1
-    ]
     if duplicates:
         raise ContractError(f"duplicate frontend node ids: {duplicates[:3]}")
-    known = set(node_ids)
     dangling = [
         edge for edge in snapshot.edges
         if edge.get("source") not in known or edge.get("target") not in known
@@ -77,6 +93,7 @@ def _validate_common(snapshot: FrontendSnapshot) -> None:
         raise ContractError(
             f"manifest says {expected_edges} edges but snapshot has {len(snapshot.edges)}"
         )
+    return known
 
 
 TIER_VALIDATION_MODES = ("strict", "warn", "off")
@@ -119,9 +136,8 @@ def _tier_violation(mode: str, message: str) -> None:
 
 
 def _validate_v2(snapshot: FrontendSnapshot) -> None:
-    _validate_common(snapshot)
+    node_ids = _validate_common(snapshot)
     tier_mode = tier_validation_mode()
-    node_ids = {node["id"] for node in snapshot.nodes}
     for node in snapshot.nodes:
         node_id = node["id"]
         kind = node.get("kind")
