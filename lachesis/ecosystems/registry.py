@@ -5,6 +5,7 @@ from typing import Iterable, Protocol, Tuple
 
 from ..core.composition import GraphDelta, compose
 from ..core.contract import ContractError
+from ..core.query import GraphIndex
 
 
 class EcosystemModel(Protocol):
@@ -14,7 +15,7 @@ class EcosystemModel(Protocol):
 
     def applies(self, graph: dict, package_inventory: frozenset[str]) -> bool: ...
 
-    def enrich(self, graph: dict) -> GraphDelta: ...
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta: ...
 
 
 class EcosystemRegistry:
@@ -53,10 +54,20 @@ class EcosystemRegistry:
         package_inventory: Iterable[str],
         languages: Iterable[str],
         capabilities: dict[str, str],
+        index: GraphIndex | None = None,
     ) -> dict:
+        """Union every applicable model's delta into the graph they all read.
+
+        Every model is handed the same graph, so every model was building the same
+        index over it. One index is built here and threaded through instead, and the
+        caller can supply one it already has: ``pipeline.enrich_graph`` builds exactly
+        this index to read the package inventory and used to throw it away.
+        """
+        if index is None:
+            index = GraphIndex(graph)
         deltas = [GraphDelta("canonical-input", graph["nodes"], graph["edges"])]
         for model in self.applicable(
             graph, package_inventory, languages, capabilities,
         ):
-            deltas.append(model.enrich(graph))
+            deltas.append(model.enrich(graph, index))
         return compose(deltas)

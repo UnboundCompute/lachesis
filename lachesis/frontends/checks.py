@@ -3485,6 +3485,87 @@ class GraphAccumulatorTests(unittest.TestCase):
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 
+class EcosystemIndexSharingTests(unittest.TestCase):
+    """Every model reads the same graph, so every model gets the same index.
+
+    The index has to stay optional: a model is a public extension point and can be
+    called on its own, and the in-tree models are.
+    """
+
+    def _graph(self) -> dict:
+        return {
+            "nodes": [_node("a"), _node("b", "call")],
+            "edges": [_edge("CALLS", "a", "b")],
+        }
+
+    def _model(self, model_id: str, seen: list):
+        from lachesis.core.composition import GraphDelta
+
+        class Recording:
+            supported_languages = ("python",)
+            required_capabilities = ()
+
+            def __init__(self, identifier: str) -> None:
+                self.model_id = identifier
+
+            def applies(self, graph, package_inventory) -> bool:
+                return True
+
+            def enrich(self, graph, index=None) -> GraphDelta:
+                seen.append(index)
+                return GraphDelta(self.model_id, [], [])
+
+        return Recording(model_id)
+
+    def test_one_index_is_built_and_every_model_gets_that_same_one(self) -> None:
+        from lachesis.ecosystems import EcosystemRegistry
+
+        seen: list = []
+        registry = EcosystemRegistry()
+        registry.register(self._model("first", seen))
+        registry.register(self._model("second", seen))
+        registry.enrich(self._graph(), (), {"python"}, {})
+
+        self.assertEqual(2, len(seen))
+        self.assertIsNotNone(seen[0])
+        self.assertIs(seen[0], seen[1])
+
+    def test_an_index_the_caller_already_has_is_the_one_used(self) -> None:
+        from lachesis.core.query import GraphIndex
+        from lachesis.ecosystems import EcosystemRegistry
+
+        graph = self._graph()
+        index, seen = GraphIndex(graph), []
+        registry = EcosystemRegistry()
+        registry.register(self._model("first", seen))
+        registry.enrich(graph, (), {"python"}, {}, index)
+
+        self.assertIs(index, seen[0])
+
+    def test_a_model_called_on_its_own_still_gets_an_index(self) -> None:
+        """The in-tree models are called directly by other tests and by callers
+        outside this package, so the parameter defaulting has to hold."""
+        from lachesis.ecosystems import GenericRouteModel
+
+        delta = GenericRouteModel().enrich(self._graph())
+        self.assertEqual([], delta.nodes)
+
+    def test_sharing_an_index_does_not_change_what_is_composed(self) -> None:
+        from lachesis.core.query import GraphIndex
+        from lachesis.ecosystems import default_ecosystem_registry
+
+        graph = {
+            "nodes": [_node("f", "function"), _node("p", "parameter")],
+            "edges": [_edge("DECLARES", "f", "p")],
+        }
+        registry = default_ecosystem_registry()
+        arguments = (GraphIndex(graph).package_inventory(), {"python"}, {})
+        self.assertEqual(
+            registry.enrich(graph, *arguments),
+            registry.enrich(graph, *arguments, GraphIndex(graph)),
+        )
+
+
 class EdgeKeyDeduplicationTests(unittest.TestCase):
     """``_EdgeKeys`` defers serializing properties, so it has to answer identically.
 

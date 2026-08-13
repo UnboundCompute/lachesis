@@ -188,7 +188,7 @@ def enrich_graph(
     graph = default_overlay_registry().enrich(graph)
     index = GraphIndex(graph)
     graph = default_ecosystem_registry().enrich(
-        graph, index.package_inventory(), set(languages), capabilities,
+        graph, index.package_inventory(), set(languages), capabilities, index,
     )
     graph = default_model_overlay_registry().enrich(graph)
     return default_security_overlay_registry().enrich(graph)

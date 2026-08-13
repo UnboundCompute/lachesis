@@ -43,8 +43,9 @@ class GenericRouteModel:
             for node in graph.get("nodes", [])
         )
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        if index is None:
+            index = GraphIndex(graph)
         nodes = []
         edges = []
         parameters_by_function = {}

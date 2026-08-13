@@ -102,8 +102,9 @@ class GenericRuntimeModel:
             return f"*.{method}", self.method_models[method]
         return None
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        if index is None:
+            index = GraphIndex(graph)
         nodes = []
         edges = []
         arguments_by_call: dict[str, list[dict]] = {}
