@@ -66,16 +66,36 @@ def detect_packages(source_dir: str, files: Iterable[str]) -> Dict[str, List[str
     """
     source_dir = os.path.abspath(source_dir)
     roots = find_package_roots(source_dir)
+    # Ownership is a property of a file's directory, not of the file, and a tree has
+    # far fewer directories than files. So instead of comparing every file against
+    # every root, walk each directory up to the first root above it and remember the
+    # answer for every directory passed on the way. The first root reached going up
+    # is the deepest one, which is the same winner the length comparison picked.
+    by_directory = {root.rstrip(os.sep) or os.sep: root for root in roots}
+    owners: Dict[str, str | None] = {}
+
+    def owner_of(directory: str) -> str | None:
+        unresolved = []
+        current = directory
+        while current not in owners:
+            if current in by_directory:
+                owners[current] = by_directory[current]
+                break
+            unresolved.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:
+                owners[current] = None
+                break
+            current = parent
+        found = owners[current]
+        for passed in unresolved:
+            owners[passed] = found
+        return found
+
     buckets: Dict[str, List[str]] = {}
     for path in files:
         absolute = os.path.abspath(path)
-        # deepest match wins; roots are compared as path prefixes with a separator so
-        # `/a/pkg-two` is never treated as living inside `/a/pkg`
-        owner = None
-        for root in roots:
-            if absolute == root or absolute.startswith(root.rstrip(os.sep) + os.sep):
-                if owner is None or len(root) > len(owner):
-                    owner = root
+        owner = owner_of(os.path.dirname(absolute))
         buckets.setdefault(package_key(source_dir, owner), []).append(absolute)
     for grouped in buckets.values():
         grouped.sort()

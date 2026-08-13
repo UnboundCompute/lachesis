@@ -3486,6 +3486,73 @@ class GraphAccumulatorTests(unittest.TestCase):
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 
+class PackageOwnershipTests(unittest.TestCase):
+    """Ownership is memoized per directory, and has to answer what the scan answered.
+
+    detect_packages used to compare every file against every package root, which is
+    a product a monorepo pays in full. Walking a file's directory up to the first
+    root above it, and remembering every directory passed on the way, is the same
+    question asked once per directory instead of once per file per root. The
+    reference here is the old rule spelled out literally: the longest root that is a
+    path prefix of the file.
+    """
+
+    @staticmethod
+    def _reference(source_dir, files, roots):
+        from lachesis.packages import package_key
+
+        buckets = {}
+        for path in files:
+            absolute = os.path.abspath(path)
+            owner = None
+            for root in roots:
+                if absolute == root or absolute.startswith(root.rstrip(os.sep) + os.sep):
+                    if owner is None or len(root) > len(owner):
+                        owner = root
+            buckets.setdefault(package_key(source_dir, owner), []).append(absolute)
+        for grouped in buckets.values():
+            grouped.sort()
+        return dict(sorted(buckets.items()))
+
+    def test_it_buckets_exactly_as_a_scan_over_every_root_does(self) -> None:
+        from lachesis.packages import detect_packages, find_package_roots
+
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            written = []
+            # `pkg` and `pkg-two` are siblings whose names are prefixes of one
+            # another, `pkg/nested` is a package inside a package, and `loose` sits
+            # under no root at all.
+            for package, manifest in (
+                ("pkg", "package.json"),
+                ("pkg-two", "package.json"),
+                ("pkg/nested", "pyproject.toml"),
+            ):
+                (tree / package).mkdir(parents=True, exist_ok=True)
+                (tree / package / manifest).write_text("{}\n")
+                written.append(str(tree / package / manifest))
+            for relative in (
+                "pkg/src/a.ts", "pkg/nested/deep/b.py", "pkg-two/c.ts", "loose/d.ts",
+            ):
+                (tree / relative).parent.mkdir(parents=True, exist_ok=True)
+                (tree / relative).write_text("\n")
+                written.append(str(tree / relative))
+
+            roots = find_package_roots(str(tree))
+            buckets = detect_packages(str(tree), written)
+            self.assertEqual(
+                self._reference(os.path.abspath(str(tree)), written, roots), buckets)
+            self.assertEqual(
+                ["<root>", "pkg", "pkg-two", "pkg/nested"], sorted(buckets))
+            self.assertEqual([str(tree / "loose" / "d.ts")], buckets["<root>"])
+            self.assertEqual(
+                [str(tree / "pkg" / "package.json"), str(tree / "pkg" / "src" / "a.ts")],
+                buckets["pkg"])
+            self.assertEqual([str(tree / "pkg-two" / "c.ts"),
+                              str(tree / "pkg-two" / "package.json")],
+                             buckets["pkg-two"])
+
+
 class SnapshotNodeIdPassTests(unittest.TestCase):
     """One pass over the nodes has to report exactly what three passes reported.
 
