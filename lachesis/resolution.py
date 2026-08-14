@@ -96,6 +96,25 @@ CALLER_SITE_CAP = 2048
 DECL_DEPTH = 1
 CONE_BUDGET = 256
 
+# A third budget, for the one caller that does not merely *walk* the cone but folds the
+# overlay tier over every node in it. Separate because it bounds a different thing and
+# the difference is an order of magnitude. `resolve_cone` at 256 members costs 256
+# dictionary walks; folding at 256 members costs whatever those declarations own, and
+# measured on this repo's own store that is 90,699 nodes -- 45% of the graph, to answer
+# a question about one function.
+#
+# The curve is superlinear and was measured, not guessed (members -> owned nodes ->
+# wall for the whole fold, seeded at `main`):
+#
+#       8 ->  4,649 -> 1.24s        64 -> 20,436 -> 2.60s
+#      16 ->  5,541 -> 1.29s       128 -> 39,413 -> 3.80s
+#      32 ->  9,974 -> 1.53s       256 -> 90,699 -> 8.91s
+#
+# 64 buys a real neighbourhood for a fraction of the tail. It is not a ceiling on what a
+# session can fold: grafts accumulate in the index, so a second question about an
+# adjacent region widens the folded area rather than re-paying for it.
+FOLD_BUDGET = 64
+
 # Steps 2 and 3 encode C's linkage rules, and only C has them. The frontend does not
 # stamp a language on a node, so the file suffix is the signal — explicit and checkable,
 # rather than inferring a language from the presence of a property.
@@ -169,6 +188,7 @@ class Resolver:
         self.graph_hash = graph_hash or ""
         self._memo: dict[str, dict] = {}
         self._cone_memo: dict[tuple, dict] = {}
+        self._hood_memo: dict[tuple, dict] = {}
 
     # -- one call site -------------------------------------------------------
 
@@ -393,6 +413,67 @@ class Resolver:
         self._cone_memo[key] = cone
         return cone
 
+    def resolve_neighbourhood(self, node_id: str, budget: int = CONE_BUDGET) -> dict:
+        """The cone around a declaration, followed in *both* call directions.
+
+        ``resolve_cone`` answers "what does this reach", which is the right question for
+        a forward dataflow walk and the wrong one for a backward one: the values that
+        arrive at a sink come from its callers, and a forward-only cone contains none of
+        them. A neighbourhood is what a dataflow question actually depends on, so it is
+        what gets folded.
+
+        Callers are followed through ``resolve_callers``, which asks the same ladder in
+        reverse and therefore agrees with the forward walk by construction -- a homonym
+        that is not really a caller does not become one just because the walk turned
+        around. Each caller contributes its *owning declaration*, since a call site is
+        inside a body and it is the body that has to be folded for the site to mean
+        anything.
+
+        Shares the forward walk's budget discipline: a stop, never a filter, and
+        ``truncated`` is the honest report that the answer below is computed over less
+        than the whole neighbourhood.
+        """
+        # Its own memo, not ``_cone_memo``: that one is serialized to the v9 ``ConeMemo``
+        # table, whose rows mean "the forward cone of this node at this budget". A
+        # neighbourhood keyed into the same dict would be written out as a cone and read
+        # back as one, and it is a strictly larger set -- a silently wrong answer to a
+        # question nobody asked here.
+        key = (node_id, int(budget))
+        cached = self._hood_memo.get(key)
+        if cached is not None:
+            return cached
+        members = {node_id}
+        frontier = [node_id]
+        truncated = False
+        while frontier and not truncated:
+            following: list[str] = []
+            for declaration in frontier:
+                for target in self._adjacent(declaration):
+                    if target in members:
+                        continue
+                    if len(members) >= budget:
+                        truncated = True
+                        break
+                    members.add(target)
+                    following.append(target)
+                if truncated:
+                    break
+            frontier = following
+        cone = {"members": frozenset(members), "truncated": truncated}
+        self._hood_memo[key] = cone
+        return cone
+
+    def _adjacent(self, declaration: str):
+        """The declarations one call hop away, callee side then caller side."""
+        for result in self.resolve_decl(declaration).values():
+            if result["target"]:
+                yield result["target"]
+        for site_id in self.resolve_callers(declaration)["sites"]:
+            site = self.index.nodes.get(site_id) or {}
+            owner = _properties(site).get("owner_function_id")
+            if owner:
+                yield owner
+
     # -- persistence ---------------------------------------------------------
 
     def memo_rows(self) -> tuple[list, list]:
@@ -502,8 +583,14 @@ def resolve_cone(index: Any, node_id: str, budget: int = CONE_BUDGET) -> dict:
     return resolver_for(index).resolve_cone(node_id, budget)
 
 
+def resolve_neighbourhood(index: Any, node_id: str, budget: int = CONE_BUDGET) -> dict:
+    return resolver_for(index).resolve_neighbourhood(node_id, budget)
+
+
 __all__ = [
     "CALLER_SITE_CAP", "CANDIDATE_CAP", "CONE_BUDGET", "DECL_DEPTH",
+    "FOLD_BUDGET",
     "Resolver", "ResolutionIndex", "owned_callsites",
-    "resolve", "resolve_callers", "resolve_cone", "resolve_decl", "resolver_for",
+    "resolve", "resolve_callers", "resolve_cone", "resolve_decl",
+    "resolve_neighbourhood", "resolver_for",
 ]

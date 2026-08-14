@@ -143,6 +143,21 @@ def _restore_node_props(columns, props_blob: Optional[bytes],
     return properties
 
 
+def materialize_subgraph(index: "KuzuGraphIndex", keep) -> dict:
+    """The canonical ``{nodes, edges}`` dict restricted to the nodes ``keep`` holds.
+
+    An edge survives only if *both* its endpoints do. A subgraph with an edge pointing
+    out of itself is not a smaller graph, it is a broken one: the overlays that fold
+    over this look their endpoints up in the node map, and a dangling target reads as a
+    node with no kind rather than as a node that was left out.
+
+    Still one columnar scan per table, exactly as the whole-graph case -- the saving
+    here is not in what the store reads but in what stays on the heap afterwards, which
+    is the entire point of folding a cone instead of a repo.
+    """
+    return _materialize(index, keep)
+
+
 def materialize_graph(index: "KuzuGraphIndex") -> dict:
     """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
 
@@ -157,6 +172,18 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
     matches ``combine_graphs`` (nodes by id, edges by ``(kind, source, target)``) so a
     materialized graph compares equal to a freshly composed one.
     """
+    return _materialize(index, None)
+
+
+def _materialize(index: "KuzuGraphIndex", keep) -> dict:
+    """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
+
+    One body rather than two because a subgraph that restored props even slightly
+    differently from the whole graph would enrich differently, and the difference would
+    surface as a dataflow edge that appears only when the cone is small -- which is
+    indistinguishable from the semantic loss cone-scoping is *expected* to have, and so
+    would hide inside it forever.
+    """
     nodes = []
     # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
     # order is not the real one — the prefix sorts as a base36 code and the hash as
@@ -169,6 +196,8 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         row = res.get_next()
         nid, kind, label = row[:3]
         nid = decode_id(nid, index._id_prefixes)
+        if keep is not None and nid not in keep:
+            continue
         nodes.append({"id": nid, "kind": kind, "label": label,
                       "properties": _restore_node_props(row[3:-1], row[-1],
                                                         index._props_dict,
@@ -182,22 +211,30 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         )
         while res.has_next():
             src, tgt, props = res.get_next()
-            edges.append({"source": decode_id(src, prefixes),
-                          "target": decode_id(tgt, prefixes), "kind": kind,
+            src, tgt = decode_id(src, prefixes), decode_id(tgt, prefixes)
+            if keep is not None and (src not in keep or tgt not in keep):
+                continue
+            edges.append({"source": src, "target": tgt, "kind": kind,
                           "properties": _restore(props, index._props_dict)})
     res = index._conn.execute(
         "MATCH (a:Node)-[e:EDGE]->(b:Node) RETURN a.id, b.id, e.kind, e.props"
     )
     while res.has_next():
         src, tgt, kind, props = res.get_next()
-        edges.append({"source": decode_id(src, prefixes),
-                      "target": decode_id(tgt, prefixes), "kind": kind,
+        src, tgt = decode_id(src, prefixes), decode_id(tgt, prefixes)
+        if keep is not None and (src not in keep or tgt not in keep):
+            continue
+        edges.append({"source": src, "target": tgt, "kind": kind,
                       "properties": _restore(props, index._props_dict)})
     # Kùzu does not promise a scan order, and two edges can share
     # ``(kind, source, target)`` while differing in props, so the tie-break folds the
     # props in: materializing the same store twice must give byte-identical output, or
     # a downstream enrich is not reproducible.
-    edges.extend(deferred_edges(index))
+    deferred = deferred_edges(index)
+    if keep is not None:
+        deferred = [e for e in deferred
+                    if e["source"] in keep and e["target"] in keep]
+    edges.extend(deferred)
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
                               json.dumps(e["properties"], sort_keys=True)))
     return {"nodes": nodes, "edges": edges}
@@ -325,6 +362,11 @@ class KuzuGraphIndex:
         # that narrow ownership by kind ask the same two or three questions over and
         # over, and each answer is a set union over buckets that do not move.
         self._kind_ids: dict = {}
+        # What `graft` has already merged, so overlapping cone folds are additive
+        # rather than duplicative. Nodes and edges separately because a node can be
+        # grafted once and then referenced by edges from several later folds.
+        self._grafted_nodes: set = set()
+        self._grafted_edges: set = set()
         self._overlay = None
         self._derived_out: dict = {}
         self._derived_in: dict = {}
@@ -475,13 +517,71 @@ class KuzuGraphIndex:
                 extra = self._overlay.edge_props.get(_overlay_edge_key(edge))
                 if extra:
                     edge["properties"].update(extra)
-            derived = self._derived_in if reverse else self._derived_out
+        # Not gated on the overlay any more: `graft` fills these from a cone fold, which
+        # produces no sidecar. Reading derived edges only when a sidecar happened to be
+        # attached was the same condition twice by coincidence, and it stopped being a
+        # coincidence the moment a second thing could populate them.
+        derived = self._derived_in if reverse else self._derived_out
+        if derived:
             edges.extend({"source": e["source"], "target": e["target"],
                           "kind": e["kind"], "properties": dict(e.get("properties") or {})}
                          for e in derived.get(node_id, ()))
         edges.sort(key=_EDGE_SORT)
         cache[node_id] = edges
         return edges
+
+    def graft(self, nodes, edges) -> int:
+        """Merge derived nodes and edges into the live index. Returns edges added.
+
+        What a cone fold hands back. `attach_overlay` cannot carry it: an ``Overlay``
+        validates every edge kind against ``DERIVED_EDGE_KINDS``, which is the guard
+        vocabulary, and the dataflow tier's ``POINTS_TO``/``READS_HEAP``/
+        ``VALUE_FLOWS_TO`` are deliberately not in it. Widening that set to let a fold
+        through would also let a hand-written sidecar through, and the whole point of
+        that check is that a sidecar is untrusted input while a fold is our own output.
+
+        Additive and idempotent. An edge already present is skipped on identity, so
+        folding two overlapping cones grafts each shared edge once and the second cone
+        costs only what it adds.
+        """
+        if not self._derived_out:
+            self._derived_out = defaultdict(list)
+            self._derived_in = defaultdict(list)
+        for node in nodes:
+            nid = node["id"]
+            if nid in self._node_cache and self._node_cache[nid] is not None:
+                continue
+            self._node_cache[nid] = node
+            if nid not in self._grafted_nodes:
+                self._grafted_nodes.add(nid)
+                self._ids.append(nid)
+                self.by_kind[node.get("kind")].append(nid)
+                self.by_label[node.get("label")].append(nid)
+                props = node.get("properties") or {}
+                path = props.get("absolute_file") or props.get("file")
+                if path:
+                    self.by_file[path].append(nid)
+                owner = props.get("owner_function_id") or props.get("function_id")
+                if owner:
+                    self.by_owner[owner].append(nid)
+        added = 0
+        for edge in edges:
+            key = (edge["source"], edge["target"], edge["kind"],
+                   json.dumps(edge.get("properties") or {}, sort_keys=True))
+            if key in self._grafted_edges:
+                continue
+            self._grafted_edges.add(key)
+            self._derived_out[edge["source"]].append(edge)
+            self._derived_in[edge["target"]].append(edge)
+            added += 1
+        # The adjacency caches answered these nodes before the graft and would keep
+        # answering the old way; the node cache is deliberately *not* cleared, because
+        # it is what the loop above just populated.
+        self._out_cache.clear()
+        self._in_cache.clear()
+        self._kind_ids.clear()
+        self._ids.sort()
+        return added
 
     def degrees(self) -> dict:
         """``{node_id: outgoing + incoming}`` for every node that has an edge.

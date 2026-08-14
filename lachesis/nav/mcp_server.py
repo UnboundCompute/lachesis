@@ -64,18 +64,30 @@ SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 # ground (20 edges: POINTS_TO, READS_HEAP, VALUE_FLOWS_TO, all from the heap overlay),
 # and `points_to`/`aliases` read POINTS_TO out of the index by hand a few lines below.
 #
-# The previous comment here argued that selective enrichment would make an answer depend
-# on which tool ran first. That hazard is real but it is not this: `ensure_dataflow_tier`
-# rebinds the index for the whole store, so the tools listed here upgrade it for
-# everyone, and a tool outside this set cannot tell the difference either way -- which is
-# precisely what the measurement establishes. What it costs is honest and small: `hubs`
-# and `search` rank by degree, and degree over the core graph is lower than degree over
-# the enriched one, so their *ordering* shifts even though their membership does not.
+# What it costs is honest and small: `hubs` and `search` rank by degree, and degree over
+# the core graph is lower than degree over the enriched one, so their *ordering* shifts
+# even though their membership does not.
 #
-# Still a waypoint, not the destination. These five fold the whole graph. Scoping the
-# fold to a cone around the seed is the next step; this one just stops the other twelve
-# from paying for it.
+# These five no longer fold the whole graph either. Each one names a seed, so each one
+# folds the call neighbourhood of that seed and nothing else -- see
+# `GraphStore.ensure_dataflow_cone`. `reaches` names two, and gets both.
+#
+# The order hazard is worth naming, because it is now real. A cone graft mutates the
+# shared index, so a `flow` from one seed leaves edges behind that a later `flow` from a
+# different seed can see, and running the two in the other order gives the second one a
+# smaller graph to reason over. The result is *monotone* -- more folding never removes an
+# edge -- so no answer is wrong, but two sessions can disagree on how much they found.
+# `cone.truncated` and the grafted counts are reported for exactly this reason: the
+# scope is part of the answer, so it is in the answer.
 OVERLAY_TOOLS = ("flow", "reaches", "sources_of", "points_to", "aliases")
+
+# Which argument each of them seeds from. A cone needs a centre, and the centre is the
+# node the caller already asked about; deriving it from the arguments keeps that in one
+# place rather than repeating a fold call in five branches below.
+OVERLAY_SEED_ARGS = {
+    "flow": ("seed",), "reaches": ("src", "sink"), "sources_of": ("sink",),
+    "points_to": ("value",), "aliases": ("value",),
+}
 
 # Canonical display order for tools/list: the centrality cold-start (hubs) leads, then
 # navigation, then value-flow reasoning, then the security tools last. Ordering only —
@@ -128,22 +140,32 @@ class _Ctx:
     def __init__(self, graph_path, overlay_path):
         self.store = GraphStore.load(graph_path, overlay_path=overlay_path)
         self._built = {}
-        self._tier = self.store.dataflow_ready
+        self._tier = (self.store.dataflow_ready,
+                      getattr(self.store, "cone_generation", 0))
         log(f"loaded {len(self.store.gl.nodes)} nodes; "
             f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges; "
-            f"dataflow tier: {'present' if self._tier else 'on demand'}")
+            f"dataflow tier: "
+            f"{'present' if self.store.dataflow_ready else 'on demand, per cone'}")
 
     def _analysis(self, key, build):
-        if self._tier != self.store.dataflow_ready:
+        # Two ways the index can move: the whole tier arrives (`dataflow_ready` flips)
+        # or a cone graft adds edges to the index in place (`cone_generation` ticks).
+        # The second leaves `dataflow_ready` false forever -- the store still has no
+        # full tier -- so watching only the flag would serve a `Reachability` built
+        # before the graft, which is exactly the answer the graft existed to improve.
+        tier = (self.store.dataflow_ready, getattr(self.store, "cone_generation", 0))
+        if self._tier != tier:
             self._built.clear()  # the index moved under them; every cache is stale
-            self._tier = self.store.dataflow_ready
+            self._tier = tier
         if key not in self._built:
             self._built[key] = build()
         return self._built[key]
 
     @property
     def reach(self):
-        self.store.ensure_dataflow_tier()
+        # No `ensure_dataflow_tier` here. The cone for this call's seed is folded in
+        # `call_tool`, which knows which argument the seed is; this property does not,
+        # and folding the whole graph because it cannot tell is what cost 49 seconds.
         return self._analysis("reach", lambda: Reachability(self.store))
 
     @property
@@ -183,6 +205,41 @@ def _seeds(store, token):
 def _seed(store, token):
     seeds = _seeds(store, token)
     return seeds[0] if seeds else None
+
+
+def _fold_cone(store, name, args):
+    """Fold the dataflow tier around this call's seeds. ``{}`` when nothing was scoped.
+
+    Every tool that reads overlay-derived edges names the node it is about, so the fold
+    can be scoped to that node's call neighbourhood rather than to the repo. This is the
+    only place that mapping lives — a tool branch below must not have to remember to
+    fold, because forgetting would not fail, it would quietly answer with fewer edges.
+
+    The report rides back to the caller as ``cone``. Costing a query is a reasonable
+    thing to want to see, and ``truncated`` there is load-bearing: it says the
+    neighbourhood hit its budget, so the answer below is computed over less than
+    everything that could reach the seed, and a smaller result may be an artifact of
+    the scope rather than a fact about the code.
+    """
+    seed_args = OVERLAY_SEED_ARGS.get(name)
+    if not seed_args:
+        return {}
+    folded = []
+    for key in seed_args:
+        token = args.get(key)
+        if not token:
+            continue
+        seed = _seed(store, token)
+        if seed:
+            folded.append(store.ensure_dataflow_cone(seed))
+    if not folded:
+        return {}
+    return {"cone": {
+        "members": sum(f["members"] for f in folded),
+        "nodes": sum(f["nodes"] for f in folded),
+        "edges": sum(f["edges"] for f in folded),
+        "truncated": any(f["truncated"] for f in folded),
+    }}
 
 
 def _alts(store, token):
@@ -366,8 +423,7 @@ def call_tool(name, args, format=None):
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
                                      "'comprehension' profile (security tool)"}, fmt)
     c = ctx()
-    if name in OVERLAY_TOOLS:
-        c.store.ensure_dataflow_tier()
+    cone = _fold_cone(c.store, name, args)
     store, gl = c.store, c.store.gl
     text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
 
@@ -446,19 +502,19 @@ def call_tool(name, args, format=None):
         if not seed:
             return _emit(name, {"error": f"no node for {args['seed']!r}"}, fmt)
         return _emit(name, {**c.reach.flow(seed, limit=int(args.get("limit", 200))),
-                            **_alts(store, args["seed"])}, fmt, offset, limit)
+                            **_alts(store, args["seed"]), **cone}, fmt, offset, limit)
     if name == "reaches":
         src, sink = _seed(store, args["src"]), _seed(store, args["sink"])
         if not src or not sink:
             return _emit(name, {"error": "could not resolve src/sink"}, fmt)
         return _emit(name, {**c.reach.reaches(src, sink),
-                            **_alts(store, args["src"])}, fmt, offset, limit)
+                            **_alts(store, args["src"]), **cone}, fmt, offset, limit)
     if name == "sources_of":
         sink = _seed(store, args["sink"])
         if not sink:
             return _emit(name, {"error": f"no node for {args['sink']!r}"}, fmt)
         return _emit(name, {**c.reach.sources_of(sink, limit=int(args.get("limit", 200))),
-                            **_alts(store, args["sink"])}, fmt, offset, limit)
+                            **_alts(store, args["sink"]), **cone}, fmt, offset, limit)
     if name == "points_to":
         value = _seed(store, args["value"])
         if not value:
@@ -467,7 +523,7 @@ def call_tool(name, args, format=None):
         edges = store.index.outgoing_of_kind(value, "POINTS_TO")
         shape = store.path_shape([store.node(value)] + heaps, edges,
                                  manifest={"move": "points_to", "value": value})
-        return _emit(name, {**shape, **_alts(store, args["value"])},
+        return _emit(name, {**shape, **_alts(store, args["value"]), **cone},
                      fmt, offset, limit)
     if name == "aliases":
         value = _seed(store, args["value"])
@@ -484,7 +540,7 @@ def call_tool(name, args, format=None):
                                                  "via": heap["id"]}})
         shape = store.path_shape([store.node(value)] + alias_nodes, edges,
                                  manifest={"move": "aliases", "value": value})
-        return _emit(name, {**shape, **_alts(store, args["value"])},
+        return _emit(name, {**shape, **_alts(store, args["value"]), **cone},
                      fmt, offset, limit)
     if name == "guards":
         fn = _seed(store, args["fn"])
