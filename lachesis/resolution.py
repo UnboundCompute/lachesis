@@ -83,6 +83,13 @@ CALLABLE_KINDS = frozenset(
 # was truncated is a wrong answer rather than a partial one.
 CANDIDATE_CAP = 64
 
+# How many call sites naming one symbol `resolve_callers` will decide before it stops
+# and says so. A different cap from CANDIDATE_CAP because it bounds a different thing:
+# CANDIDATE_CAP bounds one answer's width, this bounds how much work one question buys.
+# `get` and `len` name tens of thousands of sites, and resolving all of them to discover
+# that ten mean *this* `get` is a bad trade for an interactive tool.
+CALLER_SITE_CAP = 2048
+
 # Two different defaults, on purpose. `resolve_decl` is one declaration's own call
 # sites; `resolve_cone` walks. Sharing a default would let a caller who wanted the
 # cheap question pay for the expensive one by accident.
@@ -97,13 +104,14 @@ C_SUFFIXES = (".c", ".h")
 
 @runtime_checkable
 class ResolutionIndex(Protocol):
-    """The four things a resolver needs from an index, and nothing else."""
+    """The five things a resolver needs from an index, and nothing else."""
 
     nodes: Mapping[str, dict]
 
     def outgoing_of_kind(self, source: str, *edge_kinds: str) -> tuple: ...
     def nodes_owned_by(self, owner_id: str) -> tuple: ...
     def decl_index(self, name: Optional[str] = None): ...
+    def callsite_index(self, name: Optional[str] = None): ...
 
 
 def owned_callsites(index: Any, node_id: str) -> tuple:
@@ -313,6 +321,38 @@ class Resolver:
                 break
         return results
 
+    def resolve_callers(self, node_id: str,
+                        cap: int = CALLER_SITE_CAP) -> dict:
+        """The call sites that resolve to this declaration: ``{sites, truncated}``.
+
+        The forward direction can afford to be exhaustive because a call site names one
+        callee. The reverse cannot: a name is not an identity, so the only sites worth
+        asking about are the ones that *mention* this declaration's name, which is
+        exactly what ``callsite_index`` is for. Every mention is then put through the
+        same ladder as the forward question and kept only if the ladder lands here — so
+        a homonym's callers never leak into its twin's, which is the whole point.
+
+        A site whose answer is a conservative candidate list containing this node is
+        kept too, and its result says so. Dropping it would report "nothing calls this"
+        about a site that demonstrably might, and a confident absence is the one answer
+        this module is not allowed to give.
+        """
+        node = self.index.nodes.get(node_id)
+        name = str((node or {}).get("label") or "")
+        if not name:
+            return {"sites": {}, "truncated": False}
+        mentions = tuple(self.index.callsite_index(name) or ())
+        truncated = len(mentions) > cap
+        sites: dict[str, dict] = {}
+        for row in mentions[:cap]:
+            site_id = row.get("node_id")
+            if not site_id or site_id in sites:
+                continue
+            result = self.resolve(site_id)
+            if result["target"] == node_id or node_id in result["candidates"]:
+                sites[site_id] = result
+        return {"sites": sites, "truncated": truncated}
+
     def resolve_cone(self, node_id: str, budget: int = CONE_BUDGET) -> dict:
         """Every declaration reachable by decided calls from here, budget-stopped.
 
@@ -449,11 +489,16 @@ def resolve_decl(index: Any, node_id: str, depth: int = DECL_DEPTH) -> dict:
     return resolver_for(index).resolve_decl(node_id, depth)
 
 
+def resolve_callers(index: Any, node_id: str, cap: int = CALLER_SITE_CAP) -> dict:
+    return resolver_for(index).resolve_callers(node_id, cap)
+
+
 def resolve_cone(index: Any, node_id: str, budget: int = CONE_BUDGET) -> dict:
     return resolver_for(index).resolve_cone(node_id, budget)
 
 
 __all__ = [
-    "CANDIDATE_CAP", "CONE_BUDGET", "DECL_DEPTH", "Resolver", "ResolutionIndex",
-    "owned_callsites", "resolve", "resolve_cone", "resolve_decl", "resolver_for",
+    "CALLER_SITE_CAP", "CANDIDATE_CAP", "CONE_BUDGET", "DECL_DEPTH",
+    "Resolver", "ResolutionIndex", "owned_callsites",
+    "resolve", "resolve_callers", "resolve_cone", "resolve_decl", "resolver_for",
 ]

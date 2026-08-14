@@ -150,11 +150,32 @@ def ctx():
     return _CTX
 
 
-def _seed(store, token):
+def _seeds(store, token):
+    """Every node this token could equally mean, best-first.
+
+    A node id means itself. A name means as many nodes as share it, and `si.peers`
+    decides which of the ranked hits are genuine rivals rather than also-rans."""
     if store.node(token):
-        return token
-    hits = store.resolve(token)
-    return hits[0]["node_id"] if hits else None
+        return [token]
+    return [hit["node_id"] for hit in si.peers(store.resolve(token), token)]
+
+
+def _seed(store, token):
+    seeds = _seeds(store, token)
+    return seeds[0] if seeds else None
+
+
+def _alts(store, token):
+    """``{"homonyms": [...]}`` when a token names more than one node, else nothing.
+
+    The tools below that take a single seed still take a single seed — flow from four
+    different `funcA`s at once is four answers, not one. What changes is that the
+    caller is told the choice was made, and handed the ids it was made between, so a
+    silent collapse becomes a visible one it can undo with an explicit node_id."""
+    seeds = _seeds(store, token)
+    if len(seeds) < 2:
+        return {}
+    return {"homonyms": [_ref(store, node_id) for node_id in seeds]}
 
 
 def _ref(store, node_id):
@@ -353,13 +374,31 @@ def call_tool(name, args, format=None):
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
         return _emit(name, page, fmt, offset, limit)
     if name in ("callers", "callees"):
-        seed = _seed(store, args["name"])
-        if not seed:
+        seeds = _seeds(store, args["name"])
+        if not seeds:
             return _emit(name, {"error": f"no node named {args['name']!r}"}, fmt)
+        direct_only = bool(args.get("direct_only"))
         move = si.callers if name == "callers" else si.callees
-        moves = move(gl, seed, direct_only=bool(args.get("direct_only")),
-                     with_dispatch=text)
-        return _emit(name, {name: moves, "of": args["name"]}, fmt, offset, limit)
+        # Every homonym, unioned — not the first one. `callers("funcA")` returning only
+        # the callers of whichever `funcA` sorted first is the failure a vulnerability
+        # hunter cannot see: the answer looks complete. Each row carries its own
+        # node_id, and `of` names the seeds, so the union stays separable.
+        moves, seen = [], set()
+        for seed in seeds:
+            for row in move(gl, seed, direct_only=direct_only, with_dispatch=text,
+                            resolver=store.resolver):
+                if row["node_id"] in seen:
+                    continue
+                seen.add(row["node_id"])
+                moves.append(row)
+        payload = {name: moves, "of": args["name"],
+                   **_alts(store, args["name"])}
+        if name == "callees" and not direct_only:
+            # Invariant 2: an undecidable call is a node, not an omission.
+            payload["unresolved"] = [row for seed in seeds
+                                     for row in si.unresolved_callees(
+                                         gl, seed, store.resolver)]
+        return _emit(name, payload, fmt, offset, limit)
     if name == "read_body":
         seed = args.get("node_id") if store.node(args.get("node_id") or "") \
             else _seed(store, args.get("name") or "")
@@ -390,27 +429,29 @@ def call_tool(name, args, format=None):
         seed = _seed(store, args["seed"])
         if not seed:
             return _emit(name, {"error": f"no node for {args['seed']!r}"}, fmt)
-        return _emit(name, c.reach.flow(seed, limit=int(args.get("limit", 200))),
-                     fmt, offset, limit)
+        return _emit(name, {**c.reach.flow(seed, limit=int(args.get("limit", 200))),
+                            **_alts(store, args["seed"])}, fmt, offset, limit)
     if name == "reaches":
         src, sink = _seed(store, args["src"]), _seed(store, args["sink"])
         if not src or not sink:
             return _emit(name, {"error": "could not resolve src/sink"}, fmt)
-        return _emit(name, c.reach.reaches(src, sink), fmt, offset, limit)
+        return _emit(name, {**c.reach.reaches(src, sink),
+                            **_alts(store, args["src"])}, fmt, offset, limit)
     if name == "sources_of":
         sink = _seed(store, args["sink"])
         if not sink:
             return _emit(name, {"error": f"no node for {args['sink']!r}"}, fmt)
-        return _emit(name, c.reach.sources_of(sink, limit=int(args.get("limit", 200))),
-                     fmt, offset, limit)
+        return _emit(name, {**c.reach.sources_of(sink, limit=int(args.get("limit", 200))),
+                            **_alts(store, args["sink"])}, fmt, offset, limit)
     if name == "points_to":
         value = _seed(store, args["value"])
         if not value:
             return _emit(name, {"error": f"no node for {args['value']!r}"}, fmt)
         heaps = list(store.index.targets(value, "POINTS_TO"))
         edges = store.index.outgoing_of_kind(value, "POINTS_TO")
-        return _emit(name, store.path_shape([store.node(value)] + heaps, edges,
-                                            manifest={"move": "points_to", "value": value}),
+        shape = store.path_shape([store.node(value)] + heaps, edges,
+                                 manifest={"move": "points_to", "value": value})
+        return _emit(name, {**shape, **_alts(store, args["value"])},
                      fmt, offset, limit)
     if name == "aliases":
         value = _seed(store, args["value"])
@@ -425,15 +466,17 @@ def call_tool(name, args, format=None):
                                   "kind": "POINTS_TO",
                                   "properties": {"reason": "alias-via-heap",
                                                  "via": heap["id"]}})
-        return _emit(name, store.path_shape([store.node(value)] + alias_nodes, edges,
-                                            manifest={"move": "aliases", "value": value}),
+        shape = store.path_shape([store.node(value)] + alias_nodes, edges,
+                                 manifest={"move": "aliases", "value": value})
+        return _emit(name, {**shape, **_alts(store, args["value"])},
                      fmt, offset, limit)
     if name == "guards":
         fn = _seed(store, args["fn"])
         if not fn:
             return _emit(name, {"error": f"no function for {args['fn']!r}"}, fmt)
         return _emit(name, {"function": _ref(store, fn),
-                            "guard_signal": c.guards.profile(fn)}, fmt)
+                            "guard_signal": c.guards.profile(fn),
+                            **_alts(store, args["fn"])}, fmt)
     if name == "call_roles":
         fn = _seed(store, args["fn"])
         if not fn:
@@ -442,12 +485,16 @@ def call_tool(name, args, format=None):
         return _emit(name, {"function": _ref(store, fn),
                             "calls": [{"callee": r["callee"], "role": r["role"],
                                        "fact_origin": r["fact_origin"],
-                                       "at": f"{r['file']}:{r['line']}"} for r in recs]}, fmt)
+                                       "at": f"{r['file']}:{r['line']}"} for r in recs],
+                            **_alts(store, args["fn"])}, fmt)
     if name == "siblings":
-        hits = store.resolve(args["sym"])
+        # `diff` takes the resolved *entry*, not an id, so this one keeps `store.resolve`
+        # rather than going through `_seeds`.
+        hits = si.peers(store.resolve(args["sym"]), args["sym"])
         if not hits:
             return _emit(name, {"error": f"no node named {args['sym']!r}"}, fmt)
-        return _emit(name, c.siblings.diff(hits[0]), fmt, offset, limit)
+        return _emit(name, {**c.siblings.diff(hits[0]),
+                            **_alts(store, args["sym"])}, fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")
 
 

@@ -67,11 +67,29 @@ GOLDEN_PATH = GOLDEN_DIR / "eager_baseline.json.gz"
 SEED_LIMIT = 12
 SEED_PER_LANGUAGE = 4
 
-#: Tools allowed to answer with rows the golden does not have, and why. Empty until a
-#: phase earns an entry -- Phase 2's ``resolve`` tier legitimately adds ``callers`` and
-#: ``callees`` rows for call sites the eager frontends left unresolved, and that is the
-#: moment to add them here with the phase named.
-ALLOWED_EXTRA_ROWS: dict = {}
+#: Tools allowed to answer with rows the golden does not have, and why. An entry is a
+#: phase saying out loud that it changed an answer; the asymmetry is the point, so
+#: nothing here weakens the ``missing`` half, which stays a hard failure for every tool.
+ALLOWED_EXTRA_ROWS: dict = {
+    # Phase 3 wired the resolution tier into these two. They gain rows two ways: the
+    # union over every homonym a name means (the golden recorded one arbitrary winner),
+    # and the ladder deciding call sites the eager frontends left undecided. `callees`
+    # additionally grows an `unresolved` field, which is a field the golden has no
+    # counterpart for at all.
+    "callers": "Phase 3: homonym union + resolver-decided rows",
+    "callees": "Phase 3: homonym union + resolver-decided rows, plus `unresolved`",
+}
+
+#: Fields that are additive by construction, on any tool, and why. These are not rows
+#: about the graph -- they are the answer describing how it was arrived at -- so their
+#: presence displaces nothing and their absence from the golden is expected rather than
+#: suspicious. Listed by name so a *third* new field still has to justify itself.
+ADDED_FIELDS = {
+    # Phase 3: which seeds a name collapsed to. Every tool that takes one seed grew it.
+    "homonyms": "Phase 3: the seeds a name was resolved between",
+    # Phase 3, invariant 2: the call sites `callees` could not decide, as themselves.
+    "unresolved": "Phase 3: undecidable call sites, reported rather than omitted",
+}
 
 #: ``hubs`` is a ranking, not a set, so it is compared by membership plus how well the
 #: order survived. Below this the ranking has changed character even if the members did
@@ -512,6 +530,11 @@ def _scalar_problems(label: str, golden, actual, relaxed: bool) -> List[str]:
     for field in sorted(set(golden_scalars) | set(actual_scalars)):
         if field in rows:
             continue
+        if field in ADDED_FIELDS and field not in golden_scalars:
+            # A row-bearing field that happened to answer empty here. `rows_of` drops
+            # empty lists, so `unresolved: []` arrives as a scalar and would be reported
+            # as a new field on exactly the calls where it has nothing to say.
+            continue
         if field not in actual_scalars:
             problems.append(f"{label}.{field}: the golden has this field, the run does not")
         elif field not in golden_scalars:
@@ -568,7 +591,7 @@ def compare(golden: dict, actual: dict, relaxed: bool) -> List[str]:
                     f"run lost -- e.g. {sorted(missing)[0][:200]}",
                 )
         for field in sorted(set(actual_rows) - set(golden_rows)):
-            if tool not in ALLOWED_EXTRA_ROWS:
+            if field not in ADDED_FIELDS and tool not in ALLOWED_EXTRA_ROWS:
                 problems.append(
                     f"{label}.{field}: the run answers a field the golden does not have",
                 )
@@ -646,50 +669,81 @@ class ComparisonTests(unittest.TestCase):
     have -- and every one of these cases is a way it could pass vacuously.
     """
 
+    #: A tool with no ``ALLOWED_EXTRA_ROWS`` entry, so the default asymmetry is what is
+    #: under test here. Deliberately not `callers`: Phase 3 allow-listed that one, and a
+    #: self-test that shares a name with a real entry stops testing the default the
+    #: moment a phase claims the name.
+    TOOL = "flow"
+
     def _answer(self, rows) -> dict:
-        return {"of": "f", "callers": rows}
+        return {"of": "f", "nodes": rows}
+
+    def _label(self) -> str:
+        return f"{self.TOOL}:f@a.c:1"
 
     def test_a_lost_row_is_a_failure(self) -> None:
-        golden = {"callers:f@a.c:1": self._answer([{"name": "a"}, {"name": "b"}])}
-        actual = {"callers:f@a.c:1": self._answer([{"name": "a"}])}
+        golden = {self._label(): self._answer([{"name": "a"}, {"name": "b"}])}
+        actual = {self._label(): self._answer([{"name": "a"}])}
         problems = compare(golden, actual, relaxed=False)
         self.assertEqual(1, len(problems), problems)
         self.assertIn("the run lost", problems[0])
 
     def test_an_emptied_answer_says_so_in_its_own_words(self) -> None:
-        golden = {"callers:f@a.c:1": self._answer([{"name": "a"}])}
-        actual = {"callers:f@a.c:1": {"of": "f", "callers": []}}
+        golden = {self._label(): self._answer([{"name": "a"}])}
+        actual = {self._label(): self._answer([])}
         problems = compare(golden, actual, relaxed=False)
         self.assertEqual(1, len(problems), problems)
         self.assertIn("answers none now", problems[0])
 
     def test_an_added_row_is_a_failure_unless_a_phase_allowed_it(self) -> None:
-        golden = {"callers:f@a.c:1": self._answer([{"name": "a"}])}
-        actual = {"callers:f@a.c:1": self._answer([{"name": "a"}, {"name": "b"}])}
+        golden = {self._label(): self._answer([{"name": "a"}])}
+        actual = {self._label(): self._answer([{"name": "a"}, {"name": "b"}])}
         self.assertTrue(compare(golden, actual, relaxed=False))
         try:
-            ALLOWED_EXTRA_ROWS["callers"] = "self-test"
+            ALLOWED_EXTRA_ROWS[self.TOOL] = "self-test"
             self.assertEqual([], compare(golden, actual, relaxed=False))
         finally:
-            ALLOWED_EXTRA_ROWS.pop("callers", None)
+            ALLOWED_EXTRA_ROWS.pop(self.TOOL, None)
 
     def test_a_missing_call_is_a_failure(self) -> None:
-        golden = {"callers:f@a.c:1": self._answer([{"name": "a"}])}
+        golden = {self._label(): self._answer([{"name": "a"}])}
         self.assertTrue(compare(golden, {}, relaxed=False))
 
     def test_relaxed_mode_forgives_the_id_and_nothing_else(self) -> None:
-        golden = {"callers:f@a.c:1": self._answer([
+        golden = {self._label(): self._answer([
             {"name": "a", "file": "a.c", "node_id": "v2:old"},
         ])}
-        renamed_id = {"callers:f@a.c:1": self._answer([
+        renamed_id = {self._label(): self._answer([
             {"name": "a", "file": "a.c", "node_id": "v2:new"},
         ])}
-        renamed_row = {"callers:f@a.c:1": self._answer([
+        renamed_row = {self._label(): self._answer([
             {"name": "z", "file": "a.c", "node_id": "v2:old"},
         ])}
         self.assertTrue(compare(golden, renamed_id, relaxed=False))
         self.assertEqual([], compare(golden, renamed_id, relaxed=True))
         self.assertTrue(compare(golden, renamed_row, relaxed=True))
+
+    def test_a_field_the_golden_lacks_is_a_failure_unless_it_is_an_added_one(self) -> None:
+        """``ADDED_FIELDS`` is the narrower of the two escape hatches, so it is worth
+        checking that it is actually narrow: one named field passes and its neighbour
+        in the same answer does not."""
+        golden = {self._label(): self._answer([{"name": "a"}])}
+        actual = {self._label(): {**self._answer([{"name": "a"}]),
+                                  "homonyms": [{"node_id": "v2:x"}]}}
+        self.assertEqual([], compare(golden, actual, relaxed=False))
+        invented = {self._label(): {**self._answer([{"name": "a"}]),
+                                    "hunches": [{"node_id": "v2:x"}]}}
+        problems = compare(golden, invented, relaxed=False)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("hunches", problems[0])
+
+    def test_an_added_field_is_forgiven_when_it_answers_empty_too(self) -> None:
+        """The case that actually bit. ``rows_of`` drops empty lists, so an added field
+        with nothing to say arrives at the *scalar* comparison instead of the row one —
+        and gets reported as a new field on exactly the calls where it found nothing."""
+        golden = {self._label(): self._answer([{"name": "a"}])}
+        actual = {self._label(): {**self._answer([{"name": "a"}]), "unresolved": []}}
+        self.assertEqual([], compare(golden, actual, relaxed=False))
 
     def test_every_row_bearing_field_is_compared_not_just_the_first(self) -> None:
         """``flow`` answers ``nodes`` and ``edges``; losing either has to show."""

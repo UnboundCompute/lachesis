@@ -4593,5 +4593,121 @@ class HomonymResolutionTests(unittest.TestCase):
                                      resolve(stored, site["id"]))
 
 
+class HomonymNavigationTests(unittest.TestCase):
+    """The nav tools over two same-named functions — the collapse, and the recovery.
+
+    Phase 2 built a resolver nothing consumed. This is what consuming it changes, and
+    both halves matter. A name that means two things must stop being answered as though
+    it meant one: `callers("funcA")` is the union over every homonym, and the seeds it
+    was unioned over come back in the payload so the caller can take them apart again.
+    And a call the frontend never decided must stop reading as a call that does not
+    exist: with the eager resolution stripped out, the edges are gone and the answer
+    has to come from the ladder instead.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from lachesis.pipeline import run_project
+
+        cls._graph, _ = run_project(
+            os.path.join(ROOT, "lachesis/frontends/c/fixtures_homonym"), enrich=False)
+
+    def _store(self, graph=None):
+        from lachesis.nav.graph_store import GraphStore
+        return GraphStore(graph if graph is not None else self._graph)
+
+    @staticmethod
+    def _call(store, tool: str, args: dict) -> dict:
+        from lachesis.nav._navharness import norm, run_nav
+        return norm(run_nav(store, [("only", tool, args)])["only"])
+
+    @staticmethod
+    def _names(rows) -> set:
+        return {row["name"] for row in rows}
+
+    # -- the collapse ---------------------------------------------------------
+
+    def test_a_name_that_means_two_things_seeds_both(self):
+        from lachesis.nav import mcp_server
+
+        store = self._store()
+        self.assertEqual(2, len(mcp_server._seeds(store, "funcA")),
+                         "both static definitions are genuine rivals")
+        self.assertEqual(1, len(mcp_server._seeds(store, "alpha_entry")),
+                         "the bodyless prototype in shared.c is not a rival, it loses")
+
+    def test_callers_of_a_homonym_unions_every_homonym(self):
+        answer = self._call(self._store(), "callers", {"name": "funcA"})
+        self.assertEqual({"alpha_entry", "beta_entry"}, self._names(answer["callers"]),
+                         "one funcA's callers alone would look like a complete answer")
+
+    def test_the_payload_admits_which_seeds_it_unioned(self):
+        answer = self._call(self._store(), "callers", {"name": "funcA"})
+        self.assertEqual(2, len(answer["homonyms"]))
+        self.assertEqual({"funcA"}, {ref["name"] for ref in answer["homonyms"]})
+        self.assertEqual(2, len({ref["node_id"] for ref in answer["homonyms"]}),
+                         "two distinct, addressable ids to disambiguate with")
+
+    def test_an_unambiguous_name_says_nothing_about_homonyms(self):
+        answer = self._call(self._store(), "callers", {"name": "shared_entry"})
+        self.assertNotIn("homonyms", answer,
+                         "a key that is always there stops meaning anything")
+
+    # -- the recovery ---------------------------------------------------------
+
+    def test_callers_survive_the_loss_of_every_call_edge(self):
+        """The Phase 3 payoff, on a graph where the eager answer is simply absent.
+
+        `_blinded` is the state a C tree is in when the compiler could not see the
+        definition. Before the resolver was wired in, `callers` walked edges only, so
+        this returned nothing at all — and nothing is indistinguishable from "no one
+        calls this". Now each call site is put through the ladder from the other side,
+        and static scoping puts each one back with its own file's definition.
+        """
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        answer = self._call(self._store(blinded), "callers", {"name": "funcA"})
+        rows = answer["callers"]
+        self.assertEqual({"alpha_entry", "beta_entry"}, self._names(rows))
+        self.assertEqual({"resolved"}, {row["via"] for row in rows},
+                         "no edge carried these; the ladder did")
+        self.assertTrue(all(row["resolved"] for row in rows))
+
+    def test_a_blinded_callee_comes_back_resolved_not_missing(self):
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        answer = self._call(self._store(blinded), "callees", {"name": "alpha_entry"})
+        self.assertEqual({"funcA"}, self._names(answer["callees"]))
+        self.assertEqual([], answer["unresolved"],
+                         "nothing here is undecidable, so nothing is listed as such")
+
+    def test_an_undecidable_call_is_a_node_rather_than_an_omission(self):
+        """Invariant 2. `shared_entry` calls two functions it cannot see the bodies of
+        in the blinded graph — but their *declarations* are in the graph, so the ladder
+        decides them. Deleting the declarations is what leaves a genuine hole."""
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        gone = {node["id"] for node in blinded["nodes"]
+                if node["kind"] == "function" and node["label"] == "alpha_entry"}
+        stripped = {**blinded,
+                    "nodes": [n for n in blinded["nodes"] if n["id"] not in gone],
+                    "edges": [e for e in blinded["edges"]
+                              if e["source"] not in gone and e["target"] not in gone]}
+        answer = self._call(self._store(stripped), "callees", {"name": "shared_entry"})
+        self.assertEqual(["alpha_entry"], [row["callee"] for row in answer["unresolved"]])
+        for row in answer["unresolved"]:
+            self.assertIsNotNone(row["node_id"], "the hole has an address")
+            self.assertTrue(str(row["file"]).endswith("shared.c"))
+
+    def test_direct_only_still_means_edges_only(self):
+        """The escape hatch has to keep escaping: `direct_only` is how a caller asks
+        for the resolved decl->decl graph and nothing inferred on top of it."""
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        answer = self._call(self._store(blinded), "callers",
+                            {"name": "funcA", "direct_only": True})
+        self.assertEqual([], answer["callers"])
+        self.assertNotIn("unresolved", answer)
+
+
 if __name__ == "__main__":
     unittest.main()
