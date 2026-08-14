@@ -123,5 +123,93 @@ class AtroposCSlice(unittest.TestCase):
             self.assertEqual(self.byid[model_id]["status"], "bound", model_id)
 
 
+class AtroposCSliceEnrich(unittest.TestCase):
+    """The Atropos overlay stamps resolved facts onto exact nodes in a separate
+    enrich flow, additively, and taint consumes them.
+
+    This exercises the enrich half of the seam: the base graph is built exactly
+    as today (``run_project(enrich=False)``), a separate flow folds core
+    enrichment, then the Atropos overlay, then taint -- each an additive delta
+    over the already-built graph, never a rebuild.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("clang") is None:
+            raise unittest.SkipTest("clang not available for the C frontend")
+        atropos = _locate_atropos()
+        if atropos is None:
+            raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
+        binder = _load_binder(atropos)
+        from lachesis.core.overlays import (
+            default_overlay_registry, default_security_overlay_registry)
+        from lachesis.core.overlays.registry import OverlayRegistry
+        from lachesis.integrations.atropos.overlay import (
+            AtroposOverlay, stamps_from_report)
+
+        core, _ = run_project(str(FIXTURE), enrich=False)   # base graph, as built today
+        enriched = default_overlay_registry().enrich(core)  # separate enrich flow
+        cls.base_node_ids = {n["id"] for n in enriched["nodes"]}
+        index = canonical_index(enriched, language="c", source="lachesis:c-slice")
+        models = [m for m in binder.load_models(atropos / "models")
+                  if m["language"] == "c"]
+        models_by_id = {m["id"]: m for m in models}
+        report = binder.bind_all(models, index)
+        cls.stamps = stamps_from_report(report, models_by_id)
+        registry = OverlayRegistry()
+        registry.register(AtroposOverlay(cls.stamps))
+        cls.stamped = registry.enrich(enriched)
+        cls.label_of = {n["id"]: (n["properties"].get("label") or n.get("label"))
+                        for n in cls.stamped["nodes"]}
+        cls.final = default_security_overlay_registry().enrich(cls.stamped)
+
+    def _role_nodes(self, kind):
+        return [n for n in self.stamped["nodes"]
+                if n.get("kind") == kind
+                and n.get("properties", {}).get("fact_origin") == "atropos-model"]
+
+    def _summaries(self):
+        return {(self.label_of[e["source"]], self.label_of[e["target"]],
+                 e["properties"]["model_id"])
+                for e in self.stamped["edges"]
+                if e["kind"] == "VALUE_FLOWS_TO"
+                and e.get("properties", {}).get("fact_origin") == "atropos-model"}
+
+    def test_gold_set_resolves_to_seven_stamps(self):
+        self.assertEqual(len(self.stamps), 7)
+
+    def test_sinks_land_on_exact_argument_nodes(self):
+        got = {n["properties"]["model_id"]: self.label_of[n["properties"]["value_id"]]
+               for n in self._role_nodes("sink")}
+        self.assertEqual(got.get("c.std.system.a0"), "d")
+        self.assertEqual(got.get("c.std.memcpy.a2"), "n")
+        self.assertEqual(got.get("c.std.memcpy.a0"), "dst")
+
+    def test_sources_land_on_exact_nodes(self):
+        got = {n["properties"]["model_id"]: self.label_of[n["properties"]["value_id"]]
+               for n in self._role_nodes("source")}
+        self.assertEqual(got.get("c.std.read.a1"), "buf")
+        self.assertEqual(got.get("c.std.getenv.ret"), 'getenv("PATH")')
+
+    def test_summaries_are_flow_edges_on_exact_nodes(self):
+        summaries = self._summaries()
+        self.assertIn(("src", "dst", "c.std.memcpy.a1-a0"), summaries)
+        self.assertIn(("e", 'strdup(e)', "c.std.strdup.a0-ret"), summaries)
+
+    def test_overlay_is_additive_base_nodes_untouched(self):
+        stamped_ids = {n["id"] for n in self.stamped["nodes"]}
+        self.assertTrue(self.base_node_ids.issubset(stamped_ids))
+        # the only new nodes are the five role nodes (three sinks, two sources);
+        # summaries contribute edges, not nodes.
+        self.assertEqual(len(stamped_ids - self.base_node_ids), 5)
+
+    def test_taint_consumes_stamped_roles(self):
+        # Taint ran over the stamped graph in setUp; it must have propagated at
+        # least one flow rather than erroring on the Atropos role nodes.
+        self.assertTrue(any(e["kind"] == "TAINT_FLOWS_TO"
+                            for e in self.final["edges"]))
+
+
+
 if __name__ == "__main__":
     unittest.main()
