@@ -173,12 +173,21 @@ def resolve_corpus(target: str, repo: str | None = None):
     return str(root / subpath) if subpath else str(root), resolved, None
 
 
-def open_store(target: str):
+def open_store(target: str, tier: str = "enriched"):
     """A store for ``target``, which may be a built Kùzu store or a source tree.
 
     Taking either is what lets the harness run against the tree it is guarding without
     the caller having to remember to build first, while still being pointable at a store
     that is already built when the build is the expensive part.
+
+    ``tier="core"`` builds without folding the overlay dataflow tier, which is the state
+    a store is in when the build did not enrich. That is not a variant for completeness:
+    it is the only way to ask the question the harness exists to answer once enrichment
+    became optional -- does a tool that no longer gets a pre-folded overlay still find
+    what it used to find? Pointing the harness at a separately-built core store instead
+    almost works and then silently does not, because the corpus root is derived from the
+    target and a store path does not name the tree it was built from, so every absolute
+    path the C frontend stamped goes unstripped and reads as a changed row.
     """
     from lachesis.kuzu_store import is_kuzu_dir, write_kuzu_graph
     from lachesis.nav.graph_store import GraphStore
@@ -187,11 +196,12 @@ def open_store(target: str):
         return GraphStore.load(target), None
     from lachesis.pipeline import run_project
 
+    enriched = tier != "core"
     holder = tempfile.TemporaryDirectory()
     frontend_out = os.path.join(holder.name, "frontends")
     store_dir = os.path.join(holder.name, "store")
-    graph, snapshots = run_project(target, frontend_out)
-    write_kuzu_graph(graph, snapshots, store_dir, prune=False, enriched=True)
+    graph, snapshots = run_project(target, frontend_out, enrich=enriched)
+    write_kuzu_graph(graph, snapshots, store_dir, prune=False, enriched=enriched)
     # The holder is returned so the caller keeps it alive; a store whose directory has
     # been reclaimed fails deep inside Kùzu with a message about a missing file.
     return GraphStore.load(store_dir), holder
@@ -224,14 +234,14 @@ def corpus_target(golden: dict, requested: str) -> str:
     return pinned
 
 
-def open_corpus(target: str):
+def open_corpus(target: str, tier: str = "enriched"):
     """``(store, directory, revision, holders)`` for a target of any supported form.
 
     The holders are temporary directories the caller must keep alive and then clean up,
     innermost first -- the store lives inside a directory that the corpus export may own.
     """
     directory, revision, corpus_holder = resolve_corpus(target)
-    store, store_holder = open_store(directory)
+    store, store_holder = open_store(directory, tier)
     holders = [holder for holder in (store_holder, corpus_holder) if holder is not None]
     return store, directory, revision, holders
 
@@ -878,6 +888,12 @@ class ComparisonTests(unittest.TestCase):
 
 TARGET = os.environ.get("LACHESIS_EQUALITY_HARNESS")
 
+#: ``core`` builds the target without folding the overlay dataflow tier, so the run has
+#: to earn every row through on-demand resolution rather than reading it off a tier the
+#: build already paid for. That is the comparison the lazy work is judged by; the default
+#: ``enriched`` reproduces the conditions the golden was recorded under.
+TIER = os.environ.get("LACHESIS_EQUALITY_TIER", "enriched")
+
 
 @unittest.skipUnless(
     TARGET and GOLDEN_PATH.exists(),
@@ -890,7 +906,7 @@ class EagerLazyEqualityTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.golden = read_golden(GOLDEN_PATH)
         cls.store, cls.directory, cls.revision, cls._holders = open_corpus(
-            corpus_target(cls.golden, TARGET),
+            corpus_target(cls.golden, TARGET), TIER,
         )
         # The golden's own seeds, not this store's. `pick_seeds` ranks by degree, and
         # degree is a property of the graph rather than of the corpus: a store whose
