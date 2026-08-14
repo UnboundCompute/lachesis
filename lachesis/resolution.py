@@ -109,7 +109,7 @@ class ResolutionIndex(Protocol):
     nodes: Mapping[str, dict]
 
     def outgoing_of_kind(self, source: str, *edge_kinds: str) -> tuple: ...
-    def nodes_owned_by(self, owner_id: str) -> tuple: ...
+    def nodes_owned_by(self, owner_id: str, *kinds: str) -> tuple: ...
     def decl_index(self, name: Optional[str] = None): ...
     def callsite_index(self, name: Optional[str] = None): ...
 
@@ -121,9 +121,14 @@ def owned_callsites(index: Any, node_id: str) -> tuple:
     ``resolve_decl`` a bounded question. ``nav.symbol_index`` imports this rather than
     keeping its own copy, so the set of nodes the resolver binds and the set the
     navigator reports indirect edges from is one set by construction.
+
+    The kinds go *into* the index rather than being filtered out here. A function body
+    is hundreds of nodes and a handful of them are calls; asking for all of them and
+    discarding the rest meant a store-backed index fetched every local, every literal
+    and every branch of every function `callees` walked, to answer a question about
+    four call sites.
     """
-    return tuple(node for node in index.nodes_owned_by(node_id)
-                 if node.get("kind") in CALLSITE_KINDS)
+    return index.nodes_owned_by(node_id, *CALLSITE_KINDS)
 
 
 def _properties(node: Optional[Mapping]) -> Mapping:

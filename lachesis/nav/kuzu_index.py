@@ -313,6 +313,18 @@ class KuzuGraphIndex:
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}
+        # Prepared statements, by query text. `Connection.execute` on a raw string
+        # prepares it first, every single time, and preparing is not the cheap half:
+        # profiling `callees` on a 222k-node store showed 22,887 executions of four
+        # distinct query strings costing 4.8s in `kuzu.prepare` against 4.4s in
+        # `kuzu.execute`. The query set here is closed and tiny -- these are fixed
+        # strings with bound parameters, never interpolated user input -- so caching
+        # them is bounded by the number of literals in this file.
+        self._prepared: dict = {}
+        # Memoized unions of `by_kind` buckets, keyed by the frozen kind set. Callers
+        # that narrow ownership by kind ask the same two or three questions over and
+        # over, and each answer is a set union over buckets that do not move.
+        self._kind_ids: dict = {}
         self._overlay = None
         self._derived_out: dict = {}
         self._derived_in: dict = {}
@@ -374,6 +386,9 @@ class KuzuGraphIndex:
         self._node_cache.clear()
         self._out_cache.clear()
         self._in_cache.clear()
+        # `by_kind` is about to grow by the overlay's derived nodes, so anything
+        # memoized off it describes the index as it was a moment ago.
+        self._kind_ids.clear()
         self._derived_out = defaultdict(list)
         self._derived_in = defaultdict(list)
         for edge in overlay.derived_edges:
@@ -404,10 +419,22 @@ class KuzuGraphIndex:
 
     # -- primitives ---------------------------------------------------------
 
+    def _run(self, cypher: str, params: dict):
+        """Execute ``cypher``, preparing it at most once per process.
+
+        Only for the parameterized hot-path queries. A one-shot bulk scan gains nothing
+        from being cached and would hold a statement alive for no reason, so those keep
+        calling ``_conn.execute`` directly.
+        """
+        statement = self._prepared.get(cypher)
+        if statement is None:
+            statement = self._prepared[cypher] = self._conn.prepare(cypher)
+        return self._conn.execute(statement, params)
+
     def _node(self, node_id: str) -> Optional[dict]:
         if node_id in self._node_cache:
             return self._node_cache[node_id]
-        res = self._conn.execute(
+        res = self._run(
             f"MATCH (n:Node {{id: $id}}) RETURN n.kind, n.label, {_MERGED_SELECT}, "
             "n.props", {"id": encode_id(node_id, self._id_codes)}
         )
@@ -434,7 +461,7 @@ class KuzuGraphIndex:
         else:
             cypher = ("MATCH (a:Node {id: $id})-[e]->(b:Node) "
                       "RETURN label(e), b.id, e.kind, e.semantic_kind, e.props")
-        res = self._conn.execute(cypher, {"id": encode_id(node_id, self._id_codes)})
+        res = self._run(cypher, {"id": encode_id(node_id, self._id_codes)})
         edges = []
         while res.has_next():
             label, other, kind_col, sem_col, props = res.get_next()
@@ -455,6 +482,32 @@ class KuzuGraphIndex:
         edges.sort(key=_EDGE_SORT)
         cache[node_id] = edges
         return edges
+
+    def degrees(self) -> dict:
+        """``{node_id: outgoing + incoming}`` for every node that has an edge.
+
+        Two aggregate scans instead of two queries per node. `build_index` wants the
+        degree of every indexed declaration to break ties between a definition and its
+        prototype, and asking edge by edge made `search`'s first call issue ten thousand
+        queries to compute a number the store can count in one pass.
+
+        Counted the same way `_edges` counts, deliberately: every relationship type
+        through the untyped ``-[e]->`` match, plus the overlay's derived edges when one
+        is attached. ``DeferredEdge`` stays out because it is a node table awaiting a
+        recompiled endpoint, and `_edges` does not see it either.
+        """
+        degree: dict = defaultdict(int)
+        for column in ("a.id", "b.id"):
+            res = self._conn.execute(
+                f"MATCH (a:Node)-[e]->(b:Node) RETURN {column}, count(*)")
+            while res.has_next():
+                coded, count = res.get_next()
+                degree[decode_id(coded, self._id_prefixes)] += count
+        if self._overlay is not None:
+            for derived in (self._derived_out, self._derived_in):
+                for node_id, edges in derived.items():
+                    degree[node_id] += len(edges)
+        return degree
 
     # -- GraphIndex accessor surface ----------------------------------------
 
@@ -501,8 +554,60 @@ class KuzuGraphIndex:
     def nodes_in_file(self, path: str) -> tuple:
         return tuple(self._node(nid) for nid in self.by_file.get(path, ()))
 
-    def nodes_owned_by(self, owner_id: str) -> tuple:
-        return tuple(self._node(nid) for nid in self.by_owner.get(owner_id, ()))
+    def nodes_owned_by(self, owner_id: str, *kinds: str) -> tuple:
+        """The nodes a declaration owns, optionally narrowed to some kinds first.
+
+        Narrowing before fetching is the whole point of the parameter. Ownership and
+        kind are both already in memory from `_build_maps`, so the intersection costs no
+        query, and it is the difference between fetching the four call sites a function
+        makes and fetching all six hundred nodes of its body to throw 596 of them away.
+        """
+        owned = self.by_owner.get(owner_id, ())
+        if kinds:
+            wanted = self._ids_of_kind(kinds)
+            owned = [nid for nid in owned if nid in wanted]
+        if len(owned) > 1:
+            self._warm_nodes(owned)
+        return tuple(self._node(nid) for nid in owned)
+
+    def _ids_of_kind(self, kinds) -> frozenset:
+        key = frozenset(kinds)
+        cached = self._kind_ids.get(key)
+        if cached is None:
+            cached = self._kind_ids[key] = frozenset(
+                nid for kind in key for nid in self.by_kind.get(kind, ()))
+        return cached
+
+    def _warm_nodes(self, node_ids) -> None:
+        """Fetch a batch of nodes into the node cache with one query.
+
+        A function body is hundreds of nodes and `_node` is one query each, which is how
+        `callees` on a large declaration turned into 74,127 round trips. The rows come
+        back unordered and are keyed by id on the way into the cache, so this is purely a
+        prefetch: `_node` still answers, and answers the same, if this never ran.
+        """
+        wanted = [nid for nid in node_ids if nid not in self._node_cache]
+        if not wanted:
+            return
+        coded = [encode_id(nid, self._id_codes) for nid in wanted]
+        res = self._run(
+            f"MATCH (n:Node) WHERE n.id IN $ids RETURN n.id, n.kind, n.label, "
+            f"{_MERGED_SELECT}, n.props", {"ids": coded},
+        )
+        while res.has_next():
+            row = res.get_next()
+            node_id = decode_id(row[0], self._id_prefixes)
+            kind, label = row[1:3]
+            properties = _restore_node_props(row[3:-1], row[-1], self._props_dict,
+                                             self._id_prefixes)
+            if self._overlay is not None:
+                properties.update(self._overlay.node_props.get(node_id) or {})
+            self._node_cache[node_id] = {"id": node_id, "kind": kind, "label": label,
+                                         "properties": properties}
+        # A wanted id with no row is a genuine absence, and caching that is what stops
+        # `_node` from re-querying for it one at a time straight after this returns.
+        for node_id in wanted:
+            self._node_cache.setdefault(node_id, None)
 
     def edges_of_kind(self, *edge_kinds: str) -> Iterable[dict]:
         accepted = frozenset(edge_kinds)
@@ -551,7 +656,7 @@ class KuzuGraphIndex:
         where, params = "", {}
         if name is not None:
             where, params = f" WHERE r.{key_column} = $name", {"name": name}
-        result = self._conn.execute(
+        result = self._run(
             f"MATCH (r:{table}){where} RETURN {selected}, r.seq ORDER BY r.seq", params)
         index: dict = {}
         while result.has_next():

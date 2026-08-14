@@ -176,14 +176,43 @@ class GraphIndex:
             node for kind in kinds for node in self.by_kind.get(kind, ())
         )
 
+    def degrees(self) -> dict:
+        """``{node_id: outgoing + incoming}`` for every node that has an edge.
+
+        Trivial here -- the adjacency is already in memory and this is two dict walks.
+        It exists so callers can ask one question instead of branching on which index
+        they hold: the Kùzu side answers the same question with two aggregate scans
+        rather than two queries per node, and that difference is seconds.
+
+        Read straight out of ``_buckets`` because the order within a bucket cannot
+        change its length, and going through the sorting ``__getattr__`` would charge a
+        full sort of every adjacency list to compute a count.
+        """
+        degree: dict = {}
+        for bucket in ("outgoing", "incoming"):
+            for node_id, edges in self._buckets[bucket].items():
+                degree[node_id] = degree.get(node_id, 0) + len(edges)
+        return degree
+
     def nodes_named(self, label: str) -> tuple[dict, ...]:
         return tuple(self.by_label.get(label, ()))
 
     def nodes_in_file(self, path: str) -> tuple[dict, ...]:
         return tuple(self.by_file.get(path, ()))
 
-    def nodes_owned_by(self, owner_id: str) -> tuple[dict, ...]:
-        return tuple(self.by_owner.get(owner_id, ()))
+    def nodes_owned_by(self, owner_id: str, *kinds: str) -> tuple[dict, ...]:
+        """The nodes a declaration owns, optionally narrowed to some kinds first.
+
+        The narrowing buys nothing here -- the nodes are already dicts in memory and the
+        filter is the same either way. It exists because on the Kùzu side the kind is
+        known before the node is fetched, so passing it lets that index skip fetching
+        the body nodes a caller was only going to discard.
+        """
+        owned = self.by_owner.get(owner_id, ())
+        if kinds:
+            accepted = frozenset(kinds)
+            return tuple(node for node in owned if node.get("kind") in accepted)
+        return tuple(owned)
 
     @staticmethod
     def semantic_edge_kind(edge: dict) -> str | None:

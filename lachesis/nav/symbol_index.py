@@ -146,6 +146,10 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
     """One entry per addressable node, with location + navigation affordances."""
     exported = gl.exported_ids
     prov = _file_provenance(gl)
+    # Every degree at once. Asked per node this was two queries per indexed declaration
+    # against a Kùzu store -- ten thousand of them to build one index, and the dominant
+    # cost of `search`'s first call.
+    degrees = gl.index.degrees()
     entries: list[dict] = []
     for kind, granularity in INDEXED_KINDS.items():
         for node in gl.index.nodes_of_kind(kind):
@@ -163,8 +167,7 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
             # the same name); `degree` is the language-agnostic fallback (a definition
             # bears call/body edges, a prototype bears none). Both let name resolution
             # prefer the body-bearing definition when a name collides with its prototype.
-            degree = (len(gl.index.outgoing.get(nid, ()))
-                      + len(gl.index.incoming.get(nid, ())))
+            degree = degrees.get(nid, 0)
             entries.append({
                 "node_id": nid,
                 "name": name,
