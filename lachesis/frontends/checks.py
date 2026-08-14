@@ -3486,6 +3486,47 @@ class GraphAccumulatorTests(unittest.TestCase):
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 
+class ParallelBuildDiscoveryTests(unittest.TestCase):
+    """A parallel build walks the tree and partitions it once, not twice.
+
+    run_project_parallel needed the partition twice: once to decide the jobs and
+    once afterwards to say which package owns which file. It got it by calling
+    detect_packages over a fresh source_inventory both times, so the whole tree was
+    walked, filtered and bucketed a second time to rebuild something it had already
+    thrown away. package_jobs now takes the partition it should build from.
+    """
+
+    def test_the_tree_is_walked_and_partitioned_once(self) -> None:
+        from lachesis import packages as packages_module
+        from lachesis import pipeline
+
+        inventories, partitions = [], []
+        real_inventory = pipeline.source_inventory
+        real_detect = packages_module.detect_packages
+
+        def counting_inventory(*args, **kwargs):
+            inventories.append(args[0])
+            return real_inventory(*args, **kwargs)
+
+        def counting_detect(*args, **kwargs):
+            partitions.append(args[0])
+            return real_detect(*args, **kwargs)
+
+        pipeline.source_inventory = counting_inventory
+        packages_module.detect_packages = counting_detect
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                pipeline.run_project_parallel(
+                    str(WORKSPACE_FIXTURE), output, max_workers=1, enrich=False,
+                )
+        finally:
+            pipeline.source_inventory = real_inventory
+            packages_module.detect_packages = real_detect
+
+        self.assertEqual(1, len(inventories), inventories)
+        self.assertEqual(1, len(partitions), partitions)
+
+
 class PackageOwnershipTests(unittest.TestCase):
     """Ownership is memoized per directory, and has to answer what the scan answered.
 

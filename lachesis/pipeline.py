@@ -419,19 +419,27 @@ def package_jobs(
     output_root: str,
     registry: FrontendRegistry,
     include_tests: bool = False,
+    packages: Optional[Dict[str, List[str]]] = None,
 ) -> List[Tuple[str, str, str, str, List[str]]]:
     """The (frontend_id, package, compile_root, output_dir, roots) units of a build.
 
     ``compile_root`` is the package directory, not the repo root, so each job discovers
     its own ``tsconfig.json`` and compiles as one program — which is the semantic change
     that makes this opt-in.
+
+    ``packages`` is the partition to build from, for a caller that already has one:
+    ``run_project_parallel`` needs the same partition again afterwards to say which
+    package owns which file, and walking the tree and bucketing it twice is the walk
+    and the bucketing done twice.
     """
     from .packages import detect_packages, package_root_for
 
     source_dir = os.path.abspath(source_dir)
     output_root = os.path.abspath(output_root)
-    packages = detect_packages(source_dir,
-                               source_inventory(source_dir, include_tests=include_tests))
+    if packages is None:
+        packages = detect_packages(
+            source_dir, source_inventory(source_dir, include_tests=include_tests),
+        )
     jobs = []
     for (frontend_id, package), roots in registry.partition_by_package(packages).items():
         jobs.append((frontend_id, package, package_root_for(source_dir, package),
@@ -562,7 +570,11 @@ def run_project_parallel(
     source_dir = os.path.abspath(source_dir)
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry(workspace_root)
-    jobs = package_jobs(source_dir, output_root, registry, include_tests=include_tests)
+    packages = detect_packages(
+        source_dir, source_inventory(source_dir, include_tests=include_tests),
+    )
+    jobs = package_jobs(source_dir, output_root, registry,
+                        include_tests=include_tests, packages=packages)
     if not jobs:
         supported = sorted({
             extension for item in registry.frontends for extension in item.extensions
@@ -591,9 +603,7 @@ def run_project_parallel(
     snapshots = [load_snapshot(bundle) for bundle in bundles]
     owner_of_file = {
         path: package
-        for package, paths in detect_packages(
-            source_dir, source_inventory(source_dir, include_tests=include_tests),
-        ).items()
+        for package, paths in packages.items()
         for path in paths
     }
     graph, dropped = _merge_package_graphs(
