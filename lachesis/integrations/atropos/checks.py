@@ -211,5 +211,124 @@ class AtroposCSliceEnrich(unittest.TestCase):
 
 
 
+def _enrich_and_taint(atropos_root, binder, *, with_summary=True, with_dataflow=True):
+    """Run the separate enrich flow over the C slice and return the tainted graph.
+
+    Base graph as built today, then core enrichment, then (optionally) the C
+    call-result dataflow overlay, then the Atropos overlay, then taint -- each an
+    additive fold. ``with_summary``/``with_dataflow`` drop one contribution so a
+    test can show it is load-bearing.
+    """
+    from lachesis.core.overlays import (
+        default_overlay_registry, default_security_overlay_registry)
+    from lachesis.core.overlays.registry import OverlayRegistry
+    from lachesis.core.overlays.c_call_dataflow import CCallResultDataflow
+    from lachesis.integrations.atropos.overlay import (
+        AtroposOverlay, stamps_from_report)
+
+    core, _ = run_project(str(FIXTURE), enrich=False)
+    enriched = default_overlay_registry().enrich(core)
+    index = canonical_index(enriched, language="c", source="lachesis:c-slice")
+    models = [m for m in binder.load_models(atropos_root / "models")
+              if m["language"] == "c"]
+    models_by_id = {m["id"]: m for m in models}
+    stamps = stamps_from_report(binder.bind_all(models, index), models_by_id)
+    if not with_summary:
+        stamps = [s for s in stamps if s["model_id"] != "c.std.strdup.a0-ret"]
+    registry = OverlayRegistry()
+    if with_dataflow:
+        registry.register(CCallResultDataflow())
+    registry.register(AtroposOverlay(stamps))
+    stamped = registry.enrich(enriched)
+    final = default_security_overlay_registry().enrich(stamped)
+    label_of = {n["id"]: (n["properties"].get("label") or n.get("label"))
+                for n in final["nodes"]}
+    return final, label_of
+
+
+class CCallResultDataflowCheck(unittest.TestCase):
+    """The C dataflow overlay links each call result to the variable it initializes."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("clang") is None:
+            raise unittest.SkipTest("clang not available for the C frontend")
+        from lachesis.core.overlays import default_overlay_registry
+        from lachesis.core.overlays.registry import OverlayRegistry
+        from lachesis.core.overlays.c_call_dataflow import CCallResultDataflow
+
+        core, _ = run_project(str(FIXTURE), enrich=False)
+        cls.enriched = default_overlay_registry().enrich(core)
+        cls.before = {(e["source"], e["target"]) for e in cls.enriched["edges"]
+                      if e["kind"] == "VALUE_FLOWS_TO"}
+        registry = OverlayRegistry()
+        registry.register(CCallResultDataflow())
+        cls.after_graph = registry.enrich(cls.enriched)
+        cls.label_of = {n["id"]: (n["properties"].get("label") or n.get("label"))
+                        for n in cls.after_graph["nodes"]}
+        cls.added = [e for e in cls.after_graph["edges"]
+                     if e["kind"] == "VALUE_FLOWS_TO"
+                     and e.get("properties", {}).get("inference")
+                     == "c-call-result-to-declared-variable"]
+
+    def test_links_call_results_to_their_variables(self):
+        pairs = {(self.label_of[e["source"]], self.label_of[e["target"]])
+                 for e in self.added}
+        self.assertIn(('getenv("PATH")', "e"), pairs)
+        self.assertIn(("strdup(e)", "d"), pairs)
+
+    def test_only_declaration_inits_are_linked(self):
+        # Exactly the two call-initialized declarations in the fixture, no more.
+        self.assertEqual(len(self.added), 2)
+
+    def test_overlay_is_additive(self):
+        base_ids = {n["id"] for n in self.enriched["nodes"]}
+        after_ids = {n["id"] for n in self.after_graph["nodes"]}
+        self.assertTrue(base_ids.issubset(after_ids))
+        # It contributes edges only, never nodes.
+        self.assertEqual(base_ids, after_ids)
+
+
+class AtroposCSliceWitness(unittest.TestCase):
+    """A real source->sink taint witness rides the Atropos summary end to end."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("clang") is None:
+            raise unittest.SkipTest("clang not available for the C frontend")
+        atropos = _locate_atropos()
+        if atropos is None:
+            raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
+        cls.atropos = atropos
+        cls.binder = _load_binder(atropos)
+
+    def _witnesses(self, graph):
+        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"]
+
+    def test_getenv_reaches_system_through_strdup_summary(self):
+        graph, label_of = _enrich_and_taint(self.atropos, self.binder)
+        witnesses = self._witnesses(graph)
+        self.assertEqual(len(witnesses), 1)
+        reach = witnesses[0]
+        self.assertEqual(reach["properties"]["sink_id"].count("sink"), 1)
+        path = [label_of[w] for w in reach["properties"]["witness_ids"]]
+        # source is the getenv return, sink is the system argument; the strdup
+        # call appears mid-path, i.e. the flow crossed the library via the summary.
+        self.assertEqual(path[0], 'getenv("PATH")')
+        self.assertEqual(path[-1], "d")
+        self.assertIn("strdup(e)", path)
+
+    def test_summary_is_load_bearing(self):
+        # Drop only the strdup in->return summary: taint must no longer connect.
+        graph, _ = _enrich_and_taint(self.atropos, self.binder, with_summary=False)
+        self.assertEqual(len(self._witnesses(graph)), 0)
+
+    def test_call_result_dataflow_is_load_bearing(self):
+        # Drop only the dataflow overlay: return values are stranded on calls.
+        graph, _ = _enrich_and_taint(self.atropos, self.binder, with_dataflow=False)
+        self.assertEqual(len(self._witnesses(graph)), 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()
