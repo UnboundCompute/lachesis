@@ -402,7 +402,12 @@ TOOLS = [
                     "ends. `atropos_connected` rows are the ones a catalog fact drove (e.g. request -> "
                     "urlopen SSRF); the rest are the engine's own generic-role reaches. Costs one "
                     "whole-graph value-flow build on first call per graph (cached after). A no-op with "
-                    "a clear reason if the Atropos catalog is not checked out.",
+                    "a clear reason if the Atropos catalog is not checked out. Each witness carries "
+                    "`source_id`/`sink_id`, the exact graph node ids of the bound endpoints. "
+                    "`unwitnessed` lists bound sinks/sources that took part in no reach -- feed those "
+                    "ids straight to `sources_of`/`flow`/`reaches` to trace why (on a C graph they mark "
+                    "where value-flow gaps sever the chain); no name resolution needed since the "
+                    "endpoint is often an external callee the name index can't seed.",
      "inputSchema": {"type": "object", "properties": {
          "limit": {"type": "integer", "default": 50},
          "atropos_only": {"type": "boolean",
@@ -636,16 +641,19 @@ def _taint(store, args):
         return node.get("label") or (node.get("properties", {}) or {}).get("label") or value_id
 
     rows = []
+    witnessed = set()  # value_ids that took part in at least one reach
     for witness in TaintPropagation().enrich(stamped).nodes:
         if witness.get("kind") != "taint-reach":
             continue
         props = witness.get("properties", {})
         sv, kv = props.get("source_value_id"), props.get("sink_value_id")
+        witnessed.add(sv)
+        witnessed.add(kv)
         src_role, sink_role = marked.get(sv), marked.get(kv)
         model_props = (sink_role or src_role or {}).get("properties", {})
         rows.append({
-            "source": _label(sv), "source_at": _loc(sv),
-            "sink": _label(kv), "sink_at": _loc(kv),
+            "source": _label(sv), "source_at": _loc(sv), "source_id": sv,
+            "sink": _label(kv), "sink_at": _loc(kv), "sink_id": kv,
             "source_model": (src_role or {}).get("properties", {}).get("model_id"),
             "sink_model": (sink_role or {}).get("properties", {}).get("model_id"),
             "cwe": model_props.get("cwe", []),
@@ -657,6 +665,25 @@ def _taint(store, args):
     connected = sum(1 for r in rows if r["atropos_connected"])
     if args.get("atropos_only"):
         rows = [r for r in rows if r["atropos_connected"]]
+
+    # Bound endpoints that never took part in a reach. These are the addressable
+    # seeds for the dataflow tools -- `sources_of <sink_id>` / `flow <source_id>`
+    # over MCP, no name resolution needed (the endpoint is an external callee's
+    # arg the name index can't reach). On a C graph this listing is the frontier
+    # where the value-flow gaps sever the source->sink chain.
+    lim = int(args.get("limit", 50))
+    unwit = {"sources": [], "sinks": []}
+    for value_id, role_node in marked.items():
+        if value_id in witnessed:
+            continue
+        bucket = role_node.get("kind")
+        if bucket not in ("source", "sink"):
+            continue
+        rp = role_node.get("properties", {})
+        unwit[bucket + "s"].append({
+            "id": value_id, "label": _label(value_id), "at": _loc(value_id),
+            "model": rp.get("model_id"), "cwe": rp.get("cwe", []),
+        })
     return {
         "move": "taint", "applied": True,
         "atropos_root": summary["atropos_root"],
@@ -665,7 +692,13 @@ def _taint(store, args):
         "role_nodes": summary["role_nodes"],
         "witness_count": total,
         "atropos_connected": connected,
-        "witnesses": rows[:int(args.get("limit", 50))],
+        "witnesses": rows[:lim],
+        "unwitnessed": {
+            "sources": unwit["sources"][:lim],
+            "sinks": unwit["sinks"][:lim],
+            "source_total": len(unwit["sources"]),
+            "sink_total": len(unwit["sinks"]),
+        },
     }
 
 
