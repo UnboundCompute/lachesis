@@ -97,6 +97,19 @@ class AtroposOverlay:
         node_ids = {node["id"] for node in graph.get("nodes", ())}
         nodes: List[dict] = []
         edges: List[dict] = []
+        # A model can bind the same value node at more than one callsite; those
+        # stamps collapse to one identical role id. Emit each distinct node/edge
+        # exactly once so the additive fold never sees a self-conflict.
+        seen_nodes: set = set()
+        seen_edges: set = set()
+
+        def _add_edge(edge: dict) -> None:
+            key = (edge["kind"], edge["source"], edge["target"])
+            if key in seen_edges:
+                return
+            seen_edges.add(key)
+            edges.append(edge)
+
         for stamp in self._stamps:
             role = stamp.get("role")
             if role in ("source", "sink"):
@@ -112,6 +125,9 @@ class AtroposOverlay:
                 }
                 role_id = stable_id(_OWNER, self.overlay_id, role,
                                     stamp["model_id"], value_id)
+                if role_id in seen_nodes:
+                    continue
+                seen_nodes.add(role_id)
                 nodes.append({
                     "id": role_id,
                     "kind": role,
@@ -124,7 +140,7 @@ class AtroposOverlay:
                         "access_path": stamp.get("access_path"),
                     },
                 })
-                edges.append({
+                _add_edge({
                     "kind": "TAINT_SOURCE" if role == "source" else "TAINT_SINK",
                     "source": role_id, "target": value_id, "properties": fact,
                 })
@@ -132,7 +148,7 @@ class AtroposOverlay:
                 src, dst = stamp.get("from"), stamp.get("to")
                 if src not in node_ids or dst not in node_ids:
                     continue
-                edges.append({
+                _add_edge({
                     "kind": FLOW_KIND, "source": src, "target": dst,
                     "properties": {
                         "fact_origin": "atropos-model",
