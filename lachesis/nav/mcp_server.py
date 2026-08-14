@@ -479,10 +479,26 @@ def main():
     # Config precedence: explicit argv wins, else env. The graph path may come from
     # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
     _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")
-    if not _GRAPH_PATH:
-        print("usage: mcp_server.py <graph.kuzu> [overlay.json] [profile]\n"
-              "   or: LACHESIS_GRAPH=<graph.kuzu> mcp_server.py", file=sys.stderr)
-        return 2
+    # A graph only exists after a build somebody had to know to run, which made this
+    # server unusable as the first thing anyone tries. So a directory is accepted in
+    # the graph's place, and no argument at all means the working directory: the
+    # index is built or reused, and the client's config needs no paths in it.
+    if not _GRAPH_PATH or os.path.isdir(_GRAPH_PATH) and not _GRAPH_PATH.endswith(".kuzu"):
+        from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
+                                          ensure_graph)
+        from lachesis.cli.progress import Progress
+        source = _GRAPH_PATH or os.getcwd()
+        try:
+            # Progress writes to stderr only; stdout is the JSON-RPC channel.
+            graph, _ = ensure_graph(source, progress=Progress(enabled=True))
+        except EnvironmentProblem as error:
+            for check in error.checks:
+                print(f"lachesis-mcp: {check.name}: {check.detail}", file=sys.stderr)
+            return 3
+        except NoSourceFound as error:
+            print(f"lachesis-mcp: {error}", file=sys.stderr)
+            return 2
+        _GRAPH_PATH = str(graph)
     _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
     # Profile: explicit 3rd argv wins, else env (LACHESIS_PROFILE, back-compat
     # LACHESIS_MCP_PROFILE), else the default "all". Only "comprehension" narrows the

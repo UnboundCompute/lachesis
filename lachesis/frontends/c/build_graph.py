@@ -1346,6 +1346,16 @@ def main() -> int:
         for collection in ("edges", "expands_to", "links"):
             payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
 
+    # edge_count must reflect edges actually serialized into tier files. The
+    # distribution loop above drops any edge whose source/target has no tier
+    # (a dangling reference to a node that was never created); counting those
+    # in the manifest makes load_snapshot's edge tally disagree with the files.
+    emitted_edge_count = sum(
+        len(p["edges"]) + len(p["expands_to"]) + len(p["links"])
+        for p in tier_payloads.values()
+    )
+    dropped_edge_count = len(graph.edges) - emitted_edge_count
+
     analyzed_file_count = len(files) - len(failed_files)
     # Honest coverage: a file that failed to parse contributes only its file node,
     # so any capability that depends on complete parsing can no longer claim it.
@@ -1378,7 +1388,8 @@ def main() -> int:
         "source_dir": str(source_dir), "root_file_count": len(files),
         "analyzed_file_count": analyzed_file_count,
         "failed_file_count": len(failed_files),
-        "node_count": len(graph.nodes), "edge_count": len(graph.edges),
+        "node_count": len(graph.nodes), "edge_count": emitted_edge_count,
+        "dropped_edge_count": dropped_edge_count,
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
         "tiers": [
