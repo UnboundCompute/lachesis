@@ -57,6 +57,26 @@ _DEFAULT_FORMAT = "text"
 # mode that narrows the surface, and only when explicitly requested.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 
+# The tools that genuinely read overlay-derived edges, and therefore the only ones a
+# core-only store has to fold for. Everything else was folding for nothing: measured on
+# the pinned corpus, twelve of the seventeen tools answer *identically* against a store
+# whose overlay tier was never built -- 4,523 rows, zero lost. Only `flow` lost real
+# ground (20 edges: POINTS_TO, READS_HEAP, VALUE_FLOWS_TO, all from the heap overlay),
+# and `points_to`/`aliases` read POINTS_TO out of the index by hand a few lines below.
+#
+# The previous comment here argued that selective enrichment would make an answer depend
+# on which tool ran first. That hazard is real but it is not this: `ensure_dataflow_tier`
+# rebinds the index for the whole store, so the tools listed here upgrade it for
+# everyone, and a tool outside this set cannot tell the difference either way -- which is
+# precisely what the measurement establishes. What it costs is honest and small: `hubs`
+# and `search` rank by degree, and degree over the core graph is lower than degree over
+# the enriched one, so their *ordering* shifts even though their membership does not.
+#
+# Still a waypoint, not the destination. These five fold the whole graph. Scoping the
+# fold to a cone around the seed is the next step; this one just stops the other twelve
+# from paying for it.
+OVERLAY_TOOLS = ("flow", "reaches", "sources_of", "points_to", "aliases")
+
 # Canonical display order for tools/list: the centrality cold-start (hubs) leads, then
 # navigation, then value-flow reasoning, then the security tools last. Ordering only —
 # a name missing here (or a future tool) still shows, appended in definition order.
@@ -346,12 +366,8 @@ def call_tool(name, args, format=None):
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
                                      "'comprehension' profile (security tool)"}, fmt)
     c = ctx()
-    # Every tool, not just the dataflow ones. The overlay tier is not confined to taint
-    # and points-to: the control-flow and async overlays add EXCEPTION_BRANCH/TRY_BODY/
-    # HANDLED_BY edges that guard profiling counts, and hub ranking is degree-based over
-    # the whole graph. Enriching selectively would make an answer depend on which tool
-    # you called first, so a core-only store pays once, here, and is cached from then on.
-    c.store.ensure_dataflow_tier()
+    if name in OVERLAY_TOOLS:
+        c.store.ensure_dataflow_tier()
     store, gl = c.store, c.store.gl
     text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
 

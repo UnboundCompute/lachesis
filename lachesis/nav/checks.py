@@ -892,8 +892,19 @@ class EagerLazyEqualityTests(unittest.TestCase):
         cls.store, cls.directory, cls.revision, cls._holders = open_corpus(
             corpus_target(cls.golden, TARGET),
         )
+        # The golden's own seeds, not this store's. `pick_seeds` ranks by degree, and
+        # degree is a property of the graph rather than of the corpus: a store whose
+        # overlay tier was never folded has strictly lower degrees, so re-deriving picks
+        # a *different* seed set and the comparison reports every call the two sets do
+        # not share as "the golden has this call and the run does not". That reads as a
+        # catastrophic regression and is in fact two seed lists disagreeing about which
+        # functions are interesting. The recorded seeds keep the question fixed while
+        # the code answering it varies, which is the whole point of a baseline.
+        #
+        # A seed the store can no longer resolve is still a failure -- see
+        # `test_every_recorded_seed_still_resolves`; it just fails as itself now.
         cls.calls = build_calls(
-            pick_seeds(cls.store), tree_roots(cls.directory, cls.store),
+            cls.golden["seeds"], tree_roots(cls.directory, cls.store),
         )
 
     @classmethod
