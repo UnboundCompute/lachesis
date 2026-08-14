@@ -27,14 +27,12 @@ class ControlFlow:
 
     overlay_id = "control-flow"
 
-    def applies(self, graph: dict) -> bool:
-        return any(
-            node.get("kind") in {"function", "method", "constructor"}
-            for node in graph.get("nodes", [])
-        )
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        return index.has_kind("function", "method", "constructor")
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes = []
         edges = []
         emitted: set[tuple[str, str, str]] = set()
@@ -97,8 +95,19 @@ class ControlFlow:
             return sorted(dict.fromkeys(result), key=position)
 
         def branch_end(node_id: str, owner_id: str) -> str:
-            children = statement_children(node_id, owner_id)
-            return branch_end(children[-1], owner_id) if children else node_id
+            # Walk the last-child chain to its deepest statement. Iterative, not
+            # recursive: a Suricata function nests statements >1000 deep, which
+            # overflowed Python's stack when this descended by recursion. The
+            # `seen` guard also makes a malformed cyclic chain terminate instead
+            # of spinning, which the recursive form could not have survived either.
+            seen: set[str] = set()
+            while node_id not in seen:
+                seen.add(node_id)
+                children = statement_children(node_id, owner_id)
+                if not children:
+                    break
+                node_id = children[-1]
+            return node_id
 
         def same_owner_successors(node_id: str, owner_id: str) -> list[str]:
             return sorted((

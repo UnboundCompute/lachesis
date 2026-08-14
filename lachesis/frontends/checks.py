@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import os
 import subprocess
@@ -2438,46 +2439,14 @@ class CompilerFrontendTests(unittest.TestCase):
         # not the dropped token/span nodes).
         import os as _os
         import sys as _sys
-        import types as _types
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
         from lachesis.nav.graph_store import GraphStore
-        from lachesis.nav.reachability import Reachability
-        from lachesis.nav.hubs import Hubs
-        from lachesis.nav.guards import GuardProfiles
-        from lachesis.nav.call_roles import CallRoles
-        from lachesis.nav.siblings import SiblingDiff
-        from lachesis.nav import mcp_server
+        # The dispatch driver and the order-invariant compare live in the package now,
+        # because the eager-vs-lazy equality harness in nav/checks.py is the same
+        # operation and two checks.py files have nowhere else to share code from.
+        from lachesis.nav._navharness import norm as _norm, run_nav as _run_nav
         from lachesis.kuzu_store import write_kuzu_graph
-
-        def _run_nav(store, calls):
-            # each store drives the same global nav dispatch, one at a time. The
-            # security tools (guards/guards_top/call_roles/siblings) recompute from
-            # base facts, so the injected context mirrors the real `_Ctx` — a Kùzu
-            # store with an empty overlay must answer them identically to the in-memory
-            # store, proving the overlay is a cache, not a dependency.
-            guards = GuardProfiles(store)
-            mcp_server._CTX = _types.SimpleNamespace(
-                store=store, reach=Reachability(store), hubs=Hubs(store.gl),
-                guards=guards, roles=CallRoles(store, guards=guards),
-                siblings=SiblingDiff(store))
-            mcp_server._PROFILE = "all"
-            mcp_server._DEFAULT_FORMAT = "json"
-            return {label: mcp_server.call_tool(tool, args, format="json")
-                    for label, tool, args in calls}
-
-        def _norm(payload):
-            # order-invariant: sort every nested list so set-shaped results
-            # (which the two backends may enumerate in a different order)
-            # compare equal while any real content difference still shows.
-            def walk(x):
-                if isinstance(x, list):
-                    return sorted((walk(v) for v in x),
-                                  key=lambda e: json.dumps(e, sort_keys=True))
-                if isinstance(x, dict):
-                    return {k: walk(v) for k, v in x.items()}
-                return x
-            return walk(json.loads(payload))
 
         with tempfile.TemporaryDirectory() as output:
             # fixtures_opsreg carries an ops-struct dispatch table, so the nav set
@@ -3336,6 +3305,172 @@ def _fold_with_compose(seed: dict, deltas) -> dict:
     return current
 
 
+def _legacy_enrich(registry, graph: dict) -> dict:
+    """The fold as it stood before one index followed it: an index per overlay.
+
+    Kept here rather than in the source tree because it is the oracle, not a fallback.
+    Every overlay used to build ``GraphIndex(graph)`` for itself over a graph that grew
+    as the fold proceeded; the shared incremental index has to agree with that, exactly
+    and in order, or overlays downstream of the change see a different graph.
+    """
+    from lachesis.core.composition import GraphAccumulator
+
+    current = graph
+    accumulator = None
+    for overlay in registry.overlays:
+        if not overlay.applies(current):
+            continue
+        delta = overlay.enrich(current)
+        if accumulator is None:
+            accumulator = GraphAccumulator(graph["nodes"], graph["edges"])
+        accumulator.apply(delta)
+        current = accumulator.view()
+    return current
+
+
+class SharedIndexFoldTests(unittest.TestCase):
+    """One index absorbed forward must answer what eight rebuilt indexes answered.
+
+    The saving is real -- eight full indexes over a graph growing 209k to 287k nodes
+    become one plus its deltas -- but it is only a saving if nothing downstream can
+    tell. Two overlays read buckets whose order is not forced by a unique key, so the
+    claim under test is ordered-list equality against the old fold, not set equality:
+    a set comparison passes on exactly the reordering that would make a later overlay's
+    ``next(...)`` pick a different edge.
+    """
+
+    def _canonical_graph(self) -> dict:
+        with tempfile.TemporaryDirectory() as output:
+            completed = subprocess.run(
+                (sys.executable, "lachesis/frontends/c/build_graph.py",
+                 "lachesis/frontends/c/fixtures", output),
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(
+                0, completed.returncode,
+                f"C frontend failed:\n{completed.stdout}\n{completed.stderr}",
+            )
+            snapshot = load_snapshot(output)
+        from lachesis.pipeline import combine_graphs
+
+        return combine_graphs([snapshot_graph(snapshot)])
+
+    def test_the_shared_index_fold_equals_the_per_overlay_rebuild(self) -> None:
+        from lachesis.core.overlays import default_overlay_registry
+
+        graph = self._canonical_graph()
+        self.assertTrue(graph["nodes"], "the fixture must produce a non-empty graph")
+
+        shared = default_overlay_registry().enrich(copy.deepcopy(graph))
+        legacy = _legacy_enrich(default_overlay_registry(), copy.deepcopy(graph))
+
+        self.assertEqual(
+            [node["id"] for node in legacy["nodes"]],
+            [node["id"] for node in shared["nodes"]],
+        )
+        self.assertEqual(
+            [(edge["kind"], edge["source"], edge["target"]) for edge in legacy["edges"]],
+            [(edge["kind"], edge["source"], edge["target"]) for edge in shared["edges"]],
+        )
+        self.assertEqual(legacy["nodes"], shared["nodes"])
+        self.assertEqual(legacy["edges"], shared["edges"])
+
+    def test_every_overlay_ignores_whether_it_was_handed_an_index(self) -> None:
+        """Each overlay alone, on the same graph, with and without the index.
+
+        Standalone callers survive -- ``apply_parameter_property_effects`` is exported,
+        and the checks suites construct overlays directly -- so ``index=None`` is not a
+        dead branch and has to keep producing the same delta the shared one does.
+        """
+        from lachesis.core.overlays import default_overlay_registry
+
+        graph = self._canonical_graph()
+        applied = []
+        for overlay in default_overlay_registry().overlays:
+            index = GraphIndex(graph)
+            self.assertEqual(overlay.applies(graph), overlay.applies(graph, index))
+            if not overlay.applies(graph):
+                continue
+            applied.append(overlay.overlay_id)
+            without = overlay.enrich(graph)
+            with_index = overlay.enrich(graph, GraphIndex(graph))
+            self.assertEqual(without.nodes, with_index.nodes, overlay.overlay_id)
+            self.assertEqual(without.edges, with_index.edges, overlay.overlay_id)
+        self.assertTrue(applied, "no overlay applied, so nothing was actually compared")
+
+    def test_the_observer_is_told_about_every_overlay_that_ran(self) -> None:
+        from lachesis.core.overlays import default_overlay_registry
+
+        graph = self._canonical_graph()
+        registry = default_overlay_registry()
+        seen: list[tuple] = []
+        registry.enrich(graph, lambda overlay_id, wall, nodes, edges: seen.append(
+            (overlay_id, nodes, edges),
+        ))
+        # Which overlays apply is decided against the graph as it grows, so the
+        # observed set is not predictable from the seed. What is: the ones that ran
+        # are registered ones, reported once each, in registration order.
+        registered = [overlay.overlay_id for overlay in registry.overlays]
+        reported = [row[0] for row in seen]
+        self.assertEqual(sorted(set(reported)), sorted(reported))
+        self.assertEqual([name for name in registered if name in set(reported)], reported)
+        self.assertTrue(reported, "no overlay ran, so the observer proved nothing")
+        self.assertTrue(all(isinstance(row[1], int) for row in seen))
+
+
+class SnapshotReleaseTests(unittest.TestCase):
+    """A snapshot stops holding a copy of the graph the moment the graph exists."""
+
+    def _snapshot(self) -> FrontendSnapshot:
+        return FrontendSnapshot(
+            frontend_id="test", contract_version=1, languages=("c",),
+            capabilities={}, manifest={"diagnostic_count": 3},
+            nodes=[_node("a"), _node("b")], edges=[_edge("CALLS", "a", "b")],
+        )
+
+    def test_release_folds_the_payload_to_its_counts(self) -> None:
+        snapshot = self._snapshot()
+        self.assertFalse(snapshot.released)
+        self.assertEqual((2, 1), (snapshot.payload_node_count, snapshot.payload_edge_count))
+        snapshot.release()
+        self.assertTrue(snapshot.released)
+        self.assertEqual([], snapshot.nodes)
+        self.assertEqual([], snapshot.edges)
+        # The counts the manifest reports are the ones the payload had.
+        self.assertEqual((2, 1), (snapshot.payload_node_count, snapshot.payload_edge_count))
+        # Idempotent, so three entry points may each release without coordinating.
+        snapshot.release()
+        self.assertEqual((2, 1), (snapshot.payload_node_count, snapshot.payload_edge_count))
+
+    def test_what_survives_release_is_what_the_build_still_needs(self) -> None:
+        snapshot = self._snapshot()
+        snapshot.release()
+        self.assertEqual("test", snapshot.frontend_id)
+        self.assertEqual(("c",), snapshot.languages)
+        self.assertEqual({}, snapshot.capabilities)
+        self.assertEqual(3, snapshot.manifest.get("diagnostic_count"))
+
+    def test_the_manifest_reads_the_released_counts(self) -> None:
+        from lachesis.kuzu_store import manifest_payload
+
+        snapshot = self._snapshot()
+        before = manifest_payload({"nodes": [], "edges": []}, [snapshot])
+        snapshot.release()
+        self.assertEqual(before, manifest_payload({"nodes": [], "edges": []}, [snapshot]))
+
+    def test_run_project_releases_every_snapshot_it_returns(self) -> None:
+        from lachesis.pipeline import run_project
+
+        with tempfile.TemporaryDirectory() as output:
+            graph, snapshots = run_project(
+                str(ROOT / "lachesis" / "frontends" / "c" / "fixtures"), output,
+            )
+        self.assertTrue(snapshots)
+        self.assertTrue(all(snapshot.released for snapshot in snapshots))
+        self.assertTrue(graph["nodes"], "releasing must not empty the graph")
+        self.assertTrue(all(snapshot.payload_node_count for snapshot in snapshots))
+
+
 class GraphAccumulatorTests(unittest.TestCase):
     """The accumulator is a folding of ``compose``, so ``compose`` is the oracle.
 
@@ -3448,10 +3583,10 @@ class GraphAccumulatorTests(unittest.TestCase):
         class Inapplicable:
             overlay_id = "inapplicable"
 
-            def applies(self, graph: dict) -> bool:
+            def applies(self, graph: dict, index=None) -> bool:
                 return False
 
-            def enrich(self, graph: dict) -> GraphDelta:  # pragma: no cover
+            def enrich(self, graph: dict, index=None) -> GraphDelta:  # pragma: no cover
                 raise AssertionError("enrich must not run when applies said no")
 
         registry = OverlayRegistry()
@@ -3464,17 +3599,23 @@ class GraphAccumulatorTests(unittest.TestCase):
         from lachesis.core.overlays import OverlayRegistry
 
         seen: list[set[str]] = []
+        indexed: list[set[str]] = []
+        identities: set[int] = set()
 
         class Recording:
             def __init__(self, overlay_id: str, delta: GraphDelta) -> None:
                 self.overlay_id = overlay_id
                 self._delta = delta
 
-            def applies(self, graph: dict) -> bool:
+            def applies(self, graph: dict, index=None) -> bool:
                 return True
 
-            def enrich(self, graph: dict) -> GraphDelta:
+            def enrich(self, graph: dict, index=None) -> GraphDelta:
                 seen.append({node["id"] for node in graph["nodes"]})
+                # The fold hands every overlay one index, absorbed forward: the same
+                # object each time, and always agreeing with the graph beside it.
+                indexed.append(set(index.nodes))
+                identities.add(id(index))
                 return self._delta
 
         registry = OverlayRegistry()
@@ -3483,6 +3624,8 @@ class GraphAccumulatorTests(unittest.TestCase):
         enriched = registry.enrich(self._seed())
 
         self.assertEqual([{"a", "b"}, {"a", "b", "c"}], seen)
+        self.assertEqual(seen, indexed)
+        self.assertEqual(1, len(identities))
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
 
 

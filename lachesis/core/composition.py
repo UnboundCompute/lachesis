@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from .contract import ContractError
 
@@ -154,12 +154,18 @@ class GraphAccumulator:
         self._edge_keys = _EdgeKeys()
         self._sorted_nodes: Optional[List[dict]] = None
         self._sorted_edges: Optional[List[dict]] = None
-        self._unchecked: List[dict] = self._absorb(
+        _, self._unchecked = self._absorb(
             GraphDelta("canonical-input", list(nodes), list(edges)),
         )
 
-    def _absorb(self, delta: GraphDelta) -> List[dict]:
-        """Take in a delta's facts and return the edges whose endpoints want checking."""
+    def _absorb(self, delta: GraphDelta) -> Tuple[List[dict], List[dict]]:
+        """Take in a delta's facts and return the ones this accumulator had not seen.
+
+        The fresh edges are the ones whose endpoints want checking. Both halves are what
+        an index following the fold needs, since the whole point of following is to pay
+        for the delta rather than for the graph.
+        """
+        fresh_nodes = []
         for node in delta.nodes:
             existing = self._nodes.get(node["id"])
             if existing is not None and existing != node:
@@ -168,6 +174,7 @@ class GraphAccumulator:
                 )
             if existing is None:
                 self._sorted_nodes = None
+                fresh_nodes.append(node)
             self._nodes[node["id"]] = node
         fresh = []
         for edge in delta.edges:
@@ -176,12 +183,13 @@ class GraphAccumulator:
         if fresh:
             self._edges.extend(fresh)
             self._sorted_edges = None
-        return fresh
+        return fresh_nodes, fresh
 
-    def apply(self, delta: GraphDelta) -> None:
-        fresh = self._absorb(delta)
+    def apply(self, delta: GraphDelta) -> Tuple[List[dict], List[dict]]:
+        fresh_nodes, fresh = self._absorb(delta)
         _dangling(self._unchecked + fresh, self._nodes)
         self._unchecked = []
+        return fresh_nodes, fresh
 
     def view(self) -> dict:
         """The graph as ``compose`` would have returned it, sorted the same way.

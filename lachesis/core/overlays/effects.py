@@ -17,17 +17,19 @@ def _fact(evidence_ids: list[str], confidence: str = "high") -> dict:
 class ParameterPropertyEffects:
     overlay_id = "parameter-property-effects"
 
-    def applies(self, graph: dict) -> bool:
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        # Keyed on an edge kind, which the index does not bucket, so this stays a scan.
         return any(
             edge.get("kind") == "WRITES_PARAMETER_PROPERTY"
             for edge in graph.get("edges", [])
         )
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes = []
         edges = []
         locations: dict[tuple[str, str], tuple[str, str]] = {}
+        emitted_locations: set[str] = set()
         effects = [
             edge for edge in graph.get("edges", [])
             if edge.get("kind") == "WRITES_PARAMETER_PROPERTY"
@@ -50,27 +52,36 @@ class ParameterPropertyEffects:
                 if receiver_id not in index.nodes or value_id not in index.nodes:
                     continue
                 property_id = effect["target"]
-                evidence = [call["id"], effect["source"], property_id, receiver_id, value_id]
                 location_id = stable_id(
                     "core", self.overlay_id, "heap-location",
                     call["id"], receiver_id, property_id,
                 )
-                fact = _fact(evidence)
-                nodes.append({
-                    "id": location_id,
-                    "kind": "heap-location",
-                    "label": (
-                        f"{index.nodes[receiver_id]['label']}."
-                        f"{index.nodes.get(property_id, {}).get('label', property_id)}"
-                    ),
-                    "properties": {
-                        **fact,
-                        "receiver_value_id": receiver_id,
-                        "property_id": property_id,
-                        "callsite_id": call["id"],
-                        "context_sensitive": True,
-                    },
-                })
+                # The node identity is (callsite, receiver, property) — one heap
+                # slot. Two effects can write that same slot with different values
+                # or from different summary functions; they are two writes to one
+                # location, not two locations. So the node's evidence is only the
+                # slot-defining ids (stable across effects), and the per-write
+                # detail (value_id, summary function) rides on the edges below.
+                # Baking the varying ids into the node minted the same id twice
+                # with different content and compose() rejected the collision.
+                fact = _fact([call["id"], effect["source"], property_id, receiver_id, value_id])
+                if location_id not in emitted_locations:
+                    emitted_locations.add(location_id)
+                    nodes.append({
+                        "id": location_id,
+                        "kind": "heap-location",
+                        "label": (
+                            f"{index.nodes[receiver_id]['label']}."
+                            f"{index.nodes.get(property_id, {}).get('label', property_id)}"
+                        ),
+                        "properties": {
+                            **_fact([call["id"], property_id, receiver_id]),
+                            "receiver_value_id": receiver_id,
+                            "property_id": property_id,
+                            "callsite_id": call["id"],
+                            "context_sensitive": True,
+                        },
+                    })
                 locations[(receiver_id, property_id)] = (location_id, value_id)
                 edges.extend([
                     {

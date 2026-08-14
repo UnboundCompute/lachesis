@@ -37,11 +37,12 @@ class DynamicDispatch:
 
     overlay_id = "dynamic-dispatch"
 
-    def applies(self, graph: dict) -> bool:
-        return any(node.get("kind") == "call" for node in graph.get("nodes", []))
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        return index.has_kind("call")
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         edges = []
         emitted: set[tuple[str, str, str]] = set()
         implementations: dict[str, set[str]] = defaultdict(set)

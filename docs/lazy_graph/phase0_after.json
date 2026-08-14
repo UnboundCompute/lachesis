@@ -1,0 +1,102 @@
+{
+  "core_edges": 290012,
+  "core_nodes": 211360,
+  "enriched_edges": 513632,
+  "enriched_nodes": 292597,
+  "file_count": 154,
+  "frontends": [
+    "clang-c",
+    "cpython-ast",
+    "typescript-compiler-api"
+  ],
+  "overlays": [
+    {
+      "delta_edges": 28484,
+      "delta_nodes": 17473,
+      "overlay": "control-flow",
+      "wall": 0.5381353749980917
+    },
+    {
+      "delta_edges": 6149,
+      "delta_nodes": 33,
+      "overlay": "branch-history",
+      "wall": 0.46595345900277607
+    },
+    {
+      "delta_edges": 2206,
+      "delta_nodes": 0,
+      "overlay": "dynamic-dispatch",
+      "wall": 1.0885655839956598
+    },
+    {
+      "delta_edges": 14548,
+      "delta_nodes": 8662,
+      "overlay": "dynamic-behavior",
+      "wall": 0.18574904100387357
+    },
+    {
+      "delta_edges": 91232,
+      "delta_nodes": 37210,
+      "overlay": "interprocedural-contexts",
+      "wall": 1.259140624999418
+    },
+    {
+      "delta_edges": 74652,
+      "delta_nodes": 16048,
+      "overlay": "heap-identity",
+      "wall": 2.482552041998133
+    },
+    {
+      "delta_edges": 678,
+      "delta_nodes": 338,
+      "overlay": "module-initialization",
+      "wall": 0.39580462500452995
+    },
+    {
+      "delta_edges": 5,
+      "delta_nodes": 1,
+      "overlay": "parameter-property-effects",
+      "wall": 0.30993933299032506
+    },
+    {
+      "delta_edges": 10,
+      "delta_nodes": 1,
+      "overlay": "async-events",
+      "wall": 0.7208280000049854
+    },
+    {
+      "delta_edges": 1694,
+      "delta_nodes": 37,
+      "overlay": "taint-propagation",
+      "wall": 2.1980441250052536
+    }
+  ],
+  "peak_rss_mb": 1012.6875,
+  "python_heap": {
+    "combine_graphs": 4.958718299865723,
+    "enrich": 147.47672843933105,
+    "frontends": 373.07176399230957
+  },
+  "source_dir": "/Users/riyandhiman/project/unboundcompute/arachne/lachesis",
+  "stages": [
+    {
+      "peak_rss_delta_mb": 567.828125,
+      "python_heap_delta_mb": 0.0,
+      "stage": "frontends",
+      "wall": 6.949989540997194
+    },
+    {
+      "peak_rss_delta_mb": 294.59375,
+      "python_heap_delta_mb": 0.0,
+      "stage": "combine_graphs",
+      "wall": 2.8862933329946827
+    },
+    {
+      "peak_rss_delta_mb": 101.5,
+      "python_heap_delta_mb": 0.0,
+      "stage": "enrich",
+      "wall": 15.311114041993278
+    }
+  ],
+  "total_wall": 25.147396915985155
+}

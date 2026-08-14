@@ -169,6 +169,7 @@ def _combined_capabilities(snapshots: Sequence[FrontendSnapshot]) -> dict[str, s
 
 def enrich_graph(
     graph: CodeGraph, languages: Iterable[str], capabilities: Dict[str, str],
+    observer=None,
 ) -> CodeGraph:
     """Fold the four overlay registries over a core graph to produce the dataflow tier.
 
@@ -176,6 +177,9 @@ def enrich_graph(
     package inventory the ecosystem registry needs is derived from the graph, so those
     two values are the *only* inputs beyond the graph itself — which is exactly why
     this can run at load time from a core-only store, given a manifest.
+
+    ``observer`` is passed to the three ``OverlayRegistry`` folds so a profiler can see
+    per-overlay cost. It changes nothing about the result.
     """
     from .core.overlays import (
         default_model_overlay_registry,
@@ -185,13 +189,13 @@ def enrich_graph(
     from .core.query import GraphIndex
     from .ecosystems import default_ecosystem_registry
 
-    graph = default_overlay_registry().enrich(graph)
+    graph = default_overlay_registry().enrich(graph, observer)
     index = GraphIndex(graph)
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), set(languages), capabilities, index,
     )
-    graph = default_model_overlay_registry().enrich(graph)
-    return default_security_overlay_registry().enrich(graph)
+    graph = default_model_overlay_registry().enrich(graph, observer)
+    return default_security_overlay_registry().enrich(graph, observer)
 
 
 def enrich_project_graph(
@@ -211,6 +215,23 @@ def enrich_project_graph(
 
 
 _enrich_graph = enrich_project_graph
+
+
+def _release_payloads(snapshots: Sequence[FrontendSnapshot]) -> None:
+    """Let go of every snapshot's node and edge lists, now that they are in the graph.
+
+    ``snapshot_graph`` copies each node and its ``properties`` dict, so once the combine
+    has run the snapshots hold a second, complete copy of the graph -- and they are held
+    to the end of the build, because the store manifest is written last. Enrichment then
+    runs, and its peak is measured on top of that duplicate.
+
+    Only two things read a snapshot's payload after the combine, both in
+    ``manifest_payload``, and both only for its length; ``release`` keeps the lengths.
+    Everything else downstream (``enrich_project_graph``, the CLI reporting) reads
+    ``languages``, ``capabilities`` and ``frontend_id``, which survive untouched.
+    """
+    for snapshot in snapshots:
+        snapshot.release()
 
 
 def run_project(
@@ -254,6 +275,7 @@ def run_project(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
+    _release_payloads(snapshots)
     return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots
 
 
@@ -398,6 +420,7 @@ def run_project_incremental(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
+    _release_payloads(snapshots)
     result = _enrich_graph(graph, snapshots) if enrich else graph
     _write_manifest(manifest_path, manifest)
     return result, snapshots
@@ -611,6 +634,7 @@ def run_project_parallel(
          for job, snapshot in zip(jobs, snapshots)],
         owner_of_file, source_dir,
     )
+    _release_payloads(snapshots)
     return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots, dropped
 
 

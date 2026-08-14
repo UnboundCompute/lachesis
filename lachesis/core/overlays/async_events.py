@@ -18,18 +18,20 @@ def _fact(evidence_ids: list[str], confidence: str = "high") -> dict:
 class AsyncEvents:
     overlay_id = "async-events"
 
-    def applies(self, graph: dict) -> bool:
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        # Both halves are property tests, not kind tests, so only the first can narrow
+        # through a bucket; the await scan stays whole-graph.
         return any(
-            node.get("kind") == "function-effect"
-            and node.get("properties", {}).get("effect_kind") == "runtime-call"
-            for node in graph.get("nodes", [])
+            node.get("properties", {}).get("effect_kind") == "runtime-call"
+            for node in index.nodes_of_kind("function-effect")
         ) or any(
             node.get("properties", {}).get("operator") == "await"
             for node in graph.get("nodes", [])
         )
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes = []
         edges = []
         emitted_nodes: set[str] = set()

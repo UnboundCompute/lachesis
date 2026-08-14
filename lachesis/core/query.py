@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Iterable, Optional
 
 
+
 def _bucket_order(item: dict) -> tuple:
     """The order every bucket is kept in, node or edge.
 
@@ -29,7 +30,12 @@ class GraphIndex:
 
     This is not a weaker guarantee. Every bucket a caller can observe is ordered exactly
     as before, since the only way to reach one is through the property that orders it.
-    The buckets are never written to after construction, so a sort can never go stale.
+
+    Buckets *are* written to after construction, by ``absorb``, which is what lets one
+    index follow a fold instead of being rebuilt per overlay. A sort cannot go stale
+    across that, because ``absorb`` re-orders exactly the buckets it appended to, and
+    only among the collections a caller has already read. See ``absorb`` for why the
+    resulting order is the same one a rebuild would have produced.
     """
 
     _COLLECTIONS = ("by_kind", "by_label", "by_file", "by_owner", "outgoing", "incoming")
@@ -37,25 +43,80 @@ class GraphIndex:
     def __init__(self, graph: dict) -> None:
         self.nodes = {node["id"]: node for node in graph.get("nodes", [])}
         self._buckets = {name: defaultdict(list) for name in self._COLLECTIONS}
-        by_kind = self._buckets["by_kind"]
-        by_label = self._buckets["by_label"]
-        by_file = self._buckets["by_file"]
-        by_owner = self._buckets["by_owner"]
-        outgoing = self._buckets["outgoing"]
-        incoming = self._buckets["incoming"]
         for node in self.nodes.values():
-            by_kind[node.get("kind")].append(node)
-            by_label[node.get("label")].append(node)
+            self._file_node(node)
+        for edge in graph.get("edges", []):
+            self._file_edge(edge)
+
+    def _file_node(self, node: dict) -> None:
+        self._buckets["by_kind"][node.get("kind")].append(node)
+        self._buckets["by_label"][node.get("label")].append(node)
+        properties = node.get("properties", {})
+        path = properties.get("absolute_file") or properties.get("file")
+        if path:
+            self._buckets["by_file"][path].append(node)
+        owner = properties.get("owner_function_id") or properties.get("function_id")
+        if owner:
+            self._buckets["by_owner"][owner].append(node)
+
+    def _file_edge(self, edge: dict) -> None:
+        self._buckets["outgoing"][edge["source"]].append(edge)
+        self._buckets["incoming"][edge["target"]].append(edge)
+
+    def absorb(self, nodes: Iterable[dict], edges: Iterable[dict]) -> None:
+        """Take in the facts one overlay added, so this index keeps describing the fold.
+
+        Every overlay in a registry fold used to build its own index over a graph that
+        grows as the fold proceeds, so the eighth overlay paid to index the first seven's
+        output from scratch. Following the fold instead costs each overlay its own delta.
+
+        The order a caller observes is the order a rebuild would have produced, and for
+        two different reasons. Node buckets are keyed by a unique id, so ``_bucket_order``
+        is a total order over them and insertion order cannot survive the sort. Edge
+        buckets can tie -- two edges may agree on kind, source and target and differ only
+        in properties -- and there the tie is broken by position, so what matters is that
+        edges arrive here in the same sequence a rebuilt index would have walked them.
+        They do: a rebuild reads ``GraphAccumulator.view()``, whose edge list is a stable
+        sort of seed-then-delta-by-delta arrival, which is exactly the sequence the fold
+        hands to ``absorb``.
+
+        Only collections that have already been read need re-ordering, and only at the
+        keys this call touched. An unread collection is left alone because ``__getattr__``
+        has not sorted it yet and will sort all of it on first read.
+        """
+        touched: dict[str, set] = {name: set() for name in self._COLLECTIONS}
+        for node in nodes:
+            if node["id"] in self.nodes:
+                continue
+            self.nodes[node["id"]] = node
+            self._file_node(node)
             properties = node.get("properties", {})
+            touched["by_kind"].add(node.get("kind"))
+            touched["by_label"].add(node.get("label"))
             path = properties.get("absolute_file") or properties.get("file")
             if path:
-                by_file[path].append(node)
+                touched["by_file"].add(path)
             owner = properties.get("owner_function_id") or properties.get("function_id")
             if owner:
-                by_owner[owner].append(node)
-        for edge in graph.get("edges", []):
-            outgoing[edge["source"]].append(edge)
-            incoming[edge["target"]].append(edge)
+                touched["by_owner"].add(owner)
+        for edge in edges:
+            self._file_edge(edge)
+            touched["outgoing"].add(edge["source"])
+            touched["incoming"].add(edge["target"])
+        for name, keys in touched.items():
+            if not keys or name not in self.__dict__:
+                continue
+            bucket = self._buckets[name]
+            for key in keys:
+                bucket[key].sort(key=_bucket_order)
+    def has_kind(self, *kinds: str) -> bool:
+        """Whether any node of these kinds exists, without ordering anything.
+
+        ``applies`` is a predicate, and a predicate that reaches for ``by_kind`` through
+        the sorting property charges a whole sort to answer a yes/no question -- for
+        every overlay in the fold, including the ones that then decline to run.
+        """
+        return any(self._buckets["by_kind"].get(kind) for kind in kinds)
 
     def __getattr__(self, name: str):
         """Order a bucket on its first mention and then get out of the way.
