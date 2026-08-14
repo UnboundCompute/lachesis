@@ -352,6 +352,36 @@ class GraphStore:
             self._entries = si.build_index(self.gl)
         return self._entries
 
+    @property
+    def resolver(self):
+        """The lazy resolution tier over this store's index.
+
+        Lazy like ``entries``, and for the same reason: a store that is only ever asked
+        for a file listing should not pay for one. Bound to the index rather than to the
+        store because that is what the resolver actually reads — and because
+        ``ensure_dataflow_tier`` swaps ``self.index`` for a larger one, at which point a
+        resolver cached on the store would be memoizing answers about a graph that is no
+        longer the one being queried.
+        """
+        from lachesis.resolution import resolver_for
+        return resolver_for(self.index, self.graph_hash())
+
+    def graph_hash(self) -> str:
+        """The identity a memo is keyed on: which graph these answers are about.
+
+        The base store and its ``.enriched`` sidecar are two databases whose call sites
+        resolve differently, so a memo that crossed between them would be a confident
+        wrong answer. The open store's own manifest hash is what distinguishes them.
+        """
+        from lachesis.kuzu_store import read_store_manifest
+        try:
+            path = getattr(self, "graph_path", None)
+            manifest = read_store_manifest(path) if path else {}
+        except Exception:
+            return ""
+        return str(manifest.get("graph_content_hash")
+                   or manifest.get("core_content_hash") or "")
+
     def resolve(self, name: str) -> list[dict]:
         """Name -> candidate index entries (exact first, else fuzzy)."""
         return si._resolve(self.gl, self.entries, name)

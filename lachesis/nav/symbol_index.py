@@ -34,6 +34,7 @@ from lachesis.nav.graphlib import GraphLib, CALLABLE_KINDS
 # `decl_index` from it. Imported rather than restated so `search` and the stored index
 # cannot come to disagree about which nodes are reachable by name.
 from lachesis.indices import CALLSITE_KINDS, INDEXED_KINDS, signature_of
+from lachesis.resolution import owned_callsites
 
 # Kind precedence for name resolution: when one name resolves to multiple nodes, prefer
 # the DEFINITION over a reference to it. §4 made variable/property/constant name-
@@ -325,9 +326,13 @@ def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
 
 
 def _owned_callsites(gl: GraphLib, node_id: str) -> tuple[dict, ...]:
-    """The call-site / construct nodes a function owns (where indirect edges start)."""
-    return tuple(n for n in gl.index.nodes_owned_by(node_id)
-                 if gl.kind(n["id"]) in _CALLSITE_KINDS)
+    """The call-site / construct nodes a function owns (where indirect edges start).
+
+    The set itself is computed in `lachesis.resolution`, because it is also the set the
+    resolver binds; keeping two definitions would let the sites nav reports indirect
+    edges from drift away from the sites resolution decides.
+    """
+    return owned_callsites(gl.index, node_id)
 
 
 def _caller_decl(gl: GraphLib, node: dict) -> dict | None:

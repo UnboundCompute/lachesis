@@ -4359,5 +4359,239 @@ class HomonymIndexTests(unittest.TestCase):
         self.assertEqual(indexed, declared)
 
 
+class HomonymResolutionTests(unittest.TestCase):
+    """The resolution tier over the two fixtures that make it earn its keep.
+
+    Two things are under test and they pull in opposite directions. The first is that
+    the tier is a **strict superset**: on every call site the frontend already decided,
+    `resolve` returns the frontend's answer and not its own. The second is that where
+    the frontend has nothing, the ladder still decides -- so the frontend's answer is
+    stripped out of a copy of the graph and the same question is asked again, and the
+    two answers have to agree. An addition that changed an existing answer would not be
+    an addition.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from lachesis.pipeline import run_project
+
+        cls._graph, _ = run_project(
+            os.path.join(ROOT, "lachesis/frontends/c/fixtures_homonym"), enrich=False)
+        cls._crosstu, _ = run_project(
+            os.path.join(ROOT, "lachesis/frontends/c/fixtures_crosstu"), enrich=False)
+
+    # -- helpers -------------------------------------------------------------
+
+    def _index(self, graph=None):
+        from lachesis.core.query import GraphIndex
+        return GraphIndex(graph if graph is not None else self._graph)
+
+    @staticmethod
+    def _definition(graph, label: str) -> str:
+        """The body-bearing `label`, not its prototype twin.
+
+        Worth spelling out: `shared.c` forward-declares `alpha_entry`, so the graph
+        holds *two* nodes with that name and the bodyless one owns no call sites at
+        all. A test that took the first match would pass or fail on frontend ordering.
+        """
+        matches = [n for n in graph["nodes"]
+                   if n["kind"] == "function" and n["label"] == label
+                   and not (n["properties"] or {}).get("declaration_only")]
+        assert len(matches) == 1, f"{label}: expected one definition, got {len(matches)}"
+        return matches[0]["id"]
+
+    @staticmethod
+    def _callsites(graph, file_suffix: str, callee: str) -> list:
+        return [n for n in graph["nodes"]
+                if n["kind"] in ("call", "construct")
+                and str((n["properties"] or {}).get("file") or "").endswith(file_suffix)
+                and (n["properties"] or {}).get("callee") == callee]
+
+    @staticmethod
+    def _blinded(graph) -> dict:
+        """The same graph with every frontend call resolution removed.
+
+        `primary_target_id` off the call sites and the decided call edges dropped, which
+        is exactly the state a C tree is in when clang could not see the definition.
+        Nothing else is touched, so what answers afterwards is rungs 2-7 alone.
+        """
+        nodes = []
+        for node in graph["nodes"]:
+            if node["kind"] in ("call", "construct"):
+                properties = dict(node["properties"] or {})
+                properties.pop("primary_target_id", None)
+                node = {**node, "properties": properties}
+            nodes.append(node)
+        edges = [e for e in graph["edges"] if e["kind"] not in ("INVOKES", "CALLS")]
+        return {**graph, "nodes": nodes, "edges": edges}
+
+    # -- the superset property ----------------------------------------------
+
+    def test_each_call_site_resolves_to_its_own_files_definition(self):
+        from lachesis.resolution import resolve
+
+        index = self._index()
+        for unit in ("alpha.c", "beta.c"):
+            site = self._callsites(self._graph, unit, "funcA")
+            self.assertEqual(1, len(site), f"one funcA call in {unit}")
+            result = resolve(index, site[0]["id"])
+            self.assertEqual("exact", result["confidence"])
+            target = index.nodes[result["target"]]
+            self.assertEqual("funcA", target["label"])
+            self.assertTrue(
+                target["properties"]["file"].endswith(unit),
+                f"{unit}'s call must land on {unit}'s static funcA, not its twin",
+            )
+
+    def test_the_crosstu_call_targets_the_definition_not_the_prototype(self):
+        """Rung 1 inheriting the C post-pass rather than second-guessing it."""
+        from lachesis.resolution import resolve
+
+        index = self._index(self._crosstu)
+        sites = self._callsites(self._crosstu, "client.c", "lib_compute")
+        self.assertEqual(1, len(sites))
+        result = resolve(index, sites[0]["id"])
+        self.assertEqual("exact", result["confidence"])
+        target = index.nodes[result["target"]]
+        self.assertFalse(target["properties"].get("declaration_only"),
+                         "the definition in lib.c, not the prototype in lib.h")
+
+    def test_resolution_is_idempotent(self):
+        from lachesis.resolution import resolve
+
+        index = self._index()
+        site = self._callsites(self._graph, "alpha.c", "funcA")[0]["id"]
+        self.assertEqual(resolve(index, site), resolve(index, site))
+
+    # -- the rung the fixture exists for ------------------------------------
+
+    def test_static_scoping_decides_the_homonym_without_the_frontend(self):
+        """Rung 2, alone: same answer, from file-local C linkage rules only.
+
+        Clang resolves both of these intra-TU, so rung 1 answers them in the real
+        graph -- the fixture's original premise (that the frontend gives up here) was
+        wrong, and this is what it is actually worth testing. Blinded, the name `funcA`
+        has two definitions in two files and only `static` in the caller's own file
+        separates them.
+        """
+        from lachesis.resolution import resolve
+
+        blind = self._index(self._blinded(self._graph))
+        full = self._index()
+        for unit in ("alpha.c", "beta.c"):
+            site = self._callsites(self._graph, unit, "funcA")[0]["id"]
+            blinded_result = resolve(blind, site)
+            self.assertEqual("exact", blinded_result["confidence"])
+            self.assertEqual("static-same-file", blinded_result["via"])
+            self.assertEqual(
+                resolve(full, site)["target"], blinded_result["target"],
+                "the ladder must reproduce the frontend's answer, not replace it",
+            )
+
+    def test_a_blinded_cross_tu_call_falls_to_the_sole_definition(self):
+        """Rung 3: no static shadow anywhere, one external definition, so promote it."""
+        from lachesis.resolution import resolve
+
+        blind = self._index(self._blinded(self._crosstu))
+        site = self._callsites(self._crosstu, "client.c", "lib_compute")[0]["id"]
+        result = resolve(blind, site)
+        self.assertEqual("exact", result["confidence"])
+        self.assertEqual("sole-definition", result["via"])
+        self.assertFalse(blind.nodes[result["target"]]["properties"]
+                         .get("declaration_only"))
+
+    # -- scope: a declaration, and a cone -----------------------------------
+
+    def test_resolve_decl_visits_only_the_call_sites_it_owns(self):
+        from lachesis.resolution import resolve_decl
+
+        index = self._index()
+        results = resolve_decl(index, self._definition(self._graph, "alpha_entry"))
+        self.assertEqual(1, len(results), "alpha_entry's body holds one call")
+        target = index.nodes[next(iter(results.values()))["target"]]
+        self.assertEqual("funcA", target["label"])
+        self.assertTrue(target["properties"]["file"].endswith("alpha.c"))
+
+    def test_the_cone_reaches_both_definitions_and_says_it_was_not_cut(self):
+        from lachesis.resolution import resolve_cone
+
+        index = self._index()
+        cone = resolve_cone(index, self._definition(self._graph, "shared_entry"))
+        self.assertFalse(cone["truncated"])
+        reached = sorted(
+            f'{index.nodes[m]["label"]}@'
+            f'{os.path.basename(index.nodes[m]["properties"]["file"])}'
+            for m in cone["members"]
+        )
+        self.assertEqual(
+            ["alpha_entry@alpha.c", "beta_entry@beta.c",
+             "funcA@alpha.c", "funcA@beta.c", "shared_entry@shared.c"],
+            reached,
+            "both homonyms, each through its own caller -- not one name reached twice",
+        )
+
+    def test_a_tight_budget_stops_and_admits_it(self):
+        """The budget is a stop, not a filter: `truncated` means there was more."""
+        from lachesis.resolution import resolve_cone
+
+        index = self._index()
+        cone = resolve_cone(index, self._definition(self._graph, "shared_entry"),
+                            budget=2)
+        self.assertTrue(cone["truncated"])
+        self.assertLessEqual(len(cone["members"]), 3)
+
+    def test_the_two_entry_points_do_not_share_a_default_budget(self):
+        """Invariant 3: the cheap question must not be able to cost the dear one."""
+        from lachesis.resolution import CONE_BUDGET, DECL_DEPTH
+
+        self.assertNotEqual(DECL_DEPTH, CONE_BUDGET)
+
+    # -- the memo ------------------------------------------------------------
+
+    def test_the_memo_round_trips_into_the_v9_tables(self):
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+        from lachesis.resolution import Resolver
+
+        from lachesis.pipeline import run_project  # noqa: F401  (setUpClass import path)
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, [], db_dir, enriched=False)
+            index = KuzuGraphIndex(db_dir)
+            resolver = Resolver(index, graph_hash="test-hash")
+            resolver.resolve_cone(self._definition(self._graph, "shared_entry"))
+            self.assertTrue(resolver._memo, "the cone populated the call-site memo")
+            written = resolver.flush_memos(db_dir)
+            self.assertGreater(written, 0)
+
+            import kuzu
+            conn = kuzu.Connection(kuzu.Database(os.path.join(db_dir, "graph.kuzu")))
+            result = conn.execute(
+                "MATCH (r:ResolveMemo) RETURN count(r), count(DISTINCT r.graph_hash)")
+            rows, hashes = result.get_next()
+            self.assertEqual(len(resolver._memo), rows)
+            self.assertEqual(1, hashes, "every memo row is keyed on one graph hash")
+
+    def test_the_store_and_the_memory_index_resolve_identically(self):
+        """The same parity `decl_index` is held to, over the tier that reads it."""
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+        from lachesis.resolution import resolve
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, [], db_dir, enriched=False)
+            stored, memory = KuzuGraphIndex(db_dir), self._index()
+            for unit in ("alpha.c", "beta.c", "shared.c"):
+                for site in self._callsites(self._graph, unit, "funcA") \
+                        + self._callsites(self._graph, unit, "alpha_entry"):
+                    self.assertEqual(resolve(memory, site["id"]),
+                                     resolve(stored, site["id"]))
+
+
 if __name__ == "__main__":
     unittest.main()
