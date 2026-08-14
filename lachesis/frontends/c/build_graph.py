@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import marshal
 import os
 import shlex
 import subprocess
@@ -46,6 +47,21 @@ VALUE_KINDS = {
 }
 CONTENT_HASHES: Dict[Path, str] = {}
 
+# Memoize the (resolved path, content hash) of each distinct ``absolute_file``
+# string. ``GraphBuilder.node`` runs once per AST node (~760k for nginx) but the
+# files behind them number in the hundreds, so resolving+hashing per node turned
+# one deterministic lookup into millions of lstat/realpath syscalls.
+RESOLVED_FILES: Dict[str, Tuple[str, str]] = {}
+
+
+def _freeze(value: object) -> object:
+    """Order-independent hashable projection of a JSON-shaped value — an edge
+    dedup key without the per-edge json.dumps(sort_keys=True) string build."""
+    if isinstance(value, dict):
+        return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return tuple(_freeze(v) for v in value)
+    return value
 
 def stable_id(kind: str, *parts: object) -> str:
     raw = "\0".join(str(part) for part in parts)
@@ -298,6 +314,19 @@ def emit_tokens() -> bool:
     return os.environ.get("LACHESIS_EMIT_TOKENS", "1") != "0"
 
 
+def emit_proofs() -> bool:
+    """Whether to emit the T4 ``source-span`` proof leaves. ``LACHESIS_EMIT_PROOFS=0``
+    turns them off. Each is a 1:1 ``EVIDENCED_BY`` leaf that ``--prune`` deletes at
+    store ingest anyway, so gating emission yields a byte-identical pruned store while
+    cutting ~47% of the nodes the body pass has to build."""
+    return os.environ.get("LACHESIS_EMIT_PROOFS", "1") != "0"
+
+
+# Read once at import; the frontend runs as a fresh subprocess with the env already
+# set by analyze.py, so a module constant is correct and avoids a per-node env read.
+EMIT_PROOFS = emit_proofs()
+
+
 def run_clang_over(
     paths: Iterable[Path], source_dir: Path, *arguments: str,
     file_flags_of: Optional[Dict[Path, List[str]]] = None,
@@ -504,13 +533,17 @@ class Graph:
         }
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
-            absolute = Path(absolute_file).resolve()
+            cached = RESOLVED_FILES.get(absolute_file)
+            if cached is None:
+                absolute = Path(absolute_file).resolve()
+                cached = (str(absolute), content_hash(absolute))
+                RESOLVED_FILES[absolute_file] = cached
+            resolved_file, resolved_hash = cached
             canonical.update({
                 "frontend_id": FRONTEND_ID,
                 "language": "c",
-                "absolute_file": str(absolute),
-                "content_hash": canonical.get("content_hash")
-                    or content_hash(absolute),
+                "absolute_file": resolved_file,
+                "content_hash": canonical.get("content_hash") or resolved_hash,
                 "compiler_node_id": canonical.get("compiler_node_id") or node_id,
             })
         if node_id not in self.nodes:
@@ -530,7 +563,7 @@ class Graph:
             "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
             **properties,
         }
-        key = (kind, source, target, json.dumps(canonical, sort_keys=True))
+        key = (kind, source, target, _freeze(canonical))
         if key in self.edge_keys:
             return
         self.edge_keys.add(key)
@@ -599,15 +632,14 @@ class AstStore:
         self._directory = directory
         self._entries: List[Tuple[Path, Path]] = []
 
-    def add(self, path: Path, ast_json: str) -> None:
-        spill = self._directory / f"{len(self._entries)}.json"
-        spill.write_text(ast_json, encoding="utf-8")
+    def add(self, path: Path, ast: dict) -> None:
+        spill = self._directory / f"{len(self._entries)}.bin"
+        spill.write_bytes(marshal.dumps(ast))
         self._entries.append((path, spill))
 
     def __iter__(self) -> Iterator[Tuple[Path, dict]]:
         for path, spill in self._entries:
-            with spill.open(encoding="utf-8") as handle:
-                yield path, json.load(handle)
+            yield path, marshal.loads(spill.read_bytes())
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -742,7 +774,7 @@ def main() -> int:
                         or not _has_include_origin(child)
                         or child.get("kind") == "RecordDecl"
                     ]
-                    asts.add(path, json.dumps(ast))
+                    asts.add(path, ast)
                     recovered = True
                 else:
                     diagnostics.append((path, "Clang AST recovered no declarations"))
@@ -1054,9 +1086,10 @@ def main() -> int:
                 operator=node.get("opcode"), owner_function_id=owner,
                 control_kind=control_kind(kind),
             )
-            proof_id = stable_id("source-proof", path, position["start_offset"], position["end_offset"], kind)
-            graph.node("T4", proof_id, "source-span", f"{path.name}:{position['start_line']}", **position, text=snippet, syntax_kind=kind)
-            graph.edge("EVIDENCED_BY", body_id, proof_id)
+            if EMIT_PROOFS:
+                proof_id = stable_id("source-proof", path, position["start_offset"], position["end_offset"], kind)
+                graph.node("T4", proof_id, "source-span", f"{path.name}:{position['start_line']}", **position, text=snippet, syntax_kind=kind)
+                graph.edge("EVIDENCED_BY", body_id, proof_id)
             graph.edge(
                 "AST_CHILD" if parent_body else "CONTAINS_BODY",
                 parent_body or owner or file_ids[path], body_id,
@@ -1395,7 +1428,7 @@ def main() -> int:
         "tiers": [
             {
                 "tier": tier, "name": TIERS[tier],
-                "file": f"{tier.lower()}_{TIERS[tier]}.json",
+                "file": f"{tier.lower()}_{TIERS[tier]}.bin",
                 "node_count": len(tier_payloads[tier]["nodes"]),
                 "edge_count": len(tier_payloads[tier]["edges"]),
                 "expands_to_count": len(tier_payloads[tier]["expands_to"]),
@@ -1405,9 +1438,15 @@ def main() -> int:
         ],
     }
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Tier payloads are large and consumed only by our own parent process, so they
+    # go out as marshal (binary, C-speed) instead of json.dumps — the same round-trip
+    # fix applied to the in-memory AST spill. The payloads are already JSON-shaped
+    # (the in-process route in snapshot.py forbids tuples / non-string keys and a
+    # check enforces it), so marshal round-trips them identically to json. The tiny
+    # manifest stays human-readable json.
     for tier, payload in tier_payloads.items():
-        (output_dir / f"{tier.lower()}_{TIERS[tier]}.json").write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8",
+        (output_dir / f"{tier.lower()}_{TIERS[tier]}.bin").write_bytes(
+            marshal.dumps(payload),
         )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Clang analyzed {len(files)} C files; emitted {len(graph.nodes)} nodes and {len(graph.edges)} edges to {output_dir}")
