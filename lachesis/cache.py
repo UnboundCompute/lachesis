@@ -34,7 +34,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-CACHE_VERSION = 1
+# 1 -> 2: the Python frontend stopped folding a call site's resolved kind into its node
+# id, and the store gained the v9 index tables. Neither changes a source byte, and
+# `CacheEntry.status()` compares only `source_content_hash` — so every existing entry
+# would report "fresh" while holding a store whose ids this code no longer agrees with.
+# Bumping is what turns that into a miss instead of a wrong answer.
+CACHE_VERSION = 2
 _SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 
 

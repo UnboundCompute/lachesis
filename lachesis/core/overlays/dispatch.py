@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from ...indices import last_name as _last_name
 from ..composition import GraphDelta
 from ..query import GraphIndex
 
@@ -12,17 +13,6 @@ IDENTITY_REASONS = frozenset({
     "argument-value", "call-result", "context-call-result",
     "branch-reaching-definition", "phi-input",
 })
-
-
-def _last_name(value: str) -> str:
-    normalized = value.split("?.")[-1]
-    if "." in normalized:
-        normalized = normalized.rsplit(".", 1)[-1]
-    if "[" in normalized:
-        normalized = normalized.rsplit("[", 1)[-1]
-    if "(" in normalized:
-        normalized = normalized.split("(", 1)[0]
-    return normalized.strip("'\"`] ")
 
 
 def _fact(evidence_ids: list[str], confidence: str = "high") -> dict:

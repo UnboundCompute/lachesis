@@ -67,7 +67,7 @@ include = ["lachesis*"]
 # `tools/vendor_typescript.py` before a release build, so a wheel built without that
 # step ships without it (see RELEASING.md).
 "lachesis.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*", "vendor/**/*"]
-"lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
+"lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_homonym/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
 "lachesis.frontends.python" = ["*.json", "fixtures/**/*"]
 "lachesis.core" = ["*.json"]
 # The eager baseline the equality harness diffs every later phase against. It ships

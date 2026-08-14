@@ -40,7 +40,10 @@ from lachesis.kuzu_store import (
     CONSTANT_PROP_DEFAULTS,
     HOT_REL_KINDS,
     PROMOTED_NODE_PROPS,
+    _CALLSITE_INDEX_COLUMNS,
+    _DECL_INDEX_COLUMNS,
     _HOT_SET,
+    _INDEX_ID_COLUMNS,
     _prefix_code,
     db_file,
     decode_id,
@@ -531,6 +534,48 @@ class KuzuGraphIndex:
 
     def flow_edges(self, kinds) -> list:
         return list(self.edges_of_kind(*kinds))
+
+    # -- name indices (v9) --------------------------------------------------
+
+    def _index_rows(self, table: str, columns: tuple, key_column: str,
+                    name: Optional[str]) -> dict:
+        """Rows of an index table, keyed by name, ids decoded back to real ones.
+
+        One query for the whole table, not one per name. These tables are two orders of
+        magnitude smaller than ``Node`` (a few thousand rows on this repo against two
+        hundred thousand), and resolution asks about a great many names, so paying once
+        beats paying per lookup — and it keeps this the same shape as the in-memory
+        answer, which is a whole dict.
+        """
+        selected = ", ".join(f"r.{column}" for column in columns)
+        where, params = "", {}
+        if name is not None:
+            where, params = f" WHERE r.{key_column} = $name", {"name": name}
+        result = self._conn.execute(
+            f"MATCH (r:{table}){where} RETURN {selected}, r.seq ORDER BY r.seq", params)
+        index: dict = {}
+        while result.has_next():
+            values = result.get_next()
+            row = {}
+            for column, value in zip(columns, values):
+                row[column] = (decode_id(value, self._id_prefixes)
+                               if column in _INDEX_ID_COLUMNS and value else value)
+            index.setdefault(row[key_column], []).append(row)
+        return index
+
+    def decl_index(self, name: Optional[str] = None):
+        if name is not None:
+            return tuple(self._index_rows(
+                "DeclIndex", _DECL_INDEX_COLUMNS, "name", name).get(name, ()))
+        return self._index_rows("DeclIndex", _DECL_INDEX_COLUMNS, "name", None)
+
+    def callsite_index(self, name: Optional[str] = None):
+        if name is not None:
+            return tuple(self._index_rows(
+                "CallsiteIndex", _CALLSITE_INDEX_COLUMNS, "callee_name", name
+            ).get(name, ()))
+        return self._index_rows(
+            "CallsiteIndex", _CALLSITE_INDEX_COLUMNS, "callee_name", None)
 
     def package_inventory(self) -> frozenset:
         names = set()

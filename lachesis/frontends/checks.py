@@ -4110,5 +4110,254 @@ class GraphIndexOrderingTests(unittest.TestCase):
         )
 
 
+class IdentityFileLocalityTests(unittest.TestCase):
+    """A node's id may depend on its own file and on nothing else.
+
+    This is the invariant the whole lazy-resolution plan rests on. If editing one file
+    can rename a node in another, then no cached answer keyed on a node id survives an
+    unrelated edit, and per-file incremental reuse is impossible in principle rather
+    than merely unimplemented.
+
+    The Python frontend violated it in exactly one place. A call site's id was hashed
+    over ``"construct" if resolution.constructed_class else "call"``, and that
+    classification comes from the whole-tree resolver -- ``Thing()`` is a construct only
+    if ``Thing`` names a class, which the file doing the calling cannot know when
+    ``Thing`` is imported. So turning a class into a function two files away silently
+    renamed the call site. The kind is still reported; it is only the identity that
+    stopped depending on it.
+    """
+
+    TREE = {
+        "defs.py": "class Thing:\n    def __init__(self):\n        self.x = 1\n",
+        "use.py": (
+            "from defs import Thing\n\n\n"
+            "def build():\n"
+            "    return Thing()\n"
+        ),
+    }
+    # The same file, with Thing a function instead of a class. Nothing in use.py
+    # changes; what changes is what its one call site *means*.
+    THING_AS_FUNCTION = "def Thing():\n    return 1\n"
+
+    def _build(self, tree: dict) -> list:
+        with tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as output:
+            for name, text in tree.items():
+                Path(source, name).write_text(text)
+            completed = subprocess.run(
+                [sys.executable, "-m", "lachesis.frontends.python.build_graph",
+                 source, output],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            return load_snapshot(output).nodes
+
+    def _in_file(self, nodes, name: str) -> dict:
+        """Every node declared in one file, keyed by id."""
+        return {
+            node["id"]: node for node in nodes
+            if str(node.get("properties", {}).get("file", "")).endswith(name)
+        }
+
+    def _without(self, nodes: dict, kind: str) -> list:
+        return sorted(node_id for node_id, node in nodes.items() if node["kind"] != kind)
+
+    def test_a_call_site_keeps_its_id_when_another_file_changes_its_meaning(self) -> None:
+        before = self._in_file(self._build(self.TREE), "use.py")
+        after = self._in_file(
+            self._build({**self.TREE, "defs.py": self.THING_AS_FUNCTION}), "use.py",
+        )
+        self.assertTrue(before, "the fixture produced no nodes in use.py")
+        # Allocations are excluded here and asserted on their own below, because they
+        # differ in a different way: their ids are file-local, it is their existence
+        # that is not.
+        self.assertEqual(
+            self._without(before, "allocation"), self._without(after, "allocation"),
+            "editing defs.py renamed a node in use.py, so no cached answer keyed on a "
+            "node id can survive an unrelated edit",
+        )
+
+    def test_whether_an_allocation_exists_still_depends_on_another_file(self) -> None:
+        """The known remaining gap, recorded rather than left to be rediscovered.
+
+        ``values.py:455`` emits an ``allocation`` only when the resolver reports a
+        constructed class, so ``use.py`` gains and loses a node according to what
+        ``defs.py`` says. Its *id* is file-local (``values.py:362`` hashes the display
+        path, the offsets and the allocation kind), so §4 -- which is about identity --
+        holds, and every cached answer keyed on a node id is safe.
+
+        What does not hold is the stronger property that a file's node set is a pure
+        function of that file, which is what per-file incremental reuse needs. That is
+        Phase 5's problem and it is out of scope here; the point of this test is that
+        the gap is asserted, so it cannot quietly widen in the meantime.
+        """
+        as_class = self._in_file(self._build(self.TREE), "use.py")
+        as_function = self._in_file(
+            self._build({**self.TREE, "defs.py": self.THING_AS_FUNCTION}), "use.py",
+        )
+        allocations = [n for n in as_class.values() if n["kind"] == "allocation"]
+        self.assertEqual(1, len(allocations), "expected one class-instance allocation")
+        self.assertEqual(
+            [], [n for n in as_function.values() if n["kind"] == "allocation"],
+        )
+        # File-local all the same: the id survives a rebuild of the identical tree.
+        rebuilt = self._in_file(self._build(self.TREE), "use.py")
+        self.assertIn(allocations[0]["id"], rebuilt)
+
+    def test_the_call_site_is_still_classified_by_what_it_calls(self) -> None:
+        """The identity stopped depending on the resolver; the node did not."""
+        kinds = {
+            node["kind"] for node in self._in_file(self._build(self.TREE), "use.py").values()
+            if node.get("properties", {}).get("callee_name") == "Thing"
+        }
+        self.assertEqual({"construct"}, kinds)
+        as_function = {
+            node["kind"]
+            for node in self._in_file(
+                self._build({**self.TREE, "defs.py": self.THING_AS_FUNCTION}), "use.py",
+            ).values()
+            if node.get("properties", {}).get("callee_name") == "Thing"
+        }
+        self.assertEqual({"call"}, as_function)
+
+    def test_the_id_namespace_of_a_construct_says_call(self) -> None:
+        """Because the namespace is a namespace, not a second copy of the kind."""
+        for node in self._in_file(self._build(self.TREE), "use.py").values():
+            if node.get("properties", {}).get("callee_name") != "Thing":
+                continue
+            self.assertEqual("construct", node["kind"])
+            self.assertEqual(
+                "call", node["id"].split(":")[3],
+                "the id segment is a namespace; nothing reads semantics out of it, and "
+                "making it carry the resolver's verdict is what broke file locality",
+            )
+            break
+        else:
+            self.fail("no call site for Thing in use.py")
+
+
+class HomonymIndexTests(unittest.TestCase):
+    """Two files, one static function name -- the case a name alone cannot decide.
+
+    Both calls are intra-TU, so clang resolves them and the cross-TU post-pass never
+    gets asked; the fixture's value is that the *name* ``funcA`` is ambiguous while the
+    *file* is not. What is asserted here is that the indices keep both alternatives
+    addressable, which is the input ``HomonymResolutionTests`` then resolves against.
+    """
+
+    FIXTURE = "lachesis/frontends/c/fixtures_homonym"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from lachesis.pipeline import run_project
+
+        cls._graph, cls._snapshots = run_project(
+            os.path.join(ROOT, cls.FIXTURE), enrich=False)
+
+    def _entries(self):
+        from lachesis.nav.graphlib import GraphLib
+        from lachesis.nav.symbol_index import build_index
+
+        return build_index(GraphLib({"nodes": list(self._graph["nodes"]),
+                                     "edges": list(self._graph["edges"])}))
+
+    def test_both_definitions_survive_as_distinct_nodes(self):
+        functions = [n for n in self._graph["nodes"]
+                     if n["kind"] == "function" and n["label"] == "funcA"]
+        self.assertEqual(2, len(functions), "one funcA per translation unit")
+        self.assertEqual(2, len({n["id"] for n in functions}), "distinct node ids")
+        self.assertEqual(
+            2, len({(n["properties"] or {}).get("file") for n in functions}),
+            "in distinct files -- which is the whole of what makes them resolvable",
+        )
+
+    def test_search_reports_both_and_says_so(self):
+        from lachesis.nav.symbol_index import search_page
+
+        page = search_page(self._entries(), "funcA", "exact")
+        self.assertEqual(2, page["total"], "search does not collapse the homonyms")
+        first = page["hits"][0]
+        # The Phase 1 visibility field: eleven tools seed from hits[0], so a hit that
+        # has a twin has to say so even while that seeding stays as it is.
+        self.assertEqual(1, len(first["homonyms"]))
+        self.assertNotEqual(first["node_id"], first["homonyms"][0]["node_id"])
+        self.assertNotEqual(first["file"], first["homonyms"][0]["file"])
+
+    def test_a_unique_name_carries_no_homonyms_field(self):
+        from lachesis.nav.symbol_index import search_page
+
+        page = search_page(self._entries(), "shared_entry", "exact")
+        self.assertEqual(1, page["total"])
+        self.assertNotIn(
+            "homonyms", page["hits"][0],
+            "the field's presence is the signal; an empty list would say nothing",
+        )
+
+    def test_the_decl_index_round_trips_both_rows_through_the_store(self):
+        from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
+            manifest = read_store_manifest(db_dir)
+            self.assertEqual(9, manifest["version"])
+            self.assertGreater(manifest["decl_index_count"], 0)
+            self.assertGreater(manifest["callsite_index_count"], 0)
+
+            index = KuzuGraphIndex(db_dir)
+            rows = index.decl_index("funcA")
+            functions = [r for r in rows if r["kind"] == "function"]
+            self.assertEqual(2, len(functions))
+            self.assertEqual(2, len({r["node_id"] for r in functions}))
+            self.assertEqual(2, len({r["file"] for r in functions}))
+
+    def test_the_callsite_index_names_the_two_owners(self):
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
+            index = KuzuGraphIndex(db_dir)
+            sites = index.callsite_index("funcA")
+            self.assertEqual(2, len(sites), "one call site per translation unit")
+            owners = {index.nodes.get(row["owner_id"], {}).get("label")
+                      for row in sites}
+            self.assertEqual({"alpha_entry", "beta_entry"}, owners)
+
+    def test_the_store_and_the_memory_index_answer_identically(self):
+        """The parity that makes ``lachesis/indices.py`` worth having in one place."""
+        from lachesis.core.query import GraphIndex
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
+            stored = KuzuGraphIndex(db_dir)
+            memory = GraphIndex(self._graph)
+            self.assertEqual(memory.decl_index(), stored.decl_index())
+            self.assertEqual(memory.callsite_index(), stored.callsite_index())
+
+    def test_the_decl_index_holds_exactly_what_search_indexes(self):
+        """The assertion the equality golden cannot make while Phase 1 relaxes it.
+
+        ``build_index`` and ``build_decl_index`` read the same ``INDEXED_KINDS`` but by
+        two different routes, and a drift between them would show up as a name that is
+        searchable and unresolvable, or the reverse.
+        """
+        from lachesis.core.query import GraphIndex
+
+        indexed = {(e["name"], e["node_id"]) for e in self._entries()}
+        declared = {(row["name"], row["node_id"])
+                    for rows in GraphIndex(self._graph).decl_index().values()
+                    for row in rows}
+        self.assertEqual(indexed, declared)
+
+
 if __name__ == "__main__":
     unittest.main()

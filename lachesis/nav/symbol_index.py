@@ -30,26 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lachesis.nav.graphlib import GraphLib, CALLABLE_KINDS
 
-# node kinds that are addressable jump targets, mapped to a granularity label. Kinds
-# are a normalized cross-language vocabulary, so this is a language-agnostic superset:
-# the TS-shaped kinds plus the C declaration kinds (record = struct+union, type =
-# typedef, variable = globals, property = struct fields / ops-struct slots, constant).
-# Making globals and ops-struct slots addressable is what lets `search`/`open_file`
-# reach the things a C/kernel reader navigates by.
-#
-# Known limits (documented, not fixable here):
-#  - `macro` is NOT emitted by the C frontend (macros appear only as raw `token`
-#    nodes), so macro names are unindexable — a frontend gap, not a symbol-index one.
-#  - `variable`/`property` are high-volume (a large C tree has thousands of globals /
-#    struct fields); external + test filtering still applies, but expect a bigger index.
-INDEXED_KINDS = {
-    "file": "file",
-    "class": "type", "interface": "type", "enum": "type", "type": "type",
-    "function": "function", "method": "method", "constructor": "method",
-    "record": "type", "union": "type",
-    "variable": "variable", "property": "property", "constant": "constant",
-    "macro": "macro",
-}
+# The kind vocabulary lives in `lachesis.indices`, which also builds the persisted
+# `decl_index` from it. Imported rather than restated so `search` and the stored index
+# cannot come to disagree about which nodes are reachable by name.
+from lachesis.indices import CALLSITE_KINDS, INDEXED_KINDS, signature_of
 
 # Kind precedence for name resolution: when one name resolves to multiple nodes, prefer
 # the DEFINITION over a reference to it. §4 made variable/property/constant name-
@@ -87,8 +71,9 @@ _VIA_LABEL = {
     "INVOKES": "invokes", "MAY_INVOKE": "may_invoke",
     "CONTEXT_CALLS": "context", "READS_CALLEE": "fn-pointer",
 }
-# call-site node kinds a function owns (where INDIRECT edges originate).
-_CALLSITE_KINDS = ("call", "construct")
+# call-site node kinds a function owns (where INDIRECT edges originate). Same
+# vocabulary the persisted `callsite_index` is keyed over, for the same reason.
+_CALLSITE_KINDS = CALLSITE_KINDS
 
 
 def _via_label(edge: dict) -> str:
@@ -188,6 +173,9 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
                 "exported": nid in exported,
                 "container": container,
                 "tokens": _tokens(name),
+                # §5's field, taken from the frontend and never synthesized -- the
+                # same value the persisted `decl_index` carries, from the same helper.
+                "signature": signature_of(node.get("properties") or {}),
                 "handle": f"{file}:{line}" if file and line else None,
                 "is_test": _is_test(file),
                 "declaration_only": bool(gl.prop(node, "declaration_only")),
@@ -248,6 +236,29 @@ def search(entries: list[dict], q: str, mode: str = "fuzzy", limit: int = 25) ->
     return [e for _, e in _ranked(entries, q, mode)[:limit]]
 
 
+def _with_homonyms(entry: dict, by_name: dict) -> dict:
+    """A hit, plus the other declarations that answer to exactly its name.
+
+    Eleven of the seventeen tools seed from ``hits[0]`` and then say nothing about the
+    ones they passed over, so a codebase with four ``funcA``s reads, through the tools,
+    like a codebase with one. Rewiring that seeding is a later phase; making the
+    collapse *visible* costs one field and is worth having before then — an agent that
+    sees ``homonyms`` knows to pass a ``node_id`` instead of a name.
+
+    Same name only, never fuzzy: a near-miss is a search result, and calling it a
+    homonym would say the tools had silently chosen between two things that are not in
+    fact the same name. Absent when the name is unique, so the field's presence means
+    something.
+    """
+    twins = [
+        {"node_id": other["node_id"], "file": other["file"], "line": other["line"],
+         "kind": other["kind"]}
+        for other in by_name.get(entry["name"], ())
+        if other["node_id"] != entry["node_id"]
+    ]
+    return {**entry, "homonyms": twins} if twins else entry
+
+
 def search_page(entries: list[dict], q: str, mode: str = "fuzzy",
                 limit: int = 25, offset: int = 0) -> dict:
     """Paged search with a real total, so a cold search never silently caps.
@@ -257,7 +268,12 @@ def search_page(entries: list[dict], q: str, mode: str = "fuzzy",
     ranked = _ranked(entries, q, mode)
     total = len(ranked)
     offset = max(0, offset)
-    window = [e for _, e in ranked[offset:offset + limit]]
+    # Grouped once for the page rather than scanned once per hit: on a large C tree
+    # `entries` is six figures and the window is twenty-five.
+    by_name: dict = {}
+    for entry in entries:
+        by_name.setdefault(entry["name"], []).append(entry)
+    window = [_with_homonyms(e, by_name) for _, e in ranked[offset:offset + limit]]
     return {
         "query": q, "mode": mode, "total": total,
         "offset": offset, "limit": limit, "returned": len(window),

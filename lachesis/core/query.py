@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Iterable, Optional
 
+from ..indices import EXPORTS, build_callsite_index, build_decl_index, exported_ids
 
 
 def _bucket_order(item: dict) -> tuple:
@@ -109,6 +110,39 @@ class GraphIndex:
             bucket = self._buckets[name]
             for key in keys:
                 bucket[key].sort(key=_bucket_order)
+        self._drop_indices()
+
+    def decl_index(self, name: str | None = None):
+        """Declarations by name — the same map a Kùzu store persists as ``DeclIndex``.
+
+        Built from ``lachesis.indices``, so this and the store answer the same question
+        with the same code and the parity test covers both for free. Held after the
+        first call, because resolution asks this once per call site and building it
+        walks every node.
+        """
+        if "_decl_index" not in self.__dict__:
+            self._decl_index = build_decl_index(
+                self.nodes.values(), exported_ids(self.edges_of_kind(EXPORTS)))
+        return self._decl_index if name is None \
+            else tuple(self._decl_index.get(name, ()))
+
+    def callsite_index(self, name: str | None = None):
+        """Call sites by the name they call — the store's ``CallsiteIndex``."""
+        if "_callsite_index" not in self.__dict__:
+            self._callsite_index = build_callsite_index(self.nodes.values())
+        return self._callsite_index if name is None \
+            else tuple(self._callsite_index.get(name, ()))
+
+    def _drop_indices(self) -> None:
+        """Forget the name indices, because the graph they described just grew.
+
+        Overlays add call sites and MAY_INVOKE edges, so an index memoized before a
+        fold and read after it would be a confident answer about an older graph — the
+        one failure mode worth more than the rebuild it costs to avoid.
+        """
+        self.__dict__.pop("_decl_index", None)
+        self.__dict__.pop("_callsite_index", None)
+
     def has_kind(self, *kinds: str) -> bool:
         """Whether any node of these kinds exists, without ordering anything.
 
