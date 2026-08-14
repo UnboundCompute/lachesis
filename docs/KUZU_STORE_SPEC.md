@@ -10,7 +10,7 @@ the on-disk layout, the prune levers, and the incremental unit key still holds.
 
 ---
 
-## 0. Why (the validated basis — don't re-litigate)
+## 0. Why (the validated basis, don't re-litigate)
 
 Measured on a real single-package L graph (the largest package in the reference workload):
 
@@ -18,21 +18,21 @@ Measured on a real single-package L graph (the largest package in the reference 
 |---|---|---|---|
 | baseline JSON | 505,925 | 926,245 | **879 MB** |
 | drop `token`+`source-span` (pure lexical) | 246,633 | 495,622 | 509 MB (−42%) |
-| + compact encoding (int-ids, drop constant keys) — *projection* | 246,633 | 495,622 | 336 MB (−62%, projected) |
+| + compact encoding (int-ids, drop constant keys), *projection* | 246,633 | 495,622 | 336 MB (−62%, projected) |
 | **measured pruned Kùzu DB (this session)** | 246,633 | 495,622 | **433 MB (−49%)** |
 
 > **Correction (measured, don't plan against −62%):** the pruned Kùzu DB is **433 MB (−49% vs 879 MB
 > JSON)**, not the projected 336 MB. The long-tail props stored as a JSON string column dominate and Kùzu
 > adds page overhead, so "the encoding tax is free in Kùzu" was overstated on *disk*. **This is not a
-> blocker — disk was never the ceiling. RAM was.** The real, validated win: serving off Kùzu is **385 MB
+> blocker, disk was never the ceiling. RAM was.** The real, validated win: serving off Kùzu is **385 MB
 > RSS, opens in 1.6 s**, versus the JSON path parsing the whole ~850 MB into multi-GB RAM over ~124 s. The
 > store serves correctly (functions=1438; the parity test proved nav equivalence).
 
 Nav (`hubs`/`search`/`callers`/`callees`/`read_body`) verified **intact** on the pruned graph.
 
 Two independent shrink levers were proven:
-- **Lever A — node granularity:** `token` (171K) + `source-span` (87K) are pure lexical/positional nodes no nav tool reads. Dropping them = −51% nodes. `read_body` reads the *source file by offset*, not these nodes, so it is lossless.
-- **Lever B — encoding tax (~45%):** every node id is a ~50-byte string (`v2:frontend:typescript-compiler-api:function:0033aa2979bbad970b58`) repeated as `source`/`target` on all 926K edges; plus constant keys `fact_origin:"compiler"`, `confidence:"exact"`, `evidence_ids:[]` on nearly every node **and** edge; plus per-edge `relationship_class`/`source_tier`/`frontend_id`.
+- **Lever A, node granularity:** `token` (171K) + `source-span` (87K) are pure lexical/positional nodes no nav tool reads. Dropping them = −51% nodes. `read_body` reads the *source file by offset*, not these nodes, so it is lossless.
+- **Lever B, encoding tax (~45%):** every node id is a ~50-byte string (`v2:frontend:typescript-compiler-api:function:0033aa2979bbad970b58`) repeated as `source`/`target` on all 926K edges; plus constant keys `fact_origin:"compiler"`, `confidence:"exact"`, `evidence_ids:[]` on nearly every node **and** edge; plus per-edge `relationship_class`/`source_tier`/`frontend_id`.
 
 **Kùzu removes the RAM ceiling** (the actual prize) and recovers part of the encoding tax:
 - String PK is **dictionary-encoded** → each id stored once, referenced internally as a dense int. The id tax on endpoints largely evaporates with zero compaction code.
@@ -40,11 +40,11 @@ Two independent shrink levers were proven:
 - **Disk-backed columnar + mmap** → the nav server no longer loads the whole graph into RAM (today's 16 GB ceiling): **measured 385 MB RSS / 1.6 s open** vs multi-GB / ~124 s JSON parse. This is what blocks-then-unblocks whole-repo.
 - Lever A stays an explicit ingest-time prune (below).
 
-Net: this is what makes **whole-repo** graphs viable, which is a *correctness* requirement, not a nicety — a partial graph produces confidently-wrong reachability/safety verdicts (the SSRF-guard-outside-scope failure we already hit).
+Net: this is what makes **whole-repo** graphs viable, which is a *correctness* requirement, not a nicety, a partial graph produces confidently-wrong reachability/safety verdicts (the SSRF-guard-outside-scope failure we already hit).
 
 ---
 
-## 1. Current-state map (what you're changing — real file:lines)
+## 1. Current-state map (what you're changing, real file:lines)
 
 ### Writer (`lachesis/pipeline.py`)
 - `snapshot_graph` (`:15`) → one frontend snapshot to canonical `{"nodes":[...], "edges":[...]}`; stamps `frontend_id`/`frontend_tier` into node props (`:24-27`).
@@ -56,8 +56,8 @@ Net: this is what makes **whole-repo** graphs viable, which is a *correctness* r
 ### Loader / store (`lachesis/nav/`)
 - `GraphStore` (`lachesis/nav/graph_store.py:75`); `.load(graph_path, overlay_path)` (`:90`) → `load_graph` (`lachesis/cli/query.py:15`, `json.loads`).
 - In-memory index: `GraphIndex` (`lachesis/core/query.py:8`), wrapped by `GraphLib` (`lachesis/nav/graphlib.py`). Builds once:
-  - `self.nodes = {node["id"]: node}` — **dict by id**
-  - `self.outgoing` / `self.incoming` — **adjacency lists** keyed by `edge["source"]` / `edge["target"]` (the core seam Kùzu replaces)
+  - `self.nodes = {node["id"]: node}`: **dict by id**
+  - `self.outgoing` / `self.incoming`: **adjacency lists** keyed by `edge["source"]` / `edge["target"]` (the core seam Kùzu replaces)
   - secondary: `by_kind`, `by_label`, `by_file`, `by_owner`
   - accessors: `targets(src, *kinds)` (`:74`), `sources(tgt, *kinds)` (`:81`), `outgoing_of_kind`/`incoming_of_kind` (`:88`/`:96`), `nodes_owned_by(owner_id)` (`:51`), `semantic_edge_kind(edge)` (`:55`, unwraps `EXPANDS_TO`→`properties.via`).
 
@@ -67,8 +67,8 @@ Dispatch: `call_tool` (`:266`). **Two classes of tool:**
 - **Single-hop / index lookups** (map directly to indexed Kùzu queries or stay in the ported index):
   `hubs` (`:289`, precomputed fan_in/out over call edges, `lachesis/nav/hubs.py:66`), `search` (`:293`, name index over `store.entries`), `callers`/`callees` (`:297`, `index.sources/targets` + one INDIRECT hop), `read_body` (`:305`, single node fetch + `gl.source_text`/`gl.body_nodes` by offset), `open_file`/`open_folder`, `points_to` (`:348`, 1 hop), `aliases` (`:357`, fixed 2 hops value→heap→sibling), `guards`/`call_roles`/`siblings`.
 
-- **Multi-hop traversal — DO NOT Cypher-ify** (`lachesis/nav/reachability.py`, class `Reachability` `:64`):
-  `flow` (`:331`), `reaches` (`:337`), `sources_of` (`:342`). Driven by `_walk` (`:114`) over an adjacency `_build` (`:76`) filtered to `FLOW_EDGE_KINDS = {VALUE_FLOWS_TO, POINTS_TO}` + synthesized reverse alias-via-heap edges. **This BFS is context-sensitive** (push/pop `context-parameter`/`context-return` context-ids, `:137-144`) and does **alias-via-heap bridging** (`:98-104`). A fixed-length Cypher pattern will not reproduce the context-balancing — **keep the algorithm in Python** (§4).
+- **Multi-hop traversal, DO NOT Cypher-ify** (`lachesis/nav/reachability.py`, class `Reachability` `:64`):
+  `flow` (`:331`), `reaches` (`:337`), `sources_of` (`:342`). Driven by `_walk` (`:114`) over an adjacency `_build` (`:76`) filtered to `FLOW_EDGE_KINDS = {VALUE_FLOWS_TO, POINTS_TO}` + synthesized reverse alias-via-heap edges. **This BFS is context-sensitive** (push/pop `context-parameter`/`context-return` context-ids, `:137-144`) and does **alias-via-heap bridging** (`:98-104`). A fixed-length Cypher pattern will not reproduce the context-balancing, **keep the algorithm in Python** (§4).
 
 ### Id scheme (the incremental enabler)
 - Content-hash ids, generated **in the frontends**, passed through unchanged.
@@ -111,7 +111,7 @@ CREATE NODE TABLE Node(
 ```
 Index `kind`, `file`, `owner_function_id`, `symbol_name`, `unit` (Kùzu builds a PK index automatically; add secondary indexes for these where supported, else keep the small `by_*` maps materialized at load).
 
-### Hot rel tables (traversal-critical — one per kind, `FROM Node TO Node`)
+### Hot rel tables (traversal-critical, one per kind, `FROM Node TO Node`)
 These are the edges the multi-hop + call tools traverse; typed tables = columnar, index-backed, no `kind` filter on the hot path:
 
 ```cypher
@@ -128,7 +128,7 @@ CREATE REL TABLE WRITES_TO      (FROM Node TO Node);
 CREATE REL TABLE DEFINES        (FROM Node TO Node);
 CREATE REL TABLE REFERS_TO      (FROM Node TO Node);
 ```
-(Selection rationale: `VALUE_FLOWS_TO`/`POINTS_TO` = the `Reachability` flow subgraph; `CALLS`/`MAY_INVOKE`/`INVOKES` = `callers`/`callees`/`hubs`; `READS_FROM`/`WRITES_TO`/`DEFINES`/`REFERS_TO` = symbol resolution; `TAINT_FLOWS_TO`/`ALIASES*` = security tier. `context_id` is carried as an **edge property** — the BFS context machinery needs no separate table.)
+(Selection rationale: `VALUE_FLOWS_TO`/`POINTS_TO` = the `Reachability` flow subgraph; `CALLS`/`MAY_INVOKE`/`INVOKES` = `callers`/`callees`/`hubs`; `READS_FROM`/`WRITES_TO`/`DEFINES`/`REFERS_TO` = symbol resolution; `TAINT_FLOWS_TO`/`ALIASES*` = security tier. `context_id` is carried as an **edge property**: the BFS context machinery needs no separate table.)
 
 ### Catch-all rel table (the ~75 cold edge kinds)
 ```cypher
@@ -157,36 +157,36 @@ so an ordinary store's schema is unchanged.
 
 ### Store manifest (`lachesis-manifest.json`, beside `graph.kuzu`)
 
-Not a table — a small JSON file the writer emits with the store. It carries the
+Not a table, a small JSON file the writer emits with the store. It carries the
 per-frontend inventory (`frontend_id`, `languages`, `capabilities`, counts), the store's
 own `node_count`/`edge_count`, and two fields that make deferred enrichment possible:
 
-- `enriched` — whether the store holds the overlay dataflow tier or only the core tier.
-- `core_content_hash` — a digest over sorted node ids and `(kind, source, target)`
+- `enriched`: whether the store holds the overlay dataflow tier or only the core tier.
+- `core_content_hash`: a digest over sorted node ids and `(kind, source, target)`
   triples of what was actually stored. A core-only store stamps its own; the derived
   `<store>.enriched` cache stamps the hash of the core it was built from, and a load
   serves that cache only when the two agree.
 
 Two more fields say what the input graph had and the store does not:
 
-- `dropped_node_count` — input nodes the writer did not keep, which is what `prune`,
+- `dropped_node_count`: input nodes the writer did not keep, which is what `prune`,
   `drop_diagnostics` and `drop_tests` removed.
-- `unresolved_edge_count` — input edges whose endpoints are not both resident. `Node` is
+- `unresolved_edge_count`: input edges whose endpoints are not both resident. `Node` is
   the only node table and both ends are foreign keys into it, so an edge into a node the
   store does not hold cannot be written. Dropping it is right; dropping it quietly is not.
 
-- `deferred_edge_count` — how many of those unresolved edges the store kept anyway, in
+- `deferred_edge_count`: how many of those unresolved edges the store kept anyway, in
   the `DeferredEdge` table above. Equal to `unresolved_edge_count` for a store built that
   way, zero for every other one. The reader consults this field rather than probing for
   the table, so an ordinary store costs no query to learn it has none.
 
 A store built that way stamps three more fields, and it cannot be read without them:
 
-- `reduced` — this store is not a smaller graph, it is half of one. The bodies are absent
+- `reduced`: this store is not a smaller graph, it is half of one. The bodies are absent
   on purpose and a load has to recompile them before any tool can answer.
-- `source_dir` — the tree that was compiled, absolute. A reduced store is only readable
+- `source_dir`: the tree that was compiled, absolute. A reduced store is only readable
   where that tree is present.
-- `source_content_hash` — one SHA-256 over every file `source_inventory` would discover
+- `source_content_hash`: one SHA-256 over every file `source_inventory` would discover
   (`pipeline.source_content_hash`, reusing the incremental path's per-file digests).
   Content rather than mtime, so a touched-but-unchanged file keeps the derived cache and a
   restored older file loses it. The `<store>.joined` cache stamps the same hash, and a
@@ -256,19 +256,19 @@ core-only store with no re-compile.
 
 ## 3. Ingest / write path
 
-Add a new writer alongside the JSON one — **dual-write during migration**, don't delete `write_project_graph`. *(Historical: the migration is complete and `write_project_graph` has since been deleted; `write_kuzu_graph` is the only writer.)*
+Add a new writer alongside the JSON one, **dual-write during migration**, don't delete `write_project_graph`. *(Historical: the migration is complete and `write_project_graph` has since been deleted; `write_kuzu_graph` is the only writer.)*
 
 - **New:** `lachesis/kuzu_store.py` : `write_kuzu_graph(graph, snapshots, db_dir)`.
   - Consumes the **same composed `graph` dict** that `write_project_graph` gets (post `_enrich_graph`), so it slots in at `lachesis/cli/analyze.py:25` behind a flag / second output path.
   - **Ingest-time prune (Lever A), gated by a flag so parity tests can disable it:**
     - drop nodes where `kind ∈ {token, source-span}`;
     - drop edges with a dropped endpoint (auto-kills `HAS_TOKEN` 171K + `NEXT_TOKEN` 171K + token-targeted `EXPANDS_TO`/`AST_CHILD`);
-    - *optional, configurable:* drop `kind == diagnostic` and test-file nodes (regex on `file`) — keep configurable, tests are noise for the security engine but may matter elsewhere.
+    - *optional, configurable:* drop `kind == diagnostic` and test-file nodes (regex on `file`), keep configurable, tests are noise for the security engine but may matter elsewhere.
   - **Don't materialize constant props:** never store `fact_origin` (always `"compiler"`); store `confidence` only when `!= "exact"`; drop empty `evidence_ids`. Everything not promoted to a column → `props` JSON.
   - **Set `unit`** on every node/edge = the emitting source file (`properties.file`). This is the incremental key (§5).
   - Bulk load via Kùzu **`COPY FROM` staged Parquet** (one typed columnar file per table; endpoint PKs first, then props in table order). This is the perf-critical path: the initial per-row `conn.execute` loader measured **~9.4 min/package** (too slow for whole-repo); the `COPY FROM` rewrite is **~24× faster** (measured). Route each edge to its hot rel table by `kind`, else to `EDGE`.
 
-Acceptance for this step: the reference graph writes a Kùzu DB dir; **measured DB size = 433 MB (−49% vs 879 MB JSON)** — *not* the earlier ≤~250 MB target, which was too optimistic (the JSON-string props column + page overhead dominate; see §0 correction). Disk is a secondary benefit — the acceptance that matters is the **RAM ceiling removed** (385 MB RSS / 1.6 s open). Node/edge counts match the pruned expectation (246,633 / 495,622).
+Acceptance for this step: the reference graph writes a Kùzu DB dir; **measured DB size = 433 MB (−49% vs 879 MB JSON)**: *not* the earlier ≤~250 MB target, which was too optimistic (the JSON-string props column + page overhead dominate; see §0 correction). Disk is a secondary benefit, the acceptance that matters is the **RAM ceiling removed** (385 MB RSS / 1.6 s open). Node/edge counts match the pruned expectation (246,633 / 495,622).
 
 ---
 
@@ -279,9 +279,9 @@ Acceptance for this step: the reference graph writes a Kùzu DB dir; **measured 
 - **New:** `KuzuGraphIndex` implementing the **exact accessor surface** of `GraphIndex` (`lachesis/core/query.py`): `nodes[id]`, `targets(src,*kinds)`, `sources(tgt,*kinds)`, `outgoing_of_kind`, `incoming_of_kind`, `nodes_owned_by`, `by_kind`/`by_label`/`by_file`/`by_owner`, `semantic_edge_kind`. Backed by Kùzu queries, with:
   - node fetch by id → PK lookup;
   - `targets/sources` of given kinds → hot-rel-table query (or `EDGE WHERE kind IN …` for cold);
-  - the small secondary maps (`by_kind` etc.) can be materialized once at load from cheap aggregate queries — they're index-shaped, not the whole graph.
+  - the small secondary maps (`by_kind` etc.) can be materialized once at load from cheap aggregate queries, they're index-shaped, not the whole graph.
 - `GraphStore.load` (`lachesis/nav/graph_store.py:90`) gains a branch: **if `graph_path` is a Kùzu DB dir → build `KuzuGraphIndex`; else the existing JSON path.** `GraphStore`/`GraphLib`'s public surface is unchanged, so `mcp_server.py` and every tool are untouched.
-- **`Reachability` stays byte-for-byte.** Its `_build` (`lachesis/nav/reachability.py:76`) pulls the `FLOW_EDGE_KINDS` adjacency once — back that single build with **one Kùzu query** returning all `VALUE_FLOWS_TO` + `POINTS_TO` edges (`source, target, context_id`) into the existing in-memory adjacency dicts. The context-sensitive `_walk`, push/pop, and alias-via-heap bridging then run **exactly as today** over that adjacency. The flow subgraph is small (~105K edges on the reference graph), so materializing it on demand is cheap and preserves behavior precisely. Kùzu removes the RAM ceiling for the *full* node/edge set; the BFS only ever holds the flow slice.
+- **`Reachability` stays byte-for-byte.** Its `_build` (`lachesis/nav/reachability.py:76`) pulls the `FLOW_EDGE_KINDS` adjacency once, back that single build with **one Kùzu query** returning all `VALUE_FLOWS_TO` + `POINTS_TO` edges (`source, target, context_id`) into the existing in-memory adjacency dicts. The context-sensitive `_walk`, push/pop, and alias-via-heap bridging then run **exactly as today** over that adjacency. The flow subgraph is small (~105K edges on the reference graph), so materializing it on demand is cheap and preserves behavior precisely. Kùzu removes the RAM ceiling for the *full* node/edge set; the BFS only ever holds the flow slice.
 
 This is the whole reason the port is safe: the expensive-but-correct traversal logic never touches Cypher; only the bulk store and the single-hop index lookups move.
 
@@ -289,7 +289,7 @@ This is the whole reason the port is safe: the expensive-but-correct traversal l
 
 ## 5. Incremental update
 
-**Goal:** re-analyze a changed file in seconds instead of rebuilding the whole graph — this is what turns the engine from point-in-time into **continuous**, so it can re-analyze on every commit or PR instead of on demand.
+**Goal:** re-analyze a changed file in seconds instead of rebuilding the whole graph, this is what turns the engine from point-in-time into **continuous**, so it can re-analyze on every commit or PR instead of on demand.
 
 **Unit key:** `unit` column = source file rel path. All nodes/edges from parsing file F carry `unit = F`.
 
@@ -303,22 +303,22 @@ BEGIN;
 COMMIT;
 ```
 
-**Cross-file edge correctness — the one subtlety, call it out:**
+**Cross-file edge correctness, the one subtlety, call it out:**
 An edge F→G (e.g. `CALLS` into a symbol defined in G) is emitted while parsing F, so `unit=F` and it's re-created on F's re-ingest. The risk is **incoming** edges: an unchanged file H holding an edge into one of F's nodes. Because ids are content-hashed, an unchanged declaration in F **keeps its id**, so H's edge still resolves. It only dangles if the *specific referenced node* in F changed identity.
 - **v1 (safe, coarse):** incremental unit = **package** (reuse the existing per-frontend layered bundle, §1). Re-ingest the whole package; cross-file edges within it re-resolve together. Ship this first.
 - **v2 (finer):** incremental unit = **changed file + its direct importers** (walk `DEPENDS_ON`/`EXPORTS`/`RE_EXPORTS` neighbors) re-ingested as one transaction, so cross-file references re-resolve. Add after v1 parity holds.
-- After any incremental swap, run a **dangling-edge sweep** (`MATCH ()-[r]->() WHERE the endpoint id is absent`) as a cheap invariant check — mirrors what `combine_graphs` enforces today.
+- After any incremental swap, run a **dangling-edge sweep** (`MATCH ()-[r]->() WHERE the endpoint id is absent`) as a cheap invariant check, mirrors what `combine_graphs` enforces today.
 
-**Writer note:** Kùzu is single-writer/embedded — serialize ingest (build-then-serve, or take the write lock for incremental). Fine for this workload.
+**Writer note:** Kùzu is single-writer/embedded, serialize ingest (build-then-serve, or take the write lock for incremental). Fine for this workload.
 
 ---
 
-## 6. Rollout — revertible commits (per repo directive: every step auditable)
+## 6. Rollout, revertible commits (per repo directive: every step auditable)
 
 1. `lachesis/kuzu_store.py` writer + prune + dual-write behind a flag. JSON writer untouched. **Commit.**
-   *(Done — writer uses `COPY FROM` staged Parquet, ~24× faster than the initial per-row loader; also carries the `unit` incremental key on every node/edge.)*
+   *(Done, writer uses `COPY FROM` staged Parquet, ~24× faster than the initial per-row loader; also carries the `unit` incremental key on every node/edge.)*
 2. `KuzuGraphIndex` + `GraphStore.load` branch. `Reachability` unchanged, flow-subgraph sourced from one Kùzu query. **Commit.**
-3. **Parity harness** (`tests/`): run all nav tools (`hubs`/`search`/`callers`/`callees`/`read_body`/`open_file`/`open_folder`/`flow`/`reaches`/`sources_of`/`points_to`/`aliases`) against JSON-backed vs Kùzu-backed store on the reference graph; assert **identical** results (modulo the deliberate Lever-A prune — run parity with prune OFF first, then confirm the pruned graph still answers the nav set). **Commit.**
+3. **Parity harness** (`tests/`): run all nav tools (`hubs`/`search`/`callers`/`callees`/`read_body`/`open_file`/`open_folder`/`flow`/`reaches`/`sources_of`/`points_to`/`aliases`) against JSON-backed vs Kùzu-backed store on the reference graph; assert **identical** results (modulo the deliberate Lever-A prune, run parity with prune OFF first, then confirm the pruned graph still answers the nav set). **Commit.**
 4. Incremental v1 (per-package unit swap + `unit→content_hash` manifest + dangling sweep). **Commit.**
 5. Flip nav default to Kùzu; keep JSON export behind a debug flag. **Commit.**
 6. (Later) Incremental v2 (file + importers).
@@ -327,11 +327,11 @@ An edge F→G (e.g. `CALLS` into a symbol defined in G) is emitted while parsing
 
 ## 7. Acceptance criteria / benchmarks
 
-- **Size:** the reference Kùzu DB **measured 433 MB (−49% vs 879 MB JSON)** — disk is a secondary benefit, not the ceiling (the earlier ≤~250 MB target was too optimistic; see §0). Report actual on re-measure.
+- **Size:** the reference Kùzu DB **measured 433 MB (−49% vs 879 MB JSON)**: disk is a secondary benefit, not the ceiling (the earlier ≤~250 MB target was too optimistic; see §0). Report actual on re-measure.
 - **RAM:** nav server opens whole-repo graph without loading it all into memory; RSS bounded well under the old 16 GB ceiling.
 - **Load:** open DB + build the small secondary maps in < a few seconds; no 124 s full-JSON parse.
 - **Parity:** 100% identical nav results vs JSON on the reference graph for the full tool set (prune-off), and the pruned graph answers the nav set intact (already PoC-verified for hubs/search/callers/callees/read_body).
-- **Whole-repo:** the multi-package graph (a several-package scope first, then the full repo) opens and serves without OOM — the thing that's impossible today.
+- **Whole-repo:** the multi-package graph (a several-package scope first, then the full repo) opens and serves without OOM, the thing that's impossible today.
 - **Incremental:** re-ingest one changed package in seconds; dangling-edge sweep clean.
 
 ---
