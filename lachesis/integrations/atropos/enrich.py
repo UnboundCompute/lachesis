@@ -93,6 +93,7 @@ def atropos_enrich(
     """
     from lachesis.core.overlays.registry import OverlayRegistry
     from lachesis.core.overlays.c_call_dataflow import CCallResultDataflow
+    from lachesis.core.overlays.c_out_param_dataflow import COutParamWriteback
 
     root = locate_atropos(atropos_root)
     if root is None:
@@ -130,6 +131,15 @@ def atropos_enrich(
         # The C frontend links a call result to the variable it initializes by AST
         # only; without this the return-value sources/summaries can never flow.
         registry.register(CCallResultDataflow())
+        # An argument the catalog marks as a *source* is an out-parameter the call
+        # fills; the frontend wires only variable->use, so that write would strand
+        # on the argument node. Flow it back into the buffer's other uses.
+        out_param_sources = [
+            s["value_id"] for s in stamps
+            if s.get("role") == "source" and "value_id" in s
+            and str(s.get("access_path") or "").startswith("Argument[")
+        ]
+        registry.register(COutParamWriteback(out_param_sources))
     registry.register(AtroposOverlay(stamps))
     enriched = registry.enrich(graph)
 
