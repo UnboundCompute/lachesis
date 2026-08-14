@@ -26,6 +26,7 @@ from lachesis.pipeline import run_project
 HERE = Path(__file__).resolve().parent
 FIXTURE = HERE / "fixtures_cslice"
 FIXTURE_OUTPARAM = HERE / "fixtures_outparam"
+FIXTURE_INTERPROC = HERE / "fixtures_interproc"
 
 
 def _locate_atropos() -> Path | None:
@@ -358,6 +359,74 @@ class AtroposOutParamWitness(unittest.TestCase):
         # Drop only the write-back: the read source strands on its argument.
         graph, _ = _enrich_and_taint_outparam(
             self.atropos, self.binder, with_writeback=False)
+        self.assertEqual(len(self._witnesses(graph)), 0)
+
+
+def _enrich_and_taint_interproc(atropos_root, binder, *, with_return_summary=True):
+    """Run the enrich flow over the interprocedural fixture and taint it.
+
+    Registers the intraprocedural call-result overlay (so the caller's ``p =
+    get_gateway()`` result reaches ``p``) and, unless suppressed, the
+    return-to-callsite overlay (so ``get_gateway``'s wrapped source reaches that
+    call result). ``with_return_summary=False`` drops only the latter, stranding
+    the source at the wrapper's ``return``.
+    """
+    from lachesis.core.overlays import (
+        default_overlay_registry, default_security_overlay_registry)
+    from lachesis.core.overlays.registry import OverlayRegistry
+    from lachesis.core.overlays.c_call_dataflow import CCallResultDataflow
+    from lachesis.core.overlays.c_return_dataflow import CReturnToCallsite
+    from lachesis.integrations.atropos.overlay import (
+        AtroposOverlay, stamps_from_report)
+
+    core, _ = run_project(str(FIXTURE_INTERPROC), enrich=False)
+    enriched = default_overlay_registry().enrich(core)
+    index = canonical_index(enriched, language="c", source="lachesis:c-interproc")
+    models = [m for m in binder.load_models(atropos_root / "models")
+              if m["language"] == "c"]
+    models_by_id = {m["id"]: m for m in models}
+    stamps = stamps_from_report(binder.bind_all(models, index), models_by_id)
+    registry = OverlayRegistry()
+    registry.register(CCallResultDataflow())
+    if with_return_summary:
+        registry.register(CReturnToCallsite())
+    registry.register(AtroposOverlay(stamps))
+    stamped = registry.enrich(enriched)
+    final = default_security_overlay_registry().enrich(stamped)
+    label_of = {n["id"]: (n["properties"].get("label") or n.get("label"))
+                for n in final["nodes"]}
+    return final, label_of
+
+
+class AtroposInterprocWitness(unittest.TestCase):
+    """A source wrapped in a function reaches a caller-side sink via the return."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("clang") is None:
+            raise unittest.SkipTest("clang not available for the C frontend")
+        atropos = _locate_atropos()
+        if atropos is None:
+            raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
+        cls.atropos = atropos
+        cls.binder = _load_binder(atropos)
+
+    def _witnesses(self, graph):
+        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"]
+
+    def test_wrapped_source_reaches_caller_sink(self):
+        graph, label_of = _enrich_and_taint_interproc(self.atropos, self.binder)
+        witnesses = self._witnesses(graph)
+        self.assertEqual(len(witnesses), 1)
+        path = [label_of[w] for w in witnesses[0]["properties"]["witness_ids"]]
+        # source is getenv inside the wrapper; sink is the system argument in the
+        # caller: the flow crossed the function boundary through the return.
+        self.assertEqual(path[-1], "p")
+
+    def test_return_summary_is_load_bearing(self):
+        # Drop only the return-to-callsite overlay: the source stays in the wrapper.
+        graph, _ = _enrich_and_taint_interproc(
+            self.atropos, self.binder, with_return_summary=False)
         self.assertEqual(len(self._witnesses(graph)), 0)
 
 

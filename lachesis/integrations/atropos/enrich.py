@@ -94,6 +94,7 @@ def atropos_enrich(
     from lachesis.core.overlays.registry import OverlayRegistry
     from lachesis.core.overlays.c_call_dataflow import CCallResultDataflow
     from lachesis.core.overlays.c_out_param_dataflow import COutParamWriteback
+    from lachesis.core.overlays.c_return_dataflow import CReturnToCallsite
 
     root = locate_atropos(atropos_root)
     if root is None:
@@ -140,6 +141,10 @@ def atropos_enrich(
             and str(s.get("access_path") or "").startswith("Argument[")
         ]
         registry.register(COutParamWriteback(out_param_sources))
+        # The frontend records what a function returns and what each callsite
+        # invokes, but never links them, so a source obtained inside a wrapper
+        # dies at its return. Flow every returned value to its callers' results.
+        registry.register(CReturnToCallsite())
     registry.register(AtroposOverlay(stamps))
     enriched = registry.enrich(graph)
 
