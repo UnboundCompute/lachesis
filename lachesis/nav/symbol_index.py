@@ -30,26 +30,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lachesis.nav.graphlib import GraphLib, CALLABLE_KINDS
 
-# node kinds that are addressable jump targets, mapped to a granularity label. Kinds
-# are a normalized cross-language vocabulary, so this is a language-agnostic superset:
-# the TS-shaped kinds plus the C declaration kinds (record = struct+union, type =
-# typedef, variable = globals, property = struct fields / ops-struct slots, constant).
-# Making globals and ops-struct slots addressable is what lets `search`/`open_file`
-# reach the things a C/kernel reader navigates by.
-#
-# Known limits (documented, not fixable here):
-#  - `macro` is NOT emitted by the C frontend (macros appear only as raw `token`
-#    nodes), so macro names are unindexable — a frontend gap, not a symbol-index one.
-#  - `variable`/`property` are high-volume (a large C tree has thousands of globals /
-#    struct fields); external + test filtering still applies, but expect a bigger index.
-INDEXED_KINDS = {
-    "file": "file",
-    "class": "type", "interface": "type", "enum": "type", "type": "type",
-    "function": "function", "method": "method", "constructor": "method",
-    "record": "type", "union": "type",
-    "variable": "variable", "property": "property", "constant": "constant",
-    "macro": "macro",
-}
+# The kind vocabulary lives in `lachesis.indices`, which also builds the persisted
+# `decl_index` from it. Imported rather than restated so `search` and the stored index
+# cannot come to disagree about which nodes are reachable by name.
+from lachesis.indices import CALLSITE_KINDS, INDEXED_KINDS, signature_of
+from lachesis.indices import callee_name as _callee_name
+from lachesis.resolution import owned_callsites
 
 # Kind precedence for name resolution: when one name resolves to multiple nodes, prefer
 # the DEFINITION over a reference to it. §4 made variable/property/constant name-
@@ -87,8 +73,9 @@ _VIA_LABEL = {
     "INVOKES": "invokes", "MAY_INVOKE": "may_invoke",
     "CONTEXT_CALLS": "context", "READS_CALLEE": "fn-pointer",
 }
-# call-site node kinds a function owns (where INDIRECT edges originate).
-_CALLSITE_KINDS = ("call", "construct")
+# call-site node kinds a function owns (where INDIRECT edges originate). Same
+# vocabulary the persisted `callsite_index` is keyed over, for the same reason.
+_CALLSITE_KINDS = CALLSITE_KINDS
 
 
 def _via_label(edge: dict) -> str:
@@ -159,6 +146,10 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
     """One entry per addressable node, with location + navigation affordances."""
     exported = gl.exported_ids
     prov = _file_provenance(gl)
+    # Every degree at once. Asked per node this was two queries per indexed declaration
+    # against a Kùzu store -- ten thousand of them to build one index, and the dominant
+    # cost of `search`'s first call.
+    degrees = gl.index.degrees()
     entries: list[dict] = []
     for kind, granularity in INDEXED_KINDS.items():
         for node in gl.index.nodes_of_kind(kind):
@@ -176,8 +167,7 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
             # the same name); `degree` is the language-agnostic fallback (a definition
             # bears call/body edges, a prototype bears none). Both let name resolution
             # prefer the body-bearing definition when a name collides with its prototype.
-            degree = (len(gl.index.outgoing.get(nid, ()))
-                      + len(gl.index.incoming.get(nid, ())))
+            degree = degrees.get(nid, 0)
             entries.append({
                 "node_id": nid,
                 "name": name,
@@ -188,6 +178,9 @@ def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:
                 "exported": nid in exported,
                 "container": container,
                 "tokens": _tokens(name),
+                # §5's field, taken from the frontend and never synthesized -- the
+                # same value the persisted `decl_index` carries, from the same helper.
+                "signature": signature_of(node.get("properties") or {}),
                 "handle": f"{file}:{line}" if file and line else None,
                 "is_test": _is_test(file),
                 "declaration_only": bool(gl.prop(node, "declaration_only")),
@@ -248,6 +241,29 @@ def search(entries: list[dict], q: str, mode: str = "fuzzy", limit: int = 25) ->
     return [e for _, e in _ranked(entries, q, mode)[:limit]]
 
 
+def _with_homonyms(entry: dict, by_name: dict) -> dict:
+    """A hit, plus the other declarations that answer to exactly its name.
+
+    Eleven of the seventeen tools seed from ``hits[0]`` and then say nothing about the
+    ones they passed over, so a codebase with four ``funcA``s reads, through the tools,
+    like a codebase with one. Rewiring that seeding is a later phase; making the
+    collapse *visible* costs one field and is worth having before then — an agent that
+    sees ``homonyms`` knows to pass a ``node_id`` instead of a name.
+
+    Same name only, never fuzzy: a near-miss is a search result, and calling it a
+    homonym would say the tools had silently chosen between two things that are not in
+    fact the same name. Absent when the name is unique, so the field's presence means
+    something.
+    """
+    twins = [
+        {"node_id": other["node_id"], "file": other["file"], "line": other["line"],
+         "kind": other["kind"]}
+        for other in by_name.get(entry["name"], ())
+        if other["node_id"] != entry["node_id"]
+    ]
+    return {**entry, "homonyms": twins} if twins else entry
+
+
 def search_page(entries: list[dict], q: str, mode: str = "fuzzy",
                 limit: int = 25, offset: int = 0) -> dict:
     """Paged search with a real total, so a cold search never silently caps.
@@ -257,7 +273,12 @@ def search_page(entries: list[dict], q: str, mode: str = "fuzzy",
     ranked = _ranked(entries, q, mode)
     total = len(ranked)
     offset = max(0, offset)
-    window = [e for _, e in ranked[offset:offset + limit]]
+    # Grouped once for the page rather than scanned once per hit: on a large C tree
+    # `entries` is six figures and the window is twenty-five.
+    by_name: dict = {}
+    for entry in entries:
+        by_name.setdefault(entry["name"], []).append(entry)
+    window = [_with_homonyms(e, by_name) for _, e in ranked[offset:offset + limit]]
     return {
         "query": q, "mode": mode, "total": total,
         "offset": offset, "limit": limit, "returned": len(window),
@@ -308,10 +329,40 @@ def _resolve(gl: GraphLib, entries: list[dict], name: str) -> list[dict]:
     return search(entries, name, "fuzzy", limit=5)
 
 
+def peers(hits: list[dict], name: str) -> list[dict]:
+    """The hits genuinely tied for best — the homonyms, and only those.
+
+    ``_resolve`` returns a total order, and taking its head is how a name quietly
+    became an identity: a project with four ``funcA``s read like a project with one.
+    But not every hit is a rival. A bodyless prototype, a lower-ranked reference and a
+    fuzzy near-miss all sort below the definition and lose on the merits; reporting
+    them as equals would trade one wrong answer for a noisier one.
+
+    So a peer is an exact-name hit that ties on every discriminator about *what a node
+    is* — kind, prototype-or-not, exported, test-or-not. Degree is deliberately not one
+    of them: it is a popularity signal, and two genuine homonyms almost always differ
+    on it, so including it would collapse exactly the case this exists for.
+    """
+    exact = [hit for hit in hits if hit.get("name") == name]
+    if not exact:
+        return hits[:1]
+
+    def discriminators(entry: dict) -> tuple:
+        return (_kind_rank(entry), bool(entry.get("declaration_only")),
+                not entry.get("exported"), bool(entry.get("is_test")))
+
+    best = min(discriminators(entry) for entry in exact)
+    return [entry for entry in exact if discriminators(entry) == best]
+
+
 def _owned_callsites(gl: GraphLib, node_id: str) -> tuple[dict, ...]:
-    """The call-site / construct nodes a function owns (where indirect edges start)."""
-    return tuple(n for n in gl.index.nodes_owned_by(node_id)
-                 if gl.kind(n["id"]) in _CALLSITE_KINDS)
+    """The call-site / construct nodes a function owns (where indirect edges start).
+
+    The set itself is computed in `lachesis.resolution`, because it is also the set the
+    resolver binds; keeping two definitions would let the sites nav reports indirect
+    edges from drift away from the sites resolution decides.
+    """
+    return owned_callsites(gl.index, node_id)
 
 
 def _caller_decl(gl: GraphLib, node: dict) -> dict | None:
@@ -342,7 +393,8 @@ def _dispatch_of(edge: dict) -> dict:
 
 
 def callers(gl: GraphLib, node_id: str, include_external: bool = False,
-            direct_only: bool = False, with_dispatch: bool = False) -> list[dict]:
+            direct_only: bool = False, with_dispatch: bool = False,
+            resolver=None) -> list[dict]:
     """Who calls this node — a traversal move, direct + indirect dispatch (tagged).
 
     Direct (``CALLS``) callers land on the calling declaration. Indirect callers are
@@ -355,7 +407,15 @@ def callers(gl: GraphLib, node_id: str, include_external: bool = False,
     ``with_dispatch`` additionally stamps each indirect row with the edge's
     ``dispatch``/``slot`` (e.g. ops-struct `.ndo_open`) so a text renderer can show
     `via=ops-struct[.slot]`. It defaults off, so the default return — and therefore
-    the JSON a programmatic caller sees — is byte-identical to before."""
+    the JSON a programmatic caller sees — is byte-identical to before.
+
+    ``resolver`` adds the callers the edges do not carry. Both loops above start from
+    an edge, so a function whose callers were never resolved eagerly has none here —
+    an empty answer that reads exactly like "nothing calls this". The resolver reaches
+    them from the other side, through the call sites that name this symbol, tagged
+    ``resolved`` when the ladder decided on this node and ``candidate`` when it could
+    only narrow to a set this node is in. Off by default: it costs a lookup per name,
+    and every existing caller of this function gets what it got before."""
     prov = _file_provenance(gl)
     out: list[dict] = []
     seen: dict[str, int] = {}
@@ -388,11 +448,25 @@ def callers(gl: GraphLib, node_id: str, include_external: bool = False,
             continue
         decl = _caller_decl(gl, src) or src
         _add(decl, _via_label(edge), True, edge)
+    if resolver is not None:
+        found = resolver.resolve_callers(node_id)
+        # decided sites first: `_add` keeps the first tag it sees for a declaration, so
+        # a caller that both decides and merely-might would otherwise be reported by
+        # whichever site the dict happened to yield first.
+        for site_id, result in sorted(found["sites"].items(),
+                                      key=lambda kv: kv[1]["target"] != node_id):
+            site = gl.nodes.get(site_id)
+            if site is None:
+                continue
+            decided = result["target"] == node_id
+            _add(_caller_decl(gl, site) or site,
+                 "resolved" if decided else "candidate", decided)
     return out
 
 
 def callees(gl: GraphLib, node_id: str, include_external: bool = False,
-            direct_only: bool = False, with_dispatch: bool = False) -> list[dict]:
+            direct_only: bool = False, with_dispatch: bool = False,
+            resolver=None) -> list[dict]:
     """What this node calls — a traversal move, direct + indirect dispatch (tagged).
 
     Direct (``CALLS``) targets are already declarations. Indirect targets come from
@@ -403,7 +477,14 @@ def callees(gl: GraphLib, node_id: str, include_external: bool = False,
     row is tagged ``via``; ``direct_only`` returns exactly the old decl->decl set.
 
     ``with_dispatch`` stamps each indirect row with the edge's ``dispatch``/``slot``
-    (text-render differentiator); it defaults off, so the default return is unchanged."""
+    (text-render differentiator); it defaults off, so the default return is unchanged.
+
+    ``resolver`` walks the same owned call sites a second time and asks the resolution
+    ladder about each, adding ``resolved`` rows the frontend left undecided and
+    ``candidate`` rows where the ladder could only narrow. It never overrules: a target
+    already reported stays under the tag it already had. Sites the ladder cannot decide
+    at all are deliberately *not* rows here — see ``unresolved_callees``, which reports
+    them as themselves rather than as a callee that does not exist."""
     prov = _file_provenance(gl)
     out: list[dict] = []
     seen: dict[str, int] = {}
@@ -435,6 +516,39 @@ def callees(gl: GraphLib, node_id: str, include_external: bool = False,
             if tgt is None:
                 continue
             _add(tgt, _via_label(edge), gl.kind(tgt["id"]) in CALLABLE_KINDS, edge)
+    if resolver is not None:
+        for site in _owned_callsites(gl, node_id):
+            result = resolver.resolve(site["id"])
+            target = result["target"]
+            if target is not None:
+                decl = gl.nodes.get(target)
+                if decl is not None:
+                    _add(decl, "resolved", True)
+                continue
+            for candidate in result["candidates"]:
+                decl = gl.nodes.get(candidate)
+                if decl is not None:
+                    _add(decl, "candidate", False)
+    return out
+
+
+def unresolved_callees(gl: GraphLib, node_id: str, resolver) -> list[dict]:
+    """The call sites this declaration owns that nothing could resolve.
+
+    Invariant 2 of the lazy tier: an unresolved call must be a *thing*, not a gap in a
+    list. These are reported apart from ``callees`` rather than mixed into it, because
+    a row in that list means "this is called" and a site with no decidable callee is
+    not that — it is a question. Each row is a real, addressable node, so the answer to
+    "why does this function seem to call nothing" is something an agent can open.
+    """
+    out: list[dict] = []
+    for site in _owned_callsites(gl, node_id):
+        result = resolver.resolve(site["id"])
+        if result["target"] is not None or result["candidates"]:
+            continue
+        f, l, _ = gl.loc(site)
+        out.append({"node_id": site["id"], "callee": _callee_name(site),
+                    "file": f, "line": l, "via": result["via"]})
     return out
 
 

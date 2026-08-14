@@ -18,14 +18,12 @@ def _fact(evidence_ids: list[str], confidence: str = "unresolved") -> dict:
 class DynamicBehavior:
     overlay_id = "dynamic-behavior"
 
-    def applies(self, graph: dict) -> bool:
-        return any(
-            node.get("kind") in {"dynamic-behavior", "call", "construct"}
-            for node in graph.get("nodes", [])
-        )
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        return index.has_kind("dynamic-behavior", "call", "construct")
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes = []
         edges = []
         explicit_by_site: dict[str, list[dict]] = defaultdict(list)

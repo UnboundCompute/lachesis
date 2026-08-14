@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import os
 import subprocess
@@ -2438,46 +2439,14 @@ class CompilerFrontendTests(unittest.TestCase):
         # not the dropped token/span nodes).
         import os as _os
         import sys as _sys
-        import types as _types
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
         from lachesis.nav.graph_store import GraphStore
-        from lachesis.nav.reachability import Reachability
-        from lachesis.nav.hubs import Hubs
-        from lachesis.nav.guards import GuardProfiles
-        from lachesis.nav.call_roles import CallRoles
-        from lachesis.nav.siblings import SiblingDiff
-        from lachesis.nav import mcp_server
+        # The dispatch driver and the order-invariant compare live in the package now,
+        # because the eager-vs-lazy equality harness in nav/checks.py is the same
+        # operation and two checks.py files have nowhere else to share code from.
+        from lachesis.nav._navharness import norm as _norm, run_nav as _run_nav
         from lachesis.kuzu_store import write_kuzu_graph
-
-        def _run_nav(store, calls):
-            # each store drives the same global nav dispatch, one at a time. The
-            # security tools (guards/guards_top/call_roles/siblings) recompute from
-            # base facts, so the injected context mirrors the real `_Ctx` — a Kùzu
-            # store with an empty overlay must answer them identically to the in-memory
-            # store, proving the overlay is a cache, not a dependency.
-            guards = GuardProfiles(store)
-            mcp_server._CTX = _types.SimpleNamespace(
-                store=store, reach=Reachability(store), hubs=Hubs(store.gl),
-                guards=guards, roles=CallRoles(store, guards=guards),
-                siblings=SiblingDiff(store))
-            mcp_server._PROFILE = "all"
-            mcp_server._DEFAULT_FORMAT = "json"
-            return {label: mcp_server.call_tool(tool, args, format="json")
-                    for label, tool, args in calls}
-
-        def _norm(payload):
-            # order-invariant: sort every nested list so set-shaped results
-            # (which the two backends may enumerate in a different order)
-            # compare equal while any real content difference still shows.
-            def walk(x):
-                if isinstance(x, list):
-                    return sorted((walk(v) for v in x),
-                                  key=lambda e: json.dumps(e, sort_keys=True))
-                if isinstance(x, dict):
-                    return {k: walk(v) for k, v in x.items()}
-                return x
-            return walk(json.loads(payload))
 
         with tempfile.TemporaryDirectory() as output:
             # fixtures_opsreg carries an ops-struct dispatch table, so the nav set
@@ -3336,6 +3305,172 @@ def _fold_with_compose(seed: dict, deltas) -> dict:
     return current
 
 
+def _legacy_enrich(registry, graph: dict) -> dict:
+    """The fold as it stood before one index followed it: an index per overlay.
+
+    Kept here rather than in the source tree because it is the oracle, not a fallback.
+    Every overlay used to build ``GraphIndex(graph)`` for itself over a graph that grew
+    as the fold proceeded; the shared incremental index has to agree with that, exactly
+    and in order, or overlays downstream of the change see a different graph.
+    """
+    from lachesis.core.composition import GraphAccumulator
+
+    current = graph
+    accumulator = None
+    for overlay in registry.overlays:
+        if not overlay.applies(current):
+            continue
+        delta = overlay.enrich(current)
+        if accumulator is None:
+            accumulator = GraphAccumulator(graph["nodes"], graph["edges"])
+        accumulator.apply(delta)
+        current = accumulator.view()
+    return current
+
+
+class SharedIndexFoldTests(unittest.TestCase):
+    """One index absorbed forward must answer what eight rebuilt indexes answered.
+
+    The saving is real -- eight full indexes over a graph growing 209k to 287k nodes
+    become one plus its deltas -- but it is only a saving if nothing downstream can
+    tell. Two overlays read buckets whose order is not forced by a unique key, so the
+    claim under test is ordered-list equality against the old fold, not set equality:
+    a set comparison passes on exactly the reordering that would make a later overlay's
+    ``next(...)`` pick a different edge.
+    """
+
+    def _canonical_graph(self) -> dict:
+        with tempfile.TemporaryDirectory() as output:
+            completed = subprocess.run(
+                (sys.executable, "lachesis/frontends/c/build_graph.py",
+                 "lachesis/frontends/c/fixtures", output),
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(
+                0, completed.returncode,
+                f"C frontend failed:\n{completed.stdout}\n{completed.stderr}",
+            )
+            snapshot = load_snapshot(output)
+        from lachesis.pipeline import combine_graphs
+
+        return combine_graphs([snapshot_graph(snapshot)])
+
+    def test_the_shared_index_fold_equals_the_per_overlay_rebuild(self) -> None:
+        from lachesis.core.overlays import default_overlay_registry
+
+        graph = self._canonical_graph()
+        self.assertTrue(graph["nodes"], "the fixture must produce a non-empty graph")
+
+        shared = default_overlay_registry().enrich(copy.deepcopy(graph))
+        legacy = _legacy_enrich(default_overlay_registry(), copy.deepcopy(graph))
+
+        self.assertEqual(
+            [node["id"] for node in legacy["nodes"]],
+            [node["id"] for node in shared["nodes"]],
+        )
+        self.assertEqual(
+            [(edge["kind"], edge["source"], edge["target"]) for edge in legacy["edges"]],
+            [(edge["kind"], edge["source"], edge["target"]) for edge in shared["edges"]],
+        )
+        self.assertEqual(legacy["nodes"], shared["nodes"])
+        self.assertEqual(legacy["edges"], shared["edges"])
+
+    def test_every_overlay_ignores_whether_it_was_handed_an_index(self) -> None:
+        """Each overlay alone, on the same graph, with and without the index.
+
+        Standalone callers survive -- ``apply_parameter_property_effects`` is exported,
+        and the checks suites construct overlays directly -- so ``index=None`` is not a
+        dead branch and has to keep producing the same delta the shared one does.
+        """
+        from lachesis.core.overlays import default_overlay_registry
+
+        graph = self._canonical_graph()
+        applied = []
+        for overlay in default_overlay_registry().overlays:
+            index = GraphIndex(graph)
+            self.assertEqual(overlay.applies(graph), overlay.applies(graph, index))
+            if not overlay.applies(graph):
+                continue
+            applied.append(overlay.overlay_id)
+            without = overlay.enrich(graph)
+            with_index = overlay.enrich(graph, GraphIndex(graph))
+            self.assertEqual(without.nodes, with_index.nodes, overlay.overlay_id)
+            self.assertEqual(without.edges, with_index.edges, overlay.overlay_id)
+        self.assertTrue(applied, "no overlay applied, so nothing was actually compared")
+
+    def test_the_observer_is_told_about_every_overlay_that_ran(self) -> None:
+        from lachesis.core.overlays import default_overlay_registry
+
+        graph = self._canonical_graph()
+        registry = default_overlay_registry()
+        seen: list[tuple] = []
+        registry.enrich(graph, lambda overlay_id, wall, nodes, edges: seen.append(
+            (overlay_id, nodes, edges),
+        ))
+        # Which overlays apply is decided against the graph as it grows, so the
+        # observed set is not predictable from the seed. What is: the ones that ran
+        # are registered ones, reported once each, in registration order.
+        registered = [overlay.overlay_id for overlay in registry.overlays]
+        reported = [row[0] for row in seen]
+        self.assertEqual(sorted(set(reported)), sorted(reported))
+        self.assertEqual([name for name in registered if name in set(reported)], reported)
+        self.assertTrue(reported, "no overlay ran, so the observer proved nothing")
+        self.assertTrue(all(isinstance(row[1], int) for row in seen))
+
+
+class SnapshotReleaseTests(unittest.TestCase):
+    """A snapshot stops holding a copy of the graph the moment the graph exists."""
+
+    def _snapshot(self) -> FrontendSnapshot:
+        return FrontendSnapshot(
+            frontend_id="test", contract_version=1, languages=("c",),
+            capabilities={}, manifest={"diagnostic_count": 3},
+            nodes=[_node("a"), _node("b")], edges=[_edge("CALLS", "a", "b")],
+        )
+
+    def test_release_folds_the_payload_to_its_counts(self) -> None:
+        snapshot = self._snapshot()
+        self.assertFalse(snapshot.released)
+        self.assertEqual((2, 1), (snapshot.payload_node_count, snapshot.payload_edge_count))
+        snapshot.release()
+        self.assertTrue(snapshot.released)
+        self.assertEqual([], snapshot.nodes)
+        self.assertEqual([], snapshot.edges)
+        # The counts the manifest reports are the ones the payload had.
+        self.assertEqual((2, 1), (snapshot.payload_node_count, snapshot.payload_edge_count))
+        # Idempotent, so three entry points may each release without coordinating.
+        snapshot.release()
+        self.assertEqual((2, 1), (snapshot.payload_node_count, snapshot.payload_edge_count))
+
+    def test_what_survives_release_is_what_the_build_still_needs(self) -> None:
+        snapshot = self._snapshot()
+        snapshot.release()
+        self.assertEqual("test", snapshot.frontend_id)
+        self.assertEqual(("c",), snapshot.languages)
+        self.assertEqual({}, snapshot.capabilities)
+        self.assertEqual(3, snapshot.manifest.get("diagnostic_count"))
+
+    def test_the_manifest_reads_the_released_counts(self) -> None:
+        from lachesis.kuzu_store import manifest_payload
+
+        snapshot = self._snapshot()
+        before = manifest_payload({"nodes": [], "edges": []}, [snapshot])
+        snapshot.release()
+        self.assertEqual(before, manifest_payload({"nodes": [], "edges": []}, [snapshot]))
+
+    def test_run_project_releases_every_snapshot_it_returns(self) -> None:
+        from lachesis.pipeline import run_project
+
+        with tempfile.TemporaryDirectory() as output:
+            graph, snapshots = run_project(
+                str(ROOT / "lachesis" / "frontends" / "c" / "fixtures"), output,
+            )
+        self.assertTrue(snapshots)
+        self.assertTrue(all(snapshot.released for snapshot in snapshots))
+        self.assertTrue(graph["nodes"], "releasing must not empty the graph")
+        self.assertTrue(all(snapshot.payload_node_count for snapshot in snapshots))
+
+
 class GraphAccumulatorTests(unittest.TestCase):
     """The accumulator is a folding of ``compose``, so ``compose`` is the oracle.
 
@@ -3448,10 +3583,10 @@ class GraphAccumulatorTests(unittest.TestCase):
         class Inapplicable:
             overlay_id = "inapplicable"
 
-            def applies(self, graph: dict) -> bool:
+            def applies(self, graph: dict, index=None) -> bool:
                 return False
 
-            def enrich(self, graph: dict) -> GraphDelta:  # pragma: no cover
+            def enrich(self, graph: dict, index=None) -> GraphDelta:  # pragma: no cover
                 raise AssertionError("enrich must not run when applies said no")
 
         registry = OverlayRegistry()
@@ -3464,17 +3599,23 @@ class GraphAccumulatorTests(unittest.TestCase):
         from lachesis.core.overlays import OverlayRegistry
 
         seen: list[set[str]] = []
+        indexed: list[set[str]] = []
+        identities: set[int] = set()
 
         class Recording:
             def __init__(self, overlay_id: str, delta: GraphDelta) -> None:
                 self.overlay_id = overlay_id
                 self._delta = delta
 
-            def applies(self, graph: dict) -> bool:
+            def applies(self, graph: dict, index=None) -> bool:
                 return True
 
-            def enrich(self, graph: dict) -> GraphDelta:
+            def enrich(self, graph: dict, index=None) -> GraphDelta:
                 seen.append({node["id"] for node in graph["nodes"]})
+                # The fold hands every overlay one index, absorbed forward: the same
+                # object each time, and always agreeing with the graph beside it.
+                indexed.append(set(index.nodes))
+                identities.add(id(index))
                 return self._delta
 
         registry = OverlayRegistry()
@@ -3483,7 +3624,50 @@ class GraphAccumulatorTests(unittest.TestCase):
         enriched = registry.enrich(self._seed())
 
         self.assertEqual([{"a", "b"}, {"a", "b", "c"}], seen)
+        self.assertEqual(seen, indexed)
+        self.assertEqual(1, len(identities))
         self.assertEqual(["a", "b", "c", "d"], [n["id"] for n in enriched["nodes"]])
+
+
+class ParallelBuildDiscoveryTests(unittest.TestCase):
+    """A parallel build walks the tree and partitions it once, not twice.
+
+    run_project_parallel needed the partition twice: once to decide the jobs and
+    once afterwards to say which package owns which file. It got it by calling
+    detect_packages over a fresh source_inventory both times, so the whole tree was
+    walked, filtered and bucketed a second time to rebuild something it had already
+    thrown away. package_jobs now takes the partition it should build from.
+    """
+
+    def test_the_tree_is_walked_and_partitioned_once(self) -> None:
+        from lachesis import packages as packages_module
+        from lachesis import pipeline
+
+        inventories, partitions = [], []
+        real_inventory = pipeline.source_inventory
+        real_detect = packages_module.detect_packages
+
+        def counting_inventory(*args, **kwargs):
+            inventories.append(args[0])
+            return real_inventory(*args, **kwargs)
+
+        def counting_detect(*args, **kwargs):
+            partitions.append(args[0])
+            return real_detect(*args, **kwargs)
+
+        pipeline.source_inventory = counting_inventory
+        packages_module.detect_packages = counting_detect
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                pipeline.run_project_parallel(
+                    str(WORKSPACE_FIXTURE), output, max_workers=1, enrich=False,
+                )
+        finally:
+            pipeline.source_inventory = real_inventory
+            packages_module.detect_packages = real_detect
+
+        self.assertEqual(1, len(inventories), inventories)
+        self.assertEqual(1, len(partitions), partitions)
 
 
 class PackageOwnershipTests(unittest.TestCase):
@@ -3924,6 +4108,605 @@ class GraphIndexOrderingTests(unittest.TestCase):
             ["v2:n:a", "v2:n:d"],
             [edge["target"] for edge in index.outgoing_of_kind("v2:f", "CALLS")],
         )
+
+
+class IdentityFileLocalityTests(unittest.TestCase):
+    """A node's id may depend on its own file and on nothing else.
+
+    This is the invariant the whole lazy-resolution plan rests on. If editing one file
+    can rename a node in another, then no cached answer keyed on a node id survives an
+    unrelated edit, and per-file incremental reuse is impossible in principle rather
+    than merely unimplemented.
+
+    The Python frontend violated it in exactly one place. A call site's id was hashed
+    over ``"construct" if resolution.constructed_class else "call"``, and that
+    classification comes from the whole-tree resolver -- ``Thing()`` is a construct only
+    if ``Thing`` names a class, which the file doing the calling cannot know when
+    ``Thing`` is imported. So turning a class into a function two files away silently
+    renamed the call site. The kind is still reported; it is only the identity that
+    stopped depending on it.
+    """
+
+    TREE = {
+        "defs.py": "class Thing:\n    def __init__(self):\n        self.x = 1\n",
+        "use.py": (
+            "from defs import Thing\n\n\n"
+            "def build():\n"
+            "    return Thing()\n"
+        ),
+    }
+    # The same file, with Thing a function instead of a class. Nothing in use.py
+    # changes; what changes is what its one call site *means*.
+    THING_AS_FUNCTION = "def Thing():\n    return 1\n"
+
+    def _build(self, tree: dict) -> list:
+        with tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as output:
+            for name, text in tree.items():
+                Path(source, name).write_text(text)
+            completed = subprocess.run(
+                [sys.executable, "-m", "lachesis.frontends.python.build_graph",
+                 source, output],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            return load_snapshot(output).nodes
+
+    def _in_file(self, nodes, name: str) -> dict:
+        """Every node declared in one file, keyed by id."""
+        return {
+            node["id"]: node for node in nodes
+            if str(node.get("properties", {}).get("file", "")).endswith(name)
+        }
+
+    def _without(self, nodes: dict, kind: str) -> list:
+        return sorted(node_id for node_id, node in nodes.items() if node["kind"] != kind)
+
+    def test_a_call_site_keeps_its_id_when_another_file_changes_its_meaning(self) -> None:
+        before = self._in_file(self._build(self.TREE), "use.py")
+        after = self._in_file(
+            self._build({**self.TREE, "defs.py": self.THING_AS_FUNCTION}), "use.py",
+        )
+        self.assertTrue(before, "the fixture produced no nodes in use.py")
+        # Allocations are excluded here and asserted on their own below, because they
+        # differ in a different way: their ids are file-local, it is their existence
+        # that is not.
+        self.assertEqual(
+            self._without(before, "allocation"), self._without(after, "allocation"),
+            "editing defs.py renamed a node in use.py, so no cached answer keyed on a "
+            "node id can survive an unrelated edit",
+        )
+
+    def test_whether_an_allocation_exists_still_depends_on_another_file(self) -> None:
+        """The known remaining gap, recorded rather than left to be rediscovered.
+
+        ``values.py:455`` emits an ``allocation`` only when the resolver reports a
+        constructed class, so ``use.py`` gains and loses a node according to what
+        ``defs.py`` says. Its *id* is file-local (``values.py:362`` hashes the display
+        path, the offsets and the allocation kind), so §4 -- which is about identity --
+        holds, and every cached answer keyed on a node id is safe.
+
+        What does not hold is the stronger property that a file's node set is a pure
+        function of that file, which is what per-file incremental reuse needs. That is
+        Phase 5's problem and it is out of scope here; the point of this test is that
+        the gap is asserted, so it cannot quietly widen in the meantime.
+        """
+        as_class = self._in_file(self._build(self.TREE), "use.py")
+        as_function = self._in_file(
+            self._build({**self.TREE, "defs.py": self.THING_AS_FUNCTION}), "use.py",
+        )
+        allocations = [n for n in as_class.values() if n["kind"] == "allocation"]
+        self.assertEqual(1, len(allocations), "expected one class-instance allocation")
+        self.assertEqual(
+            [], [n for n in as_function.values() if n["kind"] == "allocation"],
+        )
+        # File-local all the same: the id survives a rebuild of the identical tree.
+        rebuilt = self._in_file(self._build(self.TREE), "use.py")
+        self.assertIn(allocations[0]["id"], rebuilt)
+
+    def test_the_call_site_is_still_classified_by_what_it_calls(self) -> None:
+        """The identity stopped depending on the resolver; the node did not."""
+        kinds = {
+            node["kind"] for node in self._in_file(self._build(self.TREE), "use.py").values()
+            if node.get("properties", {}).get("callee_name") == "Thing"
+        }
+        self.assertEqual({"construct"}, kinds)
+        as_function = {
+            node["kind"]
+            for node in self._in_file(
+                self._build({**self.TREE, "defs.py": self.THING_AS_FUNCTION}), "use.py",
+            ).values()
+            if node.get("properties", {}).get("callee_name") == "Thing"
+        }
+        self.assertEqual({"call"}, as_function)
+
+    def test_the_id_namespace_of_a_construct_says_call(self) -> None:
+        """Because the namespace is a namespace, not a second copy of the kind."""
+        for node in self._in_file(self._build(self.TREE), "use.py").values():
+            if node.get("properties", {}).get("callee_name") != "Thing":
+                continue
+            self.assertEqual("construct", node["kind"])
+            self.assertEqual(
+                "call", node["id"].split(":")[3],
+                "the id segment is a namespace; nothing reads semantics out of it, and "
+                "making it carry the resolver's verdict is what broke file locality",
+            )
+            break
+        else:
+            self.fail("no call site for Thing in use.py")
+
+
+class HomonymIndexTests(unittest.TestCase):
+    """Two files, one static function name -- the case a name alone cannot decide.
+
+    Both calls are intra-TU, so clang resolves them and the cross-TU post-pass never
+    gets asked; the fixture's value is that the *name* ``funcA`` is ambiguous while the
+    *file* is not. What is asserted here is that the indices keep both alternatives
+    addressable, which is the input ``HomonymResolutionTests`` then resolves against.
+    """
+
+    FIXTURE = "lachesis/frontends/c/fixtures_homonym"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from lachesis.pipeline import run_project
+
+        cls._graph, cls._snapshots = run_project(
+            os.path.join(ROOT, cls.FIXTURE), enrich=False)
+
+    def _entries(self):
+        from lachesis.nav.graphlib import GraphLib
+        from lachesis.nav.symbol_index import build_index
+
+        return build_index(GraphLib({"nodes": list(self._graph["nodes"]),
+                                     "edges": list(self._graph["edges"])}))
+
+    def test_both_definitions_survive_as_distinct_nodes(self):
+        functions = [n for n in self._graph["nodes"]
+                     if n["kind"] == "function" and n["label"] == "funcA"]
+        self.assertEqual(2, len(functions), "one funcA per translation unit")
+        self.assertEqual(2, len({n["id"] for n in functions}), "distinct node ids")
+        self.assertEqual(
+            2, len({(n["properties"] or {}).get("file") for n in functions}),
+            "in distinct files -- which is the whole of what makes them resolvable",
+        )
+
+    def test_search_reports_both_and_says_so(self):
+        from lachesis.nav.symbol_index import search_page
+
+        page = search_page(self._entries(), "funcA", "exact")
+        self.assertEqual(2, page["total"], "search does not collapse the homonyms")
+        first = page["hits"][0]
+        # The Phase 1 visibility field: eleven tools seed from hits[0], so a hit that
+        # has a twin has to say so even while that seeding stays as it is.
+        self.assertEqual(1, len(first["homonyms"]))
+        self.assertNotEqual(first["node_id"], first["homonyms"][0]["node_id"])
+        self.assertNotEqual(first["file"], first["homonyms"][0]["file"])
+
+    def test_a_unique_name_carries_no_homonyms_field(self):
+        from lachesis.nav.symbol_index import search_page
+
+        page = search_page(self._entries(), "shared_entry", "exact")
+        self.assertEqual(1, page["total"])
+        self.assertNotIn(
+            "homonyms", page["hits"][0],
+            "the field's presence is the signal; an empty list would say nothing",
+        )
+
+    def test_the_decl_index_round_trips_both_rows_through_the_store(self):
+        from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
+            manifest = read_store_manifest(db_dir)
+            self.assertEqual(9, manifest["version"])
+            self.assertGreater(manifest["decl_index_count"], 0)
+            self.assertGreater(manifest["callsite_index_count"], 0)
+
+            index = KuzuGraphIndex(db_dir)
+            rows = index.decl_index("funcA")
+            functions = [r for r in rows if r["kind"] == "function"]
+            self.assertEqual(2, len(functions))
+            self.assertEqual(2, len({r["node_id"] for r in functions}))
+            self.assertEqual(2, len({r["file"] for r in functions}))
+
+    def test_the_callsite_index_names_the_two_owners(self):
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
+            index = KuzuGraphIndex(db_dir)
+            sites = index.callsite_index("funcA")
+            self.assertEqual(2, len(sites), "one call site per translation unit")
+            owners = {index.nodes.get(row["owner_id"], {}).get("label")
+                      for row in sites}
+            self.assertEqual({"alpha_entry", "beta_entry"}, owners)
+
+    def test_the_store_and_the_memory_index_answer_identically(self):
+        """The parity that makes ``lachesis/indices.py`` worth having in one place."""
+        from lachesis.core.query import GraphIndex
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
+            stored = KuzuGraphIndex(db_dir)
+            memory = GraphIndex(self._graph)
+            self.assertEqual(memory.decl_index(), stored.decl_index())
+            self.assertEqual(memory.callsite_index(), stored.callsite_index())
+
+    def test_the_decl_index_holds_exactly_what_search_indexes(self):
+        """The assertion the equality golden cannot make while Phase 1 relaxes it.
+
+        ``build_index`` and ``build_decl_index`` read the same ``INDEXED_KINDS`` but by
+        two different routes, and a drift between them would show up as a name that is
+        searchable and unresolvable, or the reverse.
+        """
+        from lachesis.core.query import GraphIndex
+
+        indexed = {(e["name"], e["node_id"]) for e in self._entries()}
+        declared = {(row["name"], row["node_id"])
+                    for rows in GraphIndex(self._graph).decl_index().values()
+                    for row in rows}
+        self.assertEqual(indexed, declared)
+
+
+class HomonymResolutionTests(unittest.TestCase):
+    """The resolution tier over the two fixtures that make it earn its keep.
+
+    Two things are under test and they pull in opposite directions. The first is that
+    the tier is a **strict superset**: on every call site the frontend already decided,
+    `resolve` returns the frontend's answer and not its own. The second is that where
+    the frontend has nothing, the ladder still decides -- so the frontend's answer is
+    stripped out of a copy of the graph and the same question is asked again, and the
+    two answers have to agree. An addition that changed an existing answer would not be
+    an addition.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from lachesis.pipeline import run_project
+
+        cls._graph, _ = run_project(
+            os.path.join(ROOT, "lachesis/frontends/c/fixtures_homonym"), enrich=False)
+        cls._crosstu, _ = run_project(
+            os.path.join(ROOT, "lachesis/frontends/c/fixtures_crosstu"), enrich=False)
+
+    # -- helpers -------------------------------------------------------------
+
+    def _index(self, graph=None):
+        from lachesis.core.query import GraphIndex
+        return GraphIndex(graph if graph is not None else self._graph)
+
+    @staticmethod
+    def _definition(graph, label: str) -> str:
+        """The body-bearing `label`, not its prototype twin.
+
+        Worth spelling out: `shared.c` forward-declares `alpha_entry`, so the graph
+        holds *two* nodes with that name and the bodyless one owns no call sites at
+        all. A test that took the first match would pass or fail on frontend ordering.
+        """
+        matches = [n for n in graph["nodes"]
+                   if n["kind"] == "function" and n["label"] == label
+                   and not (n["properties"] or {}).get("declaration_only")]
+        assert len(matches) == 1, f"{label}: expected one definition, got {len(matches)}"
+        return matches[0]["id"]
+
+    @staticmethod
+    def _callsites(graph, file_suffix: str, callee: str) -> list:
+        return [n for n in graph["nodes"]
+                if n["kind"] in ("call", "construct")
+                and str((n["properties"] or {}).get("file") or "").endswith(file_suffix)
+                and (n["properties"] or {}).get("callee") == callee]
+
+    @staticmethod
+    def _blinded(graph) -> dict:
+        """The same graph with every frontend call resolution removed.
+
+        `primary_target_id` off the call sites and the decided call edges dropped, which
+        is exactly the state a C tree is in when clang could not see the definition.
+        Nothing else is touched, so what answers afterwards is rungs 2-7 alone.
+        """
+        nodes = []
+        for node in graph["nodes"]:
+            if node["kind"] in ("call", "construct"):
+                properties = dict(node["properties"] or {})
+                properties.pop("primary_target_id", None)
+                node = {**node, "properties": properties}
+            nodes.append(node)
+        edges = [e for e in graph["edges"] if e["kind"] not in ("INVOKES", "CALLS")]
+        return {**graph, "nodes": nodes, "edges": edges}
+
+    # -- the superset property ----------------------------------------------
+
+    def test_each_call_site_resolves_to_its_own_files_definition(self):
+        from lachesis.resolution import resolve
+
+        index = self._index()
+        for unit in ("alpha.c", "beta.c"):
+            site = self._callsites(self._graph, unit, "funcA")
+            self.assertEqual(1, len(site), f"one funcA call in {unit}")
+            result = resolve(index, site[0]["id"])
+            self.assertEqual("exact", result["confidence"])
+            target = index.nodes[result["target"]]
+            self.assertEqual("funcA", target["label"])
+            self.assertTrue(
+                target["properties"]["file"].endswith(unit),
+                f"{unit}'s call must land on {unit}'s static funcA, not its twin",
+            )
+
+    def test_the_crosstu_call_targets_the_definition_not_the_prototype(self):
+        """Rung 1 inheriting the C post-pass rather than second-guessing it."""
+        from lachesis.resolution import resolve
+
+        index = self._index(self._crosstu)
+        sites = self._callsites(self._crosstu, "client.c", "lib_compute")
+        self.assertEqual(1, len(sites))
+        result = resolve(index, sites[0]["id"])
+        self.assertEqual("exact", result["confidence"])
+        target = index.nodes[result["target"]]
+        self.assertFalse(target["properties"].get("declaration_only"),
+                         "the definition in lib.c, not the prototype in lib.h")
+
+    def test_resolution_is_idempotent(self):
+        from lachesis.resolution import resolve
+
+        index = self._index()
+        site = self._callsites(self._graph, "alpha.c", "funcA")[0]["id"]
+        self.assertEqual(resolve(index, site), resolve(index, site))
+
+    # -- the rung the fixture exists for ------------------------------------
+
+    def test_static_scoping_decides_the_homonym_without_the_frontend(self):
+        """Rung 2, alone: same answer, from file-local C linkage rules only.
+
+        Clang resolves both of these intra-TU, so rung 1 answers them in the real
+        graph -- the fixture's original premise (that the frontend gives up here) was
+        wrong, and this is what it is actually worth testing. Blinded, the name `funcA`
+        has two definitions in two files and only `static` in the caller's own file
+        separates them.
+        """
+        from lachesis.resolution import resolve
+
+        blind = self._index(self._blinded(self._graph))
+        full = self._index()
+        for unit in ("alpha.c", "beta.c"):
+            site = self._callsites(self._graph, unit, "funcA")[0]["id"]
+            blinded_result = resolve(blind, site)
+            self.assertEqual("exact", blinded_result["confidence"])
+            self.assertEqual("static-same-file", blinded_result["via"])
+            self.assertEqual(
+                resolve(full, site)["target"], blinded_result["target"],
+                "the ladder must reproduce the frontend's answer, not replace it",
+            )
+
+    def test_a_blinded_cross_tu_call_falls_to_the_sole_definition(self):
+        """Rung 3: no static shadow anywhere, one external definition, so promote it."""
+        from lachesis.resolution import resolve
+
+        blind = self._index(self._blinded(self._crosstu))
+        site = self._callsites(self._crosstu, "client.c", "lib_compute")[0]["id"]
+        result = resolve(blind, site)
+        self.assertEqual("exact", result["confidence"])
+        self.assertEqual("sole-definition", result["via"])
+        self.assertFalse(blind.nodes[result["target"]]["properties"]
+                         .get("declaration_only"))
+
+    # -- scope: a declaration, and a cone -----------------------------------
+
+    def test_resolve_decl_visits_only_the_call_sites_it_owns(self):
+        from lachesis.resolution import resolve_decl
+
+        index = self._index()
+        results = resolve_decl(index, self._definition(self._graph, "alpha_entry"))
+        self.assertEqual(1, len(results), "alpha_entry's body holds one call")
+        target = index.nodes[next(iter(results.values()))["target"]]
+        self.assertEqual("funcA", target["label"])
+        self.assertTrue(target["properties"]["file"].endswith("alpha.c"))
+
+    def test_the_cone_reaches_both_definitions_and_says_it_was_not_cut(self):
+        from lachesis.resolution import resolve_cone
+
+        index = self._index()
+        cone = resolve_cone(index, self._definition(self._graph, "shared_entry"))
+        self.assertFalse(cone["truncated"])
+        reached = sorted(
+            f'{index.nodes[m]["label"]}@'
+            f'{os.path.basename(index.nodes[m]["properties"]["file"])}'
+            for m in cone["members"]
+        )
+        self.assertEqual(
+            ["alpha_entry@alpha.c", "beta_entry@beta.c",
+             "funcA@alpha.c", "funcA@beta.c", "shared_entry@shared.c"],
+            reached,
+            "both homonyms, each through its own caller -- not one name reached twice",
+        )
+
+    def test_a_tight_budget_stops_and_admits_it(self):
+        """The budget is a stop, not a filter: `truncated` means there was more."""
+        from lachesis.resolution import resolve_cone
+
+        index = self._index()
+        cone = resolve_cone(index, self._definition(self._graph, "shared_entry"),
+                            budget=2)
+        self.assertTrue(cone["truncated"])
+        self.assertLessEqual(len(cone["members"]), 3)
+
+    def test_the_two_entry_points_do_not_share_a_default_budget(self):
+        """Invariant 3: the cheap question must not be able to cost the dear one."""
+        from lachesis.resolution import CONE_BUDGET, DECL_DEPTH
+
+        self.assertNotEqual(DECL_DEPTH, CONE_BUDGET)
+
+    # -- the memo ------------------------------------------------------------
+
+    def test_the_memo_round_trips_into_the_v9_tables(self):
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+        from lachesis.resolution import Resolver
+
+        from lachesis.pipeline import run_project  # noqa: F401  (setUpClass import path)
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, [], db_dir, enriched=False)
+            index = KuzuGraphIndex(db_dir)
+            resolver = Resolver(index, graph_hash="test-hash")
+            resolver.resolve_cone(self._definition(self._graph, "shared_entry"))
+            self.assertTrue(resolver._memo, "the cone populated the call-site memo")
+            written = resolver.flush_memos(db_dir)
+            self.assertGreater(written, 0)
+
+            import kuzu
+            conn = kuzu.Connection(kuzu.Database(os.path.join(db_dir, "graph.kuzu")))
+            result = conn.execute(
+                "MATCH (r:ResolveMemo) RETURN count(r), count(DISTINCT r.graph_hash)")
+            rows, hashes = result.get_next()
+            self.assertEqual(len(resolver._memo), rows)
+            self.assertEqual(1, hashes, "every memo row is keyed on one graph hash")
+
+    def test_the_store_and_the_memory_index_resolve_identically(self):
+        """The same parity `decl_index` is held to, over the tier that reads it."""
+        from lachesis.kuzu_store import write_kuzu_graph
+        from lachesis.nav.kuzu_index import KuzuGraphIndex
+        from lachesis.resolution import resolve
+
+        with tempfile.TemporaryDirectory() as output:
+            db_dir = os.path.join(output, "store")
+            write_kuzu_graph(self._graph, [], db_dir, enriched=False)
+            stored, memory = KuzuGraphIndex(db_dir), self._index()
+            for unit in ("alpha.c", "beta.c", "shared.c"):
+                for site in self._callsites(self._graph, unit, "funcA") \
+                        + self._callsites(self._graph, unit, "alpha_entry"):
+                    self.assertEqual(resolve(memory, site["id"]),
+                                     resolve(stored, site["id"]))
+
+
+class HomonymNavigationTests(unittest.TestCase):
+    """The nav tools over two same-named functions — the collapse, and the recovery.
+
+    Phase 2 built a resolver nothing consumed. This is what consuming it changes, and
+    both halves matter. A name that means two things must stop being answered as though
+    it meant one: `callers("funcA")` is the union over every homonym, and the seeds it
+    was unioned over come back in the payload so the caller can take them apart again.
+    And a call the frontend never decided must stop reading as a call that does not
+    exist: with the eager resolution stripped out, the edges are gone and the answer
+    has to come from the ladder instead.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(ROOT)))
+        from lachesis.pipeline import run_project
+
+        cls._graph, _ = run_project(
+            os.path.join(ROOT, "lachesis/frontends/c/fixtures_homonym"), enrich=False)
+
+    def _store(self, graph=None):
+        from lachesis.nav.graph_store import GraphStore
+        return GraphStore(graph if graph is not None else self._graph)
+
+    @staticmethod
+    def _call(store, tool: str, args: dict) -> dict:
+        from lachesis.nav._navharness import norm, run_nav
+        return norm(run_nav(store, [("only", tool, args)])["only"])
+
+    @staticmethod
+    def _names(rows) -> set:
+        return {row["name"] for row in rows}
+
+    # -- the collapse ---------------------------------------------------------
+
+    def test_a_name_that_means_two_things_seeds_both(self):
+        from lachesis.nav import mcp_server
+
+        store = self._store()
+        self.assertEqual(2, len(mcp_server._seeds(store, "funcA")),
+                         "both static definitions are genuine rivals")
+        self.assertEqual(1, len(mcp_server._seeds(store, "alpha_entry")),
+                         "the bodyless prototype in shared.c is not a rival, it loses")
+
+    def test_callers_of_a_homonym_unions_every_homonym(self):
+        answer = self._call(self._store(), "callers", {"name": "funcA"})
+        self.assertEqual({"alpha_entry", "beta_entry"}, self._names(answer["callers"]),
+                         "one funcA's callers alone would look like a complete answer")
+
+    def test_the_payload_admits_which_seeds_it_unioned(self):
+        answer = self._call(self._store(), "callers", {"name": "funcA"})
+        self.assertEqual(2, len(answer["homonyms"]))
+        self.assertEqual({"funcA"}, {ref["name"] for ref in answer["homonyms"]})
+        self.assertEqual(2, len({ref["node_id"] for ref in answer["homonyms"]}),
+                         "two distinct, addressable ids to disambiguate with")
+
+    def test_an_unambiguous_name_says_nothing_about_homonyms(self):
+        answer = self._call(self._store(), "callers", {"name": "shared_entry"})
+        self.assertNotIn("homonyms", answer,
+                         "a key that is always there stops meaning anything")
+
+    # -- the recovery ---------------------------------------------------------
+
+    def test_callers_survive_the_loss_of_every_call_edge(self):
+        """The Phase 3 payoff, on a graph where the eager answer is simply absent.
+
+        `_blinded` is the state a C tree is in when the compiler could not see the
+        definition. Before the resolver was wired in, `callers` walked edges only, so
+        this returned nothing at all — and nothing is indistinguishable from "no one
+        calls this". Now each call site is put through the ladder from the other side,
+        and static scoping puts each one back with its own file's definition.
+        """
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        answer = self._call(self._store(blinded), "callers", {"name": "funcA"})
+        rows = answer["callers"]
+        self.assertEqual({"alpha_entry", "beta_entry"}, self._names(rows))
+        self.assertEqual({"resolved"}, {row["via"] for row in rows},
+                         "no edge carried these; the ladder did")
+        self.assertTrue(all(row["resolved"] for row in rows))
+
+    def test_a_blinded_callee_comes_back_resolved_not_missing(self):
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        answer = self._call(self._store(blinded), "callees", {"name": "alpha_entry"})
+        self.assertEqual({"funcA"}, self._names(answer["callees"]))
+        self.assertEqual([], answer["unresolved"],
+                         "nothing here is undecidable, so nothing is listed as such")
+
+    def test_an_undecidable_call_is_a_node_rather_than_an_omission(self):
+        """Invariant 2. `shared_entry` calls two functions it cannot see the bodies of
+        in the blinded graph — but their *declarations* are in the graph, so the ladder
+        decides them. Deleting the declarations is what leaves a genuine hole."""
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        gone = {node["id"] for node in blinded["nodes"]
+                if node["kind"] == "function" and node["label"] == "alpha_entry"}
+        stripped = {**blinded,
+                    "nodes": [n for n in blinded["nodes"] if n["id"] not in gone],
+                    "edges": [e for e in blinded["edges"]
+                              if e["source"] not in gone and e["target"] not in gone]}
+        answer = self._call(self._store(stripped), "callees", {"name": "shared_entry"})
+        self.assertEqual(["alpha_entry"], [row["callee"] for row in answer["unresolved"]])
+        for row in answer["unresolved"]:
+            self.assertIsNotNone(row["node_id"], "the hole has an address")
+            self.assertTrue(str(row["file"]).endswith("shared.c"))
+
+    def test_direct_only_still_means_edges_only(self):
+        """The escape hatch has to keep escaping: `direct_only` is how a caller asks
+        for the resolved decl->decl graph and nothing inferred on top of it."""
+        blinded = HomonymResolutionTests._blinded(self._graph)
+        answer = self._call(self._store(blinded), "callers",
+                            {"name": "funcA", "direct_only": True})
+        self.assertEqual([], answer["callers"])
+        self.assertNotIn("unresolved", answer)
 
 
 if __name__ == "__main__":

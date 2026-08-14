@@ -43,6 +43,9 @@ dependencies = ["kuzu>=0.11", "pyarrow>=17"]
 dev = ["pytest>=8"]
 
 [project.scripts]
+# The product surface. Everything below it is the engine, kept because a
+# graph you hold yourself is a legitimate thing to want.
+lachesis = "lachesis.cli.main:main"
 lachesis-analyze = "lachesis.cli.analyze:main"
 lachesis-query = "lachesis.cli.query:main"
 lachesis-mcp = "lachesis.nav.mcp_server:main"
@@ -64,9 +67,12 @@ include = ["lachesis*"]
 # `tools/vendor_typescript.py` before a release build, so a wheel built without that
 # step ships without it (see RELEASING.md).
 "lachesis.frontends.typescript" = ["*.mjs", "*.json", "fixtures/**/*", "vendor/**/*"]
-"lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
+"lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_homonym/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
 "lachesis.frontends.python" = ["*.json", "fixtures/**/*"]
 "lachesis.core" = ["*.json"]
+# The eager baseline the equality harness diffs every later phase against. It ships
+# because the harness is only meaningful next to the recording it is judged against.
+"lachesis.nav" = ["goldens/*.json.gz"]
 # The capsule schema is the artifact an external consumer validates against, and the
 # golden capsule is what the planner's own suite checks the serializer round-trips.
 "lachesis.planner" = ["*.json", "fixtures/*.json", "fixtures/project/*"]

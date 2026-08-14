@@ -59,10 +59,39 @@ class FrontendSnapshot:
     edges: List[dict]
     stdout: str = ""
     stderr: str = ""
+    released: bool = False
+    _released_node_count: int = 0
+    _released_edge_count: int = 0
 
     @property
     def nodes_by_id(self) -> Dict[str, dict]:
         return {node["id"]: node for node in self.nodes}
+
+    @property
+    def payload_node_count(self) -> int:
+        return self._released_node_count if self.released else len(self.nodes)
+
+    @property
+    def payload_edge_count(self) -> int:
+        return self._released_edge_count if self.released else len(self.edges)
+
+    def release(self) -> None:
+        """Drop the payload once it has been combined into the canonical graph.
+
+        ``snapshot_graph`` copies every node and its ``properties`` dict, so from the
+        combine onwards the snapshot's own lists are duplicate memory the size of the
+        graph -- and the frontend snapshots are held for the whole build, because the
+        manifest is written at the end. Nothing reads the payload after the combine
+        except those two counts, so the counts are folded to scalars and the lists let
+        go. Idempotent, so the three entry points can each call it without checking.
+        """
+        if self.released:
+            return
+        self._released_node_count = len(self.nodes)
+        self._released_edge_count = len(self.edges)
+        self.nodes = []
+        self.edges = []
+        self.released = True
 
     def capability(self, name: str) -> str:
         return self.capabilities.get(name, CAPABILITY_NONE)

@@ -59,11 +59,12 @@ class ModuleInitialization:
 
     overlay_id = "module-initialization"
 
-    def applies(self, graph: dict) -> bool:
-        return any(node.get("kind") == "file" for node in graph.get("nodes", []))
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        return index.has_kind("file")
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes = []
         edges = []
         file_by_value: dict[str, str] = {}

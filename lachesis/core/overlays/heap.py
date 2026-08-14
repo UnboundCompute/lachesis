@@ -28,11 +28,12 @@ class HeapIdentity:
 
     overlay_id = "heap-identity"
 
-    def applies(self, graph: dict) -> bool:
-        return any(node.get("kind") == "allocation" for node in graph.get("nodes", []))
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        return index.has_kind("allocation")
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes: list[dict] = []
         edges: list[dict] = []
         emitted_edges: set[tuple[str, str, str]] = set()

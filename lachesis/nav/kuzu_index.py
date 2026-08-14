@@ -40,7 +40,10 @@ from lachesis.kuzu_store import (
     CONSTANT_PROP_DEFAULTS,
     HOT_REL_KINDS,
     PROMOTED_NODE_PROPS,
+    _CALLSITE_INDEX_COLUMNS,
+    _DECL_INDEX_COLUMNS,
     _HOT_SET,
+    _INDEX_ID_COLUMNS,
     _prefix_code,
     db_file,
     decode_id,
@@ -140,6 +143,21 @@ def _restore_node_props(columns, props_blob: Optional[bytes],
     return properties
 
 
+def materialize_subgraph(index: "KuzuGraphIndex", keep) -> dict:
+    """The canonical ``{nodes, edges}`` dict restricted to the nodes ``keep`` holds.
+
+    An edge survives only if *both* its endpoints do. A subgraph with an edge pointing
+    out of itself is not a smaller graph, it is a broken one: the overlays that fold
+    over this look their endpoints up in the node map, and a dangling target reads as a
+    node with no kind rather than as a node that was left out.
+
+    Still one columnar scan per table, exactly as the whole-graph case -- the saving
+    here is not in what the store reads but in what stays on the heap afterwards, which
+    is the entire point of folding a cone instead of a repo.
+    """
+    return _materialize(index, keep)
+
+
 def materialize_graph(index: "KuzuGraphIndex") -> dict:
     """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
 
@@ -154,6 +172,18 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
     matches ``combine_graphs`` (nodes by id, edges by ``(kind, source, target)``) so a
     materialized graph compares equal to a freshly composed one.
     """
+    return _materialize(index, None)
+
+
+def _materialize(index: "KuzuGraphIndex", keep) -> dict:
+    """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
+
+    One body rather than two because a subgraph that restored props even slightly
+    differently from the whole graph would enrich differently, and the difference would
+    surface as a dataflow edge that appears only when the cone is small -- which is
+    indistinguishable from the semantic loss cone-scoping is *expected* to have, and so
+    would hide inside it forever.
+    """
     nodes = []
     # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
     # order is not the real one — the prefix sorts as a base36 code and the hash as
@@ -166,6 +196,8 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         row = res.get_next()
         nid, kind, label = row[:3]
         nid = decode_id(nid, index._id_prefixes)
+        if keep is not None and nid not in keep:
+            continue
         nodes.append({"id": nid, "kind": kind, "label": label,
                       "properties": _restore_node_props(row[3:-1], row[-1],
                                                         index._props_dict,
@@ -179,22 +211,30 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
         )
         while res.has_next():
             src, tgt, props = res.get_next()
-            edges.append({"source": decode_id(src, prefixes),
-                          "target": decode_id(tgt, prefixes), "kind": kind,
+            src, tgt = decode_id(src, prefixes), decode_id(tgt, prefixes)
+            if keep is not None and (src not in keep or tgt not in keep):
+                continue
+            edges.append({"source": src, "target": tgt, "kind": kind,
                           "properties": _restore(props, index._props_dict)})
     res = index._conn.execute(
         "MATCH (a:Node)-[e:EDGE]->(b:Node) RETURN a.id, b.id, e.kind, e.props"
     )
     while res.has_next():
         src, tgt, kind, props = res.get_next()
-        edges.append({"source": decode_id(src, prefixes),
-                      "target": decode_id(tgt, prefixes), "kind": kind,
+        src, tgt = decode_id(src, prefixes), decode_id(tgt, prefixes)
+        if keep is not None and (src not in keep or tgt not in keep):
+            continue
+        edges.append({"source": src, "target": tgt, "kind": kind,
                       "properties": _restore(props, index._props_dict)})
     # Kùzu does not promise a scan order, and two edges can share
     # ``(kind, source, target)`` while differing in props, so the tie-break folds the
     # props in: materializing the same store twice must give byte-identical output, or
     # a downstream enrich is not reproducible.
-    edges.extend(deferred_edges(index))
+    deferred = deferred_edges(index)
+    if keep is not None:
+        deferred = [e for e in deferred
+                    if e["source"] in keep and e["target"] in keep]
+    edges.extend(deferred)
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
                               json.dumps(e["properties"], sort_keys=True)))
     return {"nodes": nodes, "edges": edges}
@@ -310,6 +350,23 @@ class KuzuGraphIndex:
         self._node_cache: dict[str, Optional[dict]] = {}
         self._out_cache: dict[str, list] = {}
         self._in_cache: dict[str, list] = {}
+        # Prepared statements, by query text. `Connection.execute` on a raw string
+        # prepares it first, every single time, and preparing is not the cheap half:
+        # profiling `callees` on a 222k-node store showed 22,887 executions of four
+        # distinct query strings costing 4.8s in `kuzu.prepare` against 4.4s in
+        # `kuzu.execute`. The query set here is closed and tiny -- these are fixed
+        # strings with bound parameters, never interpolated user input -- so caching
+        # them is bounded by the number of literals in this file.
+        self._prepared: dict = {}
+        # Memoized unions of `by_kind` buckets, keyed by the frozen kind set. Callers
+        # that narrow ownership by kind ask the same two or three questions over and
+        # over, and each answer is a set union over buckets that do not move.
+        self._kind_ids: dict = {}
+        # What `graft` has already merged, so overlapping cone folds are additive
+        # rather than duplicative. Nodes and edges separately because a node can be
+        # grafted once and then referenced by edges from several later folds.
+        self._grafted_nodes: set = set()
+        self._grafted_edges: set = set()
         self._overlay = None
         self._derived_out: dict = {}
         self._derived_in: dict = {}
@@ -371,6 +428,9 @@ class KuzuGraphIndex:
         self._node_cache.clear()
         self._out_cache.clear()
         self._in_cache.clear()
+        # `by_kind` is about to grow by the overlay's derived nodes, so anything
+        # memoized off it describes the index as it was a moment ago.
+        self._kind_ids.clear()
         self._derived_out = defaultdict(list)
         self._derived_in = defaultdict(list)
         for edge in overlay.derived_edges:
@@ -401,10 +461,22 @@ class KuzuGraphIndex:
 
     # -- primitives ---------------------------------------------------------
 
+    def _run(self, cypher: str, params: dict):
+        """Execute ``cypher``, preparing it at most once per process.
+
+        Only for the parameterized hot-path queries. A one-shot bulk scan gains nothing
+        from being cached and would hold a statement alive for no reason, so those keep
+        calling ``_conn.execute`` directly.
+        """
+        statement = self._prepared.get(cypher)
+        if statement is None:
+            statement = self._prepared[cypher] = self._conn.prepare(cypher)
+        return self._conn.execute(statement, params)
+
     def _node(self, node_id: str) -> Optional[dict]:
         if node_id in self._node_cache:
             return self._node_cache[node_id]
-        res = self._conn.execute(
+        res = self._run(
             f"MATCH (n:Node {{id: $id}}) RETURN n.kind, n.label, {_MERGED_SELECT}, "
             "n.props", {"id": encode_id(node_id, self._id_codes)}
         )
@@ -431,7 +503,7 @@ class KuzuGraphIndex:
         else:
             cypher = ("MATCH (a:Node {id: $id})-[e]->(b:Node) "
                       "RETURN label(e), b.id, e.kind, e.semantic_kind, e.props")
-        res = self._conn.execute(cypher, {"id": encode_id(node_id, self._id_codes)})
+        res = self._run(cypher, {"id": encode_id(node_id, self._id_codes)})
         edges = []
         while res.has_next():
             label, other, kind_col, sem_col, props = res.get_next()
@@ -445,13 +517,97 @@ class KuzuGraphIndex:
                 extra = self._overlay.edge_props.get(_overlay_edge_key(edge))
                 if extra:
                     edge["properties"].update(extra)
-            derived = self._derived_in if reverse else self._derived_out
+        # Not gated on the overlay any more: `graft` fills these from a cone fold, which
+        # produces no sidecar. Reading derived edges only when a sidecar happened to be
+        # attached was the same condition twice by coincidence, and it stopped being a
+        # coincidence the moment a second thing could populate them.
+        derived = self._derived_in if reverse else self._derived_out
+        if derived:
             edges.extend({"source": e["source"], "target": e["target"],
                           "kind": e["kind"], "properties": dict(e.get("properties") or {})}
                          for e in derived.get(node_id, ()))
         edges.sort(key=_EDGE_SORT)
         cache[node_id] = edges
         return edges
+
+    def graft(self, nodes, edges) -> int:
+        """Merge derived nodes and edges into the live index. Returns edges added.
+
+        What a cone fold hands back. `attach_overlay` cannot carry it: an ``Overlay``
+        validates every edge kind against ``DERIVED_EDGE_KINDS``, which is the guard
+        vocabulary, and the dataflow tier's ``POINTS_TO``/``READS_HEAP``/
+        ``VALUE_FLOWS_TO`` are deliberately not in it. Widening that set to let a fold
+        through would also let a hand-written sidecar through, and the whole point of
+        that check is that a sidecar is untrusted input while a fold is our own output.
+
+        Additive and idempotent. An edge already present is skipped on identity, so
+        folding two overlapping cones grafts each shared edge once and the second cone
+        costs only what it adds.
+        """
+        if not self._derived_out:
+            self._derived_out = defaultdict(list)
+            self._derived_in = defaultdict(list)
+        for node in nodes:
+            nid = node["id"]
+            if nid in self._node_cache and self._node_cache[nid] is not None:
+                continue
+            self._node_cache[nid] = node
+            if nid not in self._grafted_nodes:
+                self._grafted_nodes.add(nid)
+                self._ids.append(nid)
+                self.by_kind[node.get("kind")].append(nid)
+                self.by_label[node.get("label")].append(nid)
+                props = node.get("properties") or {}
+                path = props.get("absolute_file") or props.get("file")
+                if path:
+                    self.by_file[path].append(nid)
+                owner = props.get("owner_function_id") or props.get("function_id")
+                if owner:
+                    self.by_owner[owner].append(nid)
+        added = 0
+        for edge in edges:
+            key = (edge["source"], edge["target"], edge["kind"],
+                   json.dumps(edge.get("properties") or {}, sort_keys=True))
+            if key in self._grafted_edges:
+                continue
+            self._grafted_edges.add(key)
+            self._derived_out[edge["source"]].append(edge)
+            self._derived_in[edge["target"]].append(edge)
+            added += 1
+        # The adjacency caches answered these nodes before the graft and would keep
+        # answering the old way; the node cache is deliberately *not* cleared, because
+        # it is what the loop above just populated.
+        self._out_cache.clear()
+        self._in_cache.clear()
+        self._kind_ids.clear()
+        self._ids.sort()
+        return added
+
+    def degrees(self) -> dict:
+        """``{node_id: outgoing + incoming}`` for every node that has an edge.
+
+        Two aggregate scans instead of two queries per node. `build_index` wants the
+        degree of every indexed declaration to break ties between a definition and its
+        prototype, and asking edge by edge made `search`'s first call issue ten thousand
+        queries to compute a number the store can count in one pass.
+
+        Counted the same way `_edges` counts, deliberately: every relationship type
+        through the untyped ``-[e]->`` match, plus the overlay's derived edges when one
+        is attached. ``DeferredEdge`` stays out because it is a node table awaiting a
+        recompiled endpoint, and `_edges` does not see it either.
+        """
+        degree: dict = defaultdict(int)
+        for column in ("a.id", "b.id"):
+            res = self._conn.execute(
+                f"MATCH (a:Node)-[e]->(b:Node) RETURN {column}, count(*)")
+            while res.has_next():
+                coded, count = res.get_next()
+                degree[decode_id(coded, self._id_prefixes)] += count
+        if self._overlay is not None:
+            for derived in (self._derived_out, self._derived_in):
+                for node_id, edges in derived.items():
+                    degree[node_id] += len(edges)
+        return degree
 
     # -- GraphIndex accessor surface ----------------------------------------
 
@@ -498,8 +654,60 @@ class KuzuGraphIndex:
     def nodes_in_file(self, path: str) -> tuple:
         return tuple(self._node(nid) for nid in self.by_file.get(path, ()))
 
-    def nodes_owned_by(self, owner_id: str) -> tuple:
-        return tuple(self._node(nid) for nid in self.by_owner.get(owner_id, ()))
+    def nodes_owned_by(self, owner_id: str, *kinds: str) -> tuple:
+        """The nodes a declaration owns, optionally narrowed to some kinds first.
+
+        Narrowing before fetching is the whole point of the parameter. Ownership and
+        kind are both already in memory from `_build_maps`, so the intersection costs no
+        query, and it is the difference between fetching the four call sites a function
+        makes and fetching all six hundred nodes of its body to throw 596 of them away.
+        """
+        owned = self.by_owner.get(owner_id, ())
+        if kinds:
+            wanted = self._ids_of_kind(kinds)
+            owned = [nid for nid in owned if nid in wanted]
+        if len(owned) > 1:
+            self._warm_nodes(owned)
+        return tuple(self._node(nid) for nid in owned)
+
+    def _ids_of_kind(self, kinds) -> frozenset:
+        key = frozenset(kinds)
+        cached = self._kind_ids.get(key)
+        if cached is None:
+            cached = self._kind_ids[key] = frozenset(
+                nid for kind in key for nid in self.by_kind.get(kind, ()))
+        return cached
+
+    def _warm_nodes(self, node_ids) -> None:
+        """Fetch a batch of nodes into the node cache with one query.
+
+        A function body is hundreds of nodes and `_node` is one query each, which is how
+        `callees` on a large declaration turned into 74,127 round trips. The rows come
+        back unordered and are keyed by id on the way into the cache, so this is purely a
+        prefetch: `_node` still answers, and answers the same, if this never ran.
+        """
+        wanted = [nid for nid in node_ids if nid not in self._node_cache]
+        if not wanted:
+            return
+        coded = [encode_id(nid, self._id_codes) for nid in wanted]
+        res = self._run(
+            f"MATCH (n:Node) WHERE n.id IN $ids RETURN n.id, n.kind, n.label, "
+            f"{_MERGED_SELECT}, n.props", {"ids": coded},
+        )
+        while res.has_next():
+            row = res.get_next()
+            node_id = decode_id(row[0], self._id_prefixes)
+            kind, label = row[1:3]
+            properties = _restore_node_props(row[3:-1], row[-1], self._props_dict,
+                                             self._id_prefixes)
+            if self._overlay is not None:
+                properties.update(self._overlay.node_props.get(node_id) or {})
+            self._node_cache[node_id] = {"id": node_id, "kind": kind, "label": label,
+                                         "properties": properties}
+        # A wanted id with no row is a genuine absence, and caching that is what stops
+        # `_node` from re-querying for it one at a time straight after this returns.
+        for node_id in wanted:
+            self._node_cache.setdefault(node_id, None)
 
     def edges_of_kind(self, *edge_kinds: str) -> Iterable[dict]:
         accepted = frozenset(edge_kinds)
@@ -531,6 +739,48 @@ class KuzuGraphIndex:
 
     def flow_edges(self, kinds) -> list:
         return list(self.edges_of_kind(*kinds))
+
+    # -- name indices (v9) --------------------------------------------------
+
+    def _index_rows(self, table: str, columns: tuple, key_column: str,
+                    name: Optional[str]) -> dict:
+        """Rows of an index table, keyed by name, ids decoded back to real ones.
+
+        One query for the whole table, not one per name. These tables are two orders of
+        magnitude smaller than ``Node`` (a few thousand rows on this repo against two
+        hundred thousand), and resolution asks about a great many names, so paying once
+        beats paying per lookup — and it keeps this the same shape as the in-memory
+        answer, which is a whole dict.
+        """
+        selected = ", ".join(f"r.{column}" for column in columns)
+        where, params = "", {}
+        if name is not None:
+            where, params = f" WHERE r.{key_column} = $name", {"name": name}
+        result = self._run(
+            f"MATCH (r:{table}){where} RETURN {selected}, r.seq ORDER BY r.seq", params)
+        index: dict = {}
+        while result.has_next():
+            values = result.get_next()
+            row = {}
+            for column, value in zip(columns, values):
+                row[column] = (decode_id(value, self._id_prefixes)
+                               if column in _INDEX_ID_COLUMNS and value else value)
+            index.setdefault(row[key_column], []).append(row)
+        return index
+
+    def decl_index(self, name: Optional[str] = None):
+        if name is not None:
+            return tuple(self._index_rows(
+                "DeclIndex", _DECL_INDEX_COLUMNS, "name", name).get(name, ()))
+        return self._index_rows("DeclIndex", _DECL_INDEX_COLUMNS, "name", None)
+
+    def callsite_index(self, name: Optional[str] = None):
+        if name is not None:
+            return tuple(self._index_rows(
+                "CallsiteIndex", _CALLSITE_INDEX_COLUMNS, "callee_name", name
+            ).get(name, ()))
+        return self._index_rows(
+            "CallsiteIndex", _CALLSITE_INDEX_COLUMNS, "callee_name", None)
 
     def package_inventory(self) -> frozenset:
         names = set()

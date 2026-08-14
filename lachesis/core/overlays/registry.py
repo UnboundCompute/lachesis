@@ -1,18 +1,24 @@
 """Sequential registry for language-neutral canonical graph overlays."""
 from __future__ import annotations
 
-from typing import Protocol, Tuple
+import time
+from typing import Callable, Optional, Protocol, Tuple
 
 from ..composition import GraphAccumulator, GraphDelta
 from ..contract import ContractError
+from ..query import GraphIndex
+
+
+#: Told the overlay id, its wall time, and the size of the delta it contributed.
+OverlayObserver = Callable[[str, float, int, int], None]
 
 
 class CanonicalOverlay(Protocol):
     overlay_id: str
 
-    def applies(self, graph: dict) -> bool: ...
+    def applies(self, graph: dict, index: "GraphIndex | None" = None) -> bool: ...
 
-    def enrich(self, graph: dict) -> GraphDelta: ...
+    def enrich(self, graph: dict, index: "GraphIndex | None" = None) -> GraphDelta: ...
 
 
 class OverlayRegistry:
@@ -30,7 +36,7 @@ class OverlayRegistry:
     def overlays(self) -> Tuple[CanonicalOverlay, ...]:
         return tuple(self._overlays)
 
-    def enrich(self, graph: dict) -> dict:
+    def enrich(self, graph: dict, observer: Optional[OverlayObserver] = None) -> dict:
         """Fold every applicable overlay's facts into one graph.
 
         The accumulator is what makes this affordable. Recomposing the whole graph after
@@ -41,16 +47,28 @@ class OverlayRegistry:
         It is created lazily so that a registry where nothing applies hands back the
         caller's own graph rather than a re-sorted copy of it, and so that the first
         overlay to apply still sees the graph exactly as it arrived.
+
+        ``observer`` is how the fold is measured. It is a permanent seam rather than
+        something a profiler monkeypatches, because the per-overlay cost is the number
+        this file exists to keep honest, and a patch that reaches inside a loop breaks
+        the first time the loop is rewritten.
         """
         current = graph
         accumulator = None
+        index = GraphIndex(graph)
         for overlay in self._overlays:
-            if not overlay.applies(current):
+            if not overlay.applies(current, index):
                 continue
-            delta = overlay.enrich(current)
+            started = time.perf_counter()
+            delta = overlay.enrich(current, index)
             if accumulator is None:
                 accumulator = GraphAccumulator(graph["nodes"], graph["edges"])
-            accumulator.apply(delta)
+            index.absorb(*accumulator.apply(delta))
             current = accumulator.view()
+            if observer is not None:
+                observer(
+                    overlay.overlay_id, time.perf_counter() - started,
+                    len(delta.nodes), len(delta.edges),
+                )
         return current
 

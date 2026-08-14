@@ -111,6 +111,7 @@ def main() -> None:
     # LACHESIS_EMIT_TOKENS from the caller still wins in either direction.
     if args.prune:
         os.environ.setdefault("LACHESIS_EMIT_TOKENS", "0")
+        os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.

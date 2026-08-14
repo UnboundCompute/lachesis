@@ -587,7 +587,17 @@ class BodyWalk:
         resolution = self._resolve(callee, frame)
         kind = "construct" if resolution.constructed_class else "call"
         node_id = stable_id(
-            kind, self.source.display, position["start_offset"],
+            # Deliberately "call" and not ``kind``. Whether this is a construct is
+            # decided by ``resolution``, which comes from the whole-tree Resolver:
+            # ``Foo()`` with ``Foo`` imported cannot be classified from this file
+            # alone. Feeding that into the identity would make the id of a call site
+            # depend on code in some other file, so a change over there would silently
+            # rename a node over here -- the one thing an identity may never do, and
+            # what makes per-file incremental reuse possible at all. The id namespace
+            # is a namespace; ``kind`` below still says what the node is, and nothing
+            # reads semantics back out of an id (only segments 1 and 2, owner and
+            # namespace, are ever parsed -- see core/identities.py).
+            "call", self.source.display, position["start_offset"],
             position["end_offset"], callee_text,
         )
         keywords = [keyword for keyword in node.keywords if keyword.arg is not None]

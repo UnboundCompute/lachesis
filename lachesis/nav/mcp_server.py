@@ -57,6 +57,38 @@ _DEFAULT_FORMAT = "text"
 # mode that narrows the surface, and only when explicitly requested.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 
+# The tools that genuinely read overlay-derived edges, and therefore the only ones a
+# core-only store has to fold for. Everything else was folding for nothing: measured on
+# the pinned corpus, twelve of the seventeen tools answer *identically* against a store
+# whose overlay tier was never built -- 4,523 rows, zero lost. Only `flow` lost real
+# ground (20 edges: POINTS_TO, READS_HEAP, VALUE_FLOWS_TO, all from the heap overlay),
+# and `points_to`/`aliases` read POINTS_TO out of the index by hand a few lines below.
+#
+# What it costs is honest and small: `hubs` and `search` rank by degree, and degree over
+# the core graph is lower than degree over the enriched one, so their *ordering* shifts
+# even though their membership does not.
+#
+# These five no longer fold the whole graph either. Each one names a seed, so each one
+# folds the call neighbourhood of that seed and nothing else -- see
+# `GraphStore.ensure_dataflow_cone`. `reaches` names two, and gets both.
+#
+# The order hazard is worth naming, because it is now real. A cone graft mutates the
+# shared index, so a `flow` from one seed leaves edges behind that a later `flow` from a
+# different seed can see, and running the two in the other order gives the second one a
+# smaller graph to reason over. The result is *monotone* -- more folding never removes an
+# edge -- so no answer is wrong, but two sessions can disagree on how much they found.
+# `cone.truncated` and the grafted counts are reported for exactly this reason: the
+# scope is part of the answer, so it is in the answer.
+OVERLAY_TOOLS = ("flow", "reaches", "sources_of", "points_to", "aliases")
+
+# Which argument each of them seeds from. A cone needs a centre, and the centre is the
+# node the caller already asked about; deriving it from the arguments keeps that in one
+# place rather than repeating a fold call in five branches below.
+OVERLAY_SEED_ARGS = {
+    "flow": ("seed",), "reaches": ("src", "sink"), "sources_of": ("sink",),
+    "points_to": ("value",), "aliases": ("value",),
+}
+
 # Canonical display order for tools/list: the centrality cold-start (hubs) leads, then
 # navigation, then value-flow reasoning, then the security tools last. Ordering only —
 # a name missing here (or a future tool) still shows, appended in definition order.
@@ -108,22 +140,32 @@ class _Ctx:
     def __init__(self, graph_path, overlay_path):
         self.store = GraphStore.load(graph_path, overlay_path=overlay_path)
         self._built = {}
-        self._tier = self.store.dataflow_ready
+        self._tier = (self.store.dataflow_ready,
+                      getattr(self.store, "cone_generation", 0))
         log(f"loaded {len(self.store.gl.nodes)} nodes; "
             f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges; "
-            f"dataflow tier: {'present' if self._tier else 'on demand'}")
+            f"dataflow tier: "
+            f"{'present' if self.store.dataflow_ready else 'on demand, per cone'}")
 
     def _analysis(self, key, build):
-        if self._tier != self.store.dataflow_ready:
+        # Two ways the index can move: the whole tier arrives (`dataflow_ready` flips)
+        # or a cone graft adds edges to the index in place (`cone_generation` ticks).
+        # The second leaves `dataflow_ready` false forever -- the store still has no
+        # full tier -- so watching only the flag would serve a `Reachability` built
+        # before the graft, which is exactly the answer the graft existed to improve.
+        tier = (self.store.dataflow_ready, getattr(self.store, "cone_generation", 0))
+        if self._tier != tier:
             self._built.clear()  # the index moved under them; every cache is stale
-            self._tier = self.store.dataflow_ready
+            self._tier = tier
         if key not in self._built:
             self._built[key] = build()
         return self._built[key]
 
     @property
     def reach(self):
-        self.store.ensure_dataflow_tier()
+        # No `ensure_dataflow_tier` here. The cone for this call's seed is folded in
+        # `call_tool`, which knows which argument the seed is; this property does not,
+        # and folding the whole graph because it cannot tell is what cost 49 seconds.
         return self._analysis("reach", lambda: Reachability(self.store))
 
     @property
@@ -150,11 +192,67 @@ def ctx():
     return _CTX
 
 
-def _seed(store, token):
+def _seeds(store, token):
+    """Every node this token could equally mean, best-first.
+
+    A node id means itself. A name means as many nodes as share it, and `si.peers`
+    decides which of the ranked hits are genuine rivals rather than also-rans."""
     if store.node(token):
-        return token
-    hits = store.resolve(token)
-    return hits[0]["node_id"] if hits else None
+        return [token]
+    return [hit["node_id"] for hit in si.peers(store.resolve(token), token)]
+
+
+def _seed(store, token):
+    seeds = _seeds(store, token)
+    return seeds[0] if seeds else None
+
+
+def _fold_cone(store, name, args):
+    """Fold the dataflow tier around this call's seeds. ``{}`` when nothing was scoped.
+
+    Every tool that reads overlay-derived edges names the node it is about, so the fold
+    can be scoped to that node's call neighbourhood rather than to the repo. This is the
+    only place that mapping lives — a tool branch below must not have to remember to
+    fold, because forgetting would not fail, it would quietly answer with fewer edges.
+
+    The report rides back to the caller as ``cone``. Costing a query is a reasonable
+    thing to want to see, and ``truncated`` there is load-bearing: it says the
+    neighbourhood hit its budget, so the answer below is computed over less than
+    everything that could reach the seed, and a smaller result may be an artifact of
+    the scope rather than a fact about the code.
+    """
+    seed_args = OVERLAY_SEED_ARGS.get(name)
+    if not seed_args:
+        return {}
+    folded = []
+    for key in seed_args:
+        token = args.get(key)
+        if not token:
+            continue
+        seed = _seed(store, token)
+        if seed:
+            folded.append(store.ensure_dataflow_cone(seed))
+    if not folded:
+        return {}
+    return {"cone": {
+        "members": sum(f["members"] for f in folded),
+        "nodes": sum(f["nodes"] for f in folded),
+        "edges": sum(f["edges"] for f in folded),
+        "truncated": any(f["truncated"] for f in folded),
+    }}
+
+
+def _alts(store, token):
+    """``{"homonyms": [...]}`` when a token names more than one node, else nothing.
+
+    The tools below that take a single seed still take a single seed — flow from four
+    different `funcA`s at once is four answers, not one. What changes is that the
+    caller is told the choice was made, and handed the ids it was made between, so a
+    silent collapse becomes a visible one it can undo with an explicit node_id."""
+    seeds = _seeds(store, token)
+    if len(seeds) < 2:
+        return {}
+    return {"homonyms": [_ref(store, node_id) for node_id in seeds]}
 
 
 def _ref(store, node_id):
@@ -325,12 +423,7 @@ def call_tool(name, args, format=None):
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
                                      "'comprehension' profile (security tool)"}, fmt)
     c = ctx()
-    # Every tool, not just the dataflow ones. The overlay tier is not confined to taint
-    # and points-to: the control-flow and async overlays add EXCEPTION_BRANCH/TRY_BODY/
-    # HANDLED_BY edges that guard profiling counts, and hub ranking is degree-based over
-    # the whole graph. Enriching selectively would make an answer depend on which tool
-    # you called first, so a core-only store pays once, here, and is cached from then on.
-    c.store.ensure_dataflow_tier()
+    cone = _fold_cone(c.store, name, args)
     store, gl = c.store, c.store.gl
     text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
 
@@ -353,13 +446,31 @@ def call_tool(name, args, format=None):
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
         return _emit(name, page, fmt, offset, limit)
     if name in ("callers", "callees"):
-        seed = _seed(store, args["name"])
-        if not seed:
+        seeds = _seeds(store, args["name"])
+        if not seeds:
             return _emit(name, {"error": f"no node named {args['name']!r}"}, fmt)
+        direct_only = bool(args.get("direct_only"))
         move = si.callers if name == "callers" else si.callees
-        moves = move(gl, seed, direct_only=bool(args.get("direct_only")),
-                     with_dispatch=text)
-        return _emit(name, {name: moves, "of": args["name"]}, fmt, offset, limit)
+        # Every homonym, unioned — not the first one. `callers("funcA")` returning only
+        # the callers of whichever `funcA` sorted first is the failure a vulnerability
+        # hunter cannot see: the answer looks complete. Each row carries its own
+        # node_id, and `of` names the seeds, so the union stays separable.
+        moves, seen = [], set()
+        for seed in seeds:
+            for row in move(gl, seed, direct_only=direct_only, with_dispatch=text,
+                            resolver=store.resolver):
+                if row["node_id"] in seen:
+                    continue
+                seen.add(row["node_id"])
+                moves.append(row)
+        payload = {name: moves, "of": args["name"],
+                   **_alts(store, args["name"])}
+        if name == "callees" and not direct_only:
+            # Invariant 2: an undecidable call is a node, not an omission.
+            payload["unresolved"] = [row for seed in seeds
+                                     for row in si.unresolved_callees(
+                                         gl, seed, store.resolver)]
+        return _emit(name, payload, fmt, offset, limit)
     if name == "read_body":
         seed = args.get("node_id") if store.node(args.get("node_id") or "") \
             else _seed(store, args.get("name") or "")
@@ -390,27 +501,29 @@ def call_tool(name, args, format=None):
         seed = _seed(store, args["seed"])
         if not seed:
             return _emit(name, {"error": f"no node for {args['seed']!r}"}, fmt)
-        return _emit(name, c.reach.flow(seed, limit=int(args.get("limit", 200))),
-                     fmt, offset, limit)
+        return _emit(name, {**c.reach.flow(seed, limit=int(args.get("limit", 200))),
+                            **_alts(store, args["seed"]), **cone}, fmt, offset, limit)
     if name == "reaches":
         src, sink = _seed(store, args["src"]), _seed(store, args["sink"])
         if not src or not sink:
             return _emit(name, {"error": "could not resolve src/sink"}, fmt)
-        return _emit(name, c.reach.reaches(src, sink), fmt, offset, limit)
+        return _emit(name, {**c.reach.reaches(src, sink),
+                            **_alts(store, args["src"]), **cone}, fmt, offset, limit)
     if name == "sources_of":
         sink = _seed(store, args["sink"])
         if not sink:
             return _emit(name, {"error": f"no node for {args['sink']!r}"}, fmt)
-        return _emit(name, c.reach.sources_of(sink, limit=int(args.get("limit", 200))),
-                     fmt, offset, limit)
+        return _emit(name, {**c.reach.sources_of(sink, limit=int(args.get("limit", 200))),
+                            **_alts(store, args["sink"]), **cone}, fmt, offset, limit)
     if name == "points_to":
         value = _seed(store, args["value"])
         if not value:
             return _emit(name, {"error": f"no node for {args['value']!r}"}, fmt)
         heaps = list(store.index.targets(value, "POINTS_TO"))
         edges = store.index.outgoing_of_kind(value, "POINTS_TO")
-        return _emit(name, store.path_shape([store.node(value)] + heaps, edges,
-                                            manifest={"move": "points_to", "value": value}),
+        shape = store.path_shape([store.node(value)] + heaps, edges,
+                                 manifest={"move": "points_to", "value": value})
+        return _emit(name, {**shape, **_alts(store, args["value"]), **cone},
                      fmt, offset, limit)
     if name == "aliases":
         value = _seed(store, args["value"])
@@ -425,15 +538,17 @@ def call_tool(name, args, format=None):
                                   "kind": "POINTS_TO",
                                   "properties": {"reason": "alias-via-heap",
                                                  "via": heap["id"]}})
-        return _emit(name, store.path_shape([store.node(value)] + alias_nodes, edges,
-                                            manifest={"move": "aliases", "value": value}),
+        shape = store.path_shape([store.node(value)] + alias_nodes, edges,
+                                 manifest={"move": "aliases", "value": value})
+        return _emit(name, {**shape, **_alts(store, args["value"]), **cone},
                      fmt, offset, limit)
     if name == "guards":
         fn = _seed(store, args["fn"])
         if not fn:
             return _emit(name, {"error": f"no function for {args['fn']!r}"}, fmt)
         return _emit(name, {"function": _ref(store, fn),
-                            "guard_signal": c.guards.profile(fn)}, fmt)
+                            "guard_signal": c.guards.profile(fn),
+                            **_alts(store, args["fn"])}, fmt)
     if name == "call_roles":
         fn = _seed(store, args["fn"])
         if not fn:
@@ -442,12 +557,16 @@ def call_tool(name, args, format=None):
         return _emit(name, {"function": _ref(store, fn),
                             "calls": [{"callee": r["callee"], "role": r["role"],
                                        "fact_origin": r["fact_origin"],
-                                       "at": f"{r['file']}:{r['line']}"} for r in recs]}, fmt)
+                                       "at": f"{r['file']}:{r['line']}"} for r in recs],
+                            **_alts(store, args["fn"])}, fmt)
     if name == "siblings":
-        hits = store.resolve(args["sym"])
+        # `diff` takes the resolved *entry*, not an id, so this one keeps `store.resolve`
+        # rather than going through `_seeds`.
+        hits = si.peers(store.resolve(args["sym"]), args["sym"])
         if not hits:
             return _emit(name, {"error": f"no node named {args['sym']!r}"}, fmt)
-        return _emit(name, c.siblings.diff(hits[0]), fmt, offset, limit)
+        return _emit(name, {**c.siblings.diff(hits[0]),
+                            **_alts(store, args["sym"])}, fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -479,10 +598,26 @@ def main():
     # Config precedence: explicit argv wins, else env. The graph path may come from
     # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
     _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")
-    if not _GRAPH_PATH:
-        print("usage: mcp_server.py <graph.kuzu> [overlay.json] [profile]\n"
-              "   or: LACHESIS_GRAPH=<graph.kuzu> mcp_server.py", file=sys.stderr)
-        return 2
+    # A graph only exists after a build somebody had to know to run, which made this
+    # server unusable as the first thing anyone tries. So a directory is accepted in
+    # the graph's place, and no argument at all means the working directory: the
+    # index is built or reused, and the client's config needs no paths in it.
+    if not _GRAPH_PATH or os.path.isdir(_GRAPH_PATH) and not _GRAPH_PATH.endswith(".kuzu"):
+        from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
+                                          ensure_graph)
+        from lachesis.cli.progress import Progress
+        source = _GRAPH_PATH or os.getcwd()
+        try:
+            # Progress writes to stderr only; stdout is the JSON-RPC channel.
+            graph, _ = ensure_graph(source, progress=Progress(enabled=True))
+        except EnvironmentProblem as error:
+            for check in error.checks:
+                print(f"lachesis-mcp: {check.name}: {check.detail}", file=sys.stderr)
+            return 3
+        except NoSourceFound as error:
+            print(f"lachesis-mcp: {error}", file=sys.stderr)
+            return 2
+        _GRAPH_PATH = str(graph)
     _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
     # Profile: explicit 3rd argv wins, else env (LACHESIS_PROFILE, back-compat
     # LACHESIS_MCP_PROFILE), else the default "all". Only "comprehension" narrows the

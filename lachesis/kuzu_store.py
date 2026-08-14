@@ -55,6 +55,8 @@ import tempfile
 import zlib
 from typing import Iterable, Optional, Sequence
 
+from lachesis.indices import build_callsite_index, build_decl_index, exported_ids, index_rows
+
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
     import kuzu  # type: ignore
 except Exception:  # pragma: no cover - a broken install, not a supported mode
@@ -135,6 +137,10 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 #   6 — the deflate uses a preset dictionary shared by every row, kept in the manifest.
 #   7 — `compiler_node_id` is coded against a prefix table in the manifest.
 #   8 — the `id` primary key is coded against that same table.
+#   9 — four resolution tables: DeclIndex, CallsiteIndex, ResolveMemo, ConeMemo.
+# v9 adds tables and writes two of them; a v8 reader handed a v9 store would simply not
+# see them, and a v9 reader handed a v8 store would fail on a table that is not there.
+# The memo tables ship empty on purpose — see `_index_ddl` for why they are declared now.
 # v8 is a separate version from v7 and not a refinement of it: a v7 store carries the
 # prefix table but an *uncoded* `id`, so a v8 reader handed one would decode a value
 # that was never encoded. The stamp is what turns that into a sentence rather than a
@@ -147,7 +153,7 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 8
+STORE_FORMAT_VERSION = 9
 
 
 def db_file(db_dir: str) -> str:
@@ -177,8 +183,8 @@ def manifest_payload(graph: dict, snapshots: Optional[Sequence[object]]) -> dict
             "frontend_id": item.frontend_id,
             "languages": list(item.languages),
             "capabilities": item.capabilities,
-            "node_count": len(item.nodes),
-            "edge_count": len(item.edges),
+            "node_count": item.payload_node_count,
+            "edge_count": item.payload_edge_count,
             "diagnostic_count": item.manifest.get("diagnostic_count", 0),
         } for item in (snapshots or [])],
         "node_count": len(graph.get("nodes", [])),
@@ -559,6 +565,67 @@ def _deferred_ddl() -> str:
             "tgt STRING, unit STRING, props BLOB, PRIMARY KEY (seq))")
 
 
+def _index_ddl() -> list:
+    """The four resolution tables: two name indices, two memo tables.
+
+    All four are declared together, and all four are declared *unconditionally*. An
+    empty table is a fact — "this store holds no call sites" — whereas an absent one is
+    a question, and a reader cannot tell a store built before the table existed from a
+    store whose index legitimately came out empty. Declaring the memo tables here even
+    though nothing writes them yet is the same trade in time rather than in content: a
+    format bump is a rebuild for every user (KUZU_STORE_SPEC.md), so the version that
+    adds the indices pays for the memos too rather than charging twice.
+
+    ``seq`` is a primary key because Kùzu needs one and means nothing beyond insertion
+    order — the same shape as ``DeferredEdge``, and for the same reason: these are rows
+    read out whole and grouped by name, never traversed.
+
+    Every field is a typed column and there is no ``props`` blob, deliberately. The
+    point of an index is to be queryable without decompressing anything, in Cypher, by
+    somebody who is not this module.
+
+    ``graph_hash`` is a **column** on both memo tables, not an assumption. The base
+    store and its ``.enriched`` sidecar are two databases over two hashes, and a memo
+    that crossed between them would answer a question about a graph it never saw.
+    """
+    return [
+        ("CREATE NODE TABLE DeclIndex(seq INT64, name STRING, node_id STRING, "
+         "kind STRING, granularity STRING, file STRING, line INT64, "
+         "signature STRING, unit STRING, exported BOOLEAN, "
+         "declaration_only BOOLEAN, PRIMARY KEY (seq))"),
+        ("CREATE NODE TABLE CallsiteIndex(seq INT64, callee_name STRING, "
+         "node_id STRING, owner_id STRING, file STRING, line INT64, unit STRING, "
+         "form STRING, receiver STRING, PRIMARY KEY (seq))"),
+        # Phase 2 writes these; v9 only promises they exist.
+        #
+        # `truncated` is on ResolveMemo and not only on ConeMemo because measurement
+        # said so. On Suricata's `src/`, `SBB_RB_FIND` and eight siblings resolve to
+        # **473** declarations each — the red-black-tree macros, expanded `static` into
+        # every translation unit that includes the header — and `TCPSACK_RB_*` to 183.
+        # A conservative candidate list has to be capped somewhere around there, and a
+        # cap that cannot say it capped is a wrong answer rather than a partial one.
+        # It is a thin tail (50 of 22,233 call sites, 0.2%) and that is the argument for
+        # the flag rather than against it: the case is rare enough to go unnoticed and
+        # large enough to matter when it does not.
+        ("CREATE NODE TABLE ResolveMemo(seq INT64, graph_hash STRING, "
+         "node_id STRING, target STRING, candidates STRING, confidence STRING, "
+         "truncated BOOLEAN, PRIMARY KEY (seq))"),
+        ("CREATE NODE TABLE ConeMemo(seq INT64, graph_hash STRING, node_id STRING, "
+         "budget INT64, members STRING, truncated BOOLEAN, PRIMARY KEY (seq))"),
+    ]
+
+
+# Column order is the COPY contract for each index table: it must match `_index_ddl`.
+_DECL_INDEX_COLUMNS = ("name", "node_id", "kind", "granularity", "file", "line",
+                       "signature", "unit", "exported", "declaration_only")
+_CALLSITE_INDEX_COLUMNS = ("callee_name", "node_id", "owner_id", "file", "line",
+                           "unit", "form", "receiver")
+# Which of those columns hold a node id, and are therefore written coded.
+_INDEX_ID_COLUMNS = ("node_id", "owner_id")
+_INDEX_INT_COLUMNS = frozenset({"line"})
+_INDEX_BOOL_COLUMNS = frozenset({"exported", "declaration_only"})
+
+
 # -- writer -------------------------------------------------------------------
 
 def write_kuzu_graph(
@@ -641,6 +708,18 @@ def write_kuzu_graph(
         conn.execute(stmt)
     if deferred:
         conn.execute(_deferred_ddl())
+    for stmt in _index_ddl():
+        conn.execute(stmt)
+
+    # The name indices, over what the store actually holds. Built here rather than in
+    # `enrich_graph` because a store need not be enriched — `cli/indexer.py` writes one
+    # with `enrich=False` — and this is the single choke point every store passes
+    # through. They are a function of the *kept* nodes, so the index describes the store
+    # and not the graph it was projected from.
+    decl_index = build_decl_index(nodes, exported_ids(edges))
+    callsite_index = build_callsite_index(nodes)
+    decl_rows = index_rows(decl_index)
+    callsite_rows = index_rows(callsite_index)
 
     # Bulk `COPY FROM` staged Parquet is the fast path (per-row inserts measured
     # ~9.4 min/package — too slow for whole-repo). When pyarrow is absent we fall
@@ -681,11 +760,19 @@ def write_kuzu_graph(
     # The one exception is a deferred edge: its far endpoint is a node this store does not
     # hold, so no pass over `nodes` will ever have seen that prefix, and leaving it out
     # would store the longest ids in the file uncoded.
+    # The index tables' id columns join the pass too. Their `node_id`s are node ids this
+    # store holds, so their prefixes are already here by way of `n.get("id")` — but an
+    # `owner_id` can name a node that pruning dropped, and a prefix missing from the
+    # table means that column is stored uncoded, which is the one case the codec cannot
+    # notice on its own.
     id_prefixes = build_id_prefixes(itertools.chain(
         (n.get("id") for n in nodes),
         ((n.get("properties") or {}).get(column)
          for n in nodes for column in CODED_PROP_COLUMNS),
         (end for e in deferred for end in (e.get("source"), e.get("target"))),
+        (row.get(column)
+         for row in itertools.chain(decl_rows, callsite_rows)
+         for column in _INDEX_ID_COLUMNS),
     ))
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(id_prefixes)}
 
@@ -699,6 +786,10 @@ def write_kuzu_graph(
             _load_deferred_bulk(conn, deferred, elide=elide_constants,
                                 stage_dir=stage_dir, node_units=node_units,
                                 codec=deferred_codec, id_codes=id_codes)
+            _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
+                             stage_dir=stage_dir, id_codes=id_codes)
+            _load_index_bulk(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
+                             callsite_rows, stage_dir=stage_dir, id_codes=id_codes)
     else:  # pragma: no cover - exercised only without pyarrow
         _load_nodes_rowwise(conn, nodes, elide=elide_constants, codec=node_codec,
                             id_codes=id_codes)
@@ -707,6 +798,10 @@ def write_kuzu_graph(
         _load_deferred_rowwise(conn, deferred, elide=elide_constants,
                                node_units=node_units, codec=deferred_codec,
                                id_codes=id_codes)
+        _load_index_rowwise(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
+                            id_codes=id_codes)
+        _load_index_rowwise(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
+                            callsite_rows, id_codes=id_codes)
     # counts describe what the store actually holds, which is the pruned set, not the
     # composed input — a reader comparing them against a scan should find them equal.
     payload = manifest_payload(graph, snapshots)
@@ -721,6 +816,10 @@ def write_kuzu_graph(
     # to give them their far endpoint back. Equal to `unresolved_edge_count` for a
     # deferred store, zero for every other one.
     payload["deferred_edge_count"] = len(deferred)
+    # Counts, not booleans. "The index exists" is true of an empty table and tells a
+    # reader nothing; a zero here on a store that holds functions is a visible fault.
+    payload["decl_index_count"] = len(decl_rows)
+    payload["callsite_index_count"] = len(callsite_rows)
     # A reduced store is not a smaller graph, it is half of one: the bodies are missing on
     # purpose and a load has to recompile them. Saying so in the manifest is what lets a
     # reader tell that apart from a store that simply holds less.
@@ -908,6 +1007,35 @@ def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: s
     conn.execute(f"COPY DeferredEdge FROM '{path}'")
 
 
+def _index_cell(column: str, value, codes: dict):
+    """One index cell in stored form: ids coded, booleans real booleans, rest as-is."""
+    if column in _INDEX_ID_COLUMNS:
+        return encode_id(value, codes) if value else None
+    if column in _INDEX_BOOL_COLUMNS:
+        return bool(value)
+    return value
+
+
+def _load_index_bulk(conn, table_name: str, columns: tuple, rows: list, *,
+                     stage_dir: str, id_codes: Optional[dict] = None) -> None:
+    if not rows:
+        return
+    codes = id_codes or {}
+    staged = {"seq": pa.array(list(range(len(rows))), pa.int64())}
+    for column in columns:
+        cells = [_index_cell(column, row.get(column), codes) for row in rows]
+        if column in _INDEX_BOOL_COLUMNS:
+            staged[column] = pa.array(cells, pa.bool_())
+        elif column in _INDEX_INT_COLUMNS:
+            staged[column] = pa.array(
+                [None if cell is None else int(cell) for cell in cells], pa.int64())
+        else:
+            staged[column] = _str_col(cells)
+    path = os.path.join(stage_dir, f"{table_name.lower()}.parquet")
+    pq.write_table(pa.table(staged), path)
+    conn.execute(f"COPY {table_name} FROM '{path}'")
+
+
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
 
 def _blob_param(blob: bytes) -> str:
@@ -1000,6 +1128,30 @@ def _load_deferred_rowwise(conn, deferred: list[dict], *, elide: bool,
                 "props": _blob_param(
                     codec.blob(seq, edge.get("properties") or {}, elide)),
             })
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _load_index_rowwise(conn, table_name: str, columns: tuple, rows: list, *,
+                        id_codes: Optional[dict] = None) -> None:
+    if not rows:
+        return
+    codes = id_codes or {}
+    placeholders = ", ".join(["seq: $seq"] + [f"{c}: ${c}" for c in columns])
+    stmt = f"CREATE (r:{table_name} {{{placeholders}}})"
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for seq, row in enumerate(rows):
+            params = {"seq": seq}
+            for column in columns:
+                cell = _index_cell(column, row.get(column), codes)
+                params[column] = (
+                    None if cell is None and column in _INDEX_INT_COLUMNS
+                    else (int(cell) if column in _INDEX_INT_COLUMNS else cell)
+                )
+            conn.execute(stmt, params)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

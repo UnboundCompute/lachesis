@@ -45,14 +45,16 @@ class TaintPropagation:
 
     overlay_id = "taint-propagation"
 
-    def applies(self, graph: dict) -> bool:
-        return any(
-            node.get("kind") == "source" or _roles(node, "source")
-            for node in graph.get("nodes", [])
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        # A source may also be any node *carrying* the role, which no bucket answers, so
+        # the cheap half is asked first and the scan only runs when it says no.
+        return index.has_kind("source") or any(
+            _roles(node, "source") for node in graph.get("nodes", [])
         )
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes = []
         edges = []
         adjacency: dict[str, list[tuple[str, str, dict]]] = defaultdict(list)

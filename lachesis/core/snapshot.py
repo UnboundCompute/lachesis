@@ -10,6 +10,7 @@ what the snapshot says about it.
 from __future__ import annotations
 
 import json
+import marshal
 from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Tuple
 
@@ -33,7 +34,14 @@ def _read_tiers(manifest: dict, output_dir: str) -> Iterator[Tuple[str, dict]]:
     for tier_name, tier_path in _tier_files(manifest, output_dir):
         if not tier_path.is_file():
             raise ContractError(f"missing tier file: {tier_path}")
-        yield tier_name, json.loads(tier_path.read_text(encoding="utf-8"))
+        # Format is carried by the manifest-declared filename: a frontend that spills
+        # marshal (C's large tier payloads) names its files `.bin`; the json route
+        # (Python/TS) is unchanged. marshal only round-trips JSON-shaped values, which
+        # every frontend already emits (see snapshot_from_payloads' invariant).
+        if tier_path.suffix == ".bin":
+            yield tier_name, marshal.loads(tier_path.read_bytes())
+        else:
+            yield tier_name, json.loads(tier_path.read_text(encoding="utf-8"))
 
 
 def _merge_tiers(

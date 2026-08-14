@@ -203,6 +203,12 @@ class GraphStore:
         self.index = self.gl.index
         self.graph_path = graph_path
         self._entries: list[dict] | None = None
+        # Declarations whose neighbourhood has already been folded, so a second question
+        # about the same region is free and an overlapping one folds only its remainder.
+        self._folded_cones: frozenset = frozenset()
+        # Bumped by every graft that actually added an edge. Anything holding a
+        # analysis built over this index watches it to know the ground moved.
+        self.cone_generation = 0
         # an in-memory graph is whatever the caller handed us; there is no core store to
         # re-enrich from, so the lazy path is a no-op
         self._enriched = True
@@ -222,6 +228,8 @@ class GraphStore:
         self.index = gl.index
         self.graph_path = graph_path
         self._entries = None
+        self._folded_cones = frozenset()
+        self.cone_generation = 0
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
@@ -344,6 +352,78 @@ class GraphStore:
         self._enriched = True
         return self
 
+    def ensure_dataflow_cone(self, seed_id: str, budget: int = None) -> dict:
+        """Fold the overlay dataflow tier over the neighbourhood of ``seed_id`` only.
+
+        The scoped counterpart to ``ensure_dataflow_tier``, and the reason that one
+        should now almost never run. Folding the whole graph to answer a question about
+        one function is the cost this whole tier exists to stop paying: on a 222k-node
+        store the first ``flow`` call spent 49 seconds rebuilding the entire dataflow
+        tier, of which the caller read a few dozen edges.
+
+        What gets folded is the *call neighbourhood* of the seed's owning declaration --
+        callees and callers both, since a backward dataflow question depends on what the
+        callers pass in -- expanded to every node those declarations own. The subgraph is
+        materialized, the four registries fold over it exactly as they would over a whole
+        graph, and the edges the fold invented are grafted into the live index.
+
+        **This is not equal to the whole-graph fold, and the difference is reported.**
+        A value-flow fixpoint over a cone cannot see a path that leaves the cone and
+        comes back, so an answer computed here can be smaller than the eager one. That
+        was an accepted trade, but only on the condition that it is never silent:
+        ``truncated`` is true whenever the neighbourhood hit its budget, and callers
+        surface it. A quiet under-approximation would be worse than the 49 seconds.
+
+        Returns ``{"members", "nodes", "edges", "truncated"}`` -- what it folded and what
+        it grafted -- so the cost is inspectable rather than a claim.
+        """
+        from lachesis.kuzu_store import (manifest_capabilities, manifest_languages,
+                                         read_store_manifest)
+        from lachesis.pipeline import enrich_graph
+        from lachesis.nav.kuzu_index import materialize_subgraph
+        from lachesis.resolution import FOLD_BUDGET
+
+        empty = {"members": 0, "nodes": 0, "edges": 0, "truncated": False}
+        # A store that already carries the whole tier has nothing to scope, and an
+        # in-memory graph has no store to scope it out of.
+        if getattr(self, "_enriched", True) or not hasattr(self.index, "graft"):
+            return empty
+        seed = self.index.nodes.get(seed_id)
+        if seed is None:
+            return empty
+        # A call site's dataflow lives in its owner's body, so the apex is the
+        # declaration either way -- the seed itself when it is one, its owner when it
+        # is a node inside one.
+        props = seed.get("properties") or {}
+        apex = props.get("owner_function_id") or props.get("function_id") or seed_id
+        hood = self.resolver.resolve_neighbourhood(
+            apex, FOLD_BUDGET if budget is None else budget)
+        members = hood["members"]
+        if members <= self._folded_cones:
+            return {**empty, "members": len(members),
+                    "truncated": hood["truncated"]}
+        wanted = set(members)
+        for member in members:
+            wanted.update(self.index.by_owner.get(member, ()))
+        core = materialize_subgraph(self.index, wanted)
+        manifest = read_store_manifest(self._core_path)
+        enriched = enrich_graph(core, manifest_languages(manifest),
+                                manifest_capabilities(manifest))
+        seen = {node["id"] for node in core["nodes"]}
+        fresh_nodes = [n for n in enriched["nodes"] if n["id"] not in seen]
+        known = {(e["source"], e["target"], e["kind"]) for e in core["edges"]}
+        fresh_edges = [e for e in enriched["edges"]
+                       if (e["source"], e["target"], e["kind"]) not in known]
+        added = self.index.graft(fresh_nodes, fresh_edges)
+        if added or fresh_nodes:
+            self.cone_generation += 1
+        self._folded_cones |= members
+        # `entries` ranks by degree and the graft just changed degrees, so an index
+        # built before it describes the graph as it was.
+        self._entries = None
+        return {"members": len(members), "nodes": len(fresh_nodes),
+                "edges": added, "truncated": hood["truncated"]}
+
     # -- name entry / teleport ----------------------------------------------
 
     @property
@@ -351,6 +431,36 @@ class GraphStore:
         if self._entries is None:
             self._entries = si.build_index(self.gl)
         return self._entries
+
+    @property
+    def resolver(self):
+        """The lazy resolution tier over this store's index.
+
+        Lazy like ``entries``, and for the same reason: a store that is only ever asked
+        for a file listing should not pay for one. Bound to the index rather than to the
+        store because that is what the resolver actually reads — and because
+        ``ensure_dataflow_tier`` swaps ``self.index`` for a larger one, at which point a
+        resolver cached on the store would be memoizing answers about a graph that is no
+        longer the one being queried.
+        """
+        from lachesis.resolution import resolver_for
+        return resolver_for(self.index, self.graph_hash())
+
+    def graph_hash(self) -> str:
+        """The identity a memo is keyed on: which graph these answers are about.
+
+        The base store and its ``.enriched`` sidecar are two databases whose call sites
+        resolve differently, so a memo that crossed between them would be a confident
+        wrong answer. The open store's own manifest hash is what distinguishes them.
+        """
+        from lachesis.kuzu_store import read_store_manifest
+        try:
+            path = getattr(self, "graph_path", None)
+            manifest = read_store_manifest(path) if path else {}
+        except Exception:
+            return ""
+        return str(manifest.get("graph_content_hash")
+                   or manifest.get("core_content_hash") or "")
 
     def resolve(self, name: str) -> list[dict]:
         """Name -> candidate index entries (exact first, else fuzzy)."""

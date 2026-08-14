@@ -8,6 +8,10 @@ from ..identities import stable_id
 from ..query import GraphIndex
 
 
+# The control-flow node kinds of core/schema.py, spelled out so the bucket lookup can
+# do the narrowing a `kind.startswith("cfg-")` scan over every node used to do.
+CFG_NODE_KINDS = ("cfg-entry", "cfg-block", "cfg-condition", "cfg-merge", "cfg-exit")
+
 CFG_EDGE_KINDS = frozenset({
     "CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK", "SWITCH_CASE",
     "EXCEPTION_BRANCH", "RUNS_FINALLY", "MERGES_AT",
@@ -48,12 +52,12 @@ class BranchHistory:
 
     overlay_id = "branch-history"
 
-    def applies(self, graph: dict) -> bool:
-        kinds = {node.get("kind") for node in graph.get("nodes", [])}
-        return "cfg-entry" in kinds and "definition" in kinds
+    def applies(self, graph: dict, index: GraphIndex | None = None) -> bool:
+        index = GraphIndex(graph) if index is None else index
+        return index.has_kind("cfg-entry") and index.has_kind("definition")
 
-    def enrich(self, graph: dict) -> GraphDelta:
-        index = GraphIndex(graph)
+    def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta:
+        index = GraphIndex(graph) if index is None else index
         nodes: list[dict] = []
         edges: list[dict] = []
         emitted: set[tuple[str, str, str]] = set()
@@ -129,16 +133,13 @@ class BranchHistory:
         cfg_nodes_by_function: dict[str, set[str]] = defaultdict(set)
         cfg_entries_by_function: dict[str, list[dict]] = defaultdict(list)
         node_to_function: dict[str, str] = {}
-        for node in index.nodes.values():
-            kind = node.get("kind", "")
-            if not kind.startswith("cfg-"):
-                continue
+        for node in index.nodes_of_kind(*CFG_NODE_KINDS):
             owner = node.get("properties", {}).get("function_id")
             if not owner:
                 continue
             cfg_nodes_by_function[owner].add(node["id"])
             node_to_function[node["id"]] = owner
-            if kind == "cfg-entry":
+            if node.get("kind") == "cfg-entry":
                 cfg_entries_by_function[owner].append(node)
         for owner, statements in statements_by_function.items():
             for statement in statements:
