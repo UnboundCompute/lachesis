@@ -878,6 +878,22 @@ def _arrow_type(column: str):
     return pa.int64() if column in _INT_COLUMNS else pa.string()
 
 
+def _utf8_safe(text: str) -> str:
+    """Strip code points that cannot round-trip through UTF-8.
+
+    Parquet/Arrow string columns are UTF-8, so a lone UTF-16 surrogate — e.g. an
+    astral emoji that a byte-offset snippet sliced through the middle of — is not
+    encodable and makes ``pa.array`` raise, aborting the whole graph write over a
+    single node. The authoritative copy of this value lives in the ``props`` blob
+    (this column is a denormalized promotion the tail overrides on read), so
+    replacing the unencodable point here is invisible to reconstruction."""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def _cell(column: str, value):
     """Coerce a promoted-column value to its Parquet type.
 
@@ -894,11 +910,12 @@ def _cell(column: str, value):
             return int(value)
         except (TypeError, ValueError):
             return None
-    return value if isinstance(value, str) else str(value)
+    return _utf8_safe(value if isinstance(value, str) else str(value))
 
 
 def _str_col(values: list) -> "pa.Array":
-    return pa.array([None if v is None else str(v) for v in values], pa.string())
+    return pa.array(
+        [None if v is None else _utf8_safe(str(v)) for v in values], pa.string())
 
 
 def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,

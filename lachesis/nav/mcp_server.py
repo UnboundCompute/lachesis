@@ -57,6 +57,14 @@ _DEFAULT_FORMAT = "text"
 # mode that narrows the surface, and only when explicitly requested.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 
+# Removed for now: each of these builds `GuardProfiles`, whose `_build()` scans every
+# guard-kind edge across the WHOLE graph (and `call_roles` also full-scans CALLS). On a
+# large graph (e.g. Django: millions of CONDITION/short-circuit edges) that is a
+# multi-minute, all-cores cold start. A hard "never scan the whole graph" rule takes
+# precedence, so these are hidden from tools/list and refuse to run until the guard
+# signal is reworked to a bounded, per-seed computation.
+DISABLED_TOOLS = SECURITY_TOOLS
+
 # The tools that genuinely read overlay-derived edges, and therefore the only ones a
 # core-only store has to fold for. Everything else was folding for nothing: measured on
 # the pinned corpus, twelve of the seventeen tools answer *identically* against a store
@@ -102,8 +110,10 @@ TOOL_ORDER = (
 
 def _visible_tools():
     """TOOLS filtered by the active profile and sorted into canonical order."""
-    tools = TOOLS if _PROFILE != "comprehension" \
-        else [t for t in TOOLS if t["name"] not in SECURITY_TOOLS]
+    hidden = set(DISABLED_TOOLS)
+    if _PROFILE == "comprehension":
+        hidden |= set(SECURITY_TOOLS)
+    tools = [t for t in TOOLS if t["name"] not in hidden]
     rank = {n: i for i, n in enumerate(TOOL_ORDER)}
     return sorted(tools, key=lambda t: rank.get(t["name"], len(rank)))
 
@@ -419,6 +429,9 @@ def call_tool(name, args, format=None):
 
     if name == "load_graph":
         return _load_graph(args)
+    if name in DISABLED_TOOLS:
+        return _emit(name, {"error": f"tool {name!r} is disabled: it requires a "
+                                     "whole-graph guard scan (removed for now)"}, fmt)
     if _PROFILE == "comprehension" and name in SECURITY_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
                                      "'comprehension' profile (security tool)"}, fmt)
