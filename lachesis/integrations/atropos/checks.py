@@ -177,8 +177,13 @@ class AtroposCSliceEnrich(unittest.TestCase):
                 if e["kind"] == "VALUE_FLOWS_TO"
                 and e.get("properties", {}).get("fact_origin") == "atropos-model"}
 
-    def test_gold_set_resolves_to_seven_stamps(self):
-        self.assertEqual(len(self.stamps), 7)
+    def test_original_gold_stamps_remain_present_as_catalog_grows(self):
+        model_ids = {stamp["model_id"] for stamp in self.stamps}
+        self.assertTrue({
+            "c.std.memcpy.a2", "c.std.memcpy.a0", "c.std.memcpy.a1-a0",
+            "c.std.read.a1", "c.std.getenv.ret", "c.std.strdup.a0-ret",
+            "c.std.system.a0",
+        }.issubset(model_ids))
 
     def test_sinks_land_on_exact_argument_nodes(self):
         got = {n["properties"]["model_id"]: self.label_of[n["properties"]["value_id"]]
@@ -201,15 +206,39 @@ class AtroposCSliceEnrich(unittest.TestCase):
     def test_overlay_is_additive_base_nodes_untouched(self):
         stamped_ids = {n["id"] for n in self.stamped["nodes"]}
         self.assertTrue(self.base_node_ids.issubset(stamped_ids))
-        # the only new nodes are the five role nodes (three sinks, two sources);
-        # summaries contribute edges, not nodes.
-        self.assertEqual(len(stamped_ids - self.base_node_ids), 5)
+        # Only source/sink role stamps add nodes; summaries contribute edges. Keep
+        # this invariant independent of unrelated catalog growth.
+        role_count = len(self._role_nodes("source")) + len(self._role_nodes("sink"))
+        self.assertEqual(len(stamped_ids - self.base_node_ids), role_count)
+
+    def test_copy_capacity_registry_enumerates_every_bound_size_fact(self):
+        from lachesis.planner.unbounded_copy import MemoryCopyCapacity
+
+        expected = {
+            node["properties"]["model_id"] for node in self._role_nodes("sink")
+            if node["properties"].get("sink_kind") == "buffer-size"
+        }
+        result = MemoryCopyCapacity(self.stamped).enumerate()
+        actual = [row["observations"]["atropos_model_id"]
+                  for row in result["candidates"]]
+        self.assertCountEqual(actual, expected)
+        self.assertEqual(len(actual), len(expected))
+        self.assertTrue(all("state" not in row and "verdict" not in row
+                            for row in result["candidates"]))
 
     def test_taint_consumes_stamped_roles(self):
         # Taint ran over the stamped graph in setUp; it must have propagated at
         # least one flow rather than erroring on the Atropos role nodes.
         self.assertTrue(any(e["kind"] == "TAINT_FLOWS_TO"
                             for e in self.final["edges"]))
+
+    def test_dual_source_sink_attachment_does_not_make_a_zero_hop_witness(self):
+        reaches = [node for node in self.final["nodes"]
+                   if node.get("kind") == "taint-reach"]
+        self.assertFalse(any(
+            node["properties"].get("source_value_id")
+            == node["properties"].get("sink_value_id")
+            for node in reaches))
 
 
 
@@ -343,7 +372,10 @@ class AtroposOutParamWitness(unittest.TestCase):
         cls.binder = _load_binder(atropos)
 
     def _witnesses(self, graph):
-        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"]
+        by_id = {node["id"]: node for node in graph["nodes"]}
+        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"
+                and (by_id.get(n["properties"].get("sink_id"), {}).get("properties")
+                     or {}).get("model_id") == "c.std.system.a0"]
 
     def test_read_reaches_system_through_buffer(self):
         graph, label_of = _enrich_and_taint_outparam(self.atropos, self.binder)
@@ -412,7 +444,10 @@ class AtroposInterprocWitness(unittest.TestCase):
         cls.binder = _load_binder(atropos)
 
     def _witnesses(self, graph):
-        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"]
+        by_id = {node["id"]: node for node in graph["nodes"]}
+        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"
+                and (by_id.get(n["properties"].get("sink_id"), {}).get("properties")
+                     or {}).get("model_id") == "c.std.system.a0"]
 
     def test_wrapped_source_reaches_caller_sink(self):
         graph, label_of = _enrich_and_taint_interproc(self.atropos, self.binder)
@@ -444,7 +479,10 @@ class AtroposCSliceWitness(unittest.TestCase):
         cls.binder = _load_binder(atropos)
 
     def _witnesses(self, graph):
-        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"]
+        by_id = {node["id"]: node for node in graph["nodes"]}
+        return [n for n in graph["nodes"] if n.get("kind") == "taint-reach"
+                and (by_id.get(n["properties"].get("sink_id"), {}).get("properties")
+                     or {}).get("model_id") == "c.std.system.a0"]
 
     def test_getenv_reaches_system_through_strdup_summary(self):
         graph, label_of = _enrich_and_taint(self.atropos, self.binder)
