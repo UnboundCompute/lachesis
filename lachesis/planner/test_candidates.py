@@ -561,5 +561,97 @@ class CandidateMcpSurfaceTest(unittest.TestCase):
         self.assertEqual(decoded["total"], 2)
 
 
+class SinkTaxonomyTest(unittest.TestCase):
+    """The domain->family->kind tree stays coherent and honest."""
+
+    def test_every_kind_is_placed_in_exactly_one_family(self):
+        from lachesis.planner import taxonomy
+
+        seen: dict[str, tuple[str, str]] = {}
+        for domain_id, domain in taxonomy.SINK_TAXONOMY.items():
+            for family_id, family in domain["families"].items():
+                for kind in family["kinds"]:
+                    self.assertNotIn(kind, seen,
+                                     f"{kind} placed twice: {seen.get(kind)} and "
+                                     f"{(domain_id, family_id)}")
+                    seen[kind] = (domain_id, family_id)
+        # locate() agrees with the walk for every placed kind.
+        for kind, where in seen.items():
+            self.assertEqual(taxonomy.locate(kind), where)
+        self.assertIsNone(taxonomy.locate("not-a-real-kind"))
+
+    def test_sources_and_summaries_are_not_sinks(self):
+        from lachesis.planner import taxonomy
+
+        sinks = taxonomy.all_sink_kinds()
+        self.assertTrue(sinks.isdisjoint(taxonomy.SOURCE_KINDS))
+        self.assertTrue(sinks.isdisjoint(taxonomy.SUMMARY_KINDS))
+
+    def test_registered_constructor_matches_its_family(self):
+        # Metadata (domain, family, id) on every registered constructor must
+        # name a real taxonomy family whose `constructor` points back at it --
+        # so the tree and the enumerators can never silently disagree.
+        from lachesis.planner import taxonomy
+
+        registry = default_candidate_registry(fixture_graph())
+        for meta in registry.constructors:
+            domain = taxonomy.SINK_TAXONOMY[meta["domain"]]
+            family = domain["families"][meta["family"]]
+            self.assertEqual(family["constructor"], meta["id"])
+
+    def test_overview_marks_only_registered_families_enumerable(self):
+        from lachesis.planner import taxonomy
+
+        registered = {"memory.copy.capacity"}
+        by_domain = {d["domain"]: d for d in taxonomy.overview(registered)}
+        copy = next(f for f in by_domain["memory"]["families"] if f["family"] == "copy")
+        alloc = next(f for f in by_domain["memory"]["families"] if f["family"] == "alloc")
+        self.assertTrue(copy["enumerable"])
+        self.assertFalse(alloc["enumerable"])
+        self.assertTrue(by_domain["memory"]["enumerable"])
+        self.assertFalse(by_domain["injection"]["enumerable"])
+        # No registrations -> nothing is enumerable, but the menu is still full.
+        empty = taxonomy.overview(set())
+        self.assertTrue(all(not d["enumerable"] for d in empty))
+        self.assertEqual(len(empty), len(taxonomy.SINK_TAXONOMY))
+
+    def test_taxonomy_covers_the_live_catalog_kinds(self):
+        # Best-effort drift guard: if the Atropos catalog is locatable, every
+        # sink kind it models must be placed in the tree. Skipped when the
+        # catalog is not checked out beside us (unit runs stay hermetic).
+        try:
+            from lachesis.integrations.atropos.enrich import locate_atropos, _load_binder
+        except Exception:  # pragma: no cover - integration module optional
+            self.skipTest("atropos integration unavailable")
+        root = locate_atropos(None)
+        if root is None:
+            self.skipTest("atropos catalog not checked out")
+        binder = _load_binder(root)
+        models = binder.load_models(root / "models")
+        from lachesis.planner import taxonomy
+
+        # load_models returns a flat list of role entries; each sink entry
+        # carries its `kind`. Placement must cover every one.
+        catalog_sink_kinds = {
+            entry.get("kind")
+            for entry in models
+            if entry.get("role") == "sink" and entry.get("kind")}
+        placed = taxonomy.all_sink_kinds()
+        missing = catalog_sink_kinds - placed
+        self.assertEqual(missing, set(),
+                         f"catalog sink kinds not placed in taxonomy: {sorted(missing)}")
+
+
+class CensusTaxonomyTest(unittest.TestCase):
+    def test_census_advertises_the_taxonomy(self):
+        registry = default_candidate_registry(fixture_graph())
+        census = registry.census("memory.copy.capacity")
+        domains = {d["domain"] for d in census["taxonomy"]}
+        self.assertIn("memory", domains)
+        self.assertIn("injection", domains)
+        memory = next(d for d in census["taxonomy"] if d["domain"] == "memory")
+        self.assertTrue(memory["enumerable"])
+
+
 if __name__ == "__main__":
     unittest.main()

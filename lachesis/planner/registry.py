@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from . import taxonomy
 from .unbounded_copy import MemoryCopyCapacity
 
 
@@ -30,6 +31,13 @@ class CandidateRegistry:
     @property
     def constructors(self) -> tuple[dict, ...]:
         return tuple(self._specs[key].metadata for key in sorted(self._specs))
+
+    def domains(self) -> list[dict]:
+        """The sink taxonomy as a coarse-to-fine routing menu, each family
+        marked `enumerable` when a registered constructor already serves it.
+        This is how a harness bifurcates: pick a domain, then a family, then
+        the exact catalog kind -- and see which are queryable now."""
+        return taxonomy.overview(set(self._specs))
 
     def _result(self, constructor: str) -> dict:
         if constructor not in self._specs:
@@ -128,7 +136,8 @@ class CandidateRegistry:
 
     def census(self, constructor: str | None = None) -> dict:
         keys = self.selected(constructor=constructor)
-        return {"move": "candidate_census", "constructors": [{
+        return {"move": "candidate_census", "taxonomy": self.domains(),
+                "constructors": [{
             "metadata": self._result(key)["metadata"],
             "census": self._result(key)["census"],
             "frontiers": self._result(key)["frontiers"],
