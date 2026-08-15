@@ -30,6 +30,8 @@ from collections import defaultdict
 
 from .capabilities import absent_optional_capabilities
 from .unbounded_copy import (
+    BranchRegions,
+    _node_span,
     arg_from_callsite,
     condition_head,
     size_identifiers,
@@ -62,6 +64,10 @@ class SinkObligation:
         self.graph = stamped_graph
         self.bind_summary = bind_summary or {}
         self.by_id = {n["id"]: n for n in stamped_graph.get("nodes", ())}
+        # Region containment for the `dominance` observation, same as the copy
+        # constructor: does the sink call site sit inside a branch that tests its
+        # argument, or on the fall-through past it?
+        self._regions = BranchRegions(stamped_graph)
         # function_id -> [(control_kind, condition_head)], built once. Mirrors the
         # copy constructor's index so an argument can ask "does any branch in my
         # function test me?" without a graph walk per candidate.
@@ -194,10 +200,11 @@ class SinkObligation:
                         "witness_ids": [],
                         "reason": "the AI may call sources_of/reaches when investigating",
                     },
-                    # Does any branch in the enclosing function test the argument?
-                    # A neutral lead, never a verdict and never fed to the rank.
-                    # `dominance` stays uncomputed -- a comparison's presence is not
-                    # proof it guards THIS sink, only a place worth reading.
+                    # Does any branch in the enclosing function test the argument,
+                    # and does the sink sit inside that branch's region or on the
+                    # fall-through past it? A neutral lead, never a verdict and never
+                    # fed to the rank. `dominance` is sound region containment, not
+                    # proof the guard is correct -- only a place worth reading.
                     "conditions": {
                         "status": "observed" if referencing_total else "none-observed",
                         "basis": "syntactic: a control condition in the enclosing "
@@ -205,7 +212,8 @@ class SinkObligation:
                         "size_identifiers": sorted(idents),
                         "referencing_conditions": referencing,
                         "referencing_condition_count": referencing_total,
-                        "dominance": "not-computed",
+                        "dominance": self._regions.classify(
+                            owner_id, idents, _node_span(call)),
                     },
                 },
                 "rank": rank, "rank_reasons": reasons,

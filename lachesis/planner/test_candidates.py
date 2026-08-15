@@ -471,10 +471,11 @@ class ConditionObservationTest(unittest.TestCase):
                  for h in self._row()["inferences"]["conditions"]["referencing_conditions"]]
         self.assertNotIn("if (n < 4)", heads)          # belongs to fn:elsewhere
 
-    def test_dominance_is_never_claimed(self):
-        # Presence of a comparison is not proof it guards this copy.
-        self.assertEqual(self._row()["inferences"]["conditions"]["dominance"],
-                         "not-computed")
+    def test_dominance_not_claimed_without_region_substrate(self):
+        # This fixture carries no branch-region edges, so region containment is
+        # simply unavailable -- an honest `not-computed`, never a guessed verdict.
+        dominance = self._row()["inferences"]["conditions"]["dominance"]
+        self.assertEqual(dominance["status"], "not-computed")
 
     def test_absent_guard_reads_as_none_observed(self):
         # fgets size is sizeof(buf); no branch names buf, so nothing is observed.
@@ -489,6 +490,69 @@ class ConditionObservationTest(unittest.TestCase):
         plain_rows = MemoryCopyCapacity(fixture_graph()).enumerate()["candidates"]
         plain = next(r for r in plain_rows
                      if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")["rank"]
+        self.assertEqual(guarded, plain)
+
+
+def _region_graph(copy_inside):
+    """A memcpy whose size `n` is tested by a branch that owns a true-region. When
+    ``copy_inside`` the copy's byte span sits inside that region (guarded); when
+    not, the copy is on the fall-through past it (the carl9170 missing-guard
+    shape)."""
+    g = fixture_graph()
+    for node in g["nodes"]:
+        if node["id"] == "call:memcpy":
+            node["properties"].update(
+                absolute_file="/x/copy.c", start_offset=200, end_offset=230)
+    region_span = (150, 260) if copy_inside else (300, 360)
+    g["nodes"] += [
+        _cond("cond:guard", "fn:copy", "if (n > cap) { ... }"),
+        _node("region:true", "statement", "{ memcpy(dst, src, n); }",
+              absolute_file="/x/copy.c",
+              start_offset=region_span[0], end_offset=region_span[1]),
+    ]
+    g["edges"].append({"source": "cond:guard", "target": "region:true",
+                       "kind": "TRUE_BRANCH", "properties": {}})
+    return g
+
+
+class RegionDominanceTest(unittest.TestCase):
+    """`dominance` is sound region containment: whether the copy lies inside a
+    size-testing branch's region or on the fall-through. Never a verdict, never a
+    filter -- an observation the AI reads."""
+
+    def _memcpy(self, graph):
+        rows = MemoryCopyCapacity(graph).enumerate()["candidates"]
+        return next(r for r in rows
+                    if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+
+    def test_copy_inside_a_size_testing_branch_reads_as_guarded_region(self):
+        dominance = self._memcpy(_region_graph(copy_inside=True))[
+            "inferences"]["conditions"]["dominance"]
+        self.assertEqual(dominance["status"], "guarded-region")
+        self.assertIn("if (n > cap)",
+                      [r["condition"] for r in dominance["regions"]])
+
+    def test_copy_on_the_fall_through_reads_as_fall_through(self):
+        dominance = self._memcpy(_region_graph(copy_inside=False))[
+            "inferences"]["conditions"]["dominance"]
+        self.assertEqual(dominance["status"], "fall-through")
+        self.assertIn("if (n > cap)",
+                      [b["condition"] for b in dominance["branches"]])
+
+    def test_region_substrate_makes_dominance_a_present_capability(self):
+        # With branch-region edges in the graph, `dominance` is observably backed
+        # and must drop off the missing-capability list.
+        missing = MemoryCopyCapacity(_region_graph(copy_inside=True)).enumerate()[
+            "frontiers"]["missing_optional_capabilities"]
+        self.assertNotIn("dominance", missing)
+
+    def test_dominance_never_touches_the_rank(self):
+        # The neutral containment fact must not suppress or reorder: identical rank
+        # whether the copy is guarded, fall-through, or has no region substrate.
+        guarded = self._memcpy(_region_graph(copy_inside=True))["rank"]
+        fell = self._memcpy(_region_graph(copy_inside=False))["rank"]
+        plain = self._memcpy(fixture_graph())["rank"]
+        self.assertEqual(guarded, fell)
         self.assertEqual(guarded, plain)
 
 

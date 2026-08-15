@@ -1060,6 +1060,55 @@ class CompilerFrontendTests(unittest.TestCase):
                 "the variable receiving the allocation points to the heap object",
             )
 
+    def test_c_branch_regions_place_a_copy_as_guarded_or_fall_through(self) -> None:
+        # Region containment (the `dominance` observation) must work on a real
+        # C graph: the control-flow overlay emits TRUE_BRANCH region edges for C
+        # via its AST-role fallback, so a copy inside a size-testing branch reads
+        # as guarded-region and one on the fall-through past it reads as
+        # fall-through (the carl9170 missing-guard shape). Sound containment only:
+        # the negated early-return guard is honestly reported fall-through, never
+        # a guessed `dominates`.
+        from lachesis.pipeline import enrich_graph
+        from lachesis.planner.unbounded_copy import BranchRegions, _node_span
+
+        source = (
+            "void *memcpy(void *dst, const void *src, unsigned long n);\n"
+            "void guarded(char *dst, char *src, int len) {\n"
+            "    if (len <= 64) {\n"
+            "        memcpy(dst, src, len);\n"   # inside the size-testing branch
+            "    }\n"
+            "    memcpy(dst, src, len);\n"       # fall-through past it
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "guard.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+
+            regions = BranchRegions(enriched)
+            self.assertTrue(regions.has_substrate,
+                            "the control-flow overlay emitted branch-region edges for C")
+            calls = [n for n in enriched["nodes"]
+                     if n["kind"] == "call"
+                     and (n["properties"] or {}).get("callee") == "memcpy"]
+            self.assertEqual(2, len(calls))
+            statuses = {}
+            for call in calls:
+                props = call["properties"]
+                verdict = regions.classify(
+                    props.get("owner_function_id"), {"len"}, _node_span(call))
+                statuses[props.get("start_offset")] = verdict["status"]
+            # The earlier call site (smaller offset) is the guarded one.
+            inside, outside = sorted(statuses)
+            self.assertEqual("guarded-region", statuses[inside])
+            self.assertEqual("fall-through", statuses[outside])
+
     def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
         """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
 

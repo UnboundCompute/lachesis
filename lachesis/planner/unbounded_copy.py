@@ -83,6 +83,131 @@ def size_identifiers(expression: str | None) -> set[str]:
     return {tok for tok in _IDENT.findall(expression) if tok not in _NON_VARIABLE}
 
 
+# The branch-region edges the control-flow overlay emits, marking a conditionally
+# executed sub-region of a function. A copy inside one of these runs only when the
+# region's controlling branch is taken. Same set the GraphStore-based
+# ``dominance.ConditionalRegions`` consumes -- kept in sync deliberately.
+_REGION_EDGE_KINDS = frozenset({
+    "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_TRUE", "SWITCH_CASE",
+    "EXCEPTION_BRANCH", "SHORT_CIRCUIT_RIGHT"})
+
+
+def _node_span(node: dict | None) -> tuple[str, int, int] | None:
+    """(file, start_offset, end_offset) of a node, or None when it has no span."""
+    props = (node or {}).get("properties") or {}
+    path = props.get("absolute_file") or props.get("file")
+    start, end = props.get("start_offset"), props.get("end_offset")
+    if not path or start is None or end is None:
+        return None
+    return path, start, end
+
+
+def _span_within(inner: tuple[str, int, int], outer: tuple[str, int, int]) -> bool:
+    """True when ``inner``'s byte range sits inside ``outer``'s, same file."""
+    return inner[0] == outer[0] and outer[1] <= inner[1] and inner[2] <= outer[2]
+
+
+class BranchRegions:
+    """Dict-native, sound region containment for the candidate enumerators.
+
+    ``dominance.ConditionalRegions`` answers the same shape of question but needs a
+    ``GraphStore``; the enumerators hold only a stamped graph dict, so this reads
+    the same substrate -- cfg-condition nodes and the branch-region edges the
+    control-flow overlay emits (``TRUE_BRANCH`` and friends) -- straight from the
+    dict. It answers ONE sound, observable question and never an ordering verdict:
+    does a copy call site lie inside a conditional region whose controlling
+    condition names a size variable?
+
+    Containment is decidable from byte offsets: a region is the branch body's span,
+    and a call is inside it exactly when the call's offsets are within the body's.
+    It deliberately cannot decide the early-return / negated-guard case
+    (``if (n > cap) return; copy(...)``), where the copy is dominated yet sits
+    *outside* the branch body -- that needs path reasoning the graph dict does not
+    carry, so such a copy reads as ``fall-through``, never as guarded. An honest
+    ``fall-through`` (a lead worth a human's eyes) is the point; a guessed
+    ``dominates`` would violate the rule that a wrong fact is worse than an absent
+    one. This is an observation the AI reads, never a filter: it neither feeds the
+    rank nor removes a candidate."""
+
+    def __init__(self, graph: dict) -> None:
+        by_id = {n["id"]: n for n in graph.get("nodes", ())}
+        # condition-node-id -> [region body spans], from the branch-region edges.
+        self._regions_of: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+        self._has_substrate = False
+        for edge in graph.get("edges", ()):
+            if edge.get("kind") not in _REGION_EDGE_KINDS:
+                continue
+            self._has_substrate = True
+            span = _node_span(by_id.get(edge.get("target")))
+            if span is not None:
+                self._regions_of[edge.get("source")].append(span)
+        # function-id -> [(condition_node_id, controlling-expression head)].
+        self._conditions_of: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
+        for node in graph.get("nodes", ()):
+            if node.get("kind") != "cfg-condition":
+                continue
+            props = node.get("properties") or {}
+            function_id = props.get("function_id")
+            if function_id:
+                self._conditions_of[function_id].append(
+                    (node["id"], condition_head(node.get("label"))))
+
+    @property
+    def has_substrate(self) -> bool:
+        """Whether the graph carries any branch-region edges at all. When it does
+        not, containment is simply unavailable and every classification is
+        ``not-computed`` -- an honest absence, not a negative finding."""
+        return self._has_substrate
+
+    def classify(self, function_id: str | None, idents: set[str],
+                 callsite_span: tuple[str, int, int] | None) -> dict:
+        """Where a copy call site sits relative to the size-testing branches of its
+        function. A neutral observation -- never a verdict, never fed to the rank.
+
+        - ``not-computed``  : the graph has no branch-region substrate.
+        - ``none-observed`` : no branch in the function tests a size variable.
+        - ``undecided``     : a size-testing branch exists but the call has no span.
+        - ``guarded-region``: the copy lies inside a size-testing branch's region
+                              (it runs only when that branch is taken).
+        - ``fall-through``  : a size-testing branch exists but the copy is outside
+                              its region (reached without entering it -- the
+                              missing-guard shape, not proof of a bug)."""
+        if not self._has_substrate:
+            return {"status": "not-computed",
+                    "reason": "the graph carries no branch-region edges; region "
+                              "containment is unavailable"}
+        patterns = {i: re.compile(r"\b" + re.escape(i) + r"\b") for i in idents}
+        testing = []  # (head, named idents, [region spans])
+        for cond_id, head in self._conditions_of.get(function_id or "", ()):
+            named = sorted(i for i, p in patterns.items() if head and p.search(head))
+            if named:
+                testing.append((head, named, self._regions_of.get(cond_id, ())))
+        if not testing:
+            return {"status": "none-observed",
+                    "basis": "no branch in the enclosing function tests a size variable"}
+        if callsite_span is None:
+            return {"status": "undecided",
+                    "reason": "the copy call site carries no source span to place "
+                              "against a region"}
+        containing = [
+            {"condition": head, "names": named}
+            for head, named, spans in testing
+            for span in spans if _span_within(callsite_span, span)]
+        if containing:
+            return {"status": "guarded-region",
+                    "basis": "the copy call site lies inside a conditional region "
+                             "whose controlling branch tests a size variable; the "
+                             "copy runs only when that branch is taken",
+                    "regions": containing}
+        return {"status": "fall-through",
+                "basis": "a branch in this function tests a size variable, but the "
+                         "copy call site lies outside that branch's region; the copy "
+                         "is reached without entering it -- a missing-guard shape "
+                         "worth reading, not proof of a bug",
+                "branches": [{"condition": head, "names": named}
+                             for head, named, _spans in testing]}
+
+
 def looks_like_leaked_label(label: str | None) -> bool:
     """True when a value-node label is comment/AST-kind noise, not source text."""
     if not label:
@@ -257,6 +382,10 @@ class MemoryCopyCapacity:
         self.graph = stamped_graph
         self.bind_summary = bind_summary or {}
         self.by_id = {n["id"]: n for n in stamped_graph.get("nodes", ())}
+        # Region containment for the `dominance` observation: does a copy sit inside
+        # a size-testing branch's region, or is it reached on the fall-through? Built
+        # once from the branch-region edges the control-flow overlay emits.
+        self._regions = BranchRegions(stamped_graph)
         # function_id -> [(control_kind, condition_head)], built once. A condition
         # node carries the id of the function it controls, in the same id space as
         # a call's owner_function_id, so a candidate can ask "does any branch in my
@@ -405,9 +534,10 @@ class MemoryCopyCapacity:
                                   "exact-allocation-size match cannot be proven here",
                         "needs_capability": "object-size"},
                     # A neutral observation, never a verdict and never fed to the
-                    # rank: does a branch in this function test a size variable?
-                    # `dominance` stays uncomputed -- presence of a comparison is
-                    # not proof it guards THIS copy, only a lead worth reading.
+                    # rank: does a branch in this function test a size variable, and
+                    # does the copy sit inside that branch's region or on the
+                    # fall-through past it? `dominance` is sound region containment,
+                    # not proof the guard is correct -- only a lead worth reading.
                     "conditions": {
                         "status": "observed" if referencing_total else "none-observed",
                         "basis": "syntactic: a control condition in the enclosing "
@@ -415,7 +545,8 @@ class MemoryCopyCapacity:
                         "size_identifiers": sorted(idents),
                         "referencing_conditions": referencing,
                         "referencing_condition_count": referencing_total,
-                        "dominance": "not-computed",
+                        "dominance": self._regions.classify(
+                            owner_id, idents, _node_span(call)),
                     },
                 },
                 "rank": rank, "rank_reasons": reasons,
@@ -502,7 +633,10 @@ class MemoryCopyCapacity:
                         "size_identifiers": [],
                         "referencing_conditions": [],
                         "referencing_condition_count": 0,
-                        "dominance": "not-computed",
+                        "dominance": {
+                            "status": "not-applicable",
+                            "reason": "a write-only copy has no length argument, so "
+                                      "no branch can guard one"},
                     },
                 },
                 "rank": rank, "rank_reasons": reasons,

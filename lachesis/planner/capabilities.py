@@ -13,12 +13,20 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 # The graph edge kind that witnesses each raw-fact capability. A capability with
-# no entry here is a *computed inference* (object-size, dominance), not a raw
-# graph fact: it counts as present only when an enumerator says it computed it.
+# no entry here (and no substrate below) is a *computed inference* -- object-size
+# is still one: it counts as present only when an enumerator says it computed it.
 _CAPABILITY_EDGE = {
     "value-flow": "VALUE_FLOWS_TO",
     "points-to": "POINTS_TO",
 }
+
+# `dominance` (region containment) is not one edge kind but a substrate: the
+# branch-region edges the control-flow overlay emits. It is present exactly when
+# the graph carries any of them, so a size-testing branch's region can be placed
+# against a sink. Absent them, the enumerators report dominance `not-computed`.
+_DOMINANCE_SUBSTRATE = frozenset({
+    "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_TRUE", "SWITCH_CASE",
+    "EXCEPTION_BRANCH", "SHORT_CIRCUIT_RIGHT"})
 
 
 def present_capabilities(graph: dict, computed: Iterable[str] = ()) -> set[str]:
@@ -26,6 +34,8 @@ def present_capabilities(graph: dict, computed: Iterable[str] = ()) -> set[str]:
     by an edge kind being present, plus any the enumerator reports it computed."""
     edge_kinds = {edge.get("kind") for edge in graph.get("edges", ())}
     present = {cap for cap, kind in _CAPABILITY_EDGE.items() if kind in edge_kinds}
+    if edge_kinds & _DOMINANCE_SUBSTRATE:
+        present.add("dominance")
     present.update(computed)
     return present
 
