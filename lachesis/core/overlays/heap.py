@@ -12,6 +12,11 @@ IDENTITY_FLOW_REASONS = frozenset({
     "allocation", "initializer", "assignment", "write", "read", "read-value",
     "argument-value", "context-argument", "context-call-result", "return",
     "call-result", "branch-reaching-definition", "phi-input", "call-argument",
+    # A value-preserving expression -- a cast or parenthesization -- does not
+    # change what a pointer refers to, so heap identity must survive it. On C the
+    # `void *` result of an allocator reaches its typed receiver through exactly
+    # such an implicit cast; without this the object never reaches the variable.
+    "value-preserving-expression",
 })
 
 

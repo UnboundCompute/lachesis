@@ -1017,6 +1017,49 @@ class CompilerFrontendTests(unittest.TestCase):
                 "the value written into ring->buf_sz must flow into the allocation size",
             )
 
+    def test_c_allocation_sites_drive_heap_points_to(self) -> None:
+        # kzalloc/malloc are ordinary calls to clang, so the frontend must mark
+        # them as allocation sites -- without an `allocation` node the heap
+        # overlay never runs (heap.py:31-32) and points_to answers nothing on C.
+        # The allocated object must reach the variable that receives it, across
+        # the implicit void*->T* cast the allocator's result flows through.
+        from lachesis.pipeline import enrich_graph
+
+        source = (
+            "struct buf { int x; };\n"
+            "void *kzalloc(unsigned long size, int flags);\n"
+            "struct buf *make(unsigned long n) {\n"
+            "    struct buf *b;\n"
+            "    b = kzalloc(n, 0);\n"
+            "    return b;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "alloc.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+
+            allocations = [n for n in snapshot.nodes if n["kind"] == "allocation"]
+            self.assertEqual(1, len(allocations))
+            self.assertEqual("kzalloc", allocations[0]["properties"]["allocation_kind"])
+
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+            objects = {n["id"] for n in enriched["nodes"] if n["kind"] == "heap-object"}
+            self.assertTrue(objects, "the heap overlay ran and minted an object")
+            b_id = next(n["id"] for n in enriched["nodes"]
+                        if n["kind"] == "variable" and n["label"] == "b")
+            b_points_to = {e["target"] for e in enriched["edges"]
+                           if e["kind"] == "POINTS_TO" and e["source"] == b_id}
+            self.assertTrue(
+                b_points_to & objects,
+                "the variable receiving the allocation points to the heap object",
+            )
+
     def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
         """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
 
