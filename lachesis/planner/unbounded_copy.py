@@ -169,6 +169,11 @@ def size_semantics(expression: str | None, shape: str) -> tuple[float, str]:
     """Rank the size expression by *risk shape*, not spelling. Cheap and syntactic:
     a dynamic length (arithmetic, variable) is worth a human's eyes; a constant
     (literal/sizeof) rarely is. This orders, it never suppresses."""
+    if shape == "no-length-argument":
+        # A write-only copy (strcpy/strcat/gets) carries no length bound at all;
+        # the amount written is whatever the source holds. Nothing here is more
+        # deserving of a human's eyes, so it ranks at the ceiling.
+        return 1.0, "unbounded-no-length"
     if not expression or shape == "unknown":
         return 0.4, "opaque"
     # Strip literal spans first: a format string "a-b" or "f(%d)" must not be
@@ -231,8 +236,9 @@ class MemoryCopyCapacity:
         "languages": ("c",),
         "required_capabilities": ("calls", "argument-binding"),
         "optional_capabilities": ("value-flow", "points-to", "object-size", "dominance"),
-        "enumeration_basis": "atropos:sink:buffer-size",
-        "completeness_contract": "every bound Atropos buffer-size attachment",
+        "enumeration_basis": "atropos:sink:buffer-size + atropos:sink:buffer-write(write-only)",
+        "completeness_contract": "every bound Atropos buffer-size attachment, plus "
+                                 "every write-only buffer-write with no length argument",
         # The failure mode this obligation actually points at: writing past the
         # destination's capacity. A copy model may carry broader tags (a source
         # over-read, an ambient "dangerous function" class); those are real but
@@ -416,6 +422,92 @@ class MemoryCopyCapacity:
                 "completeness": "PARTIAL",
                 "next_op": {"tool": "sources_of", "args": {"sink": value_id},
                             "why": "let the AI inspect provenance before judging the obligation"},
+            }
+            candidates.append(candidate)
+
+        # Write-only copies -- strcpy/strcat/gets and friends -- carry NO length
+        # argument, so they never produce a buffer-size sink and the loop above
+        # never reaches them. They are the purest unbounded-copy obligation (the
+        # amount written is whatever the source holds), so a callsite whose only
+        # attachment is a buffer-write MUST still be enumerated. Inclusion is
+        # exhaustive: a missing length bound is a reason to surface a site, never
+        # to drop it.
+        sized_callsites = {s["properties"].get("callsite_id") for s in sizes}
+        for callsite_id, dests in destinations.items():
+            if callsite_id in sized_callsites:
+                continue  # already enumerated through its buffer-size sink
+            primary = dests[0]
+            dprops = primary["properties"]
+            value_id = dprops.get("value_id")
+            call = self._call(callsite_id)
+            call_props = call.get("properties") or {}
+            owner_id = call_props.get("owner_function_id")
+            dest_values = [d["properties"].get("value_id") for d in dests]
+            dest_expressions = [
+                arg_from_callsite(call.get("label"), d["properties"].get("access_path"))
+                or self._label(d["properties"].get("value_id"))
+                for d in dests]
+            confidence = dprops.get("confidence", "medium")
+            model_cwe = dprops.get("cwe", [])
+            obligation_cwe = set(self.metadata.get("obligation_cwe", ()))
+            shape = "no-length-argument"
+            rank, reasons = self._rank(None, shape, dest_expressions, confidence)
+            loc_file = call_props.get("absolute_file") or call_props.get("file")
+            candidate = {
+                "candidate_id": _candidate_id(
+                    dprops.get("model_id", ""), callsite_id or "", value_id or ""),
+                "constructor": CONSTRUCTOR_ID, "domain": DOMAIN, "language": "c",
+                "obligation": "copy length must not exceed destination capacity",
+                "handles": {"site_node_id": callsite_id,
+                            "enclosing_function_id": owner_id,
+                            "obligation_value_ids": dest_values},
+                "observations": {
+                    "callee": call_props.get("callee") or call_props.get("method_name"),
+                    "site": call.get("label"), "file": loc_file,
+                    "line": call_props.get("start_line"),
+                    "size_expression": None, "syntactic_shape": shape,
+                    "size_expression_origin": "implicit-length",
+                    # The length is not spelled anywhere at the callsite: it is
+                    # whatever the source string holds (an implicit strlen). This
+                    # is recorded, not guessed away.
+                    "length_bound": "none: write-only copy has no length argument",
+                    "destination_expressions": dest_expressions,
+                    "destination_kinds": [
+                        {"expression": d, "kind": destination_kind(d)}
+                        for d in dest_expressions],
+                    "atropos_model_id": dprops.get("model_id"),
+                    "access_path": dprops.get("access_path"),
+                    "cwe": model_cwe,
+                    "obligation_cwe": [c for c in model_cwe if c in obligation_cwe],
+                    "model_confidence": confidence,
+                },
+                "inferences": {
+                    "input_reachability": {
+                        "status": "not-queried", "source_kind": None,
+                        "witness_ids": [],
+                        "reason": "the AI may call sources_of/reaches when investigating",
+                    },
+                    "destination_capacity": {
+                        "status": "unknown",
+                        "reason": "object-size analysis is unavailable; the "
+                                  "exact-allocation-size match cannot be proven here",
+                        "needs_capability": "object-size"},
+                    # No size variable exists to test, so no branch can reference
+                    # one; this is stated as fact, not treated as a clean bill.
+                    "conditions": {
+                        "status": "not-applicable",
+                        "basis": "a write-only copy has no length argument to guard",
+                        "size_identifiers": [],
+                        "referencing_conditions": [],
+                        "referencing_condition_count": 0,
+                        "dominance": "not-computed",
+                    },
+                },
+                "rank": rank, "rank_reasons": reasons,
+                "completeness": "PARTIAL",
+                "next_op": {"tool": "sources_of", "args": {"sink": value_id},
+                            "why": "trace what reaches the write target; a write-only "
+                                   "copy is bounded only by its source length"},
             }
             candidates.append(candidate)
         candidates.sort(key=lambda c: (-c["rank"], c["candidate_id"]))

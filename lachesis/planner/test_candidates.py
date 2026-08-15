@@ -263,6 +263,39 @@ class SemanticRankingTest(unittest.TestCase):
                          "c.std.memcpy.a2")
         self.assertGreater(rows[0]["rank"], rows[1]["rank"])
 
+    def test_write_only_copy_with_no_length_is_still_enumerated(self):
+        # strcpy carries NO length argument, so it never produces a buffer-size
+        # sink. It is the purest unbounded copy and must still be enumerated --
+        # inclusion is exhaustive; a missing bound surfaces a site, never drops it.
+        graph = fixture_graph()
+        graph["nodes"] += [
+            _node("call:strcpy", "call", "strcpy(dst, src)", callee="strcpy",
+                  owner_function_id="fn:cp", file="cp.c", start_line=5),
+            _role("sink:strcpy-dest", "sink", "c.std.strcpy.a0", "v:strcpy-dst",
+                  "call:strcpy", "Argument[0]", "buffer-write"),
+        ]
+        rows = MemoryCopyCapacity(graph).enumerate()["candidates"]
+        # The two size-bearing sites survive AND the write-only site is added.
+        self.assertEqual(len(rows), 3)
+        strcpy = next(r for r in rows
+                      if r["observations"]["atropos_model_id"] == "c.std.strcpy.a0")
+        self.assertEqual(strcpy["observations"]["syntactic_shape"], "no-length-argument")
+        self.assertIsNone(strcpy["observations"]["size_expression"])
+        self.assertEqual(strcpy["observations"]["callee"], "strcpy")
+        # No length bound => it ranks at the ceiling, above bounded copies.
+        self.assertEqual(rows[0]["observations"]["atropos_model_id"], "c.std.strcpy.a0")
+        # Still verdict-free: capacity unknown, no safety claim, PARTIAL.
+        self.assertEqual(strcpy["inferences"]["destination_capacity"]["status"], "unknown")
+        self.assertEqual(strcpy["completeness"], "PARTIAL")
+
+    def test_write_only_and_sized_copy_at_same_callsite_prefers_the_size(self):
+        # A site that DOES have a buffer-size is enumerated once, through its size
+        # sink -- the write-only pass must not double-count it.
+        rows = MemoryCopyCapacity(fixture_graph()).enumerate()["candidates"]
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("no-length-argument",
+                         {r["observations"]["syntactic_shape"] for r in rows})
+
 
 class UnboundSinkVisibilityTest(unittest.TestCase):
     """Every sink the catalog knows must be shown, bound or not. An unbound sink
