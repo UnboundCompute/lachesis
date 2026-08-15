@@ -1109,6 +1109,48 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual("guarded-region", statuses[inside])
             self.assertEqual("fall-through", statuses[outside])
 
+    def test_c_object_size_proves_a_literal_copy_overflows_a_fixed_array(self) -> None:
+        # Object-size must resolve on a real C graph: clang types a fixed array as
+        # `char[64]` and the memcpy destination arg points straight at that
+        # array-typed value node, so a literal copy larger than the array is a
+        # sound exceeds-capacity fact. A symbolic size over the same array stays
+        # honestly unproven -- the capacity is known but the size is not constant.
+        from lachesis.pipeline import enrich_graph
+        from lachesis.planner.unbounded_copy import object_size_capacity
+
+        source = (
+            "void *memcpy(void *dst, const void *src, unsigned long n);\n"
+            "void f(char *src, int n) {\n"
+            "    char buf[64];\n"
+            "    memcpy(buf, src, 128);\n"
+            "    memcpy(buf, src, n);\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "objsize.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+            by_id = {n["id"]: n for n in enriched["nodes"]}
+
+            statuses = {}
+            for node in enriched["nodes"]:
+                props = node.get("properties") or {}
+                if node["kind"] != "call" or props.get("callee") != "memcpy":
+                    continue
+                args = props.get("argument_value_ids") or []
+                dest = by_id.get(args[0]) if args else None
+                size = "128" if "128" in (node.get("label") or "") else "n"
+                self.assertEqual("char[64]", (dest.get("properties") or {}).get("type"))
+                statuses[size] = object_size_capacity([dest], size)["status"]
+            self.assertEqual("exceeds-capacity", statuses["128"])
+            self.assertEqual("capacity-known-size-unknown", statuses["n"])
+
     def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
         """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
 

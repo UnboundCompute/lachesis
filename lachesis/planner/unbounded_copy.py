@@ -216,6 +216,110 @@ def looks_like_leaked_label(label: str | None) -> bool:
     return text.startswith(("/*", "//")) or bool(_AST_KIND.match(text))
 
 
+# A fixed-size C array type as clang spells it: `char[64]`, `unsigned char[16]`,
+# `int[8]`. The element type is everything before the bracket; the count is the
+# integer inside. A pointer (`char *`), a flexible array (`char[]`), or a VLA
+# (`char[n]`) does not match -- their capacity is not a compile-time constant and
+# must stay unknown, never guessed.
+_ARRAY_TYPE = re.compile(r"^(?P<elem>[A-Za-z_][\w ]*?)\s*\[(?P<count>\d+)\]$")
+# The element types whose size is exactly one byte by the C standard, independent
+# of platform ABI. Only for these can an element count be turned into a BYTE
+# capacity soundly; every other element type needs sizeof(T), which depends on the
+# target ABI and is therefore left unresolved rather than assumed.
+_ONE_BYTE_ELEMENTS = frozenset({"char", "signed char", "unsigned char"})
+_INT_LITERAL = re.compile(r"^\s*(?:0[xX][0-9a-fA-F]+|\d+)\s*$")
+
+
+def array_capacity(type_str: str | None) -> tuple[str, int, int | None] | None:
+    """``(element_type, element_count, byte_capacity)`` for a fixed C array type,
+    else None. ``byte_capacity`` is filled only when the element is a one-byte type
+    (``char`` and its signed/unsigned spellings); for every other element the count
+    is exact but the byte size needs ``sizeof(T)`` -- an ABI fact this analyzer does
+    not assume -- so it is left None. A compile-time constant, never an estimate."""
+    if not type_str:
+        return None
+    match = _ARRAY_TYPE.match(type_str.strip())
+    if not match:
+        return None
+    element = " ".join(match.group("elem").split())
+    count = int(match.group("count"))
+    byte_capacity = count if element in _ONE_BYTE_ELEMENTS else None
+    return element, count, byte_capacity
+
+
+def _literal_bytes(expression: str | None) -> int | None:
+    """The integer value of a copy size that is spelled as a bare integer literal,
+    else None. Only a literal is a constant here -- a named length or an arithmetic
+    expression is not evaluated, so its relation to a capacity stays unproven."""
+    if not expression or not _INT_LITERAL.match(expression):
+        return None
+    text = expression.strip()
+    return int(text, 16) if text[:2].lower() == "0x" else int(text)
+
+
+def object_size_capacity(dest_nodes: list[dict], size_expression: str | None) -> dict:
+    """The destination-capacity fact for a copy, from fixed-array object sizes.
+
+    Sound and observable only: a capacity is reported exactly when a destination is
+    a fixed-size array whose element size is known (a one-byte ``char`` family), and
+    a comparison against the copy size is made exactly when that size is an integer
+    literal. Everything else -- a pointer destination, a non-char array (byte size
+    needs the ABI's ``sizeof``), a named or arithmetic size -- stays ``unknown`` or
+    ``capacity-known-size-unknown`` rather than guessed. A wrong capacity would be
+    worse than an absent one, so this never estimates.
+
+    Never suppresses and never feeds the rank: an ``exceeds-capacity`` result is a
+    neutral, high-value observation for a human to confirm, not a verdict."""
+    resolved = []
+    for node in dest_nodes:
+        type_str = (node.get("properties") or {}).get("type")
+        capacity = array_capacity(type_str)
+        if capacity is None:
+            continue
+        element, count, byte_capacity = capacity
+        resolved.append({
+            "destination": node.get("label"), "declared_type": type_str,
+            "element_type": element, "element_count": count,
+            "capacity_bytes": byte_capacity})
+    if not resolved:
+        return {
+            "status": "unknown",
+            "reason": "no destination resolves to a fixed-size array object; the "
+                      "exact-capacity match cannot be proven here",
+            "needs_capability": "object-size"}
+    literal = _literal_bytes(size_expression)
+    byte_sized = [d for d in resolved if d["capacity_bytes"] is not None]
+    if literal is not None and byte_sized:
+        # The tightest capacity is the one the copy can actually overflow.
+        smallest = min(d["capacity_bytes"] for d in byte_sized)
+        if literal > smallest:
+            return {
+                "status": "exceeds-capacity",
+                "basis": f"the copy writes {literal} bytes into a destination whose "
+                         f"fixed capacity is {smallest} bytes",
+                "copy_size_bytes": literal, "capacity_bytes": smallest,
+                "destinations": resolved}
+        return {
+            "status": "within-capacity",
+            "basis": f"the copy writes {literal} bytes into a destination whose "
+                     f"fixed capacity is {smallest} bytes",
+            "copy_size_bytes": literal, "capacity_bytes": smallest,
+            "destinations": resolved}
+    if byte_sized:
+        return {
+            "status": "capacity-known-size-unknown",
+            "basis": "the destination's fixed byte capacity is known, but the copy "
+                     "size is not an integer literal, so the relation is unproven",
+            "capacity_bytes": min(d["capacity_bytes"] for d in byte_sized),
+            "destinations": resolved}
+    return {
+        "status": "capacity-known-in-elements",
+        "basis": "the destination is a fixed-size array of a known element count, "
+                 "but its byte size needs sizeof(element) (an ABI fact not assumed "
+                 "here), so no byte comparison is made",
+        "destinations": resolved}
+
+
 def arg_from_callsite(call_label: str | None, access_path: str | None) -> str | None:
     """Recover the exact argument spelling from the reliable callsite label.
 
@@ -423,6 +527,19 @@ class MemoryCopyCapacity:
     def _call(self, callsite_id: str | None) -> dict:
         return self.by_id.get(callsite_id or "", {})
 
+    def _capacity(self, dest_value_ids: list[str | None], size_expression: str | None,
+                  computed: set[str]) -> dict:
+        """The destination-capacity fact for a copy, resolved from the fixed-array
+        object sizes of its destination value nodes. Records that object-size was
+        actually computed (so the capability manifest can report it present) exactly
+        when a capacity was resolved -- an `unknown` result computes nothing."""
+        dest_nodes = [self.by_id[v] for v in dest_value_ids
+                      if v and v in self.by_id]
+        result = object_size_capacity(dest_nodes, size_expression)
+        if result["status"] != "unknown":
+            computed.add("object-size")
+        return result
+
     def _rank(self, expression: str | None, shape: str,
               dest_expressions: list[str | None], confidence: str
               ) -> tuple[float, list[dict]]:
@@ -457,6 +574,10 @@ class MemoryCopyCapacity:
             elif props.get("sink_kind") == "buffer-size":
                 sizes.append(node)
 
+        # Optional inferences this run actually computed (no raw edge witnesses
+        # them), so the capability manifest can report object-size present exactly
+        # when a destination capacity was resolved -- never merely advertised.
+        computed: set[str] = set()
         candidates = []
         for sink in sizes:
             props = sink["properties"]
@@ -522,17 +643,15 @@ class MemoryCopyCapacity:
                         "witness_ids": [],
                         "reason": "the AI may call sources_of/reaches when investigating",
                     },
-                    # Whether the destination's real capacity matches the copy
-                    # size -- the safe-by-construction "exact allocation" case --
-                    # cannot be told from the spelling (a malloc'd buffer and an
-                    # opaque fixed one both read as a bare identifier or a deref).
-                    # It needs object-size analysis, a capability v1 defers; until
-                    # then this stays unknown rather than guessed.
-                    "destination_capacity": {
-                        "status": "unknown",
-                        "reason": "object-size analysis is unavailable; the "
-                                  "exact-allocation-size match cannot be proven here",
-                        "needs_capability": "object-size"},
+                    # Whether the copy size fits the destination's real capacity.
+                    # Sound object-size only: resolved when a destination is a
+                    # fixed-size char array (byte capacity known) and compared only
+                    # when the size is an integer literal -- so `memcpy(buf, .., 128)`
+                    # into `char buf[64]` reads as exceeds-capacity. A pointer
+                    # destination, a non-char array, or a named/arithmetic size stays
+                    # unknown/unproven rather than guessed.
+                    "destination_capacity": self._capacity(
+                        dest_values, expression, computed),
                     # A neutral observation, never a verdict and never fed to the
                     # rank: does a branch in this function test a size variable, and
                     # does the copy sit inside that branch's region or on the
@@ -620,11 +739,12 @@ class MemoryCopyCapacity:
                         "witness_ids": [],
                         "reason": "the AI may call sources_of/reaches when investigating",
                     },
-                    "destination_capacity": {
-                        "status": "unknown",
-                        "reason": "object-size analysis is unavailable; the "
-                                  "exact-allocation-size match cannot be proven here",
-                        "needs_capability": "object-size"},
+                    # A write-only copy has no length argument, so the size is never
+                    # an integer literal; object-size can still name a fixed-array
+                    # destination's capacity (capacity-known-size-unknown), which is
+                    # a real lead -- the amount written is bounded only by the source.
+                    "destination_capacity": self._capacity(
+                        dest_values, None, computed),
                     # No size variable exists to test, so no branch can reference
                     # one; this is stated as fact, not treated as a clean bill.
                     "conditions": {
@@ -663,7 +783,7 @@ class MemoryCopyCapacity:
             "unbound_sinks": unbound_sinks,
             "truncated_walks": 0,
             "missing_optional_capabilities": absent_optional_capabilities(
-                self.graph, self.metadata["optional_capabilities"]),
+                self.graph, self.metadata["optional_capabilities"], computed),
             "unselected_configs": [],
         }
         return {

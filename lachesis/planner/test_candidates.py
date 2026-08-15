@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 from lachesis.planner.registry import CandidateRegistry, default_candidate_registry
 from lachesis.planner.unbounded_copy import (
-    MemoryCopyCapacity, arg_from_callsite, condition_head, dest_semantics,
-    destination_kind, looks_like_leaked_label, size_identifiers, size_semantics,
-    syntactic_shape)
+    MemoryCopyCapacity, arg_from_callsite, array_capacity, condition_head,
+    dest_semantics, destination_kind, looks_like_leaked_label, object_size_capacity,
+    size_identifiers, size_semantics, syntactic_shape)
 
 
 def _node(node_id, kind, label, **properties):
@@ -554,6 +554,106 @@ class RegionDominanceTest(unittest.TestCase):
         plain = self._memcpy(fixture_graph())["rank"]
         self.assertEqual(guarded, fell)
         self.assertEqual(guarded, plain)
+
+
+def _capacity_graph(dest_type="char[64]", size_arg="128"):
+    """A memcpy whose destination is a fixed array of ``dest_type`` and whose size
+    argument is spelled ``size_arg``. Object-size can compare the two soundly when
+    the array is a char family and the size is an integer literal."""
+    g = fixture_graph()
+    for node in g["nodes"]:
+        if node["id"] == "call:memcpy":
+            node["label"] = f"memcpy(buf, src, {size_arg})"
+        if node["id"] == "v:dst":
+            node["properties"]["type"] = dest_type
+    return g
+
+
+class ObjectSizeHelperTest(unittest.TestCase):
+    """The object-size primitives are sound compile-time facts, never estimates."""
+
+    def test_char_array_yields_a_byte_capacity(self):
+        self.assertEqual(("char", 64, 64), array_capacity("char[64]"))
+        self.assertEqual(("unsigned char", 16, 16), array_capacity("unsigned char[16]"))
+
+    def test_non_char_array_count_is_exact_but_bytes_stay_unknown(self):
+        # Byte size needs sizeof(int), an ABI fact this analyzer refuses to assume.
+        self.assertEqual(("int", 8, None), array_capacity("int[8]"))
+
+    def test_pointer_and_flexible_and_vla_are_not_fixed_arrays(self):
+        self.assertIsNone(array_capacity("char *"))
+        self.assertIsNone(array_capacity("char[]"))
+        self.assertIsNone(array_capacity("char[n]"))
+        self.assertIsNone(array_capacity(None))
+
+    def test_literal_over_capacity_is_exceeds(self):
+        dest = [{"label": "buf", "properties": {"type": "char[64]"}}]
+        self.assertEqual("exceeds-capacity",
+                         object_size_capacity(dest, "128")["status"])
+
+    def test_literal_within_capacity_is_within(self):
+        dest = [{"label": "buf", "properties": {"type": "char[64]"}}]
+        self.assertEqual("within-capacity",
+                         object_size_capacity(dest, "32")["status"])
+
+    def test_symbolic_size_leaves_the_relation_unproven(self):
+        dest = [{"label": "buf", "properties": {"type": "char[64]"}}]
+        self.assertEqual("capacity-known-size-unknown",
+                         object_size_capacity(dest, "n")["status"])
+
+    def test_pointer_destination_stays_unknown(self):
+        dest = [{"label": "p", "properties": {"type": "char *"}}]
+        result = object_size_capacity(dest, "128")
+        self.assertEqual("unknown", result["status"])
+        self.assertEqual("object-size", result["needs_capability"])
+
+
+class ObjectSizeCapacityTest(unittest.TestCase):
+    """The enumerator reports destination_capacity from sound object-size, and the
+    capability manifest reflects that it was actually computed."""
+
+    def _memcpy(self, graph):
+        rows = MemoryCopyCapacity(graph).enumerate()["candidates"]
+        return next(r for r in rows
+                    if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+
+    def test_literal_copy_into_a_smaller_array_reads_as_exceeds(self):
+        capacity = self._memcpy(_capacity_graph(size_arg="128"))[
+            "inferences"]["destination_capacity"]
+        self.assertEqual("exceeds-capacity", capacity["status"])
+        self.assertEqual(128, capacity["copy_size_bytes"])
+        self.assertEqual(64, capacity["capacity_bytes"])
+
+    def test_literal_copy_that_fits_reads_as_within(self):
+        capacity = self._memcpy(_capacity_graph(size_arg="16"))[
+            "inferences"]["destination_capacity"]
+        self.assertEqual("within-capacity", capacity["status"])
+
+    def test_pointer_destination_still_reads_as_unknown(self):
+        capacity = self._memcpy(_capacity_graph(dest_type="char *", size_arg="128"))[
+            "inferences"]["destination_capacity"]
+        self.assertEqual("unknown", capacity["status"])
+
+    def test_resolved_capacity_makes_object_size_a_present_capability(self):
+        missing = MemoryCopyCapacity(_capacity_graph()).enumerate()[
+            "frontiers"]["missing_optional_capabilities"]
+        self.assertNotIn("object-size", missing)
+
+    def test_unresolved_capacity_keeps_object_size_missing(self):
+        # A pointer destination resolves no capacity, so nothing was computed.
+        missing = MemoryCopyCapacity(
+            _capacity_graph(dest_type="char *")).enumerate()[
+            "frontiers"]["missing_optional_capabilities"]
+        self.assertIn("object-size", missing)
+
+    def test_object_size_never_touches_the_rank(self):
+        # An exceeds-capacity fact must not reorder or suppress: identical rank to
+        # the same copy whose destination capacity cannot be resolved.
+        exceeds = self._memcpy(_capacity_graph(dest_type="char[64]", size_arg="128"))
+        opaque = self._memcpy(_capacity_graph(dest_type="char *", size_arg="128"))
+        self.assertEqual("exceeds-capacity",
+                         exceeds["inferences"]["destination_capacity"]["status"])
+        self.assertEqual(exceeds["rank"], opaque["rank"])
 
 
 class GranularDetailTierTest(unittest.TestCase):
