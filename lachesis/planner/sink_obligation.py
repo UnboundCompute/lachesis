@@ -31,6 +31,7 @@ from collections import defaultdict
 from .capabilities import absent_optional_capabilities
 from .unbounded_copy import (
     BranchRegions,
+    VariableContext,
     _node_span,
     arg_from_callsite,
     condition_head,
@@ -68,6 +69,10 @@ class SinkObligation:
         # constructor: does the sink call site sit inside a branch that tests its
         # argument, or on the fall-through past it?
         self._regions = BranchRegions(stamped_graph)
+        # Reaching definitions for the sink argument -- where it was last written --
+        # recovered by walking value-flow edges backward. Same neutral context the
+        # copy constructor attaches; not-computed without value-flow edges.
+        self._variables = VariableContext(stamped_graph)
         # function_id -> [(control_kind, condition_head)], built once. Mirrors the
         # copy constructor's index so an argument can ask "does any branch in my
         # function test me?" without a graph walk per candidate.
@@ -215,6 +220,12 @@ class SinkObligation:
                         "dominance": self._regions.classify(
                             owner_id, idents, _node_span(call)),
                     },
+                    # Where the sink argument was last written -- its reaching
+                    # definition -- so a guard's bound can be read against the value
+                    # the argument actually carries. Neutral fact, never a verdict;
+                    # not-computed without value-flow edges.
+                    "variable_context": self._variables.describe(
+                        [("argument", value_id)], _node_span(call)),
                 },
                 "rank": rank, "rank_reasons": reasons,
                 # Enumeration is complete for the observable graph; the evidence

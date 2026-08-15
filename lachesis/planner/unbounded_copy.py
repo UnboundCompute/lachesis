@@ -208,6 +208,207 @@ class BranchRegions:
                              for head, named, _spans in testing]}
 
 
+# The value-flow edge kind and the `reason` values that mark a *definition* -- an
+# edge whose target is produced/written by its source. Walking the value-flow graph
+# backward from a sink argument, a def-reason edge is where a variable was last
+# given its value. Kept as the frontend spells them (see c_call_dataflow /
+# build_graph field-write, assignment).
+_FLOW_KIND = "VALUE_FLOWS_TO"
+_DEF_REASONS = frozenset({
+    "initializer", "assignment", "write", "field-write", "allocation",
+    "out-parameter", "call-return"})
+# The reasons a backward walk may traverse: a value merely *carried along* -- read
+# out of a variable, passed through a value-preserving cast, taken as an operand or
+# a call argument. This is an explicit WHITELIST, not "everything that is not a
+# def": the same graph also carries cross-argument taint-summary edges the Atropos
+# models stamp (e.g. memcpy's src->dst copy edge, `fact_origin='atropos-model'`,
+# no reason), which are copy SEMANTICS, not a reaching definition. Walking one would
+# make the destination falsely appear to be defined by the source. Any edge whose
+# reason is neither a def nor a known pass-through is a boundary: the walk stops
+# there and records nothing, because a wrong provenance fact is worse than a missing
+# one. New frontend pass-through reasons must be added here deliberately.
+_PASSTHROUGH_REASONS = frozenset({
+    "read", "read-value", "value-preserving-expression", "arithmetic-operand",
+    "call-argument", "field-read"})
+# A node that is a *source* of value with no local definition: a parameter is
+# supplied by the caller, an allocation/heap-object is freshly produced. Reaching
+# one means the variable is externally derived -- a fact worth surfacing, not a def.
+_ORIGIN_KINDS = frozenset({"parameter", "allocation", "heap-object"})
+
+
+def _context_row(node: dict | None, reason: str | None = None) -> dict:
+    """One neutral 'here is an operation' row: which node, what kind, where, and
+    the reason the value-flow edge carried (a def reason, or None for an origin)."""
+    props = (node or {}).get("properties") or {}
+    return {
+        "node_id": (node or {}).get("id"),
+        "kind": (node or {}).get("kind"),
+        "reason": reason,
+        "file": props.get("absolute_file") or props.get("file"),
+        "line": props.get("start_line"),
+        "offset": props.get("start_offset"),
+        "text": (node or {}).get("label") or props.get("name"),
+    }
+
+
+class VariableContext:
+    """For every variable that feeds a sink argument, the last operation(s) that
+    produced it -- its reaching definitions -- recovered by walking the value-flow
+    graph *backward* from the argument value node.
+
+    This answers the question a human asks by hand at every candidate: 'where was
+    this size/destination last set, and was it clamped or checked on the way in?'
+    A reverse walk from the argument stops at each def-reason edge (recording the
+    source as a definition) or at an origin node (a parameter or allocation with no
+    local writer). For a compound argument (``block_size - CRC``) the walk fans out
+    to each variable's definitions, so 'all vars present in the sink' fall out of
+    one traversal.
+
+    It is a neutral FACT, never a verdict: it states where a value was written, not
+    whether that write is safe, and it neither feeds the rank nor suppresses a
+    candidate. It is available only when the graph carries value-flow edges (the
+    enriched dataflow tier); on the bare core graph every argument is
+    ``not-computed`` -- an honest absence, not a claim of no definition."""
+
+    _MAX_DEPTH = 32
+    _MAX_ROWS = 8
+
+    def __init__(self, graph: dict) -> None:
+        self._by_id = {n["id"]: n for n in graph.get("nodes", ())}
+        # target-node-id -> [incoming value-flow edges], the reverse adjacency the
+        # backward walk reads. Built once.
+        self._incoming: dict[str, list[dict]] = defaultdict(list)
+        self._has_substrate = False
+        for edge in graph.get("edges", ()):
+            if edge.get("kind") != _FLOW_KIND:
+                continue
+            self._has_substrate = True
+            self._incoming[edge.get("target")].append(edge)
+
+    @property
+    def has_substrate(self) -> bool:
+        """Whether the graph carries any value-flow edges. When it does not,
+        reaching definitions are simply unavailable and every argument reads
+        ``not-computed`` -- never mistaken for 'no definition exists'."""
+        return self._has_substrate
+
+    def _reason(self, edge: dict) -> str | None:
+        return (edge.get("properties") or {}).get("reason")
+
+    def _walk_back(self, value_id: str,
+                   sink_span: tuple[str, int, int] | None
+                   ) -> tuple[list[dict], list[dict], int]:
+        """Reverse-BFS from one argument value node. Returns (definitions, origins,
+        unreadable): the def-reason writes reached, the parameter/allocation origins
+        where a path bottoms out with no local writer, and a count of reached
+        definitions whose node carried only an AST-kind/comment label instead of
+        source text. Bounded in depth and de-duplicated."""
+        defs: dict[str, dict] = {}
+        origins: dict[str, dict] = {}
+        unreadable = 0
+        seen: set[str] = set()
+        stack: list[tuple[str, int]] = [(value_id, 0)]
+        while stack:
+            nid, depth = stack.pop()
+            if nid in seen or depth > self._MAX_DEPTH:
+                continue
+            seen.add(nid)
+            incoming = self._incoming.get(nid, ())
+            writers = [e for e in incoming if self._reason(e) in _DEF_REASONS]
+            if writers:
+                # A def-reason edge is the last operation on this value: record its
+                # source and stop -- do not walk past a definition into its own inputs.
+                for edge in writers:
+                    src = self._by_id.get(edge.get("source"))
+                    if src is None or src.get("id") in defs:
+                        continue
+                    row = _context_row(src, self._reason(edge))
+                    # A node whose only label is an AST kind (`ImplicitCastExpr`) or
+                    # a leaked comment is not readable source. Counting it keeps the
+                    # tally exhaustive without presenting noise as a definition, and
+                    # without letting it crowd real defs out of the capped list.
+                    if looks_like_leaked_label(row.get("text")):
+                        unreadable += 1
+                        defs.setdefault(src["id"], None)  # reserve id, drop from output
+                    else:
+                        defs[src["id"]] = row
+                continue
+            # Only follow known pass-through edges -- never an unrecognised or
+            # taint-summary edge, which would fabricate provenance (see the reason
+            # whitelist above). A node reached only by such boundary edges is a dead
+            # end, not a definition.
+            passthrough = [e for e in incoming
+                           if self._reason(e) in _PASSTHROUGH_REASONS]
+            if passthrough:
+                for edge in passthrough:
+                    stack.append((edge.get("source"), depth + 1))
+                continue
+            # No pass-through predecessor: a value source. Surface parameters and
+            # allocations (externally derived / freshly produced); ignore bare
+            # literals and operators, which are not variables.
+            node = self._by_id.get(nid)
+            if node is not None and node.get("kind") in _ORIGIN_KINDS and nid != value_id:
+                origins[nid] = _context_row(node)
+        readable_defs = [row for row in defs.values() if row is not None]
+        return (self._finish(readable_defs, sink_span),
+                list(origins.values())[:self._MAX_ROWS], unreadable)
+
+    def _finish(self, rows: list[dict],
+                sink_span: tuple[str, int, int] | None) -> list[dict]:
+        """Order definitions by source position and flag the one nearest *before*
+        the sink -- the most recent write, the one that actually governs the copy."""
+        rows.sort(key=lambda r: (r.get("file") or "", r.get("offset") or 0))
+        if sink_span is not None:
+            sink_file, sink_start = sink_span[0], sink_span[1]
+            preceding = [r for r in rows
+                         if r.get("file") == sink_file
+                         and (r.get("offset") or 0) <= sink_start]
+            if preceding:
+                nearest = max(preceding, key=lambda r: r.get("offset") or 0)
+                nearest["nearest_to_sink"] = True
+        return rows[:self._MAX_ROWS]
+
+    def describe(self, arguments: list[tuple[str, str | None]],
+                 sink_span: tuple[str, int, int] | None = None) -> dict:
+        """The reaching-definition context for a sink's arguments. ``arguments`` is
+        a list of (role, value_id) -- e.g. ``[("size", sz), ("destination", d)]``.
+        A neutral evidence block: where each argument was last written, never a
+        judgement about whether the write is adequate."""
+        if not self._has_substrate:
+            return {
+                "status": "not-computed",
+                "reason": "the graph carries no value-flow edges; reaching "
+                          "definitions are unavailable",
+                "needs_capability": "value-flow"}
+        rows = []
+        for role, value_id in arguments:
+            if not value_id or value_id not in self._by_id:
+                continue
+            defs, origins, unreadable = self._walk_back(value_id, sink_span)
+            argument = self._by_id[value_id].get("label") \
+                or (self._by_id[value_id].get("properties") or {}).get("name")
+            if looks_like_leaked_label(argument):
+                argument = None  # an AST-kind label is not the argument's source text
+            entry = {
+                "role": role,
+                "value_id": value_id,
+                "argument": argument,
+                "last_definitions": defs,
+                "origins": origins}
+            if unreadable:
+                # Transparent, never silent: N reaching definitions exist but their
+                # nodes carried no readable source label, so they are counted here
+                # rather than shown as noise. A reader can widen via the graph.
+                entry["unreadable_definition_count"] = unreadable
+            rows.append(entry)
+        return {"status": "computed" if rows else "none-observed",
+                "basis": "reaching definitions recovered by walking value-flow edges "
+                         "backward from each sink argument; the definition nearest "
+                         "before the sink is flagged. Neutral: where a value was "
+                         "written, not whether the write is safe.",
+                "arguments": rows}
+
+
 def looks_like_leaked_label(label: str | None) -> bool:
     """True when a value-node label is comment/AST-kind noise, not source text."""
     if not label:
@@ -490,6 +691,10 @@ class MemoryCopyCapacity:
         # a size-testing branch's region, or is it reached on the fall-through? Built
         # once from the branch-region edges the control-flow overlay emits.
         self._regions = BranchRegions(stamped_graph)
+        # Reaching definitions for each sink argument -- the last operation(s) that
+        # produced a size or destination -- recovered by walking value-flow edges
+        # backward. Neutral context; not-computed until the graph carries them.
+        self._variables = VariableContext(stamped_graph)
         # function_id -> [(control_kind, condition_head)], built once. A condition
         # node carries the id of the function it controls, in the same id space as
         # a call's owner_function_id, so a candidate can ask "does any branch in my
@@ -667,6 +872,15 @@ class MemoryCopyCapacity:
                         "dominance": self._regions.classify(
                             owner_id, idents, _node_span(call)),
                     },
+                    # Where each sink argument was last written -- the reaching
+                    # definition of the size and of every destination -- so guard
+                    # ADEQUACY can be read: the bound a branch tests can be compared
+                    # against the value the size was actually clamped to. Neutral
+                    # fact, not a verdict; not-computed without value-flow edges.
+                    "variable_context": self._variables.describe(
+                        [("size", value_id),
+                         *[("destination", d) for d in dest_values]],
+                        _node_span(call)),
                 },
                 "rank": rank, "rank_reasons": reasons,
                 # Enumeration can be complete while the evidence capsule is still
@@ -758,6 +972,12 @@ class MemoryCopyCapacity:
                             "reason": "a write-only copy has no length argument, so "
                                       "no branch can guard one"},
                     },
+                    # No size argument exists, but the destination still has a last
+                    # operation -- where the buffer was allocated or last written --
+                    # which bounds how much the implicit-length copy may overrun.
+                    "variable_context": self._variables.describe(
+                        [("destination", d) for d in dest_values],
+                        _node_span(call)),
                 },
                 "rank": rank, "rank_reasons": reasons,
                 "completeness": "PARTIAL",

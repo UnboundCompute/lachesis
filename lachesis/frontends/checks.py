@@ -1151,6 +1151,56 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual("exceeds-capacity", statuses["128"])
             self.assertEqual("capacity-known-size-unknown", statuses["n"])
 
+    def test_c_variable_context_recovers_the_last_write_of_a_clamped_size(self) -> None:
+        # The reaching-definition context (`variable_context`) must work on a real
+        # C graph: a size defined by an initializer and then reassigned by a clamp
+        # yields BOTH definitions, with the clamp -- the write nearest before the
+        # copy -- flagged. This is the guard-ADEQUACY signal the pipeline otherwise
+        # lacks: it exposes the value the size was actually bounded to, so a
+        # present-but-wrong guard stops looking like a safe one. It also confirms
+        # the frontend's real value-flow reasons match the def/pass-through
+        # vocabulary the walk relies on.
+        from lachesis.pipeline import enrich_graph
+        from lachesis.planner.unbounded_copy import VariableContext, _node_span
+
+        source = (
+            "void *memcpy(void *dst, const void *src, unsigned long n);\n"
+            "unsigned int hdrlen(void);\n"
+            "void f(char *dst, const char *src, unsigned int cap) {\n"
+            "    unsigned int n = hdrlen();\n"   # first definition: the initializer
+            "    if (n > cap) n = cap;\n"        # second definition: the clamp write
+            "    memcpy(dst, src, n);\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "clamp.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+
+            variables = VariableContext(enriched)
+            self.assertTrue(variables.has_substrate,
+                            "the C frontend emitted value-flow edges")
+            call = next(n for n in enriched["nodes"]
+                        if n["kind"] == "call"
+                        and (n["properties"] or {}).get("callee") == "memcpy")
+            size_arg = (call["properties"].get("argument_value_ids") or [None, None, None])[2]
+            block = variables.describe([("size", size_arg)], _node_span(call))
+            self.assertEqual("computed", block["status"])
+            size = next(a for a in block["arguments"] if a["role"] == "size")
+            texts = {d["text"] for d in size["last_definitions"]}
+            self.assertIn("hdrlen()", texts)          # the initializer survives
+            self.assertIn("n", texts)                 # the clamp write survives
+            nearest = [d for d in size["last_definitions"] if d.get("nearest_to_sink")]
+            self.assertEqual(1, len(nearest))
+            self.assertEqual("write", nearest[0]["reason"])   # the clamp is nearest
+            self.assertEqual(5, nearest[0]["line"])
+
     def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
         """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
 

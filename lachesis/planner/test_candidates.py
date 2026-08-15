@@ -556,6 +556,127 @@ class RegionDominanceTest(unittest.TestCase):
         self.assertEqual(guarded, plain)
 
 
+def _clamp_flow_graph():
+    """A size variable ``n`` defined twice on the way to a memcpy: first from a
+    ``hdrlen()`` initializer, then reassigned by a clamp ``n = cap``. A ``read``
+    edge carries ``n`` into the size argument, and an Atropos copy-summary edge
+    (src -> dst, no reason) sits across the callsite -- the exact shape that must
+    NOT be walked. Modelled on the real C frontend's value-flow reasons."""
+    g = fixture_graph()
+    g["nodes"].extend([
+        _node("v:n_init", "expression", "hdrlen()", file="copy.c",
+              start_line=4, start_offset=100),
+        _node("v:n_clamp", "expression", "n", file="copy.c",
+              start_line=5, start_offset=150),
+        _node("v:cap", "parameter", "cap", file="copy.c",
+              start_line=3, start_offset=50),
+        _node("v:src", "parameter", "src", file="copy.c",
+              start_line=3, start_offset=60),
+    ])
+    for node in g["nodes"]:
+        # The copy site needs a byte span so "nearest definition before the sink"
+        # has a reference point; the size/dest value nodes carry files to match.
+        if node["id"] == "call:memcpy":
+            node["properties"].update(start_offset=195, end_offset=235)
+        if node["id"] == "v:n":
+            node["properties"].update(file="copy.c", start_line=6, start_offset=200)
+        if node["id"] == "v:dst":
+            node["properties"].update(file="copy.c", start_line=6, start_offset=210)
+    g["edges"] = [
+        # n's two reaching definitions: the initializer and the later clamp write.
+        {"source": "v:n_init", "target": "v:n", "kind": "VALUE_FLOWS_TO",
+         "properties": {"reason": "initializer"}},
+        {"source": "v:n_clamp", "target": "v:n", "kind": "VALUE_FLOWS_TO",
+         "properties": {"reason": "write"}},
+        # cap flows into the clamp expression (a pass-through read).
+        {"source": "v:cap", "target": "v:n_clamp", "kind": "VALUE_FLOWS_TO",
+         "properties": {"reason": "read"}},
+        # The Atropos copy summary: src -> dst, no reason. A boundary, not a def.
+        {"source": "v:src", "target": "v:dst", "kind": "VALUE_FLOWS_TO",
+         "properties": {"fact_origin": "atropos-model", "summary_kind": "copy"}},
+    ]
+    return g
+
+
+class VariableContextTest(unittest.TestCase):
+    """`variable_context` is the reaching definition of each sink argument -- where
+    its value was last written -- recovered by walking value-flow edges backward.
+    A neutral fact for judging guard adequacy, never a verdict, never fed to rank."""
+
+    def _size_ctx(self, graph):
+        row = next(r for r in MemoryCopyCapacity(graph).enumerate()["candidates"]
+                   if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+        vc = row["inferences"]["variable_context"]
+        return next(a for a in vc["arguments"] if a["role"] == "size")
+
+    def test_reaching_definitions_capture_every_write_of_the_size(self):
+        size = self._size_ctx(_clamp_flow_graph())
+        texts = {d["text"] for d in size["last_definitions"]}
+        self.assertEqual(texts, {"hdrlen()", "n"})
+        reasons = {d["reason"] for d in size["last_definitions"]}
+        self.assertEqual(reasons, {"initializer", "write"})
+
+    def test_definition_nearest_before_the_sink_is_flagged(self):
+        size = self._size_ctx(_clamp_flow_graph())
+        nearest = [d for d in size["last_definitions"] if d.get("nearest_to_sink")]
+        self.assertEqual(len(nearest), 1)
+        # The clamp at line 5 is the most recent write before the copy at line 6.
+        self.assertEqual(nearest[0]["line"], 5)
+        self.assertEqual(nearest[0]["reason"], "write")
+
+    def test_taint_summary_edge_is_never_walked_as_a_definition(self):
+        # The destination reaches its own parameter only -- never the source across
+        # the memcpy copy-summary edge. A fabricated provenance fact is worse than
+        # an absent one, so the boundary edge is not traversed.
+        row = next(r for r in MemoryCopyCapacity(_clamp_flow_graph()).enumerate()[
+            "candidates"] if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+        dest = next(a for a in row["inferences"]["variable_context"]["arguments"]
+                    if a["role"] == "destination")
+        reached = {o["text"] for o in dest["origins"]} | {
+            d["text"] for d in dest["last_definitions"]}
+        self.assertNotIn("src", reached)
+
+    def test_ast_kind_labels_are_counted_not_shown_as_definitions(self):
+        # A reaching definition whose node carries only an AST-kind label (no source
+        # text) must not appear as a definition -- presenting `IntegerLiteral` as a
+        # def is a wrong fact. It is counted transparently instead, and never crowds
+        # a real, readable definition out of the capped list.
+        g = _clamp_flow_graph()
+        g["nodes"].append(
+            _node("v:noise", "expression", "ImplicitCastExpr", file="copy.c",
+                  start_line=4, start_offset=90))
+        g["edges"].append(
+            {"source": "v:noise", "target": "v:n", "kind": "VALUE_FLOWS_TO",
+             "properties": {"reason": "assignment"}})
+        size = self._size_ctx(g)
+        texts = {d["text"] for d in size["last_definitions"]}
+        self.assertNotIn("ImplicitCastExpr", texts)     # noise is not a definition
+        self.assertEqual({"hdrlen()", "n"}, texts)      # real defs still present
+        self.assertEqual(1, size["unreadable_definition_count"])
+
+    def test_not_computed_without_value_flow_substrate(self):
+        # A graph with no value-flow edges cannot back reaching definitions; the
+        # block reads not-computed, never mistaken for "no definition exists".
+        g = fixture_graph()
+        g["edges"] = []
+        row = next(r for r in MemoryCopyCapacity(g).enumerate()["candidates"]
+                   if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+        vc = row["inferences"]["variable_context"]
+        self.assertEqual(vc["status"], "not-computed")
+        self.assertEqual(vc["needs_capability"], "value-flow")
+
+    def test_variable_context_never_touches_the_rank(self):
+        # The neutral fact must not reorder or suppress: identical rank with rich
+        # reaching-definition context and with none at all.
+        rich = self._rank(_clamp_flow_graph())
+        bare = self._rank(fixture_graph())
+        self.assertEqual(rich, bare)
+
+    def _rank(self, graph):
+        return next(r for r in MemoryCopyCapacity(graph).enumerate()["candidates"]
+                    if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")["rank"]
+
+
 def _capacity_graph(dest_type="char[64]", size_arg="128"):
     """A memcpy whose destination is a fixed array of ``dest_type`` and whose size
     argument is spelled ``size_arg``. Object-size can compare the two soundly when
