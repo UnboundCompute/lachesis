@@ -70,6 +70,7 @@ include = ["lachesis*"]
 "lachesis.frontends.c" = ["*.json", "fixtures/**/*", "fixtures_crosstu/**/*", "fixtures_homonym/**/*", "fixtures_opsreg/**/*", "fixtures_opsreg_hdr/**/*"]
 "lachesis.frontends.python" = ["*.json", "fixtures/**/*"]
 "lachesis.core" = ["*.json"]
+"lachesis.integrations.atropos" = ["fixtures_cslice/**/*"]
 # The eager baseline the equality harness diffs every later phase against. It ships
 # because the harness is only meaningful next to the recording it is judged against.
 "lachesis.nav" = ["goldens/*.json.gz"]

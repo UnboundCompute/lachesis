@@ -394,6 +394,24 @@ TOOLS = [
                     "shown against the peer guard it lacks (negative space).",
      "inputSchema": {"type": "object", "properties": {
          "sym": {"type": "string"}}, "required": ["sym"]}},
+    {"name": "taint",
+     "description": "Taint witnesses from the Atropos catalog: where untrusted input actually reaches "
+                    "a dangerous sink through value flow. Folds the Atropos taint models (sources / "
+                    "sinks / summaries) onto this graph's exact nodes and runs propagation, returning "
+                    "each source->sink reach with the catalog model id, CWE, and file:line for both "
+                    "ends. `atropos_connected` rows are the ones a catalog fact drove (e.g. request -> "
+                    "urlopen SSRF); the rest are the engine's own generic-role reaches. Costs one "
+                    "whole-graph value-flow build on first call per graph (cached after). A no-op with "
+                    "a clear reason if the Atropos catalog is not checked out. Each witness carries "
+                    "`source_id`/`sink_id`, the exact graph node ids of the bound endpoints. "
+                    "`unwitnessed` lists bound sinks/sources that took part in no reach -- feed those "
+                    "ids straight to `sources_of`/`flow`/`reaches` to trace why (on a C graph they mark "
+                    "where value-flow gaps sever the chain); no name resolution needed since the "
+                    "endpoint is often an external callee the name index can't seed.",
+     "inputSchema": {"type": "object", "properties": {
+         "limit": {"type": "integer", "default": 50},
+         "atropos_only": {"type": "boolean",
+                          "description": "only witnesses a catalog fact drove"}}}},
 ]
 
 # Every tool accepts an optional `format` ("text" compact | "json" full). Inject it
@@ -580,7 +598,108 @@ def call_tool(name, args, format=None):
             return _emit(name, {"error": f"no node named {args['sym']!r}"}, fmt)
         return _emit(name, {**c.siblings.diff(hits[0]),
                             **_alts(store, args["sym"])}, fmt, offset, limit)
+    if name == "taint":
+        return _emit(name, _taint(c.store, args), fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")
+
+
+def _taint(store, args):
+    """Fold the Atropos catalog over the whole-graph value-flow tier and list reaches.
+
+    The disk dataflow tier stays catalog-free (it is keyed by the core content hash
+    alone, so it cannot also encode a model set); the model stamping and a fresh
+    propagation happen here, in RAM, on top of it. That keeps the cache unambiguous
+    and confines every catalog effect to this one on-demand tool.
+    """
+    from lachesis.integrations.atropos.enrich import atropos_enrich
+    from lachesis.core.overlays.taint import TaintPropagation
+    from lachesis.nav.kuzu_index import materialize_graph
+
+    store.ensure_dataflow_tier()  # whole-graph value flow, built once then cached to disk
+    graph = materialize_graph(store.index)
+    stamped, summary = atropos_enrich(graph)
+    if not summary.get("applied"):
+        return {"move": "taint", "applied": False, "reason": summary.get("reason"),
+                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
+                        "at ../atropos, then reload"}
+
+    by_id = {n["id"]: n for n in stamped["nodes"]}
+    marked = {}  # value_id -> the atropos role node that stamped it
+    for node in stamped["nodes"]:
+        props = node.get("properties", {})
+        if props.get("fact_origin") == "atropos-model" and "value_id" in props:
+            marked[props["value_id"]] = node
+
+    def _loc(value_id):
+        props = by_id.get(value_id, {}).get("properties", {})
+        f = props.get("absolute_file") or props.get("file")
+        line = props.get("start_line")
+        return f"{f}:{line}" if f else None
+
+    def _label(value_id):
+        node = by_id.get(value_id, {})
+        return node.get("label") or (node.get("properties", {}) or {}).get("label") or value_id
+
+    rows = []
+    witnessed = set()  # value_ids that took part in at least one reach
+    for witness in TaintPropagation().enrich(stamped).nodes:
+        if witness.get("kind") != "taint-reach":
+            continue
+        props = witness.get("properties", {})
+        sv, kv = props.get("source_value_id"), props.get("sink_value_id")
+        witnessed.add(sv)
+        witnessed.add(kv)
+        src_role, sink_role = marked.get(sv), marked.get(kv)
+        model_props = (sink_role or src_role or {}).get("properties", {})
+        rows.append({
+            "source": _label(sv), "source_at": _loc(sv), "source_id": sv,
+            "sink": _label(kv), "sink_at": _loc(kv), "sink_id": kv,
+            "source_model": (src_role or {}).get("properties", {}).get("model_id"),
+            "sink_model": (sink_role or {}).get("properties", {}).get("model_id"),
+            "cwe": model_props.get("cwe", []),
+            "atropos_connected": bool(src_role or sink_role),
+        })
+    # A catalog-driven reach is the point of the tool, so those sort first.
+    rows.sort(key=lambda r: not r["atropos_connected"])
+    total = len(rows)
+    connected = sum(1 for r in rows if r["atropos_connected"])
+    if args.get("atropos_only"):
+        rows = [r for r in rows if r["atropos_connected"]]
+
+    # Bound endpoints that never took part in a reach. These are the addressable
+    # seeds for the dataflow tools -- `sources_of <sink_id>` / `flow <source_id>`
+    # over MCP, no name resolution needed (the endpoint is an external callee's
+    # arg the name index can't reach). On a C graph this listing is the frontier
+    # where the value-flow gaps sever the source->sink chain.
+    lim = int(args.get("limit", 50))
+    unwit = {"sources": [], "sinks": []}
+    for value_id, role_node in marked.items():
+        if value_id in witnessed:
+            continue
+        bucket = role_node.get("kind")
+        if bucket not in ("source", "sink"):
+            continue
+        rp = role_node.get("properties", {})
+        unwit[bucket + "s"].append({
+            "id": value_id, "label": _label(value_id), "at": _loc(value_id),
+            "model": rp.get("model_id"), "cwe": rp.get("cwe", []),
+        })
+    return {
+        "move": "taint", "applied": True,
+        "atropos_root": summary["atropos_root"],
+        "languages": summary["languages"],
+        "bind": summary["per_language"],
+        "role_nodes": summary["role_nodes"],
+        "witness_count": total,
+        "atropos_connected": connected,
+        "witnesses": rows[:lim],
+        "unwitnessed": {
+            "sources": unwit["sources"][:lim],
+            "sinks": unwit["sinks"][:lim],
+            "source_total": len(unwit["sources"]),
+            "sink_total": len(unwit["sinks"]),
+        },
+    }
 
 
 def _load_graph(args):

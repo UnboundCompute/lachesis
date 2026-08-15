@@ -36,4 +36,4 @@ graph_out/
 # that would land again, in full, on every version bump.
 lachesis/frontends/typescript/vendor/
 
-*.md
+*.md.claude/worktrees/
