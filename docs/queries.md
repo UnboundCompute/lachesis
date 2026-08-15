@@ -1,8 +1,9 @@
 # Querying the graph
 
-Once a graph is built there are two ways to ask it questions: the `lachesis-query`
-command line, and the `lachesis-mcp` server that exposes the same reasoning to an
-LLM agent. This page is the reference for both. For a hands-on run of the most
+Once a graph is built there are three ways to ask it questions: `lachesis-query`,
+the verdict-free `lachesis-candidates` worklist command, and the `lachesis-mcp`
+server that exposes both kinds of reasoning to an LLM agent. This page is the
+reference for them. For a hands-on run of the most
 important ones, follow [`examples/README.md`](../examples/README.md).
 
 Both surfaces read the same canonical graph and speak in terms of the
@@ -74,7 +75,7 @@ Every tool except `load_graph` accepts an optional `format` argument, `text`
 also page their text rendering so a call against a function with hundreds of
 callers stays bounded; the JSON result is always complete.
 
-The seventeen tools group by what they are for.
+The tools group by what they are for.
 
 ### Orientation: where do I start on an unfamiliar graph
 
@@ -111,6 +112,33 @@ The seventeen tools group by what they are for.
 | `guards` | The derived guard profile of a function: a score, a class (`guard`, `validate`, or `passthrough`), and the raw condition, short-circuit, and throw counts behind it. |
 | `call_roles` | Type a function's outgoing calls by derived security role (`verify`, `sanitize`, `authz`, `validate`, or `none`). These are security roles, not AST structural roles. |
 | `siblings` | The peer differential: form a symbol's cross-module family, classify each member guarded or unguarded with guard transitivity, and flag the unguarded outlier against the peer guard it lacks. This is the negative-space move that surfaces the missing check. |
+
+### Candidate worklists: point the judge at every obligation
+
+| Tool | What it does |
+|---|---|
+| `candidates` | Enumerate and rank obligation sites selected by exact Atropos attachments. Filter by `domain`, `constructor`, or `language`; page with the opaque `cursor`. The v1 constructor is `memory.copy.capacity`. |
+| `candidate_detail` | Return one complete candidate capsule by `candidate_id`, including observations, bounded inferences, graph handles, rank reasons, and the suggested drill-in move. |
+| `candidate_census` | Return counts and explicit coverage frontiers without candidate rows. This distinguishes zero candidates from missing models or analysis capability. |
+| `taint` | Bind Atropos source/sink/summary facts and report witnessed source-to-sink flows. This is flow evidence; it is separate from obligation enumeration. |
+
+Candidate tools deliberately do not run a safety check. A constant size, a
+self-bounded API, a nearby condition, or an unwitnessed input path may lower rank,
+but never removes an observable site. Atropos owns the exact symbol/access-path
+facts; Lachesis maps those facts to constructors, enumerates, derives bounded
+evidence, and ranks. The LLM remains the judge.
+
+The same registry is available for batch use:
+
+```bash
+lachesis-candidates graph.kuzu --constructor memory.copy.capacity --limit 40
+lachesis-candidates graph.kuzu --constructor memory.copy.capacity --census
+lachesis-candidates graph.kuzu --candidate-id obl_...
+```
+
+This batch command emits JSON and binds against the core symbol index. It does not
+build value flow or judge safety; the AI calls `sources_of`, `reaches`, `read_body`,
+and other graph tools for the candidates it chooses to investigate.
 
 ### Session control
 

@@ -38,6 +38,7 @@ Once a graph is built, these are the moves, from the command line or as MCP tool
 | Where does this value go? What feeds this sink? | `flow`, `sources_of` |
 | Does this source reach that sink? | `reaches`, a labeled witness path or an honest "no" |
 | What does this pointer point to? What aliases it? | `points_to`, `aliases` |
+| Which safety-obligation sites should I inspect first? | `candidates`, ranked and exhaustive over bound facts, with no safety verdict |
 
 Every answer carries a confidence and an origin. An `exact` edge is resolved; a `conservative` one is a deliberate over-approximation the tool tells you about rather than hiding. You read the results as evidence, not as verdicts, which is the honest way to reason about a large codebase you didn't write.
 
