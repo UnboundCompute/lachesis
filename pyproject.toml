@@ -50,6 +50,7 @@ lachesis-analyze = "lachesis.cli.analyze:main"
 lachesis-query = "lachesis.cli.query:main"
 lachesis-mcp = "lachesis.nav.mcp_server:main"
 lachesis-plan = "lachesis.planner.cli:main"
+lachesis-candidates = "lachesis.planner.candidate_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/UnboundCompute/lachesis"
