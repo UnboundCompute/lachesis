@@ -172,6 +172,27 @@ def size_semantics(expression: str | None, shape: str) -> tuple[float, str]:
     return 0.2, "constant"
 
 
+def destination_kind(expression: str | None) -> str:
+    """A neutral syntactic class for one destination spelling. Finer than the
+    rank's three buckets, and provable from the spelling alone: it says what
+    KIND of write target this is, never whether it is safe. Distinguishing an
+    exact-sized allocation from an opaque fixed buffer is NOT possible here --
+    both spell as a bare identifier or a deref -- so that lives on the frontier
+    as an object-size obligation, not in this guess."""
+    if not expression:
+        return "unknown"
+    text = expression.strip()
+    if _OFFSET_WRITE.search(text):
+        return "offset-write"       # base + running offset into an existing buffer
+    if "[" in text:
+        return "indexed-write"      # buf[i]: a write at a computed index
+    if text.startswith("*") or text.startswith("&"):
+        return "indirect-write"     # *p: through a pointer; capacity is not local
+    if "->" in text or "." in text:
+        return "field-write"        # a struct/union field buffer
+    return "named-buffer"           # a bare identifier: local/param/global buffer
+
+
 def dest_semantics(dest_expressions: list[str | None]) -> tuple[float, str]:
     """Rank the destination by how easily it overflows. An offset write into an
     existing buffer is the pattern to inspect; a bare buffer is next; an unknown
@@ -331,6 +352,9 @@ class MemoryCopyCapacity:
                     "size_expression": expression, "syntactic_shape": shape,
                     "size_expression_origin": expression_origin,
                     "destination_expressions": dest_expressions,
+                    "destination_kinds": [
+                        {"expression": d, "kind": destination_kind(d)}
+                        for d in dest_expressions],
                     "atropos_model_id": props.get("model_id"),
                     "access_path": props.get("access_path"),
                     # `cwe` is the model's full tag set, verbatim; `obligation_cwe`
@@ -348,8 +372,17 @@ class MemoryCopyCapacity:
                         "witness_ids": [],
                         "reason": "the AI may call sources_of/reaches when investigating",
                     },
-                    "destination_capacity": {"status": "unknown",
-                                             "reason": "object-size analysis is unavailable"},
+                    # Whether the destination's real capacity matches the copy
+                    # size -- the safe-by-construction "exact allocation" case --
+                    # cannot be told from the spelling (a malloc'd buffer and an
+                    # opaque fixed one both read as a bare identifier or a deref).
+                    # It needs object-size analysis, a capability v1 defers; until
+                    # then this stays unknown rather than guessed.
+                    "destination_capacity": {
+                        "status": "unknown",
+                        "reason": "object-size analysis is unavailable; the "
+                                  "exact-allocation-size match cannot be proven here",
+                        "needs_capability": "object-size"},
                     # A neutral observation, never a verdict and never fed to the
                     # rank: does a branch in this function test a size variable?
                     # `dominance` stays uncomputed -- presence of a comparison is

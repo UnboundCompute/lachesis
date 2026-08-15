@@ -8,7 +8,8 @@ from unittest.mock import patch
 from lachesis.planner.registry import CandidateRegistry, default_candidate_registry
 from lachesis.planner.unbounded_copy import (
     MemoryCopyCapacity, arg_from_callsite, condition_head, dest_semantics,
-    looks_like_leaked_label, size_identifiers, size_semantics, syntactic_shape)
+    destination_kind, looks_like_leaked_label, size_identifiers, size_semantics,
+    syntactic_shape)
 
 
 def _node(node_id, kind, label, **properties):
@@ -223,6 +224,31 @@ class SemanticRankingTest(unittest.TestCase):
         self.assertEqual(tag, "offset-write")
         self.assertGreater(offset, whole)
         self.assertGreater(whole, unknown)
+
+    def test_destination_kind_classifies_write_targets(self):
+        self.assertEqual(destination_kind("new->pkt + ltrim"), "offset-write")
+        self.assertEqual(destination_kind("buf[i]"), "indexed-write")
+        self.assertEqual(destination_kind("*target"), "indirect-write")
+        self.assertEqual(destination_kind("c->current->buffer"), "field-write")
+        self.assertEqual(destination_kind("buf"), "named-buffer")
+        self.assertEqual(destination_kind(None), "unknown")
+
+    def test_destination_capacity_stays_unknown_not_guessed(self):
+        # The exact-allocation-size distinction is capability-gated, never faked.
+        row = MemoryCopyCapacity(fixture_graph()).enumerate()["candidates"][0]
+        cap = row["inferences"]["destination_capacity"]
+        self.assertEqual(cap["status"], "unknown")
+        self.assertEqual(cap["needs_capability"], "object-size")
+
+    def test_destination_kinds_are_surfaced_per_expression(self):
+        graph = fixture_graph()
+        for node in graph["nodes"]:
+            if node["id"] == "call:memcpy":
+                node["label"] = "memcpy(*target, src, n)"
+        row = next(r for r in MemoryCopyCapacity(graph).enumerate()["candidates"]
+                   if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+        kinds = {k["kind"] for k in row["observations"]["destination_kinds"]}
+        self.assertIn("indirect-write", kinds)
 
     def test_arithmetic_size_outranks_constant_copy_end_to_end(self):
         # The noise fix: a parsed-length subtraction into an offset write must
