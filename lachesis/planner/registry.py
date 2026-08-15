@@ -4,7 +4,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import taxonomy
+from .sink_obligation import sink_constructor
 from .unbounded_copy import MemoryCopyCapacity
+
+# The one family whose obligation is richer than a single argument (it pairs a
+# copy size with a write destination) earns a specialized enumerator. Every other
+# family is served by the generic taxonomy-driven enumerator. This is the ONLY
+# place a specialist is named; there is no hardcoded list of which families exist
+# -- that comes entirely from `taxonomy.family_specs()`.
+_SPECIALIZED: dict[str, type] = {
+    MemoryCopyCapacity.metadata["id"]: MemoryCopyCapacity,
+}
 
 
 @dataclass(frozen=True)
@@ -146,6 +156,12 @@ class CandidateRegistry:
 
 
 def default_candidate_registry(graph: dict, bind_summary: dict | None = None) -> CandidateRegistry:
+    """Register one constructor per taxonomy family -- the specialist where one
+    exists, the generic enumerator everywhere else. The default query surface
+    therefore spans EVERY family; a caller pins a single ``constructor`` only when
+    they deliberately want to test that one family."""
     registry = CandidateRegistry(graph, bind_summary)
-    registry.register(MemoryCopyCapacity)
+    for spec in taxonomy.family_specs():
+        implementation = _SPECIALIZED.get(spec["id"]) or sink_constructor(spec)
+        registry.register(implementation)
     return registry

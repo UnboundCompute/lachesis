@@ -653,5 +653,159 @@ class CensusTaxonomyTest(unittest.TestCase):
         self.assertTrue(memory["enumerable"])
 
 
+def multi_family_graph():
+    """A graph with sinks from three families: a copy (buffer-size), an
+    allocation (alloc-size), and an injection (sql-injection) -- so a test can
+    prove the generic enumerator serves every non-copy family off one contract."""
+    return {
+        "nodes": [
+            _node("call:memcpy", "call", "memcpy(dst, src, n)", callee="memcpy",
+                  owner_function_id="fn:a", file="a.c", start_line=10),
+            _node("call:kzalloc", "call", "kzalloc(count * size, GFP_KERNEL)",
+                  callee="kzalloc", owner_function_id="fn:a", file="a.c",
+                  start_line=11, method_name="kzalloc"),
+            _node("call:query", "call", "mysql_query(db, sql)", callee="mysql_query",
+                  owner_function_id="fn:a", file="a.c", start_line=12),
+            _node("v:n", "expression", "n"),
+            _node("v:allocsz", "expression", "count * size"),
+            _node("v:sql", "expression", "sql"),
+            _role("sink:memcpy-size", "sink", "c.std.memcpy.a2", "v:n",
+                  "call:memcpy", "Argument[2]", "buffer-size"),
+            _role("sink:kzalloc-size", "sink", "c.kernel.kzalloc.a0", "v:allocsz",
+                  "call:kzalloc", "Argument[0]", "alloc-size"),
+            _role("sink:query", "sink", "c.db.mysql_query.a1", "v:sql",
+                  "call:query", "Argument[1]", "sql-injection"),
+        ],
+        "edges": [],
+    }
+
+
+class GenericSinkObligationTest(unittest.TestCase):
+    """The generic, taxonomy-driven enumerator for single-argument families."""
+
+    def setUp(self):
+        from lachesis.planner import taxonomy
+        from lachesis.planner.sink_obligation import sink_constructor
+
+        self.taxonomy = taxonomy
+        self.sink_constructor = sink_constructor
+        self.alloc_spec = next(
+            s for s in taxonomy.family_specs() if s["id"] == "memory.alloc.size")
+
+    def test_enumerates_one_candidate_per_matching_sink(self):
+        ctor = self.sink_constructor(self.alloc_spec)
+        result = ctor(multi_family_graph()).enumerate()
+        self.assertEqual(len(result["candidates"]), 1)
+        row = result["candidates"][0]
+        self.assertEqual(row["observations"]["atropos_model_id"], "c.kernel.kzalloc.a0")
+        self.assertEqual(row["observations"]["sink_kind"], "alloc-size")
+        self.assertEqual(row["constructor"], "memory.alloc.size")
+        self.assertEqual(row["domain"], "memory")
+
+    def test_ignores_sinks_of_other_families(self):
+        # An injection sink must never surface under the allocation constructor.
+        ctor = self.sink_constructor(self.alloc_spec)
+        result = ctor(multi_family_graph()).enumerate()
+        model_ids = {r["observations"]["atropos_model_id"]
+                     for r in result["candidates"]}
+        self.assertNotIn("c.db.mysql_query.a1", model_ids)
+        self.assertNotIn("c.std.memcpy.a2", model_ids)
+
+    def test_row_carries_the_full_capsule_contract(self):
+        ctor = self.sink_constructor(self.alloc_spec)
+        row = ctor(multi_family_graph()).enumerate()["candidates"][0]
+        for key in ("candidate_id", "constructor", "domain", "language",
+                    "obligation", "handles", "observations", "inferences",
+                    "rank", "rank_reasons", "completeness", "next_op"):
+            self.assertIn(key, row)
+        self.assertEqual(row["completeness"], "PARTIAL")
+        self.assertEqual(row["inferences"]["input_reachability"]["status"],
+                         "not-queried")
+        # The argument spelling is recovered from the faithful callsite label.
+        self.assertEqual(row["observations"]["size_expression"], "count * size")
+        self.assertEqual(row["observations"]["size_expression_origin"],
+                         "callsite-argument")
+
+    def test_arithmetic_argument_outranks_a_constant(self):
+        # An allocation whose size is `count * size` (overflow-prone) must rank
+        # above a bare constant -- ordering only, never suppression.
+        ctor = self.sink_constructor(self.alloc_spec)
+        row = ctor(multi_family_graph()).enumerate()["candidates"][0]
+        self.assertGreater(row["rank"], 0.5)
+        tags = {r["value"] for r in row["rank_reasons"]}
+        self.assertTrue(any(v >= 0.9 for v in tags))
+
+    def test_obligation_cwe_is_scoped_to_the_family(self):
+        # The model tags CWE-787 (from the fixture helper); the allocation
+        # obligation is about overflow/oversize, so CWE-787 must NOT ride along
+        # in obligation_cwe even though it stays visible in the full cwe set.
+        ctor = self.sink_constructor(self.alloc_spec)
+        row = ctor(multi_family_graph()).enumerate()["candidates"][0]
+        self.assertIn("CWE-787", row["observations"]["cwe"])
+        self.assertNotIn("CWE-787", row["observations"]["obligation_cwe"])
+
+    def test_unbound_frontier_is_scoped_to_the_family_kinds(self):
+        # Unbound rows now carry `kind`; the allocation constructor must report
+        # only alloc-size misses, not another family's unbound sinks.
+        bind_summary = {"per_language": {"c": {"bind": {"bound": 1, "symbol-not-found": 2},
+            "unbound": [
+                {"model_id": "c.kernel.kvmalloc.a0", "role": "sink",
+                 "kind": "alloc-size", "status": "symbol-not-found"},
+                {"model_id": "c.db.sqlite3_exec.a1", "role": "sink",
+                 "kind": "sql-injection", "status": "symbol-not-found"},
+            ]}}}
+        ctor = self.sink_constructor(self.alloc_spec)
+        result = ctor(multi_family_graph(), bind_summary).enumerate()
+        unbound = result["frontiers"]["unbound_sinks"]
+        self.assertEqual([u["model_id"] for u in unbound], ["c.kernel.kvmalloc.a0"])
+
+
+class AllFamilyRegistryTest(unittest.TestCase):
+    """The default registry spans every taxonomy family, no hardcoded list."""
+
+    def test_every_family_has_a_registered_constructor(self):
+        from lachesis.planner import taxonomy
+
+        registry = default_candidate_registry(multi_family_graph())
+        registered = {m["id"] for m in registry.constructors}
+        expected = {s["id"] for s in taxonomy.family_specs()}
+        self.assertEqual(registered, expected)
+        # And the count matches every family in the tree, not just memory.copy.
+        self.assertEqual(len(registered), sum(
+            len(d["families"]) for d in taxonomy.SINK_TAXONOMY.values()))
+
+    def test_memory_copy_keeps_its_specialist(self):
+        from lachesis.planner.unbounded_copy import MemoryCopyCapacity
+
+        registry = default_candidate_registry(multi_family_graph())
+        impl = registry._specs["memory.copy.capacity"].implementation
+        self.assertIs(impl, MemoryCopyCapacity)
+
+    def test_default_query_surface_groups_across_families(self):
+        # With no constructor pinned, the candidates move fans out over every
+        # registered family rather than collapsing to one.
+        registry = default_candidate_registry(multi_family_graph())
+        out = registry.candidates()
+        self.assertEqual(out["move"], "candidates")
+        self.assertIn("groups", out)
+        self.assertGreater(len(out["constructors"]), 1)
+
+    def test_pinned_constructor_tests_one_family(self):
+        # Pinning a single family is the deliberate "test just this" path.
+        registry = default_candidate_registry(multi_family_graph())
+        out = registry.candidates(constructor="memory.alloc.size")
+        self.assertEqual(out["constructor"], "memory.alloc.size")
+        self.assertEqual(out["total"], 1)
+
+    def test_alloc_and_injection_candidates_are_discoverable_by_id(self):
+        registry = default_candidate_registry(multi_family_graph())
+        alloc = registry.candidates(constructor="memory.alloc.size")["candidates"]
+        query = registry.candidates(constructor="injection.query.escaping")["candidates"]
+        self.assertEqual(alloc[0]["observations"]["atropos_model_id"],
+                         "c.kernel.kzalloc.a0")
+        self.assertEqual(query[0]["observations"]["atropos_model_id"],
+                         "c.db.mysql_query.a1")
+
+
 if __name__ == "__main__":
     unittest.main()

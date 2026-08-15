@@ -10,9 +10,11 @@ then to the exact catalog kind -- without losing any precision.
       family          the interpreter or resource in play        (mid)
         kind          the exact Atropos sink kind                (granular leaf)
 
-A `constructor` id on a family names the enumerator that already turns those
-kinds into candidates; ``None`` means "modeled in the catalog, not yet
-enumerable". The map is the single source of truth for both: every catalog sink
+A `constructor` id on a family names the enumerator that turns those kinds into
+candidates. Every family names one -- memory.copy has a specialized enumerator,
+every other family is served by the generic taxonomy-driven enumerator -- so a
+family is *enumerable* exactly when its constructor is registered (which is all
+of them by default). The map is the single source of truth for both: every catalog sink
 kind belongs to exactly one family (a test pins this against the live catalog),
 so adding a kind to Atropos without placing it here is a caught error, not drift.
 
@@ -36,11 +38,13 @@ SINK_TAXONOMY: dict[str, dict] = {
                 "kinds": ("buffer-size", "buffer-write"),
                 "obligation": "copy length must not exceed destination capacity",
                 "constructor": "memory.copy.capacity",
+                "obligation_cwe": ("CWE-787", "CWE-120", "CWE-125"),
             },
             "alloc": {
                 "kinds": ("alloc-size",),
                 "obligation": "allocation size must be bounded (no overflow, not attacker-huge)",
-                "constructor": None,
+                "constructor": "memory.alloc.size",
+                "obligation_cwe": ("CWE-190", "CWE-789", "CWE-770"),
             },
         },
     },
@@ -55,27 +59,32 @@ SINK_TAXONOMY: dict[str, dict] = {
                 "kinds": ("sql-injection", "nosql-injection",
                           "ldap-injection", "xpath-injection"),
                 "obligation": "no untrusted text is concatenated into a query language",
-                "constructor": None,
+                "constructor": "injection.query.escaping",
+                "obligation_cwe": ("CWE-89", "CWE-943", "CWE-90", "CWE-643"),
             },
             "exec": {
                 "kinds": ("command-injection", "code-injection", "template-injection"),
                 "obligation": "no untrusted text reaches a shell, eval, or template engine",
-                "constructor": None,
+                "constructor": "injection.exec.escaping",
+                "obligation_cwe": ("CWE-78", "CWE-94", "CWE-1336"),
             },
             "markup": {
                 "kinds": ("xss",),
                 "obligation": "no untrusted text reaches an HTML/JS context unescaped",
-                "constructor": None,
+                "constructor": "injection.markup.escaping",
+                "obligation_cwe": ("CWE-79",),
             },
             "document": {
                 "kinds": ("xxe",),
                 "obligation": "an untrusted XML/document parser resolves no external entities",
-                "constructor": None,
+                "constructor": "injection.document.entities",
+                "obligation_cwe": ("CWE-611",),
             },
             "format": {
                 "kinds": ("format-string",),
                 "obligation": "the format string is not attacker-controlled",
-                "constructor": None,
+                "constructor": "injection.format.control",
+                "obligation_cwe": ("CWE-134",),
             },
         },
     },
@@ -89,12 +98,14 @@ SINK_TAXONOMY: dict[str, dict] = {
             "fetch": {
                 "kinds": ("ssrf",),
                 "obligation": "the server does not fetch an attacker-chosen URL",
-                "constructor": None,
+                "constructor": "navigation.fetch.destination",
+                "obligation_cwe": ("CWE-918",),
             },
             "redirect": {
                 "kinds": ("open-redirect",),
                 "obligation": "the app does not redirect to an attacker-chosen URL",
-                "constructor": None,
+                "constructor": "navigation.redirect.destination",
+                "obligation_cwe": ("CWE-601",),
             },
         },
     },
@@ -108,12 +119,14 @@ SINK_TAXONOMY: dict[str, dict] = {
             "deserialize": {
                 "kinds": ("deserialization",),
                 "obligation": "untrusted bytes are not deserialized into live objects",
-                "constructor": None,
+                "constructor": "object-integrity.deserialize.trust",
+                "obligation_cwe": ("CWE-502",),
             },
             "prototype": {
                 "kinds": ("prototype-pollution",),
                 "obligation": "untrusted keys do not mutate object prototypes or shared state",
-                "constructor": None,
+                "constructor": "object-integrity.prototype.keys",
+                "obligation_cwe": ("CWE-1321",),
             },
         },
     },
@@ -127,12 +140,14 @@ SINK_TAXONOMY: dict[str, dict] = {
             "path": {
                 "kinds": ("path-traversal",),
                 "obligation": "a resolved file path stays within the intended directory",
-                "constructor": None,
+                "constructor": "filesystem.path.containment",
+                "obligation_cwe": ("CWE-22", "CWE-23", "CWE-36"),
             },
             "temp": {
                 "kinds": ("insecure-temp-file",),
                 "obligation": "a temp file is created unpredictably and exclusively",
-                "constructor": None,
+                "constructor": "filesystem.temp.exclusivity",
+                "obligation_cwe": ("CWE-377",),
             },
         },
     },
@@ -149,12 +164,14 @@ SINK_TAXONOMY: dict[str, dict] = {
             "primitive": {
                 "kinds": ("weak-crypto",),
                 "obligation": "a strong cryptographic primitive is used",
-                "constructor": None,
+                "constructor": "crypto-config.primitive.strength",
+                "obligation_cwe": ("CWE-327", "CWE-328"),
             },
             "transport": {
                 "kinds": ("insecure-tls",),
                 "obligation": "TLS certificate verification is not disabled",
-                "constructor": None,
+                "constructor": "crypto-config.transport.verification",
+                "obligation_cwe": ("CWE-295",),
             },
         },
     },
@@ -168,7 +185,8 @@ SINK_TAXONOMY: dict[str, dict] = {
             "regex": {
                 "kinds": ("redos",),
                 "obligation": "a regex cannot be driven to catastrophic backtracking",
-                "constructor": None,
+                "constructor": "resource.regex.complexity",
+                "obligation_cwe": ("CWE-1333", "CWE-400"),
             },
         },
     },
@@ -187,6 +205,32 @@ def all_sink_kinds() -> set[str]:
             for domain in SINK_TAXONOMY.values()
             for family in domain["families"].values()
             for kind in family["kinds"]}
+
+
+def family_specs() -> list[dict]:
+    """One flat spec per family -- the single source of truth the registry
+    reads to build a constructor for *every* family without a hardcoded list.
+
+    A spec carries everything a generic enumerator needs to bind and rank:
+    the constructor id, its domain/family, the exact catalog kinds it enumerates,
+    the obligation prose, the CWE set the obligation is about, and the languages
+    the domain spans. memory.copy names the same id its specialized enumerator
+    already advertises, so the registry can prefer the specialist for that one
+    family and fall back to the generic enumerator for all the rest."""
+    specs: list[dict] = []
+    for domain_id, domain in SINK_TAXONOMY.items():
+        for family_id, family in domain["families"].items():
+            specs.append({
+                "id": family["constructor"],
+                "domain": domain_id,
+                "family": family_id,
+                "kinds": tuple(family["kinds"]),
+                "obligation": family["obligation"],
+                "obligation_cwe": tuple(family.get("obligation_cwe", ())),
+                "languages": tuple(domain["languages"]),
+                "primary": domain["primary"],
+            })
+    return specs
 
 
 def locate(kind: str) -> tuple[str, str] | None:

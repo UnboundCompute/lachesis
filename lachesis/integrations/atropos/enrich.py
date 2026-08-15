@@ -132,6 +132,10 @@ def atropos_enrich(
                 unbound.append({
                     "model_id": row.get("model_id"), "method": row.get("method"),
                     "access_path": row.get("access_path"), "role": row.get("role"),
+                    # The catalog kind of the model that failed to attach, so a
+                    # per-family constructor can scope its unbound-sink frontier to
+                    # exactly its own kinds rather than the whole global roster.
+                    "kind": (models_by_id.get(row.get("model_id")) or {}).get("kind"),
                     "status": status, "detail": row.get("detail"),
                 })
         per_language[language] = {
