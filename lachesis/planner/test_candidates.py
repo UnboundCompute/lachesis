@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from lachesis.planner.registry import CandidateRegistry, default_candidate_registry
 from lachesis.planner.unbounded_copy import (
-    MemoryCopyCapacity, arg_from_callsite, looks_like_leaked_label, syntactic_shape)
+    MemoryCopyCapacity, arg_from_callsite, dest_semantics, looks_like_leaked_label,
+    size_semantics, syntactic_shape)
 
 
 def _node(node_id, kind, label, **properties):
@@ -137,6 +138,23 @@ class LabelLeakRecoveryTest(unittest.TestCase):
             arg_from_callsite("fgets(buf, sizeof(buf), fp)", "Argument[1]"),
             "sizeof(buf)")
 
+    def test_arg_from_callsite_ignores_separators_inside_string_literals(self):
+        # A comma or paren inside a string/char literal is data, not an argument
+        # boundary; otherwise Argument[2] here mis-recovers as a string fragment.
+        self.assertEqual(
+            arg_from_callsite(
+                'strlcat(policy_string, ",pass:flow", sizeof(policy_string))',
+                "Argument[2]"),
+            "sizeof(policy_string)")
+        self.assertEqual(
+            arg_from_callsite(
+                'strlcat(policy_string, ",pass:flow", sizeof(policy_string))',
+                "Argument[1]"),
+            '",pass:flow"')
+        self.assertEqual(
+            arg_from_callsite(r"memcpy(dst, some(a, b), sep(')', n))", "Argument[2]"),
+            "sep(')', n)")
+
     def test_arg_from_callsite_is_none_when_unrecoverable(self):
         self.assertIsNone(arg_from_callsite(None, "Argument[0]"))
         self.assertIsNone(arg_from_callsite("memcpy(a, b, c)", None))
@@ -168,6 +186,93 @@ class LabelLeakRecoveryTest(unittest.TestCase):
         self.assertEqual(memcpy["observations"]["size_expression_origin"],
                          "value-node-label")
         self.assertEqual(memcpy["observations"]["syntactic_shape"], "unknown")
+
+
+class SemanticRankingTest(unittest.TestCase):
+    """Ranking orders by risk shape, never suppresses. Higher rank == worth a
+    human's eyes first; every enumerated site still appears."""
+
+    def test_size_semantics_orders_by_risk_shape_not_spelling(self):
+        # Subtraction (underflow-prone) tops arithmetic tops dynamic tops constant.
+        sub, _ = size_semantics("len - hdr", "identifier-expression")
+        arith, _ = size_semantics("n + 4", "identifier-expression")
+        ident, _ = size_semantics("parsed_len", "identifier-expression")
+        call, _ = size_semantics("get_len()", "call-expression")
+        const, _ = size_semantics("sizeof(buf)", "literal-or-sizeof")
+        self.assertGreater(sub, arith)
+        self.assertGreater(arith, ident)
+        self.assertGreater(ident, call)
+        self.assertGreater(call, const)
+
+    def test_size_semantics_ignores_the_arrow_operator(self):
+        # `->` is member access, not a subtraction; must not read as arithmetic.
+        value, tag = size_semantics("buf->len", "identifier-expression")
+        self.assertEqual(tag, "dynamic-identifier")
+
+    def test_opaque_size_ranks_mid_not_bottom(self):
+        # An unrecoverable size is uncertain, not proven-safe: it must not sink
+        # below a plainly-constant one.
+        opaque, _ = size_semantics(None, "unknown")
+        const, _ = size_semantics("64", "literal-or-sizeof")
+        self.assertGreater(opaque, const)
+
+    def test_dest_semantics_boosts_offset_writes(self):
+        offset, tag = dest_semantics(["new->pkt + ltrim"])
+        whole, _ = dest_semantics(["buf"])
+        unknown, _ = dest_semantics([None])
+        self.assertEqual(tag, "offset-write")
+        self.assertGreater(offset, whole)
+        self.assertGreater(whole, unknown)
+
+    def test_arithmetic_size_outranks_constant_copy_end_to_end(self):
+        # The noise fix: a parsed-length subtraction into an offset write must
+        # rank above a bounded sizeof copy, without dropping either.
+        graph = fixture_graph()
+        for node in graph["nodes"]:
+            if node["id"] == "call:memcpy":
+                node["label"] = "memcpy(new->pkt + off, src, GET_LEN(p) - hdr)"
+        rows = MemoryCopyCapacity(graph).enumerate()["candidates"]
+        self.assertEqual(len(rows), 2)  # nothing suppressed
+        self.assertEqual(rows[0]["observations"]["atropos_model_id"],
+                         "c.std.memcpy.a2")
+        self.assertGreater(rows[0]["rank"], rows[1]["rank"])
+
+
+class UnboundSinkVisibilityTest(unittest.TestCase):
+    """Every sink the catalog knows must be shown, bound or not. An unbound sink
+    is surfaced as a named frontier row with its reason, never silently dropped."""
+
+    def _summary(self):
+        return {"per_language": {"c": {"bind": {"bound": 1, "symbol-not-found": 2,
+                                                "ambiguous": 1},
+            "unbound": [
+                {"model_id": "c.std.alloca.a0", "method": "alloca",
+                 "access_path": "Argument[0]", "role": "sink",
+                 "status": "symbol-not-found", "detail": None},
+                {"model_id": "c.std.snprintf.a2", "method": "snprintf",
+                 "access_path": "Argument[2]", "role": "sink",
+                 "status": "ambiguous", "detail": None},
+                {"model_id": "c.std.getenv.ret", "method": "getenv",
+                 "access_path": "ReturnValue", "role": "source",
+                 "status": "ambiguous", "detail": None},
+            ]}}}
+
+    def test_frontier_lists_unbound_sinks_with_reasons(self):
+        result = MemoryCopyCapacity(fixture_graph(), self._summary()).enumerate()
+        sinks = result["frontiers"]["unbound_sinks"]
+        methods = {row["method"] for row in sinks}
+        self.assertEqual(methods, {"alloca", "snprintf"})  # sinks only, not getenv
+        self.assertTrue(all("status" in row for row in sinks))
+        # The count and the shown list stay consistent about what's missing.
+        self.assertEqual(result["frontiers"]["unbound_models"], 3)
+
+    def test_unbound_sinks_never_leak_into_enumerated_candidates(self):
+        # Showing an unbound sink must not fabricate an obligation row for it;
+        # candidates come only from bound attachments in the graph.
+        result = MemoryCopyCapacity(fixture_graph(), self._summary()).enumerate()
+        methods = {row["observations"]["callee"] for row in result["candidates"]}
+        self.assertNotIn("alloca", methods)
+        self.assertNotIn("snprintf", methods)
 
 
 class CandidateRegistryTest(unittest.TestCase):

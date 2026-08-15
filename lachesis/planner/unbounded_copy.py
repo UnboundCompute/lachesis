@@ -49,7 +49,22 @@ def arg_from_callsite(call_label: str | None, access_path: str | None) -> str | 
     if start < 0:
         return None
     depth, current, args = 0, [], []
+    quote, escaped = None, False
     for ch in call_label[start:]:
+        if quote:
+            # Inside a string/char literal a comma or paren is data, not syntax.
+            current.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            current.append(ch)
+            continue
         if ch in "([{":
             depth += 1
             if depth == 1 and ch == "(":
@@ -86,6 +101,45 @@ def syntactic_shape(label: str | None) -> str:
     return "literal-or-sizeof"
 
 
+# A binary minus that is not the `->` member operator: a subtraction, which is
+# the underflow-prone size arithmetic worth ranking to the top.
+_SUBTRACT = re.compile(r"-(?!>)")
+_ARITHMETIC = re.compile(r"[+*/%]|<<|>>")
+# A destination written at base+offset (``buf->buffer + buf->len``): a copy into a
+# pre-existing buffer where an unchecked running length is the classic overflow.
+_OFFSET_WRITE = re.compile(r"\+")
+
+
+def size_semantics(expression: str | None, shape: str) -> tuple[float, str]:
+    """Rank the size expression by *risk shape*, not spelling. Cheap and syntactic:
+    a dynamic length (arithmetic, variable) is worth a human's eyes; a constant
+    (literal/sizeof) rarely is. This orders, it never suppresses."""
+    if not expression or shape == "unknown":
+        return 0.4, "opaque"
+    stripped = _SIZEOF.sub("", expression)
+    if _SUBTRACT.search(stripped):
+        return 1.0, "arithmetic-subtraction"
+    if _ARITHMETIC.search(stripped):
+        return 0.9, "arithmetic"
+    if shape == "identifier-expression":
+        return 0.75, "dynamic-identifier"
+    if shape == "call-expression":
+        return 0.7, "dynamic-call"
+    return 0.2, "constant"
+
+
+def dest_semantics(dest_expressions: list[str | None]) -> tuple[float, str]:
+    """Rank the destination by how easily it overflows. An offset write into an
+    existing buffer is the pattern to inspect; a bare buffer is next; an unknown
+    destination is least informative."""
+    present = [d for d in dest_expressions if d]
+    if any(_OFFSET_WRITE.search(d) for d in present):
+        return 1.0, "offset-write"
+    if present:
+        return 0.6, "whole-buffer"
+    return 0.3, "unknown"
+
+
 def _candidate_id(model_id: str, callsite_id: str, value_id: str) -> str:
     raw = f"{CONSTRUCTOR_ID}\0{model_id}\0{callsite_id}\0{value_id}"
     return "obl_" + hashlib.sha256(raw.encode()).hexdigest()[:20]
@@ -115,20 +169,24 @@ class MemoryCopyCapacity:
     def _call(self, callsite_id: str | None) -> dict:
         return self.by_id.get(callsite_id or "", {})
 
-    def _rank(self, shape: str, confidence: str) -> tuple[float, list[dict]]:
-        shape_value = {
-            "call-expression": 1.0, "identifier-expression": 0.75,
-            "unknown": 0.5, "literal-or-sizeof": 0.2,
-        }[shape]
+    def _rank(self, expression: str | None, shape: str,
+              dest_expressions: list[str | None], confidence: str
+              ) -> tuple[float, list[dict]]:
+        size_value, size_tag = size_semantics(expression, shape)
+        dest_value, dest_tag = dest_semantics(dest_expressions)
         confidence_value = {"high": 1.0, "medium": 0.7, "low": 0.4}.get(
             confidence, 0.5)
         reasons = [
-            {"term": "size_shape", "value": shape_value,
-             "why": f"size spelling is {shape}"},
+            {"term": "size_semantics", "value": size_value,
+             "why": f"size is {size_tag}"},
+            {"term": "destination_semantics", "value": dest_value,
+             "why": f"destination is {dest_tag}"},
             {"term": "model_confidence", "value": confidence_value,
              "why": f"Atropos attachment confidence is {confidence}"},
         ]
-        return round(0.7 * shape_value + 0.3 * confidence_value, 4), reasons
+        rank = round(0.6 * size_value + 0.2 * dest_value
+                     + 0.2 * confidence_value, 4)
+        return rank, reasons
 
     def enumerate(self) -> dict:
         role_nodes = [
@@ -163,8 +221,14 @@ class MemoryCopyCapacity:
             shape = syntactic_shape(expression)
             dests = destinations.get(callsite_id, ())
             dest_values = [d["properties"].get("value_id") for d in dests]
+            # Recover destinations from the callsite too, so a leaked value-node
+            # label can't corrupt the destination or the rank it feeds.
+            dest_expressions = [
+                arg_from_callsite(call.get("label"), d["properties"].get("access_path"))
+                or self._label(d["properties"].get("value_id"))
+                for d in dests]
             confidence = props.get("confidence", "medium")
-            rank, reasons = self._rank(shape, confidence)
+            rank, reasons = self._rank(expression, shape, dest_expressions, confidence)
             loc_file = call_props.get("absolute_file") or call_props.get("file")
             candidate = {
                 "candidate_id": _candidate_id(props.get("model_id", ""), callsite_id or "", value_id or ""),
@@ -179,7 +243,7 @@ class MemoryCopyCapacity:
                     "line": call_props.get("start_line"),
                     "size_expression": expression, "syntactic_shape": shape,
                     "size_expression_origin": expression_origin,
-                    "destination_expressions": [self._label(v) for v in dest_values],
+                    "destination_expressions": dest_expressions,
                     "atropos_model_id": props.get("model_id"),
                     "access_path": props.get("access_path"), "cwe": props.get("cwe", []),
                     "model_confidence": confidence,
@@ -204,10 +268,19 @@ class MemoryCopyCapacity:
             candidates.append(candidate)
         candidates.sort(key=lambda c: (-c["rank"], c["candidate_id"]))
 
-        bind = self.bind_summary.get("per_language", {}).get("c", {}).get("bind", {})
+        c_summary = self.bind_summary.get("per_language", {}).get("c", {})
+        bind = c_summary.get("bind", {})
+        # Every sink model the catalog carries that did NOT attach to a callsite.
+        # Surfaced in full (not just counted) so no sink is silently dropped: the
+        # AI sees exactly which copy/size sinks are missing and why. Sources are
+        # excluded here because this constructor's obligation is a copy sink.
+        unbound_sinks = [
+            row for row in c_summary.get("unbound", ())
+            if row.get("role") == "sink"]
         frontiers = {
             "unresolved_calls": 0,
             "unbound_models": sum(v for k, v in bind.items() if k != "bound"),
+            "unbound_sinks": unbound_sinks,
             "truncated_walks": 0,
             "missing_optional_capabilities": [
                 "value-flow", "points-to", "object-size", "dominance"],
