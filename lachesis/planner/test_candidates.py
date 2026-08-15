@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 from lachesis.planner.registry import CandidateRegistry, default_candidate_registry
 from lachesis.planner.unbounded_copy import (
-    MemoryCopyCapacity, arg_from_callsite, dest_semantics, looks_like_leaked_label,
-    size_semantics, syntactic_shape)
+    MemoryCopyCapacity, arg_from_callsite, condition_head, dest_semantics,
+    looks_like_leaked_label, size_identifiers, size_semantics, syntactic_shape)
 
 
 def _node(node_id, kind, label, **properties):
@@ -306,6 +306,113 @@ class CandidateRegistryTest(unittest.TestCase):
     def test_invalid_cursor_is_not_silently_accepted(self):
         with self.assertRaises(ValueError):
             self.registry.candidates(constructor="memory.copy.capacity", cursor="1")
+
+
+def _cond(node_id, function_id, text, control_kind="if"):
+    return _node(node_id, "cfg-condition", f"condition:{text}",
+                 function_id=function_id, control_kind=control_kind)
+
+
+def guarded_graph():
+    """One memcpy whose size `n` is tested by a branch in its own function, plus
+    a decoy branch that merely mentions `n` in its body (must not match)."""
+    g = fixture_graph()
+    # Point the memcpy call at a known function id and give that function a guard.
+    for node in g["nodes"]:
+        if node["id"] == "call:memcpy":
+            node["properties"]["owner_function_id"] = "fn:copy"
+    g["nodes"] += [
+        _cond("cond:guard", "fn:copy", "if (n > cap) return -1;"),
+        _cond("cond:decoy", "fn:copy", "if (ready) { total += n; }"),  # n only in body
+        _cond("cond:other", "fn:elsewhere", "if (n < 4) return;"),     # other function
+    ]
+    return g
+
+
+class ConditionHelperTest(unittest.TestCase):
+    def test_condition_head_strips_body(self):
+        self.assertEqual(condition_head("condition:if (a > b) { x = 1; }"), "if (a > b)")
+
+    def test_condition_head_balances_nested_parens(self):
+        self.assertEqual(condition_head("condition:if (f(a) == g(b)) { y(); }"),
+                         "if (f(a) == g(b))")
+
+    def test_condition_head_handles_for(self):
+        self.assertEqual(condition_head("condition:for (i = 0; i < n; i++) { }"),
+                         "for (i = 0; i < n; i++)")
+
+    def test_size_identifiers_drops_sizeof_and_keywords(self):
+        self.assertEqual(size_identifiers("sizeof(buf) - hdr"), {"buf", "hdr"})
+        self.assertEqual(size_identifiers("len"), {"len"})
+        self.assertEqual(size_identifiers("1024"), set())
+
+
+class ObligationCweScopingTest(unittest.TestCase):
+    """The surfaced obligation_cwe is scoped to the write-capacity failure mode;
+    a read-side CWE the model happens to carry stays in `cwe` but not in it."""
+
+    def _graph(self):
+        g = fixture_graph()
+        for node in g["nodes"]:
+            if node["id"] == "sink:memcpy-size":
+                node["properties"]["cwe"] = ["CWE-787", "CWE-120", "CWE-125"]
+        return g
+
+    def test_read_side_cwe_is_excluded_from_obligation_but_kept_in_cwe(self):
+        rows = MemoryCopyCapacity(self._graph()).enumerate()["candidates"]
+        row = next(r for r in rows
+                   if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+        obs = row["observations"]
+        self.assertIn("CWE-125", obs["cwe"])                 # nothing hidden
+        self.assertNotIn("CWE-125", obs["obligation_cwe"])   # but scoped out
+        self.assertEqual(set(obs["obligation_cwe"]), {"CWE-787", "CWE-120"})
+
+
+class ConditionObservationTest(unittest.TestCase):
+    """The conditions inference is a neutral presence fact: a branch in the
+    enclosing function that names a size variable, body mentions excluded."""
+
+    def _row(self):
+        rows = MemoryCopyCapacity(guarded_graph()).enumerate()["candidates"]
+        return next(r for r in rows
+                    if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")
+
+    def test_guard_on_size_var_is_observed(self):
+        cond = self._row()["inferences"]["conditions"]
+        self.assertEqual(cond["status"], "observed")
+        heads = [h["condition"] for h in cond["referencing_conditions"]]
+        self.assertIn("if (n > cap)", heads)
+
+    def test_body_only_mention_is_not_a_referencing_condition(self):
+        cond = self._row()["inferences"]["conditions"]
+        heads = [h["condition"] for h in cond["referencing_conditions"]]
+        self.assertNotIn("if (ready)", heads)          # `n` was only in the body
+        self.assertEqual(cond["referencing_condition_count"], 1)
+
+    def test_condition_in_another_function_is_not_borrowed(self):
+        heads = [h["condition"]
+                 for h in self._row()["inferences"]["conditions"]["referencing_conditions"]]
+        self.assertNotIn("if (n < 4)", heads)          # belongs to fn:elsewhere
+
+    def test_dominance_is_never_claimed(self):
+        # Presence of a comparison is not proof it guards this copy.
+        self.assertEqual(self._row()["inferences"]["conditions"]["dominance"],
+                         "not-computed")
+
+    def test_absent_guard_reads_as_none_observed(self):
+        # fgets size is sizeof(buf); no branch names buf, so nothing is observed.
+        rows = MemoryCopyCapacity(guarded_graph()).enumerate()["candidates"]
+        fgets = next(r for r in rows
+                     if r["observations"]["atropos_model_id"] == "c.io.fgets.a1")
+        self.assertEqual(fgets["inferences"]["conditions"]["status"], "none-observed")
+
+    def test_conditions_never_touch_the_rank(self):
+        # The neutral guard fact must not suppress: same rank with and without it.
+        guarded = self._row()["rank"]
+        plain_rows = MemoryCopyCapacity(fixture_graph()).enumerate()["candidates"]
+        plain = next(r for r in plain_rows
+                     if r["observations"]["atropos_model_id"] == "c.std.memcpy.a2")["rank"]
+        self.assertEqual(guarded, plain)
 
 
 class GranularDetailTierTest(unittest.TestCase):

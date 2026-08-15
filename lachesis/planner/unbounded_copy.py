@@ -26,6 +26,50 @@ _ARG_INDEX = re.compile(r"Argument\[(\d+)\]")
 _AST_KIND = re.compile(r"^[A-Z][A-Za-z]*(Expr|Literal|Operator|Cast|Stmt|Decl)$")
 
 
+# The controlling keyword of a CFG condition node, whose label is
+# "condition:if (...) { ...body... }". We match size variables against the
+# controlling expression only -- the parenthesised head -- not the body, so a
+# statement that merely mentions the variable is not mistaken for a guard on it.
+_CTRL_KEYWORD = re.compile(r"\b(if|while|for|switch)\b")
+# Tokens that are C syntax or the sizeof operator, never a size *variable*.
+_NON_VARIABLE = frozenset({
+    "if", "for", "while", "switch", "sizeof", "return", "int", "unsigned",
+    "const", "void", "char", "long", "short", "struct", "NULL"})
+
+
+def condition_head(label: str | None) -> str | None:
+    """The controlling expression of a CFG-condition label, body stripped.
+
+    ``condition:if (a > b) { ...  }`` -> ``if (a > b)``. Balanced-paren scan, so a
+    call inside the condition keeps its own parens. Recovery, not evaluation."""
+    if not label:
+        return None
+    text = label[len("condition:"):] if label.startswith("condition:") else label
+    kw = _CTRL_KEYWORD.search(text)
+    if not kw:
+        return text.strip()
+    open_paren = text.find("(", kw.end())
+    if open_paren < 0:
+        return text[kw.start():].strip()
+    depth = 0
+    for j in range(open_paren, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[kw.start():j + 1].strip()
+    return text[kw.start():].strip()
+
+
+def size_identifiers(expression: str | None) -> set[str]:
+    """The identifiers a size expression names -- the variables a guard on this
+    size would compare. Syntactic; ``sizeof`` and C keywords are not variables."""
+    if not expression:
+        return set()
+    return {tok for tok in _IDENT.findall(expression) if tok not in _NON_VARIABLE}
+
+
 def looks_like_leaked_label(label: str | None) -> bool:
     """True when a value-node label is comment/AST-kind noise, not source text."""
     if not label:
@@ -155,12 +199,51 @@ class MemoryCopyCapacity:
         "optional_capabilities": ("value-flow", "points-to", "object-size", "dominance"),
         "enumeration_basis": "atropos:sink:buffer-size",
         "completeness_contract": "every bound Atropos buffer-size attachment",
+        # The failure mode this obligation actually points at: writing past the
+        # destination's capacity. A copy model may carry broader tags (a source
+        # over-read, an ambient "dangerous function" class); those are real but
+        # out of THIS constructor's scope, so we scope what we surface rather
+        # than let a read-side CWE ride along as if the pointer had checked it.
+        "obligation_cwe": ("CWE-787", "CWE-120"),
     }
+
+    # Cap the referencing-condition list so the capsule stays bounded even in a
+    # function dense with branches; the count is reported in full regardless.
+    _MAX_CONDITIONS = 8
 
     def __init__(self, stamped_graph: dict, bind_summary: dict | None = None) -> None:
         self.graph = stamped_graph
         self.bind_summary = bind_summary or {}
         self.by_id = {n["id"]: n for n in stamped_graph.get("nodes", ())}
+        # function_id -> [(control_kind, condition_head)], built once. A condition
+        # node carries the id of the function it controls, in the same id space as
+        # a call's owner_function_id, so a candidate can ask "does any branch in my
+        # function test my size variable?" without a graph walk per candidate.
+        self._conditions_by_function: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for node in stamped_graph.get("nodes", ()):
+            if node.get("kind") != "cfg-condition":
+                continue
+            props = node.get("properties") or {}
+            fn = props.get("function_id")
+            head = condition_head(node.get("label"))
+            if fn and head:
+                self._conditions_by_function[fn].append(
+                    (props.get("control_kind") or "if", head))
+
+    def _referencing_conditions(self, function_id: str | None,
+                                idents: set[str]) -> tuple[list[dict], int]:
+        """Branch conditions in this function whose controlling expression names a
+        size variable. A neutral fact -- presence, not proof the guard dominates or
+        is even correct. Returns (capped rows, total count)."""
+        if not function_id or not idents:
+            return [], 0
+        patterns = {i: re.compile(r"\b" + re.escape(i) + r"\b") for i in idents}
+        hits = []
+        for control, head in self._conditions_by_function.get(function_id, ()):
+            named = sorted(i for i, p in patterns.items() if p.search(head))
+            if named:
+                hits.append({"control": control, "condition": head, "names": named})
+        return hits[:self._MAX_CONDITIONS], len(hits)
 
     def _label(self, node_id: str | None) -> str | None:
         node = self.by_id.get(node_id or "", {})
@@ -228,6 +311,10 @@ class MemoryCopyCapacity:
                 or self._label(d["properties"].get("value_id"))
                 for d in dests]
             confidence = props.get("confidence", "medium")
+            model_cwe = props.get("cwe", [])
+            obligation_cwe = set(self.metadata.get("obligation_cwe", ()))
+            idents = size_identifiers(expression)
+            referencing, referencing_total = self._referencing_conditions(owner_id, idents)
             rank, reasons = self._rank(expression, shape, dest_expressions, confidence)
             loc_file = call_props.get("absolute_file") or call_props.get("file")
             candidate = {
@@ -245,7 +332,14 @@ class MemoryCopyCapacity:
                     "size_expression_origin": expression_origin,
                     "destination_expressions": dest_expressions,
                     "atropos_model_id": props.get("model_id"),
-                    "access_path": props.get("access_path"), "cwe": props.get("cwe", []),
+                    "access_path": props.get("access_path"),
+                    # `cwe` is the model's full tag set, verbatim; `obligation_cwe`
+                    # is the subset this capacity pointer actually concerns (a
+                    # destination over-write). Anything the model tags but this
+                    # obligation does not check (e.g. a source over-read) stays
+                    # visible in `cwe` but is absent from `obligation_cwe`.
+                    "cwe": model_cwe,
+                    "obligation_cwe": [c for c in model_cwe if c in obligation_cwe],
                     "model_confidence": confidence,
                 },
                 "inferences": {
@@ -256,7 +350,19 @@ class MemoryCopyCapacity:
                     },
                     "destination_capacity": {"status": "unknown",
                                              "reason": "object-size analysis is unavailable"},
-                    "conditions": {"status": "unavailable", "nearby": [], "dominating": []},
+                    # A neutral observation, never a verdict and never fed to the
+                    # rank: does a branch in this function test a size variable?
+                    # `dominance` stays uncomputed -- presence of a comparison is
+                    # not proof it guards THIS copy, only a lead worth reading.
+                    "conditions": {
+                        "status": "observed" if referencing_total else "none-observed",
+                        "basis": "syntactic: a control condition in the enclosing "
+                                 "function names a size variable",
+                        "size_identifiers": sorted(idents),
+                        "referencing_conditions": referencing,
+                        "referencing_condition_count": referencing_total,
+                        "dominance": "not-computed",
+                    },
                 },
                 "rank": rank, "rank_reasons": reasons,
                 # Enumeration can be complete while the evidence capsule is still
