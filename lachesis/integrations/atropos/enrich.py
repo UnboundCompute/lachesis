@@ -121,12 +121,23 @@ def atropos_enrich(
         report = binder.bind_all(lang_models, index)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
+        unbound: List[dict] = []
         for row in report.get("results", []):
             status = row.get("status", "unknown")
             counts[status] = counts.get(status, 0) + 1
+            if status != "bound":
+                # Keep the exact model that failed to attach so the tool can *show*
+                # every sink the catalog knows, not just a headcount of misses. This
+                # is the worklist for strengthening the Atropos knowledge base.
+                unbound.append({
+                    "model_id": row.get("model_id"), "method": row.get("method"),
+                    "access_path": row.get("access_path"), "role": row.get("role"),
+                    "status": status, "detail": row.get("detail"),
+                })
         per_language[language] = {
             "callsites": len(index["callsites"]),
             "bind": counts,
+            "unbound": unbound,
         }
 
     registry = OverlayRegistry()
