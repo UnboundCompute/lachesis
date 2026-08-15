@@ -237,7 +237,13 @@ class TaintPropagation:
                     break
                 current_state = queue.popleft()
                 current, contexts = current_state
-                if current in sinks_by_value and current not in reached_sinks:
+                # A value can legitimately carry both roles at one modeled call
+                # boundary (for example read(2)'s buffer is an output source and a
+                # capacity-obligation destination). That is not a dataflow witness:
+                # no value moved anywhere. Require at least one traversed edge so
+                # catalog growth cannot manufacture source->same-value sink reaches.
+                if (current_state != initial_state and current in sinks_by_value
+                        and current not in reached_sinks):
                     reached_sinks[current] = current_state
                 if enable_unclassified:
                     callsite = arg_callsite.get(current)
