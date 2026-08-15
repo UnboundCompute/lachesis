@@ -288,6 +288,24 @@ class SemanticRankingTest(unittest.TestCase):
         self.assertEqual(strcpy["inferences"]["destination_capacity"]["status"], "unknown")
         self.assertEqual(strcpy["completeness"], "PARTIAL")
 
+    def test_missing_capabilities_are_derived_from_the_graph_not_hardcoded(self):
+        # value-flow is proven present by the graph carrying VALUE_FLOWS_TO edges;
+        # it must drop off the missing list. The computed inferences this
+        # enumerator does not produce (object-size, dominance) and points-to
+        # (no POINTS_TO edges here) remain missing.
+        missing = MemoryCopyCapacity(fixture_graph()).enumerate()[
+            "frontiers"]["missing_optional_capabilities"]
+        self.assertNotIn("value-flow", missing)
+        self.assertIn("points-to", missing)
+        self.assertIn("object-size", missing)
+        self.assertIn("dominance", missing)
+        # Strip the value-flow edges and the capability is honestly absent again.
+        graph = fixture_graph()
+        graph["edges"] = []
+        missing_bare = MemoryCopyCapacity(graph).enumerate()[
+            "frontiers"]["missing_optional_capabilities"]
+        self.assertIn("value-flow", missing_bare)
+
     def test_write_only_and_sized_copy_at_same_callsite_prefers_the_size(self):
         # A site that DOES have a buffer-size is enumerated once, through its size
         # sink -- the write-only pass must not double-count it.

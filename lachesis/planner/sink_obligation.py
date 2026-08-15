@@ -28,6 +28,7 @@ import hashlib
 import re
 from collections import defaultdict
 
+from .capabilities import absent_optional_capabilities
 from .unbounded_copy import (
     arg_from_callsite,
     condition_head,
@@ -238,8 +239,8 @@ class SinkObligation:
             "unbound_models": unbound_models_total,
             "unbound_sinks": unbound_sinks,
             "truncated_walks": 0,
-            "missing_optional_capabilities": [
-                "value-flow", "points-to", "object-size", "dominance"],
+            "missing_optional_capabilities": absent_optional_capabilities(
+                self.graph, self.metadata.get("optional_capabilities", ())),
             "unselected_configs": [],
         }
         return {

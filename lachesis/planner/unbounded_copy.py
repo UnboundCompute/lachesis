@@ -11,6 +11,8 @@ import hashlib
 import re
 from collections import defaultdict
 
+from .capabilities import absent_optional_capabilities
+
 CONSTRUCTOR_ID = "memory.copy.capacity"
 DOMAIN = "memory"
 
@@ -526,8 +528,8 @@ class MemoryCopyCapacity:
             "unbound_models": sum(v for k, v in bind.items() if k != "bound"),
             "unbound_sinks": unbound_sinks,
             "truncated_walks": 0,
-            "missing_optional_capabilities": [
-                "value-flow", "points-to", "object-size", "dominance"],
+            "missing_optional_capabilities": absent_optional_capabilities(
+                self.graph, self.metadata["optional_capabilities"]),
             "unselected_configs": [],
         }
         return {
