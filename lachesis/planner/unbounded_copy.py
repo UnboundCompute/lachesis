@@ -18,6 +18,17 @@ _SIZEOF = re.compile(r"sizeof\s*\([^()]*\)")
 _CALL = re.compile(r"[A-Za-z_]\w*\s*\(")
 _NUM = re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+)\b")
 _IDENT = re.compile(r"[A-Za-z_]\w*")
+# A string or char literal span. Its inner bytes are DATA, not C syntax: the
+# identifiers, calls, and operators inside a format string ("cal-%s.bin", "a-b",
+# "f(%d)") must not classify the argument. Only the expression AROUND the quotes
+# says whether the arg is a constant literal, a variable, or a call. Quote-aware
+# with backslash escapes. Size expressions never carry a literal, so stripping is
+# a no-op there and only the string-valued families (format/path/query) change.
+_STRLIT = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+
+
+def _strip_string_literals(text: str) -> str:
+    return _STRLIT.sub("", text)
 
 _ARG_INDEX = re.compile(r"Argument\[(\d+)\]")
 # A leaked value-node label: either a copied-through source comment (the file's
@@ -136,7 +147,7 @@ def syntactic_shape(label: str | None) -> str:
         return "unknown"
     if looks_like_leaked_label(label):
         return "unknown"
-    rest = _SIZEOF.sub("", label)
+    rest = _SIZEOF.sub("", _strip_string_literals(label))
     if _CALL.search(rest):
         return "call-expression"
     rest = _NUM.sub("", rest)
@@ -160,7 +171,9 @@ def size_semantics(expression: str | None, shape: str) -> tuple[float, str]:
     (literal/sizeof) rarely is. This orders, it never suppresses."""
     if not expression or shape == "unknown":
         return 0.4, "opaque"
-    stripped = _SIZEOF.sub("", expression)
+    # Strip literal spans first: a format string "a-b" or "f(%d)" must not be
+    # read as subtraction or arithmetic. What remains is the real size/arg math.
+    stripped = _SIZEOF.sub("", _strip_string_literals(expression))
     if _SUBTRACT.search(stripped):
         return 1.0, "arithmetic-subtraction"
     if _ARITHMETIC.search(stripped):

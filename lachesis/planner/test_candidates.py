@@ -680,6 +680,42 @@ def multi_family_graph():
     }
 
 
+class StringLiteralShapeTest(unittest.TestCase):
+    """A string-valued argument (a format/path/query) must classify by the
+    expression AROUND the quotes, never by the bytes inside them -- otherwise a
+    safe literal format ranks as if it were a dynamic, attacker-shaped value."""
+
+    def test_literal_format_reads_as_constant_not_identifier(self):
+        # Letters and a '(' inside the quotes must not make this an identifier or
+        # a call: a literal format string is a constant.
+        self.assertEqual(syntactic_shape('"cal-%s-%s.bin"'), "literal-or-sizeof")
+        self.assertEqual(syntactic_shape('"reg dump (%d)\\n"'), "literal-or-sizeof")
+        value, tag = size_semantics('"cal-%s-%s.bin"', "literal-or-sizeof")
+        self.assertEqual(tag, "constant")
+        self.assertEqual(value, 0.2)
+
+    def test_dash_inside_a_literal_is_not_subtraction(self):
+        # The '-' inside "a-b" is data, not underflow-prone arithmetic.
+        value, tag = size_semantics('"a-b-c"', "literal-or-sizeof")
+        self.assertEqual(tag, "constant")
+
+    def test_non_literal_format_still_floats_up(self):
+        # A variable or call used AS the format is the CWE-134 shape and must
+        # keep its dynamic (high) risk classification.
+        self.assertEqual(syntactic_shape("fmt"), "identifier-expression")
+        self.assertEqual(syntactic_shape("get_fmt(idx)"), "call-expression")
+        var_value, _ = size_semantics("fmt", "identifier-expression")
+        lit_value, _ = size_semantics('"literal"', "literal-or-sizeof")
+        self.assertGreater(var_value, lit_value)
+
+    def test_size_expressions_are_unaffected(self):
+        # Size math never carries a string literal, so stripping is a no-op there.
+        self.assertEqual(syntactic_shape("len - 4"), "identifier-expression")
+        value, tag = size_semantics("len - 4", "identifier-expression")
+        self.assertEqual(tag, "arithmetic-subtraction")
+        self.assertEqual(value, 1.0)
+
+
 class GenericSinkObligationTest(unittest.TestCase):
     """The generic, taxonomy-driven enumerator for single-argument families."""
 
