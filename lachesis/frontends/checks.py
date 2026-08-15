@@ -969,6 +969,54 @@ class CompilerFrontendTests(unittest.TestCase):
                 for edge in snapshot.edges
             ))
 
+    def test_c_field_sensitive_value_flow_reaches_across_a_struct_field(self) -> None:
+        # The dbring shape: a value written into a struct field in one function is
+        # read back out of that field in another and folded into an allocation
+        # size. The forward slice must cross four hops the frontend used to drop --
+        # the field-write hub, the field-read, the arithmetic operands, and the
+        # variable initializer -- or a size-overflow slice can never be witnessed.
+        from lachesis.nav.graph_store import GraphStore
+        from lachesis.nav.reachability import Reachability
+
+        source = (
+            "struct dbring { unsigned int buf_sz; };\n"
+            "struct buf { int x; };\n"
+            "void *kzalloc(int size, int flags);\n"
+            "void dbring_set_size(struct dbring *ring, unsigned int fw_value) {\n"
+            "    ring->buf_sz = fw_value;\n"
+            "}\n"
+            "void *dbring_fill(struct dbring *ring, int align) {\n"
+            "    struct buf *b;\n"
+            "    int size = sizeof(*b) + ring->buf_sz + align - 1;\n"
+            "    b = kzalloc(size, 0);\n"
+            "    return b;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "dbring.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+
+            fw_value = next(
+                node["id"] for node in snapshot.nodes
+                if node["kind"] == "parameter" and node["label"] == "fw_value"
+            )
+            size = next(
+                node["id"] for node in snapshot.nodes
+                if node["kind"] == "variable" and node["label"] == "size"
+            )
+
+            store = GraphStore({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            store.ensure_dataflow_tier()
+            witness = Reachability(store).reaches(fw_value, size)
+            self.assertTrue(
+                witness["manifest"]["reachable"],
+                "the value written into ring->buf_sz must flow into the allocation size",
+            )
+
     def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
         """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
 

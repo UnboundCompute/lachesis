@@ -1179,6 +1179,15 @@ def main() -> int:
                     declarations_by_raw_id.get(reference.get("id", ""))
                     for reference in left_references if reference.get("kind") == "FieldDecl"
                 ), None)
+                if field_id:
+                    # The FieldDecl is a receiver-insensitive hub: a write to any
+                    # `x->field` flows into it, and every read of `y->field` flows
+                    # back out (see the MemberExpr read below). This over-connects
+                    # across distinct receivers, hence conservative confidence.
+                    graph.edge(
+                        "VALUE_FLOWS_TO", body_identity(left, path), field_id,
+                        reason="field-write", confidence="conservative",
+                    )
                 receiver_id = next((
                     declarations_by_raw_id.get(reference.get("id", ""))
                     for reference in left_references if reference.get("kind") == "ParmVarDecl"
@@ -1206,6 +1215,45 @@ def main() -> int:
                 "VALUE_FLOWS_TO", body_identity(node["inner"][0], path), body_id,
                 reason="value-preserving-expression",
             )
+        if not is_included and body_id and kind in {
+            "BinaryOperator", "UnaryOperator", "ConditionalOperator",
+        } and not (kind == "BinaryOperator" and node.get("opcode") in {
+            "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+        }):
+            # A computed value carries its operands forward: `a + b`, `-x`,
+            # `c ? t : f` all propagate their inputs into the result node. The
+            # condition of a ConditionalOperator is a predicate, not a value
+            # source, so only the two value branches flow.
+            operands = node.get("inner", [])
+            if kind == "ConditionalOperator" and len(operands) >= 3:
+                operands = operands[1:]
+            for operand in operands:
+                graph.edge(
+                    "VALUE_FLOWS_TO", body_identity(operand, path), body_id,
+                    reason="arithmetic-operand",
+                )
+        if not is_included and kind == "VarDecl" and node.get("inner"):
+            # `int size = <expr>` binds the initializer's value to the variable.
+            variable_id = declarations_by_raw_id.get(node.get("id", ""))
+            initializer = node["inner"][-1]
+            if variable_id and initializer.get("kind", "").endswith(("Expr", "Operator", "Literal")):
+                graph.edge(
+                    "VALUE_FLOWS_TO", body_identity(initializer, path), variable_id,
+                    reason="initializer",
+                )
+        if not is_included and kind == "MemberExpr" and body_id:
+            # Reading `x->field` draws from the field hub every write fed (see the
+            # field-write edge above). Receiver-insensitive, hence conservative.
+            read_field_id = next((
+                declarations_by_raw_id.get(reference.get("id", ""))
+                for reference in referenced_decls(node)
+                if reference.get("kind") == "FieldDecl"
+            ), None)
+            if read_field_id:
+                graph.edge(
+                    "VALUE_FLOWS_TO", read_field_id, body_id,
+                    reason="field-read", confidence="conservative",
+                )
         for index, child in enumerate(node.get("inner", [])):
             bodies(child, path, owner, body_id, is_included, node, index)
 
