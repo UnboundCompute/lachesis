@@ -441,7 +441,9 @@ TOOLS = [
                     "fact. This is a POINTER, not a safety check: candidates are never suppressed "
                     "because a size is constant, a guard seems nearby, or no input flow was "
                     "witnessed. The first constructor is memory.copy.capacity. Costs one "
-                    "catalog bind on first call per graph (cached after).",
+                    "catalog bind on first call per graph (cached after). `frontiers` here reports "
+                    "coverage as counts (e.g. unbound_sinks_count); call candidate_census for the "
+                    "full roster of catalog sinks that never bound.",
      "inputSchema": {"type": "object", "properties": {
          "domain": {"type": "string"},
          # Wire name avoids the bare key `constructor`: it collides with
@@ -450,7 +452,10 @@ TOOLS = [
          "language": {"type": "string", "enum": ["c", "python", "javascript", "typescript"]},
          "limit": {"type": "integer", "default": 40},
          "cursor": {"type": "string"},
-         "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"}}}},
+         "detail": {"type": "string", "enum": ["brief", "compact", "full"], "default": "compact",
+                    "description": "brief (one-line scan: id/rank/callee/at/size), "
+                                   "compact (triage capsule, no inferences), "
+                                   "full (whole capsule incl. inferences)"}}}},
     {"name": "candidate_detail",
      "description": "Return the complete neutral evidence capsule for one candidate id. It "
                     "contains observations and bounded inferences, but no safe/unsafe verdict.",
@@ -478,6 +483,25 @@ for _name in ("hubs", "callers", "callees"):
     _tool["inputSchema"]["properties"].update(
         offset={"type": "integer", "default": 0},
         limit={"type": "integer", "default": 40})
+
+
+def _atropos_envelope(summary, *, full):
+    """The Atropos coverage block attached to a candidate response.
+
+    `full=True` (census only) keeps every per-language `unbound` row so the
+    coverage tool can show exactly which catalog sinks/sources never bound.
+    `full=False` (list/detail moves) drops those row lists and keeps the status
+    counts, so a page carries the shape of coverage without its full weight."""
+    per_language = summary.get("per_language", {})
+    if not full:
+        per_language = {lang: {k: v for k, v in stats.items() if k != "unbound"}
+                        for lang, stats in per_language.items()}
+    return {
+        "root": summary.get("atropos_root"),
+        "languages": summary.get("languages", []),
+        "bind": per_language,
+        "role_nodes": summary.get("role_nodes", {}),
+    }
 
 
 def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
@@ -667,12 +691,13 @@ def call_tool(name, args, format=None):
         else:
             result = registry.census(args.get("constructor_id"))
         result["applied"] = True
-        result["atropos"] = {
-            "root": summary.get("atropos_root"),
-            "languages": summary.get("languages", []),
-            "bind": summary.get("per_language", {}),
-            "role_nodes": summary.get("role_nodes", {}),
-        }
+        # The per-language bind report carries the full `unbound` row lists
+        # (hundreds of rows, ~90KB on a large catalog). That is coverage data:
+        # it belongs on `candidate_census`, the move whose job is to distinguish
+        # an empty result from missing coverage. Every other move gets the
+        # counts only, so a list page stays bounded. Nothing is dropped -- the
+        # rows are one census call away.
+        result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
         return _emit(name, result, fmt, offset, limit)
     if name == "taint":
         return _emit(name, _taint(c.store, args), fmt, offset, limit)

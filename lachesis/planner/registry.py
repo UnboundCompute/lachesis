@@ -60,6 +60,45 @@ class CandidateRegistry:
             raise ValueError("invalid candidate cursor")
         return max(0, int(cursor.split(":", 1)[1]))
 
+    # The three granular detail tiers a list row can be projected to. `full` is
+    # the whole capsule (identical to candidate_detail's row); `compact` is the
+    # triage capsule minus the bounded inferences; `brief` is a one-glance scan
+    # line. A row is never invented or dropped between tiers -- only projected.
+    _COMPACT_KEYS = ("candidate_id", "constructor", "domain", "language", "obligation",
+                     "handles", "observations", "rank", "rank_reasons", "completeness",
+                     "next_op")
+
+    @staticmethod
+    def _brief_row(row: dict) -> dict:
+        obs = row.get("observations", {})
+        file, line = obs.get("file"), obs.get("line")
+        return {"candidate_id": row["candidate_id"], "rank": row.get("rank"),
+                "callee": obs.get("callee"),
+                "at": f"{file}:{line}" if file is not None else None,
+                "size_expression": obs.get("size_expression"),
+                "size_shape": obs.get("syntactic_shape"),
+                "completeness": row.get("completeness")}
+
+    @classmethod
+    def _project(cls, row: dict, detail: str) -> dict:
+        if detail == "full":
+            return row
+        if detail == "brief":
+            return cls._brief_row(row)
+        return {k: row[k] for k in cls._COMPACT_KEYS if k in row}  # compact
+
+    @staticmethod
+    def _list_frontiers(frontiers: dict) -> dict:
+        """Coverage as counts for a list page. The full `unbound_sinks` roster
+        (one row per catalog sink that never bound) is heavy and unchanging
+        across pages, so the list carries its count and points to
+        candidate_census, which serves the rows themselves. Nothing is hidden:
+        the census move still returns every unbound sink with its reason."""
+        slim = {k: v for k, v in frontiers.items() if k != "unbound_sinks"}
+        slim["unbound_sinks_count"] = len(frontiers.get("unbound_sinks", ()))
+        slim["coverage_detail_via"] = "candidate_census"
+        return slim
+
     def candidates(self, *, constructor: str | None = None, domain: str | None = None,
                    language: str | None = None, limit: int = 40,
                    cursor: str | None = None, detail: str = "compact") -> dict:
@@ -71,17 +110,13 @@ class CandidateRegistry:
         result = self._result(keys[0])
         offset, limit = self._offset(cursor), max(1, min(int(limit), 200))
         all_rows = result["candidates"]
-        rows = all_rows[offset:offset + limit]
-        if detail == "compact":
-            rows = [{k: row[k] for k in (
-                "candidate_id", "constructor", "domain", "language", "obligation",
-                "handles", "observations", "rank", "rank_reasons", "completeness", "next_op")}
-                    for row in rows]
+        rows = [self._project(row, detail) for row in all_rows[offset:offset + limit]]
         next_cursor = f"v1:{offset + len(rows)}" if offset + len(rows) < len(all_rows) else None
-        return {"move": "candidates", "constructor": keys[0], "returned": len(rows),
-                "total": len(all_rows), "cursor": cursor, "next_cursor": next_cursor,
+        return {"move": "candidates", "constructor": keys[0], "detail": detail,
+                "returned": len(rows), "total": len(all_rows),
+                "cursor": cursor, "next_cursor": next_cursor,
                 "candidates": rows, "census": result["census"],
-                "frontiers": result["frontiers"],
+                "frontiers": self._list_frontiers(result["frontiers"]),
                 "complete_for_observable_graph": result["complete_for_observable_graph"]}
 
     def detail(self, candidate_id: str) -> dict:

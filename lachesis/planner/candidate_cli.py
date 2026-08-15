@@ -22,7 +22,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--language")
     parser.add_argument("--limit", type=int, default=40)
     parser.add_argument("--cursor")
-    parser.add_argument("--detail", choices=("compact", "full"), default="compact")
+    parser.add_argument("--detail", choices=("brief", "compact", "full"), default="compact")
     parser.add_argument("--candidate-id", help="return one full candidate capsule")
     parser.add_argument("--census", action="store_true",
                         help="return counts and coverage frontiers instead of rows")
@@ -50,10 +50,17 @@ def main(argv: list[str] | None = None) -> int:
         result = registry.candidates(
             constructor=args.constructor, domain=args.domain, language=args.language,
             limit=args.limit, cursor=args.cursor, detail=args.detail)
+    # Census carries the full per-language `unbound` rosters; the list/detail
+    # paths keep the status counts only, so a page stays bounded (mirrors the
+    # MCP server's _atropos_envelope split).
+    per_language = summary.get("per_language", {})
+    if not args.census:
+        per_language = {lang: {k: v for k, v in stats.items() if k != "unbound"}
+                        for lang, stats in per_language.items()}
     result["atropos"] = {
         "root": summary.get("atropos_root"),
         "languages": summary.get("languages", []),
-        "bind": summary.get("per_language", {}),
+        "bind": per_language,
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 1 if result.get("error") else 0

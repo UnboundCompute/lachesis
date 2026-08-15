@@ -308,6 +308,102 @@ class CandidateRegistryTest(unittest.TestCase):
             self.registry.candidates(constructor="memory.copy.capacity", cursor="1")
 
 
+class GranularDetailTierTest(unittest.TestCase):
+    """The list view projects each row to one of three tiers -- brief, compact,
+    full -- and never fabricates or drops a row between them."""
+
+    def setUp(self):
+        self.registry = default_candidate_registry(fixture_graph())
+
+    def _rows(self, detail):
+        return self.registry.candidates(
+            constructor="memory.copy.capacity", limit=40, detail=detail)["candidates"]
+
+    def test_brief_is_a_flat_scan_line(self):
+        rows = self._rows("brief")
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(set(row), {"candidate_id", "rank", "callee", "at",
+                                        "size_expression", "size_shape", "completeness"})
+            self.assertIsNone(row.get("observations"))  # heavy blocks absent
+            self.assertRegex(row["at"], r":\d+$")  # file:line
+
+    def test_compact_carries_observations_but_not_inferences(self):
+        rows = self._rows("compact")
+        self.assertIn("observations", rows[0])
+        self.assertNotIn("inferences", rows[0])  # inferences are detail-only
+
+    def test_full_is_the_whole_capsule(self):
+        rows = self._rows("full")
+        self.assertIn("inferences", rows[0])
+
+    def test_tiers_agree_on_the_row_set(self):
+        ids = {d: {r["candidate_id"] for r in self._rows(d)}
+               for d in ("brief", "compact", "full")}
+        self.assertEqual(ids["brief"], ids["compact"])
+        self.assertEqual(ids["compact"], ids["full"])
+
+    def test_response_names_its_detail_tier(self):
+        page = self.registry.candidates(
+            constructor="memory.copy.capacity", detail="brief")
+        self.assertEqual(page["detail"], "brief")
+
+
+class ListFrontierWeightTest(unittest.TestCase):
+    """The list page reports coverage as counts and relocates the heavy
+    unbound-sink roster to census -- shown, never dropped."""
+
+    def _summary(self):
+        return {"per_language": {"c": {"bind": {"bound": 1, "ambiguous": 1},
+            "unbound": [
+                {"model_id": "c.std.alloca.a0", "method": "alloca",
+                 "access_path": "Argument[0]", "role": "sink",
+                 "status": "symbol-not-found", "detail": None},
+                {"model_id": "c.std.gets.a0", "method": "gets",
+                 "access_path": "Argument[0]", "role": "sink",
+                 "status": "symbol-not-found", "detail": None},
+            ]}}}
+
+    def setUp(self):
+        self.registry = CandidateRegistry(fixture_graph(), self._summary())
+        self.registry.register(MemoryCopyCapacity)
+
+    def test_list_frontiers_carry_count_and_pointer_not_the_roster(self):
+        front = self.registry.candidates(
+            constructor="memory.copy.capacity")["frontiers"]
+        self.assertNotIn("unbound_sinks", front)          # heavy list is gone
+        self.assertEqual(front["unbound_sinks_count"], 2)  # but the count remains
+        self.assertEqual(front["coverage_detail_via"], "candidate_census")
+
+    def test_census_still_serves_every_unbound_sink_row(self):
+        front = self.registry.census(
+            "memory.copy.capacity")["constructors"][0]["frontiers"]
+        methods = {row["method"] for row in front["unbound_sinks"]}
+        self.assertEqual(methods, {"alloca", "gets"})  # full roster, with reasons
+
+
+class AtroposEnvelopeSplitTest(unittest.TestCase):
+    """The MCP server ships the per-language `unbound` rosters only on census;
+    list/detail moves get the status counts, keeping a page bounded."""
+
+    def _summary(self):
+        return {"atropos_root": "/catalog", "languages": ["c"], "role_nodes": {},
+                "per_language": {"c": {"callsites": 3, "bind": {"bound": 1},
+                    "unbound": [{"model_id": "c.std.gets.a0", "role": "sink",
+                                 "status": "symbol-not-found"}]}}}
+
+    def test_non_census_moves_drop_the_unbound_roster(self):
+        from lachesis.nav import mcp_server
+        env = mcp_server._atropos_envelope(self._summary(), full=False)
+        self.assertNotIn("unbound", env["bind"]["c"])
+        self.assertEqual(env["bind"]["c"]["bind"], {"bound": 1})
+
+    def test_census_keeps_the_unbound_roster(self):
+        from lachesis.nav import mcp_server
+        env = mcp_server._atropos_envelope(self._summary(), full=True)
+        self.assertEqual(len(env["bind"]["c"]["unbound"]), 1)
+
+
 class CandidateMcpSurfaceTest(unittest.TestCase):
     def test_tools_are_advertised_and_return_registry_payload(self):
         from lachesis.nav import mcp_server
