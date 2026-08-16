@@ -42,6 +42,7 @@ from lachesis.nav.hubs import Hubs
 from lachesis.nav.folder_graph import build_folder_graph
 from lachesis.nav.file_graph import build_file_graph, _find_file_node
 from lachesis.nav import render as render_mod
+from lachesis.nav import skeleton as skeleton_mod
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
@@ -105,7 +106,7 @@ TOOL_ORDER = (
     "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "flow", "reaches", "sources_of", "points_to", "aliases",
-    "candidates", "candidate_detail", "candidate_census", "taint",
+    "candidates", "candidate_detail", "candidate_census", "skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -466,6 +467,22 @@ TOOLS = [
                     "frontiers. Use this to distinguish an empty result from missing coverage.",
      "inputSchema": {"type": "object", "properties": {
          "constructor_id": {"type": "string"}}}},
+    {"name": "skeleton",
+     "description": "Render a function's sink map as a pseudo-function: every catalogued sink "
+                    "(all families -- memory, os, file, ...) shown in place, each annotated with "
+                    "its size expression, destination-capacity status, and guard dominance "
+                    "(fall-through | guarded-region | none-observed), plus the branch/loop "
+                    "structure that scopes them, with everything else elided. A sink is not "
+                    "adjudicable alone -- the guard that dominates it decides it -- so "
+                    "co-locating each sink with its controlling branches and loops makes closure "
+                    "a local read. Every obligation on a line is shown, highest-rank first; "
+                    "operand provenance is a drill-down (candidate_detail / sources_of). Pass "
+                    "`function` (a name or node id) for the whole enclosing function, or "
+                    "`candidate_id` to focus its enclosing function.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string", "description": "function name or node id"},
+         "candidate_id": {"type": "string", "description": "candidate id; renders its "
+                          "enclosing function"}}}},
 ]
 
 # Every tool accepts an optional `format` ("text" compact | "json" full). Inject it
@@ -698,6 +715,30 @@ def call_tool(name, args, format=None):
         # counts only, so a list page stays bounded. Nothing is dropped -- the
         # rows are one census call away.
         result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "skeleton":
+        bundle = c.candidate_bundle
+        summary = bundle["atropos"]
+        if not summary.get("applied"):
+            return _emit(name, {
+                "move": "skeleton", "applied": False, "reason": summary.get("reason"),
+                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
+                        "at ../atropos, then reload",
+            }, fmt, offset, limit)
+        registry = bundle["registry"]
+        store, gl = c.store, c.store.gl
+        if args.get("candidate_id"):
+            result = skeleton_mod.skeleton_for_candidate(gl, registry, args["candidate_id"])
+        elif args.get("function"):
+            fn = args["function"]
+            fid = fn if store.node(fn) else _seed(store, fn)
+            if not fid:
+                return _emit(name, {"move": "skeleton", "error": f"no node named {fn!r}"}, fmt)
+            result = skeleton_mod.skeleton_for_function(gl, registry, fid)
+        else:
+            return _emit(name, {"move": "skeleton",
+                                "error": "pass either `function` or `candidate_id`"}, fmt)
+        result["move"] = "skeleton"
         return _emit(name, result, fmt, offset, limit)
     if name == "taint":
         return _emit(name, _taint(c.store, args), fmt, offset, limit)

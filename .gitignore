@@ -24,6 +24,11 @@ out/
 graph_out/
 .store/
 
+# Local, unpublished working files. Never distributed.
+lachesis/private/
+private/
+.claude/
+
 # OS / editor
 .DS_Store
 *.swp
