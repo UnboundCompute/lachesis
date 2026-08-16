@@ -5,8 +5,9 @@ to turn a plain enriched graph into a *taint-aware* one using the Atropos models
 It is the composition of the seam's three engine-neutral steps -- project the
 graph to the neutral symbol index (:func:`canonical_index`), let the catalog bind
 its models against that index, and stamp each resolved fact back onto the exact
-node (:class:`AtroposOverlay`) -- followed by the core value-flow completion the C
-frontend still needs (:class:`CCallResultDataflow`).
+node (:class:`AtroposOverlay`). By default it also runs the core value-flow
+completion the C frontend needs (:class:`CCallResultDataflow`); catalog-only
+consumers such as the candidate registry disable that step.
 
 It preserves the repository boundary in both directions. The engine never takes a
 hard dependency on Atropos: the catalog and its binder are *located* at runtime
@@ -84,6 +85,7 @@ def _languages_present(graph: Dict[str, Any]) -> List[str]:
 
 def atropos_enrich(
     graph: Dict[str, Any], *, atropos_root: Optional[str] = None,
+    complete_dataflow: bool = True,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return ``(taint_aware_graph, summary)``; graph unchanged if Atropos absent.
 
@@ -119,16 +121,31 @@ def atropos_enrich(
         report = binder.bind_all(lang_models, index)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
+        unbound: List[dict] = []
         for row in report.get("results", []):
             status = row.get("status", "unknown")
             counts[status] = counts.get(status, 0) + 1
+            if status != "bound":
+                # Keep the exact model that failed to attach so the tool can *show*
+                # every sink the catalog knows, not just a headcount of misses. This
+                # is the worklist for strengthening the Atropos knowledge base.
+                unbound.append({
+                    "model_id": row.get("model_id"), "method": row.get("method"),
+                    "access_path": row.get("access_path"), "role": row.get("role"),
+                    # The catalog kind of the model that failed to attach, so a
+                    # per-family constructor can scope its unbound-sink frontier to
+                    # exactly its own kinds rather than the whole global roster.
+                    "kind": (models_by_id.get(row.get("model_id")) or {}).get("kind"),
+                    "status": status, "detail": row.get("detail"),
+                })
         per_language[language] = {
             "callsites": len(index["callsites"]),
             "bind": counts,
+            "unbound": unbound,
         }
 
     registry = OverlayRegistry()
-    if "c" in languages:
+    if "c" in languages and complete_dataflow:
         # The C frontend links a call result to the variable it initializes by AST
         # only; without this the return-value sources/summaries can never flow.
         registry.register(CCallResultDataflow())

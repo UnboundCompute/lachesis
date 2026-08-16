@@ -5,9 +5,10 @@
 Lachesis parses a codebase with real compilers, not regexes, and turns it into a graph you can navigate. Syntax, symbols, calls, and the part that matters most: a full dataflow layer of value-flow, points-to, taint, and aliasing. That graph lives in an embedded columnar database and answers questions through a small navigation API and an MCP server, so a person or an LLM agent can reason about real source with compiler-level fidelity.
 
 ```bash
-pip install lachesis-cpg
-lachesis-analyze ./my-project graph.kuzu    # parse a tree into a graph
-lachesis-mcp graph.kuzu                      # hand it to your agent over MCP
+git clone https://github.com/UnboundCompute/lachesis && cd lachesis
+pip install -e ".[dev]" && npm install       # build from source (details below)
+lachesis-analyze ./my-project graph.kuzu     # parse a tree into a graph
+lachesis-mcp graph.kuzu                       # hand it to your agent over MCP
 ```
 
 ---
@@ -38,6 +39,9 @@ Once a graph is built, these are the moves, from the command line or as MCP tool
 | Where does this value go? What feeds this sink? | `flow`, `sources_of` |
 | Does this source reach that sink? | `reaches`, a labeled witness path or an honest "no" |
 | What does this pointer point to? What aliases it? | `points_to`, `aliases` |
+| Where does untrusted input actually reach a dangerous sink? | `taint`, source→sink witnesses folded from the Atropos catalog onto this graph's own nodes |
+| Which safety-obligation sites should I inspect first? | `candidates`, ranked and exhaustive over bound facts across the whole sink taxonomy, with no safety verdict |
+| The full evidence for one site, or coverage across every family | `candidate_detail` (the neutral evidence capsule), `candidate_census` (constructor metadata, exhaustive counts, and the analysis frontier) |
 
 Every answer carries a confidence and an origin. An `exact` edge is resolved; a `conservative` one is a deliberate over-approximation the tool tells you about rather than hiding. You read the results as evidence, not as verdicts, which is the honest way to reason about a large codebase you didn't write.
 
@@ -81,7 +85,8 @@ The result: builds stay lean, the graph opens in well under a second, and the ex
       v
   nav  (+ MCP)     hubs, search, callers/callees, read_body,
                    flow, reaches, sources_of, points_to, aliases,
-                   folding the dataflow cone it needs, on demand
+                   candidates, taint, folding the dataflow cone
+                   it needs, on demand
 ```
 
 `graph.kuzu` is a directory: the embedded database plus a manifest. That *is* the graph. Every tool reads it directly, and `lachesis-mcp` serves the same tools over stdio for any MCP-capable client.
@@ -96,9 +101,9 @@ Lossless `--prune` drops pure-lexical nodes (source is read from files by offset
 
 ---
 
-## Install from a clone
+## Install from source
 
-Working on Lachesis itself:
+Lachesis installs from a clone — that's the supported path for now (a published wheel comes with the first release):
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
@@ -107,7 +112,7 @@ pip install -e ".[dev]"                 # builder, nav, MCP server, tests
 npm install                             # the TypeScript compiler the TS frontend loads
 ```
 
-Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. A published wheel carries the TypeScript compiler with it, so an end user needs no `npm install` and no network at analysis time. A checkout needs `npm install` because the vendored compiler is a build artifact, not checked in. Node must be on your PATH for the TS frontend; C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
+Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm install` step vendors the TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node must be on your PATH for the TS frontend; C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
 
 ---
 

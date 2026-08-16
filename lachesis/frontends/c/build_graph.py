@@ -45,6 +45,21 @@ VALUE_KINDS = {
     "FieldDecl": "property",
     "EnumConstantDecl": "constant",
 }
+
+# Calls that create an object. Without an `allocation` node the heap-identity
+# overlay never runs (core/overlays/heap.py:31-32), so points_to/aliases answer
+# nothing on C. Covers libc and the common kernel allocators; the family name is
+# recorded verbatim so a zeroing allocator stays distinguishable downstream.
+ALLOCATOR_NAMES = frozenset({
+    "malloc", "calloc", "realloc", "reallocarray", "valloc", "aligned_alloc",
+    "memalign", "posix_memalign", "strdup", "strndup",
+    "kmalloc", "kzalloc", "kcalloc", "kmalloc_array", "krealloc", "krealloc_array",
+    "kvmalloc", "kvzalloc", "kvcalloc", "vmalloc", "vzalloc", "vcalloc",
+    "kmemdup", "kstrdup", "kmem_cache_alloc", "kmem_cache_zalloc",
+    "devm_kzalloc", "devm_kmalloc", "devm_kcalloc",
+    "dma_alloc_coherent", "dmam_alloc_coherent",
+    "kmalloc_node", "kzalloc_node", "vmalloc_node",
+})
 CONTENT_HASHES: Dict[Path, str] = {}
 
 # Memoize the (resolved path, content hash) of each distinct ``absolute_file``
@@ -1128,6 +1143,27 @@ def main() -> int:
                         if reference.get("kind") != "FieldDecl"
                         and declarations_by_raw_id.get(reference.get("id", ""))
                     ), None)
+                callee_name = properties.get("callee")
+                if callee_name in ALLOCATOR_NAMES:
+                    # An allocation site creates an object; without this node the
+                    # heap-identity overlay stays dormant on C and points_to /
+                    # aliases answer nothing. The allocated pointer is the call's
+                    # own result, so the object flows from here into the call node
+                    # and onward through the assignment that receives it.
+                    allocation_id = stable_id(
+                        "allocation", path, position["start_offset"],
+                        position["end_offset"], callee_name,
+                    )
+                    graph.node(
+                        "T2", allocation_id, "allocation", snippet or callee_name,
+                        **position, allocation_kind=callee_name,
+                        allocated_type=node.get("type", {}).get("qualType"),
+                        owner_function_id=owner,
+                    )
+                    graph.edge("ALLOCATES", body_id, allocation_id)
+                    graph.edge(
+                        "VALUE_FLOWS_TO", allocation_id, body_id, reason="allocation",
+                    )
                 if callable_target:
                     graph.edge("INVOKES", body_id, target, resolution="compiler-local")
                     graph.edge("CALLS", owner, target, callsite=body_id)
@@ -1179,6 +1215,32 @@ def main() -> int:
                     declarations_by_raw_id.get(reference.get("id", ""))
                     for reference in left_references if reference.get("kind") == "FieldDecl"
                 ), None)
+                if field_id:
+                    # The FieldDecl is a receiver-insensitive hub: a write to any
+                    # `x->field` flows into it, and every read of `y->field` flows
+                    # back out (see the MemberExpr read below). This over-connects
+                    # across distinct receivers, hence conservative confidence.
+                    graph.edge(
+                        "VALUE_FLOWS_TO", body_identity(left, path), field_id,
+                        reason="field-write", confidence="conservative",
+                    )
+                if left.get("kind") == "DeclRefExpr":
+                    # A direct assignment `v = <expr>` writes the value into the
+                    # variable itself, not just the read expression on the LHS.
+                    # The frontend emits no definition node, so without this the
+                    # written value -- an allocated object among them -- never
+                    # reaches `v`, only the LHS reference of it.
+                    lhs_variable = next((
+                        declarations_by_raw_id.get(reference.get("id", ""))
+                        for reference in left_references
+                        if reference.get("kind") in {"VarDecl", "ParmVarDecl"}
+                        and declarations_by_raw_id.get(reference.get("id", ""))
+                    ), None)
+                    if lhs_variable:
+                        graph.edge(
+                            "VALUE_FLOWS_TO", body_identity(left, path), lhs_variable,
+                            reason="write",
+                        )
                 receiver_id = next((
                     declarations_by_raw_id.get(reference.get("id", ""))
                     for reference in left_references if reference.get("kind") == "ParmVarDecl"
@@ -1206,6 +1268,45 @@ def main() -> int:
                 "VALUE_FLOWS_TO", body_identity(node["inner"][0], path), body_id,
                 reason="value-preserving-expression",
             )
+        if not is_included and body_id and kind in {
+            "BinaryOperator", "UnaryOperator", "ConditionalOperator",
+        } and not (kind == "BinaryOperator" and node.get("opcode") in {
+            "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+        }):
+            # A computed value carries its operands forward: `a + b`, `-x`,
+            # `c ? t : f` all propagate their inputs into the result node. The
+            # condition of a ConditionalOperator is a predicate, not a value
+            # source, so only the two value branches flow.
+            operands = node.get("inner", [])
+            if kind == "ConditionalOperator" and len(operands) >= 3:
+                operands = operands[1:]
+            for operand in operands:
+                graph.edge(
+                    "VALUE_FLOWS_TO", body_identity(operand, path), body_id,
+                    reason="arithmetic-operand",
+                )
+        if not is_included and kind == "VarDecl" and node.get("inner"):
+            # `int size = <expr>` binds the initializer's value to the variable.
+            variable_id = declarations_by_raw_id.get(node.get("id", ""))
+            initializer = node["inner"][-1]
+            if variable_id and initializer.get("kind", "").endswith(("Expr", "Operator", "Literal")):
+                graph.edge(
+                    "VALUE_FLOWS_TO", body_identity(initializer, path), variable_id,
+                    reason="initializer",
+                )
+        if not is_included and kind == "MemberExpr" and body_id:
+            # Reading `x->field` draws from the field hub every write fed (see the
+            # field-write edge above). Receiver-insensitive, hence conservative.
+            read_field_id = next((
+                declarations_by_raw_id.get(reference.get("id", ""))
+                for reference in referenced_decls(node)
+                if reference.get("kind") == "FieldDecl"
+            ), None)
+            if read_field_id:
+                graph.edge(
+                    "VALUE_FLOWS_TO", read_field_id, body_id,
+                    reason="field-read", confidence="conservative",
+                )
         for index, child in enumerate(node.get("inner", [])):
             bodies(child, path, owner, body_id, is_included, node, index)
 

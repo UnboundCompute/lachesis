@@ -17,6 +17,7 @@ Tools:
   cold-start — hubs (centrality spine; language-agnostic), guards_top (guard-shaped; security)
   navigation — search, callers, callees, read_body (L3), open_file (L1), open_folder (L0)
   reasoning  — flow, reaches, sources_of, points_to, aliases, guards, call_roles, siblings
+  hunting    — candidates, candidate_detail, candidate_census (facts and ranking, no verdict)
 
 Profiles (additive): the default "all" exposes every tool (TS surface unchanged). The
 opt-in "comprehension" profile (env LACHESIS_MCP_PROFILE=comprehension, or a 3rd argv)
@@ -104,6 +105,7 @@ TOOL_ORDER = (
     "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "flow", "reaches", "sources_of", "points_to", "aliases",
+    "candidates", "candidate_detail", "candidate_census", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -193,6 +195,28 @@ class _Ctx:
     @property
     def hubs(self):
         return self._analysis("hubs", lambda: Hubs(self.store.gl))
+
+    @property
+    def candidate_bundle(self):
+        """The catalog-stamped graph and its cached obligation registry.
+
+        Candidate enumeration binds catalog facts against the core symbol index. It
+        deliberately does not build value flow or judge the resulting sites; the AI
+        chooses follow-up graph tools for candidates it wants to investigate.
+        """
+        def build():
+            from lachesis.integrations.atropos.enrich import atropos_enrich
+            from lachesis.nav.kuzu_index import materialize_graph
+            from lachesis.planner.registry import default_candidate_registry
+
+            graph = materialize_graph(self.store.index)
+            stamped, summary = atropos_enrich(graph, complete_dataflow=False)
+            return {
+                "registry": default_candidate_registry(stamped, summary),
+                "atropos": summary,
+            }
+
+        return self._analysis("candidate-registry", build)
 
 
 def ctx():
@@ -412,6 +436,36 @@ TOOLS = [
          "limit": {"type": "integer", "default": 50},
          "atropos_only": {"type": "boolean",
                           "description": "only witnesses a catalog fact drove"}}}},
+    {"name": "candidates",
+     "description": "Enumerate and rank every observable obligation site selected by an Atropos "
+                    "fact. This is a POINTER, not a safety check: candidates are never suppressed "
+                    "because a size is constant, a guard seems nearby, or no input flow was "
+                    "witnessed. The first constructor is memory.copy.capacity. Costs one "
+                    "catalog bind on first call per graph (cached after). `frontiers` here reports "
+                    "coverage as counts (e.g. unbound_sinks_count); call candidate_census for the "
+                    "full roster of catalog sinks that never bound.",
+     "inputSchema": {"type": "object", "properties": {
+         "domain": {"type": "string"},
+         # Wire name avoids the bare key `constructor`: it collides with
+         # Object.prototype.constructor and breaks the client's Zod record check.
+         "constructor_id": {"type": "string"},
+         "language": {"type": "string", "enum": ["c", "python", "javascript", "typescript"]},
+         "limit": {"type": "integer", "default": 40},
+         "cursor": {"type": "string"},
+         "detail": {"type": "string", "enum": ["brief", "compact", "full"], "default": "compact",
+                    "description": "brief (one-line scan: id/rank/callee/at/size), "
+                                   "compact (triage capsule, no inferences), "
+                                   "full (whole capsule incl. inferences)"}}}},
+    {"name": "candidate_detail",
+     "description": "Return the complete neutral evidence capsule for one candidate id. It "
+                    "contains observations and bounded inferences, but no safe/unsafe verdict.",
+     "inputSchema": {"type": "object", "properties": {
+         "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}},
+    {"name": "candidate_census",
+     "description": "Report constructor metadata, exhaustive counts, and explicit analysis "
+                    "frontiers. Use this to distinguish an empty result from missing coverage.",
+     "inputSchema": {"type": "object", "properties": {
+         "constructor_id": {"type": "string"}}}},
 ]
 
 # Every tool accepts an optional `format` ("text" compact | "json" full). Inject it
@@ -429,6 +483,25 @@ for _name in ("hubs", "callers", "callees"):
     _tool["inputSchema"]["properties"].update(
         offset={"type": "integer", "default": 0},
         limit={"type": "integer", "default": 40})
+
+
+def _atropos_envelope(summary, *, full):
+    """The Atropos coverage block attached to a candidate response.
+
+    `full=True` (census only) keeps every per-language `unbound` row so the
+    coverage tool can show exactly which catalog sinks/sources never bound.
+    `full=False` (list/detail moves) drops those row lists and keeps the status
+    counts, so a page carries the shape of coverage without its full weight."""
+    per_language = summary.get("per_language", {})
+    if not full:
+        per_language = {lang: {k: v for k, v in stats.items() if k != "unbound"}
+                        for lang, stats in per_language.items()}
+    return {
+        "root": summary.get("atropos_root"),
+        "languages": summary.get("languages", []),
+        "bind": per_language,
+        "role_nodes": summary.get("role_nodes", {}),
+    }
 
 
 def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
@@ -598,6 +671,34 @@ def call_tool(name, args, format=None):
             return _emit(name, {"error": f"no node named {args['sym']!r}"}, fmt)
         return _emit(name, {**c.siblings.diff(hits[0]),
                             **_alts(store, args["sym"])}, fmt, offset, limit)
+    if name in ("candidates", "candidate_detail", "candidate_census"):
+        bundle = c.candidate_bundle
+        summary = bundle["atropos"]
+        if not summary.get("applied"):
+            return _emit(name, {
+                "move": name, "applied": False, "reason": summary.get("reason"),
+                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
+                        "at ../atropos, then reload",
+            }, fmt, offset, limit)
+        registry = bundle["registry"]
+        if name == "candidates":
+            result = registry.candidates(
+                domain=args.get("domain"), constructor=args.get("constructor_id"),
+                language=args.get("language"), limit=args.get("limit", 40),
+                cursor=args.get("cursor"), detail=args.get("detail", "compact"))
+        elif name == "candidate_detail":
+            result = registry.detail(args["candidate_id"])
+        else:
+            result = registry.census(args.get("constructor_id"))
+        result["applied"] = True
+        # The per-language bind report carries the full `unbound` row lists
+        # (hundreds of rows, ~90KB on a large catalog). That is coverage data:
+        # it belongs on `candidate_census`, the move whose job is to distinguish
+        # an empty result from missing coverage. Every other move gets the
+        # counts only, so a list page stays bounded. Nothing is dropped -- the
+        # rows are one census call away.
+        result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
+        return _emit(name, result, fmt, offset, limit)
     if name == "taint":
         return _emit(name, _taint(c.store, args), fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")

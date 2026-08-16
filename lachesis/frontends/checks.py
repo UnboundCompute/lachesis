@@ -969,6 +969,238 @@ class CompilerFrontendTests(unittest.TestCase):
                 for edge in snapshot.edges
             ))
 
+    def test_c_field_sensitive_value_flow_reaches_across_a_struct_field(self) -> None:
+        # The dbring shape: a value written into a struct field in one function is
+        # read back out of that field in another and folded into an allocation
+        # size. The forward slice must cross four hops the frontend used to drop --
+        # the field-write hub, the field-read, the arithmetic operands, and the
+        # variable initializer -- or a size-overflow slice can never be witnessed.
+        from lachesis.nav.graph_store import GraphStore
+        from lachesis.nav.reachability import Reachability
+
+        source = (
+            "struct dbring { unsigned int buf_sz; };\n"
+            "struct buf { int x; };\n"
+            "void *kzalloc(int size, int flags);\n"
+            "void dbring_set_size(struct dbring *ring, unsigned int fw_value) {\n"
+            "    ring->buf_sz = fw_value;\n"
+            "}\n"
+            "void *dbring_fill(struct dbring *ring, int align) {\n"
+            "    struct buf *b;\n"
+            "    int size = sizeof(*b) + ring->buf_sz + align - 1;\n"
+            "    b = kzalloc(size, 0);\n"
+            "    return b;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "dbring.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+
+            fw_value = next(
+                node["id"] for node in snapshot.nodes
+                if node["kind"] == "parameter" and node["label"] == "fw_value"
+            )
+            size = next(
+                node["id"] for node in snapshot.nodes
+                if node["kind"] == "variable" and node["label"] == "size"
+            )
+
+            store = GraphStore({"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)})
+            store.ensure_dataflow_tier()
+            witness = Reachability(store).reaches(fw_value, size)
+            self.assertTrue(
+                witness["manifest"]["reachable"],
+                "the value written into ring->buf_sz must flow into the allocation size",
+            )
+
+    def test_c_allocation_sites_drive_heap_points_to(self) -> None:
+        # kzalloc/malloc are ordinary calls to clang, so the frontend must mark
+        # them as allocation sites -- without an `allocation` node the heap
+        # overlay never runs (heap.py:31-32) and points_to answers nothing on C.
+        # The allocated object must reach the variable that receives it, across
+        # the implicit void*->T* cast the allocator's result flows through.
+        from lachesis.pipeline import enrich_graph
+
+        source = (
+            "struct buf { int x; };\n"
+            "void *kzalloc(unsigned long size, int flags);\n"
+            "struct buf *make(unsigned long n) {\n"
+            "    struct buf *b;\n"
+            "    b = kzalloc(n, 0);\n"
+            "    return b;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "alloc.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+
+            allocations = [n for n in snapshot.nodes if n["kind"] == "allocation"]
+            self.assertEqual(1, len(allocations))
+            self.assertEqual("kzalloc", allocations[0]["properties"]["allocation_kind"])
+
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+            objects = {n["id"] for n in enriched["nodes"] if n["kind"] == "heap-object"}
+            self.assertTrue(objects, "the heap overlay ran and minted an object")
+            b_id = next(n["id"] for n in enriched["nodes"]
+                        if n["kind"] == "variable" and n["label"] == "b")
+            b_points_to = {e["target"] for e in enriched["edges"]
+                           if e["kind"] == "POINTS_TO" and e["source"] == b_id}
+            self.assertTrue(
+                b_points_to & objects,
+                "the variable receiving the allocation points to the heap object",
+            )
+
+    def test_c_branch_regions_place_a_copy_as_guarded_or_fall_through(self) -> None:
+        # Region containment (the `dominance` observation) must work on a real
+        # C graph: the control-flow overlay emits TRUE_BRANCH region edges for C
+        # via its AST-role fallback, so a copy inside a size-testing branch reads
+        # as guarded-region and one on the fall-through past it reads as
+        # fall-through (the carl9170 missing-guard shape). Sound containment only:
+        # the negated early-return guard is honestly reported fall-through, never
+        # a guessed `dominates`.
+        from lachesis.pipeline import enrich_graph
+        from lachesis.planner.unbounded_copy import BranchRegions, _node_span
+
+        source = (
+            "void *memcpy(void *dst, const void *src, unsigned long n);\n"
+            "void guarded(char *dst, char *src, int len) {\n"
+            "    if (len <= 64) {\n"
+            "        memcpy(dst, src, len);\n"   # inside the size-testing branch
+            "    }\n"
+            "    memcpy(dst, src, len);\n"       # fall-through past it
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "guard.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+
+            regions = BranchRegions(enriched)
+            self.assertTrue(regions.has_substrate,
+                            "the control-flow overlay emitted branch-region edges for C")
+            calls = [n for n in enriched["nodes"]
+                     if n["kind"] == "call"
+                     and (n["properties"] or {}).get("callee") == "memcpy"]
+            self.assertEqual(2, len(calls))
+            statuses = {}
+            for call in calls:
+                props = call["properties"]
+                verdict = regions.classify(
+                    props.get("owner_function_id"), {"len"}, _node_span(call))
+                statuses[props.get("start_offset")] = verdict["status"]
+            # The earlier call site (smaller offset) is the guarded one.
+            inside, outside = sorted(statuses)
+            self.assertEqual("guarded-region", statuses[inside])
+            self.assertEqual("fall-through", statuses[outside])
+
+    def test_c_object_size_proves_a_literal_copy_overflows_a_fixed_array(self) -> None:
+        # Object-size must resolve on a real C graph: clang types a fixed array as
+        # `char[64]` and the memcpy destination arg points straight at that
+        # array-typed value node, so a literal copy larger than the array is a
+        # sound exceeds-capacity fact. A symbolic size over the same array stays
+        # honestly unproven -- the capacity is known but the size is not constant.
+        from lachesis.pipeline import enrich_graph
+        from lachesis.planner.unbounded_copy import object_size_capacity
+
+        source = (
+            "void *memcpy(void *dst, const void *src, unsigned long n);\n"
+            "void f(char *src, int n) {\n"
+            "    char buf[64];\n"
+            "    memcpy(buf, src, 128);\n"
+            "    memcpy(buf, src, n);\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "objsize.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+            by_id = {n["id"]: n for n in enriched["nodes"]}
+
+            statuses = {}
+            for node in enriched["nodes"]:
+                props = node.get("properties") or {}
+                if node["kind"] != "call" or props.get("callee") != "memcpy":
+                    continue
+                args = props.get("argument_value_ids") or []
+                dest = by_id.get(args[0]) if args else None
+                size = "128" if "128" in (node.get("label") or "") else "n"
+                self.assertEqual("char[64]", (dest.get("properties") or {}).get("type"))
+                statuses[size] = object_size_capacity([dest], size)["status"]
+            self.assertEqual("exceeds-capacity", statuses["128"])
+            self.assertEqual("capacity-known-size-unknown", statuses["n"])
+
+    def test_c_variable_context_recovers_the_last_write_of_a_clamped_size(self) -> None:
+        # The reaching-definition context (`variable_context`) must work on a real
+        # C graph: a size defined by an initializer and then reassigned by a clamp
+        # yields BOTH definitions, with the clamp -- the write nearest before the
+        # copy -- flagged. This is the guard-ADEQUACY signal the pipeline otherwise
+        # lacks: it exposes the value the size was actually bounded to, so a
+        # present-but-wrong guard stops looking like a safe one. It also confirms
+        # the frontend's real value-flow reasons match the def/pass-through
+        # vocabulary the walk relies on.
+        from lachesis.pipeline import enrich_graph
+        from lachesis.planner.unbounded_copy import VariableContext, _node_span
+
+        source = (
+            "void *memcpy(void *dst, const void *src, unsigned long n);\n"
+            "unsigned int hdrlen(void);\n"
+            "void f(char *dst, const char *src, unsigned int cap) {\n"
+            "    unsigned int n = hdrlen();\n"   # first definition: the initializer
+            "    if (n > cap) n = cap;\n"        # second definition: the clamp write
+            "    memcpy(dst, src, n);\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as output:
+            (Path(src) / "clamp.c").write_text(source)
+            self.run_command(
+                sys.executable, "lachesis/frontends/c/build_graph.py", src, output,
+            )
+            snapshot = load_snapshot(output)
+            validate_snapshot(snapshot)
+            enriched = enrich_graph(
+                {"nodes": list(snapshot.nodes), "edges": list(snapshot.edges)},
+                ["c"], {})
+
+            variables = VariableContext(enriched)
+            self.assertTrue(variables.has_substrate,
+                            "the C frontend emitted value-flow edges")
+            call = next(n for n in enriched["nodes"]
+                        if n["kind"] == "call"
+                        and (n["properties"] or {}).get("callee") == "memcpy")
+            size_arg = (call["properties"].get("argument_value_ids") or [None, None, None])[2]
+            block = variables.describe([("size", size_arg)], _node_span(call))
+            self.assertEqual("computed", block["status"])
+            size = next(a for a in block["arguments"] if a["role"] == "size")
+            texts = {d["text"] for d in size["last_definitions"]}
+            self.assertIn("hdrlen()", texts)          # the initializer survives
+            self.assertIn("n", texts)                 # the clamp write survives
+            nearest = [d for d in size["last_definitions"] if d.get("nearest_to_sink")]
+            self.assertEqual(1, len(nearest))
+            self.assertEqual("write", nearest[0]["reason"])   # the clamp is nearest
+            self.assertEqual(5, nearest[0]["line"])
+
     def test_c_skipping_tokens_removes_the_tokens_and_nothing_else(self) -> None:
         """``LACHESIS_EMIT_TOKENS=0`` drops one whole clang pass per file.
 
