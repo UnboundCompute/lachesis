@@ -22,6 +22,9 @@ FLOW_EDGE_KINDS = frozenset({
     "PHI_INPUT", "BRANCH_READS_FROM", "BRANCH_PREVIOUS",
     "POINTS_TO", "WRITES_HEAP", "READS_HEAP",
     "DYNAMIC_INPUT",
+    # field-sensitive intraprocedural def->use (materialized by the c-reaching-def
+    # overlay); adds field-precise write->read chains the value-flow pass lacks.
+    "REACHING_DEF",
 })
 
 
