@@ -42,7 +42,7 @@ runs:
       # Needed at analyze time: the TypeScript frontend runs under node.
       uses: actions/setup-node@v4
       with:
-        node-version: "20"
+        node-version: "22"
 
     - name: Install Lachesis (from source)
       # Until lachesis-cpg is on PyPI, install from GitHub. The TypeScript compiler

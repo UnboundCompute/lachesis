@@ -143,6 +143,10 @@ def build_result(
     if not sink_uri:
         sink_uri = rel_uri(guard.get("file"), repo_root)
         sink_line = guard.get("line")
+    if not sink_uri:
+        # Nothing to anchor the finding to; SARIF requires a valid uri, so skip it
+        # rather than emit an invalid "<unknown>" location.
+        return None
 
     msg = f"Tainted flow reaches `{sinks}` in `{handler}` — {(guard.get('status') or 'REACHABLE')}. Flow: {label}."
     if siblings:
@@ -155,9 +159,13 @@ def build_result(
     thread_locs = []
     for st in steps:
         sl = step_location(st)
+        uri = rel_uri(sl["file"], repo_root)
+        if not uri:
+            # A step with no resolvable file would emit an invalid uri; skip it.
+            continue
         thread_locs.append({
             "location": sarif_location(
-                rel_uri(sl["file"], repo_root), sl["line"],
+                uri, sl["line"],
                 f"{st.get('kind', 'step')}: {st.get('label', '')}".strip(),
             )
         })

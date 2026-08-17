@@ -5,6 +5,8 @@ name: lachesis-selftest
 
 on:
   workflow_dispatch:        # run on demand from the Actions tab
+  push:
+    branches: [main]        # establish the default-branch baseline (what the Security tab shows by default)
   pull_request:
     paths:
       - "action/**"
@@ -21,9 +23,10 @@ jobs:
 
       - uses: ./action        # the copy on this branch, not a published tag
         with:
-          # Start scoped to the fixture: fast and deterministic. Widen to "." later
-          # to scan the whole repo (heavier; may pull in node_modules).
-          source: "lachesis/frontends/typescript/fixtures/project"
+          # Scan the whole repo (Python + TypeScript + C), not just the fixture.
+          # Heavier than the fixture-only run and less deterministic, but this is
+          # the real dogfood: Lachesis analyzing its own source.
+          source: "."
           # lachesis-ref defaults to "main" — the engine install. The action CODE
           # comes from ./action on this branch regardless.
           fail-on: "none"                      # smoke test: never fail the check
