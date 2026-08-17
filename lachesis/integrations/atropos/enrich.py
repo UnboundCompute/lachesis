@@ -162,6 +162,12 @@ def atropos_enrich(
         # invokes, but never links them, so a source obtained inside a wrapper
         # dies at its return. Flow every returned value to its callers' results.
         registry.register(CReturnToCallsite())
+        # Field-sensitive intraprocedural reaching-def edges. Opt-in: the pass is a
+        # one-time, full-graph build cost (per-function independent), so it is only
+        # registered when explicitly requested, leaving default builds unchanged.
+        if os.environ.get("LACHESIS_REACHING_DEF"):
+            from lachesis.core.overlays.c_reaching_def import CReachingDef
+            registry.register(CReachingDef())
     registry.register(AtroposOverlay(stamps))
     enriched = registry.enrich(graph)
 
