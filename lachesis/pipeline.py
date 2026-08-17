@@ -181,6 +181,8 @@ def enrich_graph(
     ``observer`` is passed to the three ``OverlayRegistry`` folds so a profiler can see
     per-overlay cost. It changes nothing about the result.
     """
+    import os
+
     from .core.overlays import (
         default_model_overlay_registry,
         default_overlay_registry,
@@ -195,7 +197,20 @@ def enrich_graph(
         graph, index.package_inventory(), set(languages), capabilities, index,
     )
     graph = default_model_overlay_registry().enrich(graph, observer)
-    return default_security_overlay_registry().enrich(graph, observer)
+    graph = default_security_overlay_registry().enrich(graph, observer)
+
+    # Opt-in field-sensitive reaching-def tier. Additive and independent (its
+    # applies() is a no-op unless the graph has the C AST + CFG edges), folded here
+    # so the dataflow tier the flow/reaches/sources_of tools read carries the
+    # REACHING_DEF edges -- not only the taint tool's separate atropos fold. Gated
+    # so default builds and non-opted stores are byte-for-byte unchanged.
+    if os.environ.get("LACHESIS_REACHING_DEF"):
+        from .core.overlays.registry import OverlayRegistry
+        from .core.overlays.c_reaching_def import CReachingDef
+        rd_registry = OverlayRegistry()
+        rd_registry.register(CReachingDef())
+        graph = rd_registry.enrich(graph, observer)
+    return graph
 
 
 def enrich_project_graph(

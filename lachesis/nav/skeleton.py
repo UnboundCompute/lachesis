@@ -96,9 +96,17 @@ def _sink_annotation(row: dict) -> str:
     return f"<== SINK [{fam}] size=({size}) cap={cap} dom={dom}{rank_s}  {cid}"
 
 
-def render_function(gl, fid: str, cands: list[dict]) -> dict | None:
+def render_function(gl, fid: str, cands: list[dict],
+                    keep_candidate_ids: set[str] | None = None) -> dict | None:
     """Render one enclosing function to a sink-and-control skeleton. Returns a dict
     with the text and a structured sink roster, or None when source is unavailable.
+
+    ``keep_candidate_ids`` is an optional pure-rendering subset filter: when given,
+    only candidates whose ``candidate_id`` is in the set are drawn (the rest are
+    elided like any other non-kept line). This is what lets a caller show *not every
+    catalogued sink but only the ones that survived some external judgement* -- e.g.
+    a taint pass -- without the renderer itself knowing or deciding what survives.
+    The subset is supplied; the skeleton stays a pure renderer.
     """
     sp = _span(gl, fid)
     if not sp:
@@ -108,6 +116,11 @@ def render_function(gl, fid: str, cands: list[dict]) -> dict | None:
     if text is None:
         return None
     src = text.splitlines()
+
+    scoped = keep_candidate_ids is not None
+    total_before = len(cands)
+    if scoped:
+        cands = [r for r in cands if r.get("candidate_id") in keep_candidate_ids]
 
     # line -> every candidate on it (all families). A dict-of-lists, never a scalar,
     # so two obligations sharing a line both survive -- the clobber that used to hide
@@ -136,8 +149,10 @@ def render_function(gl, fid: str, cands: list[dict]) -> dict | None:
 
     base = os.path.basename(path)
     total_sinks = sum(len(v) for v in sinks_at.values())
-    out = [f"{name}   {base}:{sl}-{el}   [{total_sinks} sink(s) over {len(sinks_at)} site(s)]",
-           "=" * 78]
+    header = f"{name}   {base}:{sl}-{el}   [{total_sinks} sink(s) over {len(sinks_at)} site(s)]"
+    if scoped:
+        header += f"   [taint-scoped: {total_sinks} of {total_before} survived]"
+    out = [header, "=" * 78]
     elided = 0
     for ln in range(sl, el + 1):
         if ln - 1 >= len(src):
@@ -173,20 +188,28 @@ def render_function(gl, fid: str, cands: list[dict]) -> dict | None:
         "sink_sites": len(sinks_at),
         "kept_lines": len(keep),
         "total_lines": el - sl + 1,
+        "scoped": scoped,
+        "sinks_before_scope": total_before if scoped else None,
         "sinks": sinks,
         "text": "\n".join(out),
     }
 
 
-def skeleton_for_function(gl, registry, fid: str) -> dict:
-    """Skeleton for a function node id, with all its sinks (every family)."""
+def skeleton_for_function(gl, registry, fid: str,
+                          keep_candidate_ids: set[str] | None = None) -> dict:
+    """Skeleton for a function node id, with all its sinks (every family).
+
+    ``keep_candidate_ids`` is forwarded to :func:`render_function` as a pure
+    subset filter -- give it the candidate ids that survived taint to get a
+    skeleton scoped to just those, or leave it None for the full sink map.
+    """
     cands = candidates_by_function(registry).get(fid, [])
     if not cands:
         node = gl.nodes.get(fid)
         if node is None:
             return {"error": f"unknown function id: {fid}"}
         return {"error": f"no candidates enclosed by {fid}", "function": node.get("label")}
-    rendered = render_function(gl, fid, cands)
+    rendered = render_function(gl, fid, cands, keep_candidate_ids=keep_candidate_ids)
     if rendered is None:
         return {"error": f"could not render function: {fid}"}
     return rendered

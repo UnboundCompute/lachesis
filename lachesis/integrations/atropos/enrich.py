@@ -162,6 +162,10 @@ def atropos_enrich(
         # invokes, but never links them, so a source obtained inside a wrapper
         # dies at its return. Flow every returned value to its callers' results.
         registry.register(CReturnToCallsite())
+        # NB: the opt-in field-sensitive reaching-def tier (REACHING_DEF) is folded
+        # by the canonical dataflow-tier builder (pipeline.enrich_graph), not here --
+        # the taint tool reaches it via ensure_dataflow_tier before this fold, so
+        # registering it again would double the edges.
     registry.register(AtroposOverlay(stamps))
     enriched = registry.enrich(graph)
 
