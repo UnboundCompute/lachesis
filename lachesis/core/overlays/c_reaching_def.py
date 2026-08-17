@@ -18,12 +18,19 @@ contributes only ``REACHING_DEF`` edges, so every other overlay's time and space
 are unchanged (the registry measures each overlay independently). Because the pass
 is per-function independent and its cost is dominated by the number of functions,
 an optional ``functions`` filter scopes it to a subset (e.g. the call-graph
-neighbourhood of known sinks), which is the practical lever for build time — the
+neighbourhood of known sinks), which is the practical build-time lever — the
 full-graph pass is a one-time build cost, not a per-query one.
+
+Process-parallelism was measured and deliberately *not* adopted: the per-function
+work is small (tens of ms), so wall time is dominated by moving the per-function
+result edges back across the process boundary and deduping them in the parent,
+neither of which parallelizes; an 8-worker fork pool measured ~1.1x on a full
+graph, not worth the cross-platform fork/spawn fragility. Scope with ``functions``
+instead, or accept the one-time serial cost.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, List, Optional, Tuple
 
 from ..composition import GraphDelta
 from ..query import GraphIndex
@@ -72,6 +79,31 @@ class CReachingDef:
         # needs AST to synthesize the micro-CFG and CFG_NEXT for block order
         return "AST_CHILD" in kinds and "CFG_NEXT" in kinds
 
+    @staticmethod
+    def _edge(def_id: str, use_id: str) -> dict:
+        return {
+            "kind": RD_KIND,
+            "source": def_id, "target": use_id,
+            "properties": {
+                "fact_origin": "core-inference",
+                "confidence": "high",
+                "evidence_ids": [def_id, use_id],
+                "inference": "c-reaching-def",
+            },
+        }
+
+    def _collect(self, pairs: Iterable[Tuple[str, str]], seen: set) -> List[dict]:
+        out: List[dict] = []
+        for def_id, use_id in pairs:
+            if def_id == use_id:
+                continue
+            key = (def_id, use_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(self._edge(def_id, use_id))
+        return out
+
     def enrich(self, graph: dict, index: Any = None) -> GraphDelta:
         # local imports: the reader is only needed when the overlay actually runs
         from lachesis.nav.dataflow.substrate import Substrate
@@ -79,33 +111,21 @@ class CReachingDef:
 
         index = GraphIndex(graph) if index is None else index
         sub = Substrate(_OverlayIndex(index)).load()
-        rd = ReachingDef(sub)
 
-        targets = self._functions if self._functions is not None else sub.functions()
+        if self._functions is not None:
+            targets = list(self._functions)
+        else:
+            targets = list(sub.functions())
 
-        edges = []
+        edges: List[dict] = []
         seen: set = set()
+
+        rd = ReachingDef(sub)
         for fn in targets:
             try:
                 result = rd.run_function(fn)
             except Exception:
                 # a single malformed function must not abort the whole pass
                 continue
-            for def_id, use_id in result["edges"]:
-                if def_id == use_id:
-                    continue
-                key = (def_id, use_id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                edges.append({
-                    "kind": RD_KIND,
-                    "source": def_id, "target": use_id,
-                    "properties": {
-                        "fact_origin": "core-inference",
-                        "confidence": "high",
-                        "evidence_ids": [def_id, use_id],
-                        "inference": "c-reaching-def",
-                    },
-                })
+            edges.extend(self._collect(result["edges"], seen))
         return GraphDelta(self.overlay_id, [], edges)
