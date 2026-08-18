@@ -96,10 +96,15 @@ class AbstractState:
         return AbstractState(self.env, self.facts, self.slots, self.trace)
 
     def key(self) -> tuple:
+        # These mappings are mathematical sets for state-equivalence purposes.
+        # Sorting them used ``repr(object_id)`` because recursively constructed phi
+        # IDs are not naturally orderable; on large CFGs that repeatedly rendered
+        # enormous nested tuples.  Frozensets preserve exact structural equality and
+        # hashing without inventing an ordering or allocating those strings.
         return (
-            tuple(sorted(self.env.items())),
-            tuple(sorted(self.facts.items(), key=lambda item: repr(item[0]))),
-            tuple(sorted(self.slots.items(), key=lambda item: repr(item[0]))),
+            frozenset(self.env.items()),
+            frozenset(self.facts.items()),
+            frozenset(self.slots.items()),
             self.trace,
         )
 
@@ -225,7 +230,11 @@ class AbstractState:
 
 def join_states(states: Iterable[AbstractState], node: Hashable) -> AbstractState:
     """Alias-signature-preserving may join used when path disjunctions exceed budget."""
-    ordered = sorted(states, key=lambda state: repr(state.key()))
+    # State position is used consistently across every signature below, while phi IDs
+    # are deliberately synthetic.  Reordering states can only rename those IDs; it
+    # cannot change alias partitions or joined facts.  Avoid recursively rendering
+    # entire states merely to choose an otherwise meaningless name ordering.
+    ordered = list(states)
     joined = AbstractState()
     roots = sorted({root for state in ordered for root in state.env})
     signatures: dict[tuple, ObjectId] = {}
