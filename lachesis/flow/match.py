@@ -119,14 +119,24 @@ def _match_typestate_cfg(seq, var, entry, cfg):
         reach.add(x)
         dq.extend(succ.get(x, ()))
 
+    # The FREED state carries the IDENTITY of the free SITE that produced it -- a
+    # ("FREED", free_node) token rather than a bare "FREED". This is what makes a double-free
+    # require two DISTINCT frees. The back-edge of a loop unavoidably carries a free's own FREED
+    # back to itself (and, in a `for`, is the only path from inside the loop to the code after
+    # it), so a bare-FREED automaton flags a lone free in a `for(i=0;i<1;i++)` once-loop as a
+    # double-free. Keyed by site, a free that meets only its OWN FREED (self-doubling around the
+    # back-edge) is suppressed, while a free that meets a DIFFERENT site's FREED (two textual
+    # frees on a forward path) still fires. Suppressing the single-site loop case is deliberate:
+    # it is a real double-free only when the loop provably runs more than once, which needs a
+    # trip count we do not have here.
     def apply(state, node):
         """Fold this node's events onto an incoming state set, returning the outgoing set."""
         out = set(state) or {"START"}
         for t in ev_at.get(node, []):
             if t["t"] == "alloc":
-                out = {"ALLOCATED"}
+                out = {"ALLOCATED"}                          # (re)alloc reopens: drops all FREED sites
             elif t["t"] == "free":
-                out = {"FREED"}
+                out = {("FREED", node)}                      # this site now dominates the object
             # use / escape do not change the object's state
         return out
 
@@ -147,21 +157,26 @@ def _match_typestate_cfg(seq, var, entry, cfg):
             if frozenset(in_state[m]) != before:
                 wl.append(m)
 
+    def freed_sites(state):
+        return {s[1] for s in state if isinstance(s, tuple) and s[0] == "FREED"}
+
     # read findings at the fixpoint: replay each node's events against its incoming state
     leads, seen = [], set()
     for n in reach:
         cur = set(in_state[n]) or {"START"}
         for t in ev_at.get(n, []):
             if t["t"] == "free":
-                if "FREED" in cur:
+                # a double-free needs the incoming FREED to come from a DIFFERENT free site;
+                # meeting only this site's own FREED is loop self-doubling (see apply) -> skip
+                if freed_sites(cur) - {n}:
                     key = ("double-free", t.get("line"), n)
                     if key not in seen:
                         seen.add(key)
                         leads.append({"pattern": "double-free", "var": var,
                                       "entry": entry, "line": t.get("line")})
-                cur = {"FREED"}
+                cur = {("FREED", n)}
             elif t["t"] == "use":
-                if "FREED" in cur:
+                if freed_sites(cur):
                     key = ("use-after-free", t.get("line"), n)
                     if key not in seen:
                         seen.add(key)
