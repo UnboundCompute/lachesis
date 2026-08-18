@@ -112,7 +112,12 @@ def summarize_one(name, F, summaries):
                     # callee already applies internally (inherited, not on our value)
                     add_flow(a, rec["sink"], outer + rec["guards"], callee, outer)
                 oroot = a.get("origin_root", a.get("root"))
-                if gparam in gsum["frees_params"] and oroot in params:
+                # only a WHOLE-object pass frees the param: `f(&data->field)` frees the
+                # sub-object, not `data`, so it must not mark frees_params[data] -- that
+                # over-claim would propagate "frees data" to every caller of this function
+                # (the second-order form of the destructor-idiom phantom).
+                if (gparam in gsum["frees_params"] and oroot in params
+                        and _freed_identity(a) == a.get("root")):
                     frees[oroot] = f"via:{callee}"
 
     # direct frees on a parameter (from the event stream)
