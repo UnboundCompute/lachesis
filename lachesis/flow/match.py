@@ -22,8 +22,6 @@ import json
 from collections import deque
 
 from .patterns import substrate, evaluate
-from .skeleton import build_skeletons, _summaries_for
-from .translate import load_graph
 
 
 def match_reach(skel):
@@ -207,22 +205,26 @@ def match_all(skels, cfg=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="match shape patterns over rendered flow skeletons")
+    ap = argparse.ArgumentParser(description="run the production flow pipeline and match shapes")
     ap.add_argument("--graph", required=True)
     ap.add_argument("--lang", default="c")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    F, succ = load_graph(args.graph, lang=args.lang)
-    summaries = _summaries_for(F, succ)
-    skels = build_skeletons(F, summaries, lang=args.lang)
-    leads = match_all(skels)
+    # Keep the CLI on the same entrypoint as MCP. Calling match_all directly here used
+    # to bypass object identity and silently report legacy name-keyed results.
+    from lachesis.flow.pipeline import run_pass
+    from lachesis.nav.graph_store import GraphStore
+    bundle = run_pass(GraphStore.load(args.graph), lang=args.lang)
+    skels, leads = bundle["skeletons"], bundle["leads"]
 
     if args.out:
         with open(args.out, "w") as fh:
             json.dump(leads, fh, indent=2)
 
-    print(f"matched {len(leads)} lead(s) over {len(skels)} skeleton(s)"
+    engine = bundle.get("lifetime", {}).get("active", "legacy")
+    print(f"matched {len(leads)} lead(s) over {len(skels)} skeleton(s) "
+          f"(lifetime={engine})"
           + (f" -> {args.out}" if args.out else "") + "\n")
     # single-node leads, source-rooted first (the maximal stitched flows)
     reach = [l for l in leads if l["pattern"] in ("reachability", "relational", "presence")]
