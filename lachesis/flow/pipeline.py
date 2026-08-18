@@ -14,6 +14,7 @@ from .object_lifetime import analyze_object_lifetimes
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
+_DEFAULT_LIFETIME_ENGINE = "object"
 
 
 def _lead_key(lead):
@@ -62,7 +63,8 @@ def run_pass(store, lang="c", lifetime_engine=None):
     summaries = _summaries_for(F, succ)
     skeletons = build_skeletons(F, summaries, lang=lang)
     legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
-    requested = lifetime_engine or os.environ.get("LACHESIS_LIFETIME_ENGINE", "shadow")
+    requested = lifetime_engine or os.environ.get(
+        "LACHESIS_LIFETIME_ENGINE", _DEFAULT_LIFETIME_ENGINE)
     if requested not in {"legacy", "shadow", "object"}:
         raise ValueError(
             "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")

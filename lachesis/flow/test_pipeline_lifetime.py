@@ -1,9 +1,12 @@
 import unittest
 
-from .pipeline import _select_lifetime_leads
+from .pipeline import _DEFAULT_LIFETIME_ENGINE, _select_lifetime_leads
 
 
 class PipelineLifetimeTests(unittest.TestCase):
+    def test_object_identity_is_the_default_lifetime_engine(self):
+        self.assertEqual(_DEFAULT_LIFETIME_ENGINE, "object")
+
     def setUp(self):
         self.reach = {"pattern": "relational", "entry": "f", "line": 1}
         self.leak = {"pattern": "leak", "entry": "f", "line": 2}

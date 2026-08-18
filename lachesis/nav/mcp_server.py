@@ -825,6 +825,7 @@ def call_tool(name, args, format=None):
                                       if F.get(n, {}).get("is_source", False)),
                        "skeletons": len(bundle["skeletons"]), "leads": len(bundle["leads"])},
             "functions": rows,
+            "lifetime": bundle.get("lifetime", {}),
         }
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
@@ -851,6 +852,7 @@ def call_tool(name, args, format=None):
                        "typestate": sum(1 for s in all_skels if s["kind"] == "typestate"),
                        "leads": len(bundle["leads"])},
             "leads": leads,
+            "lifetime": bundle.get("lifetime", {}),
         }
         # Render skeleton text only when scoped -- the whole-graph stream would be huge.
         if fn or kind:

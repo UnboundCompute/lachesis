@@ -330,6 +330,15 @@ def _r_flow_pass(result: dict, offset: int, limit: int) -> str:
              f"counts: {c.get('functions', 0)} functions "
              f"({c.get('sources', 0)} sources, {c.get('with_flows', 0)} carry flows), "
              f"{c.get('skeletons', 0)} skeletons, {c.get('leads', 0)} leads"]
+    lifetime = result.get("lifetime", {})
+    if lifetime:
+        differential = lifetime.get("differential", {})
+        lines.append(
+            f"lifetime-engine: {lifetime.get('active', 'legacy')} "
+            f"(legacy={differential.get('legacy', 0)}, "
+            f"object={differential.get('object', 0)}, "
+            f"legacy-only={differential.get('legacy_only', 0)}, "
+            f"object-only={differential.get('object_only', 0)})")
     rows = result.get("functions", [])
     window, footer = _window(rows, offset, limit)
     lines.append(f"functions ({len(rows)}):")
@@ -360,6 +369,14 @@ def _r_flow_skeleton(result: dict, offset: int, limit: int) -> str:
              f"counts: {c.get('skeletons', 0)} skeletons "
              f"({c.get('reach', 0)} reach, {c.get('typestate', 0)} typestate), "
              f"{c.get('leads', 0)} leads"]
+    lifetime = result.get("lifetime", {})
+    if lifetime:
+        diagnostics = lifetime.get("diagnostics", {})
+        lines.append(
+            f"lifetime-engine: {lifetime.get('active', 'legacy')} "
+            f"({diagnostics.get('analyzed', 0)} functions, "
+            f"{diagnostics.get('unplaced', 0)} unplaced, "
+            f"{len(diagnostics.get('capped', []))} capped)")
 
     leads = result.get("leads", [])
     reach = [l for l in leads if l.get("pattern") in ("reachability", "relational", "presence")]
