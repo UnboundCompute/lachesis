@@ -148,14 +148,20 @@ def summarize_one(name, F, summaries):
         if ev["kind"] == "alloc":
             alloc_node.setdefault(ev["var"], ev.get("node"))
 
-    def lifetime_events_for(v, alloc_seed=None):
+    def lifetime_events_for(v, alloc_seed=None, free_seed=None):
         """Ordered alloc/use/free/escape stream for pointer `v`, composing callee effects.
 
         Each event carries its CFG anchor `node` (the call site for call-derived and spliced
         callee effects) so a path-sensitive matcher can walk them over the real CFG; the
-        line ordering here is only a stable serialisation, not the analysis order."""
+        line ordering here is only a stable serialisation, not the analysis order.
+
+        `free_seed=(line, node)` prepends a free event -- used when the pointer ARRIVES freed,
+        i.e. it is the return value of a callee that handed back an already-freed pointer
+        (returns_dangling), so a subsequent use in this function is a use-after-free."""
         stream = ([("alloc", alloc_seed, alloc_node.get(v))]
                   if alloc_seed is not None else [])
+        if free_seed is not None:
+            stream.append(("free", free_seed[0], free_seed[1]))
         for call in fn["calls"]:
             for a in call["args"]:
                 if a.get("root") != v:
@@ -181,6 +187,32 @@ def summarize_one(name, F, summaries):
     # alloc'd locals -> full lifecycle starting at the alloc site
     typestate = {v: lifetime_events_for(v, aline) for v, aline in alloc_line.items()}
 
+    # freed locals with no detectable local alloc: still track their free/use lifecycle so a
+    # double-free / use-after-free over a local is not lost when the alloc site is invisible --
+    # e.g. the allocating assignment's value-flow edge was never emitted (a cast between the
+    # call and the write drops it), or the pointer was obtained some other way. The frees alone
+    # carry the typestate the matcher needs; the alloc only seeds ALLOCATED, which the automaton
+    # does not require to flag a second free. Params are exported through param_typestate instead.
+    covered = set(typestate) | params
+    for ev in fn["events"]:
+        v = ev["var"]
+        if ev["kind"] in ("free", "use") and v not in covered:
+            covered.add(v)
+            evs = lifetime_events_for(v)
+            if evs:
+                typestate[v] = evs
+
+    # dangling return values: a callee that returns a pointer it already freed
+    # (returns_dangling) hands the caller an already-freed pointer. Seed a free at the call
+    # site so this function's subsequent use of the assigned var is a use-after-free, and a
+    # subsequent free is a double-free -- the interprocedural analogue of splicing a freed
+    # param's lifecycle, but through the RETURN value instead of an argument.
+    for a in fn.get("assigns", []):
+        cn = a.get("callee")
+        if cn and summaries.get(cn, {}).get("returns_dangling") and a["var"] not in typestate:
+            typestate[a["var"]] = lifetime_events_for(
+                a["var"], free_seed=(a["line"], a.get("node")))
+
     # freed params -> lifetime WITHOUT a local alloc, exported so a caller that allocates
     # then passes the pointer can splice these effects (path-sensitive UAF across the call)
     param_typestate = {}
@@ -201,6 +233,29 @@ def summarize_one(name, F, summaries):
         elif r["kind"] == "var" and r.get("prov") == "param" and ret != "alloc":
             ret, ret_param = "param", r["var"]
 
+    # returns_dangling: does F return a pointer it has FREED and not re-alloc'd? A `may` fact
+    # read off the END state of the pointer's lifecycle stream (freed, with no realloc reopening
+    # it) -- deliberately NOT gated on the return statement's line, which the graph does not
+    # report reliably for a cast-wrapped `return expr`. The caller-side reach from the callsite
+    # to the use stays path-sensitive in the matcher, exactly as the param_typestate splice
+    # does. This is the missing ownership term next to `alloc`.
+    def _ends_freed(v):
+        freed = False
+        for e in typestate.get(v) or lifetime_events_for(v):
+            if e["kind"] == "alloc":
+                freed = False
+            elif e["kind"] == "free":
+                freed = True
+        return freed
+
+    returns_dangling = False
+    for r in fn["returns"]:
+        if r.get("kind") == "var" and _ends_freed(r["var"]):
+            returns_dangling = True
+        elif r.get("kind") == "call" \
+                and summaries.get(r.get("callee"), {}).get("returns_dangling"):
+            returns_dangling = True
+
     return {
         "name": name,
         "params": fn["params"],
@@ -212,6 +267,7 @@ def summarize_one(name, F, summaries):
         "frees_params": frees,
         "returns": ret,
         "returns_param": ret_param,
+        "returns_dangling": returns_dangling,
     }
 
 
@@ -227,7 +283,7 @@ def run(F, schedule):
             summaries[m] = {"name": m, "params": F[m]["params"], "taxonomy": F[m]["taxonomy"],
                             "sink_flows": [], "sink_params": {}, "typestate": {},
                             "param_typestate": {}, "frees_params": {}, "returns": "value",
-                            "returns_param": None}
+                            "returns_param": None, "returns_dangling": False}
         for _ in range(len(members) + 3):
             snapshot = json.dumps({m: summaries[m] for m in members}, sort_keys=True)
             for m in members:

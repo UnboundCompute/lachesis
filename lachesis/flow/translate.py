@@ -190,19 +190,28 @@ def _guards_for(regions, fid, idents, span):
 
 
 def _returns(ix, fid, alloc_vars, params, norm):
-    """Return records: alloc-owned / param passthrough / call result / plain value."""
+    """Return records: alloc-owned / param passthrough / call result / plain value.
+
+    A `return expr` node is usually a cast/paren wrapper, not the variable itself, so when the
+    surface label is not a known var we resolve through value-flow to the underlying variable
+    (the same VFT walk `_assigned_var` uses). This exposes a freed-then-returned local as a
+    `var` return so the summary can flag a dangling return -- without it, `return p` after
+    `free(p)` reads as an anonymous value and the interprocedural use-after-free is invisible."""
     out = []
     for rv in ix.sources(fid, "RETURNS_VALUE"):
         if rv.get("kind") == "call":
             out.append({"kind": "call", "callee": norm.canon_callee(_props(rv).get("callee")),
                         "line": _props(rv).get("start_line")})
             continue
-        label = rv.get("label")
         line = _props(rv).get("start_line")
-        if label in alloc_vars:
-            out.append({"kind": "var", "prov": "alloc", "var": label, "line": line})
-        elif label in params:
-            out.append({"kind": "var", "prov": "param", "var": label, "line": line})
+        label = rv.get("label")
+        var = label if (label in alloc_vars or label in params) else _assigned_var(ix, rv["id"])
+        if var in alloc_vars:
+            out.append({"kind": "var", "prov": "alloc", "var": var, "line": line})
+        elif var in params:
+            out.append({"kind": "var", "prov": "param", "var": var, "line": line})
+        elif var:
+            out.append({"kind": "var", "prov": "local", "var": var, "line": line})
         else:
             out.append({"kind": "value", "line": line})
     return out
@@ -229,8 +238,12 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
         cat = sinks.get(callee)
-        # the allocated pointer (alloc dst) is the call result's assignment target
-        alloc_dst = _assigned_var(ix, c["id"]) if norm.is_alloc(callee) else None
+        # the variable this call's result is assigned to (any callee, not just allocators), so
+        # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
+        # wrapper's `returns=alloc` seeds an alloc, a freed-return's `returns_dangling` seeds a
+        # free. `alloc_dst` is the is_alloc-gated subset used for the alloc event and sink dst.
+        assigned = _assigned_var(ix, c["id"])
+        alloc_dst = assigned if norm.is_alloc(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
                "is_sink": cat is not None,
                "node": c["id"],                             # graph node = CFG anchor for events
@@ -247,9 +260,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             rec["dst"] = alloc_dst if norm.is_alloc(callee) else (args[0].get("value") if args else None)
         calls.append(rec)
 
+        if assigned:
+            assigns.append({"var": assigned, "callee": callee, "line": line, "node": c["id"]})
         if alloc_dst:
             events.append({"kind": "alloc", "var": alloc_dst, "line": line, "node": c["id"]})
-            assigns.append({"var": alloc_dst, "callee": callee, "line": line, "node": c["id"]})
         if norm.is_dealloc(callee) and args and args[0]["root"]:
             events.append({"kind": "free", "var": args[0]["root"], "line": line, "node": c["id"]})
 
