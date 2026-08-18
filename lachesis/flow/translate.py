@@ -323,7 +323,10 @@ def build_F(store, lang="c"):
     Reproduces order.load's return so the pass is input-source agnostic. Taxonomy /
     caller / source classification is the same class rule the old parser used."""
     ix = store.index
-    graph = materialize_graph(ix)
+    # Disk-backed stores need a columnar materialization for BranchRegions. Tests and
+    # embedding callers can supply an already-materialized in-memory GraphStore; do not
+    # assume its GraphIndex has Kuzu's private connection surface.
+    graph = store.graph if store.graph is not None else materialize_graph(ix)
     regions = BranchRegions(graph)
     nest = ControlNesting(graph)                   # loop/branch nesting from AST containment
     sinks = atropos.sink_catalog(lang)

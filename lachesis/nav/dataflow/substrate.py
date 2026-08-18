@@ -65,7 +65,8 @@ class Substrate:
     def node(self, nid):
         n = self._node.get(nid)
         if n is None:
-            n = self.idx._node(nid) or {}
+            nodes = getattr(self.idx, "nodes", None)
+            n = (nodes.get(nid) if nodes is not None else self.idx._node(nid)) or {}
             self._node[nid] = n
         return n
 
