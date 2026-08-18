@@ -368,6 +368,9 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
     started = perf_counter()
     sub = Substrate(store.index).load().load_initializers()
     norm = normalizer(lang)
+    function_node_ids = [node_id for kind in ("function", "method", "constructor")
+                         for node_id in getattr(store.index, "by_kind", {}).get(kind, ())]
+    sub.warm_nodes(function_node_ids)
     by_name = {}
     for node in store.index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
@@ -375,6 +378,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
         name = node.get("label")
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
+
+    sub.warm_owned(by_name.values())
 
     cfgs = {}
     cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}

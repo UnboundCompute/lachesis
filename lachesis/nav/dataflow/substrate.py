@@ -81,6 +81,26 @@ class Substrate:
         self._initializers_loaded = True
         return self
 
+    def warm_nodes(self, node_ids, batch_size=5000):
+        """Bulk-warm disk-backed node records; a no-op for the in-memory index."""
+        warmer = getattr(self.idx, "_warm_nodes", None)
+        if warmer is None:
+            return self
+        ordered = list(dict.fromkeys(node_ids))
+        for start in range(0, len(ordered), batch_size):
+            warmer(ordered[start:start + batch_size])
+        return self
+
+    def warm_owned(self, function_ids, batch_size=5000):
+        """Warm all bodies in bounded batches instead of one query per function."""
+        by_owner = getattr(self.idx, "by_owner", None)
+        if by_owner is None:
+            return self
+        owned = []
+        for function_id in function_ids:
+            owned.extend(by_owner.get(function_id, ()))
+        return self.warm_nodes(owned, batch_size=batch_size)
+
     def role_children(self, node, role):
         return self.ast_by_role.get(node, {}).get(role, ())
 
