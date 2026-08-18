@@ -8,18 +8,23 @@ only thing that needs code -- that is the closed-evaluator-set promise.
 
 Three layers, kept separable so each can graduate to its destination:
 
-  (a) PATTERN DATA  -- the `kind -> evaluator` table. Pure data. Belongs with the
-                       atropos catalog, where every language's sink rows already live,
-                       so one library holds all knowledge and new rows auto-add
-                       categories.
-  (b) EVALUATORS    -- a CLOSED set of generic predicates over the substrate.
-                       reachability / relational / presence today; typestate and
-                       differential are the next primitives (need an effect catalog +
-                       object id).
+  (a) PATTERN DATA  -- the `kind -> evaluator` table. Pure data, and it now lives
+                       where it belongs: the atropos catalog (detection/evaluators.json),
+                       loaded by `catalog.py` and PASSED IN to `evaluate` here. This
+                       module holds none of it, so a new catalogued kind that maps to an
+                       existing evaluator adds a category with no change to this file.
+  (b) EVALUATORS    -- a CLOSED set of generic predicates over the substrate. This is
+                       the one thing that IS code: reachability / relational / presence
+                       today; typestate and differential are the next primitives (need
+                       an effect catalog + object id).
   (c) SUBSTRATE     -- the neutral fact a sink occurrence presents to a pattern:
                        {kind, tainted, value_bound, guarded}. Every bug is a predicate
                        over these dimensions (op/effect, object reachability, value,
                        control).
+
+The recipe (a) is data and is injected; the evaluators (b) and substrate (c) are the
+closed, graph- and catalog-neutral core. This module imports nothing and does no I/O,
+so it is testable with a synthetic recipe table.
 """
 
 
@@ -62,51 +67,28 @@ EVALUATORS = {
 }
 
 
-# ---- (a) PATTERN DATA: kind -> evaluator recipe --------------------------------------------
-# Pure data. This is the whole "add knowledge without code" seam: a row here (or, once
-# graduated, a field on the atropos sink entry) routes a category to a generic evaluator.
-KIND_EVALUATOR = {
-    # injection & traversal -> reachability (taint reaches the sink arg, unsanitized)
-    "command-injection":  "reachability",
-    "code-injection":     "reachability",
-    "sql-injection":      "reachability",
-    "nosql-injection":    "reachability",
-    "xss":                "reachability",
-    "path-traversal":     "reachability",
-    "ssrf":               "reachability",
-    "template-injection": "reachability",
-    "deserialization":    "reachability",
-    "format-string":      "reachability",
-    "xxe":                "reachability",
-    "open-redirect":      "reachability",
-    "prototype-pollution":"reachability",
-    "ldap-injection":     "reachability",
-    "xpath-injection":    "reachability",
-    "redos":              "reachability",
-    # size / memory -> relational (taint AND unbounded length vs capacity)
-    "alloc-size":         "relational",
-    "buffer-size":        "relational",
-    "buffer-write":       "relational",
-    # configuration -> presence (taint-independent; the call is the bug)
-    "weak-crypto":        "presence",
-    "insecure-tls":       "presence",
-    "insecure-temp-file": "presence",
-}
+# ---- (a) PATTERN DATA: injected, not held here ---------------------------------------------
+# The `kind -> evaluator` recipe is DATA in the atropos catalog (detection/evaluators.json).
+# `catalog.py` loads it and callers pass it in as `kind_evaluator` -- a plain
+# {kind: evaluator-name} dict. This module intentionally holds no copy: the "add knowledge
+# without code" seam is a row in atropos, never an edit here.
 
 
-def evaluate(sink_kind, fact):
-    """Route a substrate fact through the evaluator its kind selects. Returns the evaluator
-    name if the pattern fires, else None (unknown kind, or predicate not satisfied)."""
-    ev = KIND_EVALUATOR.get(sink_kind)
+def evaluate(sink_kind, fact, kind_evaluator):
+    """Route a substrate fact through the evaluator its kind selects, per the recipe table.
+    Returns the evaluator name if the pattern fires, else None (kind absent from the recipe,
+    or the predicate is not satisfied)."""
+    ev = kind_evaluator.get(sink_kind)
     if ev is None:
         return None
     return ev if EVALUATORS[ev](fact) else None
 
 
-def is_call_level(sink_kind):
-    """Occurrence granularity of a kind. Presence-class kinds are CALL-level: the defect is
-    that the sink is CALLED (weak crypto, insecure TLS), so it must be collected per-call and
-    fires even with constant arguments. Every other class is ARG-level: the occurrence is a
-    (call, argument) pair carrying a value the taint/bound predicates read. Adding a new
-    presence KIND needs no code; only a new occurrence granularity would."""
-    return KIND_EVALUATOR.get(sink_kind) == "presence"
+def is_call_level(sink_kind, kind_evaluator):
+    """Occurrence granularity of a kind, read off the recipe. Presence-class kinds are
+    CALL-level: the defect is that the sink is CALLED (weak crypto, insecure TLS), so it must
+    be collected per-call and fires even with constant arguments. Every other class is
+    ARG-level: the occurrence is a (call, argument) pair carrying a value the taint/bound
+    predicates read. Adding a new presence KIND needs no code; only a new occurrence
+    granularity would."""
+    return kind_evaluator.get(sink_kind) == "presence"

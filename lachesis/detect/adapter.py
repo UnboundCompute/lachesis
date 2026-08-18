@@ -22,23 +22,13 @@ import collections
 
 from lachesis.nav.kuzu_index import KuzuGraphIndex
 from lachesis.detect import substrate
+from lachesis.detect.catalog import load_detector
 
 
 # The enriched graph marks sinks with a `generic-security-roles` vocabulary that is
-# coarser than the atropos per-argument kinds the substrate speaks. This is
-# catalog-to-catalog DATA, not a hardcoded family: every role that denotes a
-# taint-reachability sink maps to the atropos kind the substrate routes. Roles the
-# enrichment model does not carry (size/memory, weak crypto) simply never appear on
-# these graphs; supporting one is a new row here, not engine code.
-SINK_KIND_BRIDGE = {
-    "filesystem-write": "path-traversal",
-    "filesystem-read":  "path-traversal",
-    "database":         "sql-injection",
-    "response":         "xss",
-    "process":          "command-injection",
-    "dynamic-code":     "code-injection",
-    "deserialize":      "deserialization",
-}
+# coarser than the atropos per-argument kinds the recipe speaks. That translation is
+# DATA in the atropos catalog (detection/sink-roles.json), loaded via `load_detector`;
+# supporting another front-end vocabulary is a new file there, not a change here.
 
 # The forward edges the interprocedural taint flood walks from a source-marked parameter:
 #   VALUE_FLOWS_TO            intra-procedural value flow (assignment, use)
@@ -50,8 +40,11 @@ _FLOW_EDGES = ("VALUE_FLOWS_TO", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE")
 class LachesisGraph:
     """A read view over one enriched kuzu store, opened lightweight (no full load)."""
 
-    def __init__(self, store_dir):
+    def __init__(self, store_dir, detector=None):
         self.index = KuzuGraphIndex(store_dir)
+        # The recipe + sink-role bridge come from the atropos catalog. Load the default
+        # (generic-security-roles) unless a caller injects a Detector (tests, other vocabs).
+        self.detector = detector if detector is not None else load_detector()
 
     # -- taint --------------------------------------------------------------------------
     def _seeds(self):
@@ -119,12 +112,12 @@ class LachesisGraph:
 
         out = []
         for sink_id, (label, sink_kind, is_tainted) in reached.items():
-            kind = SINK_KIND_BRIDGE.get(sink_kind)
+            kind = self.detector.bridge(sink_kind)
             if kind is None:
-                continue  # a sink role the substrate has no evaluator for yet
+                continue  # a sink role the catalog has no kind/evaluator for yet
             fact = substrate.substrate(kind, tainted=is_tainted,
                                        value_bound=None, guarded=False)
-            fired = substrate.evaluate(kind, fact)
+            fired = self.detector.evaluate(kind, fact)
             if fired:
                 out.append({"sink": sink_id, "label": label, "sink_kind": sink_kind,
                             "kind": kind, "evaluator": fired})
