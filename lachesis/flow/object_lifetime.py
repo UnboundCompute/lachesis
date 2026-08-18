@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Iterable
 
 from lachesis.nav.dataflow.ap_construct import APBuilder
@@ -375,6 +376,7 @@ class ObjectLifetimeResult:
 
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
     """Run object-identity lifetime analysis over all defined functions in ``functions``."""
+    started = perf_counter()
     sub = Substrate(store.index).load()
     norm = normalizer(lang)
     by_name = {}
@@ -393,6 +395,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
             cfg_failures[name] = "too-large" if cfg and cfg.get("bailed") else "no-cfg"
         else:
             cfgs[name] = cfg
+    cfg_seconds = perf_counter() - started
 
     # Absence means "no analyzable summary", not "proven to have no effects". That
     # distinction makes callers of a CFG failure take the conservative external-call
@@ -451,6 +454,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
                     queued.add(caller)
 
     leads = []
+    summary_seconds = perf_counter() - started - cfg_seconds
     diagnostics = {
         "functions": len(functions), "analyzed": 0, "cfg_failures": cfg_failures,
         "unplaced": 0, "unplaced_functions": {}, "capped": [],
@@ -458,6 +462,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
         "summary_analyses": sum(summary_runs.values()),
         "summary_recomputations": sum(max(0, count - 1) for count in summary_runs.values()),
         "summary_transfers": summary_transfers,
+        "cfg_seconds": round(cfg_seconds, 6),
+        "summary_seconds": round(summary_seconds, 6),
         "widenings": 0, "transfers": 0,
     }
     for name in sorted(functions):
@@ -502,5 +508,6 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
                 unsafe.add(caller)
                 queue.append(caller)
     diagnostics["unsafe_functions"] = sorted(unsafe)
+    diagnostics["total_seconds"] = round(perf_counter() - started, 6)
 
     return ObjectLifetimeResult(tuple(leads), summaries, diagnostics)
