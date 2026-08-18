@@ -360,7 +360,7 @@ class ReachingDef:
             return {"edges": [], "field_edges": [], "micro": st["micro"], "bailed": True}
         return self._emit_edges(st["nodes"], st["IN"], st["gen"])
 
-    def analyze(self, fn) -> Optional[Dict]:
+    def analyze(self, fn, *, reaching_defs=True) -> Optional[Dict]:
         """Intraprocedural CFG state for `fn`, the shared substrate the def->use edge
         emitter (and any def-site-keyed client such as a typestate pass) runs over:
 
@@ -372,6 +372,11 @@ class ReachingDef:
                                     prior def -- this is what makes reassignment reset
                                     a pointer's tracked state, generally, for free)
           IN/OUT node -> {def}      reaching-def sets at the fixpoint
+
+        ``reaching_defs=False`` returns after CFG synthesis with only
+        ``nodes/succ/params/root/micro``. Def-site clients use the full default;
+        object-state clients need control flow but not a second, unused dataflow
+        fixpoint.
 
         Returns None when the function has no analysable body; a dict with
         ``bailed=True`` (and ``micro``) when the body exceeds the micro-node cap."""
@@ -439,6 +444,10 @@ class ReachingDef:
                 f"L{ln}:{k}:{lab}" for ln, k, lab in seq))
         if len(nodes) > _MAX_MICRO:
             return {"bailed": True, "micro": len(nodes)}
+
+        if not reaching_defs:
+            return {"nodes": nodes, "succ": dict(succ), "params": params,
+                    "root": root, "micro": len(nodes)}
 
         pred: Dict[str, List[str]] = defaultdict(list)
         for a, ss in succ.items():

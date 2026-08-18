@@ -388,7 +388,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
     cfgs = {}
     cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}
     for name, function_id in by_name.items():
-        cfg = ReachingDef(sub).analyze(function_id)
+        cfg = ReachingDef(sub).analyze(function_id, reaching_defs=False)
         if cfg is None or cfg.get("bailed"):
             cfg_failures[name] = "too-large" if cfg and cfg.get("bailed") else "no-cfg"
         else:

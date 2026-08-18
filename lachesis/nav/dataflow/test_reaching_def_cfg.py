@@ -145,6 +145,17 @@ class ReachingDefCfgTests(unittest.TestCase):
         self.assertEqual(cfg["succ"]["entry"], ["decl"])
         self.assertEqual(cfg["succ"]["decl"], ["exit"])
 
+    def test_cfg_only_mode_skips_reaching_definition_fixpoint(self):
+        sub = self.fixture()
+        sub.add("call", "CallExpr", 10)
+        sub.child("root", "call")
+
+        cfg = ReachingDef(sub).analyze("fn", reaching_defs=False)
+
+        self.assertEqual(cfg["nodes"], ["entry", "call", "exit"])
+        self.assertNotIn("IN", cfg)
+        self.assertNotIn("gen", cfg)
+
 
 if __name__ == "__main__":
     unittest.main()
