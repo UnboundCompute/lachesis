@@ -1,0 +1,38 @@
+# Dogfood: run the Lachesis Action on this repo's own bundled fixture.
+# The fixture has a known guard differential, so a healthy run produces
+# 3 `error` + 3 `note` alerts in the Security tab — a deterministic smoke test.
+name: lachesis-selftest
+
+on:
+  workflow_dispatch:        # run on demand from the Actions tab
+  push:
+    branches: [main]        # establish the default-branch baseline (what the Security tab shows by default)
+  pull_request:
+    paths:
+      - "action/**"
+      - ".github/workflows/lachesis-selftest.yml"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to code scanning (same-repo only; fork PRs can't)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./action        # the copy on this branch, not a published tag
+        with:
+          # Scan the whole repo (Python + TypeScript + C), not just the fixture.
+          # Heavier than the fixture-only run and less deterministic, but this is
+          # the real dogfood: Lachesis analyzing its own source.
+          source: "."
+          # Light build. The export step now uses the batched `security-paths`
+          # query (one graph load for all findings), so --enrich is unnecessary:
+          # the single load folds the dataflow tier once anyway.
+          analyze-args: "--prune --incremental"
+          # Pin the engine to THIS branch so the install includes the batched
+          # `security-paths` command the exporter needs. Revert to "main" (the
+          # default) once this branch merges.
+          lachesis-ref: "feat/github-action"
+          fail-on: "none"                      # smoke test: never fail the check

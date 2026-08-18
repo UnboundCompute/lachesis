@@ -1,0 +1,100 @@
+name: "Lachesis security scan"
+description: "Build a Lachesis code graph and report source-to-sink security findings to GitHub code scanning (SARIF)."
+branding:
+  icon: "git-branch"
+  color: "purple"
+
+inputs:
+  source:
+    description: "Directory to analyze, relative to the repo root."
+    default: "."
+  lachesis-repo:
+    description: "Git URL to install Lachesis from (until the wheel is on PyPI)."
+    default: "https://github.com/UnboundCompute/lachesis"
+  lachesis-ref:
+    description: "Branch, tag, or SHA of Lachesis to install."
+    default: "main"
+  analyze-args:
+    description: "Extra flags passed to lachesis-analyze. Kept light by default."
+    default: "--prune --incremental"
+  sarif-file:
+    description: "Where to write the SARIF report."
+    default: "lachesis.sarif"
+  changed-files:
+    description: "Optional space/comma-separated list; when set, only findings in these files are reported."
+    default: ""
+  upload:
+    description: "Upload the SARIF to GitHub code scanning (needs security-events: write)."
+    default: "true"
+  fail-on:
+    description: "Fail the step if any finding is at this level or above: none | note | warning | error."
+    default: "none"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
+
+    - name: Set up Node
+      # Needed at analyze time: the TypeScript frontend runs under node.
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Install Lachesis (from source)
+      # Until lachesis-cpg is on PyPI, install from GitHub. The TypeScript compiler
+      # is a build artifact absent from the repo, so vendor it FIRST (a pure-Python
+      # fetch, no npm) — then it gets packaged into the install.
+      shell: bash
+      run: |
+        SRC="$RUNNER_TEMP/lachesis-src"
+        rm -rf "$SRC"
+        git clone "${{ inputs.lachesis-repo }}" "$SRC"           # full clone: ref may be a branch, tag, or SHA
+        git -C "$SRC" checkout "${{ inputs.lachesis-ref }}"
+        python3 -m pip install --upgrade pip
+        python3 "$SRC/tools/vendor_typescript.py"
+        python3 -m pip install "$SRC"
+
+    - name: Build graph
+      shell: bash
+      run: |
+        lachesis-analyze "${{ inputs.source }}" "$RUNNER_TEMP/lachesis.kuzu" ${{ inputs.analyze-args }}
+
+    - name: Export SARIF
+      shell: bash
+      run: |
+        ARGS=()
+        if [ -n "${{ inputs.changed-files }}" ]; then
+          ARGS+=(--changed-files "${{ inputs.changed-files }}")
+        fi
+        python3 "$GITHUB_ACTION_PATH/sarif_export.py" \
+          "$RUNNER_TEMP/lachesis.kuzu" \
+          --repo-root "$GITHUB_WORKSPACE" \
+          -o "${{ inputs.sarif-file }}" \
+          "${ARGS[@]}"
+
+    - name: Upload to code scanning
+      if: ${{ inputs.upload == 'true' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+
+    - name: Gate on findings
+      if: ${{ inputs.fail-on != 'none' }}
+      shell: bash
+      run: |
+        python3 - "${{ inputs.sarif-file }}" "${{ inputs.fail-on }}" <<'PY'
+        import json, sys
+        order = {"note": 1, "warning": 2, "error": 3}
+        sarif_file, threshold = sys.argv[1], sys.argv[2]
+        gate = order.get(threshold, 3)
+        results = json.load(open(sarif_file))["runs"][0]["results"]
+        hits = [r for r in results if order.get(r.get("level", "warning"), 2) >= gate]
+        if hits:
+            print(f"lachesis: {len(hits)} finding(s) at or above '{threshold}'")
+            sys.exit(1)
+        print(f"lachesis: no findings at or above '{threshold}'")
+        PY
