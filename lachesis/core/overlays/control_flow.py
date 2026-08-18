@@ -87,10 +87,26 @@ class ControlFlow:
             })
 
         def statement_children(node_id: str, owner_id: str) -> list[str]:
+            # A block's direct AST children ARE its statement sequence. Most are
+            # `statement` nodes, but an expression-statement (`free(p);`, `use(p);`,
+            # `x = f();`) is emitted by the frontends as a bare `call`/`expression`
+            # node, not wrapped in a `statement`. Adopt those too when the container is
+            # a block, so they enter control flow instead of being orphaned (without
+            # this, every bare call-statement has no CFG edge and typestate/reaching
+            # analyses never see the free/use). Gate on control_kind=='block' so we
+            # never pull a nested sub-expression (e.g. a DeclStmt's initializer call)
+            # into statement position.
+            in_block = (
+                index.nodes.get(node_id, {}).get("properties", {}).get("control_kind")
+                == "block"
+            )
             result = [
                 child["id"] for child, _properties in ast_children.get(node_id, [])
-                if child.get("kind") == "statement"
-                and child.get("properties", {}).get("owner_function_id") == owner_id
+                if child.get("properties", {}).get("owner_function_id") == owner_id
+                and (
+                    child.get("kind") == "statement"
+                    or (in_block and child.get("kind") in ("call", "expression"))
+                )
             ]
             return sorted(dict.fromkeys(result), key=position)
 
@@ -109,13 +125,30 @@ class ControlFlow:
                 node_id = children[-1]
             return node_id
 
+        def next_in_block(node_id: str, owner_id: str) -> list[str]:
+            # The statement immediately following node_id in its enclosing block,
+            # by source order. Used as a fallback when the frontend gives no explicit
+            # sequence edge -- which happens when the following sibling is a bare
+            # call/expression-statement the frontend omitted from EXECUTES_BEFORE.
+            # Without this, a container (if/for/...) whose next sibling is such a
+            # bare call has its merge routed straight to exit, orphaning the call.
+            parent = ast_parent.get(node_id)
+            if not parent:
+                return []
+            siblings = statement_children(parent, owner_id)
+            if node_id in siblings:
+                position_in_block = siblings.index(node_id)
+                return siblings[position_in_block + 1:position_in_block + 2]
+            return []
+
         def same_owner_successors(node_id: str, owner_id: str) -> list[str]:
-            return sorted((
+            explicit = sorted((
                 target for target in sequential.get(node_id, [])
                 if index.nodes.get(target, {}).get("properties", {}).get(
                     "owner_function_id"
                 ) == owner_id
             ), key=position)
+            return explicit or next_in_block(node_id, owner_id)
 
         # Bucket statements by owner ONCE (was O(functions x statements) = O(files^2)).
         statements_by_function: dict[str, list[dict]] = defaultdict(list)
