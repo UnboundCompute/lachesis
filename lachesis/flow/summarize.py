@@ -21,6 +21,7 @@ import json
 from .order import load as load_order, build_order
 from . import atropos
 from .normalize import normalizer
+from .translate import _freed_identity
 
 
 def sink_id(callee, pos):
@@ -165,6 +166,16 @@ def summarize_one(name, F, summaries):
         for call in fn["calls"]:
             for a in call["args"]:
                 if a.get("root") != v:
+                    continue
+                # object AS WRITTEN, not the base pointer: passing `&v->field` (or `v->field`,
+                # `v[i]`, `*v`) to a callee that frees its formal frees the SUB-OBJECT, not `v`.
+                # The splice below keys the callee's lifetime effects onto `v`'s stream; without
+                # this guard a helper freeing `&data->meta_hash` lands a phantom free on `data`
+                # itself -- the interprocedural form of the C destructor-idiom double-free
+                # (free the members via helpers, then free the container). This is the same
+                # "object as written" rule the local free emission already applies; a sub-object
+                # of `v` belongs to its own lifetime, so it must not contribute to `v`'s stream.
+                if _freed_identity(a) != v:
                     continue
                 sub = callee_param_stream(call, a)
                 if sub:                                    # splice the callee's effects
