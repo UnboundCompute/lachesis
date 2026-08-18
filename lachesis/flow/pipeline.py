@@ -5,6 +5,7 @@ One call returns the full bundle so callers (the CLI in walk.py, the MCP tool) s
 single code path: translate -> traverse+order+summarise -> skeletons -> shape leads.
 """
 import os
+from time import perf_counter
 
 from .translate import build_F
 from .skeleton import build_skeletons, _summaries_for
@@ -86,7 +87,9 @@ def run_pass(store, lang="c", lifetime_engine=None):
     bounded legacy differential and coverage diagnostics; functions with no complete
     object analysis retain legacy leads. Set ``LACHESIS_LIFETIME_ENGINE=shadow`` to run
     both without changing output, or ``legacy`` for an operational rollback."""
+    started = perf_counter()
     store.ensure_dataflow_tier()
+    tier_done = perf_counter()
     requested = lifetime_engine or os.environ.get(
         "LACHESIS_LIFETIME_ENGINE", _DEFAULT_LIFETIME_ENGINE)
     if requested not in {"legacy", "shadow", "object"}:
@@ -98,8 +101,11 @@ def run_pass(store, lang="c", lifetime_engine=None):
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
+    projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
+    legacy_summaries_done = perf_counter()
     skeletons = build_skeletons(F, summaries, lang=lang)
+    skeletons_done = perf_counter()
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
     legacy_leads = None
@@ -137,5 +143,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
     else:
         legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
         leads = legacy_leads
+    finished = perf_counter()
+    timings = {
+        "dataflow_tier_seconds": round(tier_done - started, 6),
+        "projection_seconds": round(projection_done - tier_done, 6),
+        "legacy_summary_seconds": round(legacy_summaries_done - projection_done, 6),
+        "skeleton_seconds": round(skeletons_done - legacy_summaries_done, 6),
+        "matching_seconds": round(finished - skeletons_done, 6),
+        "total_seconds": round(finished - started, 6),
+    }
     return {"F": F, "succ": succ, "summaries": summaries,
-            "skeletons": skeletons, "leads": leads, "lifetime": lifetime}
+            "skeletons": skeletons, "leads": leads, "lifetime": lifetime,
+            "timings": timings}
