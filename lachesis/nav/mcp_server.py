@@ -773,6 +773,7 @@ def call_tool(name, args, format=None):
         from lachesis.detect.catalog import DetectionCatalogUnavailable
         try:
             rep = detect_report(bundle["stamped"], summary,
+                                registry=bundle["registry"],
                                 evaluator=args.get("evaluator"), kind=args.get("kind"))
         except DetectionCatalogUnavailable as exc:
             return _emit(name, {"move": "detect", "applied": False, "reason": str(exc),

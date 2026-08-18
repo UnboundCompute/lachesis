@@ -104,25 +104,48 @@ def fixture_graph():
 
 class SubstrateTest(unittest.TestCase):
     def test_reachability_is_taint_alone(self):
-        f = lambda t: substrate.substrate("x", tainted=t, value_bound=None, guarded=False)
+        f = lambda t: substrate.substrate("x", tainted=t, value_bound=None)
         self.assertTrue(substrate.EVALUATORS["reachability"](f(True)))
         self.assertFalse(substrate.EVALUATORS["reachability"](f(False)))
 
     def test_relational_needs_taint_and_unbounded(self):
-        def f(t, b):
-            return substrate.substrate("x", tainted=t, value_bound=b, guarded=False)
+        def f(t, b, g=None):
+            return substrate.substrate("x", tainted=t, value_bound=b, guard=g)
         ev = substrate.EVALUATORS["relational"]
         self.assertTrue(ev(f(True, "unbounded")))
         self.assertFalse(ev(f(True, "bounded")))   # bounded length is normal
         self.assertFalse(ev(f(True, None)))        # no capacity evidence -> no lead
         self.assertFalse(ev(f(False, "unbounded")))  # unbounded constant is normal
+        # a copy inside a size-testing branch is checked -> suppressed even if unbounded
+        self.assertFalse(ev(f(True, "unbounded", "guarded-region")))
+        # fall-through / none-observed do not suppress the size lead
+        self.assertTrue(ev(f(True, "unbounded", "fall-through")))
 
     def test_presence_ignores_taint(self):
         ev = substrate.EVALUATORS["presence"]
-        self.assertTrue(ev(substrate.substrate("x", False, None, False)))
+        self.assertTrue(ev(substrate.substrate("x", False, None)))
 
-    def test_evaluate_returns_none_for_unrecipe_kind(self):
-        self.assertIsNone(substrate.evaluate("unknown-kind", {"tainted": True}, RECIPE))
+    def test_missing_guard_fires_on_fall_through_only(self):
+        ev = substrate.EVALUATORS["missing-guard"]
+        # taint-independent: fires purely on the fall-through control-flow shape
+        self.assertTrue(ev(substrate.substrate("x", False, None, guard="fall-through")))
+        self.assertFalse(ev(substrate.substrate("x", True, "unbounded", guard="guarded-region")))
+        self.assertFalse(ev(substrate.substrate("x", True, "unbounded", guard="none-observed")))
+        self.assertFalse(ev(substrate.substrate("x", True, "unbounded", guard=None)))
+
+    def test_evaluate_returns_empty_for_unrecipe_kind(self):
+        self.assertEqual(substrate.evaluate("unknown-kind", {"tainted": True}, RECIPE), [])
+
+    def test_evaluate_returns_list_of_fired_evaluators(self):
+        # a list-valued recipe fires several patterns for one occurrence
+        recipe = {"mem": ["relational", "missing-guard"]}
+        both = substrate.substrate("mem", tainted=True, value_bound="unbounded",
+                                   guard="fall-through")
+        self.assertEqual(set(substrate.evaluate("mem", both, recipe)),
+                         {"relational", "missing-guard"})
+        # only relational fires when there is no fall-through
+        only_rel = substrate.substrate("mem", tainted=True, value_bound="unbounded")
+        self.assertEqual(substrate.evaluate("mem", only_rel, recipe), ["relational"])
 
 
 class CapacityBoundsTest(unittest.TestCase):

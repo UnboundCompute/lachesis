@@ -29,6 +29,7 @@ import collections
 
 from lachesis.detect import substrate
 from lachesis.detect.capacity import capacity_bounds
+from lachesis.detect.guards import guard_status
 from lachesis.detect.catalog import DetectionCatalogUnavailable, load_detector
 
 
@@ -45,7 +46,7 @@ _FLOW_EDGES = ("VALUE_FLOWS_TO", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE", "T
 class LachesisGraph:
     """A detection view over one materialized (optionally atropos-enriched) graph dict."""
 
-    def __init__(self, graph, bind_summary=None, detector=None):
+    def __init__(self, graph, bind_summary=None, detector=None, registry=None):
         self.graph = graph
         self.nodes = graph.get("nodes", ())
         self.by_id = {n["id"]: n for n in self.nodes}
@@ -58,6 +59,9 @@ class LachesisGraph:
         # value_id -> value_bound, delegated whole to the planner's capacity proof. Empty
         # when the graph carries no atropos-model memory sinks (no relational evidence).
         self._bounds = capacity_bounds(graph, bind_summary)
+        # value_id -> guard dominance status, delegated to the planner's control-region
+        # analysis (reusing a prebuilt registry when the caller holds one, else building).
+        self._guards = guard_status(graph, bind_summary, registry=registry)
 
     @classmethod
     def from_store(cls, store_dir, detector=None):
@@ -157,9 +161,10 @@ class LachesisGraph:
             kind = self.detector.bridge(sink_kind)
             if kind is None:
                 continue  # a role the catalog has no kind for yet
-            fact = substrate.substrate(kind, tainted=is_tainted, value_bound=None, guarded=False)
-            fired = self.detector.evaluate(kind, fact)
-            if fired:
+            # A role sink names no single obligation value, so it carries no capacity or
+            # guard evidence -- only its reachability class applies.
+            fact = substrate.substrate(kind, tainted=is_tainted, value_bound=None, guard=None)
+            for fired in self.detector.evaluate(kind, fact):
                 out.append({"sink": sink_id, "label": label, "sink_kind": sink_kind,
                             "kind": kind, "evaluator": fired, "location": None,
                             "vocabulary": "generic-security-roles"})
@@ -198,15 +203,19 @@ class LachesisGraph:
                 kind,
                 tainted=value_id in tainted,
                 value_bound=self._bounds.get(value_id),
-                guarded=False,
+                guard=self._guards.get(value_id),
             )
             fired = self.detector.evaluate(kind, fact)
-            if fired:
-                site, location = self._site(props.get("callsite_id"))
+            if not fired:
+                continue
+            site, location = self._site(props.get("callsite_id"))
+            # A kind mapped to several evaluators yields one lead per fired pattern -- a
+            # memory copy can be both a `relational` and a `missing-guard` lead at once.
+            for ev in fired:
                 out.append({"sink": node["id"], "label": site or node.get("label"),
-                            "sink_kind": kind, "kind": kind, "evaluator": fired,
+                            "sink_kind": kind, "kind": kind, "evaluator": ev,
                             "location": location, "value_id": value_id,
-                            "vocabulary": "atropos-model"})
+                            "guard": fact["guard"], "vocabulary": "atropos-model"})
         return out
 
     # -- leads --------------------------------------------------------------------------
@@ -226,18 +235,19 @@ class LachesisGraph:
                 + self._model_leads(model_sinks, tainted))
 
 
-def report(graph, bind_summary=None, detector=None, evaluator=None, kind=None):
+def report(graph, bind_summary=None, detector=None, evaluator=None, kind=None, registry=None):
     """A grouped lead report over one materialized+enriched graph, for a tool surface.
 
     Returns ``{census, leads}``: the census counts every fired lead by evaluator and by
     kind (over the WHOLE graph, never the filtered view, so coverage is honest), while
     ``leads`` is the rows, optionally narrowed to one ``evaluator`` or ``kind``. Callers
     that already hold a stamped graph (the MCP server reuses the candidate bundle's) pass
-    it in, so the expensive materialize+enrich happens once.
+    it in, so the expensive materialize+enrich happens once; passing the bundle's enumerated
+    ``registry`` too lets the guard/capacity seams read cached candidates without re-running.
     """
     import collections
 
-    all_leads = LachesisGraph(graph, bind_summary, detector=detector).leads()
+    all_leads = LachesisGraph(graph, bind_summary, detector=detector, registry=registry).leads()
     by_ev = collections.Counter(ld["evaluator"] for ld in all_leads)
     by_kind = collections.Counter(ld["kind"] for ld in all_leads)
     rows = all_leads
