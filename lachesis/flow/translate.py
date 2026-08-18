@@ -322,11 +322,18 @@ def build_F(store, lang="c", *, return_graph=False):
 
     Reproduces order.load's return so the pass is input-source agnostic. Taxonomy /
     caller / source classification is the same class rule the old parser used."""
-    ix = store.index
+    source_ix = store.index
     # Disk-backed stores need a columnar materialization for BranchRegions. Tests and
     # embedding callers can supply an already-materialized in-memory GraphStore; do not
     # assume its GraphIndex has Kuzu's private connection surface.
-    graph = store.graph if store.graph is not None else materialize_graph(ix)
+    graph = (store.graph if store.graph is not None
+             else materialize_graph(source_ix))
+    # Once a disk graph has been materialized, keep the complete projection on its
+    # in-memory index.  Continuing to use ``source_ix`` here turned every helper in
+    # ``_walk_function`` into another Kuzu query for each of thousands of functions.
+    # The graph is a faithful snapshot taken after ensure_dataflow_tier(), so these
+    # indexes have the same semantics and radically different access costs.
+    ix = source_ix if store.graph is not None else GraphStore(graph).index
     regions = BranchRegions(graph)
     nest = ControlNesting(graph)                   # loop/branch nesting from AST containment
     sinks = atropos.sink_catalog(lang)
