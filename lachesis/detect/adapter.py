@@ -161,8 +161,24 @@ class LachesisGraph:
             fired = self.detector.evaluate(kind, fact)
             if fired:
                 out.append({"sink": sink_id, "label": label, "sink_kind": sink_kind,
-                            "kind": kind, "evaluator": fired, "vocabulary": "generic-security-roles"})
+                            "kind": kind, "evaluator": fired, "location": None,
+                            "vocabulary": "generic-security-roles"})
         return out
+
+    def _site(self, callsite_id):
+        """The (call expression, ``file:line``) of a callsite, for an actionable lead.
+
+        The atropos-model sink's own label is just its role name; the callsite it marks
+        carries the faithful call spelling and location, so a lead points at real source.
+        """
+        call = self.by_id.get(callsite_id or "")
+        if not call:
+            return None, None
+        props = call.get("properties") or {}
+        loc_file = props.get("absolute_file") or props.get("file")
+        line = props.get("start_line")
+        location = f"{loc_file}:{line}" if loc_file and line is not None else loc_file
+        return call.get("label"), location
 
     # -- atropos-model sinks (reachability + relational + presence) ----------------------
     def _model_leads(self, sink_nodes, tainted):
@@ -186,8 +202,10 @@ class LachesisGraph:
             )
             fired = self.detector.evaluate(kind, fact)
             if fired:
-                out.append({"sink": node["id"], "label": node.get("label"), "sink_kind": kind,
-                            "kind": kind, "evaluator": fired, "vocabulary": "atropos-model"})
+                site, location = self._site(props.get("callsite_id"))
+                out.append({"sink": node["id"], "label": site or node.get("label"),
+                            "sink_kind": kind, "kind": kind, "evaluator": fired,
+                            "location": location, "vocabulary": "atropos-model"})
         return out
 
     # -- leads --------------------------------------------------------------------------
