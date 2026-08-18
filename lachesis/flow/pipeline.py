@@ -87,20 +87,26 @@ def run_pass(store, lang="c", lifetime_engine=None):
     object analysis retain legacy leads. Set ``LACHESIS_LIFETIME_ENGINE=shadow`` to run
     both without changing output, or ``legacy`` for an operational rollback."""
     store.ensure_dataflow_tier()
-    F, succ = build_F(store, lang=lang)
-    summaries = _summaries_for(F, succ)
-    skeletons = build_skeletons(F, summaries, lang=lang)
     requested = lifetime_engine or os.environ.get(
         "LACHESIS_LIFETIME_ENGINE", _DEFAULT_LIFETIME_ENGINE)
     if requested not in {"legacy", "shadow", "object"}:
         raise ValueError(
             "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")
+    object_requested = lang.lower() == "c" and requested != "legacy"
+    if object_requested:
+        F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
+    else:
+        F, succ = build_F(store, lang=lang)
+        analysis_graph = None
+    summaries = _summaries_for(F, succ)
+    skeletons = build_skeletons(F, summaries, lang=lang)
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
     legacy_leads = None
     leads = []
-    if lang.lower() == "c" and requested != "legacy":
-        object_result = analyze_object_lifetimes(store, F, succ, lang=lang)
+    if object_requested:
+        object_result = analyze_object_lifetimes(
+            store, F, succ, lang=lang, graph=analysis_graph)
         diagnostics = object_result.diagnostics
         unsafe = set(diagnostics.get("unsafe_functions", ()))
         covered = set(F) - unsafe

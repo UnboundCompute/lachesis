@@ -317,7 +317,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             "assigns": assigns, "returns": returns, "callees": callees}
 
 
-def build_F(store, lang="c"):
+def build_F(store, lang="c", *, return_graph=False):
     """Build the whole-graph F dict + succ (callee-edge) map from an enriched store.
 
     Reproduces order.load's return so the pass is input-source agnostic. Taxonomy /
@@ -393,7 +393,7 @@ def build_F(store, lang="c"):
         }
 
     succ = {n: [c for c in F[n]["udf_callees"] if c in F] for n in F}
-    return F, succ
+    return (F, succ, graph) if return_graph else (F, succ)
 
 
 def load_graph(path, lang="c"):

@@ -363,16 +363,21 @@ class ObjectLifetimeResult:
     diagnostics: dict
 
 
-def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
+def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None):
     """Run object-identity lifetime analysis over all defined functions in ``functions``."""
     started = perf_counter()
-    sub = Substrate(store.index).load().load_initializers()
+    if graph is not None and graph is not store.graph:
+        from lachesis.nav.graph_store import GraphStore
+        analysis_store = GraphStore(graph)
+    else:
+        analysis_store = store
+    sub = Substrate(analysis_store.index).load().load_initializers()
     norm = normalizer(lang)
     function_node_ids = [node_id for kind in ("function", "method", "constructor")
-                         for node_id in getattr(store.index, "by_kind", {}).get(kind, ())]
+                         for node_id in getattr(analysis_store.index, "by_kind", {}).get(kind, ())]
     sub.warm_nodes(function_node_ids)
     by_name = {}
-    for node in store.index.nodes_of_kind("function", "method", "constructor"):
+    for node in analysis_store.index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
             continue
         name = node.get("label")
