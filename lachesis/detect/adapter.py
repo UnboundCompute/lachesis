@@ -30,11 +30,18 @@ from lachesis.detect.catalog import load_detector
 # DATA in the atropos catalog (detection/sink-roles.json), loaded via `load_detector`;
 # supporting another front-end vocabulary is a new file there, not a change here.
 
-# The forward edges the interprocedural taint flood walks from a source-marked parameter:
-#   VALUE_FLOWS_TO            intra-procedural value flow (assignment, use)
-#   ARGUMENT_BINDS_PARAMETER  actual argument -> callee formal (taint crosses a call in)
-#   RETURNS_VALUE             return value flow (taint crosses a call out)
-_FLOW_EDGES = ("VALUE_FLOWS_TO", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE")
+# The forward edges the interprocedural taint flood walks from a source-marked parameter.
+# Two front-ends encode taint flow differently, so the flood unions both encodings -- a
+# union of sound taint edges is still sound, and each graph populates the ones it uses:
+#   VALUE_FLOWS_TO            intra-procedural value flow (assignment, use)  [C computes]
+#   ARGUMENT_BINDS_PARAMETER  actual argument -> callee formal (taint crosses in) [C]
+#   RETURNS_VALUE             return value flow (taint crosses a call out)   [C]
+#   TAINT_FLOWS_TO            the front-end's own taint relation             [Python seeds]
+# The C export leaves TAINT_FLOWS_TO unseeded from the source catalog, so reachability is
+# COMPUTED from the first three; the Python export seeds TAINT_FLOWS_TO directly and leaves
+# the argument-binding edges as EDGE-kinds the first three don't fully cover. Unioning
+# reaches curl's C sinks and flask's/requests' Python sinks with one code path.
+_FLOW_EDGES = ("VALUE_FLOWS_TO", "ARGUMENT_BINDS_PARAMETER", "RETURNS_VALUE", "TAINT_FLOWS_TO")
 
 
 class LachesisGraph:
@@ -73,23 +80,58 @@ class LachesisGraph:
 
     # -- sinks --------------------------------------------------------------------------
     def _sink_arguments(self):
-        """Map each sink-call argument expression to (sink_id, sink_label, sink_kind).
+        """Map each sink argument expression to (sink_id, sink_label, sink_kind).
 
-        sink -[TAINT_SINK]-> call ; call -[HAS_ARGUMENT]-> argument-expression.
+        A `sink -[TAINT_SINK]-> target` edge lands on a node whose shape depends on the
+        front-end, so both are handled:
+
+          * C shape -- the target is a `call` node; its arguments are the HAS_ARGUMENT
+            children (`call -[HAS_ARGUMENT]-> argument-expression`).
+          * Python shape -- the target IS the argument `value` node; taint may arrive one
+            intra-procedural hop upstream, so its VALUE_FLOWS_TO predecessors count as the
+            argument too.
+
+        A `call-value` target is treated as both. Each argument node inherits its sink's
+        id/label/kind; the flood need only touch any one of a sink's arguments.
         """
         sink_node = {s["id"]: s for s in self.index.nodes_of_kind("sink")}
-        call_to_sink = {}
+
+        # sink target node -> the sink that marks it, plus that target's node kind.
+        target_sink = {}
         for e in self.index.flow_edges(["TAINT_SINK"]):
             s = sink_node.get(e["source"])
             if s is not None:
-                call_to_sink[e["target"]] = s
-        args = {}
-        for e in self.index.flow_edges(["HAS_ARGUMENT"]):
-            s = call_to_sink.get(e["source"])
-            if s is None:
-                continue
+                target_sink[e["target"]] = s
+        target_kind = {}
+        for tid in target_sink:
+            n = self.index._node(tid)
+            target_kind[tid] = n.get("kind") if n else None
+
+        call_targets = {t for t, k in target_kind.items() if k in ("call", "call-value")}
+        value_targets = {t for t, k in target_kind.items() if k in ("value", "call-value")}
+
+        def tag(s):
             props = s.get("properties", {}) or {}
-            args[e["target"]] = (s["id"], s.get("label"), props.get("sink_kind"))
+            return (s["id"], s.get("label"), props.get("sink_kind"))
+
+        args = {}
+        # C shape: call -> HAS_ARGUMENT -> argument expression.
+        for e in self.index.flow_edges(["HAS_ARGUMENT"]):
+            s = target_sink.get(e["source"])
+            if s is not None:
+                args[e["target"]] = tag(s)
+        # Python shape: the value target itself is the argument expression.
+        for t in value_targets:
+            args[t] = tag(target_sink[t])
+        # Python shape: taint may reach one intra-procedural hop upstream of the value.
+        if value_targets:
+            pred = collections.defaultdict(set)
+            for e in self.index.flow_edges(["VALUE_FLOWS_TO"]):
+                if e["target"] in value_targets:
+                    pred[e["target"]].add(e["source"])
+            for t in value_targets:
+                for p in pred.get(t, ()):
+                    args.setdefault(p, tag(target_sink[t]))
         return args
 
     # -- leads --------------------------------------------------------------------------
