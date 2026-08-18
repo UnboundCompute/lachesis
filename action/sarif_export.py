@@ -29,6 +29,7 @@ Design notes for the next pass (kept deliberately simple for v1):
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import subprocess
@@ -214,6 +215,7 @@ def build_sarif(
     query_cmd: List[str],
     repo_root: Optional[str],
     changed: Optional[set],
+    excluded: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     used_rules: Dict[str, Dict[str, str]] = {}
@@ -221,10 +223,11 @@ def build_sarif(
         res = build_result(entry["pq"], entry["detail"], repo_root)
         if res is None:
             continue
-        if changed is not None:
-            uri = res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
-            if uri not in changed:
-                continue
+        uri = res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        if changed is not None and uri not in changed:
+            continue
+        if is_excluded(uri, excluded):
+            continue
         results.append(res)
         for meta in RULES.values():
             if meta["id"] == res["ruleId"]:
@@ -267,6 +270,29 @@ def load_changed(args: argparse.Namespace) -> Optional[set]:
     return {p.replace(os.sep, "/").lstrip("./") for p in raw if p.strip()}
 
 
+def load_excluded(args: argparse.Namespace) -> List[str]:
+    """Normalize the --exclude patterns to repo-root-relative POSIX form."""
+    raw: List[str] = []
+    for chunk in args.exclude or []:
+        raw.extend(chunk.replace(",", " ").split())
+    return [p.replace(os.sep, "/").lstrip("./").rstrip("/") for p in raw if p.strip()]
+
+
+def is_excluded(uri: str, patterns: Optional[List[str]]) -> bool:
+    """True if a finding's file uri sits under, equals, or globs an excluded path.
+
+    A bare directory (``a/b/fixtures``) drops everything beneath it; a glob
+    (``**/fixtures/**``, ``*.min.js``) is matched with fnmatch. This is a report
+    filter — the excluded code is still analyzed, its findings just aren't emitted.
+    """
+    if not patterns:
+        return False
+    for pat in patterns:
+        if uri == pat or uri.startswith(pat + "/") or fnmatch.fnmatch(uri, pat):
+            return True
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Render Lachesis security findings as SARIF 2.1.0.")
     ap.add_argument("graph", help="path to the .kuzu store built by lachesis-analyze")
@@ -278,11 +304,15 @@ def main() -> int:
     ap.add_argument("--changed-files", action="append",
                     help="only report findings in these files (repeatable / comma-separated)")
     ap.add_argument("--changed-from-file", help="read the changed-file list from this path")
+    ap.add_argument("--exclude", action="append",
+                    help="drop findings under these paths/globs, e.g. a fixtures or "
+                         "vendor dir (repeatable / comma-separated)")
     args = ap.parse_args()
 
     query_cmd = args.query_cmd.split()
     changed = load_changed(args)
-    sarif = build_sarif(args.graph, query_cmd, args.repo_root, changed)
+    excluded = load_excluded(args)
+    sarif = build_sarif(args.graph, query_cmd, args.repo_root, changed, excluded)
 
     text = json.dumps(sarif, indent=2)
     n = len(sarif["runs"][0]["results"])
