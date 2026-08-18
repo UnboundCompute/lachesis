@@ -19,6 +19,7 @@ A match is a LEAD, never a verdict -- provenance still has to be adjudicated aga
 """
 import argparse
 import json
+import os
 from collections import deque
 
 from .patterns import substrate, evaluate
@@ -209,7 +210,19 @@ def main():
     ap.add_argument("--graph", required=True)
     ap.add_argument("--lang", default="c")
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--workers", type=int, default=None,
+        help="object-summary worker processes (default: up to 4; env: "
+             "LACHESIS_LIFETIME_WORKERS)")
     args = ap.parse_args()
+
+    # This module's entrypoint is protected by the __main__ guard, so Python's spawn
+    # workers are safe here. The lower-level library API remains single-process unless
+    # its embedding application explicitly supplies the same environment setting.
+    if args.workers is not None:
+        os.environ["LACHESIS_LIFETIME_WORKERS"] = str(args.workers)
+    elif "LACHESIS_LIFETIME_WORKERS" not in os.environ:
+        os.environ["LACHESIS_LIFETIME_WORKERS"] = str(min(4, os.cpu_count() or 1))
 
     # Keep the CLI on the same entrypoint as MCP. Calling match_all directly here used
     # to bypass object identity and silently report legacy name-keyed results.

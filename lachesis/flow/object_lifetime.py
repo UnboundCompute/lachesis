@@ -400,16 +400,27 @@ def _schedule_levels(schedule, call_successors):
             for callee in call_successors.get(caller, ())
             if callee in owner and owner[callee] != index
         }
-    levels = {}
-
-    def level(index):
-        if index not in levels:
-            levels[index] = 1 + max((level(dep) for dep in dependencies[index]), default=-1)
-        return levels[index]
-
+    callers = defaultdict(set)
+    for index, deps in dependencies.items():
+        for dep in deps:
+            callers[dep].add(index)
+    remaining = {index: len(deps) for index, deps in dependencies.items()}
+    ready = deque(sorted(index for index, count in remaining.items() if count == 0))
+    levels = {index: 0 for index in ready}
+    visited = 0
+    while ready:
+        index = ready.popleft()
+        visited += 1
+        for caller in sorted(callers.get(index, ())):
+            levels[caller] = max(levels.get(caller, 0), levels[index] + 1)
+            remaining[caller] -= 1
+            if remaining[caller] == 0:
+                ready.append(caller)
+    if visited != len(schedule):
+        raise ValueError("SCC condensation schedule unexpectedly contains a cycle")
     waves = defaultdict(list)
     for index in range(len(schedule)):
-        waves[level(index)].append(schedule[index])
+        waves[levels[index]].append(schedule[index])
     return [waves[index] for index in sorted(waves)]
 
 
