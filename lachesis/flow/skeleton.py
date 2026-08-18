@@ -53,6 +53,21 @@ def _kind_of(callee, pos, catalog):
     return (e.get("kinds") or {}).get(pos) or e.get("family")
 
 
+def _attach_site_facts(tok, call):
+    """Fold the call-site substrate translate resolved (loop/branch nesting, the size operand,
+    the destination identity) onto a sink token, so a shape rule can key on structure and size
+    without re-reading the graph. Absent facts are simply omitted -- an unenriched call (e.g. an
+    interprocedural sink reached in a callee) carries none, and the matcher reads what is there."""
+    if not call:
+        return
+    if call.get("control"):
+        tok["control"] = call["control"]
+    if call.get("size_expr") is not None:
+        tok["size_expr"] = call["size_expr"]
+    if call.get("dst") is not None:
+        tok["dst"] = call["dst"]
+
+
 # --- call-site resolution (map an actual arg to the callee's formal) --------------
 def _find_call(fn_rec, callee, root):
     """First call in fn to `callee` carrying an arg rooted at `root` (fallback: any call to it)."""
@@ -95,9 +110,11 @@ def _expand_reach(fn, flow, F, summaries, catalog, depth, guarded_acc, chain):
         bound = None
         if KIND_EVALUATOR.get(kind) == "relational":       # size sink: the guard IS the bound
             bound = "bounded" if guarded else "unbounded"
-        toks.append({"t": "sink", "family": kind, "callee": callee, "arg": pos,
-                     "var": flow.get("value"), "tainted": flow.get("provenance") != "const",
-                     "bound": bound, "guarded": guarded, "depth": depth})
+        tok = {"t": "sink", "family": kind, "callee": callee, "arg": pos,
+               "var": flow.get("value"), "tainted": flow.get("provenance") != "const",
+               "bound": bound, "guarded": guarded, "depth": depth}
+        _attach_site_facts(tok, call)                       # control nesting, size_expr, dst
+        toks.append(tok)
         return toks, True
 
     via = flow["via"]
@@ -194,8 +211,11 @@ def render_text(skel):
             b = f" bound={t['bound']}" if t["bound"] else ""
             tt = " tainted" if t["tainted"] else ""
             trunc = " ~truncated" if t.get("truncated") else ""
+            ctrl = f" under[{'>'.join(t['control'])}]" if t.get("control") else ""
+            sz = f" size={t['size_expr']}" if t.get("size_expr") is not None else ""
+            dst = f" dst={t['dst']}" if t.get("dst") is not None else ""
             lines.append(f"{pad}sink {t['family']} {t['callee']}#{t['arg']} "
-                         f"var={t['var']}{tt}{b} {g}{trunc}")
+                         f"var={t['var']}{tt}{b} {g}{ctrl}{sz}{dst}{trunc}")
         else:                                            # lifecycle
             ln = f"@{t['line']}" if t.get("line") is not None else ""
             lines.append(f"{pad}{t['t']} {t['var']}{ln}")

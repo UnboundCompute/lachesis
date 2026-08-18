@@ -36,6 +36,7 @@ Known gaps vs the old clang parser (honest, not silent):
 """
 import argparse
 import json
+import re
 
 from lachesis.nav.graph_store import GraphStore
 from lachesis.nav.kuzu_index import materialize_graph
@@ -71,6 +72,57 @@ def _prov(kind):
     if kind == "property":
         return "field"
     return "local"
+
+
+# --- intra-function control nesting ----------------------------------------------
+# Loop/branch keywords a rule keys on. `else` is folded into `if` -- an else arm is the
+# same branch construct, and the enclosing `if (...) {...} else {...}` statement already
+# carries the `if` head, so the arm needs no separate token.
+_CONTROL_KW = {"if", "for", "while", "switch", "do"}
+
+
+def _leading_control(label):
+    """The control keyword a statement node opens with (`for (...) {...}` -> 'for'), or None.
+    A plain statement (`char *buf = ...;`) or a bare block (`{ ... }`) returns None."""
+    if not label:
+        return None
+    m = re.match(r"\s*([A-Za-z_]\w*)", label)
+    kw = m.group(1) if m else None
+    if kw == "else":
+        return "if"
+    return kw if kw in _CONTROL_KW else None
+
+
+class ControlNesting:
+    """The ordered loop/branch structure enclosing a call, from AST containment.
+
+    The C frontend's ``cfg-condition`` nodes carry the control keyword but no source span, and
+    the loop-body region edge (``LOOP_TRUE``) is not always emitted -- so region containment
+    cannot place a call inside its loop. The AST does: a call's ``AST_CHILD`` parent chain runs
+    up through the ``statement`` nodes that enclose it, and those DO carry spans and the full
+    control text. We read each enclosing statement's leading keyword; that is the nesting."""
+
+    def __init__(self, graph):
+        self._by_id = {n["id"]: n for n in graph.get("nodes", ())}
+        self._parent = {}
+        for e in graph.get("edges", ()):
+            if e.get("kind") == "AST_CHILD":
+                self._parent[e["target"]] = e["source"]   # child -> parent
+
+    def enclosing(self, node_id):
+        """Ordered control kinds around ``node_id``, outermost first (``['for']`` for a copy
+        nested one loop deep). Empty when the call sits at function top level."""
+        kinds, cur, seen = [], node_id, set()
+        while cur in self._parent and cur not in seen:
+            seen.add(cur)
+            cur = self._parent[cur]
+            n = self._by_id.get(cur)
+            if n and n.get("kind") == "statement":
+                kw = _leading_control(n.get("label"))
+                if kw:
+                    kinds.append(kw)
+        kinds.reverse()                                    # outermost -> innermost
+        return kinds
 
 
 def _assigned_var(ix, call_id):
@@ -156,7 +208,7 @@ def _returns(ix, fid, alloc_vars, params, norm):
     return out
 
 
-def _walk_function(ix, regions, sinks, norm, fnode):
+def _walk_function(ix, regions, nest, sinks, norm, fnode):
     """Reconstruct one function's F IR from its owned graph nodes.
 
     Callee names are canonicalized through `norm` (the Atropos form oracle) as they leave the
@@ -177,17 +229,26 @@ def _walk_function(ix, regions, sinks, norm, fnode):
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
         cat = sinks.get(callee)
+        # the allocated pointer (alloc dst) is the call result's assignment target
+        alloc_dst = _assigned_var(ix, c["id"]) if norm.is_alloc(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
-               "is_sink": cat is not None}
+               "is_sink": cat is not None,
+               "control": nest.enclosing(c["id"])}          # loop/branch nesting, outer->inner
         if cat is not None:
-            rec["sink"] = {"size_arg": cat.get("size_arg")}
+            size_arg = cat.get("size_arg")
+            rec["sink"] = {"size_arg": size_arg}
+            # the size/length operand as written (the arg at the size position), so a rule can
+            # compare an alloc's size against a copy's size on the same path
+            sa = next((a for a in args if a.get("pos") == size_arg), None) if size_arg is not None else None
+            rec["size_expr"] = sa.get("value") if sa else None
+            # the destination the sink writes/allocates -- the identity a two-node shape joins on
+            # (alloc: the pointer the result is assigned to; copy/write: the first argument)
+            rec["dst"] = alloc_dst if norm.is_alloc(callee) else (args[0].get("value") if args else None)
         calls.append(rec)
 
-        if norm.is_alloc(callee):
-            var = _assigned_var(ix, c["id"])
-            if var:
-                events.append({"kind": "alloc", "var": var, "line": line})
-                assigns.append({"var": var, "callee": callee, "line": line})
+        if alloc_dst:
+            events.append({"kind": "alloc", "var": alloc_dst, "line": line})
+            assigns.append({"var": alloc_dst, "callee": callee, "line": line})
         if norm.is_dealloc(callee) and args and args[0]["root"]:
             events.append({"kind": "free", "var": args[0]["root"], "line": line})
 
@@ -211,6 +272,7 @@ def build_F(store, lang="c"):
     ix = store.index
     graph = materialize_graph(ix)
     regions = BranchRegions(graph)
+    nest = ControlNesting(graph)                   # loop/branch nesting from AST containment
     sinks = atropos.sink_catalog(lang)
     sink_names = set(sinks)
     norm = normalizer(lang)                        # form oracle: canonicalize callee names
@@ -225,7 +287,7 @@ def build_F(store, lang="c"):
         name = f.get("label")
         if not name or name in recs:              # first defined record wins (static dupes)
             continue
-        recs[name] = _walk_function(ix, regions, sinks, norm, f)
+        recs[name] = _walk_function(ix, regions, nest, sinks, norm, f)
 
     def is_lifecycle_or_sink(c):
         return c in sink_names or norm.is_alloc(c) or norm.is_dealloc(c)
