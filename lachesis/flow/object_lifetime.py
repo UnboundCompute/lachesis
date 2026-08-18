@@ -8,7 +8,7 @@ definitions.
 """
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -363,7 +363,7 @@ def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, 
     result = ObjectStateAnalyzer().analyze(
         cfg["nodes"], cfg["succ"], operations, initial=_initial_state(cfg, operations))
     alternatives = {state.trace for state in result.exit_states}
-    return tuple(sorted(alternatives, key=repr))
+    return tuple(sorted(alternatives, key=repr)), result
 
 
 @dataclass(frozen=True)
@@ -398,40 +398,79 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
     # distinction makes callers of a CFG failure take the conservative external-call
     # path instead of silently treating the callee as pure.
     summaries = {}
+    artifacts = {}
+    summary_capped = set()
+    summary_runs = Counter()
+    summary_transfers = 0
     for group in build_order(functions, call_successors):
         members = group["members"]
-        if group["cyclic"]:
-            for name in members:
-                if name in cfgs:
-                    summaries.setdefault(name, tuple())
-        rounds = len(members) + 3 if group["cyclic"] else 1
-        for _ in range(rounds):
-            changed = False
-            replacements = {}
-            for name in members:
-                if name not in cfgs:
-                    continue
-                summary = _summary_for(
-                    sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
-                replacements[name] = summary
-                changed |= summary != summaries.get(name)
-            summaries.update(replacements)
-            if not changed:
+        analysable = [name for name in members if name in cfgs]
+        if not group["cyclic"]:
+            if not analysable:
+                continue
+            name = analysable[0]
+            summary, result = _summary_for(
+                sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
+            summaries[name] = summary
+            artifacts[name] = result
+            summary_runs[name] += 1
+            summary_transfers += result.transfers
+            continue
+
+        # A cyclic component is a local monotone dataflow problem over summaries.
+        # Recompute a caller only when one of its in-component callees changed;
+        # the old len(SCC)+3 nested loop re-ran every member on every round.
+        for name in analysable:
+            summaries.setdefault(name, tuple())
+        member_set = set(analysable)
+        callers = defaultdict(set)
+        for caller in analysable:
+            for callee in call_successors.get(caller, ()):
+                if callee in member_set:
+                    callers[callee].add(caller)
+        queue = deque(analysable)
+        queued = set(analysable)
+        per_function_cap = max(8, min(32, len(analysable) * 2 + 4))
+        while queue:
+            name = queue.popleft()
+            queued.discard(name)
+            if summary_runs[name] >= per_function_cap:
+                summary_capped.update(analysable)
                 break
+            summary, result = _summary_for(
+                sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
+            summary_runs[name] += 1
+            summary_transfers += result.transfers
+            artifacts[name] = result
+            if summary == summaries.get(name):
+                continue
+            summaries[name] = summary
+            for caller in callers.get(name, ()):
+                if caller not in queued:
+                    queue.append(caller)
+                    queued.add(caller)
 
     leads = []
     diagnostics = {
         "functions": len(functions), "analyzed": 0, "cfg_failures": cfg_failures,
         "unplaced": 0, "unplaced_functions": {}, "capped": [],
+        "summary_capped": sorted(summary_capped),
+        "summary_analyses": sum(summary_runs.values()),
+        "summary_recomputations": sum(max(0, count - 1) for count in summary_runs.values()),
+        "summary_transfers": summary_transfers,
         "widenings": 0, "transfers": 0,
     }
     for name in sorted(functions):
         if name not in cfgs:
             continue
-        cfg = cfgs[name]
-        operations = extract_operations(
-            sub, norm, by_name[name], functions[name], functions, summaries, cfg)
-        result = ObjectStateAnalyzer().analyze(cfg["nodes"], cfg["succ"], operations)
+        result = artifacts.get(name)
+        if result is None:
+            cfg_failures[name] = "no-summary-artifact"
+            continue
+        # The summary run seeds parameters as UNKNOWN solely to record ParamEffects.
+        # That is the same lifetime fact a direct FREE creates in an unseeded run, so
+        # findings are identical. Reuse the stable run instead of walking every CFG a
+        # second time just to collect the same local findings.
         diagnostics["analyzed"] += 1
         diagnostics["unplaced"] += len(result.unplaced)
         if result.unplaced:
@@ -448,5 +487,20 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
                 "pattern": finding.pattern, "var": root + suffix, "entry": name,
                 "line": finding.line, "node": finding.node, "engine": "object-identity",
             })
+
+    unsafe = (set(cfg_failures) | summary_capped
+              | set(diagnostics["unplaced_functions"]) | set(diagnostics["capped"]))
+    reverse_calls = defaultdict(set)
+    for caller, callees in call_successors.items():
+        for callee in callees:
+            reverse_calls[callee].add(caller)
+    queue = deque(unsafe)
+    while queue:
+        callee = queue.popleft()
+        for caller in reverse_calls.get(callee, ()):
+            if caller not in unsafe:
+                unsafe.add(caller)
+                queue.append(caller)
+    diagnostics["unsafe_functions"] = sorted(unsafe)
 
     return ObjectLifetimeResult(tuple(leads), summaries, diagnostics)

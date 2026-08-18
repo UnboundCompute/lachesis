@@ -85,9 +85,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
     if lang.lower() == "c" and requested != "legacy":
         object_result = analyze_object_lifetimes(store, F, succ, lang=lang)
         diagnostics = object_result.diagnostics
-        unsafe = (set(diagnostics.get("cfg_failures", {}))
-                  | set(diagnostics.get("unplaced_functions", {}))
-                  | set(diagnostics.get("capped", ())))
+        unsafe = set(diagnostics.get("unsafe_functions", ()))
         covered = set(F) - unsafe
         leads, differential = _select_lifetime_leads(
             legacy_leads, object_result.leads, requested, covered_entries=covered)
