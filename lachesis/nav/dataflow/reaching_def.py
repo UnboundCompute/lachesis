@@ -189,11 +189,15 @@ class ReachingDef:
 
         def role_children():
             out = defaultdict(list)
+            role_index = getattr(self.sub, "ast_by_role", None)
+            if role_index is not None:
+                for role, children in role_index.get(nid, {}).items():
+                    out[role].extend(child for child in children if child in self._owned_set)
+                return out
             for edge in self.sub.idx.outgoing_of_kind(nid, "AST_CHILD"):
-                if edge["target"] not in self._owned_set:
-                    continue
-                props = edge.get("properties", {})
-                out[props.get("role") or "AST_CHILD"].append(edge["target"])
+                if edge["target"] in self._owned_set:
+                    out[edge.get("properties", {}).get("role") or "AST_CHILD"].append(
+                        edge["target"])
             return out
 
         def chain(micros) -> Tuple[Optional[str], List[str]]:

@@ -48,10 +48,7 @@ def _line(sub, node):
 
 
 def _roles(sub, node):
-    result = {}
-    for edge in sub.idx.outgoing_of_kind(node, "AST_CHILD"):
-        result.setdefault(_props(edge).get("role") or "AST_CHILD", []).append(edge["target"])
-    return result
+    return sub.ast_by_role.get(node, {})
 
 
 def _peel(sub, node, depth=0):
@@ -181,23 +178,18 @@ def _deref_base(sub, ap_builder, node):
 
 
 def _is_unevaluated(sub, node):
-    queue, seen = deque([node]), set()
-    while queue:
-        current = queue.popleft()
-        if current in seen:
-            continue
+    current, seen = node, set()
+    while current is not None and current not in seen:
         seen.add(current)
         if sub.kind(current) == "UnaryExprOrTypeTraitExpr":
             return True
-        queue.extend(edge["source"] for edge in sub.idx.incoming_of_kind(current, "AST_CHILD"))
+        current = sub.ast_parent.get(current)
     return False
 
 
 def _argument_path(sub, ap_builder, call_node, position):
-    for edge in sub.idx.outgoing_of_kind(call_node, "HAS_ARGUMENT"):
-        if _props(edge).get("position") == position:
-            return _path(ap_builder, edge["target"])
-    return None
+    argument = sub.role_child_at(call_node, "ARGUMENT", position)
+    return _path(ap_builder, argument)
 
 
 def _place(sub, cfg_nodes, anchor, fallback=None):

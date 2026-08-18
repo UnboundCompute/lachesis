@@ -36,6 +36,8 @@ class Substrate:
         self.idx = index
         self._node = {}
         self.ast_children = defaultdict(list)   # parent -> [child]
+        self.ast_by_role = defaultdict(lambda: defaultdict(list))
+        self.ast_by_position = defaultdict(lambda: defaultdict(dict))
         self.ast_parent = {}                    # child -> parent
         self.refers = {}                        # DeclRefExpr -> decl
         self.cfg_next = defaultdict(list)       # block -> [block]
@@ -50,6 +52,12 @@ class Substrate:
         for e in self.idx.edges_of_kind("AST_CHILD"):
             self.ast_children[e["source"]].append(e["target"])
             self.ast_parent[e["target"]] = e["source"]
+            properties = e.get("properties", {})
+            role = properties.get("role") or "AST_CHILD"
+            self.ast_by_role[e["source"]][role].append(e["target"])
+            position = properties.get("position")
+            if isinstance(position, int):
+                self.ast_by_position[e["source"]][role][position] = e["target"]
         for e in self.idx.edges_of_kind("REFERS_TO"):
             self.refers.setdefault(e["source"], e["target"])
         for e in self.idx.edges_of_kind("CFG_NEXT"):
@@ -60,6 +68,12 @@ class Substrate:
             self.cfg_nodes.add(t)
         self._loaded = True
         return self
+
+    def role_children(self, node, role):
+        return self.ast_by_role.get(node, {}).get(role, ())
+
+    def role_child_at(self, node, role, position):
+        return self.ast_by_position.get(node, {}).get(role, {}).get(position)
 
     # -- node accessors --------------------------------------------------------
     def node(self, nid):
