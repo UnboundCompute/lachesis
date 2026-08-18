@@ -90,7 +90,7 @@ class ReachingDef:
         return self._k(nid) == "DeclRefExpr"
 
     def is_param(self, nid):
-        return self._k(nid) in ("ParmVarDecl", "VarDecl")
+        return self._k(nid) == "ParmVarDecl"
 
     def _peel(self, nid, d=0):
         if d > 12:
@@ -132,6 +132,12 @@ class ReachingDef:
         seen.add(nid)
         nid_p = self._peel(nid)
         if nid_p != nid:
+            # Macro wrappers can belong to this function while the shared expansion
+            # child is attributed to a synthetic macro function. Keep the local wrapper
+            # as the micro-node instead of peeling into a foreign, unreachable node.
+            if nid in self._owned_set and nid_p not in self._owned_set:
+                out.append(nid)
+                return
             self.expr_stream(nid_p, out, seen, depth + 1)
             return
         if nid not in self._owned_set:
@@ -181,6 +187,15 @@ class ReachingDef:
     def _emit_stmt_body(self, nid, succ, depth) -> Tuple[Optional[str], List[str]]:
         k = self._k(nid)
 
+        def role_children():
+            out = defaultdict(list)
+            for edge in self.sub.idx.outgoing_of_kind(nid, "AST_CHILD"):
+                if edge["target"] not in self._owned_set:
+                    continue
+                props = edge.get("properties", {})
+                out[props.get("role") or "AST_CHILD"].append(edge["target"])
+            return out
+
         def chain(micros) -> Tuple[Optional[str], List[str]]:
             micros = [m for m in micros if m is not None]
             for a, b in zip(micros, micros[1:]):
@@ -205,10 +220,13 @@ class ReachingDef:
             return (first, prev_exits)
 
         if k == "IfStmt":
-            kids = sorted(self._kids(nid), key=lambda c: self.sub.offset(c))
-            # clang IfStmt children: [cond, then, (else)] (may include decl); split by stmt-ness
-            cond = next((c for c in kids if not self._is_stmt(c)), None)
-            branches = [c for c in kids if self._is_stmt(c)]
+            kids = list(self._kids(nid))
+            roles = role_children()
+            conds = roles.get("CONDITION", [])
+            cond = conds[0] if conds else (min(kids, key=self.sub.offset) if kids else None)
+            branches = roles.get("TRUE_BRANCH", []) + roles.get("FALSE_BRANCH", [])
+            if not branches:
+                branches = [child for child in kids if child != cond][:2]
             cstream: List[str] = []
             if cond is not None:
                 self.expr_stream(cond, cstream, set())
@@ -227,23 +245,65 @@ class ReachingDef:
                 exits.extend(cexit)
             return (centry or (exits[0] if exits else None), exits or cexit)
 
-        if k in ("ForStmt", "WhileStmt", "DoStmt"):
-            kids = sorted(self._kids(nid), key=lambda c: self.sub.offset(c))
-            cond = next((c for c in kids if not self._is_stmt(c)), None)
-            body = next((c for c in kids if self._is_stmt(c)), None)
+        if k == "ForStmt":
+            kids = list(self._kids(nid))
+            roles = role_children()
+            body = next(iter(roles.get("LOOP_BODY", [])), None)
+            cond = next(iter(roles.get("CONDITION", [])), None)
+            other = [child for child in kids if child not in {body, cond}]
+            init = next((child for child in other if self._k(child) == "DeclStmt"), None)
+            increment = next((child for child in other if child != init), None)
+            ie, ix = self.emit_stmt(init, succ, depth + 1) if init else (None, [])
             cstream: List[str] = []
             if cond is not None:
                 self.expr_stream(cond, cstream, set())
             centry, cexit = chain(cstream)
-            be, bx = (None, [])
-            if body is not None:
-                be, bx = self.emit_stmt(body, succ, depth + 1)
-            if centry is None:
-                centry, cexit = be, bx
+            be, bx = self.emit_stmt(body, succ, depth + 1) if body else (None, [])
+            nstream: List[str] = []
+            if increment is not None:
+                self.expr_stream(increment, nstream, set())
+            nentry, nexit = chain(nstream)
+            if centry is not None:
+                for x in ix:
+                    succ[x].append(centry)
             if be is not None and cexit:
                 for ce in cexit:
                     succ[ce].append(be)
-            for x in bx:                       # back-edge body -> cond (loop)
+            back = nentry or centry
+            for x in bx:
+                if back is not None:
+                    succ[x].append(back)
+            if nentry is not None and centry is not None:
+                for x in nexit:
+                    succ[x].append(centry)
+            entry = ie or centry or be
+            return (entry, cexit or bx)
+
+        if k in ("WhileStmt", "DoStmt"):
+            kids = list(self._kids(nid))
+            roles = role_children()
+            body = next(iter(roles.get("LOOP_BODY", [])), None)
+            cond = next(iter(roles.get("CONDITION", [])), None)
+            if (body is None or cond is None) and len(kids) >= 2:
+                body, cond = ((kids[0], kids[-1]) if k == "DoStmt"
+                              else (kids[-1], kids[0]))
+            cstream: List[str] = []
+            if cond is not None:
+                self.expr_stream(cond, cstream, set())
+            centry, cexit = chain(cstream)
+            be, bx = self.emit_stmt(body, succ, depth + 1) if body else (None, [])
+            if k == "DoStmt":
+                for x in bx:
+                    if centry is not None:
+                        succ[x].append(centry)
+                for x in cexit:
+                    if be is not None:
+                        succ[x].append(be)
+                return (be or centry, cexit)
+            for x in cexit:
+                if be is not None:
+                    succ[x].append(be)
+            for x in bx:
                 if centry is not None:
                     succ[x].append(centry)
             return (centry, cexit or bx)
@@ -262,7 +322,23 @@ class ReachingDef:
                     micros.extend(s)
             # flatten (only plain expr micros here for the common case)
             flat = [m for m in micros if isinstance(m, str)]
-            return chain(flat)
+            entry, exits = chain(flat)
+            if k == "ReturnStmt":
+                # Keep a terminal node even for bare `return;`; callers can distinguish
+                # it from normal fallthrough because it has no exits.
+                if entry is None:
+                    succ.setdefault(nid, [])
+                    return (nid, [])
+                for x in exits:
+                    succ[x].append(nid)
+                succ.setdefault(nid, [])
+                return (entry, [])
+            if k == "DeclStmt" and entry is None:
+                # Macro-only initializers may have no owned expansion child. The
+                # declaration statement is still a valid placement node.
+                succ.setdefault(nid, [])
+                return (nid, [nid])
+            return (entry, exits)
 
         if k in ("NullStmt", "BreakStmt", "ContinueStmt", "GotoStmt"):
             return (None, [])
@@ -277,6 +353,28 @@ class ReachingDef:
 
     # -- per-function reaching-def --------------------------------------------
     def run_function(self, fn) -> Dict:
+        st = self.analyze(fn)
+        if st is None:
+            return {"edges": [], "field_edges": [], "micro": 0}
+        if st.get("bailed"):
+            return {"edges": [], "field_edges": [], "micro": st["micro"], "bailed": True}
+        return self._emit_edges(st["nodes"], st["IN"], st["gen"])
+
+    def analyze(self, fn) -> Optional[Dict]:
+        """Intraprocedural CFG state for `fn`, the shared substrate the def->use edge
+        emitter (and any def-site-keyed client such as a typestate pass) runs over:
+
+          nodes  ordered micro-node list (BFS from entry)
+          succ   node -> [node]     control-flow successors (branch/loop/merge)
+          pred   node -> [node]     predecessors
+          gen    node -> {def}      reaching-defs generated here (def-site == node id)
+          kill   node -> {def}      reaching-defs killed here (a redefinition kills the
+                                    prior def -- this is what makes reassignment reset
+                                    a pointer's tracked state, generally, for free)
+          IN/OUT node -> {def}      reaching-def sets at the fixpoint
+
+        Returns None when the function has no analysable body; a dict with
+        ``bailed=True`` (and ``micro``) when the body exceeds the micro-node cap."""
         owned = set(self.sub._owned(fn))
         # function body root = the top CompoundStmt owned by fn
         roots = [b for b in owned if self._k(b) == "CompoundStmt"
@@ -284,31 +382,42 @@ class ReachingDef:
         if not roots:
             roots = [b for b in owned if self._k(b) == "CompoundStmt"]
         if not roots:
-            return {"edges": [], "field_edges": [], "micro": 0}
+            return None
         # pick outermost (smallest offset / largest span)
         root = min(roots, key=lambda b: self.sub.offset(b))
 
-        _dbg(f"run_function fn={fn} owned={len(owned)} root={root}")
+        _dbg(f"analyze fn={fn} owned={len(owned)} root={root}")
         succ: Dict[str, List[str]] = defaultdict(list)
-        params = [p for p in owned if self.is_param(p)]
+        params = [p for p in owned if self._k(p) == "ParmVarDecl"]
         params.sort(key=lambda p: self.sub.offset(p))
         self._owned_set = owned
         self._emit_memo = {}
         self._emit_inprogress = set()
         self._emit_memo_hits = 0
         self._emit_cycle_breaks = 0
-        entry, _ = self.emit_stmt(root, succ, 0)
+        entry, exits = self.emit_stmt(root, succ, 0)
         _dbg(f"emit_stmt done: succ-keys={len(succ)} entry={entry} "
              f"emit-calls={len(self._emit_memo)} memo-hits={self._emit_memo_hits} "
              f"cycle-breaks={self._emit_cycle_breaks}")
         if entry is None:
-            return {"edges": [], "field_edges": [], "micro": 0}
+            return None
 
-        # prepend param chain -> entry
-        chain_nodes = params + [entry]
+        # Make normal fallthrough explicit. This preserves the false edge of a final
+        # if/loop condition, which otherwise has only its taken successor.
+        cfg_entries = [n for n in owned if self._k(n) == "cfg-entry"]
+        cfg_exits = [n for n in owned if self._k(n) == "cfg-exit"]
+        cfg_entry = cfg_entries[0] if cfg_entries else None
+        cfg_exit = cfg_exits[0] if cfg_exits else None
+        if cfg_exit is not None:
+            succ.setdefault(cfg_exit, [])
+            for x in exits:
+                succ[x].append(cfg_exit)
+
+        # prepend CFG entry + formal parameter chain -> body entry
+        chain_nodes = ([cfg_entry] if cfg_entry else []) + params + [entry]
         for a, b in zip(chain_nodes, chain_nodes[1:]):
             succ[a].append(b)
-        start = params[0] if params else entry
+        start = chain_nodes[0]
 
         # collect all micro-nodes reachable
         nodes: List[str] = []
@@ -329,7 +438,7 @@ class ReachingDef:
             _dbg("CFG micro order (BFS): " + " | ".join(
                 f"L{ln}:{k}:{lab}" for ln, k, lab in seq))
         if len(nodes) > _MAX_MICRO:
-            return {"edges": [], "field_edges": [], "micro": len(nodes), "bailed": True}
+            return {"bailed": True, "micro": len(nodes)}
 
         pred: Dict[str, List[str]] = defaultdict(list)
         for a, ss in succ.items():
@@ -370,7 +479,9 @@ class ReachingDef:
                         inwl.add(s)
         _dbg(f"fixpoint done iter={_iter}")
 
-        return self._emit_edges(nodes, IN, gen)
+        return {"nodes": nodes, "succ": dict(succ), "pred": dict(pred),
+                "gen": gen, "kill": kill, "IN": IN, "OUT": OUT,
+                "params": params, "root": root, "micro": len(nodes)}
 
     def _gen_kill(self, nodes, params):
         gen: Dict[str, Set[str]] = {}
