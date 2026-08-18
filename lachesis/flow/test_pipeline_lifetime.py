@@ -31,6 +31,12 @@ class PipelineLifetimeTests(unittest.TestCase):
         _, diff = _select_lifetime_leads([self.legacy], [object_lead], "shadow")
         self.assertEqual((diff["legacy_only"], diff["object_only"]), (0, 0))
 
+    def test_object_mode_keeps_legacy_leads_for_uncovered_functions(self):
+        uncovered = dict(self.legacy, entry="too_large")
+        leads, _ = _select_lifetime_leads(
+            [self.legacy, uncovered], [self.object], "object", covered_entries={"f"})
+        self.assertEqual(leads, [self.object, uncovered])
+
 
 if __name__ == "__main__":
     unittest.main()

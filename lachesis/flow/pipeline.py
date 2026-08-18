@@ -23,11 +23,17 @@ def _lead_key(lead):
     return (lead.get("pattern"), lead.get("entry"), lead.get("line"))
 
 
-def _select_lifetime_leads(legacy, object_identity, mode):
+def _select_lifetime_leads(legacy, object_identity, mode, covered_entries=None):
     preserved = [lead for lead in legacy if lead.get("pattern") not in _LIFETIME_PATTERNS]
     legacy_lifetime = [lead for lead in legacy if lead.get("pattern") in _LIFETIME_PATTERNS]
     object_lifetime = list(object_identity)
-    selected = object_lifetime if mode == "object" else legacy_lifetime
+    if mode == "object":
+        covered = set(covered_entries) if covered_entries is not None else None
+        fallback = ([lead for lead in legacy_lifetime
+                     if covered is not None and lead.get("entry") not in covered])
+        selected = object_lifetime + fallback
+    else:
+        selected = legacy_lifetime
     seen, leads = set(), []
     for lead in preserved + selected:
         key = tuple(sorted((key, repr(value)) for key, value in lead.items()))
@@ -52,12 +58,17 @@ def _select_lifetime_leads(legacy, object_identity, mode):
 
 
 def run_pass(store, lang="c", lifetime_engine=None):
-    """Return {F, succ, summaries, skeletons, leads} for an opened GraphStore.
+    """Return {F, succ, summaries, skeletons, leads, lifetime} for an opened GraphStore.
 
     The store's whole-graph value-flow tier is ensured once (cached to disk), then every
     later stage reads only the projected IR -- never the graph again. The one exception is
     the CFG bundle (successor edges + node resolver), projected once here so the typestate
-    matcher's temporal shapes are path-sensitive over the real control-flow graph."""
+    matcher's temporal shapes are path-sensitive over the real control-flow graph.
+
+    C double-free/UAF leads use object identity by default. ``lifetime`` includes the
+    bounded legacy differential and coverage diagnostics; functions with no complete
+    object analysis retain legacy leads. Set ``LACHESIS_LIFETIME_ENGINE=shadow`` to run
+    both without changing output, or ``legacy`` for an operational rollback."""
     store.ensure_dataflow_tier()
     F, succ = build_F(store, lang=lang)
     summaries = _summaries_for(F, succ)
@@ -73,12 +84,18 @@ def run_pass(store, lang="c", lifetime_engine=None):
     leads = legacy_leads
     if lang.lower() == "c" and requested != "legacy":
         object_result = analyze_object_lifetimes(store, F, succ, lang=lang)
+        diagnostics = object_result.diagnostics
+        unsafe = (set(diagnostics.get("cfg_failures", {}))
+                  | set(diagnostics.get("unplaced_functions", {}))
+                  | set(diagnostics.get("capped", ())))
+        covered = set(F) - unsafe
         leads, differential = _select_lifetime_leads(
-            legacy_leads, object_result.leads, requested)
+            legacy_leads, object_result.leads, requested, covered_entries=covered)
         lifetime.update({
             "active": "object" if requested == "object" else "legacy",
             "available": True, "differential": differential,
-            "diagnostics": object_result.diagnostics,
+            "diagnostics": diagnostics,
+            "fallback_functions": sorted(unsafe),
         })
     return {"F": F, "succ": succ, "summaries": summaries,
             "skeletons": skeletons, "leads": leads, "lifetime": lifetime}

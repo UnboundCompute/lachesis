@@ -386,7 +386,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
             by_name[name] = node["id"]
 
     cfgs = {}
-    cfg_failures = {}
+    cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}
     for name, function_id in by_name.items():
         cfg = ReachingDef(sub).analyze(function_id)
         if cfg is None or cfg.get("bailed"):
@@ -422,7 +422,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
     leads = []
     diagnostics = {
         "functions": len(functions), "analyzed": 0, "cfg_failures": cfg_failures,
-        "unplaced": 0, "capped": [], "widenings": 0, "transfers": 0,
+        "unplaced": 0, "unplaced_functions": {}, "capped": [],
+        "widenings": 0, "transfers": 0,
     }
     for name in sorted(functions):
         if name not in cfgs:
@@ -433,6 +434,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
         result = ObjectStateAnalyzer().analyze(cfg["nodes"], cfg["succ"], operations)
         diagnostics["analyzed"] += 1
         diagnostics["unplaced"] += len(result.unplaced)
+        if result.unplaced:
+            diagnostics["unplaced_functions"][name] = len(result.unplaced)
         diagnostics["widenings"] += result.widenings
         diagnostics["transfers"] += result.transfers
         if result.capped:
