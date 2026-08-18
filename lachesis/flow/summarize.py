@@ -171,8 +171,15 @@ def summarize_one(name, F, summaries):
                     for e in sub:                          # pinned to this caller's call site
                         stream.append((e["kind"], call["line"], call.get("node")))
                     continue
-                frees_here = norm.is_dealloc(call["callee"]) and a["pos"] == 0
-                stream.append(("free" if frees_here else "use", call["line"], call.get("node")))
+                # a dealloc's free is emitted once from fn["events"], keyed on the object AS
+                # WRITTEN (free(p->field) frees the sub-object, not p). Re-emitting it here keyed
+                # on the base root a["root"] puts a field-free back on the base pointer's stream --
+                # a phantom double-free of the C destructor idiom (free the members, free the
+                # container). So skip the free here; fn["events"] is its single, correctly-keyed
+                # source. This loop emits only the pointer-as-arg USE.
+                if norm.is_dealloc(call["callee"]) and a["pos"] == 0:
+                    continue
+                stream.append(("use", call["line"], call.get("node")))
         for ev in fn["events"]:
             if ev["var"] == v and ev["kind"] in ("free", "use", "escape"):
                 stream.append((ev["kind"], ev["line"], ev.get("node")))

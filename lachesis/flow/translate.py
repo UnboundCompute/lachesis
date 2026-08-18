@@ -65,6 +65,20 @@ def _by_offset(nodes):
     return sorted(nodes, key=lambda n: _props(n).get("start_offset") or 0)
 
 
+def _stmt_line(node):
+    """A reliable source line for a lifecycle event, robust to the macro-expansion begin-loc bug.
+
+    A macro-expanded call (`curlx_free(p)` -> `free`) reports a bogus BEGIN location -- line 1,
+    offset 0 -- while its END location stays pinned to the real use site. Ordering events by that
+    bogus begin collapses every macro free to line 1, so it sorts before real uses on later lines
+    and manufactures a use-after-free. The end location is correct, so fall back to it when the
+    begin is the offset-0 sentinel (nothing real begins at offset 0 but the TU's first token)."""
+    p = _props(node)
+    if p.get("start_offset"):                        # non-zero begin: the real start line
+        return p.get("start_line")
+    return p.get("end_line") or p.get("start_line")  # macro sentinel -> the correct end line
+
+
 def _prov(kind):
     """Map a value node's kind to the coarse provenance tag summarize reads."""
     if kind == "parameter":
@@ -255,7 +269,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         callee = norm.canon_callee(_props(c).get("callee"))
         if not callee:
             continue
-        line = _props(c).get("start_line")
+        line = _stmt_line(c)
         callees.append(callee)
         args = _arg_records(ix, c)
         idents = {a["root"] for a in args if a["root"]}
