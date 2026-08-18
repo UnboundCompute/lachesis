@@ -53,6 +53,18 @@ def _leak_lead(seq, var, entry):
     return []
 
 
+def match_leak(skel):
+    """Match only the allocation-without-free/escape property.
+
+    Object mode owns double-free/UAF. Keeping this cheap property separate avoids
+    running the legacy CFG automaton over every typestate skeleton merely to retain
+    leak leads during the migration.
+    """
+    seq = [token for token in skel["tokens"]
+           if token["t"] in ("alloc", "use", "free", "escape")]
+    return _leak_lead(seq, skel["var"], skel["entry"])
+
+
 def match_typestate(skel, cfg=None):
     """Temporal shape queries over one pointer's alloc/use/free/escape stream.
 
