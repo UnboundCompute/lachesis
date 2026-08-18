@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 
 from lachesis.detect import substrate
-from lachesis.detect.adapter import LachesisGraph
+from lachesis.detect.adapter import LachesisGraph, report
 from lachesis.detect.capacity import capacity_bounds
 from lachesis.detect.catalog import Detector
 
@@ -161,6 +161,30 @@ class AdapterLeadsTest(unittest.TestCase):
     def test_every_lead_carries_its_vocabulary(self):
         self.assertTrue(all(ld["vocabulary"] in
                             ("generic-security-roles", "atropos-model") for ld in self.leads))
+
+
+class ReportTest(unittest.TestCase):
+    """report() censuses over the WHOLE graph and narrows leads to a filter."""
+
+    def test_census_counts_all_and_filter_narrows(self):
+        full = report(fixture_graph(), detector=_detector())
+        # census is over every fired lead, independent of any filter
+        self.assertEqual(full["census"]["total"], len(full["leads"]))
+        self.assertEqual(set(full["census"]["by_evaluator"]),
+                         {"reachability", "relational", "presence"})
+        # kinds counted include both the fired reachability and relational/presence kinds
+        self.assertEqual(full["census"]["by_kind"].get("weak-crypto"), 1)
+
+        rel = report(fixture_graph(), detector=_detector(), evaluator="relational")
+        # filtered rows are relational only, but the census still reports the whole graph
+        self.assertTrue(rel["leads"])
+        self.assertTrue(all(ld["evaluator"] == "relational" for ld in rel["leads"]))
+        self.assertEqual(rel["census"]["total"], full["census"]["total"])
+
+    def test_kind_filter(self):
+        got = report(fixture_graph(), detector=_detector(), kind="weak-crypto")
+        self.assertTrue(got["leads"])
+        self.assertTrue(all(ld["kind"] == "weak-crypto" for ld in got["leads"]))
 
 
 if __name__ == "__main__":

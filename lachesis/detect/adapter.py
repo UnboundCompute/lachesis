@@ -205,7 +205,8 @@ class LachesisGraph:
                 site, location = self._site(props.get("callsite_id"))
                 out.append({"sink": node["id"], "label": site or node.get("label"),
                             "sink_kind": kind, "kind": kind, "evaluator": fired,
-                            "location": location, "vocabulary": "atropos-model"})
+                            "location": location, "value_id": value_id,
+                            "vocabulary": "atropos-model"})
         return out
 
     # -- leads --------------------------------------------------------------------------
@@ -223,6 +224,30 @@ class LachesisGraph:
             (model_sinks if origin == "atropos-model" else role_sinks).append(n)
         return (self._reachability_leads(role_sinks, tainted)
                 + self._model_leads(model_sinks, tainted))
+
+
+def report(graph, bind_summary=None, detector=None, evaluator=None, kind=None):
+    """A grouped lead report over one materialized+enriched graph, for a tool surface.
+
+    Returns ``{census, leads}``: the census counts every fired lead by evaluator and by
+    kind (over the WHOLE graph, never the filtered view, so coverage is honest), while
+    ``leads`` is the rows, optionally narrowed to one ``evaluator`` or ``kind``. Callers
+    that already hold a stamped graph (the MCP server reuses the candidate bundle's) pass
+    it in, so the expensive materialize+enrich happens once.
+    """
+    import collections
+
+    all_leads = LachesisGraph(graph, bind_summary, detector=detector).leads()
+    by_ev = collections.Counter(ld["evaluator"] for ld in all_leads)
+    by_kind = collections.Counter(ld["kind"] for ld in all_leads)
+    rows = all_leads
+    if evaluator is not None:
+        rows = [ld for ld in rows if ld["evaluator"] == evaluator]
+    if kind is not None:
+        rows = [ld for ld in rows if ld["kind"] == kind]
+    return {"census": {"by_evaluator": dict(by_ev), "by_kind": dict(by_kind),
+                       "total": len(all_leads)},
+            "leads": rows}
 
 
 def leads(store_dir):

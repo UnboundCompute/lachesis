@@ -106,7 +106,7 @@ TOOL_ORDER = (
     "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "flow", "reaches", "sources_of", "points_to", "aliases",
-    "candidates", "candidate_detail", "candidate_census", "skeleton", "taint",
+    "candidates", "candidate_detail", "candidate_census", "detect", "skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -214,6 +214,7 @@ class _Ctx:
             stamped, summary = atropos_enrich(graph, complete_dataflow=False)
             return {
                 "registry": default_candidate_registry(stamped, summary),
+                "stamped": stamped,
                 "atropos": summary,
             }
 
@@ -467,6 +468,25 @@ TOOLS = [
                     "frontiers. Use this to distinguish an empty result from missing coverage.",
      "inputSchema": {"type": "object", "properties": {
          "constructor_id": {"type": "string"}}}},
+    {"name": "detect",
+     "description": "Run the data-driven detector over the whole graph and list its leads. "
+                    "Where `candidates` is taint-blind (it enumerates obligation SITES), "
+                    "`detect` adds the taint half: it seeds every catalogued source, floods "
+                    "interprocedurally, and fires each sink through the evaluator its kind "
+                    "selects -- reachability (an attacker value reaches an injection/traversal "
+                    "sink), relational (a memory-copy length is BOTH attacker-influenced AND "
+                    "unbounded vs the destination's capacity, the capacity half taken from the "
+                    "`candidates` planner), or presence (a config-weakness call, e.g. weak "
+                    "crypto, taint-independent). Leads are FACTS, not adjudicated bugs: read "
+                    "provenance (`sources_of`/`reaches`) and confirm against source before "
+                    "trusting one. `census` counts every lead by evaluator and by kind so an "
+                    "empty family is visible. Relational leads carry the `candidate_id` of the "
+                    "matching capacity obligation for a drill-down. Filter with `evaluator` "
+                    "(reachability|relational|presence) or `kind` (a catalog sink kind).",
+     "inputSchema": {"type": "object", "properties": {
+         "evaluator": {"type": "string", "enum": ["reachability", "relational", "presence"]},
+         "kind": {"type": "string", "description": "a catalog sink kind, e.g. buffer-write"},
+         "limit": {"type": "integer", "default": 50}}}},
     {"name": "skeleton",
      "description": "Render a function's sink map as a pseudo-function: every catalogued sink "
                     "(all families -- memory, os, file, ...) shown in place, each annotated with "
@@ -519,6 +539,30 @@ def _atropos_envelope(summary, *, full):
         "bind": per_language,
         "role_nodes": summary.get("role_nodes", {}),
     }
+
+
+def _capacity_index(registry):
+    """``{value_id: candidate_id}`` over every obligation the registry enumerates.
+
+    A relational detect lead names the value whose length is unbounded; that value is
+    an obligation the taint-blind candidate registry already keys by id, so this map
+    lets a lead cite the capacity candidate that carries the size/destination proof.
+    Reads the registry's cached results (candidate enumeration ran once for the bundle),
+    paging each constructor's full rows so no obligation is missed.
+    """
+    index = {}
+    for meta in registry.constructors:
+        cursor = None
+        while True:
+            page = registry.candidates(constructor=meta["id"], detail="full",
+                                       limit=200, cursor=cursor)
+            for row in page.get("candidates", ()):
+                for vid in ((row.get("handles") or {}).get("obligation_value_ids") or ()):
+                    index.setdefault(vid, row["candidate_id"])
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+    return index
 
 
 def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
@@ -716,6 +760,40 @@ def call_tool(name, args, format=None):
         # rows are one census call away.
         result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
         return _emit(name, result, fmt, offset, limit)
+    if name == "detect":
+        bundle = c.candidate_bundle
+        summary = bundle["atropos"]
+        if not summary.get("applied"):
+            return _emit(name, {
+                "move": "detect", "applied": False, "reason": summary.get("reason"),
+                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
+                        "at ../atropos, then reload",
+            }, fmt, offset, limit)
+        from lachesis.detect.adapter import report as detect_report
+        from lachesis.detect.catalog import DetectionCatalogUnavailable
+        try:
+            rep = detect_report(bundle["stamped"], summary,
+                                evaluator=args.get("evaluator"), kind=args.get("kind"))
+        except DetectionCatalogUnavailable as exc:
+            return _emit(name, {"move": "detect", "applied": False, "reason": str(exc),
+                                "hint": "atropos is present but carries no detection layer "
+                                        "(tools/detection.py); update the checkout"},
+                         fmt, offset, limit)
+        # A relational lead's value_id is a capacity obligation the taint-blind
+        # `candidates` registry already enumerated; point each such lead at its
+        # candidate_id so the caller can open the capacity proof behind the bound.
+        cap_index = _capacity_index(bundle["registry"])
+        rows = []
+        for ld in rep["leads"]:
+            row = dict(ld)
+            cand = cap_index.get(ld.get("value_id"))
+            if cand is not None:
+                row["candidate_id"] = cand
+            rows.append(row)
+        return _emit(name, {"move": "detect", "applied": True, "census": rep["census"],
+                            "returned": len(rows), "leads": rows,
+                            "atropos": _atropos_envelope(summary, full=False)},
+                     fmt, offset, limit)
     if name == "skeleton":
         bundle = c.candidate_bundle
         summary = bundle["atropos"]

@@ -321,7 +321,35 @@ def _generic(tool_name: str, result: dict, offset: int, limit: int) -> str:
     return "\n".join(lines)
 
 
+def _r_detect(result: dict, offset: int, limit: int) -> str:
+    """Detection leads grouped by evaluator, each row `[evaluator] kind  label @ loc`.
+
+    The census header states the whole-graph totals (never the windowed count) so an
+    empty family reads as coverage, not omission; relational rows show their capacity
+    `candidate_id` for a drill-down."""
+    if result.get("applied") is False:
+        return f"detect: not applied — {result.get('reason')}"
+    leads = result.get("leads") or []
+    census = result.get("census") or {}
+    by_ev = census.get("by_evaluator") or {}
+    ev_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_ev.items())) or "none"
+    window, footer = _window(leads, offset, limit)
+    lines = []
+    for ld in window:
+        loc = ld.get("location") or ""
+        at = f"  @ {loc}" if loc else ""
+        cand = ld.get("candidate_id")
+        tail = f"  ⟶ {cand}" if cand else ""
+        lines.append(f"    [{ld.get('evaluator'):<12}] {ld.get('kind'):<16} "
+                     f"{ld.get('label') or '?'}{at}{tail}")
+    header = f"DETECT — {census.get('total', len(leads))} lead(s) [{ev_summary}]"
+    if not leads:
+        return header + "\n    (none)"
+    return _lines(header, lines, footer)
+
+
 _TEMPLATES = {
+    "detect": lambda r, o, l: _r_detect(r, o, l),
     "hubs": lambda r, o, l: _r_hubs(r, o, l),
     "callers": lambda r, o, l: _r_moves(r, "callers", o, l),
     "callees": lambda r, o, l: _r_moves(r, "callees", o, l),
