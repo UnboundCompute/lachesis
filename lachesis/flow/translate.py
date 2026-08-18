@@ -147,6 +147,26 @@ def _assigned_var(ix, call_id):
     return None
 
 
+_SUBOBJECT = ("->", ".", "[", "*")
+
+
+def _freed_identity(arg):
+    """The lifetime identity of the object a `free(...)` releases -- the argument AS WRITTEN.
+
+    `free(p)` frees the base pointer `p`; `free(p->field)` / `free(p[i])` / `free(*p)` frees a
+    SUB-OBJECT with its own lifetime, distinct from `p`. Value-flow resolves all of these to the
+    same base decl `p` (the `root`), which conflates the canonical C destructor idiom
+    (free the members, then free the container) into a phantom double-free -- two frees on one
+    identity. Keying the free on the written access path keeps the sub-object free off the base
+    pointer's stream: a later `free(p)` no longer meets `free(p->field)` as a prior free of the
+    SAME object, and a `use(p)` no longer reads as a use of freed memory. Two frees still collide
+    (a real double-free) exactly when they free the same written expression."""
+    expr, root = arg.get("expr"), arg["root"]
+    if expr and expr != root and root in expr and any(s in expr for s in _SUBOBJECT):
+        return expr
+    return root
+
+
 def _arg_records(ix, call):
     """Ordered argument records for a call, resolved through argument_value_ids."""
     p = _props(call)
@@ -158,13 +178,16 @@ def _arg_records(ix, call):
         pos = _props(e).get("position")
         vid = av[pos] if (isinstance(pos, int) and pos < len(av)) else None
         vn = ix.nodes.get(vid) if vid else None
+        # the argument AS WRITTEN (`p->field`, `p[i]`, `*p`) before value-flow resolves it to
+        # its base decl -- the base loses the access path, which the lifetime identity needs.
+        expr = (ix.nodes.get(e["target"], {}) or {}).get("label")
         if vn is not None:                       # resolves to a decl/value the arg carries
             root = vn.get("label")
-            out.append({"pos": pos, "var": root, "value": root,
+            out.append({"pos": pos, "var": root, "value": root, "expr": expr,
                         "root": root, "provenance": _prov(vn.get("kind"))})
         else:                                     # literal / unresolved expression
             an = ix.nodes.get(e["target"], {})
-            out.append({"pos": pos, "var": None, "value": an.get("label"),
+            out.append({"pos": pos, "var": None, "value": an.get("label"), "expr": expr,
                         "root": None, "provenance": "const"})
     return out
 
@@ -265,7 +288,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         if alloc_dst:
             events.append({"kind": "alloc", "var": alloc_dst, "line": line, "node": c["id"]})
         if norm.is_dealloc(callee) and args and args[0]["root"]:
-            events.append({"kind": "free", "var": args[0]["root"], "line": line, "node": c["id"]})
+            events.append({"kind": "free", "var": _freed_identity(args[0]), "line": line,
+                           "node": c["id"]})
 
     alloc_vars = {a["var"] for a in assigns}
     returns = _returns(ix, fid, alloc_vars, param_set, norm)
