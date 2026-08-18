@@ -19,6 +19,7 @@ A match is a LEAD, never a verdict -- provenance still has to be adjudicated aga
 """
 import argparse
 import json
+from collections import deque
 
 from .patterns import substrate, evaluate
 from .skeleton import build_skeletons, _summaries_for
@@ -41,38 +42,140 @@ def match_reach(skel):
     return leads
 
 
-def match_typestate(skel):
-    """Temporal shape queries over the ordered alloc/use/free/escape stream of one pointer."""
+def _leak_lead(seq, var, entry):
+    """Leak is a whole-object fact (an alloc that never frees nor escapes on ANY path), so it
+    reads the same off the flat stream in both the flat and the path-sensitive matcher."""
+    saw_alloc = any(t["t"] == "alloc" for t in seq)
+    saw_free = any(t["t"] == "free" for t in seq)
+    saw_escape = any(t["t"] == "escape" for t in seq)
+    if saw_alloc and not saw_free and not saw_escape:
+        return [{"pattern": "leak", "var": var, "entry": entry}]
+    return []
+
+
+def match_typestate(skel, cfg=None):
+    """Temporal shape queries over one pointer's alloc/use/free/escape stream.
+
+    With a CFG bundle (the product path) the walk is PATH-SENSITIVE: it replays the property
+    automaton (START -> ALLOCATED -> FREED; free-on-FREED = double-free, use-on-FREED =
+    use-after-free) as a forward may-analysis over the real control-flow graph, so two frees
+    on mutually-exclusive branches never meet and a free across a loop back-edge does. Without
+    a bundle (the bare CLI, which has no store) it falls back to the flat line-ordered walk --
+    a sound-ish approximation that over-reports branch frees.
+
+    A match is a LEAD, never a verdict."""
     seq = [t for t in skel["tokens"] if t["t"] in ("alloc", "use", "free", "escape")]
     var, entry = skel["var"], skel["entry"]
+    if cfg is not None:
+        cfg_leads = _match_typestate_cfg(seq, var, entry, cfg)
+        if cfg_leads is not None:
+            return cfg_leads + _leak_lead(seq, var, entry)
+        # fall through to the flat walk when the stream can't be placed on the CFG
+
     leads = []
     freed = False
-    saw_alloc = saw_free = saw_escape = False
     for t in seq:
         k = t["t"]
         if k == "alloc":
-            saw_alloc = True
             freed = False                                # realloc reopens the object
         elif k == "free":
             if freed:                                    # free with no intervening alloc/realloc
                 leads.append({"pattern": "double-free", "var": var, "entry": entry,
                               "line": t.get("line")})
             freed = True
-            saw_free = True
         elif k == "use" and freed:
             leads.append({"pattern": "use-after-free", "var": var, "entry": entry,
                           "line": t.get("line")})
-        elif k == "escape":
-            saw_escape = True
-    if saw_alloc and not saw_free and not saw_escape:
-        leads.append({"pattern": "leak", "var": var, "entry": entry})
+    return leads + _leak_lead(seq, var, entry)
+
+
+def _match_typestate_cfg(seq, var, entry, cfg):
+    """Path-sensitive double-free / use-after-free over the CFG. Returns the (df, uaf) leads,
+    or None if the stream can't be placed on the CFG (an event with no anchor node) so the
+    caller falls back to the flat walk. Leak is added by the caller (a whole-object fact)."""
+    succ, resolve = cfg["succ"], cfg["resolve"]
+    if any(t.get("node") is None for t in seq):
+        return None
+
+    # place each event on its CFG-participating node, preserving stream order per node
+    ev_at = {}
+    placed = []
+    for t in seq:
+        n = resolve(t["node"])
+        ev_at.setdefault(n, []).append(t)
+        placed.append(n)
+
+    # seed from the alloc (it dominates the object's whole lifetime); with no local alloc
+    # (a freed-param skeleton) seed from every event node so each sits in the analysed cone.
+    alloc_nodes = [resolve(t["node"]) for t in seq if t["t"] == "alloc"]
+    seeds = alloc_nodes if alloc_nodes else list(dict.fromkeys(placed))
+
+    reach = set()
+    dq = deque(seeds)
+    while dq:
+        x = dq.popleft()
+        if x in reach:
+            continue
+        reach.add(x)
+        dq.extend(succ.get(x, ()))
+
+    def apply(state, node):
+        """Fold this node's events onto an incoming state set, returning the outgoing set."""
+        out = set(state) or {"START"}
+        for t in ev_at.get(node, []):
+            if t["t"] == "alloc":
+                out = {"ALLOCATED"}
+            elif t["t"] == "free":
+                out = {"FREED"}
+            # use / escape do not change the object's state
+        return out
+
+    # forward may-analysis to a fixpoint: union incoming states at merges, re-enqueue on
+    # change so loop back-edges are followed until stable.
+    in_state = {n: set() for n in reach}
+    wl = deque(reach)
+    guard = 0
+    while wl and guard < 200000:
+        guard += 1
+        n = wl.popleft()
+        out = apply(in_state[n], n)
+        for m in succ.get(n, ()):
+            if m not in in_state:
+                in_state[m] = set()
+            before = frozenset(in_state[m])
+            in_state[m] |= out
+            if frozenset(in_state[m]) != before:
+                wl.append(m)
+
+    # read findings at the fixpoint: replay each node's events against its incoming state
+    leads, seen = [], set()
+    for n in reach:
+        cur = set(in_state[n]) or {"START"}
+        for t in ev_at.get(n, []):
+            if t["t"] == "free":
+                if "FREED" in cur:
+                    key = ("double-free", t.get("line"), n)
+                    if key not in seen:
+                        seen.add(key)
+                        leads.append({"pattern": "double-free", "var": var,
+                                      "entry": entry, "line": t.get("line")})
+                cur = {"FREED"}
+            elif t["t"] == "use":
+                if "FREED" in cur:
+                    key = ("use-after-free", t.get("line"), n)
+                    if key not in seen:
+                        seen.add(key)
+                        leads.append({"pattern": "use-after-free", "var": var,
+                                      "entry": entry, "line": t.get("line")})
+            elif t["t"] == "alloc":
+                cur = {"ALLOCATED"}
     return leads
 
 
-def match_all(skels):
+def match_all(skels, cfg=None):
     leads = []
     for s in skels:
-        leads += match_reach(s) if s["kind"] == "reach" else match_typestate(s)
+        leads += match_reach(s) if s["kind"] == "reach" else match_typestate(s, cfg=cfg)
     return leads
 
 

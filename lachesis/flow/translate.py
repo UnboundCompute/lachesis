@@ -233,6 +233,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         alloc_dst = _assigned_var(ix, c["id"]) if norm.is_alloc(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
                "is_sink": cat is not None,
+               "node": c["id"],                             # graph node = CFG anchor for events
                "control": nest.enclosing(c["id"])}          # loop/branch nesting, outer->inner
         if cat is not None:
             size_arg = cat.get("size_arg")
@@ -247,10 +248,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         calls.append(rec)
 
         if alloc_dst:
-            events.append({"kind": "alloc", "var": alloc_dst, "line": line})
-            assigns.append({"var": alloc_dst, "callee": callee, "line": line})
+            events.append({"kind": "alloc", "var": alloc_dst, "line": line, "node": c["id"]})
+            assigns.append({"var": alloc_dst, "callee": callee, "line": line, "node": c["id"]})
         if norm.is_dealloc(callee) and args and args[0]["root"]:
-            events.append({"kind": "free", "var": args[0]["root"], "line": line})
+            events.append({"kind": "free", "var": args[0]["root"], "line": line, "node": c["id"]})
 
     alloc_vars = {a["var"] for a in assigns}
     returns = _returns(ix, fid, alloc_vars, param_set, norm)

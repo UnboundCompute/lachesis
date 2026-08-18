@@ -156,7 +156,7 @@ def _typestate_skel(fn, var, events, depth):
     toks = [{"t": "enter", "fn": fn, "depth": depth}]
     for e in events:
         toks.append({"t": e["kind"], "var": var, "line": e.get("line"),
-                     "fn": fn, "depth": depth + 1})
+                     "node": e.get("node"), "fn": fn, "depth": depth + 1})
     toks.append({"t": "exit", "fn": fn, "depth": depth})
     return toks
 

@@ -139,29 +139,43 @@ def summarize_one(name, F, summaries):
             return None
         return summaries[call["callee"]].get("param_typestate", {}).get(gp[a["pos"]])
 
+    # graph node id for each alloc var's allocating call -- the CFG anchor of its alloc event,
+    # so the path-sensitive matcher can seed the typestate walk at the right CFG node.
+    alloc_node = {}
+    for a in fn.get("assigns", []):
+        alloc_node.setdefault(a["var"], a.get("node"))
+    for ev in fn["events"]:
+        if ev["kind"] == "alloc":
+            alloc_node.setdefault(ev["var"], ev.get("node"))
+
     def lifetime_events_for(v, alloc_seed=None):
-        """Ordered alloc/use/free/escape stream for pointer `v`, composing callee effects."""
-        stream = [("alloc", alloc_seed)] if alloc_seed is not None else []
+        """Ordered alloc/use/free/escape stream for pointer `v`, composing callee effects.
+
+        Each event carries its CFG anchor `node` (the call site for call-derived and spliced
+        callee effects) so a path-sensitive matcher can walk them over the real CFG; the
+        line ordering here is only a stable serialisation, not the analysis order."""
+        stream = ([("alloc", alloc_seed, alloc_node.get(v))]
+                  if alloc_seed is not None else [])
         for call in fn["calls"]:
             for a in call["args"]:
                 if a.get("root") != v:
                     continue
                 sub = callee_param_stream(call, a)
                 if sub:                                    # splice the callee's effects
-                    for e in sub:
-                        stream.append((e["kind"], call["line"]))
+                    for e in sub:                          # pinned to this caller's call site
+                        stream.append((e["kind"], call["line"], call.get("node")))
                     continue
                 frees_here = norm.is_dealloc(call["callee"]) and a["pos"] == 0
-                stream.append(("free" if frees_here else "use", call["line"]))
+                stream.append(("free" if frees_here else "use", call["line"], call.get("node")))
         for ev in fn["events"]:
             if ev["var"] == v and ev["kind"] in ("free", "use", "escape"):
-                stream.append((ev["kind"], ev["line"]))
+                stream.append((ev["kind"], ev["line"], ev.get("node")))
         seen, ordered = set(), []
-        for k, ln in sorted(stream, key=lambda x: x[1] or 0):
-            if (k, ln) in seen:
+        for k, ln, nd in sorted(stream, key=lambda x: x[1] or 0):
+            if (k, ln, nd) in seen:
                 continue
-            seen.add((k, ln))
-            ordered.append({"kind": k, "line": ln})
+            seen.add((k, ln, nd))
+            ordered.append({"kind": k, "line": ln, "node": nd})
         return ordered
 
     # alloc'd locals -> full lifecycle starting at the alloc site
