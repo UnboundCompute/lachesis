@@ -126,6 +126,7 @@ def parser() -> argparse.ArgumentParser:
     call.add_argument("node_id")
     security = commands.add_parser("security-path")
     security.add_argument("node_id")
+    commands.add_parser("security-paths")  # batch: every path slice in one graph load
     handler = commands.add_parser("handler-security")
     handler.add_argument("focus")
     handler.add_argument("--file")
@@ -162,6 +163,8 @@ def execute(args: argparse.Namespace) -> dict:
         return query.explain_call(args.node_id, args.budget_tokens)
     if command == "security-path":
         return query.security_path(args.node_id, args.budget_tokens)
+    if command == "security-paths":
+        return query.security_paths(args.budget_tokens)
     if command == "unresolved":
         return query.unresolved_frontier(args.node_id, args.budget_tokens)
     raise AssertionError(f"unhandled query command: {command}")

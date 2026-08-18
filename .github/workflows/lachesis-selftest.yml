@@ -27,11 +27,12 @@ jobs:
           # Heavier than the fixture-only run and less deterministic, but this is
           # the real dogfood: Lachesis analyzing its own source.
           source: "."
-          # Materialize the dataflow tier once at build time (--enrich) instead of
-          # re-folding it per query in the export step. On a whole-repo graph the
-          # exporter runs one query subprocess per path, and a core-only build makes
-          # each one rebuild the full dataflow tier from scratch — the export blowup.
-          analyze-args: "--prune --incremental --enrich"
-          # lachesis-ref defaults to "main" — the engine install. The action CODE
-          # comes from ./action on this branch regardless.
+          # Light build. The export step now uses the batched `security-paths`
+          # query (one graph load for all findings), so --enrich is unnecessary:
+          # the single load folds the dataflow tier once anyway.
+          analyze-args: "--prune --incremental"
+          # Pin the engine to THIS branch so the install includes the batched
+          # `security-paths` command the exporter needs. Revert to "main" (the
+          # default) once this branch merges.
+          lachesis-ref: "feat/github-action"
           fail-on: "none"                      # smoke test: never fail the check

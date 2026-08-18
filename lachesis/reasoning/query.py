@@ -488,6 +488,28 @@ class ReasoningQuery:
             ], budget_tokens,
         )
 
+    def security_paths(self, budget_tokens: Optional[int] = None) -> dict:
+        """Every reachable-path slice in a single graph load.
+
+        ``security_path`` is what the SARIF exporter needs per finding; a consumer
+        that wants all of them (the exporter does) would otherwise spawn one query
+        process per path and pay a full graph materialization each time. Iterating
+        here reuses the one materialized graph, so the cost is O(1) loads, not O(N).
+        The per-path detail shape is identical to ``security_path``.
+        """
+        path_queries = (
+            self.layered["manifest"].get("security", {}).get("path_queries", [])
+        )
+        paths = [
+            {"id": pq["id"], "label": pq.get("label"),
+             "detail": self.security_path(pq["id"], budget_tokens)}
+            for pq in path_queries
+        ]
+        return {
+            "schema_version": 1, "query": "security-paths",
+            "count": len(paths), "paths": paths,
+        }
+
     def handler_security_slice(
         self, function_id: str, budget_tokens: Optional[int] = None,
     ) -> dict:

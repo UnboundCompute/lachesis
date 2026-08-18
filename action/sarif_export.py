@@ -8,9 +8,11 @@ results that GitHub code scanning renders inline on a PR.
 
     python3 action/sarif_export.py graph.kuzu -o lachesis.sarif
 
-It reads two queries only:
-  * `overview`      -> manifest.security  (the path_queries index + differentials)
-  * `security-path` -> per-path guard verdict, source, and sink location
+It reads one query when the engine supports it:
+  * `security-paths` -> every reachable path's guard verdict, source, and sink
+                        location in a single graph load (one process, not N).
+Older engines that lack the batch command fall back to `overview` +
+per-path `security-path` calls, which is correct but pays a graph reload each.
 
 Findings are anchored at the sink call site, carry the tainted flow as a SARIF
 codeFlow, and are leveled by guard status:
@@ -116,12 +118,10 @@ def sarif_location(uri: Optional[str], line: Optional[int], message: Optional[st
 
 
 def build_result(
-    query_cmd: List[str],
-    graph: str,
     path_query: Dict[str, Any],
+    detail: Dict[str, Any],
     repo_root: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    detail = run_query(query_cmd, graph, "security-path", path_query["id"])
     summary = detail.get("summary") or {}
     guard = summary.get("guard") or {}
     steps = (detail.get("sections") or {}).get("path") or []
@@ -182,20 +182,43 @@ def build_result(
     return result
 
 
+def collect_paths(query_cmd: List[str], graph: str) -> List[Dict[str, Any]]:
+    """Return [{path_query, detail}] for every reachable path.
+
+    Prefers the batch `security-paths` query: it loads and materializes the graph
+    once, so N findings cost one graph load instead of N. Falls back to per-path
+    `security-path` calls when the installed engine predates the batch command
+    (the Action may install an older `lachesis-ref`).
+    """
+    try:
+        batch = run_query(query_cmd, graph, "security-paths")
+        entries = batch.get("paths")
+        if entries is not None:
+            return [
+                {"pq": {"id": e.get("id"), "label": e.get("label")},
+                 "detail": e.get("detail") or {}}
+                for e in entries
+            ]
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        pass  # older engine: fall back below
+    overview = run_query(query_cmd, graph, "overview")
+    security = (overview.get("manifest") or {}).get("security") or {}
+    return [
+        {"pq": pq, "detail": run_query(query_cmd, graph, "security-path", pq["id"])}
+        for pq in (security.get("path_queries") or [])
+    ]
+
+
 def build_sarif(
     graph: str,
     query_cmd: List[str],
     repo_root: Optional[str],
     changed: Optional[set],
 ) -> Dict[str, Any]:
-    overview = run_query(query_cmd, graph, "overview")
-    security = (overview.get("manifest") or {}).get("security") or {}
-    path_queries = security.get("path_queries") or []
-
     results: List[Dict[str, Any]] = []
     used_rules: Dict[str, Dict[str, str]] = {}
-    for pq in path_queries:
-        res = build_result(query_cmd, graph, pq, repo_root)
+    for entry in collect_paths(query_cmd, graph):
+        res = build_result(entry["pq"], entry["detail"], repo_root)
         if res is None:
             continue
         if changed is not None:
