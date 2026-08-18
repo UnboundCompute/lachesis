@@ -113,15 +113,23 @@ def run_pass(store, lang="c", lifetime_engine=None):
     if object_requested:
         object_result = analyze_object_lifetimes(
             store, F, succ, lang=lang, graph=analysis_graph)
+        # The projection already paid to materialize the disk graph. Reuse that same
+        # in-memory index for the legacy coverage fallback instead of issuing another
+        # whole-graph set of Kuzu scans merely to project CFG edges.
+        if analysis_graph is not store.graph:
+            from lachesis.nav.graph_store import GraphStore
+            fallback_store = GraphStore(analysis_graph)
+        else:
+            fallback_store = store
         diagnostics = object_result.diagnostics
         unsafe = set(diagnostics.get("unsafe_functions", ()))
         covered = set(F) - unsafe
         if requested == "shadow":
-            legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
+            legacy_leads = match_all(skeletons, cfg=cfg_bundle(fallback_store))
             leads, differential = _select_lifetime_leads(
                 legacy_leads, object_result.leads, requested, covered_entries=covered)
         else:
-            fallback_cfg = cfg_bundle(store) if unsafe else None
+            fallback_cfg = cfg_bundle(fallback_store) if unsafe else None
             legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, unsafe)
             leads, _ = _select_lifetime_leads(
                 legacy_leads, object_result.leads, requested, covered_entries=covered)
