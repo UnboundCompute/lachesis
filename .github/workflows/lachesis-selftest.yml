@@ -34,5 +34,4 @@ jobs:
           # Pin the engine to THIS branch so the install includes the batched
           # `security-paths` command the exporter needs. Revert to "main" (the
           # default) once this branch merges.
-          lachesis-ref: "feat/github-action"
           fail-on: "none"                      # smoke test: never fail the check
