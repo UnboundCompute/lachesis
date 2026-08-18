@@ -106,7 +106,8 @@ TOOL_ORDER = (
     "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "flow", "reaches", "sources_of", "points_to", "aliases",
-    "candidates", "candidate_detail", "candidate_census", "detect", "skeleton", "taint",
+    "candidates", "candidate_detail", "candidate_census", "skeleton",
+    "flow_pass", "flow_skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -219,6 +220,20 @@ class _Ctx:
             }
 
         return self._analysis("candidate-registry", build)
+
+    @property
+    def flow_bundle(self):
+        """The interprocedural flow pass over the whole graph, computed once and cached.
+
+        Composes per-function summaries bottom-up, renders the stitched cross-function flow
+        skeletons, and matches shape patterns over them. Reads the enriched graph only to
+        project the IR; every later stage touches the IR, not the graph.
+        """
+        def build():
+            from lachesis.flow.pipeline import run_pass
+            return run_pass(self.store)
+
+        return self._analysis("flow-pass", build)
 
 
 def ctx():
@@ -468,25 +483,6 @@ TOOLS = [
                     "frontiers. Use this to distinguish an empty result from missing coverage.",
      "inputSchema": {"type": "object", "properties": {
          "constructor_id": {"type": "string"}}}},
-    {"name": "detect",
-     "description": "Run the data-driven detector over the whole graph and list its leads. "
-                    "Where `candidates` is taint-blind (it enumerates obligation SITES), "
-                    "`detect` adds the taint half: it seeds every catalogued source, floods "
-                    "interprocedurally, and fires each sink through the evaluator its kind "
-                    "selects -- reachability (an attacker value reaches an injection/traversal "
-                    "sink), relational (a memory-copy length is BOTH attacker-influenced AND "
-                    "unbounded vs the destination's capacity, the capacity half taken from the "
-                    "`candidates` planner), or presence (a config-weakness call, e.g. weak "
-                    "crypto, taint-independent). Leads are FACTS, not adjudicated bugs: read "
-                    "provenance (`sources_of`/`reaches`) and confirm against source before "
-                    "trusting one. `census` counts every lead by evaluator and by kind so an "
-                    "empty family is visible. Relational leads carry the `candidate_id` of the "
-                    "matching capacity obligation for a drill-down. Filter with `evaluator` "
-                    "(reachability|relational|presence) or `kind` (a catalog sink kind).",
-     "inputSchema": {"type": "object", "properties": {
-         "evaluator": {"type": "string", "enum": ["reachability", "relational", "presence"]},
-         "kind": {"type": "string", "description": "a catalog sink kind, e.g. buffer-write"},
-         "limit": {"type": "integer", "default": 50}}}},
     {"name": "skeleton",
      "description": "Render a function's sink map as a pseudo-function: every catalogued sink "
                     "(all families -- memory, os, file, ...) shown in place, each annotated with "
@@ -503,6 +499,33 @@ TOOLS = [
          "function": {"type": "string", "description": "function name or node id"},
          "candidate_id": {"type": "string", "description": "candidate id; renders its "
                           "enclosing function"}}}},
+    {"name": "flow_pass",
+     "description": "Run the interprocedural flow pass (the 3rd pass) over the whole graph and "
+                    "return its per-function SUMMARY census -- the layer beneath the skeletons. "
+                    "For each function: its taxonomy, whether it is a taint source, the ordered "
+                    "sink-flow signatures (which value reaches which sink, guarded or not, and "
+                    "the callee it flows through), and the pointer lifetime signatures "
+                    "(alloc->use->free->escape). This is the composed, interprocedural summary "
+                    "the shape matcher runs on -- one call materializes and caches the pass. Use "
+                    "`function` to scope to one function; paginate with offset/limit.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string", "description": "scope the census to one function"}}}},
+    {"name": "flow_skeleton",
+     "description": "Interprocedural flow skeletons: compose per-function summaries into "
+                    "linear, nesting-aware {control|sink|lifecycle} streams STITCHED across "
+                    "call seams -- the cross-function flow a single-function `skeleton` cannot "
+                    "show -- then match shape patterns over them. Two skeleton kinds: REACH "
+                    "(a value's guard-nesting down the call chain to a sink; feeds the "
+                    "guarded-vs-unguarded size differential) and TYPESTATE (a pointer's ordered "
+                    "alloc/use/free/escape; feeds double-free / use-after-free / leak). Returns "
+                    "shape-matcher LEADS (not verdicts -- adjudicate with sources_of/reaches). "
+                    "No arg: every lead, source-rooted first. Pass `function` to scope to one "
+                    "entry and see its rendered skeletons; `kind` to filter reach|typestate.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string", "description": "entry function name; scopes skeletons "
+                      "and renders them"},
+         "kind": {"type": "string", "enum": ["reach", "typestate"],
+                  "description": "filter to one skeleton kind"}}}},
 ]
 
 # Every tool accepts an optional `format` ("text" compact | "json" full). Inject it
@@ -515,7 +538,7 @@ for _t in TOOLS:
             "description": "text (compact, default) | json (full result dict)"}
 # Paging fields on the list-shaped moves: they window the TEXT rendering only (JSON is
 # always the full, un-paged result), so a call on a 400-caller hub stays bounded.
-for _name in ("hubs", "callers", "callees"):
+for _name in ("hubs", "callers", "callees", "flow_pass", "flow_skeleton"):
     _tool = next(t for t in TOOLS if t["name"] == _name)
     _tool["inputSchema"]["properties"].update(
         offset={"type": "integer", "default": 0},
@@ -539,30 +562,6 @@ def _atropos_envelope(summary, *, full):
         "bind": per_language,
         "role_nodes": summary.get("role_nodes", {}),
     }
-
-
-def _capacity_index(registry):
-    """``{value_id: candidate_id}`` over every obligation the registry enumerates.
-
-    A relational detect lead names the value whose length is unbounded; that value is
-    an obligation the taint-blind candidate registry already keys by id, so this map
-    lets a lead cite the capacity candidate that carries the size/destination proof.
-    Reads the registry's cached results (candidate enumeration ran once for the bundle),
-    paging each constructor's full rows so no obligation is missed.
-    """
-    index = {}
-    for meta in registry.constructors:
-        cursor = None
-        while True:
-            page = registry.candidates(constructor=meta["id"], detail="full",
-                                       limit=200, cursor=cursor)
-            for row in page.get("candidates", ()):
-                for vid in ((row.get("handles") or {}).get("obligation_value_ids") or ()):
-                    index.setdefault(vid, row["candidate_id"])
-            cursor = page.get("next_cursor")
-            if not cursor:
-                break
-    return index
 
 
 def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
@@ -760,41 +759,6 @@ def call_tool(name, args, format=None):
         # rows are one census call away.
         result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
         return _emit(name, result, fmt, offset, limit)
-    if name == "detect":
-        bundle = c.candidate_bundle
-        summary = bundle["atropos"]
-        if not summary.get("applied"):
-            return _emit(name, {
-                "move": "detect", "applied": False, "reason": summary.get("reason"),
-                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
-                        "at ../atropos, then reload",
-            }, fmt, offset, limit)
-        from lachesis.detect.adapter import report as detect_report
-        from lachesis.detect.catalog import DetectionCatalogUnavailable
-        try:
-            rep = detect_report(bundle["stamped"], summary,
-                                registry=bundle["registry"],
-                                evaluator=args.get("evaluator"), kind=args.get("kind"))
-        except DetectionCatalogUnavailable as exc:
-            return _emit(name, {"move": "detect", "applied": False, "reason": str(exc),
-                                "hint": "atropos is present but carries no detection layer "
-                                        "(tools/detection.py); update the checkout"},
-                         fmt, offset, limit)
-        # A relational lead's value_id is a capacity obligation the taint-blind
-        # `candidates` registry already enumerated; point each such lead at its
-        # candidate_id so the caller can open the capacity proof behind the bound.
-        cap_index = _capacity_index(bundle["registry"])
-        rows = []
-        for ld in rep["leads"]:
-            row = dict(ld)
-            cand = cap_index.get(ld.get("value_id"))
-            if cand is not None:
-                row["candidate_id"] = cand
-            rows.append(row)
-        return _emit(name, {"move": "detect", "applied": True, "census": rep["census"],
-                            "returned": len(rows), "leads": rows,
-                            "atropos": _atropos_envelope(summary, full=False)},
-                     fmt, offset, limit)
     if name == "skeleton":
         bundle = c.candidate_bundle
         summary = bundle["atropos"]
@@ -818,6 +782,84 @@ def call_tool(name, args, format=None):
             return _emit(name, {"move": "skeleton",
                                 "error": "pass either `function` or `candidate_id`"}, fmt)
         result["move"] = "skeleton"
+        return _emit(name, result, fmt, offset, limit)
+    if name == "flow_pass":
+        bundle = c.flow_bundle
+        summaries, F = bundle["summaries"], bundle["F"]
+        fn = args.get("function")
+        names = [fn] if fn else sorted(summaries)
+        if fn and fn not in summaries:
+            return _emit(name, {"move": "flow_pass",
+                                "error": f"no function named {fn!r} in the pass"}, fmt)
+        rows = []
+        for nm in names:
+            s = summaries[nm]
+            flows = []
+            for f in s["sink_flows"]:
+                if not f["guarded"]:
+                    g = "UNGUARDED"
+                elif f.get("site_guarded"):
+                    g = "G[" + ",".join(f["guards"]) + "]"
+                else:
+                    g = "G~[" + ",".join(f["guards"]) + "]"
+                via = "" if f["via"] == "direct" else f"~{f['via']}"
+                val = f["value"] or f["provenance"] or "expr"
+                flows.append(f"{val}->{f['sink']}({g}){via}")
+            life = []
+            for v, evs in s.get("typestate", {}).items():
+                life.append(f"{v}:" + "->".join(e["kind"] for e in evs))
+            for v, evs in s.get("param_typestate", {}).items():
+                life.append(f"param {v}:" + "->".join(e["kind"] for e in evs))
+            rows.append({"name": nm, "taxonomy": s["taxonomy"],
+                         "is_source": F.get(nm, {}).get("is_source", False),
+                         "flows": flows, "lifetime": life,
+                         "frees": sorted(s.get("frees_params", {})),
+                         "returns": s.get("returns", "value")})
+        # Most-informative first: sources, then functions carrying flows, then the rest.
+        rows.sort(key=lambda r: (not r["is_source"], not r["flows"], r["name"]))
+        result = {
+            "move": "flow_pass",
+            "counts": {"functions": len(summaries),
+                       "with_flows": sum(1 for n in summaries if summaries[n]["sink_flows"]),
+                       "sources": sum(1 for n in summaries
+                                      if F.get(n, {}).get("is_source", False)),
+                       "skeletons": len(bundle["skeletons"]), "leads": len(bundle["leads"])},
+            "functions": rows,
+        }
+        return _emit(name, result, fmt, offset, limit)
+    if name == "flow_skeleton":
+        bundle = c.flow_bundle
+        all_skels, leads = bundle["skeletons"], bundle["leads"]
+        kind, fn = args.get("kind"), args.get("function")
+        skels = all_skels
+        _reach_pats = ("reachability", "relational", "presence")
+        if kind in ("reach", "typestate"):
+            skels = [s for s in skels if s["kind"] == kind]
+            want_reach = kind == "reach"
+            leads = [l for l in leads
+                     if (l.get("pattern") in _reach_pats) == want_reach]
+        if fn:
+            skels = [s for s in skels if s["entry"] == fn]
+            leads = [l for l in leads if l.get("entry") == fn]
+            if not skels and not leads:
+                return _emit(name, {"move": "flow_skeleton",
+                                    "error": f"no flow skeletons for entry {fn!r}"}, fmt)
+        result = {
+            "move": "flow_skeleton",
+            "counts": {"skeletons": len(all_skels),
+                       "reach": sum(1 for s in all_skels if s["kind"] == "reach"),
+                       "typestate": sum(1 for s in all_skels if s["kind"] == "typestate"),
+                       "leads": len(bundle["leads"])},
+            "leads": leads,
+        }
+        # Render skeleton text only when scoped -- the whole-graph stream would be huge.
+        if fn or kind:
+            from lachesis.flow import render_text as render_flow_skeleton
+            result["skeletons"] = [
+                {"entry": s["entry"], "kind": s["kind"], "sink": s.get("sink"),
+                 "var": s.get("var"), "is_source": s["is_source"],
+                 "complete": s.get("complete", True), "text": render_flow_skeleton(s)}
+                for s in sorted(skels, key=lambda x: (not x["is_source"], x["entry"]))]
         return _emit(name, result, fmt, offset, limit)
     if name == "taint":
         return _emit(name, _taint(c.store, args), fmt, offset, limit)
