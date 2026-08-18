@@ -139,10 +139,7 @@ def _rhs_kind(sub, ap_builder, norm, rhs):
 
 
 def _initializer(sub, declaration):
-    for edge in sub.idx.incoming_of_kind(declaration, "VALUE_FLOWS_TO"):
-        if _props(edge).get("reason") == "initializer":
-            return edge["source"]
-    return None
+    return sub.initializer_source.get(declaration)
 
 
 def _assignment_operands(sub, assignment):
@@ -369,7 +366,7 @@ class ObjectLifetimeResult:
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c"):
     """Run object-identity lifetime analysis over all defined functions in ``functions``."""
     started = perf_counter()
-    sub = Substrate(store.index).load()
+    sub = Substrate(store.index).load().load_initializers()
     norm = normalizer(lang)
     by_name = {}
     for node in store.index.nodes_of_kind("function", "method", "constructor"):

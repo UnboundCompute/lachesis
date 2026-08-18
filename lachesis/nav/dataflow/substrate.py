@@ -43,6 +43,8 @@ class Substrate:
         self.cfg_next = defaultdict(list)       # block -> [block]
         self.cfg_prev = defaultdict(list)
         self.cfg_nodes = set()
+        self.initializer_source = {}
+        self._initializers_loaded = False
         self._loaded = False
 
     # -- lazy bulk load --------------------------------------------------------
@@ -67,6 +69,16 @@ class Substrate:
             self.cfg_nodes.add(s)
             self.cfg_nodes.add(t)
         self._loaded = True
+        return self
+
+    def load_initializers(self):
+        """Bulk-index declaration initializers once instead of one edge query per VarDecl."""
+        if self._initializers_loaded:
+            return self
+        for edge in self.idx.edges_of_kind("VALUE_FLOWS_TO"):
+            if (edge.get("properties", {}).get("reason") == "initializer"):
+                self.initializer_source.setdefault(edge["target"], edge["source"])
+        self._initializers_loaded = True
         return self
 
     def role_children(self, node, role):
