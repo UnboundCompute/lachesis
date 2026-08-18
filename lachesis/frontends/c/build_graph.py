@@ -1054,6 +1054,15 @@ def main() -> int:
             return {"role": ("CONDITION", "TRUE_BRANCH", "FALSE_BRANCH")[min(index, 2)]}
         if kind in {"WhileStmt", "DoStmt"}:
             return {"role": "CONDITION" if index == 0 else "LOOP_BODY"}
+        if kind == "ForStmt":
+            # Clang emits a fixed 5-slot ForStmt layout, padding absent slots with a
+            # null placeholder that yields no node: [init, cond-var, cond, inc, body].
+            # So the index is stable regardless of which parts the source omits.
+            # Tag the two slots the control-flow overlay consumes -- CONDITION (the
+            # loop head) and LOOP_BODY (from which it derives the LOOP_BACK edge),
+            # exactly as while/do above. Init and increment stay AST_CHILD (the
+            # overlay sequences from the ForStmt statement itself, as for while/do).
+            return {"role": {2: "CONDITION", 4: "LOOP_BODY"}.get(index, "AST_CHILD")}
         return {"role": "AST_CHILD"}
 
     def control_kind(kind: str) -> Optional[str]:
