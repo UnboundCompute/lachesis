@@ -47,7 +47,7 @@ def _is_symbol(s):
 class Normalizer:
     """Canonicalizes IR names from one language's form profile. Cheap; build once per lang."""
 
-    def __init__(self, lang="c"):
+    def __init__(self, lang="c", *, extra_alloc=(), extra_dealloc=()):
         self.lang = lang
         prof = atropos.normalization_profile(lang) or {}
         # Merge EVERY '*_aliases' section into one callee-rewrite table (convention, not
@@ -80,6 +80,16 @@ class Normalizer:
         cat = atropos.sink_catalog(lang)
         self.alloc_names = {m for m, c in cat.items()
                             if c.get("family") in alloc_kinds} | alloc_extra
+        # Per-target manifest facts (project.memory.alloc/free) extend the catalog
+        # vocabulary for this run only. A target's own allocator/free wrappers
+        # (Curl_safefree, talloc_free, ...) are named here so the typestate skeleton
+        # emits their lifecycle events -- the highest-recall lever the manifest adds.
+        # They are canonical surface names, so they join the post-canonicalization sets
+        # directly (canon of an unmapped name is itself).
+        self.alloc_names |= {n for n in extra_alloc if _is_symbol(n)}
+        self.dealloc_names |= {n for n in extra_dealloc if _is_symbol(n)}
+        self.manifest_alloc = tuple(n for n in extra_alloc if _is_symbol(n))
+        self.manifest_dealloc = tuple(n for n in extra_dealloc if _is_symbol(n))
 
     def is_alloc(self, callee):
         """True if `callee` allocates an owned object (a lifecycle alloc event source)."""
@@ -106,7 +116,9 @@ class Normalizer:
         """Small dict describing what this normalizer will apply -- for a coverage line."""
         return {"lang": self.lang, "alias_sections": sorted(self.alias_sections),
                 "callee_rewrites": len(self.callee_rewrites), "opaque_kinds": len(self.opaque),
-                "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names)}
+                "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names),
+                "manifest_alloc": list(self.manifest_alloc),
+                "manifest_dealloc": list(self.manifest_dealloc)}
 
 
 _CACHE = {}
@@ -117,3 +129,15 @@ def normalizer(lang="c"):
     if lang not in _CACHE:
         _CACHE[lang] = Normalizer(lang)
     return _CACHE[lang]
+
+
+def normalizer_with(lang="c", extra_alloc=(), extra_dealloc=()):
+    """A Normalizer for *lang*, extended with per-target manifest alloc/free names.
+
+    With no extras this is the shared cached instance. With extras it is a fresh,
+    UNCACHED instance -- the global cache stays keyed on language only, so one run's
+    manifest never leaks its custom vocabulary into another run's normalizer."""
+    if not extra_alloc and not extra_dealloc:
+        return normalizer(lang)
+    return Normalizer(lang, extra_alloc=tuple(extra_alloc),
+                      extra_dealloc=tuple(extra_dealloc))

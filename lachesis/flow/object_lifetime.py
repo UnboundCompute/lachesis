@@ -20,7 +20,7 @@ from lachesis.nav.dataflow.ap_construct import APBuilder
 from lachesis.nav.dataflow.reaching_def import ReachingDef
 from lachesis.nav.dataflow.substrate import Substrate
 
-from .normalize import normalizer
+from .normalize import normalizer, normalizer_with
 from .object_state import (
     AbstractState,
     AccessPath,
@@ -38,6 +38,11 @@ _CASTS = {
     "CXXStaticCastExpr", "CXXReinterpretCastExpr", "CXXFunctionalCastExpr",
 }
 _NULL_KINDS = {"GNUNullExpr", "CXXNullPtrLiteralExpr"}
+
+# Per-node disjunct cap for the object-state solver. 32 (not 64) is tuned: see
+# ``_analyze_prepared`` for why earlier widening raises recall on looping functions.
+# A manifest ``analysis.disjunct_cap`` overrides it per run.
+_DEFAULT_MAX_DISJUNCTS = 32
 
 
 def _props(item):
@@ -350,21 +355,25 @@ def _initial_state(cfg, operations):
     return initial
 
 
-def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
+def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, cfg,
+                 max_disjuncts=_DEFAULT_MAX_DISJUNCTS):
     prepared = _prepare_summary(
-        sub, norm, function_id, function_ir, all_functions, summaries, cfg)
+        sub, norm, function_id, function_ir, all_functions, summaries, cfg, max_disjuncts)
     return _analyze_prepared(prepared)
 
 
-def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
+def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summaries, cfg,
+                     max_disjuncts=_DEFAULT_MAX_DISJUNCTS):
     operations = extract_operations(
         sub, norm, function_id, function_ir, all_functions, summaries, cfg)
-    return cfg["nodes"], cfg["succ"], operations, _initial_state(cfg, operations)
+    # max_disjuncts rides INSIDE the prepared tuple so it survives the pickle to a worker
+    # process -- a module global would reset to its default on spawn re-import.
+    return cfg["nodes"], cfg["succ"], operations, _initial_state(cfg, operations), max_disjuncts
 
 
 def _analyze_prepared(prepared):
     """Pure, pickleable solver boundary used by process workers."""
-    nodes, successors, operations, initial = prepared
+    nodes, successors, operations, initial, max_disjuncts = prepared
     # 32 disjuncts/node (not 64): a fully-wired CFG closes every loop's def-use cycle,
     # so a looping function accumulates disjuncts across the back-edge until widening
     # fires. At 64 the widening fired so late that small pipeline-walk functions blew
@@ -372,7 +381,8 @@ def _analyze_prepared(prepared):
     # Widening sooner makes them converge within budget; the join is an over-
     # approximation, so recall (uncapped functions) rises at a marginal precision cost,
     # which is the right trade for a finder (capping is a guaranteed false negative).
-    result = ObjectStateAnalyzer(max_disjuncts=32).analyze(
+    # A manifest may override the cap; the default stays 32 for the reasons above.
+    result = ObjectStateAnalyzer(max_disjuncts=max_disjuncts).analyze(
         nodes, successors, operations, initial=initial)
     alternatives = {state.trace for state in result.exit_states}
     return tuple(sorted(alternatives, key=repr)), result
@@ -438,16 +448,23 @@ class ObjectLifetimeResult:
     diagnostics: dict
 
 
-def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None):
-    """Run object-identity lifetime analysis over all defined functions in ``functions``."""
+def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None,
+                             extra_alloc=(), extra_dealloc=(), max_disjuncts=None):
+    """Run object-identity lifetime analysis over all defined functions in ``functions``.
+
+    ``extra_alloc`` / ``extra_dealloc`` are per-target manifest ``memory.alloc`` /
+    ``memory.free`` names: they extend the lifecycle vocabulary this run recognizes so a
+    project's own allocator/free wrappers emit typestate events. ``max_disjuncts`` overrides
+    the solver's per-node disjunct cap (``None`` keeps the tuned default)."""
     started = perf_counter()
+    disjunct_cap = _DEFAULT_MAX_DISJUNCTS if max_disjuncts is None else max_disjuncts
     if graph is not None and graph is not store.graph:
         from lachesis.nav.graph_store import GraphStore
         analysis_store = GraphStore(graph)
     else:
         analysis_store = store
     sub = Substrate(analysis_store.index).load().load_initializers()
-    norm = normalizer(lang)
+    norm = normalizer_with(lang, extra_alloc, extra_dealloc)
     function_node_ids = [node_id for kind in ("function", "method", "constructor")
                          for node_id in getattr(analysis_store.index, "by_kind", {}).get(kind, ())]
     sub.warm_nodes(function_node_ids)
@@ -496,7 +513,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                     continue
                 name = analysable[0]
                 prepared = _prepare_summary(
-                    sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
+                    sub, norm, by_name[name], functions[name], functions, summaries,
+                    cfgs[name], disjunct_cap)
                 future = (executor.submit(_analyze_prepared, prepared)
                           if executor is not None else None)
                 pending.append((name, prepared, future))
@@ -527,7 +545,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                         break
                     summary, result = _summary_for(
                         sub, norm, by_name[name], functions[name], functions,
-                        summaries, cfgs[name])
+                        summaries, cfgs[name], disjunct_cap)
                     summary_runs[name] += 1
                     summary_transfers += result.transfers
                     artifacts[name] = result
