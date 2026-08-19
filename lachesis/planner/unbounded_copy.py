@@ -792,21 +792,41 @@ class MemoryCopyCapacity:
             owner_id = call_props.get("owner_function_id")
             # Prefer the argument recovered from the faithful callsite label; the
             # value node's own label is sometimes comment/AST-kind noise (A12).
-            recovered = arg_from_callsite(call.get("label"), props.get("access_path"))
+            # A callsite whose own label is comment/AST noise -- a sink mislocated
+            # onto a file-header comment (start_line 1, label `/* Copyright ... */`)
+            # -- cannot yield a faithful argument spelling. Recovering from it only
+            # fabricates expressions from stray comment fragments ("the \"License\"")
+            # and, worse, invents a destination the rank then trusts. Treat such a
+            # callsite as unresolved rather than emitting that noise as real source.
+            call_label = call.get("label")
+            faithful = bool(call_label) and not looks_like_leaked_label(call_label)
+            recovered = (arg_from_callsite(call_label, props.get("access_path"))
+                         if faithful else None)
             value_label = self._label(value_id)
             if recovered:
                 expression, expression_origin = recovered, "callsite-argument"
-            else:
+            elif faithful:
+                # Faithful callsite but the argument index did not resolve: fall
+                # back to the value node's own label. It may still be AST/comment
+                # noise, which syntactic_shape flags "unknown" -- recorded, not
+                # fabricated away.
                 expression, expression_origin = value_label, "value-node-label"
+            else:
+                # The callsite itself is comment/AST noise (a sink mislocated onto
+                # a file-header comment): nothing here is faithful source, so it is
+                # unresolved rather than a "the \"License\"" fragment posing as one.
+                expression, expression_origin = None, "unresolved-callsite"
             shape = syntactic_shape(expression)
             dests = destinations.get(callsite_id, ())
             dest_values = [d["properties"].get("value_id") for d in dests]
             # Recover destinations from the callsite too, so a leaked value-node
-            # label can't corrupt the destination or the rank it feeds.
+            # label can't corrupt the destination or the rank it feeds. An
+            # unfaithful callsite recovers no destination at all -- an empty list is
+            # honest where a fabricated buffer name would mislead the judge.
             dest_expressions = [
-                arg_from_callsite(call.get("label"), d["properties"].get("access_path"))
+                arg_from_callsite(call_label, d["properties"].get("access_path"))
                 or self._label(d["properties"].get("value_id"))
-                for d in dests]
+                for d in dests] if faithful else []
             confidence = props.get("confidence", "medium")
             model_cwe = props.get("cwe", [])
             obligation_cwe = set(self.metadata.get("obligation_cwe", ()))

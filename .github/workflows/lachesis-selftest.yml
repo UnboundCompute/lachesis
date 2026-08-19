@@ -31,8 +31,8 @@ jobs:
           # query (one graph load for all findings), so --enrich is unnecessary:
           # the single load folds the dataflow tier once anyway.
           analyze-args: "--prune --incremental"
-          # Pin the engine to THIS branch so the install includes the batched
-          # `security-paths` command the exporter needs. Revert to "main" (the
-          # default) once this branch merges.
-          lachesis-ref: "feat/github-action"
+          # Drop the bundled test fixtures from the report: they carry deliberate
+          # guard differentials (the smoke-test 3 error + 3 note), which would
+          # otherwise drown the real findings in Lachesis's own source.
+          exclude: "lachesis/frontends/typescript/fixtures"
           fail-on: "none"                      # smoke test: never fail the check

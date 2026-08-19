@@ -76,6 +76,34 @@ def _find_file_node(gl: GraphLib, *, path: str | None, file_id: str | None) -> d
     return fallback
 
 
+def _node_paths(gl: GraphLib, node: dict) -> set[str]:
+    """The normalized full-path forms a node carries — its `file` and its
+    `absolute_file`. Basenames are deliberately excluded: this set is for
+    same-file identity, where a bare basename is too weak to trust."""
+    out: set[str] = set()
+    for raw in (gl.prop(node, "file"), gl.prop(node, "absolute_file")):
+        norm = _norm(raw)
+        if norm:
+            out.add(norm)
+    return out
+
+
+def _same_file(a: set[str], b: set[str]) -> bool:
+    """Whether two path key-sets denote the same source file, tolerant of an
+    absolute-vs-relative convention split. Frontends do not always record the
+    path the same way on a file node and on the declarations inside it (the C
+    frontend keeps the file node repo-relative — `lib/easy.c` — but stamps each
+    declaration with an absolute `file`), so a raw string compare would group
+    zero declarations. Match on a path boundary instead: equal after
+    normalization, or one a path-suffix of the other (…/curl/lib/easy.c ⊇
+    lib/easy.c). The leading "/" keeps it a real suffix, never a basename glob."""
+    for x in a:
+        for y in b:
+            if x == y or x.endswith("/" + y) or y.endswith("/" + x):
+                return True
+    return False
+
+
 def _edge(source: str, target: str, kind: str, extra: dict | None = None,
           display: str | None = None) -> dict:
     props = {"display": display or edge_names.verb(kind)}
@@ -114,11 +142,15 @@ def build_file_graph(gl: GraphLib, file_node: dict, include_external: bool = Fal
         edges.append(_edge(file_id, tgt["id"], edge["kind"],
                            extra={"specifier": specifier}))
 
-    # 2. declarations owned by this file (complete: grouped on the `file` property)
+    # 2. declarations owned by this file. Group on path identity rather than a
+    # raw `file` string compare: file nodes and their declarations can record
+    # the path under different conventions (relative vs absolute), and a plain
+    # `!=` would drop every declaration. See _same_file.
+    file_paths = _node_paths(gl, file_node)
     my_decls: set[str] = set()
     for kind in DECL_KINDS:
         for decl in gl.index.nodes_of_kind(kind):
-            if gl.prop(decl, "file") != path:
+            if not _same_file(file_paths, _node_paths(gl, decl)):
                 continue
             my_decls.add(decl["id"])
             _, line, _ = gl.loc(decl)

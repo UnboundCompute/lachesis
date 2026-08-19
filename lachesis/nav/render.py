@@ -321,8 +321,101 @@ def _generic(tool_name: str, result: dict, offset: int, limit: int) -> str:
     return "\n".join(lines)
 
 
+def _r_flow_pass(result: dict, offset: int, limit: int) -> str:
+    """Per-function summary census from the flow pass -- the layer beneath the skeletons."""
+    if "error" in result:
+        return f"error: {result['error']}"
+    c = result.get("counts", {})
+    lines = ["FLOW_PASS",
+             f"counts: {c.get('functions', 0)} functions "
+             f"({c.get('sources', 0)} sources, {c.get('with_flows', 0)} carry flows), "
+             f"{c.get('skeletons', 0)} skeletons, {c.get('leads', 0)} leads"]
+    lifetime = result.get("lifetime", {})
+    if lifetime:
+        differential = lifetime.get("differential", {})
+        lines.append(
+            f"lifetime-engine: {lifetime.get('active', 'legacy')} "
+            f"(legacy={differential.get('legacy', 0)}, "
+            f"object={differential.get('object', 0)}, "
+            f"legacy-only={differential.get('legacy_only', 0)}, "
+            f"object-only={differential.get('object_only', 0)})")
+    rows = result.get("functions", [])
+    window, footer = _window(rows, offset, limit)
+    lines.append(f"functions ({len(rows)}):")
+    for r in window:
+        tag = r.get("taxonomy", "")
+        src = " src" if r.get("is_source") else ""
+        bits = list(r.get("flows", [])) + [f"[{s}]" for s in r.get("lifetime", [])]
+        if r.get("frees"):
+            bits.append("frees:" + ",".join(r["frees"]))
+        if r.get("returns") == "alloc":
+            bits.append("returns:alloc")
+        body = "; ".join(bits) if bits else "-"
+        lines.append(f"    {r.get('name',''):18} {tag:8}{src}  {body}")
+    if footer:
+        lines.append(footer)
+    return "\n".join(lines)
+
+
+def _r_flow_skeleton(result: dict, offset: int, limit: int) -> str:
+    """Flow-pass view: whole-graph counts, shape leads, and any scoped skeleton text.
+
+    Leads split into the single-node reach differential (guarded vs unguarded size/injection
+    sinks) and the temporal lifetime shapes (double-free / use-after-free / leak)."""
+    if "error" in result:
+        return f"error: {result['error']}"
+    c = result.get("counts", {})
+    lines = ["FLOW_SKELETON",
+             f"counts: {c.get('skeletons', 0)} skeletons "
+             f"({c.get('reach', 0)} reach, {c.get('typestate', 0)} typestate), "
+             f"{c.get('leads', 0)} leads"]
+    lifetime = result.get("lifetime", {})
+    if lifetime:
+        diagnostics = lifetime.get("diagnostics", {})
+        lines.append(
+            f"lifetime-engine: {lifetime.get('active', 'legacy')} "
+            f"({diagnostics.get('analyzed', 0)} functions, "
+            f"{diagnostics.get('unplaced', 0)} unplaced, "
+            f"{len(diagnostics.get('capped', []))} capped)")
+
+    leads = result.get("leads", [])
+    reach = [l for l in leads if l.get("pattern") in ("reachability", "relational", "presence")]
+    temporal = [l for l in leads if l not in reach]
+    if reach:
+        window, footer = _window(
+            sorted(reach, key=lambda x: (not x.get("is_source"), x.get("entry", ""))),
+            offset, limit)
+        lines.append(f"reach leads ({len(reach)}):")
+        for l in window:
+            g = "GUARDED  " if l.get("guarded") else "UNGUARDED"
+            src = "src " if l.get("is_source") else "    "
+            lines.append(f"    {src}{l.get('pattern',''):11} {g} "
+                         f"{l.get('entry',''):16} {l.get('at',''):20} ({l.get('value')})")
+        if footer:
+            lines.append(footer)
+    if temporal:
+        lines.append(f"lifetime leads ({len(temporal)}):")
+        for l in temporal:
+            ln = f"@{l['line']}" if l.get("line") else ""
+            lines.append(f"    {l.get('pattern',''):16} {l.get('entry',''):16} "
+                         f"{l.get('var','')}{ln}")
+
+    skels = result.get("skeletons")
+    if skels:
+        window, footer = _window(skels, offset, limit)
+        lines.append(f"skeletons ({len(skels)}):")
+        for s in window:
+            lines.append("")
+            lines.append(s.get("text", ""))
+        if footer:
+            lines.append(footer)
+    return "\n".join(lines)
+
+
 _TEMPLATES = {
     "hubs": lambda r, o, l: _r_hubs(r, o, l),
+    "flow_pass": lambda r, o, l: _r_flow_pass(r, o, l),
+    "flow_skeleton": lambda r, o, l: _r_flow_skeleton(r, o, l),
     "callers": lambda r, o, l: _r_moves(r, "callers", o, l),
     "callees": lambda r, o, l: _r_moves(r, "callees", o, l),
     "search": lambda r, o, l: _r_search(r, o, l),

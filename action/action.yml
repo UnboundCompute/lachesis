@@ -23,6 +23,9 @@ inputs:
   changed-files:
     description: "Optional space/comma-separated list; when set, only findings in these files are reported."
     default: ""
+  exclude:
+    description: "Optional space/comma-separated paths/globs; findings under these (e.g. a fixtures or vendor dir) are dropped."
+    default: ""
   upload:
     description: "Upload the SARIF to GitHub code scanning (needs security-events: write)."
     default: "true"
@@ -69,6 +72,9 @@ runs:
         ARGS=()
         if [ -n "${{ inputs.changed-files }}" ]; then
           ARGS+=(--changed-files "${{ inputs.changed-files }}")
+        fi
+        if [ -n "${{ inputs.exclude }}" ]; then
+          ARGS+=(--exclude "${{ inputs.exclude }}")
         fi
         python3 "$GITHUB_ACTION_PATH/sarif_export.py" \
           "$RUNNER_TEMP/lachesis.kuzu" \
