@@ -29,7 +29,8 @@ jobs:
           # Test the engine at this repo's own HEAD, not the Action's default main.
           lachesis-ref: ${{ github.sha }}
           analyze-args: "--prune --incremental"
-          # Drop the bundled test fixtures from the report: they carry deliberate
-          # guard differentials that would otherwise drown the real findings.
-          exclude: "lachesis/frontends/typescript/fixtures"
+          # Drop every bundled test fixture from the report (c/python/typescript
+          # frontends + planner): they carry deliberate guard differentials that
+          # would otherwise drown the real findings in Lachesis's own source.
+          exclude: "**/fixtures/**"
           fail-on: "none"                      # smoke test: never fail the check
