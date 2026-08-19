@@ -574,21 +574,42 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         # second time just to collect the same local findings.
         diagnostics["analyzed"] += 1
         diagnostics["unplaced"] += len(result.unplaced)
-        if result.unplaced:
-            diagnostics["unplaced_functions"][name] = len(result.unplaced)
+        # Only a dropped *state-changing* op (a free/alloc/reset we could not place)
+        # leaves the summary untrustworthy: it may hide a free (missed double-free in a
+        # caller) or a reset (a live object we would wrongly call freed). A dropped USE
+        # can only cost a read — a false negative — so it must not mark the function
+        # unsafe and poison every caller that passes an object through it.
+        state_changing = sum(1 for op in result.unplaced if op.kind is not OpKind.USE)
+        if state_changing:
+            diagnostics["unplaced_functions"][name] = state_changing
         diagnostics["widenings"] += result.widenings
         diagnostics["transfers"] += result.transfers
         if result.capped:
             diagnostics["capped"].append(name)
+        # One lead per (object, pattern): a loop-carried free floods the freed state
+        # around the back-edge, so the same bug otherwise surfaces at every later
+        # free/use of that object (187 findings for one image double-free in a decoder
+        # main). Collapse to the earliest site -- the representative, root-cause-nearest
+        # occurrence -- and keep a count so the volume is visible without the noise.
+        best: dict[tuple, dict] = {}
         for finding in sorted(result.findings):
             root_id = finding.path.root.removeprefix("decl:")
             root = sub.label(root_id) or root_id
             suffix = "".join(finding.path.selectors)
-            leads.append({
-                "pattern": finding.pattern, "var": root + suffix, "root": root,
-                "entry": name, "line": finding.line, "node": finding.node,
-                "engine": "object-identity",
-            })
+            key = (finding.pattern, root + suffix)
+            existing = best.get(key)
+            if existing is None:
+                best[key] = {
+                    "pattern": finding.pattern, "var": root + suffix, "root": root,
+                    "entry": name, "line": finding.line, "node": finding.node,
+                    "engine": "object-identity", "sites": 1,
+                }
+            else:
+                existing["sites"] += 1
+                if finding.line is not None and (
+                        existing["line"] is None or finding.line < existing["line"]):
+                    existing["line"], existing["node"] = finding.line, finding.node
+        leads.extend(best[key] for key in sorted(best))
 
     # A function is *seed*-unsafe when its own analysis is untrustworthy (no CFG,
     # capped worklist, dropped ops). That set propagates UP the call graph, because a
