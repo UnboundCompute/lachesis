@@ -424,6 +424,7 @@ class ObjectStateAnalyzer:
         incoming[nodes[0]][seed.key()] = seed
         work = deque([nodes[0]])
         queued = {nodes[0]}
+        widened: set[Hashable] = set()
         findings: set[Finding] = set()
         transfers = widenings = 0
         cap = self.transfer_cap or max(10000, len(nodes) * 500)
@@ -436,17 +437,25 @@ class ObjectStateAnalyzer:
             for successor in successors.get(node, ()):
                 if successor not in incoming:
                     continue
-                changed = False
+                before = set(incoming[successor])
                 for key, state in outgoing.items():
-                    if key not in incoming[successor]:
-                        incoming[successor][key] = state
-                        changed = True
-                if len(incoming[successor]) > self.max_disjuncts:
+                    incoming[successor].setdefault(key, state)
+                # Sticky widening: once a node's disjunct budget is exceeded it stays
+                # collapsed to a single joined state, and every later update joins into
+                # that state instead of re-expanding. Without this a loop node oscillates
+                # -- widen to one state, re-expand past the budget from the back-edge,
+                # widen again -- burning the whole transfer budget and capping the
+                # function. Collapsing monotonically bounds the lattice height so the
+                # fixpoint terminates; the join is a sound may-approximation.
+                if len(incoming[successor]) > self.max_disjuncts or successor in widened:
                     merged = join_states(incoming[successor].values(), successor)
                     incoming[successor] = {merged.key(): merged}
+                    if successor not in widened:
+                        widened.add(successor)
                     widenings += 1
-                    changed = True
-                if changed and successor not in queued:
+                # Re-queue only when the successor's state set actually changed; a
+                # collapsed node that re-joins to the same key has reached its fixpoint.
+                if set(incoming[successor]) != before and successor not in queued:
                     work.append(successor)
                     queued.add(successor)
 
