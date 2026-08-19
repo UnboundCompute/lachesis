@@ -116,14 +116,19 @@ class AbstractState:
         facts: Mapping[ObjectId, frozenset[ObjectFact]] | None = None,
         slots: Mapping[tuple[ObjectId, str], ObjectId] | None = None,
         trace: Sequence[ParamEffect] = (),
+        freed_paths: Mapping[AccessPath, ObjectId] | None = None,
     ):
         self.env = dict(env or {})
         self.facts = dict(facts or {})
         self.slots = dict(slots or {})
         self.trace = tuple(trace)
+        # Pointer-field paths freed on this path but not yet reassigned. Book-keeping for
+        # the free-then-reallocate compensation; almost always empty between statements.
+        self.freed_paths = dict(freed_paths or {})
 
     def clone(self) -> "AbstractState":
-        return AbstractState(self.env, self.facts, self.slots, self.trace)
+        return AbstractState(self.env, self.facts, self.slots, self.trace,
+                             self.freed_paths)
 
     def key(self) -> tuple:
         # These mappings are mathematical sets for state-equivalence purposes.
@@ -136,6 +141,7 @@ class AbstractState:
             frozenset(self.facts.items()),
             frozenset(self.slots.items()),
             self.trace,
+            frozenset(self.freed_paths.items()),
         )
 
     def seed_parameter(self, path: AccessPath, position: int) -> None:
@@ -225,15 +231,35 @@ class AbstractState:
         self.facts[recent] = frozenset({fact})
         self.bind(op.target, recent)
 
+    def _compensate_reassignment(self, op: Operation) -> None:
+        # A reassignment THROUGH a pointer parameter -- a fresh allocation, a null-out,
+        # or a pointer copy (``p->buf = realloc(...)`` / ``= NULL`` / ``= tmp``) -- of a
+        # path this analysis has already freed restores a caller-visible live (or NULL)
+        # object: the caller no longer holds a dangling pointer. Record a compensating
+        # ALLOC so a free-then-reallocate idiom is not read as a loop-carried double-free
+        # once the summary is instantiated at a callsite. Keyed on the freed access path
+        # (not the current object id), so it survives the local rebinding the reassignment
+        # itself performs, and on the FIRST reassignment only. A bare-root parameter (no
+        # selectors) is by-value -- the caller's own pointer still dangles -- so it is
+        # never tracked here and its free stays visible.
+        if op.target is None or not op.target.selectors:
+            return
+        freed_param = self.freed_paths.pop(op.target, None)
+        if freed_param is not None:
+            self._record_param_effect(OpKind.ALLOC, freed_param)
+
     def apply(self, op: Operation, findings: set[Finding]) -> None:
         if op.kind == OpKind.ALLOC:
+            self._compensate_reassignment(op)
             self._fresh(op, ObjectFact.ALLOCATED)
             return
         if op.kind == OpKind.CLOBBER:
+            self._compensate_reassignment(op)
             self._fresh(op, ObjectFact.NULL if op.is_null else ObjectFact.UNKNOWN)
             return
         if op.kind == OpKind.COPY:
             assert op.target is not None and op.source is not None
+            self._compensate_reassignment(op)
             self.bind(op.target, self.resolve(op.source, create=True))
             return
         if op.kind not in (OpKind.FREE, OpKind.USE):
@@ -244,6 +270,11 @@ class AbstractState:
         if oid is None:
             return
         self._record_param_effect(op.kind, oid)
+        if (op.kind == OpKind.FREE and op.target is not None and op.target.selectors
+                and isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
+            # Remember the freed pointer-field so a later reassignment through it
+            # (see _compensate_reassignment) can net the summary back to live.
+            self.freed_paths[op.target] = oid
         facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
         # A summary object (identity formed through a variable subscript) may-be-freed
         # abstracts distinct concrete cells; a repeat free/use of it is not a proven
@@ -319,6 +350,12 @@ def join_states(states: Iterable[AbstractState], node: Hashable) -> AbstractStat
             if trace.count(effect) < 2 and len(trace) < AbstractState.TRACE_LIMIT:
                 trace.append(effect)
     joined.trace = tuple(trace)
+    # A pending free-not-yet-reassigned in any branch stays pending in the join, so a
+    # reassignment after the join still nets the summary to live (param oids are stable
+    # under the phi renaming, being keyed on position/selectors, not object identity).
+    for state in ordered:
+        for path, param_oid in state.freed_paths.items():
+            joined.freed_paths.setdefault(path, param_oid)
     return joined
 
 

@@ -7,6 +7,7 @@ from .object_state import (
     ObjectStateAnalyzer,
     OpKind,
     Operation,
+    ParamEffect,
     join_states,
 )
 
@@ -129,6 +130,29 @@ class ObjectStateTests(unittest.TestCase):
             op(OpKind.ALLOC, "alloc", P), summary, op(OpKind.USE, "use", P),
         ])
         self.assertEqual({finding.pattern for finding in result.findings}, {"use-after-free"})
+
+    def test_realloc_through_pointer_field_nets_to_live_in_summary(self):
+        # free(p->buf); p->buf = realloc(...) -- a store *through* the pointer parameter.
+        # The compensating ALLOC must join the trace so the caller sees a live object,
+        # not a free-only summary that reads as a loop-carried double-free.
+        state = AbstractState()
+        state.seed_parameter(P, 0)
+        buf = P.child("->buf")
+        state.apply(op(OpKind.FREE, "free", buf), set())
+        state.apply(op(OpKind.ALLOC, "realloc", buf), set())
+        self.assertEqual(state.trace, (
+            ParamEffect(OpKind.FREE, 0, ("->buf",)),
+            ParamEffect(OpKind.ALLOC, 0, ("->buf",)),
+        ))
+
+    def test_free_then_reassign_bare_param_stays_freed(self):
+        # free(p); p = malloc(...) reassigns a by-value parameter -- the caller's own
+        # pointer still dangles, so the free must remain visible (no compensating ALLOC).
+        state = AbstractState()
+        state.seed_parameter(P, 0)
+        state.apply(op(OpKind.FREE, "free", P), set())
+        state.apply(op(OpKind.ALLOC, "malloc", P), set())
+        self.assertEqual(state.trace, (ParamEffect(OpKind.FREE, 0, ()),))
 
     def test_unplaced_operation_is_reported(self):
         missing = op(OpKind.FREE, "missing", P)
