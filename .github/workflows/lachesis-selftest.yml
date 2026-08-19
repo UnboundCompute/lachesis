@@ -1,6 +1,7 @@
-# Dogfood: run the Lachesis Action on this repo's own bundled fixture.
-# The fixture has a known guard differential, so a healthy run produces
-# 3 `error` + 3 `note` alerts in the Security tab — a deterministic smoke test.
+# Dogfood: run the published Lachesis Action on this repo's own source.
+# Lachesis analyzing itself. A healthy run surfaces the guard differentials in
+# its own tree (fixtures excluded) into the Security tab as a deterministic
+# smoke test. The Action itself lives at UnboundCompute/lachesis-action.
 name: lachesis-selftest
 
 on:
@@ -9,7 +10,6 @@ on:
     branches: [main]        # establish the default-branch baseline (what the Security tab shows by default)
   pull_request:
     paths:
-      - "action/**"
       - ".github/workflows/lachesis-selftest.yml"
 
 jobs:
@@ -21,18 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./action        # the copy on this branch, not a published tag
+      - uses: UnboundCompute/lachesis-action@v1   # the published Marketplace action
         with:
-          # Scan the whole repo (Python + TypeScript + C), not just the fixture.
-          # Heavier than the fixture-only run and less deterministic, but this is
-          # the real dogfood: Lachesis analyzing its own source.
+          # Scan the whole repo (Python + TypeScript + C), not just a fixture:
+          # the real dogfood is Lachesis analyzing its own source.
           source: "."
-          # Light build. The export step now uses the batched `security-paths`
-          # query (one graph load for all findings), so --enrich is unnecessary:
-          # the single load folds the dataflow tier once anyway.
+          # Test the engine at this repo's own HEAD, not the Action's default main.
+          lachesis-ref: ${{ github.sha }}
           analyze-args: "--prune --incremental"
           # Drop the bundled test fixtures from the report: they carry deliberate
-          # guard differentials (the smoke-test 3 error + 3 note), which would
-          # otherwise drown the real findings in Lachesis's own source.
+          # guard differentials that would otherwise drown the real findings.
           exclude: "lachesis/frontends/typescript/fixtures"
           fail-on: "none"                      # smoke test: never fail the check

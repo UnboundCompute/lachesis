@@ -2,6 +2,10 @@
 
 **A compiler-precise code graph you can ask questions about: how data moves, who calls what, what reaches a sink. C, Python, and TypeScript, all in one graph.**
 
+[![Lachesis](https://img.shields.io/badge/security-Lachesis-8250df)](https://github.com/UnboundCompute/lachesis-action)
+
+> Scan your own repo with this on every PR: the [Lachesis Security Scan Action](https://github.com/UnboundCompute/lachesis-action) traces untrusted input to sinks and reports guard differentials straight into GitHub code scanning.
+
 Lachesis parses a codebase with real compilers, not regexes, and turns it into a graph you can navigate. Syntax, symbols, calls, and the part that matters most: a full dataflow layer of value-flow, points-to, taint, and aliasing. That graph lives in an embedded columnar database and answers questions through a small navigation API and an MCP server, so a person or an LLM agent can reason about real source with compiler-level fidelity.
 
 ```bash
