@@ -75,6 +75,36 @@ class ParamEffect:
 ObjectId = tuple
 
 
+# The access-path algebra renders an index-insensitive array subscript — a variable
+# index such as ``a[i]`` — as this selector (a literal index becomes ``<0>``/``<3>``).
+# An object whose identity was formed through it is a SUMMARY object: it abstracts
+# every cell the loop could reach, so two frees of ``a[i]`` in a loop are frees of
+# distinct cells, not the same one. Strong lifetime findings (double-free,
+# use-after-free) require a MUST identity, so we suppress them on summary objects.
+# This trades a rare false negative (a genuine same-index double-free the abstraction
+# cannot prove) for removing the weak-update false positive a loop over ``a[i]``
+# otherwise produces on every iteration. It is a general strong/weak-update rule, not
+# a per-codebase heuristic.
+_UNKNOWN_SUBSCRIPT = "<?>"
+
+
+def _is_summary_object(oid: ObjectId) -> bool:
+    if not isinstance(oid, tuple):
+        return False
+    # Parameter-derived object: ("param", position, selectors).
+    if len(oid) == 3 and oid[0] == "param":
+        return _UNKNOWN_SUBSCRIPT in oid[2]
+    # Allocation/free-site object: (kind, "recent"|"summary", site, target_path).
+    if len(oid) == 4 and oid[1] in ("recent", "summary"):
+        target = oid[3]
+        return isinstance(target, AccessPath) and _UNKNOWN_SUBSCRIPT in target.selectors
+    # Heap-slot child: ("unknown-slot", parent_oid, selector) — weak if the selector
+    # is the unknown subscript or the parent it hangs off is itself a summary object.
+    if len(oid) == 3 and oid[0] == "unknown-slot":
+        return oid[2] == _UNKNOWN_SUBSCRIPT or _is_summary_object(oid[1])
+    return False
+
+
 class AbstractState:
     """One path-correlated environment and object-property state."""
 
@@ -215,12 +245,16 @@ class AbstractState:
             return
         self._record_param_effect(op.kind, oid)
         facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
+        # A summary object (identity formed through a variable subscript) may-be-freed
+        # abstracts distinct concrete cells; a repeat free/use of it is not a proven
+        # violation of the same object, so it does not raise a strong finding.
+        weak = _is_summary_object(oid)
         if op.kind == OpKind.USE:
-            if ObjectFact.FREED in facts:
+            if ObjectFact.FREED in facts and not weak:
                 findings.add(Finding("use-after-free", op.line, op.target, op.node))
             return
 
-        if ObjectFact.FREED in facts:
+        if ObjectFact.FREED in facts and not weak:
             findings.add(Finding("double-free", op.line, op.target, op.node))
         if facts != frozenset({ObjectFact.NULL}):
             freed = frozenset({ObjectFact.FREED})
