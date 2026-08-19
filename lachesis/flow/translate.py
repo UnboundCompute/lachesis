@@ -297,6 +297,35 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             rec["dst"] = alloc_dst if norm.is_alloc(callee) else (args[0].get("value") if args else None)
         calls.append(rec)
 
+        # Interprocedural dispatch seam. A resolved indirect call (`obj->ops->fn()`, a
+        # function-pointer field) carries a MAY_INVOKE edge to every handler bound to its
+        # slot -- the widened seam. Emit one synthetic call record per resolved handler,
+        # over THIS call's args, so the summary pass composes each handler's effects (above
+        # all its free/lifetime signature) at this site. That is what lets a free reached
+        # only through the seam land on the pointer's typestate stream, so a later use is a
+        # cross-seam use-after-free and a second free a cross-seam double-free. May-
+        # semantics: the union over handlers (freed if ANY handler frees) is the sound
+        # over-approximation for the temporal lattice; the judge prunes the spurious arms.
+        for mi in ix.outgoing_of_kind(c["id"], "MAY_INVOKE"):
+            hnode = ix.nodes.get(mi["target"])
+            hcallee = norm.canon_callee(hnode.get("label")) if hnode else None
+            if not hcallee or hcallee == callee:
+                continue
+            callees.append(hcallee)
+            hcat = sinks.get(hcallee)
+            hrec = {"callee": hcallee, "line": line, "args": args, "guards": guards,
+                    "is_sink": hcat is not None, "node": c["id"],
+                    "control": rec["control"], "dispatch": "may-invoke"}
+            if hcat is not None:
+                hsize = hcat.get("size_arg")
+                hrec["sink"] = {"size_arg": hsize}
+                hsa = (next((a for a in args if a.get("pos") == hsize), None)
+                       if hsize is not None else None)
+                hrec["size_expr"] = hsa.get("value") if hsa else None
+                hrec["dst"] = (assigned if norm.is_alloc(hcallee)
+                               else (args[0].get("value") if args else None))
+            calls.append(hrec)
+
         if assigned:
             assigns.append({"var": assigned, "callee": callee, "line": line, "node": c["id"]})
         if alloc_dst:

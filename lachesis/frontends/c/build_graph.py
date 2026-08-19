@@ -936,6 +936,16 @@ def main() -> int:
 
     field_bindings: Dict[str, set] = defaultdict(set)   # property slot -> {function ids}
     var_bindings: Dict[str, set] = defaultdict(set)     # pointer variable -> {function ids}
+    # TU-stable slot index. `field_bindings` keys on the field *node*, which only
+    # exists in the TU that materialised the header's FieldDecl; a handler bound in
+    # any other TU gets a None field id and is dropped from dispatch resolution
+    # (registration still fires, keyed on the table variable — which is why a slot
+    # can register N handlers yet dispatch resolves to 1). Keying by the stable
+    # (record type, field name) instead accumulates every handler program-wide, and
+    # `field_node_slot` maps a materialised field node back to that key so the
+    # dispatch pass can widen a resolved field to the full handler set for its slot.
+    slot_bindings: Dict[Tuple[str, str], set] = defaultdict(set)
+    field_node_slot: Dict[str, Tuple[str, str]] = {}
     # Ops-struct registrations: (ops-struct variable id, field slot id, handler id,
     # field name). `field_bindings` is keyed by slot only (a dispatch call-site
     # `ops->f()` knows the field, not which instance), but an *entry-point* handler is
@@ -950,8 +960,25 @@ def main() -> int:
     def bind_init_list(init_list: dict, variable_id: Optional[str] = None) -> None:
         # Clang emits initializer values in record-field order (holes filled with
         # ImplicitValueInitExpr), so element position maps to the ordered fields.
-        type_name = normalize_type(init_list.get("type", {}).get("qualType", ""))
+        init_type = init_list.get("type", {})
+        type_name = normalize_type(init_type.get("qualType", ""))
+        # `slot_type` is the key the record layout actually lives under — it must be
+        # the same spelling `field_node_slot` uses (the tagged type), or the dispatch
+        # pass looks the slot up under one key while registration stored it under
+        # another and the widening silently drops.
+        slot_type = type_name
         fields = record_fields_by_type.get(type_name)
+        if not fields:
+            # The table may be declared through a typedef (`ops_t`) while the record
+            # layout is keyed on the tagged type (`struct ops_st`). Clang carries the
+            # canonical spelling in desugaredQualType, so fall back to it before
+            # giving up — without this, every typedef-hidden ops struct (the common
+            # C-API idiom, where the struct tag is never written at the use site)
+            # silently fails to register.
+            desugared = normalize_type(init_type.get("desugaredQualType", ""))
+            if desugared and desugared != type_name:
+                fields = record_fields_by_type.get(desugared)
+                slot_type = desugared
         if not fields:
             return
         for position, element in enumerate(init_list.get("inner", [])):
@@ -963,6 +990,11 @@ def main() -> int:
                 # struct is header-defined and has no field node.
                 if field_id:
                     field_bindings[field_id].add(function_id)
+                # TU-stable slot binding: fires for every handler regardless of
+                # whether this TU has the field node, so dispatch can reach handlers
+                # bound in other TUs.
+                if field_name:
+                    slot_bindings[(slot_type, field_name)].add(function_id)
                 # Entry-point registration only needs the owning table and the slot
                 # name, so it fires even for a header-defined ops struct.
                 if variable_id is not None:
@@ -1011,6 +1043,14 @@ def main() -> int:
         declarations(ast, path)
         collect_record_fields(ast)
         collect_bindings(ast)
+
+    # Canonical slot index: map each materialised field node to its TU-stable
+    # (record type, field name) identity, so the dispatch pass can widen a resolved
+    # field node to the full program-wide handler set bound to that slot.
+    for record_key, slots in record_fields_by_type.items():
+        for slot_field_name, slot_field_id in slots:
+            if slot_field_id and slot_field_name:
+                field_node_slot[slot_field_id] = (record_key, slot_field_name)
 
     # Ops-struct registration edges. A handler bound into a dispatch table
     # (`static const struct net_device_ops ops = { .ndo_start_xmit = handler }`) is an
@@ -1181,7 +1221,15 @@ def main() -> int:
                     # known (ops-struct initializer / pointer assignment), also resolve
                     # the concrete target as MAY_INVOKE from the dispatch call-site.
                     graph.edge("READS_CALLEE", body_id, target, dispatch="function-pointer")
-                    field_bound = field_bindings.get(target)
+                    # Widen a resolved ops-struct field to the union of every handler
+                    # bound to that (type, field) slot anywhere in the program. The
+                    # per-TU field_bindings only sees handlers whose field node
+                    # materialised locally; the TU-stable slot index carries the rest,
+                    # so `ops->f()` reaches every candidate handler, not just one.
+                    slot_key = field_node_slot.get(target)
+                    field_bound = set(field_bindings.get(target, ()))
+                    if slot_key:
+                        field_bound |= slot_bindings.get(slot_key, set())
                     resolved = field_bound or var_bindings.get(target)
                     if resolved:
                         dispatch_label = "ops-struct" if field_bound else "function-pointer"
