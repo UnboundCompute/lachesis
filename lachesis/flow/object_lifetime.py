@@ -585,12 +585,18 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
             root = sub.label(root_id) or root_id
             suffix = "".join(finding.path.selectors)
             leads.append({
-                "pattern": finding.pattern, "var": root + suffix, "entry": name,
-                "line": finding.line, "node": finding.node, "engine": "object-identity",
+                "pattern": finding.pattern, "var": root + suffix, "root": root,
+                "entry": name, "line": finding.line, "node": finding.node,
+                "engine": "object-identity",
             })
 
-    unsafe = (set(cfg_failures) | summary_capped
-              | set(diagnostics["unplaced_functions"]) | set(diagnostics["capped"]))
+    # A function is *seed*-unsafe when its own analysis is untrustworthy (no CFG,
+    # capped worklist, dropped ops). That set propagates UP the call graph, because a
+    # caller of an unsafe function inherits its unknowns -- unless we can show the
+    # unknown never touches the object a lead is about (see the object-flow map below).
+    seed_unsafe = (set(cfg_failures) | summary_capped
+                   | set(diagnostics["unplaced_functions"]) | set(diagnostics["capped"]))
+    unsafe = set(seed_unsafe)
     reverse_calls = defaultdict(set)
     for caller, callees in call_successors.items():
         for callee in callees:
@@ -602,7 +608,36 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
             if caller not in unsafe:
                 unsafe.add(caller)
                 queue.append(caller)
+
+    # Object-flow refinement of the propagated-unsafe blanket. `unsafe` is transitively
+    # closed up the call graph, so a propagation-only-unsafe intermediary is itself in
+    # `unsafe`; therefore an object that reaches an unknown effect ALWAYS flows -- in one
+    # direct hop -- into some callee already in `unsafe`. We record, per function, the
+    # object roots that do so. A lead in a propagation-only-unsafe function is safe to
+    # keep when its object is NOT in this set: the unknown callees never see that object.
+    ap_builder = APBuilder(sub)
+    unsafe_object_flow = {}
+    for name, function_ir in ((n, functions[n]) for n in sorted(functions) if n in cfgs):
+        if name in seed_unsafe or name not in unsafe:
+            continue
+        tainted = set()
+        for call in function_ir.get("calls", ()):
+            if call.get("callee") not in unsafe:
+                continue
+            call_node = call.get("node")
+            if call_node is None:
+                continue
+            for argument in call.get("args", ()):
+                path = _argument_path(sub, ap_builder, call_node, argument.get("pos"))
+                if path is not None:
+                    root_id = path.root.removeprefix("decl:")
+                    tainted.add(sub.label(root_id) or root_id)
+        if tainted:
+            unsafe_object_flow[name] = sorted(tainted)
+
     diagnostics["unsafe_functions"] = sorted(unsafe)
+    diagnostics["seed_unsafe_functions"] = sorted(seed_unsafe)
+    diagnostics["unsafe_object_flow"] = unsafe_object_flow
     diagnostics["total_seconds"] = round(perf_counter() - started, 6)
 
     return ObjectLifetimeResult(tuple(leads), summaries, diagnostics)

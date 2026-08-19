@@ -39,6 +39,16 @@ class PipelineLifetimeTests(unittest.TestCase):
             covered_entries={"f"})
         self.assertEqual(leads, [self.object, uncovered])
 
+    def test_object_flow_drops_only_the_tainted_object_not_the_whole_function(self):
+        # `f` is covered (object-trusted) but one of its objects flows into an unknown
+        # callee. Only the lead on that object is dropped; the sibling lead survives.
+        tainted = dict(self.object, root="escapes", var="escapes", line=5)
+        clean = dict(self.object, root="safe", var="safe", line=6)
+        leads, _ = _select_lifetime_leads(
+            [], [tainted, clean], "object",
+            covered_entries={"f"}, object_flow={"f": ["escapes"]})
+        self.assertEqual(leads, [clean])
+
 
 if __name__ == "__main__":
     unittest.main()

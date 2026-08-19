@@ -24,15 +24,22 @@ def _lead_key(lead):
     return (lead.get("pattern"), lead.get("entry"), lead.get("line"))
 
 
-def _select_lifetime_leads(legacy, object_identity, mode, covered_entries=None):
+def _select_lifetime_leads(legacy, object_identity, mode, covered_entries=None,
+                           object_flow=None):
     preserved = [lead for lead in legacy if lead.get("pattern") not in _LIFETIME_PATTERNS]
     legacy_lifetime = [lead for lead in legacy if lead.get("pattern") in _LIFETIME_PATTERNS]
     object_lifetime = list(object_identity)
     if mode == "object":
         covered = set(covered_entries) if covered_entries is not None else None
+        object_flow = object_flow or {}
         if covered is not None:
+            # Keep an object lead when its function is object-trusted AND its object is
+            # not one that flows into an unknown (unsafe) callee. The second test rescues
+            # every lead in a function whose only unsafety is an unrelated failed callee.
             object_lifetime = [lead for lead in object_lifetime
-                               if lead.get("entry") in covered]
+                               if lead.get("entry") in covered
+                               and lead.get("root") not in
+                               object_flow.get(lead.get("entry"), ())]
         fallback = ([lead for lead in legacy_lifetime
                      if covered is not None and lead.get("entry") not in covered])
         selected = object_lifetime + fallback
@@ -123,16 +130,23 @@ def run_pass(store, lang="c", lifetime_engine=None):
             fallback_store = store
         diagnostics = object_result.diagnostics
         unsafe = set(diagnostics.get("unsafe_functions", ()))
-        covered = set(F) - unsafe
+        # Object mode is fully untrusted only where the function's OWN analysis failed
+        # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
+        # filtered per-object by the object-flow map. Legacy fallback covers seed-unsafe.
+        seed_unsafe = set(diagnostics.get("seed_unsafe_functions", unsafe))
+        object_flow = diagnostics.get("unsafe_object_flow", {})
+        covered = set(F) - seed_unsafe
         if requested == "shadow":
             legacy_leads = match_all(skeletons, cfg=cfg_bundle(fallback_store))
             leads, differential = _select_lifetime_leads(
-                legacy_leads, object_result.leads, requested, covered_entries=covered)
+                legacy_leads, object_result.leads, requested, covered_entries=covered,
+                object_flow=object_flow)
         else:
-            fallback_cfg = cfg_bundle(fallback_store) if unsafe else None
-            legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, unsafe)
+            fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
+            legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
             leads, _ = _select_lifetime_leads(
-                legacy_leads, object_result.leads, requested, covered_entries=covered)
+                legacy_leads, object_result.leads, requested, covered_entries=covered,
+                object_flow=object_flow)
             differential = {
                 "computed": False,
                 "reason": "set LACHESIS_LIFETIME_ENGINE=shadow for a full differential",
@@ -146,7 +160,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
             "active": "object" if requested == "object" else "legacy",
             "available": True, "differential": differential,
             "diagnostics": diagnostics,
-            "fallback_functions": sorted(unsafe),
+            "fallback_functions": sorted(seed_unsafe),
         })
     else:
         legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
