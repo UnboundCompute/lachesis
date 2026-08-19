@@ -85,20 +85,24 @@ def _match_object_mode_legacy(skels, cfg, fallback_entries):
 def _manifest_config(manifest):
     """Extract the run knobs a manifest contributes, and an audit of each.
 
-    Returns ``(engine, extra_alloc, extra_dealloc, max_disjuncts, applied)`` where
-    ``applied`` is a per-knob log so a run summary can show what the manifest changed
+    Returns ``(engine, extra_alloc, extra_dealloc, max_disjuncts, contracts, applied)``
+    where ``applied`` is a per-knob log so a run summary can show what the manifest changed
     and -- critically -- what it declared that has no effect yet (no silent truncation:
     a config knob that quietly does nothing is exactly the backdoor a facts-file must
     not become)."""
     applied = {}
     if manifest is None:
-        return None, (), (), None, applied
+        return None, (), (), None, (), applied
     mem = manifest.project.memory
     analysis = manifest.analysis
+    contracts = manifest.project.functions
     if mem.alloc:
         applied["memory.alloc"] = f"+{len(mem.alloc)} allocator name(s): {list(mem.alloc)}"
     if mem.free:
         applied["memory.free"] = f"+{len(mem.free)} free name(s): {list(mem.free)}"
+    if contracts:
+        applied["functions"] = (
+            f"{len(contracts)} function contract(s): {[c.name for c in contracts]}")
     if analysis.engine:
         applied["analysis.engine"] = f"engine={analysis.engine} (manifest)"
     if analysis.disjunct_cap is not None:
@@ -109,7 +113,7 @@ def _manifest_config(manifest):
         applied["analysis.timeout_per_fn"] = (
             f"declared {analysis.timeout_per_fn}s but NOT enforced "
             "(engine caps by disjunct/run count, no wall-clock timeout yet)")
-    return (analysis.engine, mem.alloc, mem.free, analysis.disjunct_cap, applied)
+    return (analysis.engine, mem.alloc, mem.free, analysis.disjunct_cap, contracts, applied)
 
 
 def run_pass(store, lang="c", lifetime_engine=None, manifest=None):
@@ -134,7 +138,7 @@ def run_pass(store, lang="c", lifetime_engine=None, manifest=None):
     store.ensure_dataflow_tier()
     tier_done = perf_counter()
     (cfg_engine, extra_alloc, extra_dealloc,
-     cfg_disjunct, applied_config) = _manifest_config(manifest)
+     cfg_disjunct, contracts, applied_config) = _manifest_config(manifest)
     requested = lifetime_engine or cfg_engine or os.environ.get(
         "LACHESIS_LIFETIME_ENGINE", _DEFAULT_LIFETIME_ENGINE)
     if requested not in {"legacy", "shadow", "object"}:
@@ -160,7 +164,7 @@ def run_pass(store, lang="c", lifetime_engine=None, manifest=None):
         object_result = analyze_object_lifetimes(
             store, F, succ, lang=lang, graph=analysis_graph,
             extra_alloc=extra_alloc, extra_dealloc=extra_dealloc,
-            max_disjuncts=cfg_disjunct)
+            max_disjuncts=cfg_disjunct, contracts=contracts)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.

@@ -285,7 +285,10 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             continue
 
         callee_summary = summaries.get(callee)
-        if callee in all_functions and callee_summary is not None:
+        # A summary is instantiated whether the solver derived it (the callee is an
+        # analyzable function) or a manifest contract supplied it for an opaque callee
+        # the solver cannot see into; both are trustworthy replays of the callee's effects.
+        if callee_summary is not None:
             alternatives = []
             for alternative in callee_summary:
                 effects = []
@@ -448,14 +451,64 @@ class ObjectLifetimeResult:
     diagnostics: dict
 
 
+def _parse_arg_path(spec):
+    """Parse a contract access path ``arg0.data`` -> ``(position, selectors)``.
+
+    Only the positional ``argN`` form is resolvable, because a summary instantiates by
+    binding ``effect.position`` to the actual argument at a call site -- a named formal
+    would need the (often bodiless) callee's signature we do not have. Returns ``None``
+    for any other spelling so a non-positional path is skipped, not silently mis-bound."""
+    head, _, rest = spec.partition(".")
+    if not head.startswith("arg"):
+        return None
+    try:
+        position = int(head[3:])
+    except ValueError:
+        return None
+    selectors = tuple(s for s in rest.split(".") if s)
+    return position, selectors
+
+
+def _contracts_to_summaries(contracts, exclude):
+    """Convert manifest ``FunctionContract`` facts into engine summaries.
+
+    A contract is ground truth a maintainer supplies for a function the engine cannot see
+    into (cross-TU / library). It is therefore seeded ONLY for names not in ``exclude``
+    (the analyzable set): a function with a real body stays body-authoritative, so a
+    contract never overrides what the solver can observe directly. Each contract becomes
+    one summary alternative whose ``ParamEffect``s replay at every call site, exactly like
+    a computed summary. ``returns`` ownership is not a parameter effect and is handled at
+    the return-binding site, not here."""
+    summaries = {}
+    for contract in contracts:
+        if contract.name in exclude:
+            continue
+        effects = []
+        for kind, paths in ((OpKind.ALLOC, contract.allocs),
+                            (OpKind.USE, contract.uses),
+                            (OpKind.FREE, contract.frees)):
+            for spec in paths:
+                parsed = _parse_arg_path(spec)
+                if parsed is None:
+                    continue
+                position, selectors = parsed
+                effects.append(ParamEffect(kind, position, selectors))
+        if effects:
+            summaries[contract.name] = (tuple(effects),)
+    return summaries
+
+
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None,
-                             extra_alloc=(), extra_dealloc=(), max_disjuncts=None):
+                             extra_alloc=(), extra_dealloc=(), max_disjuncts=None,
+                             contracts=()):
     """Run object-identity lifetime analysis over all defined functions in ``functions``.
 
     ``extra_alloc`` / ``extra_dealloc`` are per-target manifest ``memory.alloc`` /
     ``memory.free`` names: they extend the lifecycle vocabulary this run recognizes so a
     project's own allocator/free wrappers emit typestate events. ``max_disjuncts`` overrides
-    the solver's per-node disjunct cap (``None`` keeps the tuned default)."""
+    the solver's per-node disjunct cap (``None`` keeps the tuned default). ``contracts`` are
+    manifest ``FunctionContract`` facts, seeded as summaries for opaque/cross-TU callees the
+    solver cannot analyze -- letting a free/use effect compose across a library boundary."""
     started = perf_counter()
     disjunct_cap = _DEFAULT_MAX_DISJUNCTS if max_disjuncts is None else max_disjuncts
     if graph is not None and graph is not store.graph:
@@ -491,7 +544,12 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     # Absence means "no analyzable summary", not "proven to have no effects". That
     # distinction makes callers of a CFG failure take the conservative external-call
     # path instead of silently treating the callee as pure.
-    summaries = {}
+    #
+    # Manifest contracts seed the summary table for opaque callees (names with no body
+    # here). They persist through the worklist because no computed summary ever overwrites
+    # a name that was never analyzed -- so a maintainer-declared free/use composes across
+    # the library boundary exactly like a summary the solver derived itself.
+    summaries = _contracts_to_summaries(contracts, exclude=set(functions))
     artifacts = {}
     summary_capped = set()
     summary_runs = Counter()

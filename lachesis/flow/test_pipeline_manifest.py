@@ -21,13 +21,17 @@ from pathlib import Path
 from lachesis.core.snapshot import load_snapshot
 from lachesis.manifest.schema import (
     AnalysisConfig,
+    FunctionContract,
     Manifest,
     Memory,
+    Ownership,
     ProjectFacts,
 )
 from lachesis.nav.graph_store import GraphStore
 from lachesis.pipeline import semantic_snapshot_graph
 
+from .object_lifetime import _contracts_to_summaries, _parse_arg_path
+from .object_state import OpKind, ParamEffect
 from .pipeline import _manifest_config, run_pass
 
 # A double-free routed entirely through a project-specific free wrapper. The libc
@@ -88,8 +92,9 @@ class ManifestDrivenLifetimeTests(unittest.TestCase):
 
     def test_manifest_config_extraction_and_audit(self):
         # No manifest -> empty knobs, empty audit.
-        engine, alloc, dealloc, cap, applied = _manifest_config(None)
-        self.assertEqual((engine, alloc, dealloc, cap, applied), (None, (), (), None, {}))
+        engine, alloc, dealloc, cap, contracts, applied = _manifest_config(None)
+        self.assertEqual((engine, alloc, dealloc, cap, contracts, applied),
+                         (None, (), (), None, (), {}))
 
         # A full analysis block: applied knobs are recorded; timeout is surfaced as
         # declared-but-unenforced rather than silently dropped.
@@ -97,7 +102,7 @@ class ManifestDrivenLifetimeTests(unittest.TestCase):
             project=ProjectFacts(memory=Memory(alloc=("xmalloc",), free=("xfree",))),
             analysis=AnalysisConfig(engine="object", disjunct_cap=16, timeout_per_fn=30.0),
         )
-        engine, alloc, dealloc, cap, applied = _manifest_config(manifest)
+        engine, alloc, dealloc, cap, contracts, applied = _manifest_config(manifest)
         self.assertEqual(engine, "object")
         self.assertEqual(alloc, ("xmalloc",))
         self.assertEqual(dealloc, ("xfree",))
@@ -105,6 +110,76 @@ class ManifestDrivenLifetimeTests(unittest.TestCase):
         self.assertIn("memory.alloc", applied)
         self.assertIn("analysis.disjunct_cap", applied)
         self.assertIn("NOT enforced", applied["analysis.timeout_per_fn"])
+
+
+# An opaque (declaration-only, cross-TU) free that releases its whole argument. Only a
+# manifest contract can tell the engine what it does; without one the call is a blind USE.
+CONTRACT_SOURCE = r"""
+void *malloc(unsigned long);
+void ext_release(void *p);
+
+void frees_via_opaque(void) {
+    char *p = malloc(8);
+    ext_release(p);
+    *p = 1;
+}
+"""
+
+
+class ContractConversionTests(unittest.TestCase):
+    def test_parse_arg_path(self):
+        self.assertEqual(_parse_arg_path("arg0"), (0, ()))
+        self.assertEqual(_parse_arg_path("arg1.data"), (1, ("data",)))
+        self.assertEqual(_parse_arg_path("arg2.next.data"), (2, ("next", "data")))
+        # non-positional forms are unresolvable and skipped, not mis-bound
+        self.assertIsNone(_parse_arg_path("value"))
+        self.assertIsNone(_parse_arg_path("argX"))
+
+    def test_contract_to_summary_skips_analyzable_and_maps_effects(self):
+        contracts = (
+            FunctionContract(name="ext_free_data", frees=("arg0.data",)),
+            FunctionContract(name="ext_use", uses=("arg0",)),
+            FunctionContract(name="local_fn", frees=("arg0",)),   # excluded: has a body
+        )
+        summaries = _contracts_to_summaries(contracts, exclude={"local_fn"})
+        self.assertNotIn("local_fn", summaries)  # body-authoritative, never overridden
+        self.assertEqual(summaries["ext_free_data"],
+                         ((ParamEffect(OpKind.FREE, 0, ("data",)),),))
+        self.assertEqual(summaries["ext_use"], ((ParamEffect(OpKind.USE, 0, ()),),))
+
+
+class ContractDrivenLifetimeTests(unittest.TestCase):
+    def test_opaque_free_contract_composes_use_after_free(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as output:
+            Path(source_dir, "contract.c").write_text(CONTRACT_SOURCE)
+            completed = subprocess.run(
+                [sys.executable, "-m", "lachesis.frontends.c.build_graph", source_dir, output],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            snapshot = load_snapshot(output)
+
+            # Baseline: ext_release is opaque, so the engine cannot know it frees p.
+            store = GraphStore(semantic_snapshot_graph(snapshot))
+            baseline = run_pass(store, lang="c", lifetime_engine="object")
+            self.assertEqual(
+                _patterns_by_function(baseline)["frees_via_opaque"], set(),
+                "an opaque free must be invisible without a contract",
+            )
+
+            # A contract declaring ext_release frees arg0 composes across the boundary:
+            # the later *p = 1 becomes a use-after-free.
+            manifest = Manifest(project=ProjectFacts(functions=(
+                FunctionContract(name="ext_release", frees=("arg0",),
+                                 returns=Ownership.UNKNOWN),
+            )))
+            store2 = GraphStore(semantic_snapshot_graph(snapshot))
+            declared = run_pass(store2, lang="c", lifetime_engine="object", manifest=manifest)
+            self.assertEqual(
+                _patterns_by_function(declared)["frees_via_opaque"], {"use-after-free"},
+                "the free contract must compose a cross-TU use-after-free",
+            )
+            self.assertIn("functions", declared["lifetime"]["applied_config"])
 
 
 if __name__ == "__main__":
