@@ -7,6 +7,7 @@ an output directory, matching every other Lachesis command frontend.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import marshal
@@ -269,6 +270,28 @@ def load_compile_commands(source_dir: Path) -> Dict[Path, List[str]]:
     return flags_by_file
 
 
+@functools.lru_cache(maxsize=None)
+def project_include_dirs(source_dir: Path) -> Tuple[str, ...]:
+    """Every directory under the project root that holds a C header, as ``-I`` roots.
+
+    Absent a ``compile_commands.json`` the only include path we would otherwise pass
+    is the source root itself. A project that keeps its public headers in a separate
+    directory (`include/`, per-module `src/foo/`) then fails to resolve its own
+    ``#include``s, and Clang recovers only a *partial* AST: function bodies survive
+    but any initializer that needs an unresolved type or macro collapses — which
+    silently drops the ops-table static initializers the dispatch-seam widening reads
+    (and macro-defined constants generally). Adding every header-bearing directory as
+    an include root recovers the common header-in-a-separate-dir layout with no build
+    system present. Deduped and sorted for a stable command line; Clang ignores roots
+    that resolve nothing. Superseded per-file whenever real compile flags exist.
+    """
+    roots = {source_dir.resolve()}
+    for candidate in source_dir.rglob("*"):
+        if candidate.is_file() and candidate.suffix.lower() == ".h":
+            roots.add(candidate.parent.resolve())
+    return tuple("-I" + str(root) for root in sorted(roots))
+
+
 def clang_command(
     source_dir: Path, path: Path, *arguments: str,
     file_flags: Optional[List[str]] = None,
@@ -278,7 +301,7 @@ def clang_command(
     if file_flags is not None:
         base = list(file_flags)
     else:
-        base = ["-I", str(source_dir)] + shlex.split(os.environ.get("LACHESIS_CFLAGS", ""))
+        base = list(project_include_dirs(source_dir)) + shlex.split(os.environ.get("LACHESIS_CFLAGS", ""))
     return configured + base + language + list(arguments) + [str(path)]
 
 
@@ -980,6 +1003,21 @@ def main() -> int:
                 fields = record_fields_by_type.get(desugared)
                 slot_type = desugared
         if not fields:
+            # An array of records (`static cmsIntentsList Intents[] = {{…},{…}}`,
+            # `static const struct net_device_ops ops[] = {…}`) is typed `T[N]`,
+            # which has no record layout of its own — Clang initialises each element
+            # with its own struct InitListExpr carrying the element's record type.
+            # Descend into those element lists so the per-element positional field
+            # mapping fires for the array-of-dispatch-table idiom (the most common
+            # C-API registry shape). Gate on the outer type actually being an array
+            # so unrelated nested aggregates are not walked as struct initializers;
+            # each recursion re-reads the child's own (record) type and binds there.
+            qual = init_type.get("qualType", "").rstrip()
+            desugared_qual = init_type.get("desugaredQualType", "").rstrip()
+            if qual.endswith("]") or desugared_qual.endswith("]"):
+                for element in init_list.get("inner", []):
+                    if element.get("kind") == "InitListExpr":
+                        bind_init_list(element, variable_id)
             return
         for position, element in enumerate(init_list.get("inner", [])):
             if position >= len(fields):
