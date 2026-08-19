@@ -159,6 +159,21 @@ class ReachingDef:
         k = self._k(nid)
         return k.endswith("Stmt") or k in ("cfg-entry", "cfg-exit", "cfg-merge", "cfg-condition")
 
+    def _label_name(self, nid) -> Optional[str]:
+        """Identifier of a `LabelStmt`. The frontend renders it as ``name: <stmt>``;
+        the name is the token before the first colon."""
+        lbl = self.sub.label(nid) or ""
+        name = lbl.split(":", 1)[0].strip()
+        return name or None
+
+    def _goto_target(self, nid) -> Optional[str]:
+        """Target label of a `GotoStmt`. Rendered as ``goto name``; the name is the
+        remainder after the leading ``goto`` keyword."""
+        lbl = (self.sub.label(nid) or "").strip()
+        if lbl.startswith("goto"):
+            lbl = lbl[len("goto"):]
+        return lbl.strip().rstrip(";").strip() or None
+
     def emit_stmt(self, nid, succ, depth=0) -> Tuple[Optional[str], List[str]]:
         """Return (entry_micro, [exit_micros]) for a statement subtree, wiring `succ` in between.
 
@@ -254,9 +269,22 @@ class ReachingDef:
             roles = role_children()
             body = next(iter(roles.get("LOOP_BODY", [])), None)
             cond = next(iter(roles.get("CONDITION", [])), None)
-            other = [child for child in kids if child not in {body, cond}]
-            init = next((child for child in other if self._k(child) == "DeclStmt"), None)
-            increment = next((child for child in other if child != init), None)
+            # The init and increment arrive as unroled AST children distinguished only
+            # by source position: init precedes the condition, increment follows it.
+            # init may be a DeclStmt (`for (int i = 0; ...)`) OR a plain expression
+            # (`for (p = head; ...)`); keying on DeclStmt alone drops the expression
+            # form entirely, orphaning every value it defines. emit_stmt handles both
+            # (a DeclStmt as a statement, an expression via the bare-expr path).
+            other = sorted((child for child in kids if child not in {body, cond}),
+                           key=lambda c: self.sub.offset(c))
+            if cond is not None:
+                cond_off = self.sub.offset(cond)
+                init = next((c for c in other if self.sub.offset(c) < cond_off), None)
+                increment = next((c for c in reversed(other)
+                                  if self.sub.offset(c) > cond_off), None)
+            else:
+                init = other[0] if other else None
+                increment = other[-1] if len(other) >= 2 else None
             ie, ix = self.emit_stmt(init, succ, depth + 1) if init else (None, [])
             cstream: List[str] = []
             if cond is not None:
@@ -312,7 +340,120 @@ class ReachingDef:
                     succ[x].append(centry)
             return (centry, cexit or bx)
 
-        if k in ("ReturnStmt", "DeclStmt", "CaseStmt", "DefaultStmt", "SwitchStmt", "LabelStmt"):
+        if k == "LabelStmt":
+            # Linearize like the generic statement group below, but record the entry
+            # micro under the label's name so deferred `goto`s can splice an edge to it.
+            micros: List[str] = []
+            for c in sorted(self._kids(nid), key=lambda c: self.sub.offset(c)):
+                if self._is_stmt(c):
+                    e, x = self.emit_stmt(c, succ, depth + 1)
+                    if e is not None:
+                        micros.append((e, x))
+                else:
+                    s = []
+                    self.expr_stream(c, s, set())
+                    micros.extend((m, [m]) for m in s)
+            entry = micros[0][0] if micros else nid
+            prev_exits: List[str] = []
+            for e, x in micros:
+                for pe in prev_exits:
+                    succ[pe].append(e)
+                prev_exits = x
+            name = self._label_name(nid)
+            if name:
+                self._label_entries[name] = entry
+            if not micros:
+                # a bare `label:;` still needs a reachable placement node
+                succ.setdefault(nid, [])
+                return (nid, [nid])
+            return (entry, prev_exits)
+
+        if k == "GotoStmt":
+            # An unconditional jump: a reachable micro-node with no fall-through exit,
+            # wired to its target label after the whole body is emitted.
+            target = self._goto_target(nid)
+            if target:
+                self._pending_gotos.append((nid, target))
+            succ.setdefault(nid, [])
+            return (nid, [])
+
+        if k == "SwitchStmt":
+            # A switch dispatches: control flows from the condition to EVERY case/
+            # default label, not only into the first one. Sequential fall-through
+            # between consecutive cases is real too, but it is NOT the only entry --
+            # a case whose predecessor ends without fall-through (returns/breaks with
+            # no exit) is still reachable via the dispatch. Modelling only fall-through
+            # orphans every such case (and everything nested inside it). So: emit the
+            # body compound (which chains the cases in source order, preserving
+            # fall-through), then add an edge from the condition to each case/default
+            # label entry. Precise `break`->after-switch edges remain a refinement;
+            # the absence of a default keeps the condition itself as a fall-out exit.
+            kids = list(self._kids(nid))
+            roles = role_children()
+            cond = next(iter(roles.get("CONDITION", [])), None)
+            body = next(iter(roles.get("LOOP_BODY", [])), None)
+            if body is None:
+                comps = [c for c in kids if self._k(c) == "CompoundStmt"]
+                body = comps[0] if comps else None
+            if cond is None:
+                non_body = [c for c in kids if c is not body]
+                cond = min(non_body, key=self.sub.offset) if non_body else None
+            cstream: List[str] = []
+            if cond is not None:
+                self.expr_stream(cond, cstream, set())
+            centry, cexit = chain(cstream)
+            bentry, bexits = (self.emit_stmt(body, succ, depth + 1)
+                              if body is not None else (None, []))
+            label_kids = []
+            if body is not None:
+                if self._k(body) in ("CaseStmt", "DefaultStmt"):
+                    label_kids = [body]
+                else:
+                    label_kids = [c for c in sorted(self._kids(body),
+                                                    key=lambda c: self.sub.offset(c))
+                                  if self._k(c) in ("CaseStmt", "DefaultStmt")]
+            case_entries: List[str] = []
+            for c in label_kids:
+                ce, _cx = self.emit_stmt(c, succ, depth + 1)   # memoized: same entry
+                if ce is not None:
+                    case_entries.append(ce)
+            dispatch_srcs = cexit if cexit else ([centry] if centry else [])
+            for src in dispatch_srcs:
+                for ce in case_entries:
+                    succ[src].append(ce)
+            entry = centry or bentry or (case_entries[0] if case_entries else None)
+            exits = list(bexits)
+            has_default = any(self._k(c) == "DefaultStmt" for c in label_kids)
+            if not has_default and cexit:
+                exits.extend(cexit)        # no default => the condition can fall out
+            return (entry, exits or cexit)
+
+        if k in ("CaseStmt", "DefaultStmt"):
+            # A case/default label carries nested STATEMENTS (the case body), not only
+            # expressions. Chain the case-value expression and the guarded statement
+            # subtrees in source order so the bodies stay reachable; the plain-expr
+            # path below would keep only string micros and orphan every statement.
+            units: List[Tuple[str, List[str]]] = []
+            for c in sorted(self._kids(nid), key=lambda c: self.sub.offset(c)):
+                if self._is_stmt(c):
+                    e, x = self.emit_stmt(c, succ, depth + 1)
+                    if e is not None:
+                        units.append((e, x))
+                else:
+                    s = []
+                    self.expr_stream(c, s, set())
+                    units.extend((m, [m]) for m in s)
+            if not units:
+                return (None, [])
+            first = units[0][0]
+            prev_exits: List[str] = []
+            for e, x in units:
+                for pe in prev_exits:
+                    succ[pe].append(e)
+                prev_exits = x
+            return (first, prev_exits)
+
+        if k in ("ReturnStmt", "DeclStmt"):
             # linearize any contained expressions in source order
             micros: List[str] = []
             for c in sorted(self._kids(nid), key=lambda c: self.sub.offset(c)):
@@ -344,8 +485,20 @@ class ReachingDef:
                 return (nid, [nid])
             return (entry, exits)
 
-        if k in ("NullStmt", "BreakStmt", "ContinueStmt", "GotoStmt"):
+        if k == "NullStmt":
             return (None, [])
+
+        if k in ("BreakStmt", "ContinueStmt"):
+            # A jump: reachable (so it is placed), but with NO fall-through exit -- the
+            # statement that textually follows is not wired from here. In a switch this
+            # is what stops one case from bleeding into the next; the following case is
+            # still reachable through the switch's dispatch edges. Without this a `break`
+            # was invisible and every case fell through into the next, both spuriously
+            # (a case->case edge C never takes) and expensively (the extra fan-in blows
+            # the object-state transfer budget). Precise break->after-switch /
+            # continue->loop-header edges remain a refinement.
+            succ.setdefault(nid, [])
+            return (nid, [])
 
         if self._is_stmt(nid):
             return (None, [])
@@ -404,7 +557,17 @@ class ReachingDef:
         self._emit_inprogress = set()
         self._emit_memo_hits = 0
         self._emit_cycle_breaks = 0
+        # goto/label wiring: a labeled block reachable only via `goto` (the dominant C
+        # cleanup idiom) is otherwise dropped from the CFG. Collect label entry-micros
+        # and deferred goto edges during emission, then splice them after the walk when
+        # every label has been emitted.
+        self._label_entries: Dict[str, str] = {}
+        self._pending_gotos: List[Tuple[str, str]] = []
         entry, exits = self.emit_stmt(root, succ, 0)
+        for goto_nid, target in self._pending_gotos:
+            label_entry = self._label_entries.get(target)
+            if label_entry is not None:
+                succ[goto_nid].append(label_entry)
         _dbg(f"emit_stmt done: succ-keys={len(succ)} entry={entry} "
              f"emit-calls={len(self._emit_memo)} memo-hits={self._emit_memo_hits} "
              f"cycle-breaks={self._emit_cycle_breaks}")

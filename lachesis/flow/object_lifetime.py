@@ -365,7 +365,14 @@ def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summari
 def _analyze_prepared(prepared):
     """Pure, pickleable solver boundary used by process workers."""
     nodes, successors, operations, initial = prepared
-    result = ObjectStateAnalyzer().analyze(
+    # 32 disjuncts/node (not 64): a fully-wired CFG closes every loop's def-use cycle,
+    # so a looping function accumulates disjuncts across the back-edge until widening
+    # fires. At 64 the widening fired so late that small pipeline-walk functions blew
+    # the transfer budget and were marked capped/unsafe -- dropping ALL their leads.
+    # Widening sooner makes them converge within budget; the join is an over-
+    # approximation, so recall (uncapped functions) rises at a marginal precision cost,
+    # which is the right trade for a finder (capping is a guaranteed false negative).
+    result = ObjectStateAnalyzer(max_disjuncts=32).analyze(
         nodes, successors, operations, initial=initial)
     alternatives = {state.trace for state in result.exit_states}
     return tuple(sorted(alternatives, key=repr)), result
