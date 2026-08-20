@@ -972,10 +972,10 @@ def _str_col(values: list) -> "pa.Array":
         [None if v is None else _utf8_safe(str(v)) for v in values], pa.string())
 
 
-def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
-                     codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
+def _node_table(nodes: list[dict], *, elide: bool, codec: PropsCodec,
+                id_codes: Optional[dict] = None):
     if not nodes:
-        return
+        return None
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     data: dict[str, list] = {c: [] for c in columns}
     for index, node in enumerate(nodes):
@@ -987,8 +987,15 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
             data[prop].append(_coded_cell(prop, _promoted_value(props, prop),
                                           id_codes or {}))
         data["props"].append(codec.blob(index, props, elide, _COLUMN_KEYS))
-    table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
-                      for c in columns})
+    return pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
+                     for c in columns})
+
+
+def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
+                     codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
+    table = _node_table(nodes, elide=elide, codec=codec, id_codes=id_codes)
+    if table is None:
+        return
     path = os.path.join(stage_dir, "node.parquet")
     pq.write_table(table, path)
     conn.execute(f"COPY Node FROM '{path}'")
@@ -1305,6 +1312,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     codec = PropsCodec()
     bulk = pa is not None and pq is not None
     stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
+    node_writer = None
+    node_path = None
     edge_writers = {}
     edge_paths = {}
 
@@ -1312,8 +1321,12 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         if not batch:
             return
         if bulk:
-            _load_nodes_bulk(conn, batch, elide=True, stage_dir=stage.name,
-                             codec=codec, id_codes=id_codes)
+            nonlocal node_writer, node_path
+            table = _node_table(batch, elide=True, codec=codec, id_codes=id_codes)
+            if node_writer is None:
+                node_path = os.path.join(stage.name, "node.parquet")
+                node_writer = pq.ParquetWriter(node_path, table.schema)
+            node_writer.write_table(table)
         else:
             _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
 
@@ -1346,6 +1359,9 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             batch.clear()
     if batch:
         load_nodes(batch)
+    if bulk and node_writer is not None:
+        node_writer.close()
+        conn.execute(f"COPY Node FROM '{node_path}'")
 
     batch = []
     kept_edge_count = 0
