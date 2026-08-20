@@ -125,6 +125,10 @@ dropped from 2,167 to 319; the emitted graph remained 442 nodes and 784 edges. T
 is a CPU/syscall reduction, not a large-codebase timing claim; the Linux `fs` run still
 needs a fresh bounded measurement before its pass-1 row can change.
 
+Macro recovery also streams preprocessor lines (`0fc41c5`) instead of creating a
+temporary `splitlines()` list, reducing transient memory without changing the fixture
+graph.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
