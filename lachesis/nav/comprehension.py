@@ -35,6 +35,8 @@ _TEXT_EXTENSIONS = frozenset({
     ".c", ".h", ".cc", ".cpp", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx",
     ".go", ".rs", ".java", ".kt", ".md", ".rst", ".txt", ".adoc",
 })
+DEFAULT_DETAIL_LIMIT = 100
+COMMUNITY_FILE_LIMIT = 50
 
 
 def _loc(gl, node: dict) -> dict:
@@ -75,6 +77,18 @@ def _component(path: str | None, depth: int = 1) -> str | None:
     return "/".join(directories[:max(1, depth)])
 
 
+def _page(rows: list, offset: int, limit: int) -> tuple[list, dict]:
+    """Return a stable offset page plus enough metadata to fetch the next page."""
+    start, size = max(0, offset), max(1, limit)
+    window = rows[start:start + size]
+    next_offset = start + len(window)
+    has_more = next_offset < len(rows)
+    return window, {
+        "total": len(rows), "offset": start, "returned": len(window),
+        "has_more": has_more, "next_offset": next_offset if has_more else None,
+    }
+
+
 class Comprehension:
     """Cached indexes and deterministic views for the comprehension MCP profile."""
 
@@ -82,18 +96,23 @@ class Comprehension:
         self.store = store
         self.gl = store.gl
         self.index = store.index
+        self._cached_source_root: Path | None | bool = False
 
     def _source_root(self) -> Path | None:
+        if self._cached_source_root is not False:
+            return self._cached_source_root
         explicit = getattr(self.store, "source_dir", None)
         if explicit and os.path.isdir(explicit):
-            return Path(explicit).resolve()
+            self._cached_source_root = Path(explicit).resolve()
+            return self._cached_source_root
         graph_path = getattr(self.store, "_core_path", None)
         if graph_path:
             try:
                 from lachesis.kuzu_store import read_store_manifest
                 recorded = read_store_manifest(graph_path).get("source_dir")
                 if recorded and os.path.isdir(recorded):
-                    return Path(recorded).resolve()
+                    self._cached_source_root = Path(recorded).resolve()
+                    return self._cached_source_root
             except (OSError, ValueError, TypeError):
                 pass
         absolute = []
@@ -102,9 +121,24 @@ class Comprehension:
             if path and os.path.isabs(path):
                 absolute.append(path)
         if not absolute:
+            self._cached_source_root = None
             return None
         common = Path(os.path.commonpath(absolute))
-        return common if common.is_dir() else common.parent
+        self._cached_source_root = common if common.is_dir() else common.parent
+        return self._cached_source_root
+
+    def _relative_path(self, path: str | None) -> str | None:
+        """Normalize graph locations to the recorded repository root when possible."""
+        if not path:
+            return None
+        root = self._source_root()
+        candidate = Path(path)
+        if root is not None and candidate.is_absolute():
+            try:
+                return candidate.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                pass
+        return path.strip("./")
 
     def _source_files(self):
         root = self._source_root()
@@ -122,7 +156,60 @@ class Comprehension:
                     files.append(path)
         return root, sorted(files)
 
-    def unknowns(self, function: str | None = None, limit: int = 100) -> dict:
+    def _declared_fields(self, typ: dict) -> list[dict]:
+        """Type members, with a source-backed fallback for frontend ownership gaps."""
+        members = [n for n in self.index.targets(typ["id"], "DECLARES_MEMBER")
+                   if n.get("kind") in FIELD_KINDS]
+        if members:
+            return members
+        source = self.gl.source_text(typ)
+        if not source:
+            return []
+        names = []
+        if typ.get("kind") == "record" and "{" in source and "}" in source:
+            body = source[source.find("{") + 1:source.rfind("}")]
+            body = re.sub(r"/\*.*?\*/|//[^\n]*", " ", body, flags=re.DOTALL)
+            for declaration in body.split(";"):
+                declaration = re.sub(r"#[^\n]*", " ", declaration).strip()
+                if not declaration:
+                    continue
+                match = re.search(r"\(\s*\*\s*([A-Za-z_]\w*)\s*\)", declaration)
+                if match is None:
+                    match = re.search(
+                        r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?::\s*\d+)?\s*$",
+                        declaration,
+                    )
+                if match and match.group(1) not in names:
+                    names.append(match.group(1))
+        else:
+            # Python and JS/TS frontends can represent ``self.x`` / ``this.x`` as
+            # ordinary variables without a DECLARES_MEMBER edge. The field node is
+            # still graph-addressable, so recover only names whose evidence lies
+            # inside this recorded class definition.
+            found = set()
+            for match in re.finditer(
+                    r"\b(?:self|this)\.([A-Za-z_$][A-Za-z0-9_$]*)", source):
+                if re.match(r"\s*\(", source[match.end():]):
+                    continue  # method invocation, not field evidence
+                found.add(match.group(1))
+            names = sorted(found)
+        type_file, start, end = self.gl.loc(typ)
+        fields = []
+        for name in names:
+            candidates = _matches(self.gl, name, FIELD_KINDS)
+            local = []
+            for node in candidates:
+                file, line, _ = self.gl.loc(node)
+                if file == type_file and (start is None or line is None or
+                                          start <= line <= (end or start)):
+                    local.append(node)
+            fields.extend(local or candidates[:1])
+        unique = {node["id"]: node for node in fields}
+        return sorted(unique.values(), key=lambda node: (
+            self.gl.loc(node)[0] or "", self.gl.loc(node)[1] or 0, self.gl.label(node)))
+
+    def unknowns(self, function: str | None = None, limit: int = 100,
+                 offset: int = 0) -> dict:
         """Return explicit graph frontiers, never turn absence into success."""
         owner_ids = None
         owner_nodes = []
@@ -182,14 +269,16 @@ class Comprehension:
 
         rows.sort(key=lambda r: (r["frontier"], r.get("file") or "", r.get("line") or 0))
         counts = Counter(r["frontier"] for r in rows)
+        page, paging = _page(rows, offset, limit)
         return {
             "move": "unknowns", "scope": function or "graph",
             "status": "could-not-cross" if rows else "proven-absent",
             "counts": dict(sorted(counts.items())), "total": len(rows),
-            "unknowns": rows[:max(1, limit)], "truncated": len(rows) > max(1, limit),
+            "unknowns": page, "page": paging,
         }
 
-    def coverage_map(self, component_depth: int = 1) -> dict:
+    def coverage_map(self, component_depth: int = 1,
+                     limit: int = DEFAULT_DETAIL_LIMIT, offset: int = 0) -> dict:
         """Describe graph coverage, not mutable client/session activity."""
         files = list(self.index.nodes_of_kind("file"))
         functions = list(self.index.nodes_of_kind(*CALLABLE_KINDS))
@@ -203,8 +292,15 @@ class Comprehension:
         )
         components = Counter()
         for node in functions:
-            components[_component(self.gl.loc(node)[0], component_depth) or "(unknown)"] += 1
+            path = self._relative_path(self.gl.loc(node)[0])
+            components[_component(path, component_depth) or "(unknown)"] += 1
         unresolved = self.unknowns(limit=1)
+        component_rows = [{"component": name, "functions": count}
+                          for name, count in sorted(components.items())]
+        diagnostic_rows = [{"file": self._relative_path(name), "count": count}
+                           for name, count in sorted(diagnostics_by_file.items()) if name]
+        component_page, component_paging = _page(component_rows, offset, limit)
+        diagnostic_page, diagnostic_paging = _page(diagnostic_rows, offset, limit)
         return {
             "move": "coverage_map", "basis": "indexed-graph",
             "counts": {
@@ -214,19 +310,25 @@ class Comprehension:
                 "diagnostics": sum(diagnostics_by_file.values()),
                 "unmodeled_frontiers": unresolved.get("total", 0),
             },
-            "components": [{"component": name, "functions": count}
-                           for name, count in sorted(components.items())],
-            "diagnostic_files": [{"file": name, "count": count}
-                                 for name, count in sorted(diagnostics_by_file.items()) if name],
+            "components": component_page,
+            "component_count": len(component_rows),
+            "diagnostic_files": diagnostic_page,
+            "diagnostic_file_count": len(diagnostic_rows),
+            "pages": {"components": component_paging,
+                      "diagnostic_files": diagnostic_paging},
             "interpretation": "graph coverage only; this does not track per-client reads",
         }
 
-    def field_history(self, field: str, owner_type: str | None = None) -> dict:
+    def field_history(self, field: str, owner_type: str | None = None,
+                      limit: int = DEFAULT_DETAIL_LIMIT, offset: int = 0) -> dict:
         matches = _matches(self.gl, field, FIELD_KINDS)
         if owner_type:
-            type_ids = {n["id"] for n in _matches(self.gl, owner_type, TYPE_KINDS)}
+            type_nodes = _matches(self.gl, owner_type, TYPE_KINDS)
+            type_ids = {n["id"] for n in type_nodes}
             member_ids = {e["target"] for tid in type_ids
                           for e in self.index.outgoing_of_kind(tid, "DECLARES_MEMBER")}
+            member_ids.update(field_node["id"] for typ in type_nodes
+                              for field_node in self._declared_fields(typ))
             matches = [n for n in matches if n["id"] in member_ids
                        or n.get("properties", {}).get("base_value_id") in type_ids]
         if not matches:
@@ -280,12 +382,14 @@ class Comprehension:
                            "owner": _owner(self.gl, node),
                            "via": sorted(kinds & (FLOW_KINDS | CONTROL_KINDS))})
         events.sort(key=lambda r: (r.get("file") or "", r.get("line") or 0, r["role"]))
+        page, paging = _page(events, offset, limit)
         return {"move": "field_history", "field": field,
                 "matches": [_loc(self.gl, n) for n in matches],
                 "counts": dict(sorted(Counter(e["role"] for e in events).items())),
-                "events": events}
+                "event_count": len(events), "events": page, "page": paging}
 
-    def sibling_compare(self, symbol: str) -> dict:
+    def sibling_compare(self, symbol: str, limit: int = DEFAULT_DETAIL_LIMIT,
+                        offset: int = 0, call_offset: int = 0) -> dict:
         """Structural peer diff without security vocabulary or adjudication."""
         from .siblings import _anchor
         hits = _matches(self.gl, symbol, frozenset(CALLABLE_KINDS))
@@ -310,7 +414,9 @@ class Comprehension:
                 for n in self.gl.body_nodes(node["id"])
                 if n.get("properties", {}).get("control_kind")
             )
-            members.append({**_loc(self.gl, node), "calls": callees,
+            call_page, call_paging = _page(callees, call_offset, limit)
+            members.append({**_loc(self.gl, node), "call_count": len(callees),
+                            "calls": call_page, "calls_page": call_paging,
                             "control": dict(sorted(controls.items()))})
         all_calls = Counter(c for member in members for c in member["calls"])
         for member in members:
@@ -319,18 +425,35 @@ class Comprehension:
                 "calls_missing": [c for c, count in sorted(all_calls.items())
                                   if count == len(members) - 1 and c not in member["calls"]],
             }
+        family_size = len(members)
+        page, paging = _page(members, offset, limit)
         return {"move": "sibling_compare", "symbol": symbol,
                 "family_key": {"verb": verb, "nouns": sorted(nouns)},
-                "family_size": len(members), "members": members}
+                "family_size": family_size, "members": page, "page": paging}
 
-    def type_explain(self, type_name: str) -> dict:
+    def type_explain(self, type_name: str, limit: int = DEFAULT_DETAIL_LIMIT,
+                     offset: int = 0, member_offset: int = 0) -> dict:
         matches = _matches(self.gl, type_name, TYPE_KINDS)
         if not matches:
             return {"error": f"no type named {type_name!r}"}
+        declarations = sorted((_loc(self.gl, node) for node in matches), key=lambda row: (
+            row.get("file") or "", row.get("line") or 0))
+        declarations_page, declarations_paging = _page(declarations, member_offset, limit)
+        # C emits one record node per forward declaration. Consolidate those into the
+        # body-bearing definition; reporting each as a separate type repeats the same
+        # 1,600 consumers and can turn one explanation into a multi-minute response.
+        if matches and all(node.get("kind") == "record" for node in matches):
+            matches = [max(matches, key=lambda node: len(self.gl.source_text(node)))]
+        def node_id(item):
+            return item["id"] if isinstance(item, dict) else item
+
+        write_ids = {node_id(item) for item in self.index.by_kind.get("write", ())}
+        mutation_sources = {edge["source"] for edge in self.index.edges_of_kind(
+            "WRITES_TO", "WRITES_PARAMETER_PROPERTY", "MUTATES")}
         types = []
         for typ in matches:
             member_nodes = list(self.index.targets(typ["id"], "DECLARES_MEMBER"))
-            fields = [_loc(self.gl, n) for n in member_nodes if n.get("kind") in FIELD_KINDS]
+            fields = [_loc(self.gl, n) for n in self._declared_fields(typ)]
             methods = [n for n in member_nodes if n.get("kind") in CALLABLE_KINDS]
             # Some frontends encode ownership as a property rather than DECLARES_MEMBER.
             methods.extend(n for n in self.index.nodes_owned_by(typ["id"], *CALLABLE_KINDS)
@@ -353,24 +476,35 @@ class Comprehension:
                     role = "constructor"
                 elif any(tok in name for tok in ("free", "destroy", "dispose", "close", "release")):
                     role = "destructor"
-                elif (any(_semantic(e) in {"WRITES_TO", "WRITES_PARAMETER_PROPERTY", "MUTATES"}
-                          for e in self.index.outgoing.get(method["id"], ()))
-                      or any(n.get("kind") == "write"
-                             for n in self.gl.body_nodes(method["id"]))):
+                elif (method["id"] in mutation_sources
+                      or any(node_id(item) in write_ids
+                             for item in self.index.by_owner.get(method["id"], ()))):
                     role = "mutator"
                 else:
                     role = "consumer"
                 roles[role].append(_loc(self.gl, method))
-            types.append({**_loc(self.gl, typ), "fields": fields,
-                          "roles": {k: v for k, v in sorted(roles.items())}})
-        return {"move": "type_explain", "query": type_name, "types": types}
+            field_page, field_paging = _page(fields, member_offset, limit)
+            role_pages = {k: _page(v, member_offset, limit) for k, v in roles.items()}
+            types.append({**_loc(self.gl, typ), "field_count": len(fields),
+                          "fields": field_page, "fields_page": field_paging,
+                          "roles": {k: role_pages[k][0] for k in sorted(role_pages)},
+                          "role_pages": {k: role_pages[k][1] for k in sorted(role_pages)},
+                          "role_counts": {k: len(v) for k, v in sorted(roles.items())},
+                          })
+        page, paging = _page(types, offset, limit)
+        return {"move": "type_explain", "query": type_name,
+                "type_count": len(types), "types": page, "page": paging,
+                "declaration_count": len(declarations),
+                "declarations": declarations_page,
+                "declarations_page": declarations_paging}
 
-    def component_boundary(self, source: str, target: str) -> dict:
+    def component_boundary(self, source: str, target: str,
+                           limit: int = DEFAULT_DETAIL_LIMIT, offset: int = 0) -> dict:
         """Facts crossing two path components in either direction."""
         def belongs(path, component):
             if not path:
                 return False
-            clean = path.strip("./")
+            clean = (self._relative_path(path) or "").strip("./")
             component = component.strip("./")
             return clean == component or clean.startswith(component + "/")
 
@@ -405,10 +539,13 @@ class Comprehension:
                          "confidence": edge.get("properties", {}).get("confidence")})
         rows.sort(key=lambda r: (r["direction"], r["kind"], r["source"]["name"],
                                  r["target"]["name"]))
+        page, paging = _page(rows, offset, limit)
         return {"move": "component_boundary", "from": source, "to": target,
-                "count": len(rows), "crossings": rows}
+                "count": len(rows), "crossings": page, "page": paging}
 
-    def indirect_targets(self, function: str) -> dict:
+    def indirect_targets(self, function: str,
+                         limit: int = DEFAULT_DETAIL_LIMIT, offset: int = 0,
+                         target_offset: int = 0) -> dict:
         """Resolve each indirect call site separately and preserve undecidable slots."""
         hits = _matches(self.gl, function, frozenset(CALLABLE_KINDS))
         if not hits:
@@ -471,27 +608,35 @@ class Comprehension:
                     resolution = "registration"
                 else:
                     resolution = props.get("resolution") or ("resolved" if targets else "unresolved")
+                target_page, target_paging = _page(targets, target_offset, limit)
                 sites.append({**_loc(self.gl, call), "owner": _loc(self.gl, owner),
                               "resolution": resolution,
                               "slot": props.get("method_name") or props.get("callee"),
-                              "targets": targets, "resolved": bool(targets)})
+                              "target_count": len(targets),
+                              "targets": target_page, "targets_page": target_paging,
+                              "resolved": bool(targets)})
         sites.sort(key=lambda r: (r.get("file") or "", r.get("line") or 0))
+        page, paging = _page(sites, offset, limit)
         return {"move": "indirect_targets", "function": function,
-                "sites": sites, "counts": {
+                "sites": page, "page": paging,
+                "counts": {
                     "sites": len(sites), "resolved": sum(s["resolved"] for s in sites),
                     "unresolved": sum(not s["resolved"] for s in sites),
                 }}
 
-    def architecture_map(self, component_depth: int = 2, max_communities: int = 30) -> dict:
+    def architecture_map(self, component_depth: int = 2, max_communities: int = 30,
+                         max_files_per_community: int = COMMUNITY_FILE_LIMIT,
+                         offset: int = 0, file_offset: int = 0) -> dict:
         """Deterministic label-propagation communities over call + include edges."""
-        files = {n["id"]: self.gl.loc(n)[0] or self.gl.prop(n, "file")
+        files = {n["id"]: self._relative_path(
+            self.gl.loc(n)[0] or self.gl.prop(n, "file"))
                  for n in self.index.nodes_of_kind("file")}
         path_to_id = {path: node_id for node_id, path in files.items() if path}
         adjacency: dict[str, Counter] = defaultdict(Counter)
         call_degree = Counter()
 
         def file_id(node):
-            path = self.gl.loc(node)[0]
+            path = self._relative_path(self.gl.loc(node)[0])
             if path in path_to_id:
                 return path_to_id[path]
             # File nodes can use a relative path while declarations carry an absolute one.
@@ -556,19 +701,23 @@ class Comprehension:
                            if neighbor not in member_set)
             functions = [fn for fid in member_ids for fn in functions_by_file.get(fid, ())]
             hubs = sorted(functions, key=lambda n: (-call_degree[n["id"]], self.gl.label(n)))[:5]
+            file_page, file_paging = _page(
+                member_paths, file_offset, max_files_per_community)
             communities.append({
                 "id": min(member_paths) if member_paths else str(_label),
-                "files": member_paths, "internal_edges": internal,
+                "file_count": len(member_paths), "files": file_page,
+                "files_page": file_paging,
+                "internal_edges": internal,
                 "boundary_edges": crossing,
                 "hubs": [{**_loc(self.gl, n), "call_degree": call_degree[n["id"]]}
                          for n in hubs if call_degree[n["id"]]],
             })
-        communities.sort(key=lambda c: (-len(c["files"]), c["id"]))
+        communities.sort(key=lambda c: (-c["file_count"], c["id"]))
+        page, paging = _page(communities, offset, max_communities)
         return {"move": "architecture_map", "algorithm": "weighted-label-propagation",
                 "inputs": ["CALLS", "DEPENDS_ON", "RUNTIME_DEPENDS_ON", "RE_EXPORTS"],
                 "counts": {"files": len(files), "communities": len(communities)},
-                "communities": communities[:max(1, max_communities)],
-                "truncated": len(communities) > max(1, max_communities)}
+                "communities": page, "page": paging}
 
     def execution_story(self, entry: str, max_depth: int = 5,
                         max_steps: int = 100) -> dict:
@@ -589,10 +738,13 @@ class Comprehension:
                          "control": n.get("properties", {}).get("control_kind")}
                         for n in body if n.get("properties", {}).get("control_kind")
                         in {"if", "switch", "while", "for", "for-each", "try"}]
+            branch_limit = min(20, max(1, max_steps))
             step = {"sequence": len(steps), "depth": depth,
                     "function": _loc(self.gl, function),
                     "caller": _loc(self.gl, caller) if caller else None,
-                    "via": via, "branches": branches}
+                    "via": via, "branch_count": len(branches),
+                    "branches": branches[:branch_limit],
+                    "branches_truncated": len(branches) > branch_limit}
             steps.append(step)
             callees = [(n, "direct") for n in self.index.targets(function["id"], "CALLS")]
             for call in self.index.nodes_owned_by(function["id"], "call", "construct"):
@@ -620,7 +772,9 @@ class Comprehension:
         return {"move": "execution_story", "entry": _loc(self.gl, root),
                 "algorithm": "bounded-forward-call-and-branch-trace",
                 "limits": {"max_depth": max_depth, "max_steps": max_steps},
-                "steps": steps, "frontier": frontier,
+                "steps": steps, "frontier": frontier[:max(1, max_steps)],
+                "frontier_count": len(frontier),
+                "frontier_truncated": len(frontier) > max(1, max_steps),
                 "complete": not queue and not frontier}
 
     def change_context(self, symbol: str, limit: int = 12) -> dict:

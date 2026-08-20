@@ -305,7 +305,11 @@ def _fold_cone(store, name, args):
         "members": sum(f["members"] for f in folded),
         "nodes": sum(f["nodes"] for f in folded),
         "edges": sum(f["edges"] for f in folded),
+        "deferred_edges_omitted": sum(f.get("deferred_edges_omitted", 0)
+                                      for f in folded),
         "truncated": any(f["truncated"] for f in folded),
+        "complete": (not any(f["truncated"] for f in folded)
+                     and not any(f.get("deferred_edges_omitted", 0) for f in folded)),
     }}
 
 
@@ -350,47 +354,66 @@ TOOLS = [
                     "from couldn't-cross instead of silently treating missing graph facts as none.",
      "inputSchema": {"type": "object", "properties": {
          "function": {"type": "string", "description": "optional function name or node id"},
-         "limit": {"type": "integer", "default": 100}}}},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}}}},
     {"name": "coverage_map",
      "description": "Deterministic indexed-graph coverage by component: files, callable bodies, "
                     "diagnostics, and unmodeled frontiers. This reports graph coverage, not mutable "
                     "per-client session activity.",
      "inputSchema": {"type": "object", "properties": {
-         "component_depth": {"type": "integer", "default": 1}}}},
+         "component_depth": {"type": "integer", "default": 1},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}}}},
     {"name": "field_history",
      "description": "For a field/property, list graph-evidenced initialization, modification, "
                     "reads, checks, and value-flow events with owning functions.",
      "inputSchema": {"type": "object", "properties": {
          "field": {"type": "string"},
-         "owner_type": {"type": "string", "description": "optional type name/id disambiguator"}},
+         "owner_type": {"type": "string", "description": "optional type name/id disambiguator"},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}},
          "required": ["field"]}},
     {"name": "sibling_compare",
      "description": "Compare structurally similar callables by callees and control structure. "
                     "Returns differences as facts only; it does not rank anomalies or issue verdicts.",
      "inputSchema": {"type": "object", "properties": {
-         "symbol": {"type": "string"}}, "required": ["symbol"]}},
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "call_offset": {"type": "integer", "default": 0}},
+         "required": ["symbol"]}},
     {"name": "type_explain",
      "description": "Explain a type from graph facts: fields and constructor, mutator, consumer, "
                     "and destructor method roles.",
      "inputSchema": {"type": "object", "properties": {
-         "type": {"type": "string"}}, "required": ["type"]}},
+         "type": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "member_offset": {"type": "integer", "default": 0}},
+         "required": ["type"]}},
     {"name": "component_boundary",
      "description": "Show calls, callbacks, and type references crossing between two path "
                     "components, in both directions, with confidence and source locations.",
      "inputSchema": {"type": "object", "properties": {
-         "from_component": {"type": "string"}, "to_component": {"type": "string"}},
+         "from_component": {"type": "string"}, "to_component": {"type": "string"},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}},
          "required": ["from_component", "to_component"]}},
     {"name": "indirect_targets",
      "description": "Resolve function-pointer, callback, ops-table, and runtime dispatch sites "
                     "inside a function. Keeps unresolved sites visible and reports confidence.",
      "inputSchema": {"type": "object", "properties": {
-         "function": {"type": "string"}}, "required": ["function"]}},
+         "function": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "target_offset": {"type": "integer", "default": 0}},
+         "required": ["function"]}},
     {"name": "architecture_map",
      "description": "Deterministic file communities over the call + dependency graph, with "
                     "internal/boundary edge counts and call-graph hubs. Returns no generated labels.",
      "inputSchema": {"type": "object", "properties": {
          "component_depth": {"type": "integer", "default": 2},
-         "max_communities": {"type": "integer", "default": 30}}}},
+         "max_communities": {"type": "integer", "default": 30},
+         "max_files_per_community": {"type": "integer", "default": 50},
+         "offset": {"type": "integer", "default": 0},
+         "file_offset": {"type": "integer", "default": 0}}}},
     {"name": "execution_story",
      "description": "Bounded forward call-and-branch trace from an entry point, including resolved "
                     "indirect dispatch. Returns graph structure, not generated narrative prose.",
@@ -432,6 +455,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string"}, "limit": {"type": "integer", "default": 20},
          "min_score": {"type": "number", "default": 0.0},
+         "offset": {"type": "integer", "default": 0},
          "model": {"type": "string", "default": "BAAI/bge-small-en-v1.5"}},
          "required": ["query"]}},
     {"name": "guards_top",
@@ -641,9 +665,10 @@ for _t in TOOLS:
     if _t["name"] != "load_graph":
         _t["inputSchema"].setdefault("properties", {})["format"] = {
             "type": "string", "enum": ["text", "json"],
-            "description": "text (compact, default) | json (full result dict)"}
-# Paging fields on the list-shaped moves: they window the TEXT rendering only (JSON is
-# always the full, un-paged result), so a call on a 400-caller hub stays bounded.
+            "description": "text (compact, default) | json (structured result page)"}
+# Paging fields on these legacy list-shaped moves window their text rendering. Newer
+# comprehension tools page structured results before they reach this layer and include
+# total/next-offset metadata in both JSON and compact text.
 for _name in ("hubs", "callers", "callees", "flow_pass", "flow_skeleton"):
     _tool = next(t for t in TOOLS if t["name"] == _name)
     _tool["inputSchema"]["properties"].update(
@@ -671,10 +696,10 @@ def _atropos_envelope(summary, *, full):
 
 
 def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
-    """Serialize a tool's result dict: full JSON, or compact text via the renderer.
+    """Serialize a tool result as structured JSON or compact agent-facing text.
 
-    JSON is byte-identical to the pre-render behavior; text applies id/handle/null
-    stripping, path relativization, and the offset/limit window (text-only paging)."""
+    Comprehension tools page evidence in the result contract itself. The renderer also
+    windows legacy list-shaped text results and strips redundant detail."""
     if fmt == "json":
         return json.dumps(result)
     return render_mod.render(name, result, offset=offset, limit=limit)
@@ -699,32 +724,48 @@ def call_tool(name, args, format=None):
 
     if name == "unknowns":
         result = c.comprehension.unknowns(
-            function=args.get("function"), limit=int(args.get("limit", 100)))
+            function=args.get("function"), limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "coverage_map":
         result = c.comprehension.coverage_map(
-            component_depth=int(args.get("component_depth", 1)))
+            component_depth=int(args.get("component_depth", 1)),
+            limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "field_history":
-        result = c.comprehension.field_history(args["field"], args.get("owner_type"))
+        result = c.comprehension.field_history(
+            args["field"], args.get("owner_type"), limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "sibling_compare":
-        result = c.comprehension.sibling_compare(args["symbol"])
+        result = c.comprehension.sibling_compare(
+            args["symbol"], limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)), call_offset=int(args.get("call_offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "type_explain":
-        result = c.comprehension.type_explain(args["type"])
+        result = c.comprehension.type_explain(
+            args["type"], limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)),
+            member_offset=int(args.get("member_offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "component_boundary":
         result = c.comprehension.component_boundary(
-            args["from_component"], args["to_component"])
+            args["from_component"], args["to_component"],
+            limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "indirect_targets":
-        return _emit(name, c.comprehension.indirect_targets(args["function"]),
+        return _emit(name, c.comprehension.indirect_targets(
+                         args["function"], limit=int(args.get("limit", 100)),
+                         offset=int(args.get("offset", 0)),
+                         target_offset=int(args.get("target_offset", 0))),
                      fmt, offset, limit)
     if name == "architecture_map":
         result = c.comprehension.architecture_map(
             component_depth=int(args.get("component_depth", 2)),
-            max_communities=int(args.get("max_communities", 30)))
+            max_communities=int(args.get("max_communities", 30)),
+            max_files_per_community=int(args.get("max_files_per_community", 50)),
+            offset=int(args.get("offset", 0)),
+            file_offset=int(args.get("file_offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "execution_story":
         result = c.comprehension.execution_story(
@@ -757,7 +798,8 @@ def call_tool(name, args, format=None):
     if name == "concept_search":
         result = c.concepts(args.get("model", DEFAULT_MODEL)).search(
             args["query"], limit=int(args.get("limit", 20)),
-            min_score=float(args.get("min_score", 0.0)))
+            min_score=float(args.get("min_score", 0.0)),
+            offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
 
     if name == "guards_top":

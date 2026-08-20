@@ -383,7 +383,8 @@ class GraphStore:
         from lachesis.nav.kuzu_index import materialize_subgraph
         from lachesis.resolution import FOLD_BUDGET
 
-        empty = {"members": 0, "nodes": 0, "edges": 0, "truncated": False}
+        empty = {"members": 0, "nodes": 0, "edges": 0, "truncated": False,
+                 "deferred_edges_omitted": 0}
         # A store that already carries the whole tier has nothing to scope, and an
         # in-memory graph has no store to scope it out of.
         if getattr(self, "_enriched", True) or not hasattr(self.index, "graft"):
@@ -406,6 +407,13 @@ class GraphStore:
         for member in members:
             wanted.update(self.index.by_owner.get(member, ()))
         core = materialize_subgraph(self.index, wanted)
+        resident = {node["id"] for node in core["nodes"]}
+        from lachesis.nav.kuzu_index import deferred_edges
+        omitted = sum(
+            1 for edge in deferred_edges(self.index)
+            if edge["source"] in wanted and edge["target"] in wanted
+            and (edge["source"] not in resident or edge["target"] not in resident)
+        )
         manifest = read_store_manifest(self._core_path)
         enriched = enrich_graph(core, manifest_languages(manifest),
                                 manifest_capabilities(manifest))
@@ -422,7 +430,8 @@ class GraphStore:
         # built before it describes the graph as it was.
         self._entries = None
         return {"members": len(members), "nodes": len(fresh_nodes),
-                "edges": added, "truncated": hood["truncated"]}
+                "edges": added, "truncated": hood["truncated"],
+                "deferred_edges_omitted": omitted}
 
     # -- name entry / teleport ----------------------------------------------
 

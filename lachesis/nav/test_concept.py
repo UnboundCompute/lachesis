@@ -68,6 +68,15 @@ class ConceptSearchTests(unittest.TestCase):
             self.assertEqual("validateInput", answer["results"][0]["name"])
             self.assertTrue(_FakeEmbedding.calls[1]["local_files_only"])
 
+            first_page = ConceptSearch(_store()).search(
+                "validate untrusted input", limit=1)
+            second_page = ConceptSearch(_store()).search(
+                "validate untrusted input", limit=1,
+                offset=first_page["page"]["next_offset"],
+            )
+            self.assertTrue(first_page["page"]["has_more"])
+            self.assertNotEqual(first_page["results"], second_page["results"])
+
             # A fresh query object loads the graph-vector cache but still opens the
             # model in offline-only mode; no embedding download path is re-entered.
             again = ConceptSearch(_store()).search("database query")

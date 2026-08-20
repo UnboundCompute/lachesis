@@ -138,8 +138,13 @@ def _is_external(file: str | None, prov: dict[str, str]) -> bool:
         return False
     provenance = prov.get(file)
     if provenance:
-        return provenance != "application"
-    return "node_modules" in file  # fallback when provenance is absent
+        if provenance != "application":
+            return True
+    parts = {part.casefold() for part in Path(file).parts}
+    # Repositories sometimes commit third-party browser/runtime sources under these
+    # conventional boundaries. They remain indexed and directly searchable, but must
+    # not outrank the project's own code as the cold-start architectural spine.
+    return bool(parts & {"node_modules", "vendor", "vendors", "third_party", "third-party"})
 
 
 def build_index(gl: GraphLib, include_external: bool = False) -> list[dict]:

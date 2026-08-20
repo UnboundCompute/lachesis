@@ -139,6 +139,23 @@ class ComprehensionTests(unittest.TestCase):
                          [step["function"]["name"] for step in story["steps"]])
         self.assertEqual("bounded-forward-call-and-branch-trace", story["algorithm"])
 
+    def test_large_evidence_lists_are_retrievable_as_stable_pages(self):
+        first = self.query.architecture_map(max_communities=1, max_files_per_community=1)
+        community = first["communities"][0]
+        self.assertEqual(1, community["files_page"]["returned"])
+        if community["files_page"]["has_more"]:
+            second = self.query.architecture_map(
+                max_communities=1, max_files_per_community=1,
+                file_offset=community["files_page"]["next_offset"],
+            )
+            self.assertNotEqual(community["files"], second["communities"][0]["files"])
+
+        unknowns = self.query.unknowns(limit=1)
+        self.assertEqual(1, unknowns["page"]["returned"])
+        if unknowns["page"]["has_more"]:
+            later = self.query.unknowns(limit=1, offset=unknowns["page"]["next_offset"])
+            self.assertNotEqual(unknowns["unknowns"], later["unknowns"])
+
     def test_comprehension_answers_match_the_disk_store(self):
         from lachesis.kuzu_store import write_kuzu_graph
         from ._navharness import norm

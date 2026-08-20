@@ -22,7 +22,8 @@ from .graphlib import CALLABLE_KINDS
 
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
-INDEX_VERSION = 1
+INDEX_VERSION = 4
+EMBED_BATCH_SIZE = 32
 CARD_KINDS = frozenset((*CALLABLE_KINDS, "class", "interface", "type", "record", "enum"))
 
 
@@ -107,6 +108,25 @@ def semantic_cards(store) -> list[dict]:
     """Compact graph-grounded documents; no whole raw body is embedded."""
     gl, index = store.gl, store.index
     cards = []
+    seen_text = set()
+    # Build the two relational summaries in bulk. Asking ``calls_from`` and
+    # ``DECLARES_MEMBER`` once per card turns a 16k-card C graph into tens of thousands
+    # of Kuzu round trips; the edge families are small enough to scan once and group.
+    label_by_id = {
+        (item["id"] if isinstance(item, dict) else item): label
+        for label, items in index.by_label.items() if label for item in items
+    }
+    calls_by_source = {}
+    for edge in index.edges_of_kind("CALLS"):
+        name = label_by_id.get(edge["target"])
+        if name:
+            calls_by_source.setdefault(edge["source"], set()).add(name)
+    members_by_type = {}
+    for edge in index.edges_of_kind("DECLARES_MEMBER"):
+        name = label_by_id.get(edge["target"])
+        if name:
+            members_by_type.setdefault(edge["source"], set()).add(name)
+
     for node in index.nodes_of_kind(*CARD_KINDS):
         name = gl.label(node)
         if not name:
@@ -117,28 +137,27 @@ def semantic_cards(store) -> list[dict]:
         if signature:
             parts.append(f"signature {signature}")
         if node.get("kind") in CALLABLE_KINDS:
-            callees = sorted({gl.label(target) for target in gl.calls_from(node["id"])
-                              if gl.label(target)})
+            callees = sorted(calls_by_source.get(node["id"], ()))
             if callees:
-                parts.append("calls " + ", ".join(callees[:40]))
-            controls = sorted({body.get("properties", {}).get("control_kind")
-                               for body in index.nodes_owned_by(node["id"])
-                               if body.get("properties", {}).get("control_kind")})
-            if controls:
-                parts.append("control " + ", ".join(controls))
+                parts.append("calls " + ", ".join(callees[:20]))
             source = gl.source_text(node)
             if source:
-                # Enough lexical behavior for semantic retrieval, bounded below the
-                # model's 512-token context rather than embedding an arbitrary body.
-                compact = " ".join(source.split())[:2200]
-                parts.append("code " + compact)
+                # Rich source behavior is retained for the full semantic index. The
+                # interactive path will use a coarse structural pass before embedding
+                # only a shortlist of these richer cards.
+                parts.append("code " + " ".join(source.split())[:1000])
         else:
-            members = sorted({gl.label(member)
-                              for member in index.targets(node["id"], "DECLARES_MEMBER")
-                              if gl.label(member)})
+            members = sorted(members_by_type.get(node["id"], ()))
             if members:
-                parts.append("members " + ", ".join(members[:80]))
-        cards.append({**_location(gl, node), "text": "\n".join(parts)})
+                parts.append("members " + ", ".join(members[:40]))
+        text = "\n".join(parts)
+        # C graphs commonly contain the same record declaration once per translation
+        # unit. Embedding identical cards repeatedly spends minutes and adds no search
+        # signal; keep the first stable location as the representative result.
+        if text in seen_text:
+            continue
+        seen_text.add(text)
+        cards.append({**_location(gl, node), "text": text})
     cards.sort(key=lambda card: (card.get("file") or "", card.get("line") or 0,
                                  card["name"], card["node_id"]))
     return cards
@@ -185,6 +204,19 @@ def _norm(vector) -> list[float]:
     return [value / length for value in values] if length else values
 
 
+def _embed_documents(embedder, documents: list[str]) -> list[list[float]]:
+    """Embed in explicit small batches so ONNX never retains a corpus-sized tensor."""
+    vectors = []
+    for start in range(0, len(documents), EMBED_BATCH_SIZE):
+        batch = documents[start:start + EMBED_BATCH_SIZE]
+        try:
+            generated = embedder.embed(batch, batch_size=EMBED_BATCH_SIZE)
+        except TypeError:  # lightweight test/fallback adapters may omit batch_size
+            generated = embedder.embed(batch)
+        vectors.extend(_norm(vector) for vector in generated)
+    return vectors
+
+
 class ConceptSearch:
     def __init__(self, store, model: str = DEFAULT_MODEL) -> None:
         self.store = store
@@ -211,7 +243,7 @@ class ConceptSearch:
             except (OSError, ValueError):
                 pass
         documents = ["passage: " + card["text"] for card in cards]
-        vectors = [_norm(vector) for vector in embedder.embed(documents)] if documents else []
+        vectors = _embed_documents(embedder, documents) if documents else []
         payload = {"version": INDEX_VERSION, "model": self.model,
                    "fingerprint": fingerprint, "cards": cards, "vectors": vectors}
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,7 +254,8 @@ class ConceptSearch:
         self._embedder, self._index = embedder, payload
         return payload, None
 
-    def search(self, query: str, limit: int = 20, min_score: float = 0.0) -> dict:
+    def search(self, query: str, limit: int = 20, min_score: float = 0.0,
+               offset: int = 0) -> dict:
         payload, error = self._ensure_index()
         if error:
             return {"move": "concept_search", "query": query, **error}
@@ -234,10 +267,17 @@ class ConceptSearch:
                 ranked.append((score, card))
         ranked.sort(key=lambda item: (-item[0], item[1].get("file") or "",
                                       item[1].get("line") or 0))
+        start, size = max(0, offset), max(1, limit)
+        page = ranked[start:start + size]
         results = [{k: v for k, v in card.items() if k != "text"} |
                    {"score": round(score, 6), "summary": card["text"][:500]}
-                   for score, card in ranked[:max(1, limit)]]
+                   for score, card in page]
+        next_offset = start + len(results)
+        has_more = next_offset < len(ranked)
         return {"move": "concept_search", "query": query, "model": self.model,
                 "index": {"documents": len(payload["cards"]),
                           "fingerprint": payload["fingerprint"]},
-                "count": len(results), "results": results}
+                "count": len(results), "total": len(ranked), "results": results,
+                "page": {"total": len(ranked), "offset": start,
+                         "returned": len(results), "has_more": has_more,
+                         "next_offset": next_offset if has_more else None}}

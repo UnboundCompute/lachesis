@@ -4601,6 +4601,37 @@ class HomonymResolutionTests(unittest.TestCase):
         self.assertFalse(blind.nodes[result["target"]]["properties"]
                          .get("declaration_only"))
 
+    def test_name_fallback_does_not_cross_frontend_languages(self):
+        """A mixed Python/TS repository does not make homonyms callable peers."""
+        from lachesis.core.identities import stable_id
+        from lachesis.core.query import GraphIndex
+        from lachesis.resolution import resolve
+
+        owner = stable_id("frontend", "cpython-ast", "function", "owner")
+        call = stable_id("frontend", "cpython-ast", "call", "len-site")
+        python_len = stable_id("frontend", "cpython-ast", "function", "len")
+        typescript_len = stable_id(
+            "frontend", "typescript-compiler-api", "function", "len",
+        )
+        graph = {
+            "nodes": [
+                {**_node(owner), "label": "owner",
+                 "properties": {"language": "python"}},
+                {**_node(call, "call"), "label": "len()",
+                 "properties": {"callee_name": "len", "language": "python",
+                                "owner_function_id": owner}},
+                {**_node(python_len), "label": "len",
+                 "properties": {"language": "python"}},
+                {**_node(typescript_len), "label": "len",
+                 "properties": {"language": "typescript"}},
+            ],
+            "edges": [],
+        }
+        result = resolve(GraphIndex(graph), call)
+        self.assertEqual(python_len, result["target"])
+        self.assertEqual((python_len,), result["candidates"])
+        self.assertEqual("sole-candidate", result["via"])
+
     # -- scope: a declaration, and a cone -----------------------------------
 
     def test_resolve_decl_visits_only_the_call_sites_it_owns(self):
