@@ -149,6 +149,16 @@ An `mmap` reader was benchmarked on a 400k-record shard stream (200k nodes and
 (0.225s versus 0.189s in the local run), so it was reverted in `eb249b8`. The current
 length-framed marshal format remains the faster measured implementation.
 
+### Rejected streaming Clang-JSON experiment
+
+A prototype that spilled Clang's AST JSON to a mmap'd file and scanned root children
+one at a time was tested on Linux `drivers/usb`. It produced 857,999 nodes and
+1,693,850 edges instead of the reference 858,016 / 1,693,995, took 173.39s versus
+about 99s for the direct frontend, and peaked at 2.35 GiB. The prototype was reverted:
+the Python byte scanner was both slower and lossy, so it is not an accepted memory
+optimization. A future streaming parser must prove byte-for-byte graph parity before
+being used on large trees.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
