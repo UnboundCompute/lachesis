@@ -147,6 +147,14 @@ def main() -> None:
             prune=args.prune,
         )
         print(f"Streamed {len(snapshots)} frontends into {stored}")
+        if args.parallel_packages:
+            dropped = 0
+            for snapshot, reader in zip(snapshots, readers):
+                original = int(snapshot.manifest.get("edge_count", snapshot.payload_edge_count))
+                retained = sum(int(item.get("edge_count", 0))
+                               for item in reader.manifest.get("shards", []))
+                dropped += max(0, original - retained)
+            print(f"Dropped {dropped} imported-view edges (package-sharded streaming)")
         return
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
