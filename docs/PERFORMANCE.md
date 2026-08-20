@@ -94,6 +94,15 @@ The internal additive dataflow cache is a versioned, core-content-hash-keyed std
 text format and adds no runtime dependency. JSON remains reserved for user-facing
 output; it is not used for this internal cache.
 
+### Internal wire-format decision
+
+The shard **record contract** is language-neutral, but its current on-disk encoding is
+Python-specific length-framed `marshal`. Protobuf was evaluated as the cross-language
+replacement, but is not enabled yet: no supported runtime ships protobuf today, and a
+migration would require a versioned schema plus generated bindings for every frontend.
+Until that contract is deliberately introduced, the Action and local engine use the
+stdlib format and must not advertise shards as externally consumable protobuf data.
+
 ### Rejected scheduling experiment
 
 On Linux `fs/ext4` (51 files, 69,304 LOC), raising `LACHESIS_C_JOBS` from 1 to 4
