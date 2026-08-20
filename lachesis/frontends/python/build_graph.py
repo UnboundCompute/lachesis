@@ -20,7 +20,7 @@ if __package__ in (None, ""):  # invoked as a bare script path, not with -m
     __package__ = "lachesis.frontends.python"
 
 from .declarations import DeclarationWalk
-from lachesis.core.graph_wire import encode_document, encode_tier
+from lachesis.core.graph_wire import encode_document, write_tier
 from .emit import (
     CONTRACT_VERSION, FRONTEND_ID, LANGUAGE, TIERS, Graph, SourceFile, stable_id,
 )
@@ -368,9 +368,7 @@ def build(source_dir: Path, output_dir: Path) -> int:
     analysis = analyze(source_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for tier, payload in analysis.payloads.items():
-        (output_dir / f"{tier.lower()}_{TIERS[tier]}.pb").write_bytes(
-            encode_tier(payload)
-        )
+        write_tier(output_dir / f"{tier.lower()}_{TIERS[tier]}.pb", payload)
     (output_dir / "manifest.pb").write_bytes(encode_document(analysis.manifest))
     print(f"{analysis.summary} to {output_dir}")
     # A non-zero exit is a ContractError that kills the whole multi-language build,

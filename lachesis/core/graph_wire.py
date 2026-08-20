@@ -18,6 +18,20 @@ FRAME = struct.Struct("!I")
 WIRE_FORMAT_VERSION = 2
 
 
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    value = int(value)
+    while value > 0x7F:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _field_bytes(number: int, payload: bytes) -> bytes:
+    return _varint((number << 3) | 2) + _varint(len(payload)) + payload
+
+
 def _value(value: Any) -> graph_pb2.Value:
     result = graph_pb2.Value()
     if value is None:
@@ -177,6 +191,18 @@ def decode_tier(payload: bytes) -> dict[str, Any]:
         "expands_to": [decode_edge(item.SerializeToString()) for item in message.expands_to],
         "links": [decode_edge(item.SerializeToString()) for item in message.links],
     }
+
+
+def write_tier(path: str | Path, payload: Mapping[str, Any]) -> None:
+    """Write a typed tier incrementally without materializing its outer message."""
+    with open(path, "wb") as handle:
+        handle.write(_field_bytes(1, str(payload.get("tier") or "").encode()))
+        handle.write(_field_bytes(2, str(payload.get("name") or "").encode()))
+        for node in payload.get("nodes", ()):
+            handle.write(_field_bytes(3, encode_node(node)))
+        for field, tag in (("edges", 4), ("expands_to", 5), ("links", 6)):
+            for edge in payload.get(field, ()):
+                handle.write(_field_bytes(tag, encode_edge(edge)))
 
 
 def encode_document(payload: Mapping[str, Any], *, version: int = 1) -> bytes:
