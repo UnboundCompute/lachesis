@@ -567,11 +567,16 @@ class Graph:
         canonical = dict(properties)
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
-            cached = RESOLVED_FILES.get(absolute_file)
+            # Clang can spell the same included file with redundant ``./`` or
+            # separator components across translation units. Normalize before the
+            # memo lookup so those spellings do not repeat realpath/content-hash
+            # work for every AST node.
+            file_key = os.path.normcase(os.path.normpath(absolute_file))
+            cached = RESOLVED_FILES.get(file_key)
             if cached is None:
                 absolute = Path(absolute_file).resolve()
                 cached = (str(absolute), content_hash(absolute))
-                RESOLVED_FILES[absolute_file] = cached
+                RESOLVED_FILES[file_key] = cached
             resolved_file, resolved_hash = cached
             canonical.update({
                 "frontend_id": FRONTEND_ID,
@@ -877,6 +882,7 @@ def main() -> int:
     asts = AstStore(Path(ast_spill.name))
     diagnostics: List[Tuple[Path, str]] = []
     failed_files: Set[Path] = set()
+    dependency_targets: Dict[str, Optional[Path]] = {}
 
     for path in files:
         text = source_text(path, texts)
@@ -898,8 +904,16 @@ def main() -> int:
         flattened = dependency.stdout.replace("\\\n", " ")
         dependencies = flattened.split(":", 1)[1].split() if ":" in flattened else []
         for raw in dependencies:
-            target = (Path.cwd() / raw).resolve() if not os.path.isabs(raw) else Path(raw).resolve()
-            if target == path or not target.exists():
+            target = dependency_targets.get(raw)
+            if raw not in dependency_targets:
+                candidate = Path(raw) if os.path.isabs(raw) else Path.cwd() / raw
+                try:
+                    candidate = candidate.resolve()
+                except OSError:
+                    candidate = None
+                dependency_targets[raw] = candidate if candidate and candidate.exists() else None
+                target = dependency_targets[raw]
+            if target is None or target == path:
                 continue
             if target not in file_ids:
                 text = source_text(target, texts)

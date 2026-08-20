@@ -97,17 +97,23 @@ def parse_macro_definitions(
     """
     origin_resolved = origin.resolve()
     current_file: Optional[str] = None
+    current_resolved: Optional[Path] = None
     current_line = 0
+    resolved_files: Dict[str, Path] = {}
     macros: List[Dict[str, object]] = []
     for line in preprocessed.splitlines():
         marker = _parse_line_marker(line)
         if marker is not None:
             current_file, current_line = marker
+            current_resolved = resolved_files.get(current_file)
+            if current_resolved is None:
+                current_resolved = Path(current_file).resolve()
+                resolved_files[current_file] = current_resolved
             continue
         if (
             line.startswith(_DEFINE)
             and current_file is not None
-            and Path(current_file).resolve() == origin_resolved
+            and current_resolved == origin_resolved
         ):
             definition = _split_definition(line[len(_DEFINE):])
             if definition is not None:
