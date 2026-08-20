@@ -28,6 +28,13 @@ When memory is the limiting resource during store materialization, add
 `LACHESIS_KUZU_LOW_MEMORY=1`. It removes the in-memory property-text compression
 arrays and preserves graph facts; the tradeoff is a larger/slightly slower store write.
 
+The bounded core-only path uses the same direct package command exposed in README:
+
+```bash
+lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
 For a safe first run on a constrained machine, set `LACHESIS_C_JOBS=1`. The command
 still builds the complete subsystem; this only makes Clang scheduling predictable.
 For a warm incremental measurement, repeat with `--incremental` and the same

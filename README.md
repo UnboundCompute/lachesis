@@ -153,6 +153,17 @@ LACHESIS_C_JOBS=1 LACHESIS_EMIT_TOKENS=0 LACHESIS_EMIT_PROOFS=0 \
   /path/to/large-c-tree /tmp/lachesis-frontends
 ```
 
+For a core-only store on a large mixed-language tree, stream frontend shards directly
+into Kùzu to keep the parent process from composing one giant graph:
+
+```bash
+lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
+`--stream-shards` is currently incompatible with `--enrich`; dataflow partition
+streaming is the next integration step.
+
 Use a clean output directory and monitor the process on very large trees. The command
 builds the complete C graph directly; the token/proof switches remove only lexical
 facts that `--prune` discards later.
