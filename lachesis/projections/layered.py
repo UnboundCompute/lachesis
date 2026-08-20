@@ -329,7 +329,7 @@ def build_security_query_projection(
     tier assignment and ownership identical to :func:`build_layered_graph` so the
     locators are byte-for-byte compatible, but omit the presentation payload.
     """
-    index = GraphIndex(graph)
+    index = GraphIndex(graph, compact=True)
     project_id = _project_id(graph)
     tier_of, _untiered = _tier_assignments(index)
     owners = _ownership(graph, index, tier_of, project_id)
@@ -533,7 +533,7 @@ def _component_summaries(
 
 def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) -> dict:
     """Create layered-v2 artifacts without changing canonical graph facts."""
-    index = GraphIndex(graph)
+    index = GraphIndex(graph, compact=True)
     tier_of, untiered = _tier_assignments(index)
     project_id = _project_id(graph)
     owners = _ownership(graph, index, tier_of, project_id)
