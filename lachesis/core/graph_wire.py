@@ -59,22 +59,31 @@ def _value(value: Any) -> graph_pb2.Value:
     return result
 
 
-def _freeze_property(value: Any):
-    """Return a bounded-cache key for JSON-shaped graph property values."""
-    if isinstance(value, Mapping):
-        return tuple(sorted((str(key), _freeze_property(item))
-                            for key, item in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_property(item) for item in value)
-    if isinstance(value, (str, bytes, int, float, bool, type(None))):
-        return type(value).__name__, value
-    return type(value).__name__, repr(value)
-
-
 _CACHE_SKIP_KEYS = frozenset({
     "file", "absolute_file", "content_hash", "compiler_node_id",
     "start_offset", "end_offset", "start_line", "end_line",
 })
+_CACHEABLE_KEYS = frozenset({
+    "confidence", "fact_origin", "evidence_ids", "via", "resolution",
+    "reason", "target_tier", "semantic_kind",
+})
+
+
+def _property_cache_key(values: Mapping[str, Any]) -> tuple | None:
+    """Fast key for the small, repeated metadata maps used by graph edges."""
+    if any(key not in _CACHEABLE_KEYS for key in values):
+        return None
+    parts = []
+    for key, value in values.items():
+        if isinstance(value, (list, tuple)):
+            if not all(isinstance(item, (str, bytes, int, float, bool, type(None)))
+                       for item in value):
+                return None
+            value = tuple((type(item).__name__, item) for item in value)
+        elif not isinstance(value, (str, bytes, int, float, bool, type(None))):
+            return None
+        parts.append((str(key), type(value).__name__, value))
+    return tuple(sorted(parts))
 
 
 def _properties(
@@ -82,16 +91,17 @@ def _properties(
     cache: dict | None = None,
 ) -> list[graph_pb2.Field]:
     cache_key = None
-    cacheable = (
-        cache is not None
-        and len(values or {}) <= 8
-        and not _CACHE_SKIP_KEYS.intersection(values or {})
-    )
+    properties = values or {}
+    cache_key = None
+    cacheable = (cache is not None and len(properties) <= 8
+                 and not _CACHE_SKIP_KEYS.intersection(properties))
     if cacheable:
-        cache_key = _freeze_property(values or {})
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return list(cached)
+        cache_key = _property_cache_key(properties)
+        cacheable = cache_key is not None
+        if cacheable:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
     fields = []
     for key in sorted(values or {}, key=str):
         field = graph_pb2.Field(key=str(key))
