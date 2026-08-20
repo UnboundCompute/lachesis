@@ -94,6 +94,14 @@ class ReasoningQuery:
         for adjacency in (self.layered_outgoing, self.layered_incoming):
             for edges in adjacency.values():
                 edges.sort(key=lambda item: item["id"])
+        self._security_cache = None
+
+    def _security_verdicts(self):
+        """Compute sink classifications and guard verdicts once per query."""
+        if self._security_cache is None:
+            sinks = classify_sinks(self.graph)
+            self._security_cache = (sinks, detect_guards(self.graph, sinks))
+        return self._security_cache
 
     def _budget(self, budget_tokens: Optional[int]) -> int:
         return budget_tokens or self.default_budget_tokens
@@ -470,8 +478,9 @@ class ReasoningQuery:
         guard = None
         if call:
             owner = call.get("properties", {}).get("owner_function_id")
+            _sinks, verdicts = self._security_verdicts()
             guard = next((
-                verdict for verdict in detect_guards(self.graph, classify_sinks(self.graph))
+                verdict for verdict in verdicts
                 if verdict["handler_id"] == owner and call_id in verdict["sink_call_ids"]
             ), None)
         return self._slice(

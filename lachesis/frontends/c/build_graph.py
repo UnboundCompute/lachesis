@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import mmap
 import marshal
 import os
 import shlex
@@ -25,6 +26,12 @@ try:  # run as a script (sys.path[0] is this directory) …
     from macros import parse_macro_definitions
 except ImportError:  # … or imported as a package module.
     from lachesis.frontends.c.macros import parse_macro_definitions
+
+try:
+    from lachesis.core.graph_wire import encode_document, write_tier
+except ModuleNotFoundError:  # direct script execution from the frontend directory
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from lachesis.core.graph_wire import encode_document, write_tier
 
 
 CONTRACT_VERSION = 2
@@ -69,15 +76,6 @@ CONTENT_HASHES: Dict[Path, str] = {}
 # one deterministic lookup into millions of lstat/realpath syscalls.
 RESOLVED_FILES: Dict[str, Tuple[str, str]] = {}
 
-
-def _freeze(value: object) -> object:
-    """Order-independent hashable projection of a JSON-shaped value — an edge
-    dedup key without the per-edge json.dumps(sort_keys=True) string build."""
-    if isinstance(value, dict):
-        return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
-    if isinstance(value, list):
-        return tuple(_freeze(v) for v in value)
-    return value
 
 def stable_id(kind: str, *parts: object) -> str:
     raw = "\0".join(str(part) for part in parts)
@@ -315,7 +313,10 @@ def run_clang(
     )
 
 
-def clang_jobs() -> int:
+LARGE_PROJECT_FILE_LIMIT = 128
+
+
+def clang_jobs(path_count: Optional[int] = None) -> int:
     """How many clang processes this frontend keeps in flight at once.
 
     Deliberately below the core count. Each pass holds one whole ``stdout`` per
@@ -323,7 +324,10 @@ def clang_jobs() -> int:
     real kernel translation unit re-expands its headers into hundreds of MB of JSON
     before the prune below trims it. Concurrency multiplies that peak, so the default
     trades some of the available parallelism for a resident set that does not grow with
-    the machine. ``LACHESIS_C_JOBS`` overrides it, ``1`` restores the serial build.
+    the machine. Large projects use one AST at a time by default: a project with many
+    roots is precisely the workload where two or more expanded kernel/header ASTs can
+    exhaust the runner before the pruning step. ``LACHESIS_C_JOBS`` overrides it, ``1``
+    restores the serial build, and small projects retain the faster parallel default.
     """
     configured = os.environ.get("LACHESIS_C_JOBS")
     if configured:
@@ -331,6 +335,8 @@ def clang_jobs() -> int:
             return max(1, int(configured))
         except ValueError:
             pass
+    if path_count is not None and path_count >= LARGE_PROJECT_FILE_LIMIT:
+        return 1
     return max(1, min(4, (os.cpu_count() or 1) // 2))
 
 
@@ -387,7 +393,7 @@ def run_clang_over(
     """
     paths = list(paths)
     flags = file_flags_of or {}
-    jobs = jobs or clang_jobs()
+    jobs = jobs or clang_jobs(len(paths))
     if jobs <= 1 or len(paths) <= 1:
         for path in paths:
             yield path, run_clang(source_dir, path, *arguments,
@@ -562,20 +568,29 @@ class Graph:
         self.nodes: Dict[str, dict] = {}
         self.node_tier: Dict[str, str] = {}
         self.edges: List[dict] = []
-        self.edge_keys = set()
+        self.edge_keys = _EdgeKeys()
 
     def node(self, tier: str, node_id: str, kind: str, label: str, **properties) -> str:
-        canonical = {
-            "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-            **properties,
-        }
+        # Defaults are restored at bundle serialization. Keeping them out of every
+        # live node/edge property dict saves three repeated values per fact while all
+        # in-memory analysis sees the same effective defaults via ``.get``.
+        # Stable IDs recur in node maps, edge endpoints, and cross-TU indexes.  Keep
+        # one canonical string object instead of retaining a fresh copy per edge.
+        node_id = sys.intern(node_id)
+        kind = sys.intern(kind)
+        canonical = dict(properties)
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
-            cached = RESOLVED_FILES.get(absolute_file)
+            # Clang can spell the same included file with redundant ``./`` or
+            # separator components across translation units. Normalize before the
+            # memo lookup so those spellings do not repeat realpath/content-hash
+            # work for every AST node.
+            file_key = os.path.normcase(os.path.normpath(absolute_file))
+            cached = RESOLVED_FILES.get(file_key)
             if cached is None:
                 absolute = Path(absolute_file).resolve()
                 cached = (str(absolute), content_hash(absolute))
-                RESOLVED_FILES[absolute_file] = cached
+                RESOLVED_FILES[file_key] = cached
             resolved_file, resolved_hash = cached
             canonical.update({
                 "frontend_id": FRONTEND_ID,
@@ -585,10 +600,7 @@ class Graph:
                 "compiler_node_id": canonical.get("compiler_node_id") or node_id,
             })
         if node_id not in self.nodes:
-            self.nodes[node_id] = {
-                "id": node_id, "kind": kind, "label": label,
-                "properties": canonical,
-            }
+            self.nodes[node_id] = Node(node_id, kind, label, canonical)
             self.node_tier[node_id] = tier
         else:
             self.nodes[node_id]["properties"].update(canonical)
@@ -597,18 +609,159 @@ class Graph:
     def edge(self, kind: str, source: Optional[str], target: Optional[str], **properties) -> None:
         if not source or not target or source == target:
             return
-        canonical = {
-            "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-            **properties,
-        }
-        key = (kind, source, target, _freeze(canonical))
-        if key in self.edge_keys:
+        # Defaults are restored at bundle serialization. Keeping them out of every
+        # live node/edge property dict saves three repeated values per fact while all
+        # in-memory analysis sees the same effective defaults via ``.get``.
+        kind = sys.intern(kind)
+        source = sys.intern(source)
+        target = sys.intern(target)
+        canonical = dict(properties)
+        if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
-        self.edge_keys.add(key)
-        self.edges.append({
-            "kind": kind, "source": source, "target": target,
-            "properties": canonical,
-        })
+        self.edges.append(Edge(kind, source, target, canonical))
+
+
+class Edge:
+    """Compact mutable edge record with the mapping access used by the builder."""
+
+    __slots__ = ("kind", "source", "target", "properties")
+
+    def __init__(self, kind: str, source: str, target: str, properties: dict) -> None:
+        self.kind = kind
+        self.source = source
+        self.target = target
+        self.properties = properties
+
+    def __getitem__(self, key: str):
+        if key == "kind":
+            return self.kind
+        if key == "source":
+            return self.source
+        if key == "target":
+            return self.target
+        if key == "properties":
+            return self.properties
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value) -> None:
+        if key == "kind":
+            self.kind = value
+        elif key == "source":
+            self.source = value
+        elif key == "target":
+            self.target = value
+        elif key == "properties":
+            self.properties = value
+        else:
+            raise KeyError(key)
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": self.kind, "source": self.source, "target": self.target,
+            "properties": self.properties,
+        }
+
+
+class Node:
+    """Compact mutable node record with the mapping access used by the builder."""
+
+    __slots__ = ("id", "kind", "label", "properties")
+
+    def __init__(self, node_id: str, kind: str, label: str, properties: dict) -> None:
+        self.id = node_id
+        self.kind = kind
+        self.label = label
+        self.properties = properties
+
+    def __getitem__(self, key: str):
+        if key == "id":
+            return self.id
+        if key == "kind":
+            return self.kind
+        if key == "label":
+            return self.label
+        if key == "properties":
+            return self.properties
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value) -> None:
+        if key == "id":
+            self.id = value
+        elif key == "kind":
+            self.kind = value
+        elif key == "label":
+            self.label = value
+        elif key == "properties":
+            self.properties = value
+        else:
+            raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id, "kind": self.kind, "label": self.label,
+            "properties": self.properties,
+        }
+
+
+class _EdgeKeys:
+    """Deduplicate edges without retaining a frozen property copy for every edge.
+
+    Most edges have a unique ``(kind, source, target)`` triple.  Keeping a fully
+    frozen property tuple for all of them duplicates a large fraction of the graph's
+    live memory.  Remember the first edge's position instead, and serialize
+    properties only when a triple collides.  This is the same identity predicate as
+    the old ``_freeze`` key, with first-occurrence ordering preserved.
+    """
+
+    __slots__ = ("_first", "_tied")
+
+    def __init__(self) -> None:
+        # A tuple of three long IDs for every edge is surprisingly expensive.  A
+        # hash normally identifies the triple; an explicit collision chain retains
+        # exact semantics even in the (rare) event of a hash collision.
+        self._first: Dict[int, object] = {}
+        self._tied: Dict[Tuple[int, int], Set[str]] = {}
+
+    def add(
+        self, kind: str, source: str, target: str, properties: dict,
+        edges: List[dict],
+    ) -> bool:
+        digest = hash((kind, source, target))
+        entry = self._first.get(digest)
+        if entry is None:
+            self._first[digest] = len(edges)
+            return True
+        candidates = (entry,) if isinstance(entry, int) else entry
+        first = None
+        for index in candidates:
+            existing = edges[index]
+            if (existing["kind"], existing["source"], existing["target"]) == (kind, source, target):
+                first = index
+                break
+        if first is None:
+            if isinstance(entry, int):
+                self._first[digest] = [entry, len(edges)]
+            else:
+                entry.append(len(edges))
+            return True
+        tied_key = (digest, first)
+        properties_seen = self._tied.get(tied_key)
+        if properties_seen is None:
+            properties_seen = {
+                json.dumps(edges[first]["properties"], sort_keys=True),
+            }
+            self._tied[tied_key] = properties_seen
+        key = json.dumps(properties, sort_keys=True)
+        if key in properties_seen:
+            return False
+        properties_seen.add(key)
+        return True
 
 
 def referenced_decl(node: dict) -> Optional[dict]:
@@ -655,6 +808,15 @@ def _has_include_origin(node: dict) -> bool:
     return bool(loc.get("includedFrom") or begin.get("includedFrom"))
 
 
+def _has_function_body(node: dict) -> bool:
+    """Whether an AST contains a non-declaration function body worth walking."""
+    if node.get("kind") == "FunctionDecl" and any(
+        child.get("kind") == "CompoundStmt" for child in node.get("inner", ())
+    ):
+        return True
+    return any(_has_function_body(child) for child in node.get("inner", ()))
+
+
 class AstStore:
     """Disk-backed sequence of Clang ASTs, re-parsed one translation unit at a time.
 
@@ -668,16 +830,35 @@ class AstStore:
 
     def __init__(self, directory: Path) -> None:
         self._directory = directory
-        self._entries: List[Tuple[Path, Path]] = []
+        self._entries: List[Tuple[Path, Path, bool]] = []
 
-    def add(self, path: Path, ast: dict) -> None:
+    def add(self, path: Path, ast: dict, bodyful: bool = True) -> None:
         spill = self._directory / f"{len(self._entries)}.bin"
-        spill.write_bytes(marshal.dumps(ast))
-        self._entries.append((path, spill))
+        # Stream the serialization directly to disk.  ``marshal.dumps`` briefly
+        # creates a second, full AST-sized bytes object before ``write_bytes`` copies
+        # it; a large kernel translation unit can make that avoidable duplication the
+        # frontend's peak allocation.
+        with spill.open("wb") as handle:
+            marshal.dump(ast, handle)
+        self._entries.append((path, spill, bodyful))
 
     def __iter__(self) -> Iterator[Tuple[Path, dict]]:
-        for path, spill in self._entries:
-            yield path, marshal.loads(spill.read_bytes())
+        for path, spill, _bodyful in self._entries:
+            # Avoid materializing a second bytes-sized copy of a potentially huge
+            # marshalled AST before ``marshal`` creates its object tree. The mapping
+            # is released as soon as the one-TU object is handed to the pass.
+            with spill.open("rb") as handle:
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                    yield path, marshal.loads(mapped)
+
+    def body_asts(self) -> Iterator[Tuple[Path, dict]]:
+        """Reload only TUs that can emit function-body facts."""
+        for path, spill, bodyful in self._entries:
+            if not bodyful:
+                continue
+            with spill.open("rb") as handle:
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                    yield path, marshal.loads(mapped)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -715,6 +896,7 @@ def main() -> int:
     asts = AstStore(Path(ast_spill.name))
     diagnostics: List[Tuple[Path, str]] = []
     failed_files: Set[Path] = set()
+    dependency_targets: Dict[str, Optional[Path]] = {}
 
     for path in files:
         text = source_text(path, texts)
@@ -736,8 +918,16 @@ def main() -> int:
         flattened = dependency.stdout.replace("\\\n", " ")
         dependencies = flattened.split(":", 1)[1].split() if ":" in flattened else []
         for raw in dependencies:
-            target = (Path.cwd() / raw).resolve() if not os.path.isabs(raw) else Path(raw).resolve()
-            if target == path or not target.exists():
+            target = dependency_targets.get(raw)
+            if raw not in dependency_targets:
+                candidate = Path(raw) if os.path.isabs(raw) else Path.cwd() / raw
+                try:
+                    candidate = candidate.resolve()
+                except OSError:
+                    candidate = None
+                dependency_targets[raw] = candidate if candidate and candidate.exists() else None
+                target = dependency_targets[raw]
+            if target is None or target == path:
                 continue
             if target not in file_ids:
                 text = source_text(target, texts)
@@ -769,13 +959,21 @@ def main() -> int:
         # only falls back to "failed" when nothing usable was recovered: empty
         # stdout, unparseable JSON, or a TranslationUnitDecl with no declarations.
         # Diagnostics are recorded either way.
-        stderr_lines = [line for line in result.stderr.splitlines() if line.strip()]
+        # Decode one TU, then release Clang's raw JSON before the decoded tree is
+        # marshalled to the AST spill. On large headers the two representations can
+        # otherwise overlap for hundreds of MB; keeping only the decoded tree makes
+        # peak memory track one representation at a time without changing facts.
+        raw_stdout = result.stdout
+        raw_stderr = result.stderr
+        result.stdout = ""
+        result.stderr = ""
+        stderr_lines = [line for line in raw_stderr.splitlines() if line.strip()]
         meaningful = [line for line in stderr_lines if "error:" in line or "warning:" in line]
         diagnostics.extend((path, line) for line in meaningful)
         recovered = False
-        if result.stdout.strip():
+        if raw_stdout.strip():
             try:
-                ast = json.loads(result.stdout)
+                ast = json.loads(raw_stdout)
             except json.JSONDecodeError as error:
                 diagnostics.append((path, f"invalid Clang AST JSON: {error}"))
             else:
@@ -812,11 +1010,12 @@ def main() -> int:
                         or not _has_include_origin(child)
                         or child.get("kind") == "RecordDecl"
                     ]
-                    asts.add(path, ast)
+                    asts.add(path, ast, _has_function_body(ast))
                     recovered = True
                 else:
                     diagnostics.append((path, "Clang AST recovered no declarations"))
                 del ast
+        del raw_stdout, raw_stderr
         if not recovered:
             # Degrade, don't drop: the file node (emitted above) survives with its
             # compiler diagnostics attached as T4 proof; only the semantic layer for
@@ -1405,7 +1604,7 @@ def main() -> int:
         for index, child in enumerate(node.get("inner", [])):
             bodies(child, path, owner, body_id, is_included, node, index)
 
-    for path, ast in asts:
+    for path, ast in asts.body_asts():
         bodies(ast, path)
 
     # Preprocessor-aware compiler tokens. These are deliberately partial: the
@@ -1545,45 +1744,76 @@ def main() -> int:
         "DECLARES", "DECLARES_MEMBER", "DECLARES_VALUE", "CONTAINS_BODY",
         "AST_CHILD", "EVIDENCED_BY", "HAS_ARGUMENT",
     }
-    tier_payloads = {
-        tier: {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
-        for tier, name in TIERS.items()
-    }
-    for node_id, node in graph.nodes.items():
-        tier_payloads[graph.node_tier[node_id]]["nodes"].append(node)
-    for edge in graph.edges:
-        source_tier = graph.node_tier.get(edge["source"])
-        target_tier = graph.node_tier.get(edge["target"])
-        if not source_tier or not target_tier:
-            continue
-        if source_tier == target_tier:
-            tier_payloads[source_tier]["edges"].append(edge)
-        elif edge["kind"] in structural:
-            tier_payloads[source_tier]["expands_to"].append({
-                "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
-                "properties": {
-                    "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-                    "via": edge["kind"],
-                },
-            })
-        else:
-            linked = dict(edge)
-            linked["properties"] = dict(edge["properties"], target_tier=target_tier)
-            tier_payloads[source_tier]["links"].append(linked)
-    for payload in tier_payloads.values():
+    # Serialize one tier at a time.  Keeping all tier lists alive alongside the
+    # canonical graph used to create a second full graph-sized object at peak
+    # memory on large subsystems.  The extra linear scans are intentional: bounded
+    # peak memory is more important than shaving a few seconds from finalization.
+    tier_counts = {}
+    emitted_edge_count = 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def serialized_payload(payload: dict) -> dict:
+        defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
+
+        def with_defaults(item: dict) -> dict:
+            # ``as_dict`` has already allocated the emission record.  Copying that
+            # record and its properties again for every fact briefly doubled the
+            # largest tier at flush time; defaults are immutable contract values, so
+            # fill the existing mapping in place and keep only one record alive.
+            properties = item.setdefault("properties", {})
+            for key, value in defaults.items():
+                properties.setdefault(key, value)
+            return item
+
+        return {
+            **payload,
+            "nodes": [with_defaults(item) for item in payload["nodes"]],
+            "edges": [with_defaults(item) for item in payload["edges"]],
+            "expands_to": [with_defaults(item) for item in payload["expands_to"]],
+            "links": [with_defaults(item) for item in payload["links"]],
+        }
+
+    for tier, name in TIERS.items():
+        payload = {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
+        payload["nodes"].extend(
+            node.as_dict() for node_id, node in graph.nodes.items()
+            if graph.node_tier.get(node_id) == tier
+        )
+        for edge in graph.edges:
+            source_tier = graph.node_tier.get(edge["source"])
+            target_tier = graph.node_tier.get(edge["target"])
+            if source_tier != tier or not target_tier:
+                continue
+            if source_tier == target_tier:
+                payload["edges"].append(edge.as_dict())
+            elif edge["kind"] in structural:
+                payload["expands_to"].append({
+                    "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
+                    "properties": {"via": edge["kind"]},
+                })
+            else:
+                payload["links"].append({
+                    **edge.as_dict(),
+                    "properties": {**edge["properties"], "target_tier": target_tier},
+                })
         payload["nodes"].sort(key=lambda item: item["id"])
         for collection in ("edges", "expands_to", "links"):
             payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
-
-    # edge_count must reflect edges actually serialized into tier files. The
-    # distribution loop above drops any edge whose source/target has no tier
-    # (a dangling reference to a node that was never created); counting those
-    # in the manifest makes load_snapshot's edge tally disagree with the files.
-    emitted_edge_count = sum(
-        len(p["edges"]) + len(p["expands_to"]) + len(p["links"])
-        for p in tier_payloads.values()
-    )
-    dropped_edge_count = len(graph.edges) - emitted_edge_count
+        tier_counts[tier] = {
+            "node_count": len(payload["nodes"]),
+            "edge_count": len(payload["edges"]),
+            "expands_to_count": len(payload["expands_to"]),
+            "cross_tier_link_count": len(payload["links"]),
+        }
+        emitted_edge_count += sum(
+            len(payload[collection]) for collection in ("edges", "expands_to", "links")
+        )
+        tier_path = output_dir / f"{tier.lower()}_{name}.pb"
+        write_tier(tier_path, serialized_payload(payload))
+        del payload
+    emitted_node_count = len(graph.nodes)
+    graph_edge_count = len(graph.edges)
+    dropped_edge_count = graph_edge_count - emitted_edge_count
 
     analyzed_file_count = len(files) - len(failed_files)
     # Honest coverage: a file that failed to parse contributes only its file node,
@@ -1617,35 +1847,30 @@ def main() -> int:
         "source_dir": str(source_dir), "root_file_count": len(files),
         "analyzed_file_count": analyzed_file_count,
         "failed_file_count": len(failed_files),
-        "node_count": len(graph.nodes), "edge_count": emitted_edge_count,
+        "node_count": emitted_node_count, "edge_count": emitted_edge_count,
         "dropped_edge_count": dropped_edge_count,
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
         "tiers": [
-            {
-                "tier": tier, "name": TIERS[tier],
-                "file": f"{tier.lower()}_{TIERS[tier]}.bin",
-                "node_count": len(tier_payloads[tier]["nodes"]),
-                "edge_count": len(tier_payloads[tier]["edges"]),
-                "expands_to_count": len(tier_payloads[tier]["expands_to"]),
-                "cross_tier_link_count": len(tier_payloads[tier]["links"]),
-            }
+            {"tier": tier, "name": TIERS[tier], "file": f"{tier.lower()}_{TIERS[tier]}.pb", **tier_counts[tier]}
             for tier in TIERS
         ],
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
     # Tier payloads are large and consumed only by our own parent process, so they
     # go out as marshal (binary, C-speed) instead of json.dumps — the same round-trip
     # fix applied to the in-memory AST spill. The payloads are already JSON-shaped
     # (the in-process route in snapshot.py forbids tuples / non-string keys and a
     # check enforces it), so marshal round-trips them identically to json. The tiny
     # manifest stays human-readable json.
-    for tier, payload in tier_payloads.items():
-        (output_dir / f"{tier.lower()}_{TIERS[tier]}.bin").write_bytes(
-            marshal.dumps(payload),
-        )
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"Clang analyzed {len(files)} C files; emitted {len(graph.nodes)} nodes and {len(graph.edges)} edges to {output_dir}")
+    # The graph indexes are no longer needed once the tier lists own their records;
+    # dropping them before serializing prevents a second map/list copy from extending
+    # the peak on large kernel subsystems.
+    graph.nodes.clear()
+    graph.node_tier.clear()
+    graph.edges.clear()
+    graph.edge_keys = _EdgeKeys()
+    (output_dir / "manifest.pb").write_bytes(encode_document(manifest))
+    print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
     return 0
 

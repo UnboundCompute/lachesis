@@ -9,12 +9,11 @@ what the snapshot says about it.
 """
 from __future__ import annotations
 
-import json
-import marshal
 from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Tuple
 
 from .contract import ContractError, FrontendSnapshot
+from .graph_wire import decode_document, decode_tier, iter_tier_records
 from .validation import validate_snapshot
 
 
@@ -35,13 +34,10 @@ def _read_tiers(manifest: dict, output_dir: str) -> Iterator[Tuple[str, dict]]:
         if not tier_path.is_file():
             raise ContractError(f"missing tier file: {tier_path}")
         # Format is carried by the manifest-declared filename: a frontend that spills
-        # marshal (C's large tier payloads) names its files `.bin`; the json route
-        # (Python/TS) is unchanged. marshal only round-trips JSON-shaped values, which
-        # every frontend already emits (see snapshot_from_payloads' invariant).
-        if tier_path.suffix == ".bin":
-            yield tier_name, marshal.loads(tier_path.read_bytes())
+        if tier_path.suffix == ".pb":
+            yield tier_name, decode_tier(tier_path.read_bytes())
         else:
-            yield tier_name, json.loads(tier_path.read_text(encoding="utf-8"))
+            raise ContractError(f"unsupported tier encoding: {tier_path}")
 
 
 def _merge_tiers(
@@ -56,13 +52,20 @@ def _merge_tiers(
     nodes: List[dict] = []
     edges: List[dict] = []
     for tier_name, payload in tiers:
-        nodes.extend({**node, "tier": tier_name} for node in payload.get("nodes", []))
+        # Tier payloads are owned by this snapshot construction path. Stamp records
+        # in place instead of copying every property dictionary with ``{**record}``:
+        # on large C bundles the copy and the still-live tier payload briefly doubled
+        # the graph footprint before shard persistence could release it.
+        tier_nodes = payload.get("nodes", [])
+        for node in tier_nodes:
+            node["tier"] = tier_name
+        nodes.extend(tier_nodes)
         for collection in ("edges", "expands_to", "links"):
-            edges.extend({
-                **edge,
-                "source_tier": tier_name,
-                "relationship_class": collection,
-            } for edge in payload.get(collection, []))
+            tier_edges = payload.get(collection, [])
+            for edge in tier_edges:
+                edge["source_tier"] = tier_name
+                edge["relationship_class"] = collection
+            edges.extend(tier_edges)
     return nodes, edges
 
 
@@ -97,16 +100,40 @@ def _snapshot(
 def load_snapshot(
     output_dir: str, stdout: str = "", stderr: str = "",
 ) -> FrontendSnapshot:
-    manifest_path = Path(output_dir) / "manifest.json"
+    manifest_path = Path(output_dir) / "manifest.pb"
     if not manifest_path.is_file():
         raise ContractError(f"frontend did not emit {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = decode_document(manifest_path.read_bytes())
     # Read the header before any tier file is opened. A bundle with no frontend_id
     # is unusable whatever its tiers hold, and complaining about that first is the
     # error this has always raised.
     _header(manifest)
     nodes, edges = _merge_tiers(_read_tiers(manifest, output_dir))
     return _snapshot(manifest, nodes, edges, stdout, stderr)
+
+
+def load_manifest(output_dir: str) -> dict:
+    """Read and validate only a frontend's protobuf header."""
+    path = Path(output_dir) / "manifest.pb"
+    if not path.is_file():
+        raise ContractError(f"frontend did not emit {path}")
+    manifest = decode_document(path.read_bytes())
+    _header(manifest)
+    return manifest
+
+
+def iter_snapshot_records(output_dir: str, manifest: dict):
+    """Stream a protobuf frontend bundle without constructing a whole snapshot."""
+    for tier_name, tier_path in _tier_files(manifest, output_dir):
+        if tier_path.suffix != ".pb" or not tier_path.is_file():
+            raise ContractError(f"missing protobuf tier file: {tier_path}")
+        for collection, record in iter_tier_records(tier_path):
+            if collection == "nodes":
+                record["tier"] = tier_name
+            else:
+                record["source_tier"] = tier_name
+                record["relationship_class"] = collection
+            yield collection, record
 
 
 def snapshot_from_payloads(
@@ -120,10 +147,9 @@ def snapshot_from_payloads(
     round trip is most of the frontend's wall time, and nobody between the two ends
     of it wants the file.
 
-    One thing the file route does incidentally is normalise: ``json.dumps`` followed
-    by ``json.loads`` turns tuples into lists and non-string mapping keys into
-    strings. This route does no such thing, so a frontend wired in here has to emit
-    JSON-shaped values in the first place. That is not taken on trust —
+    The file route decodes typed protobuf values. This route does no serialization,
+    so a frontend wired in here has to emit the same JSON-shaped contract values in
+    the first place. That is not taken on trust —
     ``lachesis.frontends.checks`` builds a snapshot both ways and requires them to
     agree element for element.
     """
@@ -137,4 +163,3 @@ def snapshot_from_payloads(
         tiers.append((tier_name, payloads[tier_name]))
     nodes, edges = _merge_tiers(tiers)
     return _snapshot(manifest, nodes, edges, stdout, stderr)
-

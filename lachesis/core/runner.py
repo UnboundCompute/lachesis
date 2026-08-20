@@ -7,7 +7,72 @@ import tempfile
 from typing import Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
-from .snapshot import load_snapshot
+from . import graph_pb2
+from .graph_wire import iter_tier_records
+from .shards import ShardSetWriter
+from .snapshot import load_manifest, load_snapshot
+
+
+def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
+    """Persist a language-neutral cache shard when the caller opts in."""
+    if not root:
+        return
+    directory = os.path.join(root, snapshot.frontend_id)
+    shard_set = ShardSetWriter(directory, frontend_id=snapshot.frontend_id)
+    shard_id = snapshot.manifest.get("source_content_hash", "0")
+    writer = shard_set.start(str(shard_id))
+    try:
+        for node in snapshot.nodes:
+            writer.add_node(node)
+        for edge in snapshot.edges:
+            writer.add_edge(edge)
+        shard_set.complete(str(shard_id), writer)
+    except Exception:
+        writer.close()
+        raise
+
+
+def _stream_bundle_to_shard(
+    output_dir: str, root: str, stdout: str, stderr: str,
+) -> FrontendSnapshot:
+    """Persist a protobuf bundle record-by-record, without loading its tier arrays."""
+    manifest = load_manifest(output_dir)
+    frontend_id = manifest.get("frontend_id") or manifest.get("generator")
+    directory = os.path.join(root, frontend_id)
+    shard_set = ShardSetWriter(directory, frontend_id=frontend_id)
+    shard_id = manifest.get("source_content_hash", "0")
+    writer = shard_set.start(str(shard_id))
+    node_count = edge_count = 0
+    try:
+        for tier_name, tier_path in ((item.get("tier"), os.path.join(output_dir, item.get("file", "")))
+                                     for item in manifest.get("tiers", [])):
+            for collection, payload in iter_tier_records(tier_path, raw=True):
+                if collection == "nodes":
+                    message = graph_pb2.NodeRecord()
+                    message.ParseFromString(payload)
+                    message.tier = tier_name
+                    writer.add_node_payload(message.SerializeToString())
+                    node_count += 1
+                    continue
+                message = graph_pb2.EdgeRecord()
+                message.ParseFromString(payload)
+                message.source_tier = tier_name
+                message.relationship_class = collection
+                writer.add_edge_payload(message.SerializeToString())
+                edge_count += 1
+        shard_set.complete(str(shard_id), writer)
+    except Exception:
+        writer.close()
+        raise
+    snapshot = FrontendSnapshot(
+        frontend_id=frontend_id,
+        contract_version=manifest.get("frontend_contract_version", manifest.get("version")),
+        languages=tuple(manifest.get("languages", ())),
+        capabilities=dict(manifest.get("capabilities", {})),
+        manifest=manifest, nodes=[], edges=[], stdout=stdout, stderr=stderr,
+        released=True, _released_node_count=node_count, _released_edge_count=edge_count,
+    )
+    return snapshot
 
 
 def _in_process_applies(
@@ -48,7 +113,9 @@ def run_frontend(
     roots: Optional[Sequence[str]] = None,
 ) -> FrontendSnapshot:
     if _in_process_applies(frontend, output_dir):
-        return frontend.in_process(source_dir, roots)
+        snapshot = frontend.in_process(source_dir, roots)
+        _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"))
+        return snapshot
     temporary = None
     if output_dir is None:
         temporary = tempfile.TemporaryDirectory(prefix="lachesis-frontend-")
@@ -80,7 +147,14 @@ def run_frontend(
                 f"frontend {frontend.frontend_id} exited {completed.returncode}\n"
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
-        return load_snapshot(output_dir, completed.stdout, completed.stderr)
+        shard_root = environment.get("LACHESIS_SHARD_ROOT")
+        if shard_root:
+            snapshot = _stream_bundle_to_shard(
+                output_dir, shard_root, completed.stdout, completed.stderr,
+            )
+        else:
+            snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)
+        return snapshot
     except subprocess.TimeoutExpired as error:
         raise ContractError(
             f"frontend {frontend.frontend_id} exceeded {timeout_seconds}s"
@@ -88,4 +162,3 @@ def run_frontend(
     finally:
         if temporary is not None:
             temporary.cleanup()
-

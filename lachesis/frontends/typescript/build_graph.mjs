@@ -3223,7 +3223,7 @@ const manifest = {
   tiers: TIER_ORDER.map((tier) => ({
     tier,
     name: TIER_NAMES[tier],
-    file: `${tier.toLowerCase()}_${TIER_NAMES[tier]}.json`,
+    file: `${tier.toLowerCase()}_${TIER_NAMES[tier]}.pb`,
     node_count: tiers[tier].nodes.length,
     edge_count: tiers[tier].edges.length,
     expands_to_count: tiers[tier].expands_to.length,
@@ -3231,51 +3231,107 @@ const manifest = {
   })),
 };
 
-// One `JSON.stringify(tier)` per file is the obvious way to write these, and it caps
-// the size of tree this frontend can analyse: V8 refuses to build a string past about
-// 512MB, so a large scope died with `RangeError: Invalid string length` after the whole
-// analysis had already succeeded. Serializing element by element keeps every
-// intermediate string in the kilobytes, whatever the total comes to.
-//
-// The file is the same JSON object it always was, same keys in the same order and the
-// same already-sorted element order, so `Lachesis/core/snapshot.py` reads it unchanged.
-// Only the whitespace differs: one compact element per line instead of an indented tree.
-function writeTierStreaming(filePath, tier) {
-  // Batched rather than one write per element, because the syscall, not the string
-  // building, is what a million-element tier would otherwise spend its time on.
-  const BATCH = 1000;
-  const handle = fs.openSync(filePath, "w");
-  try {
-    fs.writeSync(handle, `{"tier":${JSON.stringify(tier.tier)},`);
-    fs.writeSync(handle, `"name":${JSON.stringify(tier.name)}`);
-    for (const collection of ["nodes", "edges", "expands_to", "links"]) {
-      fs.writeSync(handle, `,${JSON.stringify(collection)}:[`);
-      const elements = tier[collection];
-      let buffered = "";
-      for (let index = 0; index < elements.length; index += 1) {
-        buffered += `${index ? "," : ""}\n${JSON.stringify(elements[index])}`;
-        if (index % BATCH === BATCH - 1) {
-          fs.writeSync(handle, buffered);
-          buffered = "";
-        }
-      }
-      if (buffered) fs.writeSync(handle, buffered);
-      fs.writeSync(handle, elements.length ? "\n]" : "]");
-    }
-    fs.writeSync(handle, "}\n");
-  } finally {
-    fs.closeSync(handle);
-  }
+// Minimal encoder for the shared graph.proto Document envelope. It keeps the
+// standalone frontend dependency-free while producing bytes consumed by the Python
+// generated bindings. Values are the JSON-shaped graph contract: scalars, arrays,
+// and string-keyed objects.
+function varint(value) {
+  let n = BigInt(value); const out = [];
+  while (n > 0x7fn) { out.push(Number((n & 0x7fn) | 0x80n)); n >>= 7n; }
+  out.push(Number(n)); return Buffer.from(out);
 }
+function zigzag(value) { const n = BigInt(Math.trunc(value)); return n >= 0n ? n * 2n : (-n * 2n) - 1n; }
+function wireField(number, wireType, payload) {
+  return Buffer.concat([varint((BigInt(number) << 3n) | BigInt(wireType)), payload]);
+}
+function lengthDelimited(number, payload) {
+  return wireField(number, 2, Buffer.concat([varint(payload.length), payload]));
+}
+function encodeValue(value) {
+  if (value === null || value === undefined) return lengthDelimited(8, Buffer.alloc(0));
+  if (typeof value === "string") return lengthDelimited(1, Buffer.from(value));
+  if (typeof value === "boolean") return wireField(4, 0, varint(value ? 1 : 0));
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && Number.isSafeInteger(value)) return wireField(2, 0, varint(zigzag(value)));
+    const bytes = Buffer.allocUnsafe(8); bytes.writeDoubleLE(value, 0); return wireField(3, 1, bytes);
+  }
+  if (Array.isArray(value)) return lengthDelimited(6, Buffer.concat(value.map(item => lengthDelimited(1, encodeValue(item)))));
+  const fields = Object.keys(value).sort().map(key => {
+    const field = Buffer.concat([lengthDelimited(1, Buffer.from(key)), lengthDelimited(2, encodeValue(value[key]))]);
+    return lengthDelimited(1, field);
+  });
+  return lengthDelimited(7, Buffer.concat(fields));
+}
+function encodeProperties(properties) {
+  return Object.keys(properties || {}).sort().map(key =>
+    lengthDelimited(1, Buffer.concat([
+      lengthDelimited(1, Buffer.from(key)), lengthDelimited(2, encodeValue(properties[key])),
+    ]))).reduce((all, field) => Buffer.concat([all, field]), Buffer.alloc(0));
+}
+function encodeNode(node) {
+  const fields = [lengthDelimited(1, Buffer.from(node.id || ""))];
+  if (node.kind) fields.push(lengthDelimited(2, Buffer.from(node.kind)));
+  if (node.label) fields.push(lengthDelimited(3, Buffer.from(node.label)));
+  for (const key of Object.keys(node.properties || {}).sort()) {
+    fields.push(lengthDelimited(4, Buffer.concat([
+      lengthDelimited(1, Buffer.from(key)), lengthDelimited(2, encodeValue(node.properties[key])),
+    ])));
+  }
+  if (node.tier) fields.push(lengthDelimited(5, Buffer.from(node.tier)));
+  return Buffer.concat(fields);
+}
+function encodeEdge(edge) {
+  const fields = [lengthDelimited(1, Buffer.from(edge.kind || "")),
+    lengthDelimited(2, Buffer.from(edge.source || "")), lengthDelimited(3, Buffer.from(edge.target || ""))];
+  for (const key of Object.keys(edge.properties || {}).sort()) {
+    fields.push(lengthDelimited(4, Buffer.concat([
+      lengthDelimited(1, Buffer.from(key)), lengthDelimited(2, encodeValue(edge.properties[key])),
+    ])));
+  }
+  if (edge.source_tier) fields.push(lengthDelimited(5, Buffer.from(edge.source_tier)));
+  if (edge.relationship_class) fields.push(lengthDelimited(6, Buffer.from(edge.relationship_class)));
+  return Buffer.concat(fields);
+}
+function writeTier(filePath, tier) {
+  // Do not construct one outer Buffer for the whole tier.  The node/edge arrays
+  // are already retained for cross-reference resolution, but the old Buffer.concat
+  // added another full tier-sized copy at the exact point a large TypeScript bundle
+  // was being flushed.  Batch framed records into small writes instead.
+  const fd = fs.openSync(filePath, "w");
+  const pending = [];
+  let pendingBytes = 0;
+  const emit = (field) => {
+    pending.push(field);
+    pendingBytes += field.length;
+    if (pendingBytes >= 1024 * 1024) {
+      fs.writeSync(fd, Buffer.concat(pending, pendingBytes));
+      pending.length = 0;
+      pendingBytes = 0;
+    }
+  };
+  emit(lengthDelimited(1, Buffer.from(tier.tier || "")));
+  emit(lengthDelimited(2, Buffer.from(tier.name || "")));
+  for (const node of tier.nodes || []) emit(lengthDelimited(3, encodeNode(node)));
+  for (const [tag, name] of [[4, "edges"], [5, "expands_to"], [6, "links"]]) {
+    for (const edge of tier[name] || []) emit(lengthDelimited(tag, encodeEdge(edge)));
+  }
+  if (pendingBytes) fs.writeSync(fd, Buffer.concat(pending, pendingBytes));
+  fs.closeSync(fd);
+}
+function encodeDocument(value) {
+  const encodedObject = encodeValue(value);
+  // encodeValue(object) is tag 7 + length; unwrap that Value envelope for Document.fields.
+  let offset = 1; let length = 0; let shift = 0;
+  do { length |= (encodedObject[offset] & 0x7f) << shift; shift += 7; offset += 1; } while (encodedObject[offset - 1] & 0x80);
+  return Buffer.concat([wireField(1, 0, varint(1)), lengthDelimited(2, encodedObject.subarray(offset, offset + length))]);
+}
+function writeProto(filePath, value) { fs.writeFileSync(filePath, encodeDocument(value)); }
 
 fs.mkdirSync(outputDir, { recursive: true });
 for (const tier of TIER_ORDER) {
-  writeTierStreaming(
-    path.join(outputDir, `${tier.toLowerCase()}_${TIER_NAMES[tier]}.json`),
-    tiers[tier],
-  );
+  writeTier(path.join(outputDir, `${tier.toLowerCase()}_${TIER_NAMES[tier]}.pb`), tiers[tier]);
 }
-fs.writeFileSync(path.join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+writeProto(path.join(outputDir, "manifest.pb"), manifest);
 
 console.log(`TypeScript ${ts.version} loaded from ${loadedFrom}`);
 console.log(

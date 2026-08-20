@@ -41,9 +41,11 @@ class GraphIndex:
 
     _COLLECTIONS = ("by_kind", "by_label", "by_file", "by_owner", "outgoing", "incoming")
 
-    def __init__(self, graph: dict) -> None:
+    def __init__(self, graph: dict, *, compact: bool = False) -> None:
+        self._compact = compact
         self.nodes = {node["id"]: node for node in graph.get("nodes", [])}
-        self._buckets = {name: defaultdict(list) for name in self._COLLECTIONS}
+        active = ("by_kind", "outgoing", "incoming") if compact else self._COLLECTIONS
+        self._buckets = {name: defaultdict(list) for name in active}
         for node in self.nodes.values():
             self._file_node(node)
         for edge in graph.get("edges", []):
@@ -51,6 +53,8 @@ class GraphIndex:
 
     def _file_node(self, node: dict) -> None:
         self._buckets["by_kind"][node.get("kind")].append(node)
+        if "by_label" not in self._buckets:
+            return
         self._buckets["by_label"][node.get("label")].append(node)
         properties = node.get("properties", {})
         path = properties.get("absolute_file") or properties.get("file")
@@ -105,7 +109,7 @@ class GraphIndex:
             touched["outgoing"].add(edge["source"])
             touched["incoming"].add(edge["target"])
         for name, keys in touched.items():
-            if not keys or name not in self.__dict__:
+            if not keys or name not in self._buckets:
                 continue
             bucket = self._buckets[name]
             for key in keys:
@@ -165,7 +169,32 @@ class GraphIndex:
             raise AttributeError(
                 f"{type(self).__name__!r} object has no attribute {name!r}"
             )
-        collection = self._buckets[name]
+        collection = self._buckets.get(name)
+        if collection is None:
+            # Compact enrichment indexes defer navigation-only node buckets until
+            # a caller actually asks for one. This preserves the public API while
+            # avoiding three extra references per node during pass 3.
+            collection = defaultdict(list)
+            if name == "by_label":
+                for node in self.nodes.values():
+                    collection[node.get("label")].append(node)
+            elif name == "by_file":
+                for node in self.nodes.values():
+                    properties = node.get("properties", {})
+                    path = properties.get("absolute_file") or properties.get("file")
+                    if path:
+                        collection[path].append(node)
+            elif name == "by_owner":
+                for node in self.nodes.values():
+                    properties = node.get("properties", {})
+                    owner = properties.get("owner_function_id") or properties.get("function_id")
+                    if owner:
+                        collection[owner].append(node)
+            else:
+                raise AttributeError(
+                    f"{type(self).__name__!r} has no bucket {name!r}"
+                )
+            self._buckets[name] = collection
         for values in collection.values():
             values.sort(key=_bucket_order)
         setattr(self, name, collection)

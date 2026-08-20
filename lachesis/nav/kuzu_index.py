@@ -29,7 +29,7 @@ exactly, and an elided build reconstructs them identically for navigation.
 """
 from __future__ import annotations
 
-import json
+import os
 import zlib
 from collections import defaultdict
 from typing import Iterable, Optional, Sequence
@@ -52,11 +52,27 @@ from lachesis.kuzu_store import (
     manifest_props_dictionary,
     read_store_manifest,
 )
+from lachesis.core.graph_wire import decode_document, encode_document
+from lachesis.nav.overlay import edge_key
 
 try:  # 3.10+ only
     import kuzu  # type: ignore
 except Exception:  # pragma: no cover
     kuzu = None
+
+
+def _query_threads() -> int:
+    """Return the bounded Kùzu read parallelism for materialization/query scans."""
+    raw = os.environ.get("LACHESIS_KUZU_QUERY_THREADS", "")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("LACHESIS_KUZU_QUERY_THREADS must be an integer") from exc
+        if value < 1:
+            raise ValueError("LACHESIS_KUZU_QUERY_THREADS must be positive")
+        return value
+    return max(1, min(os.cpu_count() or 1, 8))
 
 def _EDGE_SORT(edge: dict) -> tuple:
     """Total order on edges, ``(kind, source, target)`` plus the properties.
@@ -72,7 +88,7 @@ def _EDGE_SORT(edge: dict) -> tuple:
     twice should list them the same way twice.
     """
     return (edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
-            json.dumps(edge.get("properties") or {}, sort_keys=True))
+            encode_document(edge.get("properties") or {}))
 
 
 def _overlay_edge_key(edge: dict) -> str:
@@ -97,9 +113,8 @@ def _inflate(props_blob: bytes, zdict: bytes) -> bytes:
 def _restore(props_blob: Optional[bytes], zdict: bytes) -> dict:
     """Inflate a stored ``props`` blob back into a properties dict.
 
-    The blob is deflated UTF-8 JSON (see ``kuzu_store.PropsCodec``). Inflating all
-    244,954 nodes of the reference store costs 0.34s, against a materialize of ~5.5s."""
-    props = json.loads(_inflate(props_blob, zdict)) if props_blob else {}
+    The blob is deflated protobuf metadata (see ``kuzu_store.PropsCodec``)."""
+    props = decode_document(_inflate(props_blob, zdict)) if props_blob else {}
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
             props[key] = list(default) if isinstance(default, list) else default
@@ -238,8 +253,42 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
     deferred = [e for e in deferred
                 if e["source"] in resident and e["target"] in resident]
     edges.extend(deferred)
+
+    # A core-only store keeps additive dataflow facts in a sidecar overlay.  The
+    # normal navigation accessors graft those records as needed, but whole-graph
+    # materialization must expose the same canonical view as an eagerly enriched
+    # Kùzu store (used by enrichment/parity callers).  Previously the lazy path
+    # silently returned only base rows, dropping every derived node/edge from the
+    # comparison while leaving ordinary navigation apparently healthy.
+    overlay = getattr(index, "_overlay", None)
+    if overlay is not None:
+        if overlay.node_props:
+            for position, node in enumerate(nodes):
+                extra = overlay.node_props.get(node["id"])
+                if extra:
+                    properties = dict(node.get("properties") or {})
+                    properties.update(extra)
+                    nodes[position] = {**node, "properties": properties}
+        if overlay.edge_props:
+            for position, edge in enumerate(edges):
+                extra = overlay.edge_props.get(edge_key(edge))
+                if extra:
+                    properties = dict(edge.get("properties") or {})
+                    properties.update(extra)
+                    edges[position] = {**edge, "properties": properties}
+        nodes.extend(
+            node for node in overlay.derived_nodes
+            if keep is None or node.get("id") in keep
+        )
+        resident = {node["id"] for node in nodes}
+        edges.extend(
+            edge for edge in overlay.derived_edges
+            if (keep is None or
+                (edge.get("source") in resident and edge.get("target") in resident))
+        )
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
-                              json.dumps(e["properties"], sort_keys=True)))
+                              encode_document(e["properties"])))
+    nodes.sort(key=lambda n: n["id"])
     return {"nodes": nodes, "edges": edges}
 
 
@@ -334,6 +383,9 @@ class KuzuGraphIndex:
             )
         self._db = kuzu.Database(db_file(db_dir), read_only=True)
         self._conn = kuzu.Connection(self._db)
+        set_threads = getattr(self._conn, "set_max_threads_for_exec", None)
+        if set_threads is not None:
+            set_threads(_query_threads())
         # Read once at open, not per blob: it is a fixed 32 KB and every `props` in the
         # store needs it. ``GraphStore.load`` has already checked the format stamp in
         # this same manifest, so a store whose dictionary this reader could not use has
@@ -570,7 +622,7 @@ class KuzuGraphIndex:
         added = 0
         for edge in edges:
             key = (edge["source"], edge["target"], edge["kind"],
-                   json.dumps(edge.get("properties") or {}, sort_keys=True))
+                   encode_document(edge.get("properties") or {}))
             if key in self._grafted_edges:
                 continue
             self._grafted_edges.add(key)

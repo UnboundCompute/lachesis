@@ -64,6 +64,7 @@ from lachesis.projections import build_layered_graph
 from lachesis.reasoning import InvestigationAgent, ReasoningQuery
 from lachesis.reasoning.agent import ACTION_SCHEMA, AgentRequest
 from lachesis.core.snapshot import load_snapshot
+from lachesis.core.graph_wire import decode_document, decode_overlay, encode_overlay
 from lachesis.core.validation import validate_snapshot
 from lachesis.core.contract import ContractError, FrontendSnapshot
 from lachesis.core.boundaries import import_boundary_violations
@@ -275,7 +276,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 "--layered-out", str(layered_path),
             )
             self.assertTrue((graph_path / "graph.kuzu").exists())
-            self.assertTrue((graph_path / "lachesis-manifest.json").is_file())
+            self.assertTrue((graph_path / "lachesis-manifest.pb").is_file())
             self.assertTrue((layered_path / "manifest.json").is_file())
             self.assertTrue((layered_path / "node_index.json").is_file())
             overview = subprocess.run(
@@ -1301,7 +1302,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 )
                 snapshot = load_snapshot(output)
                 validate_snapshot(snapshot)
-                manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+                manifest = decode_document((Path(output) / "manifest.pb").read_bytes())
                 # Nonzero exit, but the AST was consumed: file analyzed, not failed.
                 self.assertEqual(0, manifest["failed_file_count"])
                 self.assertEqual(1, manifest["analyzed_file_count"])
@@ -1333,7 +1334,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 )
                 snapshot = load_snapshot(output)
                 validate_snapshot(snapshot)
-                manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+                manifest = decode_document((Path(output) / "manifest.pb").read_bytes())
                 self.assertEqual(1, manifest["failed_file_count"])
                 self.assertEqual(1, manifest["analyzed_file_count"])
                 # A parse hole downgrades the otherwise-complete parse capabilities.
@@ -1675,8 +1676,8 @@ class CompilerFrontendTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as output:
                 child = run_frontend(frontend, fixtures, output)
                 self.assertTrue(
-                    (Path(output) / "manifest.json").is_file(),
-                    "the subprocess route still writes the bundle it always wrote",
+                    (Path(output) / "manifest.pb").is_file(),
+                    "the subprocess route writes the protobuf bundle",
                 )
         finally:
             os.environ.clear()
@@ -2674,10 +2675,9 @@ class CompilerFrontendTests(unittest.TestCase):
         import sys as _sys
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(ROOT)))
-        from lachesis.nav.graph_store import GraphStore, enriched_store_path
+        from lachesis.nav.graph_store import GraphStore, dataflow_overlay_path
         from lachesis.nav.kuzu_index import materialize_graph
-        from lachesis.kuzu_store import (read_store_manifest, store_manifest_file,
-                                         write_kuzu_graph)
+        from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph
         from lachesis.pipeline import _enrich_graph
 
         overlay_node_kinds = {
@@ -2744,16 +2744,16 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(reference["edges"], lazy["edges"])
 
             # the cache is keyed to this core, and a second load opens it directly
-            cache = enriched_store_path(core_dir)
+            cache = dataflow_overlay_path(core_dir)
+            overlay = decode_overlay(Path(cache).read_bytes())
             self.assertEqual(manifest["core_content_hash"],
-                             read_store_manifest(cache)["core_content_hash"])
+                             overlay["core_content_hash"])
             self.assertTrue(GraphStore.load(core_dir).dataflow_ready)
 
             # a cache that does not describe this core is a miss, not a stale hit
-            tampered = read_store_manifest(cache)
+            tampered = overlay
             tampered["core_content_hash"] = "0" * 64
-            with open(store_manifest_file(cache), "w", encoding="utf-8") as handle:
-                json.dump(tampered, handle)
+            Path(cache).write_bytes(encode_overlay(tampered))
             self.assertFalse(GraphStore.load(core_dir).dataflow_ready)
 
     def test_package_detection_assigns_each_file_to_its_deepest_package(self) -> None:
@@ -4395,14 +4395,16 @@ class HomonymIndexTests(unittest.TestCase):
         )
 
     def test_the_decl_index_round_trips_both_rows_through_the_store(self):
-        from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph
+        from lachesis.kuzu_store import (
+            STORE_FORMAT_VERSION, read_store_manifest, write_kuzu_graph,
+        )
         from lachesis.nav.kuzu_index import KuzuGraphIndex
 
         with tempfile.TemporaryDirectory() as output:
             db_dir = os.path.join(output, "store")
             write_kuzu_graph(self._graph, self._snapshots, db_dir, enriched=False)
             manifest = read_store_manifest(db_dir)
-            self.assertEqual(9, manifest["version"])
+            self.assertEqual(STORE_FORMAT_VERSION, manifest["version"])
             self.assertGreater(manifest["decl_index_count"], 0)
             self.assertGreater(manifest["callsite_index_count"], 0)
 

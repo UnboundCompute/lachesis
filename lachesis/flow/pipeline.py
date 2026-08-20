@@ -5,6 +5,7 @@ One call returns the full bundle so callers (the CLI in walk.py, the MCP tool) s
 single code path: translate -> traverse+order+summarise -> skeletons -> shape leads.
 """
 import os
+from collections import defaultdict, deque
 from time import perf_counter
 
 from .translate import build_F
@@ -16,6 +17,30 @@ from .object_lifetime import analyze_object_lifetimes
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
 _DEFAULT_LIFETIME_ENGINE = "object"
+
+
+def _lifetime_slice(F, succ):
+    """Restrict object analysis to the call-graph region carrying lifecycle events."""
+    seeds = {
+        name for name, function in F.items()
+        if any(event.get("kind") in {"alloc", "free", "escape"}
+               for event in function.get("events", ()))
+    }
+    if not seeds:
+        return {}
+    reverse = defaultdict(set)
+    for caller, callees in succ.items():
+        for callee in callees:
+            reverse[callee].add(caller)
+    region = set(seeds)
+    queue = deque(seeds)
+    while queue:
+        name = queue.popleft()
+        for neighbour in set(succ.get(name, ())) | set(reverse.get(name, ())):
+            if neighbour in F and neighbour not in region:
+                region.add(neighbour)
+                queue.append(neighbour)
+    return {name: F[name] for name in region}
 
 
 def _lead_key(lead):
@@ -118,8 +143,13 @@ def run_pass(store, lang="c", lifetime_engine=None):
     legacy_leads = None
     leads = []
     if object_requested:
+        object_functions = _lifetime_slice(F, succ)
+        object_succ = {
+            name: [callee for callee in succ.get(name, ()) if callee in object_functions]
+            for name in object_functions
+        }
         object_result = analyze_object_lifetimes(
-            store, F, succ, lang=lang, graph=analysis_graph)
+            store, object_functions, object_succ, lang=lang, graph=analysis_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.
@@ -161,6 +191,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
             "available": True, "differential": differential,
             "diagnostics": diagnostics,
             "fallback_functions": sorted(seed_unsafe),
+            "candidate_functions": len(object_functions),
         })
     else:
         legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))

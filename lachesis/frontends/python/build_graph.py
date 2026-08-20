@@ -3,13 +3,12 @@
 Usage: ``python -m lachesis.frontends.python.build_graph <source_dir> <output_dir>``
 
 Parses every in-root ``.py``/``.pyi`` file with CPython's own ``ast`` module and
-writes the contract-v2 tier files plus ``manifest.json``. No third-party parser is
+writes the contract-v2 tier files plus ``manifest.pb``. No third-party parser is
 involved and nothing outside the root set is ever read.
 """
 from __future__ import annotations
 
 import ast
-import json
 import os
 import platform
 import sys
@@ -21,6 +20,7 @@ if __package__ in (None, ""):  # invoked as a bare script path, not with -m
     __package__ = "lachesis.frontends.python"
 
 from .declarations import DeclarationWalk
+from lachesis.core.graph_wire import encode_document, write_tier
 from .emit import (
     CONTRACT_VERSION, FRONTEND_ID, LANGUAGE, TIERS, Graph, SourceFile, stable_id,
 )
@@ -349,7 +349,7 @@ def analyze(source_dir: Path, roots: Optional[Sequence[str]] = None) -> Analysis
         "tiers": [
             {
                 "tier": tier, "name": TIERS[tier],
-                "file": f"{tier.lower()}_{TIERS[tier]}.json",
+                "file": f"{tier.lower()}_{TIERS[tier]}.pb",
                 "node_count": len(payloads[tier]["nodes"]),
                 "edge_count": len(payloads[tier]["edges"]),
                 "expands_to_count": len(payloads[tier]["expands_to"]),
@@ -368,12 +368,8 @@ def build(source_dir: Path, output_dir: Path) -> int:
     analysis = analyze(source_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for tier, payload in analysis.payloads.items():
-        (output_dir / f"{tier.lower()}_{TIERS[tier]}.json").write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8",
-        )
-    (output_dir / "manifest.json").write_text(
-        json.dumps(analysis.manifest, indent=2) + "\n", encoding="utf-8",
-    )
+        write_tier(output_dir / f"{tier.lower()}_{TIERS[tier]}.pb", payload)
+    (output_dir / "manifest.pb").write_bytes(encode_document(analysis.manifest))
     print(f"{analysis.summary} to {output_dir}")
     # A non-zero exit is a ContractError that kills the whole multi-language build,
     # so it is reserved for "nothing at all was ingested".

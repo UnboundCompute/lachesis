@@ -40,7 +40,7 @@ def ensure_graph(
     the whole design is arranged around: the second run of anything is instant.
     """
     from lachesis.kuzu_store import write_kuzu_graph
-    from lachesis.pipeline import run_project, source_content_hash
+    from lachesis.pipeline import run_project_incremental, source_content_hash
 
     progress = progress or Progress(enabled=False)
     entry = entry_for(source_dir)
@@ -63,16 +63,26 @@ def ensure_graph(
 
     if status == "stale":
         progress.note("source changed since the last index, rebuilding")
-    # A rebuild starts from nothing: a store written over a previous one, next to a
-    # dataflow cache derived from that previous one, is the one way this cache could
-    # answer with something that never existed.
-    entry.discard()
+    # Rebuild the graph itself, but retain per-frontend bundles.  The incremental
+    # pipeline validates each bundle against its source digests and build options, so
+    # unchanged translation units can be loaded instead of reparsed.  The old graph
+    # and its derived dataflow tier must still go: they describe the previous source.
+    import shutil
+    for stale in (entry.graph_path, Path(str(entry.graph_path) + ".enriched")):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+        elif stale.exists():
+            stale.unlink()
     entry.directory.mkdir(parents=True, exist_ok=True)
+    frontend_cache = entry.directory / "frontend-cache"
 
     progress.phase("compiling")
     try:
-        graph, snapshots = run_project(str(source), None, enrich=False,
-                                       timeout_seconds=timeout_seconds)
+        graph, snapshots = run_project_incremental(
+            str(source), str(frontend_cache), enrich=False,
+            timeout_seconds=timeout_seconds,
+            manifest_path=str(frontend_cache / "incremental_manifest.pb"),
+        )
     except Exception:
         progress.fail()
         entry.discard()

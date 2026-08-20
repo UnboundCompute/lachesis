@@ -140,6 +140,81 @@ The store is columnar, which is what lets a graph with well over a million nodes
 
 Lossless `--prune` drops pure-lexical nodes (source is read from files by offset, not stored twice), roughly halving the store. The on-disk layout and the compression work live in [`docs/KUZU_STORE_SPEC.md`](./docs/KUZU_STORE_SPEC.md) and [`docs/STORE_COMPRESSION_SPEC.md`](./docs/STORE_COMPRESSION_SPEC.md).
 
+For reproducible large-codebase measurements, use the direct-package commands and
+record the results in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The ledger tracks
+frontend build, enrichment, Kùzu materialization, node/edge counts, and peak memory so
+an optimization can be checked for both speed and graph completeness.
+
+The main engine-only command is:
+
+```bash
+LACHESIS_C_JOBS=1 LACHESIS_EMIT_TOKENS=0 LACHESIS_EMIT_PROOFS=0 \
+  python3.11 -m lachesis.frontends.c.build_graph \
+  /path/to/large-c-tree /tmp/lachesis-frontends
+```
+
+The C frontend keeps small trees parallel, but automatically limits large trees to
+one Clang AST at a time so expanded headers cannot multiply the runner's peak memory.
+Set `LACHESIS_C_JOBS` explicitly when the runner has a measured safe capacity (the
+large Linux benchmark uses `LACHESIS_C_JOBS=1`).
+
+For a core-only store on a large mixed-language tree, stream frontend shards directly
+into Kùzu to keep the parent process from composing one giant graph:
+
+```bash
+lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
+For large CI runners, bound Kùzu's cache explicitly so materialization cannot claim
+the host's entire available RAM. The value is bytes; 1 GiB is a good starting point
+for Linux/net-sized workloads:
+
+```bash
+LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
+  lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
+To print the streamed Kùzu phase timings while profiling a cold output directory,
+add `LACHESIS_TIMINGS=1`. The timing lines cover header scanning, schema creation,
+node and edge COPY, and index loading; they are silent by default:
+
+```bash
+LACHESIS_TIMINGS=1 LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
+  lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
+`--stream-shards` is currently incompatible with `--enrich`; dataflow partition
+streaming is the next integration step. The resulting store is explicitly marked
+core-only, so `GraphStore`/the GitHub Action builds the dataflow tier on its first
+security query rather than silently skipping enrichment. Additive derived records are
+cached in a compact internal `<store>.dataflow.pb` sidecar; JSON is reserved for
+user-facing output. A full `.enriched` Kùzu cache remains the fallback for overlays
+that mutate core records.
+
+The GitHub Action's SARIF step sets `LACHESIS_QUERY_EPHEMERAL_ENRICH=1`: its batch
+security query uses the derived tier only for that process and avoids writing a second
+graph-sized cache. Local query commands keep persistent enriched-cache behavior.
+
+The streamed path defaults to a 1 GiB Kùzu buffer pool. For very large subsystems
+such as Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
+
+```bash
+LACHESIS_KUZU_BUFFER_POOL_SIZE=2147483648 \
+  lachesis-analyze /path/to/linux/fs /tmp/fs.kuzu \
+  --stream-shards /tmp/fs-shards --prune --timeout 900
+```
+
+Disk-backed query/materialization scans use up to eight Kùzu execution threads by
+default. Override this for a constrained runner with `LACHESIS_KUZU_QUERY_THREADS=2`
+(or another positive integer); this changes read parallelism, not graph facts.
+
+Use a clean output directory and monitor the process on very large trees. The command
+builds the complete C graph directly; the token/proof switches remove only lexical
+facts that `--prune` discards later.
+
 ---
 
 ## Install from source

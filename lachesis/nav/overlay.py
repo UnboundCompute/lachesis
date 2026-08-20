@@ -36,6 +36,8 @@ import json
 import sys
 from pathlib import Path
 
+from lachesis.core.graph_wire import decode_document, encode_document
+
 OVERLAY_ID = "nav-reasoning"
 # derived edge kinds this layer is allowed to materialize (kept explicit so a typo
 # never silently invents an edge kind the movers then query for and never find).
@@ -43,9 +45,9 @@ DERIVED_EDGE_KINDS = frozenset({"GUARDED", "UNGUARDED"})
 
 
 def sidecar_path(graph_path: str | Path) -> Path:
-    """The overlay file that pairs with a graph: `foo.kuzu` -> `foo.nav-overlay.json`."""
+    """The overlay file that pairs with a graph: `foo.kuzu` -> `foo.nav-overlay.pb`."""
     p = Path(graph_path)
-    return p.with_name(p.stem + ".nav-overlay.json")
+    return p.with_name(p.stem + ".nav-overlay.pb")
 
 
 def edge_key(edge: dict) -> str:
@@ -101,8 +103,7 @@ class Overlay:
 
     def write(self, path: str | Path) -> Path:
         path = Path(path)
-        path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False),
-                        encoding="utf-8")
+        path.write_bytes(encode_document(self.to_dict()))
         return path
 
     @classmethod
@@ -119,7 +120,7 @@ class Overlay:
         path = Path(path)
         if not path.exists():
             return cls()
-        return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        return cls.from_dict(decode_document(path.read_bytes()))
 
     # -- application (in memory only — never touches the canonical file) -----
 

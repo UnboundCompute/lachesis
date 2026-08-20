@@ -318,6 +318,43 @@ def _locator(node: dict, tier: str, owners: list[dict]) -> dict:
     }
 
 
+def build_security_query_projection(
+    graph: dict, project_metadata: Optional[dict] = None,
+) -> dict:
+    """Build only the projection state needed by security-path queries.
+
+    ``ReasoningQuery`` normally constructs every layered-v2 tier.  The Action's
+    batch ``security-paths`` command only needs canonical node locators and the
+    path-query manifest; emitting every exposed node and edge is redundant.  Keep
+    tier assignment and ownership identical to :func:`build_layered_graph` so the
+    locators are byte-for-byte compatible, but omit the presentation payload.
+    """
+    index = GraphIndex(graph)
+    project_id = _project_id(graph)
+    tier_of, _untiered = _tier_assignments(index)
+    owners = _ownership(graph, index, tier_of, project_id)
+    node_index = {
+        node_id: _locator(node, tier_of[node_id], owners[node_id])
+        for node_id, node in index.nodes.items()
+    }
+    reaches = sorted(index.nodes_of_kind("taint-reach"), key=lambda item: item["id"])
+    return {
+        "manifest": {
+            "security": {
+                "path_queries": [
+                    {"id": reach["id"], "label": reach["label"],
+                     "query": {"operation": "security-path", "node_id": reach["id"]}}
+                    for reach in reaches[:50]
+                ],
+            },
+        },
+        "node_index": node_index,
+        # ReasoningQuery indexes these collections during construction.  Security
+        # queries do not traverse the layered payload, so empty tiers are enough.
+        "tiers": {},
+    }
+
+
 def _path_steps(
     reach: dict, index: GraphIndex, node_index: dict[str, dict],
 ) -> list[dict]:

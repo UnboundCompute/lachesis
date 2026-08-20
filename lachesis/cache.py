@@ -17,22 +17,23 @@ Layout, one directory per source tree::
     ~/.lachesis/cache/<basename>-<path-digest>/
         graph.kuzu           the store
         graph.kuzu.enriched  the dataflow tier, cached beside it by nav
-        meta.json            what tree this is, and what it hashed to
+        meta.pb              what tree this is, and what it hashed to
 
 Keyed by path so re-indexing a project replaces its entry instead of accumulating one
-per edit; the content hash rides in meta.json and decides whether that entry still
+per edit; the content hash rides in meta.pb and decides whether that entry still
 describes what is on disk.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from lachesis.core.graph_wire import decode_document, encode_document
 
 # 1 -> 2: the Python frontend stopped folding a call site's resolved kind into its node
 # id, and the store gained the v9 index tables. Neither changes a source byte, and
@@ -75,11 +76,11 @@ class CacheEntry:
 
     @property
     def meta_path(self) -> Path:
-        return self.directory / "meta.json"
+        return self.directory / "meta.pb"
 
     def meta(self) -> dict | None:
         try:
-            data = json.loads(self.meta_path.read_text(encoding="utf-8"))
+            data = decode_document(self.meta_path.read_bytes())
         except (OSError, ValueError):
             return None
         # A cache written by a layout we no longer speak is a miss, not an error: the
@@ -112,10 +113,10 @@ class CacheEntry:
             **extra,
         }
         self.directory.mkdir(parents=True, exist_ok=True)
-        # Written last and atomically: a meta.json beside a half-written store would
+        # Written last and atomically: a meta.pb beside a half-written store would
         # claim a build that did not finish, and every later run would trust it.
-        temporary = self.meta_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary = self.meta_path.with_suffix(".pb.tmp")
+        temporary.write_bytes(encode_document(payload))
         temporary.replace(self.meta_path)
 
     def discard(self) -> None:

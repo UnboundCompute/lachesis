@@ -22,7 +22,7 @@ Storage contract:
   * one generic ``Node`` table; the columns nav filters on are promoted to typed columns,
     and ``props`` carries the *tail*, the properties no column holds. Reconstruction
     unions the two, so nothing is stored twice and nothing is lost.
-  * ``props`` is deflated UTF-8 JSON in a ``BLOB``, not a ``STRING``. That costs
+  * ``props`` is deflated protobuf bytes in a ``BLOB``, not a ``STRING``. That costs
     readability in a raw Cypher dump and buys the last easy allocation boundary; see
     ``STORE_COMPRESSION_SPEC.md`` 0.2 for why boundaries are the unit of account here.
     The deflate runs against a preset dictionary built from this store's own most
@@ -47,15 +47,23 @@ import base64
 import collections
 import hashlib
 import itertools
-import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import time
 import zlib
+from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-from lachesis.indices import build_callsite_index, build_decl_index, exported_ids, index_rows
+from lachesis.core.graph_wire import (
+    decode_document, decode_node, encode_document, encode_node, read_frames, write_frame,
+)
+from lachesis.indices import (
+    CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
+    build_decl_and_callsite_index, exported_ids, index_rows,
+)
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
     import kuzu  # type: ignore
@@ -119,15 +127,75 @@ CONSTANT_PROP_DEFAULTS = {
 }
 
 
+def _is_default_constant(key: str, value) -> bool:
+    """Whether a constant-valued property can be safely omitted from ``props``.
+
+    The defaults are common on compiler facts, but overlay-derived records can
+    legitimately carry a different provenance/confidence.  Eliding by key alone
+    silently changed ``core-inference/high`` back to ``compiler/exact`` on read.
+    """
+    if key not in CONSTANT_PROP_DEFAULTS:
+        return False
+    return value == CONSTANT_PROP_DEFAULTS[key]
+
+
 # the Kùzu store is a *directory* holding this DB file plus the store manifest. The
 # marker file lets the loader branch without a magic byte and is robust to Kùzu using a
 # single-file DB.
 KUZU_DB_FILENAME = "graph.kuzu"
 
-# Deliberately NOT `manifest.json`: that name is already taken by the per-frontend
+# Keep each streamed relation COPY below a bounded row count.  Kùzu's COPY path
+# can need a temporary working set proportional to the input relation, even
+# though the Parquet staging itself is streaming.  Partitioning the input keeps
+# that transient allocation bounded on large repositories while retaining the
+# fast bulk-load path.
+STREAM_EDGE_COPY_PARTITION_ROWS = 250_000
+
+
+def _kuzu_buffer_pool_size(default: int = 0) -> int:
+    """Return an optional bounded Kùzu buffer pool size in bytes.
+
+    Kùzu's ``0`` default auto-sizes from host memory, which is unsafe for CI
+    runners when a large graph is being materialized.  Keep the historical
+    default unless the caller opts in, while allowing the low-memory and streamed
+    paths to set a hard ceiling without changing the graph format.
+    """
+    raw = os.environ.get("LACHESIS_KUZU_BUFFER_POOL_SIZE", "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LACHESIS_KUZU_BUFFER_POOL_SIZE must be an integer byte count") from exc
+    if value < 0:
+        raise ValueError("LACHESIS_KUZU_BUFFER_POOL_SIZE must be non-negative")
+    return value
+
+
+def _kuzu_checkpoint_threshold(default: int = -1) -> int:
+    """Return the Kùzu WAL checkpoint threshold in bytes.
+
+    A bounded threshold prevents a streamed build from retaining a very large
+    copy-on-write shadow file until the final checkpoint.  ``-1`` preserves Kùzu's
+    automatic default for the non-streamed writer.
+    """
+    raw = os.environ.get("LACHESIS_KUZU_CHECKPOINT_THRESHOLD", "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be an integer byte count"
+        ) from exc
+    if value < 0:
+        raise ValueError("LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be non-negative")
+    return value
+
+# Deliberately separate from the per-frontend
 # bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
 # two would collide the moment anyone points one at the other.
-STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
+STORE_MANIFEST_FILENAME = "lachesis-manifest.pb"
 
 # On-disk format of the store, stamped into the manifest.
 #   2 — `props` carries the whole properties dict; promoted columns are duplicates.
@@ -153,7 +221,9 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 9
+# v10 switches the manifest and compressed ``props`` payloads to protobuf. Existing
+# stores are rebuildable artifacts and must not be opened as if their bytes were v10.
+STORE_FORMAT_VERSION = 10
 
 
 def db_file(db_dir: str) -> str:
@@ -162,6 +232,11 @@ def db_file(db_dir: str) -> str:
 
 def store_manifest_file(db_dir: str) -> str:
     return os.path.join(db_dir, STORE_MANIFEST_FILENAME)
+
+
+def _write_store_manifest(db_dir: str, payload: dict) -> None:
+    """Write canonical protobuf metadata for the store."""
+    Path(store_manifest_file(db_dir)).write_bytes(encode_document(payload))
 
 
 def is_kuzu_dir(path: str) -> bool:
@@ -198,8 +273,10 @@ def read_store_manifest(db_dir: str) -> dict:
     if not os.path.isfile(path):
         return {"version": STORE_FORMAT_VERSION, "frontends": [],
                 "node_count": 0, "edge_count": 0}
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        return decode_document(Path(path).read_bytes())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid protobuf store manifest: {path}; rebuild the store") from error
 
 
 def manifest_props_dictionary(manifest: dict) -> bytes:
@@ -414,18 +491,15 @@ def _coded_cell(column: str, value, codes: dict):
 
 def _props_text(properties: dict, elide: bool,
                 drop: frozenset = frozenset()) -> bytes:
-    """The properties a typed column is not already carrying, as UTF-8 JSON."""
+    """The properties a typed column is not already carrying, as protobuf bytes."""
     properties = properties or {}
     if properties and (elide or drop):
         properties = {
             k: v for k, v in properties.items()
-            if not (elide and k in CONSTANT_PROP_DEFAULTS)
+            if not (elide and _is_default_constant(k, v))
             and not (k in drop and _column_faithful(k, v))
         }
-    # Compact separators: `json.dumps` defaults to ", " and ": ", which is two bytes of
-    # whitespace per key on every row and nothing else. `json.loads` cannot tell the
-    # difference, so this is invisible above the column.
-    return json.dumps(properties, separators=(",", ":")).encode("utf-8")
+    return encode_document(properties)
 
 
 class PropsCodec:
@@ -448,7 +522,7 @@ class PropsCodec:
     not safe to clone from concurrently, so a parallel writer needs one prototype each.
 
     `texts` is the second amortisation: the tails the dictionary pre-pass already built,
-    kept rather than discarded, so no row's properties are serialised to JSON twice. It
+    kept rather than discarded, so no row's properties are serialized to protobuf twice. It
     is positional against the collection it was built from, which is what makes a codec
     belong to exactly one of `nodes` / `edges` / `deferred` — the three are serialised
     with different arguments and a codec handed the wrong list would write the wrong
@@ -469,7 +543,7 @@ class PropsCodec:
 
     def blob(self, index: int, properties: dict, elide: bool,
              drop: frozenset = frozenset()) -> bytes:
-        """The `props` blob for row `index`: its tail, as deflated UTF-8 JSON."""
+        """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
         if self._prototype is None:
@@ -643,10 +717,14 @@ def write_kuzu_graph(
     carry_unresolved_edges: bool = False,
     source_dir: Optional[str] = None,
     source_content_hash: Optional[str] = None,
+    build_fingerprint: Optional[str] = None,
+    low_memory: Optional[bool] = None,
+    buffer_pool_size: Optional[int] = None,
+    checkpoint_threshold: Optional[int] = None,
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
-    ``snapshots`` supplies the store manifest (``lachesis-manifest.json`` beside the DB
+    ``snapshots`` supplies the store manifest (``lachesis-manifest.pb`` beside the DB
     file): the frontend inventory, and with it the capabilities and languages that
     overlay enrichment needs. Set ``prune=False, elide_constants=False`` for an
     exact-reconstruction parity build.
@@ -667,6 +745,12 @@ def write_kuzu_graph(
     from and what it hashed to. A reduced store cannot be read without them: getting the
     bodies back means compiling that tree again, and the hash is what says whether an
     already-joined cache still describes it.
+
+    ``low_memory`` overrides ``LACHESIS_KUZU_LOW_MEMORY`` for this write. It avoids
+    retaining the shared property-text dictionary and is used by lazy enriched-cache
+    writes, where bounded RSS is more important than the smaller/faster compressed tail.
+    ``buffer_pool_size`` and ``checkpoint_threshold`` similarly override the environment
+    for a derived cache without changing the process-wide defaults of ordinary builds.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -674,12 +758,12 @@ def write_kuzu_graph(
             "Create a venv (e.g. `python3.11 -m venv .venv-kuzu && "
             ".venv-kuzu/bin/pip install kuzu`) and run there."
         )
-    db_dir = os.path.abspath(db_dir)
-    if os.path.exists(db_dir):
-        if not overwrite:
-            raise FileExistsError(db_dir)
-        shutil.rmtree(db_dir) if os.path.isdir(db_dir) else os.remove(db_dir)
-    os.makedirs(db_dir, exist_ok=True)
+    target_db_dir = os.path.abspath(db_dir)
+    if os.path.exists(target_db_dir) and not overwrite:
+        raise FileExistsError(target_db_dir)
+    # Publish only after every table and the manifest are complete. A killed large
+    # build must never leave a path that looks like a valid but partial store.
+    db_dir = tempfile.mkdtemp(prefix=".lachesis-stream-", dir=os.path.dirname(target_db_dir))
 
     nodes = _kept_nodes(graph.get("nodes", []), prune=prune,
                         drop_diagnostics=drop_diagnostics, drop_tests=drop_tests)
@@ -701,7 +785,16 @@ def write_kuzu_graph(
     # its source node's unit as the §5 incremental key.
     node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
 
-    db = kuzu.Database(db_file(db_dir))
+    db = kuzu.Database(
+        db_file(db_dir),
+        buffer_pool_size=(
+            _kuzu_buffer_pool_size() if buffer_pool_size is None else buffer_pool_size
+        ),
+        checkpoint_threshold=(
+            _kuzu_checkpoint_threshold()
+            if checkpoint_threshold is None else checkpoint_threshold
+        ),
+    )
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
@@ -735,22 +828,31 @@ def write_kuzu_graph(
     # been seen. What does not have to stay is *rebuilding* the tails for the second
     # pass, so they are kept here and handed to the loaders. On a graph of this repo that
     # is ~740k tails and about 90 MB held for the length of the write, and it grows with
-    # the graph — the trade is memory against a second full JSON serialisation of every
+    # the graph — the trade is memory against a second full protobuf serialization of every
     # row.
-    node_texts = [_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
-                  for n in nodes]
-    edge_texts = [_props_text(e.get("properties") or {}, elide_constants)
-                  for e in edges]
-    deferred_texts = [_props_text(e.get("properties") or {}, elide_constants)
-                      for e in deferred]
-    props_dict = build_props_dictionary(
-        itertools.chain(node_texts, edge_texts, deferred_texts))
-    # One codec per collection, each primed with that dictionary and cloned per row by
-    # the loaders below. They can only be built after the pre-pass: the priming is the
-    # point, and the dictionary is its input.
-    node_codec = PropsCodec(props_dict, node_texts)
-    edge_codec = PropsCodec(props_dict, edge_texts)
-    deferred_codec = PropsCodec(props_dict, deferred_texts)
+    use_low_memory = (
+        os.environ.get("LACHESIS_KUZU_LOW_MEMORY") == "1"
+        if low_memory is None else low_memory
+    )
+    if use_low_memory:
+        # Rebuild each protobuf tail on demand instead of retaining one serialized tail
+        # per node and edge. This trades the shared dictionary for a lower peak.
+        props_dict = b""
+        node_codec = PropsCodec()
+        edge_codec = PropsCodec()
+        deferred_codec = PropsCodec()
+    else:
+        node_texts = [_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
+                      for n in nodes]
+        edge_texts = [_props_text(e.get("properties") or {}, elide_constants)
+                      for e in edges]
+        deferred_texts = [_props_text(e.get("properties") or {}, elide_constants)
+                          for e in deferred]
+        props_dict = build_props_dictionary(
+            itertools.chain(node_texts, edge_texts, deferred_texts))
+        node_codec = PropsCodec(props_dict, node_texts)
+        edge_codec = PropsCodec(props_dict, edge_texts)
+        deferred_codec = PropsCodec(props_dict, deferred_texts)
 
     # The other manifest-carried table: the id prefixes the coded columns are written
     # against. Nodes only — every coded column is on the node table — and the whole
@@ -829,11 +931,14 @@ def write_kuzu_graph(
     if source_content_hash:
         payload["source_content_hash"] = source_content_hash
     payload["enriched"] = bool(enriched)
-    # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
+    payload["pruned"] = bool(prune)
+    if build_fingerprint:
+        payload["build_fingerprint"] = build_fingerprint
+    # Base64 rather than raw bytes because the manifest Value field stores text, and in the manifest
     # rather than a sidecar file because losing it makes every `props` blob in the
     # store unreadable: it is part of the store, not metadata about it.
     payload[PROPS_DICT_KEY] = base64.b64encode(props_dict).decode("ascii")
-    # Plain JSON strings, not base64: the prefix table is short, and leaving it legible
+    # Plain strings, not base64: the prefix table is short, and leaving it legible
     # means a coded column can be read by hand from a Cypher dump. Same reason as the
     # dictionary for living here rather than in a sidecar — a code is an index into
     # this list, so losing it makes every coded value unreadable.
@@ -844,10 +949,11 @@ def write_kuzu_graph(
         core_content_hash if core_content_hash is not None
         else (None if enriched else graph_content_hash(nodes, edges))
     )
-    with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
-    return db_dir
+    _write_store_manifest(db_dir, payload)
+    if os.path.exists(target_db_dir):
+        shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
+    os.replace(db_dir, target_db_dir)
+    return target_db_dir
 
 
 # -- node/edge unit key (§5 incremental) --------------------------------------
@@ -918,10 +1024,10 @@ def _str_col(values: list) -> "pa.Array":
         [None if v is None else _utf8_safe(str(v)) for v in values], pa.string())
 
 
-def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
-                     codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
+def _node_table(nodes: list[dict], *, elide: bool, codec: PropsCodec,
+                id_codes: Optional[dict] = None, index_offset: int = 0):
     if not nodes:
-        return
+        return None
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
     data: dict[str, list] = {c: [] for c in columns}
     for index, node in enumerate(nodes):
@@ -932,17 +1038,29 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
         for prop in PROMOTED_NODE_PROPS:
             data[prop].append(_coded_cell(prop, _promoted_value(props, prop),
                                           id_codes or {}))
-        data["props"].append(codec.blob(index, props, elide, _COLUMN_KEYS))
-    table = pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
-                      for c in columns})
-    path = os.path.join(stage_dir, "node.parquet")
-    pq.write_table(table, path)
-    conn.execute(f"COPY Node FROM '{path}'")
+        data["props"].append(codec.blob(index_offset + index, props, elide, _COLUMN_KEYS))
+    return pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
+                     for c in columns})
 
 
-def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
-                     node_units: dict, codec: PropsCodec,
-                     id_codes: Optional[dict] = None) -> None:
+def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
+                     codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
+    for offset in range(0, len(nodes), STREAM_EDGE_COPY_PARTITION_ROWS):
+        table = _node_table(
+            nodes[offset:offset + STREAM_EDGE_COPY_PARTITION_ROWS],
+            elide=elide, codec=codec, id_codes=id_codes, index_offset=offset,
+        )
+        if table is None:
+            continue
+        path = os.path.join(stage_dir, f"node.{offset}.parquet")
+        pq.write_table(table, path)
+        conn.execute(f"COPY Node FROM '{path}'")
+        os.unlink(path)
+
+
+def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
+                 codec: PropsCodec, id_codes: Optional[dict] = None,
+                 index_offset: int = 0) -> dict:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
     hot: dict[str, dict[str, list]] = {
@@ -958,7 +1076,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
         kind = edge.get("kind")
         props = edge.get("properties") or {}
         unit = _edge_unit(edge, node_units)
-        stored = codec.blob(index, props, elide)
+        stored = codec.blob(index_offset + index, props, elide)
         src, tgt = encode_id(edge["source"], codes), encode_id(edge["target"], codes)
         if kind in _HOT_SET:
             bucket = hot[kind]
@@ -974,6 +1092,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             cold["unit"].append(unit)
             cold["props"].append(stored)
 
+    tables = {}
     for kind, bucket in hot.items():
         if not bucket["src"]:
             continue
@@ -982,9 +1101,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             "unit": _str_col(bucket["unit"]),
             "props": pa.array(bucket["props"], pa.binary()),
         })
-        path = os.path.join(stage_dir, f"rel_{kind}.parquet")
-        pq.write_table(table, path)
-        conn.execute(f"COPY {kind} FROM '{path}'")
+        tables[kind] = table
 
     if cold["src"]:
         table = pa.table({
@@ -993,9 +1110,43 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             "unit": _str_col(cold["unit"]),
             "props": pa.array(cold["props"], pa.binary()),
         })
-        path = os.path.join(stage_dir, "rel_EDGE.parquet")
-        pq.write_table(table, path)
-        conn.execute(f"COPY EDGE FROM '{path}'")
+        tables["EDGE"] = table
+    return tables
+
+
+def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
+                     node_units: dict, codec: PropsCodec,
+                     id_codes: Optional[dict] = None) -> None:
+    writers = {}
+    paths = collections.defaultdict(list)
+    rows = collections.defaultdict(int)
+    def flush(kind: str) -> None:
+        writer = writers.pop(kind, None)
+        if writer is None:
+            return
+        writer.close()
+        path = paths[kind][-1]
+        conn.execute(f"COPY {kind} FROM '{path}'")
+        os.unlink(path)
+        rows[kind] = 0
+    for offset in range(0, len(edges), 10_000):
+        batch = edges[offset:offset + 10_000]
+        for kind, table in _edge_tables(
+            batch, elide=elide, node_units=node_units, codec=codec,
+            id_codes=id_codes, index_offset=offset,
+        ).items():
+            writer = writers.get(kind)
+            if writer is None:
+                path = os.path.join(stage_dir, f"rel_{kind}.{len(paths[kind])}.parquet")
+                paths[kind].append(path)
+                writer = pq.ParquetWriter(path, table.schema)
+                writers[kind] = writer
+            writer.write_table(table)
+            rows[kind] += table.num_rows
+            if rows[kind] >= STREAM_EDGE_COPY_PARTITION_ROWS:
+                flush(kind)
+    for kind in list(writers):
+        flush(kind)
 
 
 def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: str,
@@ -1173,3 +1324,210 @@ def _load_index_rowwise(conn, table_name: str, columns: tuple, rows: list, *,
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool = True,
+                      overwrite: bool = True) -> str:
+    """Materialize a streaming shard reader without a whole graph dictionary."""
+    if kuzu is None:
+        raise RuntimeError("kuzu is required for streamed materialization")
+    target_db_dir = os.path.abspath(db_dir)
+    if os.path.exists(target_db_dir):
+        if not overwrite:
+            raise FileExistsError(target_db_dir)
+    timing_enabled = os.environ.get("LACHESIS_TIMINGS") == "1"
+    timing_started = time.perf_counter()
+    timing_last = timing_started
+
+    def timing(label: str) -> None:
+        nonlocal timing_last
+        if timing_enabled:
+            now = time.perf_counter()
+            elapsed = now - timing_started
+            phase = now - timing_last
+            timing_last = now
+            print(f"[lachesis timing] kuzu {label}: +{phase:.3f}s ({elapsed:.3f}s total)",
+                  file=sys.stderr, flush=True)
+
+    # Build beside the requested path and publish only after all tables, indices,
+    # and the manifest are complete. An interrupted large run must not expose a
+    # directory that looks like a valid but partial store.
+    db_dir = tempfile.mkdtemp(prefix=".lachesis-stream-",
+                              dir=os.path.dirname(target_db_dir))
+
+    kept_ids: set[str] = set()
+    node_units: dict[str, str] = {}
+    prefixes: set[str] = set()
+    # Index candidates are spilled while the large node/edge streams are loaded.
+    # Keeping hundreds of thousands of full property dictionaries alive here was a
+    # surprising multi-GB peak on Linux/net; the index builders only need them again
+    # after the graph tables are complete.
+    index_stage = tempfile.NamedTemporaryFile(mode="wb", prefix="lachesis-index-",
+                                               delete=False)
+    for node in shard_reader.nodes(headers_only=True):
+        kind = node.get("kind")
+        if prune and kind in PRUNE_NODE_KINDS:
+            continue
+        node_id = node["id"]
+        props = node.get("properties") or {}
+        kept_ids.add(node_id)
+        if props.get("file"):
+            node_units[node_id] = props["file"]
+        for value in (node_id, props.get("compiler_node_id")):
+            match = _ID_SHAPE.match(value) if isinstance(value, str) else None
+            if match:
+                prefixes.add(match.group(1))
+        if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
+            write_frame(index_stage, encode_node(node))
+
+    exported: set[str] = set()
+    unresolved_count = 0
+    for edge in shard_reader.edges(headers_only=True):
+        if edge.get("kind") == "EXPORTS" and edge.get("target"):
+            exported.add(edge["target"])
+        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+            unresolved_count += 1
+        # Streamed stores do not carry deferred edges: the second pass drops every
+        # edge whose endpoints were pruned or absent. Therefore retained endpoints
+        # are necessarily retained nodes, and their prefixes were collected above;
+        # scanning both endpoint strings again here was millions of redundant regex
+        # matches on the large Linux graph.
+    timing("scan headers and edge endpoints")
+    id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
+
+    # Streamed materialization is explicitly the bounded-memory path. Keep a
+    # predictable 1 GiB cache by default; callers can raise/lower it with the env.
+    db = kuzu.Database(
+        db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(1 << 30),
+        checkpoint_threshold=_kuzu_checkpoint_threshold(256 << 20),
+    )
+    conn = kuzu.Connection(db)
+    conn.execute(_node_ddl())
+    for stmt in _rel_ddl():
+        conn.execute(stmt)
+    for stmt in _index_ddl():
+        conn.execute(stmt)
+    timing("create schema")
+    codec = PropsCodec()
+    bulk = pa is not None and pq is not None
+    stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
+    node_writer = None
+    node_path = None
+    edge_writers = {}
+    edge_writer_paths = {}
+    edge_path_lists = collections.defaultdict(list)
+    edge_row_counts = collections.defaultdict(int)
+
+    def flush_edge_partition(kind: str) -> None:
+        writer = edge_writers.pop(kind, None)
+        if writer is None:
+            return
+        writer.close()
+        edge_path_lists[kind].append(edge_writer_paths.pop(kind))
+        edge_row_counts[kind] = 0
+
+    def load_nodes(batch: list[dict]) -> None:
+        if not batch:
+            return
+        if bulk:
+            nonlocal node_writer, node_path
+            table = _node_table(batch, elide=True, codec=codec, id_codes=id_codes)
+            if node_writer is None:
+                node_path = os.path.join(stage.name, "node.parquet")
+                node_writer = pq.ParquetWriter(node_path, table.schema)
+            node_writer.write_table(table)
+        else:
+            _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
+
+    def load_edges(batch: list[dict]) -> None:
+        if not batch:
+            return
+        if bulk:
+            for kind, table in _edge_tables(
+                batch, elide=True, node_units=node_units,
+                codec=codec, id_codes=id_codes,
+            ).items():
+                writer = edge_writers.get(kind)
+                if writer is None:
+                    partition = len(edge_path_lists[kind])
+                    path = os.path.join(stage.name, f"rel_{kind}.{partition}.parquet")
+                    writer = pq.ParquetWriter(path, table.schema)
+                    edge_writers[kind] = writer
+                    edge_writer_paths[kind] = path
+                writer.write_table(table)
+                edge_row_counts[kind] += table.num_rows
+                if edge_row_counts[kind] >= STREAM_EDGE_COPY_PARTITION_ROWS:
+                    flush_edge_partition(kind)
+        else:
+            _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
+                                codec=codec, id_codes=id_codes)
+
+    batch: list[dict] = []
+    for node in shard_reader.nodes():
+        if prune and node.get("kind") in PRUNE_NODE_KINDS:
+            continue
+        batch.append(node)
+        if len(batch) >= 10_000:
+            load_nodes(batch)
+            batch.clear()
+    if batch:
+        load_nodes(batch)
+    if bulk and node_writer is not None:
+        node_writer.close()
+        conn.execute(f"COPY Node FROM '{node_path}'")
+    timing("load nodes")
+
+    batch = []
+    kept_edge_count = 0
+    for edge in shard_reader.edges():
+        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+            continue
+        batch.append(edge)
+        kept_edge_count += 1
+        if len(batch) >= 10_000:
+            load_edges(batch)
+            batch.clear()
+    if batch:
+        load_edges(batch)
+    if bulk:
+        for kind in list(edge_writers):
+            flush_edge_partition(kind)
+        for kind, paths in edge_path_lists.items():
+            for path in paths:
+                conn.execute(f"COPY {kind} FROM '{path}'")
+                os.unlink(path)
+    timing("load edges")
+    index_stage.close()
+    indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
+    decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
+    decl_rows = index_rows(decl_index)
+    callsite_rows = index_rows(callsite_index)
+    os.unlink(index_stage.name)
+    if bulk:
+        _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
+                         stage_dir=stage.name, id_codes=id_codes)
+        _load_index_bulk(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
+                         callsite_rows, stage_dir=stage.name, id_codes=id_codes)
+    else:
+        _load_index_rowwise(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
+                            id_codes=id_codes)
+        _load_index_rowwise(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
+                            callsite_rows, id_codes=id_codes)
+    timing("build and load indices")
+    if stage is not None:
+        stage.cleanup()
+    payload = manifest_payload({"nodes": [], "edges": []}, snapshots)
+    payload.update({
+        "node_count": len(kept_ids), "edge_count": kept_edge_count,
+        "unresolved_edge_count": unresolved_count,
+        "dropped_node_count": 0, "deferred_edge_count": 0,
+        "decl_index_count": len(decl_rows), "callsite_index_count": len(callsite_rows),
+        "streamed": True, "enriched": False,
+        PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
+    })
+    _write_store_manifest(db_dir, payload)
+    if os.path.exists(target_db_dir):
+        shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
+    os.replace(db_dir, target_db_dir)
+    timing("publish store")
+    return target_db_dir

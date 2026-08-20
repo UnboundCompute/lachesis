@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
+from .core.graph_wire import decode_document, encode_document
 from .core.runner import run_frontend
 from .core.snapshot import load_snapshot
+from .core.shards import ShardSetReader
 from .frontends.registry import FrontendRegistry, default_registry
 from .types import CodeGraph, GraphEdge, GraphNode
 
@@ -18,7 +20,10 @@ def snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
     """Convert one validated frontend snapshot without changing its facts."""
     nodes: List[GraphNode] = []
     for source in snapshot.nodes:
-        properties = dict(source.get("properties", {}))
+        # Transfer ownership of the existing properties mapping. The snapshot is
+        # released immediately after this conversion, so copying it only creates a
+        # second graph-sized set of dictionaries during common composition.
+        properties = source.setdefault("properties", {})
         properties.update({
             "frontend_id": snapshot.frontend_id,
             "frontend_tier": source.get("tier"),
@@ -29,7 +34,7 @@ def snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
         })
     edges: List[GraphEdge] = []
     for source in snapshot.edges:
-        properties = dict(source.get("properties", {}))
+        properties = source.setdefault("properties", {})
         properties.update({
             "frontend_id": snapshot.frontend_id,
             "source_tier": source.get("source_tier"),
@@ -249,6 +254,16 @@ def _release_payloads(snapshots: Sequence[FrontendSnapshot]) -> None:
         snapshot.release()
 
 
+def _snapshot_graphs_releasing(
+    snapshots: Sequence[FrontendSnapshot],
+) -> Iterable[CodeGraph]:
+    """Convert one frontend payload, then release its duplicate immediately."""
+    for snapshot in snapshots:
+        graph = snapshot_graph(snapshot)
+        snapshot.release()
+        yield graph
+
+
 def run_project(
     source_dir: str,
     output_root: Optional[str] = None,
@@ -289,9 +304,50 @@ def run_project(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
-    _release_payloads(snapshots)
+    graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
     return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots
+
+
+def run_project_streaming(
+    source_dir: str,
+    shard_root: str,
+    output_root: str,
+    registry: Optional[FrontendRegistry] = None,
+    timeout_seconds: int = 300,
+    include_tests: bool = False,
+):
+    """Run frontends one at a time and return shard readers plus metadata.
+
+    This core-only path deliberately never composes frontend payloads. Each validated
+    snapshot is persisted by the common runner, released, and represented afterward
+    only by its shard-set reader and manifest metadata.
+    """
+    source_dir = os.path.abspath(source_dir)
+    shard_root = os.path.abspath(shard_root)
+    output_root = os.path.abspath(output_root)
+    registry = registry or default_registry()
+    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    snapshots = []
+    readers = []
+    previous = os.environ.get("LACHESIS_SHARD_ROOT")
+    os.environ["LACHESIS_SHARD_ROOT"] = shard_root
+    try:
+        for frontend_id in sorted(groups):
+            frontend = registry.get(frontend_id)
+            frontend_output = os.path.join(output_root, frontend_id)
+            snapshot = run_frontend(
+                frontend, source_dir, frontend_output, timeout_seconds,
+                roots=groups[frontend_id],
+            )
+            snapshots.append(snapshot)
+            readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
+            snapshot.release()
+    finally:
+        if previous is None:
+            os.environ.pop("LACHESIS_SHARD_ROOT", None)
+        else:
+            os.environ["LACHESIS_SHARD_ROOT"] = previous
+    return readers, snapshots
 
 
 def _file_digest(path: str) -> str:
@@ -341,7 +397,8 @@ def source_content_hash(source_dir: str, include_tests: bool = False) -> str:
 # rewrites it per build and the roots it names are already covered by the digests, and
 # LACHESIS_C_JOBS is absent because it is a scheduling knob whose output is identical.
 _OUTPUT_BEARING_ENVIRONMENT = (
-    "LACHESIS_EMIT_TOKENS", "LACHESIS_CFLAGS", "LACHESIS_COMPILE_COMMANDS",
+    "LACHESIS_EMIT_TOKENS", "LACHESIS_EMIT_PROOFS", "LACHESIS_CFLAGS",
+    "LACHESIS_COMPILE_COMMANDS",
     "LACHESIS_INCLUDE_DEP_TYPES", "LACHESIS_MAX_DEPENDENCY_FILES",
 )
 
@@ -356,8 +413,8 @@ def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
     if not manifest_path or not os.path.isfile(manifest_path):
         return {}
     try:
-        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        payload = decode_document(Path(manifest_path).read_bytes())
+    except (ValueError, OSError):
         return {}  # a corrupt/partial manifest just forces a full recompile
     frontends = payload.get("frontends") if isinstance(payload, dict) else None
     return frontends if isinstance(frontends, dict) else {}
@@ -366,15 +423,12 @@ def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
 def _write_manifest(manifest_path: str, frontends: Dict[str, dict]) -> None:
     output = Path(manifest_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps({"version": 1, "frontends": frontends}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    output.write_bytes(encode_document({"version": 1, "frontends": frontends}))
 
 
 def default_manifest_path(output_root: str) -> str:
     """The incremental manifest lives beside the per-frontend bundles."""
-    return os.path.join(os.path.abspath(output_root), "incremental_manifest.json")
+    return os.path.join(os.path.abspath(output_root), "incremental_manifest.pb")
 
 
 def run_project_incremental(
@@ -413,7 +467,7 @@ def run_project_incremental(
             prior_entry.get("files") == digests
             # a bundle built under different settings answers a different question
             and (prior_entry.get("options") or {}) == options
-            and Path(frontend_output, "manifest.json").is_file()
+            and Path(frontend_output, "manifest.pb").is_file()
         )
         if can_reuse:
             snapshots.append(load_snapshot(frontend_output))
@@ -434,8 +488,7 @@ def run_project_incremental(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
-    _release_payloads(snapshots)
+    graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
     result = _enrich_graph(graph, snapshots) if enrich else graph
     _write_manifest(manifest_path, manifest)
     return result, snapshots

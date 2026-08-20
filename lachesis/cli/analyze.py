@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from collections import Counter
@@ -10,12 +11,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lachesis.kuzu_store import write_kuzu_graph
+from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuzu_shards
+from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
 from lachesis.pipeline import (enrich_project_graph, run_project,
                                run_project_incremental, run_project_parallel,
-                               source_content_hash)
+                               run_project_streaming, source_content_hash,
+                               default_manifest_path)
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
@@ -96,10 +99,37 @@ def main() -> None:
         help="cap the --parallel-packages pool (default: one worker per package, "
              "never more than the core count). N=1 runs the same partition serially.",
     )
+    parser.add_argument(
+        "--stream-shards", metavar="DIR", default=None,
+        help="stream core-only frontend shards directly into Kùzu",
+    )
     args = parser.parse_args()
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
-                     "incremental manifest keys bundles by frontend, not by package")
+            "incremental manifest keys bundles by frontend, not by package")
+    if args.stream_shards and (args.enrich or args.reduced or args.layered_out):
+        parser.error("--stream-shards currently supports core-only stores")
+    if args.stream_shards and (args.parallel_packages or args.incremental):
+        parser.error("--stream-shards cannot combine with incremental or parallel builds")
+    # --prune deletes pure-lexical/proof records at the store boundary, so apply the
+    # same output defaults before the streaming branch as the ordinary path below.
+    # Previously the early return skipped this block and made --stream-shards run
+    # token/proof Clang passes whose output was immediately discarded.
+    if args.prune:
+        os.environ.setdefault("LACHESIS_EMIT_TOKENS", "0")
+        os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
+    if args.stream_shards:
+        frontend_out = args.frontend_out or os.path.join(args.stream_shards, "frontends")
+        readers, snapshots = run_project_streaming(
+            args.source_dir, args.stream_shards, frontend_out,
+            timeout_seconds=args.timeout,
+        )
+        stored = write_kuzu_shards(
+            CompositeShardReader(readers), args.output_path, snapshots,
+            prune=args.prune,
+        )
+        print(f"Streamed {len(snapshots)} frontends into {stored}")
+        return
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
@@ -109,9 +139,6 @@ def main() -> None:
     # the frontends up front turns that into work not done: for C the token stream costs
     # a whole extra clang parse of every file. setdefault, not assignment, so an explicit
     # LACHESIS_EMIT_TOKENS from the caller still wins in either direction.
-    if args.prune:
-        os.environ.setdefault("LACHESIS_EMIT_TOKENS", "0")
-        os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
@@ -138,6 +165,23 @@ def main() -> None:
         graph, snapshots = run_project(args.source_dir, frontend_out,
                                        enrich=compile_enrich,
                                        timeout_seconds=args.timeout)
+    build_fingerprint = None
+    if args.incremental and frontend_out:
+        manifest_path = default_manifest_path(frontend_out)
+        try:
+            build_fingerprint = hashlib.sha256(
+                Path(manifest_path).read_bytes()).hexdigest()
+        except OSError:
+            build_fingerprint = None
+        if build_fingerprint and os.path.isdir(args.output_path):
+            existing = read_store_manifest(args.output_path)
+            if (
+                existing.get("build_fingerprint") == build_fingerprint
+                and existing.get("pruned") is args.prune
+                and existing.get("enriched") is bool(enrich)
+            ):
+                print(f"Reused unchanged graph store: {args.output_path}")
+                return
     stored = graph
     if args.reduced:
         enriched = enrich_project_graph(graph, snapshots)
@@ -154,6 +198,7 @@ def main() -> None:
         # so a load can tell whether an already-joined cache still describes it.
         source_content_hash=(source_content_hash(args.source_dir)
                              if args.reduced else None),
+        build_fingerprint=build_fingerprint,
     )
     if args.layered_out:
         layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)

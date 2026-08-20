@@ -113,30 +113,9 @@ def build_decl_index(
     exported = frozenset(exported)
     index: dict[str, list[dict]] = {}
     for node in nodes:
-        kind = node.get("kind")
-        granularity = INDEXED_KINDS.get(kind)
-        if granularity is None:
-            continue
-        name = str(node.get("label") or "")
-        if not name:
-            continue
-        properties = _properties(node)
-        node_id = node.get("id")
-        index.setdefault(name, []).append({
-            "name": name,
-            "node_id": node_id,
-            "kind": kind,
-            "granularity": granularity,
-            "file": properties.get("file"),
-            "line": properties.get("start_line"),
-            "signature": signature_of(properties),
-            "unit": properties.get("file"),
-            "exported": node_id in exported,
-            # The C frontend's crisp flag for a bodyless prototype, which twins the
-            # real definition under the same name. Resolution prefers the twin that
-            # has a body, so the flag has to survive into the index.
-            "declaration_only": bool(properties.get("declaration_only")),
-        })
+        row = _decl_row(node, exported)
+        if row is not None:
+            index.setdefault(row["name"], []).append(row)
     return _ordered(index)
 
 
@@ -150,24 +129,79 @@ def build_callsite_index(nodes: Iterable[Mapping]) -> dict:
     """
     index: dict[str, list[dict]] = {}
     for node in nodes:
-        if node.get("kind") not in CALLSITE_KINDS:
-            continue
-        properties = _properties(node)
-        name = callee_name(node)
-        if not name:
-            continue
-        index.setdefault(name, []).append({
-            "callee_name": name,
-            "node_id": node.get("id"),
-            "owner_id": properties.get("owner_function_id"),
-            "file": properties.get("file"),
-            "line": properties.get("start_line"),
-            "unit": properties.get("file"),
-            "form": properties.get("callee_form") or properties.get("form"),
-            "receiver": (properties.get("receiver")
-                         or properties.get("receiver_expression")),
-        })
+        row = _callsite_row(node)
+        if row is not None:
+            index.setdefault(row["callee_name"], []).append(row)
     return _ordered(index)
+
+
+def build_decl_and_callsite_index(
+    nodes: Iterable[Mapping],
+    exported: Sequence | frozenset | set = frozenset(),
+) -> tuple[dict, dict]:
+    """Build both persisted indices in one pass over ``nodes``.
+
+    Streamed Kùzu publication stores only index candidates in a temporary protobuf
+    file. Reading and decoding that file once for declarations and again for call
+    sites was pure duplicate work (and doubled protobuf/property allocations). This
+    fused variant keeps the same independent ordered outputs while allowing callers
+    to retain bounded memory and make one forward pass.
+    """
+    exported = frozenset(exported)
+    declarations: dict[str, list[dict]] = {}
+    callsites: dict[str, list[dict]] = {}
+    for node in nodes:
+        decl = _decl_row(node, exported)
+        if decl is not None:
+            declarations.setdefault(decl["name"], []).append(decl)
+        callsite = _callsite_row(node)
+        if callsite is not None:
+            callsites.setdefault(callsite["callee_name"], []).append(callsite)
+    return _ordered(declarations), _ordered(callsites)
+
+
+def _decl_row(node: Mapping, exported: frozenset) -> dict | None:
+    kind = node.get("kind")
+    granularity = INDEXED_KINDS.get(kind)
+    if granularity is None:
+        return None
+    name = str(node.get("label") or "")
+    if not name:
+        return None
+    properties = _properties(node)
+    node_id = node.get("id")
+    return {
+        "name": name,
+        "node_id": node_id,
+        "kind": kind,
+        "granularity": granularity,
+        "file": properties.get("file"),
+        "line": properties.get("start_line"),
+        "signature": signature_of(properties),
+        "unit": properties.get("file"),
+        "exported": node_id in exported,
+        "declaration_only": bool(properties.get("declaration_only")),
+    }
+
+
+def _callsite_row(node: Mapping) -> dict | None:
+    if node.get("kind") not in CALLSITE_KINDS:
+        return None
+    properties = _properties(node)
+    name = callee_name(node)
+    if not name:
+        return None
+    return {
+        "callee_name": name,
+        "node_id": node.get("id"),
+        "owner_id": properties.get("owner_function_id"),
+        "file": properties.get("file"),
+        "line": properties.get("start_line"),
+        "unit": properties.get("file"),
+        "form": properties.get("callee_form") or properties.get("form"),
+        "receiver": (properties.get("receiver")
+                     or properties.get("receiver_expression")),
+    }
 
 
 def callee_name(node: Mapping) -> str:
