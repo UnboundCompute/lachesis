@@ -1370,7 +1370,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
 
     exported: set[str] = set()
     unresolved_count = 0
-    for edge in shard_reader.edges():
+    for edge in shard_reader.edges(headers_only=True):
         if edge.get("kind") == "EXPORTS" and edge.get("target"):
             exported.add(edge["target"])
         if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:

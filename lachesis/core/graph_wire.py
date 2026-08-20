@@ -133,13 +133,13 @@ def encode_edge(record: Mapping[str, Any]) -> bytes:
     return message.SerializeToString()
 
 
-def decode_edge(payload: bytes) -> dict[str, Any]:
+def decode_edge(payload: bytes, *, properties: bool = True) -> dict[str, Any]:
     message = graph_pb2.EdgeRecord()
     message.ParseFromString(payload)
     record = {"source": message.source, "target": message.target}
     if message.kind:
         record["kind"] = message.kind
-    if message.properties:
+    if properties and message.properties:
         record["properties"] = _read_properties(message.properties)
     if message.source_tier:
         record["source_tier"] = message.source_tier
