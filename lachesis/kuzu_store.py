@@ -147,6 +147,27 @@ def _kuzu_buffer_pool_size(default: int = 0) -> int:
         raise ValueError("LACHESIS_KUZU_BUFFER_POOL_SIZE must be non-negative")
     return value
 
+
+def _kuzu_checkpoint_threshold(default: int = -1) -> int:
+    """Return the Kùzu WAL checkpoint threshold in bytes.
+
+    A bounded threshold prevents a streamed build from retaining a very large
+    copy-on-write shadow file until the final checkpoint.  ``-1`` preserves Kùzu's
+    automatic default for the non-streamed writer.
+    """
+    raw = os.environ.get("LACHESIS_KUZU_CHECKPOINT_THRESHOLD", "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be an integer byte count"
+        ) from exc
+    if value < 0:
+        raise ValueError("LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be non-negative")
+    return value
+
 # Deliberately NOT `manifest.json`: that name is already taken by the per-frontend
 # bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
 # two would collide the moment anyone points one at the other.
@@ -724,7 +745,8 @@ def write_kuzu_graph(
     # its source node's unit as the §5 incremental key.
     node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
 
-    db = kuzu.Database(db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size())
+    db = kuzu.Database(db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(),
+                        checkpoint_threshold=_kuzu_checkpoint_threshold())
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
@@ -1263,8 +1285,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
 
     # Streamed materialization is explicitly the bounded-memory path. Keep a
     # predictable 1 GiB cache by default; callers can raise/lower it with the env.
-    db = kuzu.Database(db_file(db_dir),
-                       buffer_pool_size=_kuzu_buffer_pool_size(1 << 30))
+    db = kuzu.Database(
+        db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(1 << 30),
+        checkpoint_threshold=_kuzu_checkpoint_threshold(256 << 20),
+    )
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
