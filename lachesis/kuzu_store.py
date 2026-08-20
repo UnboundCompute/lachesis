@@ -193,12 +193,12 @@ def _kuzu_checkpoint_threshold(default: int = -1) -> int:
     return value
 
 
-def _stream_batch_rows(default: int = 25_000) -> int:
+def _stream_batch_rows(default: int = 10_000) -> int:
     """Bound the number of records handed to each streamed Arrow batch.
 
-    Ten-thousand-row batches were chosen before the protobuf-to-Parquet path was
-    fused.  A moderately larger batch amortizes Python/Arrow writer calls without
-    allowing an environment override to create an unbounded transient allocation.
+    Ten-thousand-row batches are the measured safe default on the USB north-star
+    workload. Callers may try a larger value experimentally without allowing an
+    environment override to create an unbounded transient allocation.
     """
     raw = os.environ.get("LACHESIS_STREAM_BATCH_ROWS", "")
     if not raw:
