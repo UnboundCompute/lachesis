@@ -101,6 +101,13 @@ reduced the frontend wall time from 11.85s to 9.51s, but changed the graph: edge
 went from 286,007 to 286,015, with a 317/325 edge-set differential. The faster setting
 is therefore not accepted as a default; deterministic fact preservation takes priority.
 
+### Rejected shard-reader experiment
+
+An `mmap` reader was benchmarked on a 400k-record shard stream (200k nodes and
+199,999 edges). It was about 19% slower than the existing buffered `read()` loop
+(0.225s versus 0.189s in the local run), so it was reverted in `eb249b8`. The current
+length-framed marshal format remains the faster measured implementation.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
