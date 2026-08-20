@@ -16,6 +16,7 @@ testable.
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -101,7 +102,10 @@ def parse_macro_definitions(
     current_line = 0
     resolved_files: Dict[str, Path] = {}
     macros: List[Dict[str, object]] = []
-    for line in preprocessed.splitlines():
+    # Iterate the captured compiler output without creating a second list containing
+    # every preprocessed line; large header-heavy TUs can make that transient list
+    # substantial even though macro recovery only needs one line at a time.
+    for line in io.StringIO(preprocessed):
         marker = _parse_line_marker(line)
         if marker is not None:
             current_file, current_line = marker
