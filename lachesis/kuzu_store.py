@@ -1336,7 +1336,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # after the graph tables are complete.
     index_stage = tempfile.NamedTemporaryFile(mode="wb", prefix="lachesis-index-",
                                                delete=False)
-    for node in shard_reader.nodes():
+    for node in shard_reader.nodes(headers_only=True):
         kind = node.get("kind")
         if prune and kind in PRUNE_NODE_KINDS:
             continue

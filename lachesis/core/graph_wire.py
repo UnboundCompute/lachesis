@@ -89,8 +89,10 @@ def _from_value(value: graph_pb2.Value) -> Any:
     raise ValueError("protobuf graph value has no kind")
 
 
-def _read_properties(fields) -> dict[str, Any]:
-    return {field.key: _from_value(field.value) for field in fields}
+def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
+    if wanted is None:
+        return {field.key: _from_value(field.value) for field in fields}
+    return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
 
 
 def encode_node(record: Mapping[str, Any]) -> bytes:
@@ -102,7 +104,7 @@ def encode_node(record: Mapping[str, Any]) -> bytes:
     return message.SerializeToString()
 
 
-def decode_node(payload: bytes) -> dict[str, Any]:
+def decode_node(payload: bytes, *, properties: bool = True) -> dict[str, Any]:
     message = graph_pb2.NodeRecord()
     message.ParseFromString(payload)
     record = {"id": message.id}
@@ -111,7 +113,10 @@ def decode_node(payload: bytes) -> dict[str, Any]:
     if message.label:
         record["label"] = message.label
     if message.properties:
-        record["properties"] = _read_properties(message.properties)
+        record["properties"] = _read_properties(
+            message.properties,
+            None if properties else {"file", "compiler_node_id"},
+        )
     if message.tier:
         record["tier"] = message.tier
     return record

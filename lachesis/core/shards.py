@@ -89,9 +89,10 @@ class ShardReader:
         else:
             raise ValueError("missing protobuf shard manifest; rebuild shards")
 
-    def nodes(self) -> Iterator[dict]:
+    def nodes(self, *, headers_only: bool = False) -> Iterator[dict]:
         path = self.directory / str(self.manifest["nodes_file"])
-        yield from (decode_node(payload) for payload in read_frames(path))
+        yield from (decode_node(payload, properties=not headers_only)
+                    for payload in read_frames(path))
 
     def edges(self) -> Iterator[dict]:
         path = self.directory / str(self.manifest["edges_file"])
@@ -132,9 +133,9 @@ class ShardSetReader:
             directory = self._root / str(entry["directory"])
             yield ShardReader(directory)
 
-    def nodes(self) -> Iterator[dict]:
+    def nodes(self, *, headers_only: bool = False) -> Iterator[dict]:
         for shard in self._shards():
-            yield from shard.nodes()
+            yield from shard.nodes(headers_only=headers_only)
 
     def edges(self) -> Iterator[dict]:
         for shard in self._shards():
@@ -147,8 +148,10 @@ class CompositeShardReader:
     def __init__(self, readers) -> None:
         self.readers = tuple(readers)
 
-    def nodes(self) -> Iterator[dict]:
-        yield from chain.from_iterable(reader.nodes() for reader in self.readers)
+    def nodes(self, *, headers_only: bool = False) -> Iterator[dict]:
+        yield from chain.from_iterable(
+            reader.nodes(headers_only=headers_only) for reader in self.readers
+        )
 
     def edges(self) -> Iterator[dict]:
         yield from chain.from_iterable(reader.edges() for reader in self.readers)
