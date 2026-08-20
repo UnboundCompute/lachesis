@@ -1,6 +1,6 @@
 import unittest
 
-from .pipeline import _DEFAULT_LIFETIME_ENGINE, _select_lifetime_leads
+from .pipeline import _DEFAULT_LIFETIME_ENGINE, _lifetime_slice, _select_lifetime_leads
 
 
 class PipelineLifetimeTests(unittest.TestCase):
@@ -48,6 +48,16 @@ class PipelineLifetimeTests(unittest.TestCase):
             [], [tainted, clean], "object",
             covered_entries={"f"}, object_flow={"f": ["escapes"]})
         self.assertEqual(leads, [clean])
+
+
+    def test_lifetime_slice_keeps_callers_and_drops_unrelated_functions(self):
+        functions = {
+            "alloc": {"events": [{"kind": "alloc"}]},
+            "caller": {"events": []},
+            "unrelated": {"events": []},
+        }
+        successors = {"caller": ["alloc"], "alloc": [], "unrelated": []}
+        self.assertEqual(set(_lifetime_slice(functions, successors)), {"alloc", "caller"})
 
 
 if __name__ == "__main__":
