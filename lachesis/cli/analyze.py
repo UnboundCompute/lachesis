@@ -111,6 +111,13 @@ def main() -> None:
         parser.error("--stream-shards currently supports core-only stores")
     if args.stream_shards and (args.parallel_packages or args.incremental):
         parser.error("--stream-shards cannot combine with incremental or parallel builds")
+    # --prune deletes pure-lexical/proof records at the store boundary, so apply the
+    # same output defaults before the streaming branch as the ordinary path below.
+    # Previously the early return skipped this block and made --stream-shards run
+    # token/proof Clang passes whose output was immediately discarded.
+    if args.prune:
+        os.environ.setdefault("LACHESIS_EMIT_TOKENS", "0")
+        os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
     if args.stream_shards:
         frontend_out = args.frontend_out or os.path.join(args.stream_shards, "frontends")
         readers, snapshots = run_project_streaming(
@@ -132,9 +139,6 @@ def main() -> None:
     # the frontends up front turns that into work not done: for C the token stream costs
     # a whole extra clang parse of every file. setdefault, not assignment, so an explicit
     # LACHESIS_EMIT_TOKENS from the caller still wins in either direction.
-    if args.prune:
-        os.environ.setdefault("LACHESIS_EMIT_TOKENS", "0")
-        os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
