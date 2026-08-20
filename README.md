@@ -176,6 +176,10 @@ streaming is the next integration step. The resulting store is explicitly marked
 core-only, so `GraphStore`/the GitHub Action rebuilds and caches the dataflow tier
 on its first security query rather than silently skipping enrichment.
 
+The GitHub Action's SARIF step sets `LACHESIS_QUERY_EPHEMERAL_ENRICH=1`: its batch
+security query uses the derived tier only for that process and avoids writing a second
+graph-sized cache. Local query commands keep persistent enriched-cache behavior.
+
 The streamed path defaults to a 1 GiB Kùzu buffer pool. For very large subsystems
 such as Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
 

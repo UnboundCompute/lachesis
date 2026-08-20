@@ -65,6 +65,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `c9c4512` | Linux `fs` streamed core, partitioned node/edge COPY, 1 GiB pool | — | — | 618.03 | 3,157,724 | 6,210,345 | ~5.5* | Completed and reopened under the previously failing 1 GiB pool; direct relation counts sum exactly to the manifest. Partitioning removed the buffer-pool failure, but the end-to-end build remains slow. |
 | 2026-08-20 | `50e5cfd` | Linux `fs` lazy dataflow enrichment, partitioned node/edge cache COPY | — | >300* | not published | — | — | ~5.0* | Hard process-group timeout at 300s; memory stayed bounded, but pass 3 did not publish a cache. Further incremental/targeted enrichment work is required. |
 | 2026-08-20 | `16c1cfa` | Linux `fs` core Kùzu materialization, 8 query threads | — | — | 150.66 | 3,157,724 | 6,210,345 | ~3.9* | Read-only materialization completed with exact counts under the 5-minute cap; bounded Kùzu query parallelism is configurable via `LACHESIS_KUZU_QUERY_THREADS`. |
+| 2026-08-20 | `ff8ea37` | Linux `fs` Action-style ephemeral `security-paths` query | — | >300* | no cache | — | — | ~4.3* | The Action no longer writes a graph-sized enriched sibling on this path, but whole-graph materialization/enrichment still exceeded the 300s cap. Next target is scoped security extraction. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
