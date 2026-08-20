@@ -59,12 +59,46 @@ def _value(value: Any) -> graph_pb2.Value:
     return result
 
 
-def _properties(values: Mapping[str, Any] | None) -> list[graph_pb2.Field]:
+def _freeze_property(value: Any):
+    """Return a bounded-cache key for JSON-shaped graph property values."""
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _freeze_property(item))
+                            for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_property(item) for item in value)
+    if isinstance(value, (str, bytes, int, float, bool, type(None))):
+        return type(value).__name__, value
+    return type(value).__name__, repr(value)
+
+
+_CACHE_SKIP_KEYS = frozenset({
+    "file", "absolute_file", "content_hash", "compiler_node_id",
+    "start_offset", "end_offset", "start_line", "end_line",
+})
+
+
+def _properties(
+    values: Mapping[str, Any] | None,
+    cache: dict | None = None,
+) -> list[graph_pb2.Field]:
+    cache_key = None
+    cacheable = (
+        cache is not None
+        and len(values or {}) <= 8
+        and not _CACHE_SKIP_KEYS.intersection(values or {})
+    )
+    if cacheable:
+        cache_key = _freeze_property(values or {})
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
     fields = []
     for key in sorted(values or {}, key=str):
         field = graph_pb2.Field(key=str(key))
         field.value.CopyFrom(_value(values[key]))
         fields.append(field)
+    if cacheable and len(cache) < 1024:
+        cache[cache_key] = tuple(fields)
     return fields
 
 
@@ -95,12 +129,12 @@ def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
     return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
 
 
-def encode_node(record: Mapping[str, Any]) -> bytes:
+def encode_node(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
     message = graph_pb2.NodeRecord(
         id=str(record.get("id", "")), kind=str(record.get("kind", "")),
         label=str(record.get("label", "")), tier=str(record.get("tier", "")),
     )
-    message.properties.extend(_properties(record.get("properties")))
+    message.properties.extend(_properties(record.get("properties"), _property_cache))
     return message.SerializeToString()
 
 
@@ -122,14 +156,14 @@ def decode_node(payload: bytes, *, properties: bool = True) -> dict[str, Any]:
     return record
 
 
-def encode_edge(record: Mapping[str, Any]) -> bytes:
+def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
     message = graph_pb2.EdgeRecord(
         kind=str(record.get("kind", "")), source=str(record.get("source", "")),
         target=str(record.get("target", "")),
         source_tier=str(record.get("source_tier", "")),
         relationship_class=str(record.get("relationship_class", "")),
     )
-    message.properties.extend(_properties(record.get("properties")))
+    message.properties.extend(_properties(record.get("properties"), _property_cache))
     return message.SerializeToString()
 
 
@@ -200,14 +234,16 @@ def decode_tier(payload: bytes) -> dict[str, Any]:
 
 def write_tier(path: str | Path, payload: Mapping[str, Any]) -> None:
     """Write a typed tier incrementally without materializing its outer message."""
+    property_cache: dict = {}
     with open(path, "wb") as handle:
         handle.write(_field_bytes(1, str(payload.get("tier") or "").encode()))
         handle.write(_field_bytes(2, str(payload.get("name") or "").encode()))
         for node in payload.get("nodes", ()):
-            handle.write(_field_bytes(3, encode_node(node)))
+            handle.write(_field_bytes(3, encode_node(node, _property_cache=property_cache)))
         for field, tag in (("edges", 4), ("expands_to", 5), ("links", 6)):
             for edge in payload.get(field, ()):
-                handle.write(_field_bytes(tag, encode_edge(edge)))
+                handle.write(_field_bytes(
+                    tag, encode_edge(edge, _property_cache=property_cache)))
 
 
 def _take_varint(buffer: bytearray):
