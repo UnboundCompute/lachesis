@@ -581,10 +581,7 @@ class Graph:
                 "compiler_node_id": canonical.get("compiler_node_id") or node_id,
             })
         if node_id not in self.nodes:
-            self.nodes[node_id] = {
-                "id": node_id, "kind": kind, "label": label,
-                "properties": canonical,
-            }
+            self.nodes[node_id] = Node(node_id, kind, label, canonical)
             self.node_tier[node_id] = tier
         else:
             self.nodes[node_id]["properties"].update(canonical)
@@ -642,6 +639,53 @@ class Edge:
     def as_dict(self) -> dict:
         return {
             "kind": self.kind, "source": self.source, "target": self.target,
+            "properties": self.properties,
+        }
+
+
+class Node:
+    """Compact mutable node record with the mapping access used by the builder."""
+
+    __slots__ = ("id", "kind", "label", "properties")
+
+    def __init__(self, node_id: str, kind: str, label: str, properties: dict) -> None:
+        self.id = node_id
+        self.kind = kind
+        self.label = label
+        self.properties = properties
+
+    def __getitem__(self, key: str):
+        if key == "id":
+            return self.id
+        if key == "kind":
+            return self.kind
+        if key == "label":
+            return self.label
+        if key == "properties":
+            return self.properties
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value) -> None:
+        if key == "id":
+            self.id = value
+        elif key == "kind":
+            self.kind = value
+        elif key == "label":
+            self.label = value
+        elif key == "properties":
+            self.properties = value
+        else:
+            raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id, "kind": self.kind, "label": self.label,
             "properties": self.properties,
         }
 
@@ -1683,7 +1727,7 @@ def main() -> int:
     for tier, name in TIERS.items():
         payload = {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
         payload["nodes"].extend(
-            node for node_id, node in graph.nodes.items()
+            node.as_dict() for node_id, node in graph.nodes.items()
             if graph.node_tier.get(node_id) == tier
         )
         for edge in graph.edges:
