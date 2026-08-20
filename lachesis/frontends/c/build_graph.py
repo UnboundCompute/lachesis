@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import mmap
 import marshal
 import os
 import shlex
@@ -704,7 +705,12 @@ class AstStore:
 
     def __iter__(self) -> Iterator[Tuple[Path, dict]]:
         for path, spill in self._entries:
-            yield path, marshal.loads(spill.read_bytes())
+            # Avoid materializing a second bytes-sized copy of a potentially huge
+            # marshalled AST before ``marshal`` creates its object tree. The mapping
+            # is released as soon as the one-TU object is handed to the pass.
+            with spill.open("rb") as handle:
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                    yield path, marshal.loads(mapped)
 
     def __len__(self) -> int:
         return len(self._entries)
