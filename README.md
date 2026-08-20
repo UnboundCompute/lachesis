@@ -161,6 +161,16 @@ lachesis-analyze /path/to/project /tmp/project.kuzu \
   --stream-shards /tmp/project-shards --prune
 ```
 
+For large CI runners, bound Kùzu's cache explicitly so materialization cannot claim
+the host's entire available RAM. The value is bytes; 1 GiB is a good starting point
+for Linux/net-sized workloads:
+
+```bash
+LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
+  lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
 `--stream-shards` is currently incompatible with `--enrich`; dataflow partition
 streaming is the next integration step.
 

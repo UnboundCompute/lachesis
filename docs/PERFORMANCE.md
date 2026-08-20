@@ -27,6 +27,10 @@ time python3.11 -m lachesis.cli.analyze \
 When memory is the limiting resource during store materialization, add
 `LACHESIS_KUZU_LOW_MEMORY=1`. It removes the in-memory property-text compression
 arrays and preserves graph facts; the tradeoff is a larger/slightly slower store write.
+For a hard Kùzu cache ceiling, set `LACHESIS_KUZU_BUFFER_POOL_SIZE` to a byte count
+(for example `1073741824` for 1 GiB). This is especially important in GitHub Action
+runners, where automatic pool sizing can otherwise consume the runner before the
+graph is published.
 
 The bounded core-only path uses the same direct package command exposed in README:
 
@@ -51,6 +55,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `d841e61` | Linux `fs` | >421* | — | — | — | — | >4.77* | Safety-stopped before completion; next scale boundary. |
 | 2026-08-20 | `ad44b90` | Linux `net` CLI + `--enrich` | >160* | — | — | — | — | >5.30* | Frontend child exceeded safety cap before composition; pass 2 not measured. |
 | 2026-08-20 | `2c00f9d` | Linux `net` CLI + `--stream-shards` | >541* | — | partial | — | — | ~4.2* | Frontend completed; rowwise Kùzu load did not finish. Stream publication is now atomic. |
+| 2026-08-20 | `2db7808` | Linux `net` shard materialization, 1 GiB Kùzu pool | >298* | — | stopped | — | — | ~3.6* | Memory stayed bounded; stopped on host disk exhaustion before manifest publication. Not a valid graph result. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
