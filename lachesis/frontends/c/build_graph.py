@@ -602,10 +602,48 @@ class Graph:
         canonical = dict(properties)
         if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
-        self.edges.append({
-            "kind": kind, "source": source, "target": target,
-            "properties": canonical,
-        })
+        self.edges.append(Edge(kind, source, target, canonical))
+
+
+class Edge:
+    """Compact mutable edge record with the mapping access used by the builder."""
+
+    __slots__ = ("kind", "source", "target", "properties")
+
+    def __init__(self, kind: str, source: str, target: str, properties: dict) -> None:
+        self.kind = kind
+        self.source = source
+        self.target = target
+        self.properties = properties
+
+    def __getitem__(self, key: str):
+        if key == "kind":
+            return self.kind
+        if key == "source":
+            return self.source
+        if key == "target":
+            return self.target
+        if key == "properties":
+            return self.properties
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value) -> None:
+        if key == "kind":
+            self.kind = value
+        elif key == "source":
+            self.source = value
+        elif key == "target":
+            self.target = value
+        elif key == "properties":
+            self.properties = value
+        else:
+            raise KeyError(key)
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": self.kind, "source": self.source, "target": self.target,
+            "properties": self.properties,
+        }
 
 
 class _EdgeKeys:
@@ -1654,7 +1692,7 @@ def main() -> int:
             if source_tier != tier or not target_tier:
                 continue
             if source_tier == target_tier:
-                payload["edges"].append(edge)
+                payload["edges"].append(edge.as_dict())
             elif edge["kind"] in structural:
                 payload["expands_to"].append({
                     "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
@@ -1662,7 +1700,7 @@ def main() -> int:
                 })
             else:
                 payload["links"].append({
-                    **edge,
+                    **edge.as_dict(),
                     "properties": {**edge["properties"], "target_tier": target_tier},
                 })
         payload["nodes"].sort(key=lambda item: item["id"])
