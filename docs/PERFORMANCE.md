@@ -71,6 +71,8 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `e966f98` | Linux `fs/ext4` incremental store-artifact reuse | 17.17 → 1.96 | — | skipped | 131,635 | 286,007 | not sampled | Matching frontend fingerprint, prune, and enrichment settings reused the existing Kùzu store and skipped the rewrite entirely. |
 | 2026-08-20 | `0fc41c5` | Linux `fs/netfs` streamed core after C path/macro caching | — | — | 2.64 | 13,185 | 24,719 | ~0.36* | 27 files / 10,293 LOC; tokens and proof leaves disabled, `LACHESIS_C_JOBS=1`; graph reopened with matching manifest counts. |
 | 2026-08-20 | `0fc41c5` | Linux `drivers/usb` streamed core after C path/macro caching | — | — | 131.47 | 858,016 | 1,694,180 | ~3.99* | 790 files / 582,731 LOC; tokens and proof leaves disabled, `LACHESIS_C_JOBS=1`; completed and reopened with matching manifest counts under the 300s cap. |
+| 2026-08-20 | working tree | TypeScript fixture typed protobuf tiers | 0.71 | — | — | 2,677 | 4,539 | — | 3.63 MiB of `.pb` tiers + manifest; 3.5% smaller than compact JSON-equivalent. |
+| 2026-08-20 | working tree | Python fixture typed protobuf tiers | 0.19 | — | — | 2,182 | 2,968 | — | 2.40 MiB of `.pb` tiers + manifest; 3.9% smaller than compact JSON-equivalent. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
@@ -95,8 +97,10 @@ The internal additive dataflow cache is a versioned, core-content-hash-keyed pro
 sidecar (`<store>.dataflow.pb`). JSON remains reserved for user-facing output; it is
 not used for this internal cache.
 
-The protobuf migration is now underway for graph shards. A 100k-record local
-microbenchmark showed typed protobuf payloads 12–28% smaller than marshal, but Python
+The protobuf migration now covers graph shards, C tiers, TypeScript tiers, and Python
+tiers. Typed tier records avoid repeating record field names. On the current fixtures,
+the TypeScript and Python tier bundles are 3.5% and 3.9% smaller than compact JSON
+equivalents. A 100k-record local microbenchmark showed typed protobuf payloads 12–28% smaller than marshal, but Python
 protobuf encode/decode was slower (roughly 5–10× encode and 1.3–4.5× decode for the
 sample records). This makes the storage win real, while leaving the hot producer/reader
 loops as candidates for a Rust/C++ implementation once the schema is stable.

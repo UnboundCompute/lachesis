@@ -28,10 +28,10 @@ except ImportError:  # … or imported as a package module.
     from lachesis.frontends.c.macros import parse_macro_definitions
 
 try:
-    from lachesis.core.graph_wire import encode_document
+    from lachesis.core.graph_wire import encode_document, encode_tier
 except ModuleNotFoundError:  # direct script execution from the frontend directory
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from lachesis.core.graph_wire import encode_document
+    from lachesis.core.graph_wire import encode_document, encode_tier
 
 
 CONTRACT_VERSION = 2
@@ -1794,7 +1794,7 @@ def main() -> int:
             len(payload[collection]) for collection in ("edges", "expands_to", "links")
         )
         tier_path = output_dir / f"{tier.lower()}_{name}.pb"
-        tier_path.write_bytes(encode_document(serialized_payload(payload)))
+        tier_path.write_bytes(encode_tier(serialized_payload(payload)))
         del payload
     emitted_node_count = len(graph.nodes)
     graph_edge_count = len(graph.edges)

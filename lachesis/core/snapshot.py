@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Tuple
 
 from .contract import ContractError, FrontendSnapshot
-from .graph_wire import decode_document
+from .graph_wire import decode_document, decode_tier
 from .validation import validate_snapshot
 
 
@@ -40,7 +40,7 @@ def _read_tiers(manifest: dict, output_dir: str) -> Iterator[Tuple[str, dict]]:
         # (Python/TS) is unchanged. marshal only round-trips JSON-shaped values, which
         # every frontend already emits (see snapshot_from_payloads' invariant).
         if tier_path.suffix == ".pb":
-            yield tier_name, decode_document(tier_path.read_bytes())
+            yield tier_name, decode_tier(tier_path.read_bytes())
         elif tier_path.suffix == ".bin":
             # Compatibility for pre-protobuf frontend bundles.
             yield tier_name, marshal.loads(tier_path.read_bytes())

@@ -153,6 +153,32 @@ def decode_overlay(payload: bytes) -> dict[str, Any]:
     }
 
 
+def encode_tier(payload: Mapping[str, Any]) -> bytes:
+    """Encode a frontend tier with typed node/edge records."""
+    message = graph_pb2.TierPayload(
+        tier=str(payload.get("tier") or ""), name=str(payload.get("name") or "")
+    )
+    for node in payload.get("nodes", ()):
+        message.nodes.add().ParseFromString(encode_node(node))
+    for field in ("edges", "expands_to", "links"):
+        for edge in payload.get(field, ()):
+            message.__getattribute__(field).add().ParseFromString(encode_edge(edge))
+    return message.SerializeToString()
+
+
+def decode_tier(payload: bytes) -> dict[str, Any]:
+    message = graph_pb2.TierPayload()
+    message.ParseFromString(payload)
+    return {
+        "tier": message.tier,
+        "name": message.name,
+        "nodes": [decode_node(item.SerializeToString()) for item in message.nodes],
+        "edges": [decode_edge(item.SerializeToString()) for item in message.edges],
+        "expands_to": [decode_edge(item.SerializeToString()) for item in message.expands_to],
+        "links": [decode_edge(item.SerializeToString()) for item in message.links],
+    }
+
+
 def encode_document(payload: Mapping[str, Any], *, version: int = 1) -> bytes:
     message = graph_pb2.Document(format_version=version)
     value = _value(dict(payload))

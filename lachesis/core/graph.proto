@@ -87,3 +87,14 @@ message Document {
   uint32 format_version = 1;
   ObjectValue fields = 2;
 }
+
+// Typed frontend tier payload. Keeping records typed avoids repeating the field
+// names `id`, `kind`, `source`, and `target` for every record in generic Documents.
+message TierPayload {
+  string tier = 1;
+  string name = 2;
+  repeated NodeRecord nodes = 3;
+  repeated EdgeRecord edges = 4;
+  repeated EdgeRecord expands_to = 5;
+  repeated EdgeRecord links = 6;
+}
