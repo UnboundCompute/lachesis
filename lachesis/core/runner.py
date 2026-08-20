@@ -59,20 +59,17 @@ def _stream_bundle_to_shard(
                                      for item in manifest.get("tiers", [])):
             for collection, payload in iter_tier_records(tier_path, raw=True):
                 if collection == "nodes":
-                    message = graph_pb2.NodeRecord()
-                    message.ParseFromString(payload)
                     node = None
                     if keep_node is not None:
                         # The predicate is intentionally applied while the protobuf
                         # record is live.  It lets package-sharded builds discard
                         # imported dependency views without materialising a bundle.
-                        node = decode_node(message.SerializeToString())
+                        node = decode_node(payload)
                         if not keep_node(node):
                             continue
-                    if node is not None:
-                        node_id = node["id"]
-                    else:
-                        node_id = message.id
+                    message = graph_pb2.NodeRecord()
+                    message.ParseFromString(payload)
+                    node_id = node["id"] if node is not None else message.id
                     message.tier = tier_name
                     writer.add_node_payload(message.SerializeToString())
                     retained_node_ids.add(node_id)
