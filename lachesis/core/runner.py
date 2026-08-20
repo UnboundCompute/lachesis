@@ -7,7 +7,27 @@ import tempfile
 from typing import Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
+from .shards import ShardSetWriter
 from .snapshot import load_snapshot
+
+
+def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
+    """Persist a language-neutral cache shard when the caller opts in."""
+    if not root:
+        return
+    directory = os.path.join(root, snapshot.frontend_id)
+    shard_set = ShardSetWriter(directory, frontend_id=snapshot.frontend_id)
+    shard_id = snapshot.manifest.get("source_content_hash", "0")
+    writer = shard_set.start(str(shard_id))
+    try:
+        for node in snapshot.nodes:
+            writer.add_node(node)
+        for edge in snapshot.edges:
+            writer.add_edge(edge)
+        shard_set.complete(str(shard_id), writer)
+    except Exception:
+        writer.close()
+        raise
 
 
 def _in_process_applies(
@@ -48,7 +68,9 @@ def run_frontend(
     roots: Optional[Sequence[str]] = None,
 ) -> FrontendSnapshot:
     if _in_process_applies(frontend, output_dir):
-        return frontend.in_process(source_dir, roots)
+        snapshot = frontend.in_process(source_dir, roots)
+        _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"))
+        return snapshot
     temporary = None
     if output_dir is None:
         temporary = tempfile.TemporaryDirectory(prefix="lachesis-frontend-")
@@ -80,7 +102,9 @@ def run_frontend(
                 f"frontend {frontend.frontend_id} exited {completed.returncode}\n"
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
-        return load_snapshot(output_dir, completed.stdout, completed.stderr)
+        snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)
+        _persist_shard(snapshot, environment.get("LACHESIS_SHARD_ROOT"))
+        return snapshot
     except subprocess.TimeoutExpired as error:
         raise ContractError(
             f"frontend {frontend.frontend_id} exceeded {timeout_seconds}s"
@@ -88,4 +112,3 @@ def run_frontend(
     finally:
         if temporary is not None:
             temporary.cleanup()
-
