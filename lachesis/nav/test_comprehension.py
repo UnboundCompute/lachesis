@@ -47,8 +47,19 @@ class ComprehensionTests(unittest.TestCase):
                  owner_function_id="helper", control_kind="return"),
             node("call_helper", "call", "parseConfig(raw)", "api/account.py", 16,
                  owner_function_id="load_mysql", resolution="exact"),
+            node("arg_raw", "argument", "raw", "api/account.py", 16,
+                 owner_function_id="load_mysql"),
+            node("param_raw", "parameter", "raw", "storage/store.py", 30,
+                 owner_function_id="helper"),
             node("mystery", "call", "plugin.run(raw)", "api/account.py", 17,
                  owner_function_id="load_mysql", resolution="dynamic-or-unresolved"),
+            node("register", "call", "register(table)", "api/account.py", 19,
+                 owner_function_id="load_mysql", resolution="registration"),
+            node("register_arg", "argument", "table", "api/account.py", 19,
+                 owner_function_id="load_mysql"),
+            node("callback_table", "variable", "callbacks", "api/account.py", 20,
+                 owner_function_id="load_mysql"),
+            node("registered_callback", "function", "onConfig", "storage/store.py", 40),
             node("if1", "statement", "if raw", "api/account.py", 18,
                  owner_function_id="load_mysql", control_kind="if"),
             node("diag", "diagnostic", "syntax recovery", "storage/store.py", 2,
@@ -62,9 +73,15 @@ class ComprehensionTests(unittest.TestCase):
             edge("WRITES_TO", "w", "status"),
             edge("READS_FROM", "status", "r"),
             edge("CALLS", "load_mysql", "helper"),
+            edge("ARGUMENT_BINDS_PARAMETER", "arg_raw", "param_raw"),
             edge("INVOKES", "call_helper", "helper"),
+            edge("HAS_ARGUMENT", "register", "register_arg"),
+            edge("REFERS_TO", "register_arg", "callback_table"),
+            edge("MAY_INVOKE", "callback_table", "registered_callback",
+                 dispatch="registration", slot="on_config"),
             edge("CONTAINS_BODY", "load_mysql", "call_helper"),
             edge("CONTAINS_BODY", "load_mysql", "mystery"),
+            edge("CONTAINS_BODY", "load_mysql", "register"),
             edge("CONTAINS_BODY", "load_mysql", "if1"),
             edge("CONTAINS_BODY", "helper", "helper_body"),
         ]
@@ -99,6 +116,14 @@ class ComprehensionTests(unittest.TestCase):
         self.assertEqual(2, answer["counts"]["files"])
         self.assertGreaterEqual(answer["counts"]["unmodeled_frontiers"], 2)
         self.assertIn("does not track per-client reads", answer["interpretation"])
+        original = self.query.unknowns
+        try:
+            self.query.unknowns = lambda **_kwargs: self.fail(
+                "a later coverage page repeated the whole-graph frontier scan",
+            )
+            self.assertEqual(answer["counts"], self.query.coverage_map(offset=1)["counts"])
+        finally:
+            self.query.unknowns = original
 
     def test_field_history_and_type_roles(self):
         history = self.query.field_history("status", "User")
@@ -114,9 +139,20 @@ class ComprehensionTests(unittest.TestCase):
         self.assertNotIn("verdict", compared)
         mysql = next(m for m in compared["members"] if m["name"] == "loadMysqlConfig")
         self.assertEqual(["parseConfig"], mysql["calls"])
+        late_calls = self.query.sibling_compare(
+            "loadMysqlConfig", limit=100, call_offset=1,
+        )
+        late_mysql = next(
+            member for member in late_calls["members"]
+            if member["name"] == "loadMysqlConfig"
+        )
+        self.assertEqual(1, late_mysql["differences"]["calls_unique_page"]["total"])
         boundary = self.query.component_boundary("api", "storage")
-        self.assertEqual(1, boundary["count"])
-        self.assertEqual("api->storage", boundary["crossings"][0]["direction"])
+        self.assertEqual(3, boundary["count"])
+        self.assertEqual({"call", "value"},
+                         {row["category"] for row in boundary["crossings"]})
+        self.assertEqual({"api->storage"},
+                         {row["direction"] for row in boundary["crossings"]})
 
     def test_mcp_dispatch_and_schema(self):
         from . import mcp_server
@@ -153,7 +189,7 @@ class ComprehensionTests(unittest.TestCase):
         self.assertTrue(architecture["communities"])
 
         story = self.query.execution_story("loadMysqlConfig")
-        self.assertEqual(["loadMysqlConfig", "parseConfig"],
+        self.assertEqual(["loadMysqlConfig", "parseConfig", "onConfig"],
                          [step["function"]["name"] for step in story["steps"]])
         self.assertEqual("bounded-forward-call-and-branch-trace", story["algorithm"])
 

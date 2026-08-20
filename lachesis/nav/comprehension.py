@@ -28,6 +28,14 @@ CONTROL_KINDS = frozenset({
     "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH", "SHORT_CIRCUIT_LEFT",
     "SHORT_CIRCUIT_RIGHT", "SWITCH_CASE", "LOOP_TRUE", "EXCEPTION_BRANCH",
 })
+BOUNDARY_VALUE_KINDS = frozenset({
+    "DEFINES", "READS_FROM", "WRITES_TO", "WRITES_PARAMETER_PROPERTY",
+    "VALUE_FLOWS_TO", "ARGUMENT_BINDS_PARAMETER", "BINDS_PARAMETER",
+    "RETURNS_VALUE", "CONTEXT_RETURNS", "POINTS_TO", "ALIASES", "ALIASES_VALUE",
+})
+BOUNDARY_LIFECYCLE_KINDS = frozenset({
+    "ALLOCATES", "CONTEXT_ALLOCATES", "MUTATES", "APPLIES_EFFECT",
+})
 _TEST_FILE = re.compile(
     r"(^|/)(tests?|__tests__)/|(^|/)(test_[^/]+|[^/]+[._](test|spec))\.[^.]+$",
     re.IGNORECASE,
@@ -99,6 +107,7 @@ class Comprehension:
         self.index = store.index
         self._cached_source_root: Path | None | bool = False
         self._cached_source_file_list: tuple[Path, ...] | None = None
+        self._coverage_cache: dict[tuple[int, int], dict] = {}
 
     def _source_root(self) -> Path | None:
         if self._cached_source_root is not False:
@@ -336,7 +345,9 @@ class Comprehension:
             resolved = any(_semantic(e) in {"INVOKES", "MAY_INVOKE"} for e in outgoing)
             props = call.get("properties", {})
             resolution = props.get("resolution")
-            if resolved or resolution in {"exact", "compiler-local", "binding"}:
+            if resolved or resolution in {
+                "exact", "compiler-local", "cross-tu", "binding", "registration",
+            }:
                 continue
             key = ("unresolved-call", call["id"])
             if key not in seen:
@@ -384,38 +395,62 @@ class Comprehension:
     def coverage_map(self, component_depth: int = 1,
                      limit: int = DEFAULT_DETAIL_LIMIT, offset: int = 0) -> dict:
         """Describe graph coverage, not mutable client/session activity."""
-        files = list(self.index.nodes_of_kind("file"))
-        functions = list(self.index.nodes_of_kind(*CALLABLE_KINDS))
-        body_owners = {
-            n.get("properties", {}).get("owner_function_id")
-            for n in self.index.nodes_of_kind("statement", "expression", "call", "construct")
-        }
-        body_owners.discard(None)
-        diagnostics_by_file = Counter(
-            n.get("properties", {}).get("file") for n in self.index.nodes_of_kind("diagnostic")
-        )
-        components = Counter()
-        for node in functions:
-            path = self._relative_path(self.gl.loc(node)[0])
-            components[_component(path, component_depth) or "(unknown)"] += 1
-        unresolved = self.unknowns(limit=1)
-        component_rows = [{"component": name, "functions": count}
-                          for name, count in sorted(components.items())]
-        diagnostic_rows = [{"file": self._relative_path(name), "count": count}
-                           for name, count in sorted(
-                               diagnostics_by_file.items(), key=lambda item: item[0] or "",
-                           ) if name]
+        cache_key = (max(1, component_depth), int(self.store.cone_generation))
+        cached = self._coverage_cache.get(cache_key)
+        if cached is None:
+            files = list(self.index.nodes_of_kind("file"))
+            functions = list(self.index.nodes_of_kind(*CALLABLE_KINDS))
+            body_owners = {
+                n.get("properties", {}).get("owner_function_id")
+                for n in self.index.nodes_of_kind(
+                    "statement", "expression", "call", "construct",
+                )
+            }
+            body_owners.discard(None)
+            diagnostics_by_file = Counter(
+                n.get("properties", {}).get("file")
+                for n in self.index.nodes_of_kind("diagnostic")
+            )
+            components = Counter()
+            for node in functions:
+                path = self._relative_path(self.gl.loc(node)[0])
+                components[_component(path, component_depth) or "(unknown)"] += 1
+            unresolved = self.unknowns(limit=1)
+            component_rows = [{"component": name, "functions": count}
+                              for name, count in sorted(components.items())]
+            diagnostic_rows = [{"file": self._relative_path(name), "count": count}
+                               for name, count in sorted(
+                                   diagnostics_by_file.items(),
+                                   key=lambda item: item[0] or "",
+                               ) if name]
+            cached = {
+                "counts": {
+                    "files": len(files), "functions": len(functions),
+                    "functions_with_body": len(
+                        body_owners & {n["id"] for n in functions}
+                    ),
+                    "functions_without_body": len(
+                        {n["id"] for n in functions} - body_owners
+                    ),
+                    "diagnostics": sum(diagnostics_by_file.values()),
+                    "unmodeled_frontiers": unresolved.get("total", 0),
+                },
+                "components": component_rows,
+                "diagnostics": diagnostic_rows,
+            }
+            # Cone generations advance as lazy enrichment joins new evidence. Keep
+            # enough generations for ordinary page-following without retaining an
+            # unbounded history during a long-lived MCP session.
+            if len(self._coverage_cache) >= 8:
+                self._coverage_cache.clear()
+            self._coverage_cache[cache_key] = cached
+        component_rows = cached["components"]
+        diagnostic_rows = cached["diagnostics"]
         component_page, component_paging = _page(component_rows, offset, limit)
         diagnostic_page, diagnostic_paging = _page(diagnostic_rows, offset, limit)
         return {
             "move": "coverage_map", "basis": "indexed-graph",
-            "counts": {
-                "files": len(files), "functions": len(functions),
-                "functions_with_body": len(body_owners & {n["id"] for n in functions}),
-                "functions_without_body": len({n["id"] for n in functions} - body_owners),
-                "diagnostics": sum(diagnostics_by_file.values()),
-                "unmodeled_frontiers": unresolved.get("total", 0),
-            },
+            "counts": cached["counts"],
             "components": component_page,
             "component_count": len(component_rows),
             "diagnostic_files": diagnostic_page,
@@ -523,13 +558,21 @@ class Comprehension:
             call_page, call_paging = _page(callees, call_offset, limit)
             members.append({**_loc(self.gl, node), "call_count": len(callees),
                             "calls": call_page, "calls_page": call_paging,
+                            "_all_calls": callees,
                             "control": dict(sorted(controls.items()))})
-        all_calls = Counter(c for member in members for c in member["calls"])
+        all_calls = Counter(c for member in members for c in member["_all_calls"])
         for member in members:
+            unique = [c for c in member["_all_calls"] if all_calls[c] == 1]
+            missing = [c for c, count in sorted(all_calls.items())
+                       if count == len(members) - 1 and c not in member["_all_calls"]]
+            unique_page, unique_paging = _page(unique, call_offset, limit)
+            missing_page, missing_paging = _page(missing, call_offset, limit)
+            member.pop("_all_calls")
             member["differences"] = {
-                "calls_unique": [c for c in member["calls"] if all_calls[c] == 1],
-                "calls_missing": [c for c, count in sorted(all_calls.items())
-                                  if count == len(members) - 1 and c not in member["calls"]],
+                "calls_unique": unique_page,
+                "calls_unique_page": unique_paging,
+                "calls_missing": missing_page,
+                "calls_missing_page": missing_paging,
             }
         family_size = len(members)
         page, paging = _page(members, offset, limit)
@@ -617,7 +660,8 @@ class Comprehension:
         rows, seen = [], set()
         boundary_edges = list(self.index.edges_of_kind("CALLS"))
         boundary_edges.extend(self.index.edges_of_kind(
-            "INVOKES", "MAY_INVOKE", "PASSES_CALLBACK", "TYPE_REFERS_TO", "HAS_TYPE"))
+            "INVOKES", "MAY_INVOKE", "PASSES_CALLBACK", "TYPE_REFERS_TO", "HAS_TYPE",
+            *BOUNDARY_VALUE_KINDS, *BOUNDARY_LIFECYCLE_KINDS))
         for edge in boundary_edges:
             left, right = self.gl.nodes.get(edge.get("source")), self.gl.nodes.get(edge.get("target"))
             if not left or not right:
@@ -635,12 +679,22 @@ class Comprehension:
             if not direction:
                 continue
             semantic = _semantic(edge)
-            category = "call" if semantic in CALL_EDGE_KINDS else semantic
+            if semantic in CALL_EDGE_KINDS:
+                category = "call"
+            elif semantic in BOUNDARY_VALUE_KINDS:
+                category = "value"
+            elif semantic in BOUNDARY_LIFECYCLE_KINDS:
+                category = "lifecycle"
+            elif semantic in {"TYPE_REFERS_TO", "HAS_TYPE"}:
+                category = "type"
+            else:
+                category = "callback"
             key = (left["id"], right["id"], category)
             if key in seen:
                 continue
             seen.add(key)
-            rows.append({"direction": direction, "kind": _semantic(edge),
+            rows.append({"direction": direction, "category": category,
+                         "kind": _semantic(edge),
                          "source": _loc(self.gl, left), "target": _loc(self.gl, right),
                          "confidence": edge.get("properties", {}).get("confidence")})
         rows.sort(key=lambda r: (r["direction"], r["kind"], r["source"]["name"],
@@ -864,6 +918,19 @@ class Comprehension:
                     if target and target.get("kind") in CALLABLE_KINDS:
                         dispatch = edge.get("properties", {}).get("dispatch") or kind.lower()
                         callees.append((target, f"indirect:{dispatch}"))
+            # Include the stronger registration/static-table resolution used by the
+            # dedicated tool. Those MAY_INVOKE edges can live on an argument's value
+            # cone rather than on the call site, so reading call-site edges alone
+            # misses precisely the callback paths execution_story promises to follow.
+            resolved_indirect = self.indirect_targets(
+                function["id"], limit=1_000_000_000,
+            )
+            for site in resolved_indirect.get("sites", ()):
+                for row in site.get("targets", ()):
+                    target = self.gl.nodes.get(row.get("node_id"))
+                    if target and target.get("kind") in CALLABLE_KINDS:
+                        dispatch = row.get("dispatch") or row.get("slot") or row.get("via")
+                        callees.append((target, f"indirect:{dispatch or 'resolved'}"))
             deduped = {}
             for callee, call_via in callees:
                 deduped.setdefault(callee["id"], (callee, call_via))
