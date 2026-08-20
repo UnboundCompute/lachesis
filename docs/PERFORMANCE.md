@@ -73,6 +73,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `0fc41c5` | Linux `drivers/usb` streamed core after C path/macro caching | — | — | 131.47 | 858,016 | 1,694,180 | ~3.99* | 790 files / 582,731 LOC; tokens and proof leaves disabled, `LACHESIS_C_JOBS=1`; completed and reopened with matching manifest counts under the 300s cap. |
 | 2026-08-20 | working tree | TypeScript fixture typed protobuf tiers | 0.71 | — | — | 2,677 | 4,539 | — | 3.63 MiB of `.pb` tiers + manifest; 3.5% smaller than compact JSON-equivalent. |
 | 2026-08-20 | working tree | Python fixture typed protobuf tiers | 0.19 | — | — | 2,182 | 2,968 | — | 2.40 MiB of `.pb` tiers + manifest; 3.9% smaller than compact JSON-equivalent. |
+| 2026-08-20 | `8240bd9` | Linux `fs/netfs` C frontend typed protobuf tiers | 2.20 | — | — | 13,185 | 24,719 | ~0.17* | 27 files / 10,293 LOC; tokens/proofs disabled, `LACHESIS_C_JOBS=1`; 15 MiB bundle, direct frontend command, cold output directory. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
