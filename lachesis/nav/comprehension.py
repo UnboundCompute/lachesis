@@ -402,7 +402,9 @@ class Comprehension:
         component_rows = [{"component": name, "functions": count}
                           for name, count in sorted(components.items())]
         diagnostic_rows = [{"file": self._relative_path(name), "count": count}
-                           for name, count in sorted(diagnostics_by_file.items()) if name]
+                           for name, count in sorted(
+                               diagnostics_by_file.items(), key=lambda item: item[0] or "",
+                           ) if name]
         component_page, component_paging = _page(component_rows, offset, limit)
         diagnostic_page, diagnostic_paging = _page(diagnostic_rows, offset, limit)
         return {

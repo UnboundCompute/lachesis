@@ -52,6 +52,7 @@ class ComprehensionTests(unittest.TestCase):
                  owner_function_id="load_mysql", control_kind="if"),
             node("diag", "diagnostic", "syntax recovery", "storage/store.py", 2,
                  category="parse-recovery"),
+            node("diag_global", "diagnostic", "project warning", category="configuration"),
         ]
         edges = [
             edge("DECLARES_MEMBER", "user", "status"),
