@@ -313,7 +313,10 @@ def run_clang(
     )
 
 
-def clang_jobs() -> int:
+LARGE_PROJECT_FILE_LIMIT = 128
+
+
+def clang_jobs(path_count: Optional[int] = None) -> int:
     """How many clang processes this frontend keeps in flight at once.
 
     Deliberately below the core count. Each pass holds one whole ``stdout`` per
@@ -321,7 +324,10 @@ def clang_jobs() -> int:
     real kernel translation unit re-expands its headers into hundreds of MB of JSON
     before the prune below trims it. Concurrency multiplies that peak, so the default
     trades some of the available parallelism for a resident set that does not grow with
-    the machine. ``LACHESIS_C_JOBS`` overrides it, ``1`` restores the serial build.
+    the machine. Large projects use one AST at a time by default: a project with many
+    roots is precisely the workload where two or more expanded kernel/header ASTs can
+    exhaust the runner before the pruning step. ``LACHESIS_C_JOBS`` overrides it, ``1``
+    restores the serial build, and small projects retain the faster parallel default.
     """
     configured = os.environ.get("LACHESIS_C_JOBS")
     if configured:
@@ -329,6 +335,8 @@ def clang_jobs() -> int:
             return max(1, int(configured))
         except ValueError:
             pass
+    if path_count is not None and path_count >= LARGE_PROJECT_FILE_LIMIT:
+        return 1
     return max(1, min(4, (os.cpu_count() or 1) // 2))
 
 
@@ -385,7 +393,7 @@ def run_clang_over(
     """
     paths = list(paths)
     flags = file_flags_of or {}
-    jobs = jobs or clang_jobs()
+    jobs = jobs or clang_jobs(len(paths))
     if jobs <= 1 or len(paths) <= 1:
         for path in paths:
             yield path, run_clang(source_dir, path, *arguments,
