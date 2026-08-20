@@ -8,7 +8,7 @@ from typing import Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from .shards import ShardSetWriter
-from .snapshot import load_snapshot
+from .snapshot import iter_snapshot_records, load_manifest, load_snapshot
 
 
 def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
@@ -28,6 +28,38 @@ def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
     except Exception:
         writer.close()
         raise
+
+
+def _stream_bundle_to_shard(
+    output_dir: str, root: str, stdout: str, stderr: str,
+) -> FrontendSnapshot:
+    """Persist a protobuf bundle record-by-record, without loading its tier arrays."""
+    manifest = load_manifest(output_dir)
+    frontend_id = manifest.get("frontend_id") or manifest.get("generator")
+    directory = os.path.join(root, frontend_id)
+    shard_set = ShardSetWriter(directory, frontend_id=frontend_id)
+    shard_id = manifest.get("source_content_hash", "0")
+    writer = shard_set.start(str(shard_id))
+    node_count = edge_count = 0
+    try:
+        for collection, record in iter_snapshot_records(output_dir, manifest):
+            if collection == "nodes":
+                writer.add_node(record); node_count += 1
+            else:
+                writer.add_edge(record); edge_count += 1
+        shard_set.complete(str(shard_id), writer)
+    except Exception:
+        writer.close()
+        raise
+    snapshot = FrontendSnapshot(
+        frontend_id=frontend_id,
+        contract_version=manifest.get("frontend_contract_version", manifest.get("version")),
+        languages=tuple(manifest.get("languages", ())),
+        capabilities=dict(manifest.get("capabilities", {})),
+        manifest=manifest, nodes=[], edges=[], stdout=stdout, stderr=stderr,
+        released=True, _released_node_count=node_count, _released_edge_count=edge_count,
+    )
+    return snapshot
 
 
 def _in_process_applies(
@@ -102,8 +134,13 @@ def run_frontend(
                 f"frontend {frontend.frontend_id} exited {completed.returncode}\n"
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
-        snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)
-        _persist_shard(snapshot, environment.get("LACHESIS_SHARD_ROOT"))
+        shard_root = environment.get("LACHESIS_SHARD_ROOT")
+        if shard_root:
+            snapshot = _stream_bundle_to_shard(
+                output_dir, shard_root, completed.stdout, completed.stderr,
+            )
+        else:
+            snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)
         return snapshot
     except subprocess.TimeoutExpired as error:
         raise ContractError(

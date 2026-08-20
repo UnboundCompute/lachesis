@@ -205,6 +205,57 @@ def write_tier(path: str | Path, payload: Mapping[str, Any]) -> None:
                 handle.write(_field_bytes(tag, encode_edge(edge)))
 
 
+def _take_varint(buffer: bytearray):
+    value = 0
+    shift = 0
+    for index, byte in enumerate(buffer):
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, index + 1
+        shift += 7
+        if shift > 63:
+            raise ValueError("protobuf varint is too long")
+    return None
+
+
+def iter_tier_records(path: str | Path):
+    """Yield typed tier records while reading a tier file in bounded chunks."""
+    buffer = bytearray()
+    with open(path, "rb") as handle:
+        eof = False
+        while True:
+            if not eof:
+                chunk = handle.read(1024 * 1024)
+                if chunk:
+                    buffer.extend(chunk)
+                else:
+                    eof = True
+            while buffer:
+                key = _take_varint(buffer)
+                if key is None:
+                    break
+                wire_key, key_size = key
+                number = wire_key >> 3
+                length = _take_varint(buffer[key_size:])
+                if length is None:
+                    break
+                size, length_size = length
+                start = key_size + length_size
+                end = start + size
+                if len(buffer) < end:
+                    break
+                payload = bytes(buffer[start:end])
+                del buffer[:end]
+                if number == 3:
+                    yield "nodes", decode_node(payload)
+                elif number in (4, 5, 6):
+                    yield {4: "edges", 5: "expands_to", 6: "links"}[number], decode_edge(payload)
+            if eof:
+                if buffer:
+                    raise ValueError(f"truncated protobuf tier: {path}")
+                return
+
+
 def encode_document(payload: Mapping[str, Any], *, version: int = 1) -> bytes:
     message = graph_pb2.Document(format_version=version)
     value = _value(dict(payload))

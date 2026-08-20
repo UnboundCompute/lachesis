@@ -77,6 +77,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `8240bd9` | Linux `drivers/usb` full CLI + typed protobuf tiers | >195* | — | — | — | — | ~4.3* | 790 files / 582,731 LOC; pass 1 remained in C frontend serialization and was stopped before publication under the 240s safety cap. This is a regression boundary versus the prior 131.47s streamed-core record; do not treat it as a valid graph result. |
 | 2026-08-20 | working tree | Linux `drivers/usb` direct C pass 1, incremental typed protobuf tiers | 101.46 | — | — | 858,016 | 1,694,180 | ~3.09* | 790 files / 582,731 LOC; tokens/proofs disabled, `LACHESIS_C_JOBS=1`; cold direct frontend output completed and was cleaned after measurement. |
 | 2026-08-20 | `fe20eb8` | Linux `fs/netfs` direct CLI streamed core, typed protobuf tiers | 2.00 | — | 8.34 | 13,185 | 24,719 | ~0.54* | 27 files / 10,293 LOC; end-to-end 10.34s / 550 MiB max RSS, tokens/proofs disabled, `LACHESIS_C_JOBS=1`; pass 2 is total minus the direct frontend measurement and includes shard/Kùzu publication. |
+| 2026-08-20 | working tree | Linux `fs/netfs` CLI with bundle-to-shard streaming | 2.00 | — | 8.83 | 13,185 | 24,719 | ~0.38* | Cold output directory; end-to-end 10.83s / 377 MiB max RSS. Frontend protobuf tiers are parsed in bounded chunks and persisted directly to shards, avoiding a second full snapshot copy. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be

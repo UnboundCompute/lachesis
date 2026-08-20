@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Tuple
 
 from .contract import ContractError, FrontendSnapshot
-from .graph_wire import decode_document, decode_tier
+from .graph_wire import decode_document, decode_tier, iter_tier_records
 from .validation import validate_snapshot
 
 
@@ -110,6 +110,30 @@ def load_snapshot(
     _header(manifest)
     nodes, edges = _merge_tiers(_read_tiers(manifest, output_dir))
     return _snapshot(manifest, nodes, edges, stdout, stderr)
+
+
+def load_manifest(output_dir: str) -> dict:
+    """Read and validate only a frontend's protobuf header."""
+    path = Path(output_dir) / "manifest.pb"
+    if not path.is_file():
+        raise ContractError(f"frontend did not emit {path}")
+    manifest = decode_document(path.read_bytes())
+    _header(manifest)
+    return manifest
+
+
+def iter_snapshot_records(output_dir: str, manifest: dict):
+    """Stream a protobuf frontend bundle without constructing a whole snapshot."""
+    for tier_name, tier_path in _tier_files(manifest, output_dir):
+        if tier_path.suffix != ".pb" or not tier_path.is_file():
+            raise ContractError(f"missing protobuf tier file: {tier_path}")
+        for collection, record in iter_tier_records(tier_path):
+            if collection == "nodes":
+                record["tier"] = tier_name
+            else:
+                record["source_tier"] = tier_name
+                record["relationship_class"] = collection
+            yield collection, record
 
 
 def snapshot_from_payloads(
