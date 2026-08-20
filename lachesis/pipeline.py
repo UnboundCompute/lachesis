@@ -249,6 +249,16 @@ def _release_payloads(snapshots: Sequence[FrontendSnapshot]) -> None:
         snapshot.release()
 
 
+def _snapshot_graphs_releasing(
+    snapshots: Sequence[FrontendSnapshot],
+) -> Iterable[CodeGraph]:
+    """Convert one frontend payload, then release its duplicate immediately."""
+    for snapshot in snapshots:
+        graph = snapshot_graph(snapshot)
+        snapshot.release()
+        yield graph
+
+
 def run_project(
     source_dir: str,
     output_root: Optional[str] = None,
@@ -289,8 +299,7 @@ def run_project(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
-    _release_payloads(snapshots)
+    graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
     return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots
 
 
@@ -434,8 +443,7 @@ def run_project_incremental(
             f"no registered frontend supports files below {source_dir}; "
             f"supported extensions: {', '.join(supported)}"
         )
-    graph = combine_graphs(snapshot_graph(snapshot) for snapshot in snapshots)
-    _release_payloads(snapshots)
+    graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
     result = _enrich_graph(graph, snapshots) if enrich else graph
     _write_manifest(manifest_path, manifest)
     return result, snapshots
