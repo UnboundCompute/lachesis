@@ -38,6 +38,7 @@ or source revisions. Record those changes alongside the result.
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | 2026-08-20 | `d841e61` | Linux `net` | 191* | — | — | 1,833,812 | 3,507,808 | 4.34* | Direct C frontend; full bundle validated. |
 | 2026-08-20 | `d841e61` | Linux `fs` | >421* | — | — | — | — | >4.77* | Safety-stopped before completion; next scale boundary. |
+| 2026-08-20 | `ad44b90` | Linux `net` CLI + `--enrich` | >160* | — | — | — | — | >5.30* | Frontend child exceeded safety cap before composition; pass 2 not measured. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
@@ -46,6 +47,11 @@ replaced by a fresh JSON record before using it as a regression baseline.
 The `fs` result is intentionally retained as a failure boundary. A large-codebase
 optimization must move that row from “stopped” to a validated node/edge count; a
 smaller successful subsystem is not considered a substitute.
+
+The CLI/enrichment row is also a boundary, not a timing result: the frontend process
+must finish before composition and enrichment can begin. It is kept to prevent a
+misleading claim that pass 2 has been optimized when pass 1 has not yet completed on
+the larger end-to-end path.
 
 ## Regression rules
 
