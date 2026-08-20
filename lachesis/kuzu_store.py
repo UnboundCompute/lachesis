@@ -677,12 +677,12 @@ def write_kuzu_graph(
             "Create a venv (e.g. `python3.11 -m venv .venv-kuzu && "
             ".venv-kuzu/bin/pip install kuzu`) and run there."
         )
-    db_dir = os.path.abspath(db_dir)
-    if os.path.exists(db_dir):
-        if not overwrite:
-            raise FileExistsError(db_dir)
-        shutil.rmtree(db_dir) if os.path.isdir(db_dir) else os.remove(db_dir)
-    os.makedirs(db_dir, exist_ok=True)
+    target_db_dir = os.path.abspath(db_dir)
+    if os.path.exists(target_db_dir) and not overwrite:
+        raise FileExistsError(target_db_dir)
+    # Publish only after every table and the manifest are complete. A killed large
+    # build must never leave a path that looks like a valid but partial store.
+    db_dir = tempfile.mkdtemp(prefix=".lachesis-stream-", dir=os.path.dirname(target_db_dir))
 
     nodes = _kept_nodes(graph.get("nodes", []), prune=prune,
                         drop_diagnostics=drop_diagnostics, drop_tests=drop_tests)
@@ -856,7 +856,10 @@ def write_kuzu_graph(
     with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
-    return db_dir
+    if os.path.exists(target_db_dir):
+        shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
+    os.replace(db_dir, target_db_dir)
+    return target_db_dir
 
 
 # -- node/edge unit key (§5 incremental) --------------------------------------
