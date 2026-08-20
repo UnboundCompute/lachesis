@@ -140,10 +140,22 @@ The store is columnar, which is what lets a graph with well over a million nodes
 
 Lossless `--prune` drops pure-lexical nodes (source is read from files by offset, not stored twice), roughly halving the store. The on-disk layout and the compression work live in [`docs/KUZU_STORE_SPEC.md`](./docs/KUZU_STORE_SPEC.md) and [`docs/STORE_COMPRESSION_SPEC.md`](./docs/STORE_COMPRESSION_SPEC.md).
 
-For reproducible large-codebase measurements, use the direct-package benchmark
- harness in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). It records frontend build,
- enrichment, Kùzu materialization, node/edge counts, and peak memory in JSON so an
- optimization can be checked for both speed and graph completeness.
+For reproducible large-codebase measurements, use the direct-package commands and
+record the results in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The ledger tracks
+frontend build, enrichment, Kùzu materialization, node/edge counts, and peak memory so
+an optimization can be checked for both speed and graph completeness.
+
+The main engine-only command is:
+
+```bash
+LACHESIS_C_JOBS=1 LACHESIS_EMIT_TOKENS=0 LACHESIS_EMIT_PROOFS=0 \
+  python3.11 -m lachesis.frontends.c.build_graph \
+  /path/to/large-c-tree /tmp/lachesis-frontends
+```
+
+Use a clean output directory and monitor the process on very large trees. The command
+builds the complete C graph directly; the token/proof switches remove only lexical
+facts that `--prune` discards later.
 
 ---
 

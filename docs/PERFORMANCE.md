@@ -37,10 +37,15 @@ or source revisions. Record those changes alongside the result.
 | Date | Revision | Workload | Build s | Enrichment s | Kùzu s | Nodes | Edges | Peak GiB | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | 2026-08-20 | `d841e61` | Linux `net` | 191* | — | — | 1,833,812 | 3,507,808 | 4.34* | Direct C frontend; full bundle validated. |
+| 2026-08-20 | `d841e61` | Linux `fs` | >421* | — | — | — | — | >4.77* | Safety-stopped before completion; next scale boundary. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
 replaced by a fresh JSON record before using it as a regression baseline.
+
+The `fs` result is intentionally retained as a failure boundary. A large-codebase
+optimization must move that row from “stopped” to a validated node/edge count; a
+smaller successful subsystem is not considered a substitute.
 
 ## Regression rules
 
