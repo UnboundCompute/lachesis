@@ -91,6 +91,38 @@ def _EDGE_SORT(edge: dict) -> tuple:
             encode_document(edge.get("properties") or {}))
 
 
+def _sort_materialized_edges(edges: list[dict]) -> None:
+    """Sort materialized edges without encoding properties for unique triples.
+
+    The canonical order includes encoded properties only to make duplicate
+    ``(kind, source, target)`` triples deterministic.  On large graphs almost every
+    triple is unique, so putting the protobuf encoding in the primary sort key pays
+    for every edge for a tie-break that almost never runs.  Sort by the triple first,
+    then sort only collision groups by the same property key.
+    """
+    edges.sort(key=lambda edge: (
+        edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
+    ))
+    start = 0
+    while start < len(edges):
+        first = edges[start]
+        triple = (first.get("kind") or "", first.get("source") or "",
+                  first.get("target") or "")
+        end = start + 1
+        while end < len(edges):
+            edge = edges[end]
+            if (edge.get("kind") or "", edge.get("source") or "",
+                    edge.get("target") or "") != triple:
+                break
+            end += 1
+        if end - start > 1:
+            edges[start:end] = sorted(
+                edges[start:end],
+                key=lambda edge: encode_document(edge.get("properties") or {}),
+            )
+        start = end
+
+
 def _overlay_edge_key(edge: dict) -> str:
     from lachesis.nav.overlay import edge_key
     return edge_key(edge)
@@ -292,8 +324,7 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
             if (keep is None or
                 (edge.get("source") in resident and edge.get("target") in resident))
         )
-    edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
-                              encode_document(e["properties"])))
+    _sort_materialized_edges(edges)
     nodes.sort(key=lambda n: n["id"])
     return {"nodes": nodes, "edges": edges}
 
