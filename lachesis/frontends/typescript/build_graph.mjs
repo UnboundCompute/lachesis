@@ -3292,13 +3292,31 @@ function encodeEdge(edge) {
   if (edge.relationship_class) fields.push(lengthDelimited(6, Buffer.from(edge.relationship_class)));
   return Buffer.concat(fields);
 }
-function encodeTier(tier) {
-  const fields = [lengthDelimited(1, Buffer.from(tier.tier || "")), lengthDelimited(2, Buffer.from(tier.name || ""))];
-  for (const node of tier.nodes || []) fields.push(lengthDelimited(3, encodeNode(node)));
+function writeTier(filePath, tier) {
+  // Do not construct one outer Buffer for the whole tier.  The node/edge arrays
+  // are already retained for cross-reference resolution, but the old Buffer.concat
+  // added another full tier-sized copy at the exact point a large TypeScript bundle
+  // was being flushed.  Batch framed records into small writes instead.
+  const fd = fs.openSync(filePath, "w");
+  const pending = [];
+  let pendingBytes = 0;
+  const emit = (field) => {
+    pending.push(field);
+    pendingBytes += field.length;
+    if (pendingBytes >= 1024 * 1024) {
+      fs.writeSync(fd, Buffer.concat(pending, pendingBytes));
+      pending.length = 0;
+      pendingBytes = 0;
+    }
+  };
+  emit(lengthDelimited(1, Buffer.from(tier.tier || "")));
+  emit(lengthDelimited(2, Buffer.from(tier.name || "")));
+  for (const node of tier.nodes || []) emit(lengthDelimited(3, encodeNode(node)));
   for (const [tag, name] of [[4, "edges"], [5, "expands_to"], [6, "links"]]) {
-    for (const edge of tier[name] || []) fields.push(lengthDelimited(tag, encodeEdge(edge)));
+    for (const edge of tier[name] || []) emit(lengthDelimited(tag, encodeEdge(edge)));
   }
-  return Buffer.concat(fields);
+  if (pendingBytes) fs.writeSync(fd, Buffer.concat(pending, pendingBytes));
+  fs.closeSync(fd);
 }
 function encodeDocument(value) {
   const encodedObject = encodeValue(value);
@@ -3311,7 +3329,7 @@ function writeProto(filePath, value) { fs.writeFileSync(filePath, encodeDocument
 
 fs.mkdirSync(outputDir, { recursive: true });
 for (const tier of TIER_ORDER) {
-  fs.writeFileSync(path.join(outputDir, `${tier.toLowerCase()}_${TIER_NAMES[tier]}.pb`), encodeTier(tiers[tier]));
+  writeTier(path.join(outputDir, `${tier.toLowerCase()}_${TIER_NAMES[tier]}.pb`), tiers[tier]);
 }
 writeProto(path.join(outputDir, "manifest.pb"), manifest);
 
