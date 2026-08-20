@@ -232,6 +232,14 @@ about 3.6 MiB, but the whole 1,738-file ``linux/net`` run rose from 3,442,147,32
 3,761,340,416 bytes peak RSS (wall time stayed near 219s). The change was reverted;
 the whole-tree result, not the small-subsystem result, is the acceptance gate.
 
+### Rejected early C scratch-index release
+
+Releasing the declaration maps, source caches, and spilled AST directory immediately
+after their apparent last pass reduced the 254-file ``net/netfilter`` sample to about
+465 MiB RSS, but the complete 1,738-file ``linux/net`` run rose to 3,800,219,648 bytes
+(from the 3,442,147,328-byte baseline). It was reverted; allocator/page-cache effects
+make the small-subsystem result non-predictive at whole-tree scale.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
