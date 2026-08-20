@@ -82,6 +82,7 @@ Once a graph is built, these are the moves, from the command line or as MCP tool
 | Where does untrusted input actually reach a dangerous sink? | `taint`, source→sink witnesses folded from the Atropos catalog onto this graph's own nodes |
 | Which safety-obligation sites should I inspect first? | `candidates`, ranked and exhaustive over bound facts across the whole sink taxonomy, with no safety verdict |
 | The full evidence for one site, or coverage across every family | `candidate_detail` (the neutral evidence capsule), `candidate_census` (constructor metadata, exhaustive counts, and the analysis frontier) |
+| Which code implements a behavior when I do not know its symbol name? | `concept_search` (optional local model, installed and downloaded separately) |
 
 Every answer carries a confidence and an origin. An `exact` edge is resolved; a `conservative` one is a deliberate over-approximation the tool tells you about rather than hiding. You read the results as evidence, not as verdicts, which is the honest way to reason about a large codebase you didn't write.
 
@@ -153,6 +154,20 @@ npm install                             # the TypeScript compiler the TS fronten
 ```
 
 Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm install` step vendors the TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node must be on your PATH for the TS frontend; C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
+
+Semantic `concept_search` is deliberately separate from the core install. Neither its
+FastEmbed runtime nor its model weights ship in the Lachesis wheel, and a search never
+downloads them implicitly. Opt in and download the local model explicitly:
+
+```bash
+pip install -e ".[concept-search]"       # optional ONNX embedding runtime
+lachesis concept-model download          # model weights in the user cache
+lachesis concept-model status            # inspect without downloading
+```
+
+The default is the small local `BAAI/bge-small-en-v1.5` model. Graph embeddings are
+cached separately by graph fingerprint and model ID. Set `LACHESIS_CONCEPT_CACHE` to
+choose where both the model and those derived indexes live.
 
 ---
 

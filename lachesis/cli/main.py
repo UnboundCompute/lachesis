@@ -253,6 +253,35 @@ def command_doctor(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------------ concept model
+
+def command_concept_model(args: argparse.Namespace) -> int:
+    """Inspect or explicitly download the optional local embedding model."""
+    import json
+    from lachesis.nav.concept import download_model, model_status
+
+    if args.model_action == "download":
+        try:
+            result = download_model(args.model)
+        except RuntimeError as error:
+            _stderr(f"lachesis: {error}")
+            return EXIT_ENVIRONMENT
+    else:
+        result = model_status(args.model)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        _stderr(f"concept runtime: {result['runtime']}")
+        _stderr(f"concept model:   {result['model']} "
+                f"({'ready' if result['model_ready'] else 'not downloaded'})")
+        _stderr(f"model cache:     {result['cache']}")
+        if result["runtime"] != "installed":
+            _stderr(f"install runtime: {result['install']}")
+        if not result["model_ready"]:
+            _stderr(f"download model:  {result['download']}")
+    return EXIT_OK
+
+
 # ------------------------------------------------------------------------ parsing
 
 def _add_source_flags(parser: argparse.ArgumentParser) -> None:
@@ -322,6 +351,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("path", nargs="?", default=".",
                         help="directory to report on (default: the current one)")
     doctor.set_defaults(handler=command_doctor)
+
+    concept = subcommands.add_parser(
+        "concept-model", help="manage the optional local concept-search model")
+    concept_actions = concept.add_subparsers(dest="model_action", metavar="<action>")
+    for action in ("status", "download"):
+        action_parser = concept_actions.add_parser(action)
+        action_parser.add_argument("--model", default="BAAI/bge-small-en-v1.5")
+        action_parser.add_argument("--json", action="store_true")
+    concept.set_defaults(handler=command_concept_model, model_action="status",
+                         model="BAAI/bge-small-en-v1.5", json=False)
 
     # The engine's own programs, one word in. Their arguments are passed through
     # untouched, which is why these take REMAINDER rather than a parsed shape: they

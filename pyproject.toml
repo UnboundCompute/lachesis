@@ -41,6 +41,9 @@ dependencies = ["kuzu>=0.11", "pyarrow>=17"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Runtime only. Model weights are fetched separately by `lachesis concept-model
+# download`; neither FastEmbed nor the model is part of the core wheel.
+concept-search = ["fastembed>=0.8,<0.9"]
 
 [project.scripts]
 # The product surface. Everything below it is the engine, kept because a

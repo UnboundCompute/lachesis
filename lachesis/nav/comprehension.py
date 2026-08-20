@@ -738,15 +738,18 @@ class Comprehension:
                 "truncated": len(references) >= max(1, limit)}
 
     def context_pack(self, question: str, max_symbols: int = 6,
-                     max_neighbors: int = 30) -> dict:
+                     max_neighbors: int = 30, semantic_hits=None,
+                     semantic_status: str | None = None) -> dict:
         """Compose a minimal factual neighborhood around question-relevant symbols."""
         query_tokens = set(camel_tokens(question))
         query_tokens.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]+", question.casefold()))
         stop = {"a", "an", "and", "are", "does", "for", "from", "how", "in", "is",
                 "of", "the", "this", "to", "what", "where", "which", "why", "with"}
         query_tokens -= stop
-        scored = []
-        for entry in self.store.entries:
+        score_by_id = {}
+        entries = self.store.entries
+        entry_by_id = {entry["node_id"]: entry for entry in entries}
+        for entry in entries:
             if entry.get("granularity") not in ("function", "method", "type"):
                 continue
             name_tokens = set(entry.get("tokens") or camel_tokens(entry.get("name", "")))
@@ -755,7 +758,18 @@ class Comprehension:
                 continue
             exact = entry.get("name", "").casefold() in question.casefold()
             score = len(overlap) * 10 + (20 if exact else 0) + min(entry.get("degree", 0), 10)
-            scored.append((score, entry))
+            score_by_id[entry["node_id"]] = (float(score), entry)
+        for hit in semantic_hits or ():
+            node = self.gl.nodes.get(hit.get("node_id"))
+            if not node or node.get("kind") not in set(CALLABLE_KINDS) | TYPE_KINDS:
+                continue
+            entry = entry_by_id.get(node["id"])
+            if not entry:
+                continue
+            semantic_score = max(0.0, float(hit.get("score", 0.0))) * 100.0
+            prior = score_by_id.get(node["id"], (0.0, entry))[0]
+            score_by_id[node["id"]] = (prior + semantic_score, entry)
+        scored = list(score_by_id.values())
         scored.sort(key=lambda item: (-item[0], item[1].get("file") or "",
                                       item[1].get("line") or 0))
         selected = scored[:max(1, max_symbols)]
@@ -763,7 +777,8 @@ class Comprehension:
         if not seeds:
             return {"move": "context_pack", "question": question,
                     "status": "no-identifier-match", "selection_basis": "identifier-tokens",
-                    "semantic_search": "unavailable: configure concept_search embeddings",
+                    "semantic_search": semantic_status or
+                                       "unavailable: configure concept_search embeddings",
                     "symbols": [], "relationships": [], "conditions": [], "unknowns": []}
 
         included = {entry["node_id"] for entry in seeds}
@@ -812,8 +827,10 @@ class Comprehension:
                    if node_id in self.gl.nodes]
         symbols.sort(key=lambda row: (row.get("file") or "", row.get("line") or 0))
         return {"move": "context_pack", "question": question, "status": "complete",
-                "selection_basis": "identifier-token-relevance",
-                "semantic_search": "unavailable: configure concept_search embeddings",
+                "selection_basis": ("semantic-plus-identifier" if semantic_hits
+                                    else "identifier-token-relevance"),
+                "semantic_search": semantic_status or
+                                   "unavailable: configure concept_search embeddings",
                 "seeds": [{**_loc(self.gl, self.gl.nodes[entry["node_id"]]),
                            "score": score} for score, entry in selected],
                 "symbols": symbols, "relationships": relationships,

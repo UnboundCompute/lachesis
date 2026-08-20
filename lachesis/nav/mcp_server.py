@@ -44,6 +44,7 @@ from lachesis.nav.file_graph import build_file_graph, _find_file_node
 from lachesis.nav import render as render_mod
 from lachesis.nav import skeleton as skeleton_mod
 from lachesis.nav.comprehension import Comprehension
+from lachesis.nav.concept import ConceptSearch, DEFAULT_MODEL
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
@@ -112,7 +113,7 @@ TOOL_ORDER = (
     "type_explain", "component_boundary", "indirect_targets",
     "architecture_map", "execution_story",
     "change_context", "tests_for", "spec_links",
-    "context_pack",
+    "concept_search", "context_pack",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
@@ -209,6 +210,9 @@ class _Ctx:
     @property
     def comprehension(self):
         return self._analysis("comprehension", lambda: Comprehension(self.store))
+
+    def concepts(self, model=DEFAULT_MODEL):
+        return self._analysis(f"concept:{model}", lambda: ConceptSearch(self.store, model))
 
     @property
     def candidate_bundle(self):
@@ -421,6 +425,15 @@ TOOLS = [
          "max_symbols": {"type": "integer", "default": 6},
          "max_neighbors": {"type": "integer", "default": 30}},
          "required": ["question"]}},
+    {"name": "concept_search",
+     "description": "Search code by behavior rather than spelling using an optional local "
+                    "embedding model. Search is offline-only and never downloads implicitly; "
+                    "install the concept-search extra and run `lachesis concept-model download`.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string"}, "limit": {"type": "integer", "default": 20},
+         "min_score": {"type": "number", "default": 0.0},
+         "model": {"type": "string", "default": "BAAI/bge-small-en-v1.5"}},
+         "required": ["query"]}},
     {"name": "guards_top",
      "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
                     "name knowledge needed — a security-hunting entry point (for the spine of an "
@@ -731,9 +744,20 @@ def call_tool(name, args, format=None):
             args["symbol"], limit=int(args.get("limit", 50)))
         return _emit(name, result, fmt, offset, limit)
     if name == "context_pack":
+        semantic = c.concepts(DEFAULT_MODEL).search(
+            args["question"], limit=max(6, int(args.get("max_symbols", 6)) * 3))
+        semantic_hits = semantic.get("results", []) if "error" not in semantic else []
+        semantic_status = (f"ready:{semantic.get('model')}" if semantic_hits
+                           else semantic.get("error", "no-semantic-matches"))
         result = c.comprehension.context_pack(
             args["question"], max_symbols=int(args.get("max_symbols", 6)),
-            max_neighbors=int(args.get("max_neighbors", 30)))
+            max_neighbors=int(args.get("max_neighbors", 30)),
+            semantic_hits=semantic_hits, semantic_status=semantic_status)
+        return _emit(name, result, fmt, offset, limit)
+    if name == "concept_search":
+        result = c.concepts(args.get("model", DEFAULT_MODEL)).search(
+            args["query"], limit=int(args.get("limit", 20)),
+            min_score=float(args.get("min_score", 0.0)))
         return _emit(name, result, fmt, offset, limit)
 
     if name == "guards_top":

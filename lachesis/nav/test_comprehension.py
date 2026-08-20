@@ -17,6 +17,7 @@ def node(node_id, kind, label, file=None, line=None, **properties):
 
 
 def edge(kind, source, target, **properties):
+    properties.setdefault("confidence", "exact")
     return {"kind": kind, "source": source, "target": target,
             "properties": properties}
 
@@ -137,6 +138,28 @@ class ComprehensionTests(unittest.TestCase):
         self.assertEqual(["loadMysqlConfig", "parseConfig"],
                          [step["function"]["name"] for step in story["steps"]])
         self.assertEqual("bounded-forward-call-and-branch-trace", story["algorithm"])
+
+    def test_comprehension_answers_match_the_disk_store(self):
+        from lachesis.kuzu_store import write_kuzu_graph
+        from ._navharness import norm
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "graph.kuzu")
+            write_kuzu_graph(self.store.graph, [], path, prune=False,
+                             elide_constants=False)
+            disk = Comprehension(GraphStore.load(path))
+            calls = (
+                lambda q: q.unknowns("loadMysqlConfig"),
+                lambda q: q.coverage_map(),
+                lambda q: q.field_history("status"),
+                lambda q: q.sibling_compare("loadMysqlConfig"),
+                lambda q: q.type_explain("User"),
+                lambda q: q.component_boundary("api", "storage"),
+                lambda q: q.indirect_targets("loadMysqlConfig"),
+                lambda q: q.architecture_map(),
+                lambda q: q.execution_story("loadMysqlConfig"),
+            )
+            for call in calls:
+                self.assertEqual(norm(call(self.query)), norm(call(disk)))
 
     def test_compact_render_strips_nested_ids_and_paths(self):
         from .render import render
