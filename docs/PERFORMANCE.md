@@ -97,6 +97,11 @@ source-to-core run completed in 618.03s; the 64.98s shard-persistence and 150.66
 Kùzu-materialization figures are warm/component measurements and must not be presented
 as cold-start user experience.
 
+The C frontend now defaults to one Clang AST at a time for trees with at least 128
+source roots, preventing multiple expanded-header JSON trees from multiplying peak
+RSS. `LACHESIS_C_JOBS` remains an explicit override; no large-tree timing claim is
+attached to this guard until a complete cold run publishes matching graph counts.
+
 The CLI/enrichment row is also a boundary, not a timing result: the frontend process
 must finish before composition and enrichment can begin. It is kept to prevent a
 misleading claim that pass 2 has been optimized when pass 1 has not yet completed on
