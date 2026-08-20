@@ -42,9 +42,9 @@ def _annotate(role_of, node_id, role, subtype=None, confidence="high", witnesses
     })
 
 
-def classify_sinks(graph: dict) -> dict[str, dict]:
+def classify_sinks(graph: dict, index: GraphIndex | None = None) -> dict[str, dict]:
     """Return canonical call-site sinks indexed by call node ID."""
-    index = GraphIndex(graph, compact=True)
+    index = index or GraphIndex(graph, compact=True)
     result = {}
     for sink in index.nodes_of_kind("sink"):
         properties = sink.get("properties", {})
@@ -60,11 +60,13 @@ def classify_sinks(graph: dict) -> dict[str, dict]:
     return result
 
 
-def derive_roles(graph: dict) -> tuple[dict[str, list[dict]], dict[str, dict]]:
+def derive_roles(
+    graph: dict, index: GraphIndex | None = None,
+) -> tuple[dict[str, list[dict]], dict[str, dict]]:
     """Derive presentation roles exclusively from canonical graph facts."""
-    index = GraphIndex(graph, compact=True)
+    index = index or GraphIndex(graph, compact=True)
     role_of = defaultdict(list)
-    sinks = classify_sinks(graph)
+    sinks = classify_sinks(graph, index)
 
     for source in index.nodes_of_kind("source"):
         properties = source.get("properties", {})
@@ -117,13 +119,15 @@ def derive_roles(graph: dict) -> tuple[dict[str, list[dict]], dict[str, dict]]:
     return role_of, sinks
 
 
-def detect_guards(graph: dict, sinks: dict[str, dict]) -> list[dict]:
+def detect_guards(
+    graph: dict, sinks: dict[str, dict], index: GraphIndex | None = None,
+) -> list[dict]:
     """Summarize guard signals for functions containing canonical sink calls.
 
     Accessor recognition is deliberately a policy over compiler-resolved call
     metadata. It never scans or tokenizes source text.
     """
-    index = GraphIndex(graph, compact=True)
+    index = index or GraphIndex(graph, compact=True)
     calls_by_function = defaultdict(list)
     for call in index.nodes_of_kind("call", "construct"):
         owner = call.get("properties", {}).get("owner_function_id")

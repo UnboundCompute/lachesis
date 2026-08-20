@@ -537,8 +537,8 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
     tier_of, untiered = _tier_assignments(index)
     project_id = _project_id(graph)
     owners = _ownership(graph, index, tier_of, project_id)
-    role_of, sinks = derive_roles(graph)
-    verdicts = detect_guards(graph, sinks)
+    role_of, sinks = derive_roles(graph, index)
+    verdicts = detect_guards(graph, sinks, index)
     for verdict in verdicts:
         if verdict["status"] == "GUARDED":
             for witness in verdict["witnesses"]:
