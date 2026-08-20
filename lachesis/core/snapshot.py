@@ -56,13 +56,20 @@ def _merge_tiers(
     nodes: List[dict] = []
     edges: List[dict] = []
     for tier_name, payload in tiers:
-        nodes.extend({**node, "tier": tier_name} for node in payload.get("nodes", []))
+        # Tier payloads are owned by this snapshot construction path. Stamp records
+        # in place instead of copying every property dictionary with ``{**record}``:
+        # on large C bundles the copy and the still-live marshal payload briefly
+        # doubled the graph footprint before shard persistence could release it.
+        tier_nodes = payload.get("nodes", [])
+        for node in tier_nodes:
+            node["tier"] = tier_name
+        nodes.extend(tier_nodes)
         for collection in ("edges", "expands_to", "links"):
-            edges.extend({
-                **edge,
-                "source_tier": tier_name,
-                "relationship_class": collection,
-            } for edge in payload.get(collection, []))
+            tier_edges = payload.get(collection, [])
+            for edge in tier_edges:
+                edge["source_tier"] = tier_name
+                edge["relationship_class"] = collection
+            edges.extend(tier_edges)
     return nodes, edges
 
 
@@ -137,4 +144,3 @@ def snapshot_from_payloads(
         tiers.append((tier_name, payloads[tier_name]))
     nodes, edges = _merge_tiers(tiers)
     return _snapshot(manifest, nodes, edges, stdout, stderr)
-
