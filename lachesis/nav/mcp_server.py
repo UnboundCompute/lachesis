@@ -431,13 +431,15 @@ TOOLS = [
                     "assertion evidence. Reads the recorded source tree because tests are normally "
                     "excluded from the production graph.",
      "inputSchema": {"type": "object", "properties": {
-         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50}},
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50},
+         "offset": {"type": "integer", "default": 0}},
          "required": ["symbol"]}},
     {"name": "spec_links",
      "description": "Link a symbol to documentation and source comments, preserving any standards "
                     "URLs and exact file:line evidence.",
      "inputSchema": {"type": "object", "properties": {
-         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50}},
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50},
+         "offset": {"type": "integer", "default": 0}},
          "required": ["symbol"]}},
     {"name": "context_pack",
      "description": "Return a minimal coherent factual set for a code question: relevant symbols, "
@@ -778,11 +780,13 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
     if name == "tests_for":
         result = c.comprehension.tests_for(
-            args["symbol"], limit=int(args.get("limit", 50)))
+            args["symbol"], limit=int(args.get("limit", 50)),
+            offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "spec_links":
         result = c.comprehension.spec_links(
-            args["symbol"], limit=int(args.get("limit", 50)))
+            args["symbol"], limit=int(args.get("limit", 50)),
+            offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "context_pack":
         semantic = c.concepts(DEFAULT_MODEL).search(

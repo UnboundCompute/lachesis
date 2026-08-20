@@ -7,6 +7,7 @@ answers into whatever narrative they need.
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+import json
 import os
 from pathlib import PurePosixPath
 from pathlib import Path
@@ -97,6 +98,7 @@ class Comprehension:
         self.gl = store.gl
         self.index = store.index
         self._cached_source_root: Path | None | bool = False
+        self._cached_source_file_list: tuple[Path, ...] | None = None
 
     def _source_root(self) -> Path | None:
         if self._cached_source_root is not False:
@@ -114,6 +116,20 @@ class Comprehension:
                     self._cached_source_root = Path(recorded).resolve()
                     return self._cached_source_root
             except (OSError, ValueError, TypeError):
+                pass
+            # Graphs built through the user cache carry the source root in the cache
+            # entry's metadata even when an older store manifest omitted it.  Reading
+            # that tiny file avoids a 50-second Kuzu scan over every file node merely
+            # to rediscover a path the builder already recorded.
+            metadata_path = Path(graph_path).resolve().parent / "meta.json"
+            try:
+                recorded = json.loads(metadata_path.read_text(encoding="utf-8")).get(
+                    "source_dir",
+                )
+                if recorded and os.path.isdir(recorded):
+                    self._cached_source_root = Path(recorded).resolve()
+                    return self._cached_source_root
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
         absolute = []
         for file_node in self.index.nodes_of_kind("file"):
@@ -144,6 +160,8 @@ class Comprehension:
         root = self._source_root()
         if root is None:
             return None, []
+        if self._cached_source_file_list is not None:
+            return root, list(self._cached_source_file_list)
         files = []
         skipped = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
                    ".venv", "venv", "__pycache__"}
@@ -154,7 +172,93 @@ class Comprehension:
                 path = base / filename
                 if path.suffix.lower() in _TEXT_EXTENSIONS:
                     files.append(path)
-        return root, sorted(files)
+        self._cached_source_file_list = tuple(sorted(files))
+        return root, list(self._cached_source_file_list)
+
+    def _source_matches(self, symbol: str, wanted: int,
+                        accept, ignore_case: bool = False) -> tuple[list[dict], bool]:
+        """Use ripgrep's streaming JSON as the source-reference index.
+
+        Reading every source file in Python made one documentation lookup take about
+        a minute on Django.  Ripgrep searches the same recorded source tree in a
+        fraction of a second, while JSON output keeps paths containing colons safe.
+        Stop after one row beyond the requested page so a broad identifier cannot
+        create an unbounded captured response.  The fallback preserves portability
+        when ripgrep is unavailable.
+        """
+        root, files = self._source_files()
+        if root is None:
+            return [], True
+        target = max(1, wanted + 1)
+        command = ["rg", "--json", "--max-filesize", "2M", "--hidden",
+                   "--glob", "!.git/**", "--glob", "!node_modules/**",
+                   "--glob", "!vendor/**"]
+        if ignore_case:
+            command.append("--ignore-case")
+        command.extend(["-e", rf"\b{re.escape(symbol)}\b", str(root)])
+        try:
+            process = subprocess.Popen(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            process = None
+        matches: list[dict] = []
+        exhausted = True
+        if process is not None and process.stdout is not None:
+            try:
+                for raw in process.stdout:
+                    try:
+                        event = json.loads(raw)
+                        if event.get("type") != "match":
+                            continue
+                        data = event["data"]
+                        path = Path(data["path"]["text"])
+                        line = data["lines"]["text"].rstrip("\r\n")
+                        number = int(data["line_number"])
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    try:
+                        relative = path.resolve().relative_to(root).as_posix()
+                    except ValueError:
+                        continue
+                    row = accept(path, relative, number, line)
+                    if row is None:
+                        continue
+                    matches.append(row)
+                    if len(matches) >= target:
+                        exhausted = False
+                        process.terminate()
+                        break
+            finally:
+                process.stdout.close()
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            return matches, exhausted
+
+        pattern = re.compile(rf"\b{re.escape(symbol)}\b",
+                             re.IGNORECASE if ignore_case else 0)
+        for path in files:
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            relative = path.relative_to(root).as_posix()
+            for number, line in enumerate(lines, 1):
+                if not pattern.search(line):
+                    continue
+                row = accept(path, relative, number, line)
+                if row is not None:
+                    matches.append(row)
+                if len(matches) >= target:
+                    return matches, False
+        return matches, True
 
     def _declared_fields(self, typ: dict) -> list[dict]:
         """Type members, with a source-backed fallback for frontend ownership gaps."""
@@ -817,79 +921,79 @@ class Comprehension:
                 "files": files, "commits": commits,
                 "status": "history-found" if commits else "no-history"}
 
-    def tests_for(self, symbol: str, limit: int = 50) -> dict:
+    def tests_for(self, symbol: str, limit: int = 50, offset: int = 0) -> dict:
         """Find test references in the source tree that the production graph excludes."""
         root, files = self._source_files()
         if root is None:
             return {"error": "source tree unavailable; graph manifest has no usable source_dir"}
-        pattern = re.compile(rf"\b{re.escape(symbol)}\b")
-        references = []
-        searched = 0
-        for path in files:
-            relative = path.relative_to(root).as_posix()
-            if not _TEST_FILE.search(relative):
-                continue
-            searched += 1
-            try:
-                if path.stat().st_size > 2_000_000:
-                    continue
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for number, line in enumerate(lines, 1):
-                if not pattern.search(line):
-                    continue
-                nearby = " ".join(lines[max(0, number - 2):min(len(lines), number + 1)])
-                references.append({"file": relative, "line": number,
-                                   "snippet": line.strip()[:300],
-                                   "assertion_nearby": bool(re.search(
-                                       r"\b(assert|expect|should|require|CHECK|ASSERT)", nearby,
-                                       re.IGNORECASE))})
-                if len(references) >= max(1, limit):
-                    break
-            if len(references) >= max(1, limit):
-                break
-        return {"move": "tests_for", "symbol": symbol,
-                "test_files_searched": searched, "references": references,
-                "truncated": len(references) >= max(1, limit)}
+        test_files = [path for path in files
+                      if _TEST_FILE.search(path.relative_to(root).as_posix())]
+        line_cache: dict[Path, list[str]] = {}
 
-    def spec_links(self, symbol: str, limit: int = 50) -> dict:
+        def accept(path: Path, relative: str, number: int, line: str):
+            if not _TEST_FILE.search(relative):
+                return None
+            try:
+                lines = line_cache.get(path)
+                if lines is None:
+                    lines = path.read_text(
+                        encoding="utf-8", errors="replace",
+                    ).splitlines()
+                    line_cache[path] = lines
+            except OSError:
+                return None
+            nearby = " ".join(lines[max(0, number - 2):min(len(lines), number + 1)])
+            return {"file": relative, "line": number, "snippet": line.strip()[:300],
+                    "assertion_nearby": bool(re.search(
+                        r"\b(assert|expect|should|require|CHECK|ASSERT)", nearby,
+                        re.IGNORECASE))}
+
+        start, size = max(0, offset), max(1, limit)
+        found, exhausted = self._source_matches(symbol, start + size, accept)
+        references = found[start:start + size]
+        has_more = len(found) > start + len(references)
+        pagination = {"total": len(found) if exhausted else None,
+                      "total_at_least": len(found), "offset": start,
+                      "returned": len(references), "has_more": has_more,
+                      "next_offset": start + len(references) if has_more else None}
+        return {"move": "tests_for", "symbol": symbol,
+                "test_files_searched": len(test_files), "references": references,
+                "pagination": pagination, "truncated": has_more}
+
+    def spec_links(self, symbol: str, limit: int = 50, offset: int = 0) -> dict:
         """Link a symbol to docs, format definitions, standards URLs, and comments."""
         root, files = self._source_files()
         if root is None:
             return {"error": "source tree unavailable; graph manifest has no usable source_dir"}
-        pattern = re.compile(rf"\b{re.escape(symbol)}\b", re.IGNORECASE)
-        references = []
-        docs_searched = 0
-        for path in files:
-            relative = path.relative_to(root).as_posix()
+        doc_suffixes = {".md", ".rst", ".txt", ".adoc"}
+        docs_searched = sum(path.suffix.lower() in doc_suffixes for path in files)
+
+        def accept(path: Path, relative: str, number: int, line: str):
             is_doc = path.suffix.lower() in {".md", ".rst", ".txt", ".adoc"}
             if not is_doc and _TEST_FILE.search(relative):
-                continue
-            try:
-                if path.stat().st_size > 2_000_000:
-                    continue
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            if is_doc:
-                docs_searched += 1
-            for number, line in enumerate(lines, 1):
-                stripped = line.strip()
-                is_comment = stripped.startswith(("//", "/*", "*", "#", "--"))
-                if not pattern.search(line) or (not is_doc and not is_comment):
-                    continue
-                urls = re.findall(r"https?://[^\s)>\]}]+", line)
-                references.append({"file": relative, "line": number,
-                                   "kind": "documentation" if is_doc else "comment",
-                                   "snippet": stripped[:300], "urls": urls})
-                if len(references) >= max(1, limit):
-                    break
-            if len(references) >= max(1, limit):
-                break
+                return None
+            stripped = line.strip()
+            is_comment = stripped.startswith(("//", "/*", "*", "#", "--"))
+            if not is_doc and not is_comment:
+                return None
+            urls = re.findall(r"https?://[^\s)>\]}]+", line)
+            return {"file": relative, "line": number,
+                    "kind": "documentation" if is_doc else "comment",
+                    "snippet": stripped[:300], "urls": urls}
+
+        start, size = max(0, offset), max(1, limit)
+        found, exhausted = self._source_matches(
+            symbol, start + size, accept, ignore_case=True,
+        )
+        references = found[start:start + size]
+        has_more = len(found) > start + len(references)
+        pagination = {"total": len(found) if exhausted else None,
+                      "total_at_least": len(found), "offset": start,
+                      "returned": len(references), "has_more": has_more,
+                      "next_offset": start + len(references) if has_more else None}
         return {"move": "spec_links", "symbol": symbol,
                 "docs_searched": docs_searched, "references": references,
-                "truncated": len(references) >= max(1, limit)}
+                "pagination": pagination, "truncated": has_more}
 
     def context_pack(self, question: str, max_symbols: int = 6,
                      max_neighbors: int = 30, semantic_hits=None,

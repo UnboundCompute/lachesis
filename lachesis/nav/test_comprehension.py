@@ -194,9 +194,11 @@ class ComprehensionTests(unittest.TestCase):
             (root / "api/account.py").write_text(
                 "def loadMysqlConfig():\n    return 1\n", encoding="utf-8")
             (root / "tests/test_account.py").write_text(
-                "def test_load():\n    assert loadMysqlConfig() == 1\n", encoding="utf-8")
+                "def test_load():\n    assert loadMysqlConfig() == 1\n"
+                "def test_reload():\n    assert loadMysqlConfig() == 1\n", encoding="utf-8")
             (root / "docs/config.md").write_text(
-                "`loadMysqlConfig` implements https://example.test/config.\n",
+                "`loadMysqlConfig` implements https://example.test/config.\n"
+                "See `loadMysqlConfig` when reloading configuration.\n",
                 encoding="utf-8")
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.test"],
@@ -211,9 +213,15 @@ class ComprehensionTests(unittest.TestCase):
             self.assertEqual("add config loader", history["commits"][0]["subject"])
             tests = self.query.tests_for("loadMysqlConfig")
             self.assertTrue(tests["references"][0]["assertion_nearby"])
+            tests_page = self.query.tests_for("loadMysqlConfig", limit=1, offset=1)
+            self.assertEqual(1, tests_page["pagination"]["offset"])
+            self.assertEqual(1, len(tests_page["references"]))
             specs = self.query.spec_links("loadMysqlConfig")
             self.assertEqual(["https://example.test/config."],
                              specs["references"][0]["urls"])
+            spec_page = self.query.spec_links("loadMysqlConfig", limit=1, offset=1)
+            self.assertEqual(1, spec_page["pagination"]["offset"])
+            self.assertEqual(1, len(spec_page["references"]))
 
             pack = self.query.context_pack("How does load mysql config work?")
             self.assertEqual("identifier-token-relevance", pack["selection_basis"])
