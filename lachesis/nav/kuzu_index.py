@@ -29,7 +29,6 @@ exactly, and an elided build reconstructs them identically for navigation.
 """
 from __future__ import annotations
 
-import json
 import os
 import zlib
 from collections import defaultdict
@@ -53,6 +52,7 @@ from lachesis.kuzu_store import (
     manifest_props_dictionary,
     read_store_manifest,
 )
+from lachesis.core.graph_wire import decode_document, encode_document
 
 try:  # 3.10+ only
     import kuzu  # type: ignore
@@ -87,7 +87,7 @@ def _EDGE_SORT(edge: dict) -> tuple:
     twice should list them the same way twice.
     """
     return (edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
-            json.dumps(edge.get("properties") or {}, sort_keys=True))
+            encode_document(edge.get("properties") or {}))
 
 
 def _overlay_edge_key(edge: dict) -> str:
@@ -112,9 +112,8 @@ def _inflate(props_blob: bytes, zdict: bytes) -> bytes:
 def _restore(props_blob: Optional[bytes], zdict: bytes) -> dict:
     """Inflate a stored ``props`` blob back into a properties dict.
 
-    The blob is deflated UTF-8 JSON (see ``kuzu_store.PropsCodec``). Inflating all
-    244,954 nodes of the reference store costs 0.34s, against a materialize of ~5.5s."""
-    props = json.loads(_inflate(props_blob, zdict)) if props_blob else {}
+    The blob is deflated protobuf metadata (see ``kuzu_store.PropsCodec``)."""
+    props = decode_document(_inflate(props_blob, zdict)) if props_blob else {}
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
             props[key] = list(default) if isinstance(default, list) else default
@@ -254,7 +253,7 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
                 if e["source"] in resident and e["target"] in resident]
     edges.extend(deferred)
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
-                              json.dumps(e["properties"], sort_keys=True)))
+                              encode_document(e["properties"])))
     return {"nodes": nodes, "edges": edges}
 
 
@@ -588,7 +587,7 @@ class KuzuGraphIndex:
         added = 0
         for edge in edges:
             key = (edge["source"], edge["target"], edge["kind"],
-                   json.dumps(edge.get("properties") or {}, sort_keys=True))
+                   encode_document(edge.get("properties") or {}))
             if key in self._grafted_edges:
                 continue
             self._grafted_edges.add(key)

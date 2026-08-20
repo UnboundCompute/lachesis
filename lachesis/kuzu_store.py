@@ -44,17 +44,21 @@ absent; the writer then raises a clear error.
 from __future__ import annotations
 
 import base64
+import json
 import collections
 import hashlib
 import itertools
-import json
 import os
 import re
 import shutil
 import tempfile
 import zlib
+from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from lachesis.core.graph_wire import (
+    decode_document, decode_node, encode_document, encode_node, read_frames, write_frame,
+)
 from lachesis.indices import (
     CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
     exported_ids, index_rows,
@@ -175,10 +179,10 @@ def _kuzu_checkpoint_threshold(default: int = -1) -> int:
         raise ValueError("LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be non-negative")
     return value
 
-# Deliberately NOT `manifest.json`: that name is already taken by the per-frontend
+# Deliberately separate from the per-frontend
 # bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
 # two would collide the moment anyone points one at the other.
-STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
+STORE_MANIFEST_FILENAME = "lachesis-manifest.pb"
 
 # On-disk format of the store, stamped into the manifest.
 #   2 — `props` carries the whole properties dict; promoted columns are duplicates.
@@ -204,7 +208,9 @@ STORE_MANIFEST_FILENAME = "lachesis-manifest.json"
 # they arrive as a sentence telling you to rebuild rather than as a Cypher error. A store
 # is a rebuildable artifact (KUZU_STORE_SPEC.md): a format bump is a rebuild, not a
 # migration.
-STORE_FORMAT_VERSION = 9
+# v10 switches the manifest and compressed ``props`` payloads to protobuf. Existing
+# stores are rebuildable artifacts and must not be opened as if their bytes were v10.
+STORE_FORMAT_VERSION = 10
 
 
 def db_file(db_dir: str) -> str:
@@ -213,6 +219,16 @@ def db_file(db_dir: str) -> str:
 
 def store_manifest_file(db_dir: str) -> str:
     return os.path.join(db_dir, STORE_MANIFEST_FILENAME)
+
+
+def _write_store_manifest(db_dir: str, payload: dict) -> None:
+    """Write canonical protobuf metadata plus a deprecated CLI compatibility view."""
+    Path(store_manifest_file(db_dir)).write_bytes(encode_document(payload))
+    # Older CLI/tests inspect this name; it is not read by the engine and can be
+    # removed once downstream consumers have switched to lachesis-manifest.pb.
+    Path(db_dir, "lachesis-manifest.json").write_text(
+        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def is_kuzu_dir(path: str) -> bool:
@@ -249,8 +265,10 @@ def read_store_manifest(db_dir: str) -> dict:
     if not os.path.isfile(path):
         return {"version": STORE_FORMAT_VERSION, "frontends": [],
                 "node_count": 0, "edge_count": 0}
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        return decode_document(Path(path).read_bytes())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid protobuf store manifest: {path}; rebuild the store") from error
 
 
 def manifest_props_dictionary(manifest: dict) -> bytes:
@@ -465,7 +483,7 @@ def _coded_cell(column: str, value, codes: dict):
 
 def _props_text(properties: dict, elide: bool,
                 drop: frozenset = frozenset()) -> bytes:
-    """The properties a typed column is not already carrying, as UTF-8 JSON."""
+    """The properties a typed column is not already carrying, as protobuf bytes."""
     properties = properties or {}
     if properties and (elide or drop):
         properties = {
@@ -473,10 +491,7 @@ def _props_text(properties: dict, elide: bool,
             if not (elide and k in CONSTANT_PROP_DEFAULTS)
             and not (k in drop and _column_faithful(k, v))
         }
-    # Compact separators: `json.dumps` defaults to ", " and ": ", which is two bytes of
-    # whitespace per key on every row and nothing else. `json.loads` cannot tell the
-    # difference, so this is invisible above the column.
-    return json.dumps(properties, separators=(",", ":")).encode("utf-8")
+    return encode_document(properties)
 
 
 class PropsCodec:
@@ -701,7 +716,7 @@ def write_kuzu_graph(
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
-    ``snapshots`` supplies the store manifest (``lachesis-manifest.json`` beside the DB
+    ``snapshots`` supplies the store manifest (``lachesis-manifest.pb`` beside the DB
     file): the frontend inventory, and with it the capabilities and languages that
     overlay enrichment needs. Set ``prune=False, elide_constants=False`` for an
     exact-reconstruction parity build.
@@ -926,9 +941,7 @@ def write_kuzu_graph(
         core_content_hash if core_content_hash is not None
         else (None if enriched else graph_content_hash(nodes, edges))
     )
-    with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+    _write_store_manifest(db_dir, payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)
@@ -1327,8 +1340,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # Keeping hundreds of thousands of full property dictionaries alive here was a
     # surprising multi-GB peak on Linux/net; the index builders only need them again
     # after the graph tables are complete.
-    index_stage = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8",
-                                               prefix="lachesis-index-", delete=False)
+    index_stage = tempfile.NamedTemporaryFile(mode="wb", prefix="lachesis-index-",
+                                               delete=False)
     for node in shard_reader.nodes():
         kind = node.get("kind")
         if prune and kind in PRUNE_NODE_KINDS:
@@ -1343,8 +1356,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if match:
                 prefixes.add(match.group(1))
         if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
-            index_stage.write(json.dumps(node, ensure_ascii=False, separators=(",", ":")))
-            index_stage.write("\n")
+            write_frame(index_stage, encode_node(node))
 
     exported: set[str] = set()
     unresolved_count = 0
@@ -1459,14 +1471,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             for path in paths:
                 conn.execute(f"COPY {kind} FROM '{path}'")
                 os.unlink(path)
-    index_stage.flush()
-    index_stage.seek(0)
-    indexed_nodes = (json.loads(line) for line in index_stage if line.strip())
-    decl_rows = index_rows(build_decl_index(indexed_nodes, exported))
-    index_stage.seek(0)
-    indexed_nodes = (json.loads(line) for line in index_stage if line.strip())
-    callsite_rows = index_rows(build_callsite_index(indexed_nodes))
     index_stage.close()
+    indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
+    decl_rows = index_rows(build_decl_index(indexed_nodes, exported))
+    indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
+    callsite_rows = index_rows(build_callsite_index(indexed_nodes))
     os.unlink(index_stage.name)
     if bulk:
         _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
@@ -1489,9 +1498,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         "streamed": True, "enriched": False,
         PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
     })
-    with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+    _write_store_manifest(db_dir, payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)

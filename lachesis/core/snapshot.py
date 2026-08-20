@@ -9,12 +9,13 @@ what the snapshot says about it.
 """
 from __future__ import annotations
 
-import json
 import marshal
+import json
 from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Tuple
 
 from .contract import ContractError, FrontendSnapshot
+from .graph_wire import decode_document
 from .validation import validate_snapshot
 
 
@@ -38,10 +39,17 @@ def _read_tiers(manifest: dict, output_dir: str) -> Iterator[Tuple[str, dict]]:
         # marshal (C's large tier payloads) names its files `.bin`; the json route
         # (Python/TS) is unchanged. marshal only round-trips JSON-shaped values, which
         # every frontend already emits (see snapshot_from_payloads' invariant).
-        if tier_path.suffix == ".bin":
+        if tier_path.suffix == ".pb":
+            yield tier_name, decode_document(tier_path.read_bytes())
+        elif tier_path.suffix == ".bin":
+            # Compatibility for pre-protobuf frontend bundles.
             yield tier_name, marshal.loads(tier_path.read_bytes())
-        else:
+        elif tier_path.suffix == ".json":
+            # Transitional compatibility for the TypeScript/Python subprocess
+            # frontends while their writers move to the shared protobuf schema.
             yield tier_name, json.loads(tier_path.read_text(encoding="utf-8"))
+        else:
+            raise ContractError(f"unsupported tier encoding: {tier_path}")
 
 
 def _merge_tiers(
@@ -104,10 +112,17 @@ def _snapshot(
 def load_snapshot(
     output_dir: str, stdout: str = "", stderr: str = "",
 ) -> FrontendSnapshot:
-    manifest_path = Path(output_dir) / "manifest.json"
+    manifest_path = Path(output_dir) / "manifest.pb"
+    if not manifest_path.is_file():
+        # Transitional compatibility for Python/TypeScript frontends that have not
+        # switched their subprocess bundle writer yet.
+        manifest_path = Path(output_dir) / "manifest.json"
     if not manifest_path.is_file():
         raise ContractError(f"frontend did not emit {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest_path.suffix == ".pb":
+        manifest = decode_document(manifest_path.read_bytes())
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     # Read the header before any tier file is opened. A bundle with no frontend_id
     # is unusable whatever its tiers hold, and complaining about that first is the
     # error this has always raised.

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
+from .core.graph_wire import decode_document, encode_document
 from .core.runner import run_frontend
 from .core.snapshot import load_snapshot
 from .core.shards import ShardSetReader
@@ -412,8 +413,8 @@ def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
     if not manifest_path or not os.path.isfile(manifest_path):
         return {}
     try:
-        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        payload = decode_document(Path(manifest_path).read_bytes())
+    except (ValueError, OSError):
         return {}  # a corrupt/partial manifest just forces a full recompile
     frontends = payload.get("frontends") if isinstance(payload, dict) else None
     return frontends if isinstance(frontends, dict) else {}
@@ -422,15 +423,12 @@ def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
 def _write_manifest(manifest_path: str, frontends: Dict[str, dict]) -> None:
     output = Path(manifest_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps({"version": 1, "frontends": frontends}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    output.write_bytes(encode_document({"version": 1, "frontends": frontends}))
 
 
 def default_manifest_path(output_root: str) -> str:
     """The incremental manifest lives beside the per-frontend bundles."""
-    return os.path.join(os.path.abspath(output_root), "incremental_manifest.json")
+    return os.path.join(os.path.abspath(output_root), "incremental_manifest.pb")
 
 
 def run_project_incremental(

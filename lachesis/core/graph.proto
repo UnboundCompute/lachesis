@@ -81,3 +81,9 @@ message DataflowOverlay {
   repeated NodeRecord derived_nodes = 5;
   repeated EdgeRecord derived_edges = 6;
 }
+
+// Generic typed metadata envelope for internal manifests and cache fingerprints.
+message Document {
+  uint32 format_version = 1;
+  ObjectValue fields = 2;
+}

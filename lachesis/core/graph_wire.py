@@ -34,10 +34,12 @@ def _value(value: Any) -> graph_pb2.Value:
         result.text = value
     elif isinstance(value, (list, tuple)):
         result.list.values.extend((_value(item) for item in value))
+        result.list.SetInParent()
     elif isinstance(value, Mapping):
         for key in sorted(value, key=str):
             field = result.object.fields.add(key=str(key))
             field.value.CopyFrom(_value(value[key]))
+        result.object.SetInParent()
     else:
         raise TypeError(f"unsupported graph property value: {type(value).__name__}")
     return result
@@ -149,6 +151,23 @@ def decode_overlay(payload: bytes) -> dict[str, Any]:
         "derived_nodes": [decode_node(item.SerializeToString()) for item in message.derived_nodes],
         "derived_edges": [decode_edge(item.SerializeToString()) for item in message.derived_edges],
     }
+
+
+def encode_document(payload: Mapping[str, Any], *, version: int = 1) -> bytes:
+    message = graph_pb2.Document(format_version=version)
+    value = _value(dict(payload))
+    message.fields.CopyFrom(value.object)
+    return message.SerializeToString()
+
+
+def decode_document(payload: bytes) -> dict[str, Any]:
+    message = graph_pb2.Document()
+    message.ParseFromString(payload)
+    if message.format_version != 1:
+        raise ValueError("unsupported protobuf document format")
+    value = graph_pb2.Value()
+    value.object.CopyFrom(message.fields)
+    return _from_value(value)
 
 
 def write_frame(handle, payload: bytes) -> None:

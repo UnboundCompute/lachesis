@@ -27,6 +27,12 @@ try:  # run as a script (sys.path[0] is this directory) …
 except ImportError:  # … or imported as a package module.
     from lachesis.frontends.c.macros import parse_macro_definitions
 
+try:
+    from lachesis.core.graph_wire import encode_document
+except ModuleNotFoundError:  # direct script execution from the frontend directory
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from lachesis.core.graph_wire import encode_document
+
 
 CONTRACT_VERSION = 2
 FRONTEND_ID = "clang-c"
@@ -1787,8 +1793,8 @@ def main() -> int:
         emitted_edge_count += sum(
             len(payload[collection]) for collection in ("edges", "expands_to", "links")
         )
-        tier_path = output_dir / f"{tier.lower()}_{name}.bin"
-        tier_path.write_bytes(marshal.dumps(serialized_payload(payload)))
+        tier_path = output_dir / f"{tier.lower()}_{name}.pb"
+        tier_path.write_bytes(encode_document(serialized_payload(payload)))
         del payload
     emitted_node_count = len(graph.nodes)
     graph_edge_count = len(graph.edges)
@@ -1831,7 +1837,7 @@ def main() -> int:
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
         "tiers": [
-            {"tier": tier, "name": TIERS[tier], "file": f"{tier.lower()}_{TIERS[tier]}.bin", **tier_counts[tier]}
+            {"tier": tier, "name": TIERS[tier], "file": f"{tier.lower()}_{TIERS[tier]}.pb", **tier_counts[tier]}
             for tier in TIERS
         ],
     }
@@ -1848,6 +1854,9 @@ def main() -> int:
     graph.node_tier.clear()
     graph.edges.clear()
     graph.edge_keys = _EdgeKeys()
+    (output_dir / "manifest.pb").write_bytes(encode_document(manifest))
+    # Keep a short-lived compatibility copy for callers that inspect the frontend
+    # bundle directly. The canonical reader and all graph storage use manifest.pb.
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
