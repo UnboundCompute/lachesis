@@ -30,6 +30,7 @@ exactly, and an elided build reconstructs them identically for navigation.
 from __future__ import annotations
 
 import json
+import os
 import zlib
 from collections import defaultdict
 from typing import Iterable, Optional, Sequence
@@ -57,6 +58,20 @@ try:  # 3.10+ only
     import kuzu  # type: ignore
 except Exception:  # pragma: no cover
     kuzu = None
+
+
+def _query_threads() -> int:
+    """Return the bounded Kùzu read parallelism for materialization/query scans."""
+    raw = os.environ.get("LACHESIS_KUZU_QUERY_THREADS", "")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("LACHESIS_KUZU_QUERY_THREADS must be an integer") from exc
+        if value < 1:
+            raise ValueError("LACHESIS_KUZU_QUERY_THREADS must be positive")
+        return value
+    return max(1, min(os.cpu_count() or 1, 8))
 
 def _EDGE_SORT(edge: dict) -> tuple:
     """Total order on edges, ``(kind, source, target)`` plus the properties.
@@ -334,6 +349,9 @@ class KuzuGraphIndex:
             )
         self._db = kuzu.Database(db_file(db_dir), read_only=True)
         self._conn = kuzu.Connection(self._db)
+        set_threads = getattr(self._conn, "set_max_threads_for_exec", None)
+        if set_threads is not None:
+            set_threads(_query_threads())
         # Read once at open, not per blob: it is a fixed 32 KB and every `props` in the
         # store needs it. ``GraphStore.load`` has already checked the format stamp in
         # this same manifest, so a store whose dictionary this reader could not use has

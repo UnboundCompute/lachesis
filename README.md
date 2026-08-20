@@ -185,6 +185,10 @@ LACHESIS_KUZU_BUFFER_POOL_SIZE=2147483648 \
   --stream-shards /tmp/fs-shards --prune --timeout 900
 ```
 
+Disk-backed query/materialization scans use up to eight Kùzu execution threads by
+default. Override this for a constrained runner with `LACHESIS_KUZU_QUERY_THREADS=2`
+(or another positive integer); this changes read parallelism, not graph facts.
+
 Use a clean output directory and monitor the process on very large trees. The command
 builds the complete C graph directly; the token/proof switches remove only lexical
 facts that `--prune` discards later.
