@@ -1406,7 +1406,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         "unresolved_edge_count": unresolved_count,
         "dropped_node_count": 0, "deferred_edge_count": 0,
         "decl_index_count": len(decl_rows), "callsite_index_count": len(callsite_rows),
-        "streamed": True, PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
+        "streamed": True, "enriched": False,
+        PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
     })
     with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
