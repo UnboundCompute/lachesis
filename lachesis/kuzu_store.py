@@ -688,6 +688,8 @@ def write_kuzu_graph(
     source_dir: Optional[str] = None,
     source_content_hash: Optional[str] = None,
     low_memory: Optional[bool] = None,
+    buffer_pool_size: Optional[int] = None,
+    checkpoint_threshold: Optional[int] = None,
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
@@ -716,6 +718,8 @@ def write_kuzu_graph(
     ``low_memory`` overrides ``LACHESIS_KUZU_LOW_MEMORY`` for this write. It avoids
     retaining the shared property-text dictionary and is used by lazy enriched-cache
     writes, where bounded RSS is more important than the smaller/faster compressed tail.
+    ``buffer_pool_size`` and ``checkpoint_threshold`` similarly override the environment
+    for a derived cache without changing the process-wide defaults of ordinary builds.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -750,8 +754,16 @@ def write_kuzu_graph(
     # its source node's unit as the §5 incremental key.
     node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
 
-    db = kuzu.Database(db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(),
-                        checkpoint_threshold=_kuzu_checkpoint_threshold())
+    db = kuzu.Database(
+        db_file(db_dir),
+        buffer_pool_size=(
+            _kuzu_buffer_pool_size() if buffer_pool_size is None else buffer_pool_size
+        ),
+        checkpoint_threshold=(
+            _kuzu_checkpoint_threshold()
+            if checkpoint_threshold is None else checkpoint_threshold
+        ),
+    )
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
