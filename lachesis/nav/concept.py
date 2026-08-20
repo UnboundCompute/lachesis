@@ -18,12 +18,13 @@ from pathlib import Path
 import re
 import uuid
 
-from .graphlib import CALLABLE_KINDS
+from .graphlib import CALLABLE_KINDS, camel_tokens
 
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
-INDEX_VERSION = 4
+INDEX_VERSION = 7
 EMBED_BATCH_SIZE = 32
+RICH_RERANK_CANDIDATES = 32
 CARD_KINDS = frozenset((*CALLABLE_KINDS, "class", "interface", "type", "record", "enum"))
 
 
@@ -217,12 +218,37 @@ def _embed_documents(embedder, documents: list[str]) -> list[list[float]]:
     return vectors
 
 
+_LEXICAL_STOP = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "does", "for", "from",
+    "how", "in", "is", "it", "of", "on", "or", "the", "this", "to", "what",
+    "when", "where", "which", "with",
+})
+
+
+def _search_tokens(text: str) -> frozenset[str]:
+    tokens = set()
+    for word in re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", text):
+        tokens.add(word.casefold())
+        tokens.update(token.casefold() for token in camel_tokens(word))
+    return frozenset(token for token in tokens if token and token not in _LEXICAL_STOP)
+
+
+def _write_index(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+    temporary.replace(path)
+
+
 class ConceptSearch:
     def __init__(self, store, model: str = DEFAULT_MODEL) -> None:
         self.store = store
         self.model = model
         self._index = None
         self._embedder = None
+        self._index_file: Path | None = None
+        self._card_tokens: list[frozenset[str]] | None = None
 
     def _ensure_index(self):
         if self._index is not None:
@@ -238,20 +264,14 @@ class ConceptSearch:
                 with gzip.open(path, "rt", encoding="utf-8") as handle:
                     payload = json.load(handle)
                 if payload.get("fingerprint") == fingerprint:
-                    self._embedder, self._index = embedder, payload
+                    self._embedder, self._index, self._index_file = embedder, payload, path
                     return payload, None
             except (OSError, ValueError):
                 pass
-        documents = ["passage: " + card["text"] for card in cards]
-        vectors = _embed_documents(embedder, documents) if documents else []
         payload = {"version": INDEX_VERSION, "model": self.model,
-                   "fingerprint": fingerprint, "cards": cards, "vectors": vectors}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-        with gzip.open(temporary, "wt", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
-        temporary.replace(path)
-        self._embedder, self._index = embedder, payload
+                   "fingerprint": fingerprint, "cards": cards, "rich_vectors": {}}
+        _write_index(path, payload)
+        self._embedder, self._index, self._index_file = embedder, payload, path
         return payload, None
 
     def search(self, query: str, limit: int = 20, min_score: float = 0.0,
@@ -260,23 +280,63 @@ class ConceptSearch:
         if error:
             return {"move": "concept_search", "query": query, **error}
         query_vector = _norm(next(iter(self._embedder.embed(["query: " + query]))))
-        ranked = []
-        for card, vector in zip(payload["cards"], payload["vectors"]):
-            score = sum(left * right for left, right in zip(query_vector, vector))
-            if score >= min_score:
-                ranked.append((score, card))
-        ranked.sort(key=lambda item: (-item[0], item[1].get("file") or "",
-                                      item[1].get("line") or 0))
+        if self._card_tokens is None:
+            self._card_tokens = [_search_tokens(card["text"]) for card in payload["cards"]]
+        query_tokens = _search_tokens(query)
+        document_count = max(1, len(self._card_tokens))
+        frequencies = {token: sum(token in tokens for tokens in self._card_tokens)
+                       for token in query_tokens}
+        weights = {token: math.log((document_count + 1) / (frequencies[token] + 1)) + 1
+                   for token in query_tokens}
+        denominator = sum(weights.values()) or 1.0
+        coarse = []
+        for card, tokens in zip(payload["cards"], self._card_tokens):
+            score = sum(weight for token, weight in weights.items() if token in tokens)
+            coarse.append((score / denominator, card))
+        coarse.sort(key=lambda item: (-item[0], item[1].get("file") or "",
+                                      item[1].get("line") or 0, item[1]["node_id"]))
+
+        # Richly rerank a stable prefix, then append the remaining lexical order.
+        # Pagination therefore reaches the whole corpus without changing earlier pages,
+        # while no query embeds more than this fixed, inspectable amount of source.
+        shortlist = coarse[:RICH_RERANK_CANDIDATES]
+        rich_vectors = payload.setdefault("rich_vectors", {})
+        missing = [card for _score, card in shortlist if card["node_id"] not in rich_vectors]
+        if missing:
+            generated = _embed_documents(
+                self._embedder, ["passage: " + card["text"] for card in missing],
+            )
+            rich_vectors.update({card["node_id"]: vector
+                                 for card, vector in zip(missing, generated)})
+            if self._index_file is not None:
+                _write_index(self._index_file, payload)
+        reranked = []
+        for coarse_score, card in shortlist:
+            vector = rich_vectors.get(card["node_id"])
+            rich_score = (sum(left * right for left, right in zip(query_vector, vector))
+                          if vector else coarse_score)
+            score = 0.35 * coarse_score + 0.65 * rich_score
+            reranked.append((score, card, "rich"))
+        reranked.sort(key=lambda item: (-item[0], item[1].get("file") or "",
+                                        item[1].get("line") or 0, item[1]["node_id"]))
+        ranked = reranked + [(score, card, "structural")
+                             for score, card in coarse[RICH_RERANK_CANDIDATES:]]
+        ranked = [item for item in ranked if item[0] >= min_score]
         start, size = max(0, offset), max(1, limit)
         page = ranked[start:start + size]
         results = [{k: v for k, v in card.items() if k != "text"} |
-                   {"score": round(score, 6), "summary": card["text"][:500]}
-                   for score, card in page]
+                   {"score": round(score, 6), "ranking_tier": tier,
+                    "summary": card["text"][:500]}
+                   for score, card, tier in page]
         next_offset = start + len(results)
         has_more = next_offset < len(ranked)
         return {"move": "concept_search", "query": query, "model": self.model,
                 "index": {"documents": len(payload["cards"]),
-                          "fingerprint": payload["fingerprint"]},
+                          "fingerprint": payload["fingerprint"],
+                          "strategy": "lexical-structural-global-plus-rich-rerank",
+                          "rich_rerank_candidates": min(
+                              RICH_RERANK_CANDIDATES, len(payload["cards"])),
+                          "rich_vectors_cached": len(rich_vectors)},
                 "count": len(results), "total": len(ranked), "results": results,
                 "page": {"total": len(ranked), "offset": start,
                          "returned": len(results), "has_more": has_more,
