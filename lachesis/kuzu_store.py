@@ -737,20 +737,26 @@ def write_kuzu_graph(
     # is ~740k tails and about 90 MB held for the length of the write, and it grows with
     # the graph — the trade is memory against a second full JSON serialisation of every
     # row.
-    node_texts = [_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
-                  for n in nodes]
-    edge_texts = [_props_text(e.get("properties") or {}, elide_constants)
-                  for e in edges]
-    deferred_texts = [_props_text(e.get("properties") or {}, elide_constants)
-                      for e in deferred]
-    props_dict = build_props_dictionary(
-        itertools.chain(node_texts, edge_texts, deferred_texts))
-    # One codec per collection, each primed with that dictionary and cloned per row by
-    # the loaders below. They can only be built after the pre-pass: the priming is the
-    # point, and the dictionary is its input.
-    node_codec = PropsCodec(props_dict, node_texts)
-    edge_codec = PropsCodec(props_dict, edge_texts)
-    deferred_codec = PropsCodec(props_dict, deferred_texts)
+    low_memory = os.environ.get("LACHESIS_KUZU_LOW_MEMORY") == "1"
+    if low_memory:
+        # Rebuild each JSON tail on demand instead of retaining one serialized tail
+        # per node and edge. This trades the shared dictionary for a lower peak.
+        props_dict = b""
+        node_codec = PropsCodec()
+        edge_codec = PropsCodec()
+        deferred_codec = PropsCodec()
+    else:
+        node_texts = [_props_text(n.get("properties") or {}, elide_constants, _COLUMN_KEYS)
+                      for n in nodes]
+        edge_texts = [_props_text(e.get("properties") or {}, elide_constants)
+                      for e in edges]
+        deferred_texts = [_props_text(e.get("properties") or {}, elide_constants)
+                          for e in deferred]
+        props_dict = build_props_dictionary(
+            itertools.chain(node_texts, edge_texts, deferred_texts))
+        node_codec = PropsCodec(props_dict, node_texts)
+        edge_codec = PropsCodec(props_dict, edge_texts)
+        deferred_codec = PropsCodec(props_dict, deferred_texts)
 
     # The other manifest-carried table: the id prefixes the coded columns are written
     # against. Nodes only — every coded column is on the node table — and the whole
