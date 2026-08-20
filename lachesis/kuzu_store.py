@@ -44,7 +44,6 @@ absent; the writer then raises a clear error.
 from __future__ import annotations
 
 import base64
-import json
 import collections
 import hashlib
 import itertools
@@ -222,13 +221,8 @@ def store_manifest_file(db_dir: str) -> str:
 
 
 def _write_store_manifest(db_dir: str, payload: dict) -> None:
-    """Write canonical protobuf metadata plus a deprecated CLI compatibility view."""
+    """Write canonical protobuf metadata for the store."""
     Path(store_manifest_file(db_dir)).write_bytes(encode_document(payload))
-    # Older CLI/tests inspect this name; it is not read by the engine and can be
-    # removed once downstream consumers have switched to lachesis-manifest.pb.
-    Path(db_dir, "lachesis-manifest.json").write_text(
-        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
-    )
 
 
 def is_kuzu_dir(path: str) -> bool:

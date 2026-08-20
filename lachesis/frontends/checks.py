@@ -64,6 +64,7 @@ from lachesis.projections import build_layered_graph
 from lachesis.reasoning import InvestigationAgent, ReasoningQuery
 from lachesis.reasoning.agent import ACTION_SCHEMA, AgentRequest
 from lachesis.core.snapshot import load_snapshot
+from lachesis.core.graph_wire import decode_document
 from lachesis.core.validation import validate_snapshot
 from lachesis.core.contract import ContractError, FrontendSnapshot
 from lachesis.core.boundaries import import_boundary_violations
@@ -275,7 +276,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 "--layered-out", str(layered_path),
             )
             self.assertTrue((graph_path / "graph.kuzu").exists())
-            self.assertTrue((graph_path / "lachesis-manifest.json").is_file())
+            self.assertTrue((graph_path / "lachesis-manifest.pb").is_file())
             self.assertTrue((layered_path / "manifest.json").is_file())
             self.assertTrue((layered_path / "node_index.json").is_file())
             overview = subprocess.run(
@@ -1301,7 +1302,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 )
                 snapshot = load_snapshot(output)
                 validate_snapshot(snapshot)
-                manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+                manifest = decode_document((Path(output) / "manifest.pb").read_bytes())
                 # Nonzero exit, but the AST was consumed: file analyzed, not failed.
                 self.assertEqual(0, manifest["failed_file_count"])
                 self.assertEqual(1, manifest["analyzed_file_count"])
@@ -1333,7 +1334,7 @@ class CompilerFrontendTests(unittest.TestCase):
                 )
                 snapshot = load_snapshot(output)
                 validate_snapshot(snapshot)
-                manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+                manifest = decode_document((Path(output) / "manifest.pb").read_bytes())
                 self.assertEqual(1, manifest["failed_file_count"])
                 self.assertEqual(1, manifest["analyzed_file_count"])
                 # A parse hole downgrades the otherwise-complete parse capabilities.
@@ -1675,8 +1676,8 @@ class CompilerFrontendTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as output:
                 child = run_frontend(frontend, fixtures, output)
                 self.assertTrue(
-                    (Path(output) / "manifest.json").is_file(),
-                    "the subprocess route still writes the bundle it always wrote",
+                    (Path(output) / "manifest.pb").is_file(),
+                    "the subprocess route writes the protobuf bundle",
                 )
         finally:
             os.environ.clear()

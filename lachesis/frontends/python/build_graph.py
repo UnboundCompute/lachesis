@@ -3,13 +3,12 @@
 Usage: ``python -m lachesis.frontends.python.build_graph <source_dir> <output_dir>``
 
 Parses every in-root ``.py``/``.pyi`` file with CPython's own ``ast`` module and
-writes the contract-v2 tier files plus ``manifest.json``. No third-party parser is
+writes the contract-v2 tier files plus ``manifest.pb``. No third-party parser is
 involved and nothing outside the root set is ever read.
 """
 from __future__ import annotations
 
 import ast
-import json
 import os
 import platform
 import sys
@@ -373,11 +372,6 @@ def build(source_dir: Path, output_dir: Path) -> int:
             encode_tier(payload)
         )
     (output_dir / "manifest.pb").write_bytes(encode_document(analysis.manifest))
-    # Deprecated compatibility marker for callers that only used the old manifest
-    # existence check; graph loading uses the protobuf manifest above.
-    (output_dir / "manifest.json").write_text(
-        json.dumps(analysis.manifest, indent=2) + "\n", encoding="utf-8"
-    )
     print(f"{analysis.summary} to {output_dir}")
     # A non-zero exit is a ContractError that kills the whole multi-language build,
     # so it is reserved for "nothing at all was ingested".

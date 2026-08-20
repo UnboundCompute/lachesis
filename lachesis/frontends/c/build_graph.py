@@ -1855,9 +1855,6 @@ def main() -> int:
     graph.edges.clear()
     graph.edge_keys = _EdgeKeys()
     (output_dir / "manifest.pb").write_bytes(encode_document(manifest))
-    # Keep a short-lived compatibility copy for callers that inspect the frontend
-    # bundle directly. The canonical reader and all graph storage use manifest.pb.
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
     return 0

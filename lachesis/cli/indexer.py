@@ -81,7 +81,7 @@ def ensure_graph(
         graph, snapshots = run_project_incremental(
             str(source), str(frontend_cache), enrich=False,
             timeout_seconds=timeout_seconds,
-            manifest_path=str(frontend_cache / "incremental_manifest.json"),
+            manifest_path=str(frontend_cache / "incremental_manifest.pb"),
         )
     except Exception:
         progress.fail()

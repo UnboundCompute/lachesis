@@ -467,7 +467,7 @@ def run_project_incremental(
             prior_entry.get("files") == digests
             # a bundle built under different settings answers a different question
             and (prior_entry.get("options") or {}) == options
-            and Path(frontend_output, "manifest.json").is_file()
+            and Path(frontend_output, "manifest.pb").is_file()
         )
         if can_reuse:
             snapshots.append(load_snapshot(frontend_output))
