@@ -66,6 +66,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `50e5cfd` | Linux `fs` lazy dataflow enrichment, partitioned node/edge cache COPY | — | >300* | not published | — | — | ~5.0* | Hard process-group timeout at 300s; memory stayed bounded, but pass 3 did not publish a cache. Further incremental/targeted enrichment work is required. |
 | 2026-08-20 | `16c1cfa` | Linux `fs` core Kùzu materialization, 8 query threads | — | — | 150.66 | 3,157,724 | 6,210,345 | ~3.9* | Read-only materialization completed with exact counts under the 5-minute cap; bounded Kùzu query parallelism is configurable via `LACHESIS_KUZU_QUERY_THREADS`. |
 | 2026-08-20 | `ff8ea37` | Linux `fs` Action-style ephemeral `security-paths` query | — | >300* | no cache | — | — | ~4.3* | The Action no longer writes a graph-sized enriched sibling on this path, but whole-graph materialization/enrichment still exceeded the 300s cap. Next target is scoped security extraction. |
+| 2026-08-20 | `e966f98` | Linux `fs/ext4` incremental cold → warm | 17.42 → 7.88 | — | included | 131,635 | 286,007 | not sampled | Warm reuse skipped the frontend subprocess; remaining time is graph composition/Kùzu write. Proof-emission settings are now part of the reuse key. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
