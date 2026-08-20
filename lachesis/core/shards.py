@@ -7,6 +7,7 @@ record shape remains the same JSON-shaped node/edge contract used by snapshots.
 from __future__ import annotations
 
 import json
+import mmap
 import marshal
 import struct
 from itertools import chain
@@ -27,18 +28,28 @@ def _write_record(handle, record: dict) -> None:
 
 
 def _read_records(path: Path) -> Iterator[dict]:
-    with path.open("rb") as handle:
-        while True:
-            header = handle.read(_FRAME.size)
-            if not header:
-                return
-            if len(header) != _FRAME.size:
+    # A shard is already an immutable, length-framed file. Mapping it avoids two
+    # Python-level read calls per record (millions of calls on a large graph) while
+    # keeping RSS bounded: the kernel pages records in on demand and evicts them
+    # under pressure. ``marshal.loads`` accepts a memoryview, so no payload copy is
+    # needed before decoding.
+    size_on_disk = path.stat().st_size
+    if not size_on_disk:
+        return
+    with path.open("rb") as handle, mmap.mmap(
+        handle.fileno(), 0, access=mmap.ACCESS_READ,
+    ) as mapped:
+        offset = 0
+        while offset < size_on_disk:
+            if size_on_disk - offset < _FRAME.size:
                 raise ValueError(f"truncated shard frame header: {path}")
-            (size,) = _FRAME.unpack(header)
-            payload = handle.read(size)
-            if len(payload) != size:
+            (size,) = _FRAME.unpack_from(mapped, offset)
+            offset += _FRAME.size
+            end = offset + size
+            if end > size_on_disk:
                 raise ValueError(f"truncated shard frame: {path}")
-            record = marshal.loads(payload)
+            record = marshal.loads(memoryview(mapped)[offset:end])
+            offset = end
             if not isinstance(record, dict):
                 raise ValueError(f"shard record is not an object: {path}")
             yield record
