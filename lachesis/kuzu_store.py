@@ -127,6 +127,13 @@ CONSTANT_PROP_DEFAULTS = {
 # single-file DB.
 KUZU_DB_FILENAME = "graph.kuzu"
 
+# Keep each streamed relation COPY below a bounded row count.  Kùzu's COPY path
+# can need a temporary working set proportional to the input relation, even
+# though the Parquet staging itself is streaming.  Partitioning the input keeps
+# that transient allocation bounded on large repositories while retaining the
+# fast bulk-load path.
+STREAM_EDGE_COPY_PARTITION_ROWS = 250_000
+
 
 def _kuzu_buffer_pool_size(default: int = 0) -> int:
     """Return an optional bounded Kùzu buffer pool size in bytes.
@@ -1335,7 +1342,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     node_writer = None
     node_path = None
     edge_writers = {}
-    edge_paths = {}
+    edge_writer_paths = {}
+    edge_path_lists = collections.defaultdict(list)
+    edge_row_counts = collections.defaultdict(int)
+
+    def flush_edge_partition(kind: str) -> None:
+        writer = edge_writers.pop(kind, None)
+        if writer is None:
+            return
+        writer.close()
+        edge_path_lists[kind].append(edge_writer_paths.pop(kind))
+        edge_row_counts[kind] = 0
 
     def load_nodes(batch: list[dict]) -> None:
         if not batch:
@@ -1360,11 +1377,15 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             ).items():
                 writer = edge_writers.get(kind)
                 if writer is None:
-                    path = os.path.join(stage.name, f"rel_{kind}.parquet")
-                    edge_paths[kind] = path
+                    partition = len(edge_path_lists[kind])
+                    path = os.path.join(stage.name, f"rel_{kind}.{partition}.parquet")
                     writer = pq.ParquetWriter(path, table.schema)
                     edge_writers[kind] = writer
+                    edge_writer_paths[kind] = path
                 writer.write_table(table)
+                edge_row_counts[kind] += table.num_rows
+                if edge_row_counts[kind] >= STREAM_EDGE_COPY_PARTITION_ROWS:
+                    flush_edge_partition(kind)
         else:
             _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
                                 codec=codec, id_codes=id_codes)
@@ -1396,9 +1417,12 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     if batch:
         load_edges(batch)
     if bulk:
-        for kind, writer in edge_writers.items():
-            writer.close()
-            conn.execute(f"COPY {kind} FROM '{edge_paths[kind]}'")
+        for kind in list(edge_writers):
+            flush_edge_partition(kind)
+        for kind, paths in edge_path_lists.items():
+            for path in paths:
+                conn.execute(f"COPY {kind} FROM '{path}'")
+                os.unlink(path)
     index_stage.flush()
     index_stage.seek(0)
     indexed_nodes = (json.loads(line) for line in index_stage if line.strip())
