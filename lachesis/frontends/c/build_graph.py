@@ -931,13 +931,21 @@ def main() -> int:
         # only falls back to "failed" when nothing usable was recovered: empty
         # stdout, unparseable JSON, or a TranslationUnitDecl with no declarations.
         # Diagnostics are recorded either way.
-        stderr_lines = [line for line in result.stderr.splitlines() if line.strip()]
+        # Decode one TU, then release Clang's raw JSON before the decoded tree is
+        # marshalled to the AST spill. On large headers the two representations can
+        # otherwise overlap for hundreds of MB; keeping only the decoded tree makes
+        # peak memory track one representation at a time without changing facts.
+        raw_stdout = result.stdout
+        raw_stderr = result.stderr
+        result.stdout = ""
+        result.stderr = ""
+        stderr_lines = [line for line in raw_stderr.splitlines() if line.strip()]
         meaningful = [line for line in stderr_lines if "error:" in line or "warning:" in line]
         diagnostics.extend((path, line) for line in meaningful)
         recovered = False
-        if result.stdout.strip():
+        if raw_stdout.strip():
             try:
-                ast = json.loads(result.stdout)
+                ast = json.loads(raw_stdout)
             except json.JSONDecodeError as error:
                 diagnostics.append((path, f"invalid Clang AST JSON: {error}"))
             else:
@@ -979,6 +987,7 @@ def main() -> int:
                 else:
                     diagnostics.append((path, "Clang AST recovered no declarations"))
                 del ast
+        del raw_stdout, raw_stderr
         if not recovered:
             # Degrade, don't drop: the file node (emitted above) survives with its
             # compiler diagnostics attached as T4 proof; only the semantic layer for
