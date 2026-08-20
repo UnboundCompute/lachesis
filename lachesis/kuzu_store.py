@@ -694,6 +694,7 @@ def write_kuzu_graph(
     carry_unresolved_edges: bool = False,
     source_dir: Optional[str] = None,
     source_content_hash: Optional[str] = None,
+    build_fingerprint: Optional[str] = None,
     low_memory: Optional[bool] = None,
     buffer_pool_size: Optional[int] = None,
     checkpoint_threshold: Optional[int] = None,
@@ -907,6 +908,9 @@ def write_kuzu_graph(
     if source_content_hash:
         payload["source_content_hash"] = source_content_hash
     payload["enriched"] = bool(enriched)
+    payload["pruned"] = bool(prune)
+    if build_fingerprint:
+        payload["build_fingerprint"] = build_fingerprint
     # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
     # rather than a sidecar file because losing it makes every `props` blob in the
     # store unreadable: it is part of the store, not metadata about it.

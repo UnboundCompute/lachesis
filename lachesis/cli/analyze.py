@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from collections import Counter
@@ -10,13 +11,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lachesis.kuzu_store import write_kuzu_graph, write_kuzu_shards
+from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuzu_shards
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
 from lachesis.pipeline import (enrich_project_graph, run_project,
                                run_project_incremental, run_project_parallel,
-                               run_project_streaming, source_content_hash)
+                               run_project_streaming, source_content_hash,
+                               default_manifest_path)
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
@@ -159,6 +161,23 @@ def main() -> None:
         graph, snapshots = run_project(args.source_dir, frontend_out,
                                        enrich=compile_enrich,
                                        timeout_seconds=args.timeout)
+    build_fingerprint = None
+    if args.incremental and frontend_out:
+        manifest_path = default_manifest_path(frontend_out)
+        try:
+            build_fingerprint = hashlib.sha256(
+                Path(manifest_path).read_bytes()).hexdigest()
+        except OSError:
+            build_fingerprint = None
+        if build_fingerprint and os.path.isdir(args.output_path):
+            existing = read_store_manifest(args.output_path)
+            if (
+                existing.get("build_fingerprint") == build_fingerprint
+                and existing.get("pruned") is args.prune
+                and existing.get("enriched") is bool(enrich)
+            ):
+                print(f"Reused unchanged graph store: {args.output_path}")
+                return
     stored = graph
     if args.reduced:
         enriched = enrich_project_graph(graph, snapshots)
@@ -175,6 +194,7 @@ def main() -> None:
         # so a load can tell whether an already-joined cache still describes it.
         source_content_hash=(source_content_hash(args.source_dir)
                              if args.reduced else None),
+        build_fingerprint=build_fingerprint,
     )
     if args.layered_out:
         layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)
