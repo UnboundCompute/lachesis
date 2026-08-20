@@ -138,6 +138,51 @@ class ShardSetReader:
             yield from shard.edges()
 
 
+class ShardSetWriter:
+    """Track shard completion atomically so interrupted builds are resumable."""
+
+    def __init__(self, directory: str | Path, *, frontend_id: str) -> None:
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.frontend_id = frontend_id
+        self.path = self.directory / "shards.json"
+        if self.path.is_file():
+            self.manifest = json.loads(self.path.read_text(encoding="utf-8"))
+        else:
+            self.manifest = {
+                "shard_format_version": SHARD_FORMAT_VERSION,
+                "frontend_id": frontend_id,
+                "shards": [],
+            }
+            self._save()
+
+    def _save(self) -> None:
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(self.manifest, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self.path)
+
+    def start(self, shard_id: str) -> ShardWriter:
+        relative = f"shard-{shard_id}"
+        entries = [entry for entry in self.manifest["shards"] if entry["shard_id"] != shard_id]
+        entries.append({"shard_id": shard_id, "directory": relative, "status": "running"})
+        self.manifest["shards"] = entries
+        self._save()
+        return ShardWriter(
+            self.directory / relative, frontend_id=self.frontend_id, shard_id=shard_id,
+        )
+
+    def complete(self, shard_id: str, writer: ShardWriter) -> None:
+        writer.close()
+        for entry in self.manifest["shards"]:
+            if entry["shard_id"] == shard_id:
+                entry.update({
+                    "status": "complete", "node_count": writer.node_count,
+                    "edge_count": writer.edge_count,
+                })
+                break
+        self._save()
+
+
 def write_snapshot_shard(
     directory: str | Path, *, frontend_id: str, shard_id: str,
     nodes: Iterable[dict], edges: Iterable[dict],

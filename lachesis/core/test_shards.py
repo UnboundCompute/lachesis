@@ -1,6 +1,7 @@
 import json
 
-from .shards import SHARD_FORMAT_VERSION, ShardReader, ShardSetReader, write_snapshot_shard
+from .shards import (SHARD_FORMAT_VERSION, ShardReader, ShardSetReader,
+                     ShardSetWriter, write_snapshot_shard)
 
 
 def test_shards_round_trip_records_incrementally(tmp_path):
@@ -33,3 +34,15 @@ def test_shard_set_skips_incomplete_work_and_orders_shards(tmp_path):
     )
     reader = ShardSetReader(tmp_path / "shards.json")
     assert [node["id"] for node in reader.nodes()] == ["zero", "one"]
+
+
+def test_shard_set_writer_marks_only_completed_work_reusable(tmp_path):
+    shards = ShardSetWriter(tmp_path, frontend_id="test")
+    writer = shards.start("0")
+    writer.add_node({"id": "n"})
+    shards.complete("0", writer)
+    reader = ShardSetReader(tmp_path / "shards.json")
+    assert list(reader.nodes()) == [{"id": "n"}]
+    running = shards.start("1")
+    running.add_node({"id": "not-yet-complete"})
+    assert list(reader.nodes()) == [{"id": "n"}]
