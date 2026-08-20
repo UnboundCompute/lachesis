@@ -10,6 +10,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
 from .core.runner import run_frontend
 from .core.snapshot import load_snapshot
+from .core.shards import ShardSetReader
 from .frontends.registry import FrontendRegistry, default_registry
 from .types import CodeGraph, GraphEdge, GraphNode
 
@@ -304,6 +305,48 @@ def run_project(
         )
     graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
     return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots
+
+
+def run_project_streaming(
+    source_dir: str,
+    shard_root: str,
+    output_root: str,
+    registry: Optional[FrontendRegistry] = None,
+    timeout_seconds: int = 300,
+    include_tests: bool = False,
+):
+    """Run frontends one at a time and return shard readers plus metadata.
+
+    This core-only path deliberately never composes frontend payloads. Each validated
+    snapshot is persisted by the common runner, released, and represented afterward
+    only by its shard-set reader and manifest metadata.
+    """
+    source_dir = os.path.abspath(source_dir)
+    shard_root = os.path.abspath(shard_root)
+    output_root = os.path.abspath(output_root)
+    registry = registry or default_registry()
+    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    snapshots = []
+    readers = []
+    previous = os.environ.get("LACHESIS_SHARD_ROOT")
+    os.environ["LACHESIS_SHARD_ROOT"] = shard_root
+    try:
+        for frontend_id in sorted(groups):
+            frontend = registry.get(frontend_id)
+            frontend_output = os.path.join(output_root, frontend_id)
+            snapshot = run_frontend(
+                frontend, source_dir, frontend_output, timeout_seconds,
+                roots=groups[frontend_id],
+            )
+            snapshots.append(snapshot)
+            readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.json")))
+            snapshot.release()
+    finally:
+        if previous is None:
+            os.environ.pop("LACHESIS_SHARD_ROOT", None)
+        else:
+            os.environ["LACHESIS_SHARD_ROOT"] = previous
+    return readers, snapshots
 
 
 def _file_digest(path: str) -> str:

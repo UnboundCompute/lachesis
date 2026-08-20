@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import marshal
 import struct
+from itertools import chain
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
@@ -136,6 +137,19 @@ class ShardSetReader:
     def edges(self) -> Iterator[dict]:
         for shard in self._shards():
             yield from shard.edges()
+
+
+class CompositeShardReader:
+    """Stream several frontend shard sets as one canonical source."""
+
+    def __init__(self, readers) -> None:
+        self.readers = tuple(readers)
+
+    def nodes(self) -> Iterator[dict]:
+        yield from chain.from_iterable(reader.nodes() for reader in self.readers)
+
+    def edges(self) -> Iterator[dict]:
+        yield from chain.from_iterable(reader.edges() for reader in self.readers)
 
 
 class ShardSetWriter:

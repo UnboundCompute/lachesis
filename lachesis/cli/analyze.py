@@ -10,12 +10,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lachesis.kuzu_store import write_kuzu_graph
+from lachesis.kuzu_store import write_kuzu_graph, write_kuzu_shards
+from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
 from lachesis.pipeline import (enrich_project_graph, run_project,
                                run_project_incremental, run_project_parallel,
-                               source_content_hash)
+                               run_project_streaming, source_content_hash)
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
@@ -96,10 +97,30 @@ def main() -> None:
         help="cap the --parallel-packages pool (default: one worker per package, "
              "never more than the core count). N=1 runs the same partition serially.",
     )
+    parser.add_argument(
+        "--stream-shards", metavar="DIR", default=None,
+        help="stream core-only frontend shards directly into Kùzu",
+    )
     args = parser.parse_args()
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
-                     "incremental manifest keys bundles by frontend, not by package")
+            "incremental manifest keys bundles by frontend, not by package")
+    if args.stream_shards and (args.enrich or args.reduced or args.layered_out):
+        parser.error("--stream-shards currently supports core-only stores")
+    if args.stream_shards and (args.parallel_packages or args.incremental):
+        parser.error("--stream-shards cannot combine with incremental or parallel builds")
+    if args.stream_shards:
+        frontend_out = args.frontend_out or os.path.join(args.stream_shards, "frontends")
+        readers, snapshots = run_project_streaming(
+            args.source_dir, args.stream_shards, frontend_out,
+            timeout_seconds=args.timeout,
+        )
+        stored = write_kuzu_shards(
+            CompositeShardReader(readers), args.output_path, snapshots,
+            prune=args.prune,
+        )
+        print(f"Streamed {len(snapshots)} frontends into {stored}")
+        return
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
