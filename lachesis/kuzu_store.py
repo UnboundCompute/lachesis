@@ -687,6 +687,7 @@ def write_kuzu_graph(
     carry_unresolved_edges: bool = False,
     source_dir: Optional[str] = None,
     source_content_hash: Optional[str] = None,
+    low_memory: Optional[bool] = None,
 ) -> str:
     """Write the composed ``graph`` dict into a Kùzu DB directory. Returns the path.
 
@@ -711,6 +712,10 @@ def write_kuzu_graph(
     from and what it hashed to. A reduced store cannot be read without them: getting the
     bodies back means compiling that tree again, and the hash is what says whether an
     already-joined cache still describes it.
+
+    ``low_memory`` overrides ``LACHESIS_KUZU_LOW_MEMORY`` for this write. It avoids
+    retaining the shared property-text dictionary and is used by lazy enriched-cache
+    writes, where bounded RSS is more important than the smaller/faster compressed tail.
     """
     if kuzu is None:
         raise RuntimeError(
@@ -782,8 +787,11 @@ def write_kuzu_graph(
     # is ~740k tails and about 90 MB held for the length of the write, and it grows with
     # the graph — the trade is memory against a second full JSON serialisation of every
     # row.
-    low_memory = os.environ.get("LACHESIS_KUZU_LOW_MEMORY") == "1"
-    if low_memory:
+    use_low_memory = (
+        os.environ.get("LACHESIS_KUZU_LOW_MEMORY") == "1"
+        if low_memory is None else low_memory
+    )
+    if use_low_memory:
         # Rebuild each JSON tail on demand instead of retaining one serialized tail
         # per node and edge. This trades the shared dictionary for a lower peak.
         props_dict = b""

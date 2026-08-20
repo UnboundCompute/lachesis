@@ -384,7 +384,8 @@ class GraphStore:
         # prune/elide are already decided by the core store: whatever it holds is what
         # was materialized, so re-pruning here would silently drop more than the build did.
         write_kuzu_graph(enriched, None, cache, prune=False,
-                         enriched=True, core_content_hash=core_hash)
+                         enriched=True, core_content_hash=core_hash,
+                         low_memory=True)
         _copy_frontend_inventory(core_path, cache)
         # The derived store is now authoritative; do not keep the materialized core
         # and enriched graph alive while Kùzu reopens the cache. On large action runs
