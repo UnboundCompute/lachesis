@@ -6,7 +6,8 @@ from .shards import (SHARD_FORMAT_VERSION, ShardReader, ShardSetReader,
 def test_shards_round_trip_records_incrementally(tmp_path):
     nodes = ({"id": f"n{i}", "kind": "function", "properties": {"i": i}}
              for i in range(3))
-    edges = ({"kind": "CALLS", "source": "n0", "target": f"n{i}"}
+    edges = ({"kind": "CALLS", "source": "n0", "target": f"n{i}",
+              "properties": {"line": i}}
              for i in range(1, 3))
     counts = write_snapshot_shard(
         tmp_path, frontend_id="test", shard_id="0", nodes=nodes, edges=edges,
@@ -15,6 +16,9 @@ def test_shards_round_trip_records_incrementally(tmp_path):
     reader = ShardReader(tmp_path)
     assert list(reader.nodes())[2]["id"] == "n2"
     assert list(reader.edges())[1]["target"] == "n2"
+    assert list(reader.edges(headers_only=True))[1] == {
+        "kind": "CALLS", "source": "n0", "target": "n2",
+    }
     manifest = graph_pb2.ShardManifest()
     manifest.ParseFromString((tmp_path / "manifest.pb").read_bytes())
     assert manifest.format_version == SHARD_FORMAT_VERSION
