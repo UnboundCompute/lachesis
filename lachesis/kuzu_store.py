@@ -1000,7 +1000,7 @@ def _str_col(values: list) -> "pa.Array":
 
 
 def _node_table(nodes: list[dict], *, elide: bool, codec: PropsCodec,
-                id_codes: Optional[dict] = None):
+                id_codes: Optional[dict] = None, index_offset: int = 0):
     if not nodes:
         return None
     columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
@@ -1013,19 +1013,24 @@ def _node_table(nodes: list[dict], *, elide: bool, codec: PropsCodec,
         for prop in PROMOTED_NODE_PROPS:
             data[prop].append(_coded_cell(prop, _promoted_value(props, prop),
                                           id_codes or {}))
-        data["props"].append(codec.blob(index, props, elide, _COLUMN_KEYS))
+        data["props"].append(codec.blob(index_offset + index, props, elide, _COLUMN_KEYS))
     return pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
                      for c in columns})
 
 
 def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
                      codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
-    table = _node_table(nodes, elide=elide, codec=codec, id_codes=id_codes)
-    if table is None:
-        return
-    path = os.path.join(stage_dir, "node.parquet")
-    pq.write_table(table, path)
-    conn.execute(f"COPY Node FROM '{path}'")
+    for offset in range(0, len(nodes), STREAM_EDGE_COPY_PARTITION_ROWS):
+        table = _node_table(
+            nodes[offset:offset + STREAM_EDGE_COPY_PARTITION_ROWS],
+            elide=elide, codec=codec, id_codes=id_codes, index_offset=offset,
+        )
+        if table is None:
+            continue
+        path = os.path.join(stage_dir, f"node.{offset}.parquet")
+        pq.write_table(table, path)
+        conn.execute(f"COPY Node FROM '{path}'")
+        os.unlink(path)
 
 
 def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
