@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import marshal
 import os
+import tempfile
 import sys
 from pathlib import Path
 
@@ -75,6 +77,38 @@ def edge_view(edge: dict) -> dict:
 def enriched_store_path(graph_path: str) -> str:
     """The derived overlay-tier cache that sits beside a core-only store."""
     return str(graph_path).rstrip("/") + ".enriched"
+
+
+def dataflow_overlay_path(graph_path: str) -> str:
+    """Binary additive dataflow cache beside a core Kùzu store."""
+    return str(graph_path).rstrip("/") + ".dataflow.bin"
+
+
+def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
+    if not core_hash or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            payload = marshal.load(handle)
+    except (OSError, ValueError, EOFError, TypeError):
+        return False
+    return payload.get("version") == 1 and payload.get("core_content_hash") == core_hash
+
+
+def _merge_overlays(primary: Overlay, secondary: Overlay) -> Overlay:
+    """Combine the nav sidecar and additive dataflow sidecar for one index."""
+    merged = Overlay(source=primary.source or secondary.source)
+    merged.node_props = {**primary.node_props, **secondary.node_props}
+    merged.edge_props = {**primary.edge_props, **secondary.edge_props}
+    merged.derived_nodes = [*primary.derived_nodes, *secondary.derived_nodes]
+    merged.derived_edges = [*primary.derived_edges, *secondary.derived_edges]
+    return merged
+
+
+def _load_dataflow_overlay(path: str) -> Overlay:
+    """Load the internal binary dataflow sidecar."""
+    with open(path, "rb") as handle:
+        return Overlay.from_dict(marshal.load(handle))
 
 
 def joined_store_path(graph_path: str) -> str:
@@ -307,6 +341,7 @@ class GraphStore:
                 f"`lachesis-analyze <source_dir> {graph_path}`"
             )
         open_path = graph_path
+        dataflow_path = None
         # A reduced store is opened through its rejoin, never directly: without the
         # bodies the graph is half of itself, and no caller should have to know that.
         # Same shape as the `.enriched` redirect below, and for the same reason — the
@@ -317,22 +352,33 @@ class GraphStore:
             cached = enriched_store_path(graph_path)
             if _cache_matches(cached, core_manifest.get("core_content_hash")):
                 open_path = cached
-        self = cls._open(open_path, overlay_path=overlay_path)
+            else:
+                candidate = dataflow_overlay_path(graph_path)
+                if _dataflow_cache_matches(candidate, core_manifest.get("core_content_hash")):
+                    dataflow_path = candidate
+        self = cls._open(open_path, overlay_path=overlay_path,
+                         dataflow_path=dataflow_path)
         # The overlay sidecar and the caller-facing identity stay the *core* path even
         # when the derived cache is what is actually open: the cache is an
         # implementation detail, and its sidecar would be a second, divergent copy.
         self.graph_path = graph_path
         self._core_path = graph_path
         self._overlay_path = overlay_path
-        self._enriched = open_path != graph_path or bool(core_manifest.get("enriched", True))
+        self._enriched = (
+            open_path != graph_path or dataflow_path is not None
+            or bool(core_manifest.get("enriched", True))
+        )
         return self
 
     @classmethod
-    def _open(cls, path: str, overlay_path: str | None = None) -> "GraphStore":
+    def _open(cls, path: str, overlay_path: str | None = None,
+              dataflow_path: str | None = None) -> "GraphStore":
         from lachesis.nav.kuzu_index import KuzuGraphIndex
         index = KuzuGraphIndex(path)
         ov_path = Path(overlay_path) if overlay_path else sidecar_path(path)
         overlay = Overlay.load(ov_path)
+        if dataflow_path:
+            overlay = _merge_overlays(overlay, _load_dataflow_overlay(dataflow_path))
         index.attach_overlay(overlay)
         return cls.from_graphlib(GraphLib.from_index(index), graph_path=path,
                                  overlay=overlay)
@@ -350,8 +396,9 @@ class GraphStore:
         in-memory graph. Otherwise: materialize the core, fold the four overlay
         registries over it (``enriched = f(core_graph, languages, capabilities)`` —
         pure, so this is exactly what a build-time enrich would have produced), write
-        the result to a sibling ``<store>.enriched`` cache keyed by the core's content
-        hash, and reopen against it.
+        additive records to a compact sibling ``<store>.dataflow.bin`` sidecar keyed
+        by the core's content hash, and reopen against it. Non-additive overlays use
+        the older full ``<store>.enriched`` Kùzu-cache fallback.
 
         The honest cost: enrichment is a whole-graph in-RAM operation, so the first call
         re-materializes the RAM the columnar store exists to avoid. This *moves* that
@@ -380,19 +427,57 @@ class GraphStore:
                      or graph_content_hash(core["nodes"], core["edges"]))
         enriched = enrich_graph(core, manifest_languages(manifest),
                                manifest_capabilities(manifest))
-        cache = enriched_store_path(core_path)
-        # prune/elide are already decided by the core store: whatever it holds is what
-        # was materialized, so re-pruning here would silently drop more than the build did.
-        write_kuzu_graph(enriched, None, cache, prune=False,
-                         enriched=True, core_content_hash=core_hash,
-                         low_memory=True, buffer_pool_size=2 << 30,
-                         checkpoint_threshold=256 << 20)
-        _copy_frontend_inventory(core_path, cache)
-        # The derived store is now authoritative; do not keep the materialized core
-        # and enriched graph alive while Kùzu reopens the cache. On large action runs
-        # this overlap was a transient second graph-sized RSS spike.
+        cache = dataflow_overlay_path(core_path)
+        core_node_ids = {id(node) for node in core["nodes"]}
+        core_edge_ids = {id(edge) for edge in core["edges"]}
+        enriched_node_ids = {id(node) for node in enriched["nodes"]}
+        enriched_edge_ids = {id(edge) for edge in enriched["edges"]}
+        additive = (
+            core_node_ids.issubset(enriched_node_ids)
+            and core_edge_ids.issubset(enriched_edge_ids)
+        )
+        if additive:
+            payload = {
+                "overlay_id": "dataflow",
+                "source": Path(core_path).name,
+                "version": 1,
+                "core_content_hash": core_hash,
+                "node_props": {}, "edge_props": {},
+                "derived_nodes": [node for node in enriched["nodes"]
+                                  if id(node) not in core_node_ids],
+                "derived_edges": [edge for edge in enriched["edges"]
+                                  if id(edge) not in core_edge_ids],
+            }
+            fd, temporary = tempfile.mkstemp(
+                prefix=".lachesis-dataflow-", suffix=".json",
+                dir=os.path.dirname(os.path.abspath(cache)),
+            )
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    # marshal is stdlib, C-speed, and already used by the shard/AST
+                    # tiers. The cache is content-hash keyed, so Python-version
+                    # changes safely invalidate it rather than serving stale data.
+                    marshal.dump(payload, handle)
+                os.replace(temporary, cache)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
+                                     dataflow_path=cache)
+        else:
+            # A future overlay that mutates canonical records is not safe to represent
+            # as a delta; retain the existing full Kùzu-cache fallback for that case.
+            cache = enriched_store_path(core_path)
+            write_kuzu_graph(enriched, None, cache, prune=False,
+                             enriched=True, core_content_hash=core_hash,
+                             low_memory=True, buffer_pool_size=2 << 30,
+                             checkpoint_threshold=256 << 20)
+            _copy_frontend_inventory(core_path, cache)
+            fresh = type(self)._open(cache, overlay_path=self._overlay_path)
+        # The derived graph is now represented by the attached cache. Release the
+        # materialized lists before reopening so large action runs do not overlap
+        # two graph-sized Python representations.
         del enriched, core
-        fresh = type(self)._open(cache, overlay_path=self._overlay_path)
         self.overlay = fresh.overlay
         self.graph = fresh.graph
         self.gl = fresh.gl

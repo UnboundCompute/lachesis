@@ -64,6 +64,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `84224eb` | Linux `fs` lazy dataflow enrichment from streamed core | — | >131* | not published | — | — | >5.4* | Overlay/index materialization exceeded the safety RSS ceiling before derived-cache publication; bounded Kùzu serialization did not remove this pre-writer peak. |
 | 2026-08-20 | `c9c4512` | Linux `fs` streamed core, partitioned node/edge COPY, 1 GiB pool | — | — | 618.03 | 3,157,724 | 6,210,345 | ~5.5* | Completed and reopened under the previously failing 1 GiB pool; direct relation counts sum exactly to the manifest. Partitioning removed the buffer-pool failure, but the end-to-end build remains slow. |
 | 2026-08-20 | `50e5cfd` | Linux `fs` lazy dataflow enrichment, partitioned node/edge cache COPY | — | >300* | not published | — | — | ~5.0* | Hard process-group timeout at 300s; memory stayed bounded, but pass 3 did not publish a cache. Further incremental/targeted enrichment work is required. |
+| 2026-08-20 | working tree | Linux `fs` additive dataflow sidecar (binary marshal) | — | >300* | not published | — | — | ~3.6* | Compact sidecar avoids a full enriched Kùzu rewrite and passed fixture parity; whole-graph materialization/enrichment still hit the 300s cap at 3.15M nodes. |
 | 2026-08-20 | `16c1cfa` | Linux `fs` core Kùzu materialization, 8 query threads | — | — | 150.66 | 3,157,724 | 6,210,345 | ~3.9* | Read-only materialization completed with exact counts under the 5-minute cap; bounded Kùzu query parallelism is configurable via `LACHESIS_KUZU_QUERY_THREADS`. |
 | 2026-08-20 | `ff8ea37` | Linux `fs` Action-style ephemeral `security-paths` query | — | >300* | no cache | — | — | ~4.3* | The Action no longer writes a graph-sized enriched sibling on this path, but whole-graph materialization/enrichment still exceeded the 300s cap. Next target is scoped security extraction. |
 | 2026-08-20 | `e966f98` | Linux `fs/ext4` incremental cold → warm | 17.42 → 7.88 | — | included | 131,635 | 286,007 | not sampled | Warm reuse skipped the frontend subprocess; remaining time is graph composition/Kùzu write. Proof-emission settings are now part of the reuse key. |
@@ -87,6 +88,11 @@ The CLI/enrichment row is also a boundary, not a timing result: the frontend pro
 must finish before composition and enrichment can begin. It is kept to prevent a
 misleading claim that pass 2 has been optimized when pass 1 has not yet completed on
 the larger end-to-end path.
+
+The internal additive dataflow cache is a versioned, core-content-hash-keyed stdlib
+`marshal` sidecar (`<store>.dataflow.bin`). It is smaller and faster to load than a
+text format and adds no runtime dependency. JSON remains reserved for user-facing
+output; it is not used for this internal cache.
 
 ### Rejected scheduling experiment
 

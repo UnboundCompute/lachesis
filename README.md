@@ -173,8 +173,11 @@ LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
 
 `--stream-shards` is currently incompatible with `--enrich`; dataflow partition
 streaming is the next integration step. The resulting store is explicitly marked
-core-only, so `GraphStore`/the GitHub Action rebuilds and caches the dataflow tier
-on its first security query rather than silently skipping enrichment.
+core-only, so `GraphStore`/the GitHub Action builds the dataflow tier on its first
+security query rather than silently skipping enrichment. Additive derived records are
+cached in a compact internal `<store>.dataflow.bin` sidecar; JSON is reserved for
+user-facing output. A full `.enriched` Kùzu cache remains the fallback for overlays
+that mutate core records.
 
 The GitHub Action's SARIF step sets `LACHESIS_QUERY_EPHEMERAL_ENRICH=1`: its batch
 security query uses the derived tier only for that process and avoids writing a second
