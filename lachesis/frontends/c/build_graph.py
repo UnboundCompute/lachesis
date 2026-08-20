@@ -869,6 +869,9 @@ class AstStore:
 
 
 def main() -> int:
+    # A frontend may be invoked repeatedly in one interpreter by library callers;
+    # discard any cache left by an interrupted prior build before resolving paths.
+    RESOLVED_FILES.clear()
     if len(sys.argv) < 2:
         raise SystemExit(
             "Usage: python3 lachesis/frontends/c/build_graph.py SRC_DIR [OUT_DIR]")
