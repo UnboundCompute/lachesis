@@ -549,7 +549,7 @@ class PropsCodec:
     outside the writer gets.
     """
 
-    __slots__ = ("_prototype", "_texts")
+    __slots__ = ("_prototype", "_texts", "_cache")
 
     def __init__(self, zdict: bytes = b"",
                  texts: Optional[Sequence[bytes]] = None) -> None:
@@ -558,6 +558,11 @@ class PropsCodec:
         self._prototype = zlib.compressobj(
             _PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
             zlib.DEF_MEM_LEVEL, 0, zdict) if zdict else None
+        # Edge/node metadata repeats heavily (confidence, origin, empty tails), but
+        # a cache without a bound would turn a large graph into another graph-sized
+        # allocation. Short tails are the repeated case and a small fixed table keeps
+        # the optimization bounded; longer or unique tails take the normal path.
+        self._cache: dict[bytes, bytes] = {}
         self._texts = texts
 
     def blob(self, index: int, properties: dict, elide: bool,
@@ -565,10 +570,18 @@ class PropsCodec:
         """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
+        if len(text) <= 512:
+            cached = self._cache.get(text)
+            if cached is not None:
+                return cached
         if self._prototype is None:
-            return zlib.compress(text, _PROPS_ZLIB_LEVEL)
-        obj = self._prototype.copy()
-        return obj.compress(text) + obj.flush()
+            result = zlib.compress(text, _PROPS_ZLIB_LEVEL)
+        else:
+            obj = self._prototype.copy()
+            result = obj.compress(text) + obj.flush()
+        if len(text) <= 512 and len(self._cache) < 4096:
+            self._cache[text] = result
+        return result
 
 
 def build_props_dictionary(texts: Iterable[bytes]) -> bytes:
