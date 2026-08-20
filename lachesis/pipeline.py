@@ -350,6 +350,75 @@ def run_project_streaming(
     return readers, snapshots
 
 
+def run_project_streaming_parallel(
+    source_dir: str,
+    shard_root: str,
+    output_root: str,
+    registry: Optional[FrontendRegistry] = None,
+    timeout_seconds: int = 300,
+    include_tests: bool = False,
+    *,
+    max_files_per_package: Optional[int] = None,
+    workspace_root: Optional[str] = None,
+):
+    """Stream package/shard compiler jobs without composing their snapshots.
+
+    This is the bounded-memory counterpart to ``run_project_parallel``.  Jobs are
+    intentionally serialized: a TypeScript compiler process can already consume
+    gigabytes, so multiplying those heaps for wall-clock parallelism defeats the
+    purpose of this path.  Each completed bundle is converted to protobuf frames in
+    its own shard set and its released metadata is retained for the store manifest.
+    """
+    from .packages import detect_packages, split_large_packages
+
+    source_dir = os.path.abspath(source_dir)
+    shard_root = os.path.abspath(shard_root)
+    output_root = os.path.abspath(output_root)
+    registry = registry or default_registry(workspace_root)
+    packages = detect_packages(
+        source_dir, source_inventory(source_dir, include_tests=include_tests),
+    )
+    packages = split_large_packages(source_dir, packages, max_files_per_package)
+    jobs = package_jobs(source_dir, output_root, registry,
+                        include_tests=include_tests, packages=packages)
+    if not jobs:
+        supported = sorted({
+            extension for item in registry.frontends for extension in item.extensions
+        })
+        raise FrontendError(
+            f"no registered frontend supports files below {source_dir}; "
+            f"supported extensions: {', '.join(supported)}"
+        )
+
+    readers = []
+    snapshots = []
+    previous = os.environ.get("LACHESIS_SHARD_ROOT")
+    try:
+        for frontend_id, package, compile_root, output_dir, roots in jobs:
+            # A separate root prevents same-frontend shard manifests from being
+            # rewritten while another package is still being compiled and keeps the
+            # reader's ownership boundary explicit for future parallel scheduling.
+            slug = package.replace(os.sep, "__").replace("<", "").replace(">", "") or "root"
+            job_shard_root = os.path.join(shard_root, frontend_id, slug)
+            os.makedirs(job_shard_root, exist_ok=True)
+            os.environ["LACHESIS_SHARD_ROOT"] = job_shard_root
+            snapshot = run_frontend(
+                registry.get(frontend_id), compile_root, output_dir, timeout_seconds,
+                roots=roots,
+            )
+            snapshots.append(snapshot)
+            readers.append(ShardSetReader(
+                os.path.join(job_shard_root, frontend_id, "shards.pb")
+            ))
+            snapshot.release()
+    finally:
+        if previous is None:
+            os.environ.pop("LACHESIS_SHARD_ROOT", None)
+        else:
+            os.environ["LACHESIS_SHARD_ROOT"] = previous
+    return readers, snapshots
+
+
 def _file_digest(path: str) -> str:
     """SHA-256 of a source file's bytes — the incremental change key. Self-contained
     (not tied to how any frontend stamps its own content_hash) so the manifest is

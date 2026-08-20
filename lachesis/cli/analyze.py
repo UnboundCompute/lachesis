@@ -17,7 +17,8 @@ from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
 from lachesis.pipeline import (enrich_project_graph, run_project,
                                run_project_incremental, run_project_parallel,
-                               run_project_streaming, source_content_hash,
+                               run_project_streaming, run_project_streaming_parallel,
+                               source_content_hash,
                                default_manifest_path)
 from lachesis.projections import build_layered_graph, write_layered_graph
 
@@ -117,8 +118,8 @@ def main() -> None:
         parser.error("--shard-large-packages requires --parallel-packages")
     if args.stream_shards and (args.enrich or args.reduced or args.layered_out):
         parser.error("--stream-shards currently supports core-only stores")
-    if args.stream_shards and (args.parallel_packages or args.incremental):
-        parser.error("--stream-shards cannot combine with incremental or parallel builds")
+    if args.stream_shards and args.incremental:
+        parser.error("--stream-shards cannot combine with incremental builds")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
     # same output defaults before the streaming branch as the ordinary path below.
     # Previously the early return skipped this block and made --stream-shards run
@@ -128,10 +129,17 @@ def main() -> None:
         os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
     if args.stream_shards:
         frontend_out = args.frontend_out or os.path.join(args.stream_shards, "frontends")
-        readers, snapshots = run_project_streaming(
-            args.source_dir, args.stream_shards, frontend_out,
-            timeout_seconds=args.timeout,
-        )
+        if args.parallel_packages:
+            readers, snapshots = run_project_streaming_parallel(
+                args.source_dir, args.stream_shards, frontend_out,
+                timeout_seconds=args.timeout,
+                max_files_per_package=args.shard_large_packages,
+            )
+        else:
+            readers, snapshots = run_project_streaming(
+                args.source_dir, args.stream_shards, frontend_out,
+                timeout_seconds=args.timeout,
+            )
         stored = write_kuzu_shards(
             CompositeShardReader(readers), args.output_path, snapshots,
             prune=args.prune,
