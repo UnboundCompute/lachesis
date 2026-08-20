@@ -1353,10 +1353,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             exported.add(edge["target"])
         if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
             unresolved_count += 1
-        for value in (edge.get("source"), edge.get("target")):
-            match = _ID_SHAPE.match(value) if isinstance(value, str) else None
-            if match:
-                prefixes.add(match.group(1))
+        # Streamed stores do not carry deferred edges: the second pass drops every
+        # edge whose endpoints were pruned or absent. Therefore retained endpoints
+        # are necessarily retained nodes, and their prefixes were collected above;
+        # scanning both endpoint strings again here was millions of redundant regex
+        # matches on the large Linux graph.
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
     # Streamed materialization is explicitly the bounded-memory path. Keep a
