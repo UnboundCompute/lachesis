@@ -18,7 +18,10 @@ def snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
     """Convert one validated frontend snapshot without changing its facts."""
     nodes: List[GraphNode] = []
     for source in snapshot.nodes:
-        properties = dict(source.get("properties", {}))
+        # Transfer ownership of the existing properties mapping. The snapshot is
+        # released immediately after this conversion, so copying it only creates a
+        # second graph-sized set of dictionaries during common composition.
+        properties = source.setdefault("properties", {})
         properties.update({
             "frontend_id": snapshot.frontend_id,
             "frontend_tier": source.get("tier"),
@@ -29,7 +32,7 @@ def snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
         })
     edges: List[GraphEdge] = []
     for source in snapshot.edges:
-        properties = dict(source.get("properties", {}))
+        properties = source.setdefault("properties", {})
         properties.update({
             "frontend_id": snapshot.frontend_id,
             "source_tier": source.get("source_tier"),
