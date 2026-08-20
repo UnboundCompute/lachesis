@@ -127,6 +127,26 @@ CONSTANT_PROP_DEFAULTS = {
 # single-file DB.
 KUZU_DB_FILENAME = "graph.kuzu"
 
+
+def _kuzu_buffer_pool_size() -> int:
+    """Return an optional bounded Kùzu buffer pool size in bytes.
+
+    Kùzu's ``0`` default auto-sizes from host memory, which is unsafe for CI
+    runners when a large graph is being materialized.  Keep the historical
+    default unless the caller opts in, while allowing the low-memory and streamed
+    paths to set a hard ceiling without changing the graph format.
+    """
+    raw = os.environ.get("LACHESIS_KUZU_BUFFER_POOL_SIZE", "")
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LACHESIS_KUZU_BUFFER_POOL_SIZE must be an integer byte count") from exc
+    if value < 0:
+        raise ValueError("LACHESIS_KUZU_BUFFER_POOL_SIZE must be non-negative")
+    return value
+
 # Deliberately NOT `manifest.json`: that name is already taken by the per-frontend
 # bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
 # two would collide the moment anyone points one at the other.
@@ -704,7 +724,7 @@ def write_kuzu_graph(
     # its source node's unit as the §5 incremental key.
     node_units = {n["id"]: _node_unit(n.get("properties") or {}) for n in nodes}
 
-    db = kuzu.Database(db_file(db_dir))
+    db = kuzu.Database(db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size())
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
@@ -1241,7 +1261,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 prefixes.add(match.group(1))
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
-    db = kuzu.Database(db_file(db_dir))
+    db = kuzu.Database(db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size())
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
