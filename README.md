@@ -171,6 +171,16 @@ LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
   --stream-shards /tmp/project-shards --prune
 ```
 
+To print the streamed Kùzu phase timings while profiling a cold output directory,
+add `LACHESIS_TIMINGS=1`. The timing lines cover header scanning, schema creation,
+node and edge COPY, and index loading; they are silent by default:
+
+```bash
+LACHESIS_TIMINGS=1 LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
+  lachesis-analyze /path/to/project /tmp/project.kuzu \
+  --stream-shards /tmp/project-shards --prune
+```
+
 `--stream-shards` is currently incompatible with `--enrich`; dataflow partition
 streaming is the next integration step. The resulting store is explicitly marked
 core-only, so `GraphStore`/the GitHub Action builds the dataflow tier on its first

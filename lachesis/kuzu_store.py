@@ -50,7 +50,9 @@ import itertools
 import os
 import re
 import shutil
+import sys
 import tempfile
+import time
 import zlib
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -1321,6 +1323,20 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     if os.path.exists(target_db_dir):
         if not overwrite:
             raise FileExistsError(target_db_dir)
+    timing_enabled = os.environ.get("LACHESIS_TIMINGS") == "1"
+    timing_started = time.perf_counter()
+    timing_last = timing_started
+
+    def timing(label: str) -> None:
+        nonlocal timing_last
+        if timing_enabled:
+            now = time.perf_counter()
+            elapsed = now - timing_started
+            phase = now - timing_last
+            timing_last = now
+            print(f"[lachesis timing] kuzu {label}: +{phase:.3f}s ({elapsed:.3f}s total)",
+                  file=sys.stderr, flush=True)
+
     # Build beside the requested path and publish only after all tables, indices,
     # and the manifest are complete. An interrupted large run must not expose a
     # directory that looks like a valid but partial store.
@@ -1364,6 +1380,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         # are necessarily retained nodes, and their prefixes were collected above;
         # scanning both endpoint strings again here was millions of redundant regex
         # matches on the large Linux graph.
+    timing("scan headers and edge endpoints")
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
     # Streamed materialization is explicitly the bounded-memory path. Keep a
@@ -1378,6 +1395,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         conn.execute(stmt)
     for stmt in _index_ddl():
         conn.execute(stmt)
+    timing("create schema")
     codec = PropsCodec()
     bulk = pa is not None and pq is not None
     stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
@@ -1445,6 +1463,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     if bulk and node_writer is not None:
         node_writer.close()
         conn.execute(f"COPY Node FROM '{node_path}'")
+    timing("load nodes")
 
     batch = []
     kept_edge_count = 0
@@ -1465,6 +1484,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             for path in paths:
                 conn.execute(f"COPY {kind} FROM '{path}'")
                 os.unlink(path)
+    timing("load edges")
     index_stage.close()
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
     decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
@@ -1481,6 +1501,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                             id_codes=id_codes)
         _load_index_rowwise(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
                             callsite_rows, id_codes=id_codes)
+    timing("build and load indices")
     if stage is not None:
         stage.cleanup()
     payload = manifest_payload({"nodes": [], "edges": []}, snapshots)
@@ -1496,4 +1517,5 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)
+    timing("publish store")
     return target_db_dir
