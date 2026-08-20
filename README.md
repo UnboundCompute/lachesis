@@ -194,6 +194,19 @@ cached in a compact internal `<store>.dataflow.pb` sidecar; JSON is reserved for
 user-facing output. A full `.enriched` Kùzu cache remains the fallback for overlays
 that mutate core records.
 
+For a TypeScript monorepo whose largest package does not fit in one compiler heap,
+the opt-in package-sharded build bounds each compiler root list (it is a semantic
+tradeoff, so the CLI reports cross-shard edges that could not be merged):
+
+```bash
+lachesis-analyze /path/to/monorepo /tmp/monorepo.kuzu \
+  --parallel-packages --shard-large-packages 1000 --max-workers 1 --prune
+```
+
+Start with `--max-workers 1` on memory-constrained CI; increase it only after measuring
+the runner's peak RSS. A whole-program TypeScript build remains the highest-fidelity
+mode when it fits, while package sharding is the bounded fallback for very large trees.
+
 The GitHub Action's SARIF step sets `LACHESIS_QUERY_EPHEMERAL_ENRICH=1`: its batch
 security query uses the derived tier only for that process and avoids writing a second
 graph-sized cache. Local query commands keep persistent enriched-cache behavior.

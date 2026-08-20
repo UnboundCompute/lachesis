@@ -19,7 +19,7 @@ across everything. That is why the parallel build is opt-in.
 from __future__ import annotations
 
 import os
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Mapping
 
 ROOT_PACKAGE_KEY = "<root>"
 
@@ -105,4 +105,34 @@ def detect_packages(source_dir: str, files: Iterable[str]) -> Dict[str, List[str
 def package_root_for(source_dir: str, key: str) -> str:
     """Invert ``package_key``: the directory a bucket should be compiled from."""
     source_dir = os.path.abspath(source_dir)
+    # Large-package shards retain the real package root after the reserved suffix;
+    # their roots file, not the directory walk, defines the chunk's compiler roots.
+    base, marker, _shard = key.partition("::shard-")
+    key = base if marker else key
     return source_dir if key == ROOT_PACKAGE_KEY else os.path.join(source_dir, key)
+
+
+def split_large_packages(
+    source_dir: str, packages: Mapping[str, List[str]], max_files: int | None,
+) -> Dict[str, List[str]]:
+    """Split oversized package root lists into deterministic compiler chunks.
+
+    The normal package boundary remains the default.  When explicitly requested,
+    each chunk keeps the same package root (and therefore its tsconfig/path mapping)
+    but receives a bounded ``LACHESIS_ROOTS_FILE``.  Stable IDs let the merge layer
+    union overlapping dependency views; the caller reports any cross-chunk edge
+    loss, just as it does for ordinary package-parallel builds.
+    """
+    if max_files is None or max_files <= 0:
+        return {key: list(paths) for key, paths in packages.items()}
+    result: Dict[str, List[str]] = {}
+    for key, paths in sorted(packages.items()):
+        ordered = sorted(paths)
+        if len(ordered) <= max_files:
+            result[key] = ordered
+            continue
+        for offset in range(0, len(ordered), max_files):
+            shard = offset // max_files
+            shard_key = f"{key}::shard-{shard:04d}"
+            result[shard_key] = ordered[offset:offset + max_files]
+    return dict(sorted(result.items()))

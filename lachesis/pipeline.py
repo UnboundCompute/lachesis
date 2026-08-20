@@ -636,6 +636,7 @@ def run_project_parallel(
     *,
     enrich: bool = True,
     max_workers: Optional[int] = None,
+    max_files_per_package: Optional[int] = None,
     workspace_root: Optional[str] = None,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot], int]:
     """Compile each (frontend, package) unit in its own process, then compose.
@@ -656,7 +657,7 @@ def run_project_parallel(
     """
     from concurrent.futures import ProcessPoolExecutor
 
-    from .packages import detect_packages
+    from .packages import detect_packages, split_large_packages
 
     source_dir = os.path.abspath(source_dir)
     output_root = os.path.abspath(output_root)
@@ -664,6 +665,7 @@ def run_project_parallel(
     packages = detect_packages(
         source_dir, source_inventory(source_dir, include_tests=include_tests),
     )
+    packages = split_large_packages(source_dir, packages, max_files_per_package)
     jobs = package_jobs(source_dir, output_root, registry,
                         include_tests=include_tests, packages=packages)
     if not jobs:

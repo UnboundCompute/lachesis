@@ -97,7 +97,13 @@ def main() -> None:
     parser.add_argument(
         "--max-workers", type=int, default=None, metavar="N",
         help="cap the --parallel-packages pool (default: one worker per package, "
-             "never more than the core count). N=1 runs the same partition serially.",
+        "never more than the core count). N=1 runs the same partition serially.",
+    )
+    parser.add_argument(
+        "--shard-large-packages", type=int, default=None, metavar="FILES",
+        help="with --parallel-packages, split any package larger than FILES roots "
+        "into bounded compiler jobs; this is an opt-in semantic tradeoff and "
+        "reports cross-shard edges that cannot be merged",
     )
     parser.add_argument(
         "--stream-shards", metavar="DIR", default=None,
@@ -107,6 +113,8 @@ def main() -> None:
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
             "incremental manifest keys bundles by frontend, not by package")
+    if args.shard_large_packages is not None and not args.parallel_packages:
+        parser.error("--shard-large-packages requires --parallel-packages")
     if args.stream_shards and (args.enrich or args.reduced or args.layered_out):
         parser.error("--stream-shards currently supports core-only stores")
     if args.stream_shards and (args.parallel_packages or args.incremental):
@@ -156,6 +164,7 @@ def main() -> None:
         graph, snapshots, dropped = run_project_parallel(
             args.source_dir, frontend_out, enrich=compile_enrich,
             max_workers=args.max_workers, timeout_seconds=args.timeout,
+            max_files_per_package=args.shard_large_packages,
         )
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, frontend_out,
