@@ -127,6 +127,18 @@ CONSTANT_PROP_DEFAULTS = {
 }
 
 
+def _is_default_constant(key: str, value) -> bool:
+    """Whether a constant-valued property can be safely omitted from ``props``.
+
+    The defaults are common on compiler facts, but overlay-derived records can
+    legitimately carry a different provenance/confidence.  Eliding by key alone
+    silently changed ``core-inference/high`` back to ``compiler/exact`` on read.
+    """
+    if key not in CONSTANT_PROP_DEFAULTS:
+        return False
+    return value == CONSTANT_PROP_DEFAULTS[key]
+
+
 # the Kùzu store is a *directory* holding this DB file plus the store manifest. The
 # marker file lets the loader branch without a magic byte and is robust to Kùzu using a
 # single-file DB.
@@ -484,7 +496,7 @@ def _props_text(properties: dict, elide: bool,
     if properties and (elide or drop):
         properties = {
             k: v for k, v in properties.items()
-            if not (elide and k in CONSTANT_PROP_DEFAULTS)
+            if not (elide and _is_default_constant(k, v))
             and not (k in drop and _column_faithful(k, v))
         }
     return encode_document(properties)

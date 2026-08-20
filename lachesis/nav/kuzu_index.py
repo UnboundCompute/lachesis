@@ -53,6 +53,7 @@ from lachesis.kuzu_store import (
     read_store_manifest,
 )
 from lachesis.core.graph_wire import decode_document, encode_document
+from lachesis.nav.overlay import edge_key
 
 try:  # 3.10+ only
     import kuzu  # type: ignore
@@ -252,8 +253,42 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
     deferred = [e for e in deferred
                 if e["source"] in resident and e["target"] in resident]
     edges.extend(deferred)
+
+    # A core-only store keeps additive dataflow facts in a sidecar overlay.  The
+    # normal navigation accessors graft those records as needed, but whole-graph
+    # materialization must expose the same canonical view as an eagerly enriched
+    # Kùzu store (used by enrichment/parity callers).  Previously the lazy path
+    # silently returned only base rows, dropping every derived node/edge from the
+    # comparison while leaving ordinary navigation apparently healthy.
+    overlay = getattr(index, "_overlay", None)
+    if overlay is not None:
+        if overlay.node_props:
+            for position, node in enumerate(nodes):
+                extra = overlay.node_props.get(node["id"])
+                if extra:
+                    properties = dict(node.get("properties") or {})
+                    properties.update(extra)
+                    nodes[position] = {**node, "properties": properties}
+        if overlay.edge_props:
+            for position, edge in enumerate(edges):
+                extra = overlay.edge_props.get(edge_key(edge))
+                if extra:
+                    properties = dict(edge.get("properties") or {})
+                    properties.update(extra)
+                    edges[position] = {**edge, "properties": properties}
+        nodes.extend(
+            node for node in overlay.derived_nodes
+            if keep is None or node.get("id") in keep
+        )
+        resident = {node["id"] for node in nodes}
+        edges.extend(
+            edge for edge in overlay.derived_edges
+            if (keep is None or
+                (edge.get("source") in resident and edge.get("target") in resident))
+        )
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
                               encode_document(e["properties"])))
+    nodes.sort(key=lambda n: n["id"])
     return {"nodes": nodes, "edges": edges}
 
 
