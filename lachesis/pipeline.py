@@ -396,7 +396,8 @@ def source_content_hash(source_dir: str, include_tests: bool = False) -> str:
 # rewrites it per build and the roots it names are already covered by the digests, and
 # LACHESIS_C_JOBS is absent because it is a scheduling knob whose output is identical.
 _OUTPUT_BEARING_ENVIRONMENT = (
-    "LACHESIS_EMIT_TOKENS", "LACHESIS_CFLAGS", "LACHESIS_COMPILE_COMMANDS",
+    "LACHESIS_EMIT_TOKENS", "LACHESIS_EMIT_PROOFS", "LACHESIS_CFLAGS",
+    "LACHESIS_COMPILE_COMMANDS",
     "LACHESIS_INCLUDE_DEP_TYPES", "LACHESIS_MAX_DEPENDENCY_FILES",
 )
 
