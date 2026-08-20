@@ -172,7 +172,9 @@ LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
 ```
 
 `--stream-shards` is currently incompatible with `--enrich`; dataflow partition
-streaming is the next integration step.
+streaming is the next integration step. The resulting store is explicitly marked
+core-only, so `GraphStore`/the GitHub Action rebuilds and caches the dataflow tier
+on its first security query rather than silently skipping enrichment.
 
 The streamed path defaults to a 1 GiB Kùzu buffer pool. For very large subsystems
 such as Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
