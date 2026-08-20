@@ -191,13 +191,18 @@ class GraphAccumulator:
         self._unchecked = []
         return fresh_nodes, fresh
 
-    def view(self) -> dict:
-        """The graph as ``compose`` would have returned it, sorted the same way.
+    def view(self, *, sorted_output: bool = True) -> dict:
+        """Return the accumulated graph, optionally without global sorting.
 
         The two sorted lists are cached and dropped only by the delta that invalidates
         them, so an overlay whose ``applies`` says no costs nothing, and a delta that
-        contributes no node leaves the node ordering alone.
+        contributes no node leaves the node ordering alone.  Overlay folds use the
+        unsorted form between models: predicates and indexes are order-independent,
+        and sorting millions of records after every small delta is pure overhead.  The
+        public/default form remains byte-for-byte compatible with ``compose``.
         """
+        if not sorted_output:
+            return {"nodes": self._nodes.values(), "edges": self._edges}
         if self._sorted_nodes is None:
             self._sorted_nodes = sorted(self._nodes.values(), key=_NODE_ORDER)
         if self._sorted_edges is None:
@@ -209,4 +214,3 @@ class GraphAccumulator:
             _dangling(self._unchecked, self._nodes)
             self._unchecked = []
         return self.view()
-
