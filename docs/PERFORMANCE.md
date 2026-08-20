@@ -70,6 +70,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `e966f98` | Linux `fs/ext4` incremental cold → warm | 17.42 → 7.88 | — | included | 131,635 | 286,007 | not sampled | Warm reuse skipped the frontend subprocess; remaining time is graph composition/Kùzu write. Proof-emission settings are now part of the reuse key. |
 | 2026-08-20 | `e966f98` | Linux `fs/ext4` incremental store-artifact reuse | 17.17 → 1.96 | — | skipped | 131,635 | 286,007 | not sampled | Matching frontend fingerprint, prune, and enrichment settings reused the existing Kùzu store and skipped the rewrite entirely. |
 | 2026-08-20 | `0fc41c5` | Linux `fs/netfs` streamed core after C path/macro caching | — | — | 2.64 | 13,185 | 24,719 | ~0.36* | 27 files / 10,293 LOC; tokens and proof leaves disabled, `LACHESIS_C_JOBS=1`; graph reopened with matching manifest counts. |
+| 2026-08-20 | `0fc41c5` | Linux `drivers/usb` streamed core after C path/macro caching | — | — | 131.47 | 858,016 | 1,694,180 | ~3.99* | 790 files / 582,731 LOC; tokens and proof leaves disabled, `LACHESIS_C_JOBS=1`; completed and reopened with matching manifest counts under the 300s cap. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
