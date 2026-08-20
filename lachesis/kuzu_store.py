@@ -60,7 +60,7 @@ from lachesis.core.graph_wire import (
 )
 from lachesis.indices import (
     CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
-    exported_ids, index_rows,
+    build_decl_and_callsite_index, exported_ids, index_rows,
 )
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
@@ -1467,9 +1467,9 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 os.unlink(path)
     index_stage.close()
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
-    decl_rows = index_rows(build_decl_index(indexed_nodes, exported))
-    indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
-    callsite_rows = index_rows(build_callsite_index(indexed_nodes))
+    decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
+    decl_rows = index_rows(decl_index)
+    callsite_rows = index_rows(callsite_index)
     os.unlink(index_stage.name)
     if bulk:
         _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
