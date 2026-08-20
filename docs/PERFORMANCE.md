@@ -86,6 +86,13 @@ must finish before composition and enrichment can begin. It is kept to prevent a
 misleading claim that pass 2 has been optimized when pass 1 has not yet completed on
 the larger end-to-end path.
 
+### Rejected scheduling experiment
+
+On Linux `fs/ext4` (51 files, 69,304 LOC), raising `LACHESIS_C_JOBS` from 1 to 4
+reduced the frontend wall time from 11.85s to 9.51s, but changed the graph: edges
+went from 286,007 to 286,015, with a 317/325 edge-set differential. The faster setting
+is therefore not accepted as a default; deterministic fact preservation takes priority.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
