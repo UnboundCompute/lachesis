@@ -19,6 +19,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from lachesis.core.snapshot import load_snapshot
+from lachesis.cli.manifest_run import execute_manifest_run
 from lachesis.manifest.schema import (
     AnalysisConfig,
     FunctionContract,
@@ -180,6 +181,81 @@ class ContractDrivenLifetimeTests(unittest.TestCase):
                 "the free contract must compose a cross-TU use-after-free",
             )
             self.assertIn("functions", declared["lifetime"]["applied_config"])
+
+
+RUN_SOURCE = r"""
+void *malloc(unsigned long);
+void free(void *);
+
+void kept_double_free(void) {
+    char *p = malloc(8);
+    free(p);
+    free(p);
+}
+
+void claims_to_free(char *p) {
+    (void)p;
+}
+"""
+
+EXCLUDED_SOURCE = r"""
+void *malloc(unsigned long);
+void free(void *);
+
+void excluded_double_free(void) {
+    char *p = malloc(8);
+    free(p);
+    free(p);
+}
+"""
+
+RUN_MANIFEST = r"""
+[project]
+name = "manifest-run-proof"
+language = "c"
+
+[project.source]
+exclude = ["tests", "**/vendor/**"]
+
+[project.functions.claims_to_free]
+frees = ["arg0"]
+
+[analysis]
+engine = "object"
+"""
+
+
+class ManifestRunTests(unittest.TestCase):
+    def test_end_to_end_summary_scopes_excludes_and_warns_on_body_contradiction(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as output:
+            Path(source_dir, "src").mkdir()
+            Path(source_dir, "tests").mkdir()
+            Path(source_dir, "src", "kept.c").write_text(RUN_SOURCE)
+            Path(source_dir, "tests", "excluded.c").write_text(EXCLUDED_SOURCE)
+            manifest_path = Path(source_dir, "lachesis.toml")
+            manifest_path.write_text(RUN_MANIFEST)
+            completed = subprocess.run(
+                [sys.executable, "-m", "lachesis.frontends.c.build_graph", source_dir, output],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            snapshot = load_snapshot(output)
+            store = GraphStore(semantic_snapshot_graph(snapshot))
+
+            payload = execute_manifest_run(
+                Path(source_dir), manifest_path, Path(output), store)
+            summary = payload["run_summary"]
+
+            entries = {lead["entry"] for lead in payload["leads"]}
+            self.assertIn("kept_double_free", entries)
+            self.assertNotIn("excluded_double_free", entries)
+            self.assertGreaterEqual(summary["excluded_leads"], 1)
+            self.assertIn("project.source.exclude", summary["applied_config"])
+            self.assertEqual(summary["manifest_validation"]["warnings"], 0)
+            self.assertEqual(
+                [warning["symbol"] for warning in summary["semantic_warnings"]],
+                ["claims_to_free"],
+            )
 
 
 if __name__ == "__main__":

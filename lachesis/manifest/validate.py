@@ -151,3 +151,31 @@ def validate_manifest(manifest: Manifest, store) -> ManifestReport:
         _check(store, checks, f"project.typedefs[{alias}]", struct, TYPE_KINDS)
 
     return ManifestReport(checks=tuple(checks))
+
+
+def validate_contract_effects(manifest: Manifest, summaries) -> ManifestReport:
+    """Warn when a body-visible function contract claims a free the solver never saw.
+
+    Opaque functions are intentionally absent from ``summaries`` and remain unverifiable.
+    For a visible body we keep the check conservative: any observed free effect satisfies
+    the declaration.  Exact access-path equivalence is a deeper claim than the current
+    summary representation can prove reliably.
+    """
+    checks = []
+    for contract in manifest.project.functions:
+        if not contract.frees or contract.name not in summaries:
+            continue
+        alternatives = summaries.get(contract.name) or ()
+        observed = any(
+            getattr(getattr(effect, "kind", None), "value",
+                    getattr(effect, "kind", None)) == "free"
+            for alternative in alternatives for effect in alternative
+        )
+        if not observed:
+            checks.append(FactCheck(
+                location=f"project.functions.{contract.name}.frees",
+                symbol=contract.name,
+                status=Status.WARNING,
+                detail="contract declares a free, but the analyzed body has no free effect",
+            ))
+    return ManifestReport(checks=tuple(checks))

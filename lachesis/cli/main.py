@@ -28,6 +28,7 @@ EXIT_FAILURE = 4       # the build or the query broke
 
 EPILOG = """\
 examples:
+  lachesis run                      run the checked-in lachesis.toml contract
   lachesis scan                     analyse the current directory and report findings
   lachesis scan ~/src/app --json    the same, as JSON, for a script
   lachesis mcp                      serve the current directory to an AI agent
@@ -274,6 +275,20 @@ def build_parser() -> argparse.ArgumentParser:
     root.add_argument("--version", action="store_true",
                       help="print the installed version and exit")
     subcommands = root.add_subparsers(dest="command", metavar="<command>")
+
+    run = subcommands.add_parser(
+        "run", help="run the project's checked-in lachesis.toml contract",
+        description="Load and validate lachesis.toml, run the flow pass, then report "
+                    "applied configuration and any excluded coverage.")
+    _add_source_flags(run)
+    run.add_argument("--manifest", default=None, metavar="PATH",
+                     help="manifest path (default: nearest lachesis.toml)")
+    run.add_argument("--json", action="store_true",
+                     help="write the run summary and leads as JSON")
+    run.add_argument("--quiet", "-q", action="store_true",
+                     help="suppress progress; the run summary is still printed")
+    from lachesis.cli.manifest_run import command_run
+    run.set_defaults(handler=command_run)
 
     scan = subcommands.add_parser(
         "scan", help="report what an attacker could reach in a codebase",

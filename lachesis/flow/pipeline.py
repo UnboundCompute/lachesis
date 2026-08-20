@@ -174,6 +174,14 @@ def run_pass(store, lang="c", lifetime_engine=None, manifest=None):
         else:
             fallback_store = store
         diagnostics = object_result.diagnostics
+        if manifest is not None:
+            from lachesis.manifest.validate import validate_contract_effects
+            effect_report = validate_contract_effects(manifest, object_result.summaries)
+            lifetime["semantic_warnings"] = [
+                {"location": check.location, "symbol": check.symbol,
+                 "status": check.status.value, "detail": check.detail}
+                for check in effect_report.warnings
+            ]
         unsafe = set(diagnostics.get("unsafe_functions", ()))
         # Object mode is fully untrusted only where the function's OWN analysis failed
         # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
