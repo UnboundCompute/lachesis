@@ -567,6 +567,9 @@ class Graph:
     def __init__(self) -> None:
         self.nodes: Dict[str, dict] = {}
         self.node_tier: Dict[str, str] = {}
+        # Tier membership is stable when a node is first created.  Keeping compact
+        # id references avoids rescanning the complete node map once per emitted tier.
+        self.nodes_by_tier: Dict[str, List[str]] = defaultdict(list)
         self.edges: List[dict] = []
         self.edge_keys = _EdgeKeys()
 
@@ -602,6 +605,7 @@ class Graph:
         if node_id not in self.nodes:
             self.nodes[node_id] = Node(node_id, kind, label, canonical)
             self.node_tier[node_id] = tier
+            self.nodes_by_tier[tier].append(node_id)
         else:
             self.nodes[node_id]["properties"].update(canonical)
         return node_id
@@ -1758,6 +1762,13 @@ def main() -> int:
     tier_counts = {}
     emitted_edge_count = 0
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Unlike the old per-tier full-graph scan, this partitions edges once.  The edge
+    # objects remain owned by ``graph.edges``; these are only short pointer lists.
+    edges_by_tier: Dict[str, List[Edge]] = defaultdict(list)
+    for edge in graph.edges:
+        source_tier = graph.node_tier.get(edge["source"])
+        if source_tier:
+            edges_by_tier[source_tier].append(edge)
 
     def serialized_payload(payload: dict) -> dict:
         defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
@@ -1783,11 +1794,10 @@ def main() -> int:
     for tier, name in TIERS.items():
         payload = {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
         payload["nodes"].extend(
-            node.as_dict() for node_id, node in graph.nodes.items()
-            if graph.node_tier.get(node_id) == tier
+            graph.nodes[node_id].as_dict() for node_id in graph.nodes_by_tier.get(tier, ())
         )
-        for edge in graph.edges:
-            source_tier = graph.node_tier.get(edge["source"])
+        for edge in edges_by_tier.get(tier, ()):
+            source_tier = tier
             target_tier = graph.node_tier.get(edge["target"])
             if source_tier != tier or not target_tier:
                 continue
@@ -1874,7 +1884,9 @@ def main() -> int:
     # the peak on large kernel subsystems.
     graph.nodes.clear()
     graph.node_tier.clear()
+    graph.nodes_by_tier.clear()
     graph.edges.clear()
+    edges_by_tier.clear()
     graph.edge_keys = _EdgeKeys()
     (output_dir / "manifest.pb").write_bytes(encode_document(manifest))
     print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
