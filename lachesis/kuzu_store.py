@@ -1029,7 +1029,8 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
 
 
 def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
-                 codec: PropsCodec, id_codes: Optional[dict] = None) -> dict:
+                 codec: PropsCodec, id_codes: Optional[dict] = None,
+                 index_offset: int = 0) -> dict:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
     hot: dict[str, dict[str, list]] = {
@@ -1045,7 +1046,7 @@ def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
         kind = edge.get("kind")
         props = edge.get("properties") or {}
         unit = _edge_unit(edge, node_units)
-        stored = codec.blob(index, props, elide)
+        stored = codec.blob(index_offset + index, props, elide)
         src, tgt = encode_id(edge["source"], codes), encode_id(edge["target"], codes)
         if kind in _HOT_SET:
             bucket = hot[kind]
@@ -1086,11 +1087,36 @@ def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
 def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
                      node_units: dict, codec: PropsCodec,
                      id_codes: Optional[dict] = None) -> None:
-    for kind, table in _edge_tables(edges, elide=elide, node_units=node_units,
-                                    codec=codec, id_codes=id_codes).items():
-        path = os.path.join(stage_dir, f"rel_{kind}.parquet")
-        pq.write_table(table, path)
+    writers = {}
+    paths = collections.defaultdict(list)
+    rows = collections.defaultdict(int)
+    def flush(kind: str) -> None:
+        writer = writers.pop(kind, None)
+        if writer is None:
+            return
+        writer.close()
+        path = paths[kind][-1]
         conn.execute(f"COPY {kind} FROM '{path}'")
+        os.unlink(path)
+        rows[kind] = 0
+    for offset in range(0, len(edges), 10_000):
+        batch = edges[offset:offset + 10_000]
+        for kind, table in _edge_tables(
+            batch, elide=elide, node_units=node_units, codec=codec,
+            id_codes=id_codes, index_offset=offset,
+        ).items():
+            writer = writers.get(kind)
+            if writer is None:
+                path = os.path.join(stage_dir, f"rel_{kind}.{len(paths[kind])}.parquet")
+                paths[kind].append(path)
+                writer = pq.ParquetWriter(path, table.schema)
+                writers[kind] = writer
+            writer.write_table(table)
+            rows[kind] += table.num_rows
+            if rows[kind] >= STREAM_EDGE_COPY_PARTITION_ROWS:
+                flush(kind)
+    for kind in list(writers):
+        flush(kind)
 
 
 def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: str,
