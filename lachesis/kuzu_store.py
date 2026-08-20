@@ -55,7 +55,10 @@ import tempfile
 import zlib
 from typing import Iterable, Optional, Sequence
 
-from lachesis.indices import build_callsite_index, build_decl_index, exported_ids, index_rows
+from lachesis.indices import (
+    CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
+    exported_ids, index_rows,
+)
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
     import kuzu  # type: ignore
@@ -1179,3 +1182,101 @@ def _load_index_rowwise(conn, table_name: str, columns: tuple, rows: list, *,
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool = True,
+                      overwrite: bool = True) -> str:
+    """Materialize a streaming shard reader without a whole graph dictionary."""
+    if kuzu is None:
+        raise RuntimeError("kuzu is required for streamed materialization")
+    db_dir = os.path.abspath(db_dir)
+    if os.path.exists(db_dir):
+        if not overwrite:
+            raise FileExistsError(db_dir)
+        shutil.rmtree(db_dir) if os.path.isdir(db_dir) else os.remove(db_dir)
+    os.makedirs(db_dir, exist_ok=True)
+
+    kept_ids: set[str] = set()
+    node_units: dict[str, str] = {}
+    prefixes: set[str] = set()
+    indexed_nodes: list[dict] = []
+    for node in shard_reader.nodes():
+        kind = node.get("kind")
+        if prune and kind in PRUNE_NODE_KINDS:
+            continue
+        node_id = node["id"]
+        props = node.get("properties") or {}
+        kept_ids.add(node_id)
+        if props.get("file"):
+            node_units[node_id] = props["file"]
+        for value in (node_id, props.get("compiler_node_id")):
+            match = _ID_SHAPE.match(value) if isinstance(value, str) else None
+            if match:
+                prefixes.add(match.group(1))
+        if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
+            indexed_nodes.append(node)
+
+    exported: set[str] = set()
+    unresolved_count = 0
+    for edge in shard_reader.edges():
+        if edge.get("kind") == "EXPORTS" and edge.get("target"):
+            exported.add(edge["target"])
+        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+            unresolved_count += 1
+        for value in (edge.get("source"), edge.get("target")):
+            match = _ID_SHAPE.match(value) if isinstance(value, str) else None
+            if match:
+                prefixes.add(match.group(1))
+    id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
+
+    db = kuzu.Database(db_file(db_dir))
+    conn = kuzu.Connection(db)
+    conn.execute(_node_ddl())
+    for stmt in _rel_ddl():
+        conn.execute(stmt)
+    for stmt in _index_ddl():
+        conn.execute(stmt)
+    codec = PropsCodec()
+    batch: list[dict] = []
+    for node in shard_reader.nodes():
+        if prune and node.get("kind") in PRUNE_NODE_KINDS:
+            continue
+        batch.append(node)
+        if len(batch) >= 10_000:
+            _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
+            batch.clear()
+    if batch:
+        _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
+
+    batch = []
+    kept_edge_count = 0
+    for edge in shard_reader.edges():
+        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+            continue
+        batch.append(edge)
+        kept_edge_count += 1
+        if len(batch) >= 10_000:
+            _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
+                                codec=codec, id_codes=id_codes)
+            batch.clear()
+    if batch:
+        _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
+                            codec=codec, id_codes=id_codes)
+
+    decl_rows = index_rows(build_decl_index(indexed_nodes, exported))
+    callsite_rows = index_rows(build_callsite_index(indexed_nodes))
+    _load_index_rowwise(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows, id_codes=id_codes)
+    _load_index_rowwise(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
+                        callsite_rows, id_codes=id_codes)
+    payload = manifest_payload({"nodes": [], "edges": []}, snapshots)
+    payload.update({
+        "node_count": len(kept_ids), "edge_count": kept_edge_count,
+        "unresolved_edge_count": unresolved_count,
+        "dropped_node_count": 0, "deferred_edge_count": 0,
+        "decl_index_count": len(decl_rows), "callsite_index_count": len(callsite_rows),
+        "streamed": True, PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
+    })
+    with open(store_manifest_file(db_dir), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return db_dir
