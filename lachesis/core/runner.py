@@ -4,16 +4,19 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from . import graph_pb2
-from .graph_wire import iter_tier_records
+from .graph_wire import decode_node, iter_tier_records
 from .shards import ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
 
 
-def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
+def _persist_shard(
+    snapshot: FrontendSnapshot, root: Optional[str],
+    *, keep_node: Optional[Callable[[dict], bool]] = None,
+) -> None:
     """Persist a language-neutral cache shard when the caller opts in."""
     if not root:
         return
@@ -22,9 +25,15 @@ def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
     shard_id = snapshot.manifest.get("source_content_hash", "0")
     writer = shard_set.start(str(shard_id))
     try:
+        retained = set()
         for node in snapshot.nodes:
+            if keep_node is not None and not keep_node(node):
+                continue
             writer.add_node(node)
+            retained.add(node["id"])
         for edge in snapshot.edges:
+            if keep_node is not None and edge.get("source") not in retained:
+                continue
             writer.add_edge(edge)
         shard_set.complete(str(shard_id), writer)
     except Exception:
@@ -34,6 +43,7 @@ def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
 
 def _stream_bundle_to_shard(
     output_dir: str, root: str, stdout: str, stderr: str,
+    *, keep_node: Optional[Callable[[dict], bool]] = None,
 ) -> FrontendSnapshot:
     """Persist a protobuf bundle record-by-record, without loading its tier arrays."""
     manifest = load_manifest(output_dir)
@@ -43,6 +53,7 @@ def _stream_bundle_to_shard(
     shard_id = manifest.get("source_content_hash", "0")
     writer = shard_set.start(str(shard_id))
     node_count = edge_count = 0
+    retained_node_ids: set[str] = set()
     try:
         for tier_name, tier_path in ((item.get("tier"), os.path.join(output_dir, item.get("file", "")))
                                      for item in manifest.get("tiers", [])):
@@ -50,14 +61,29 @@ def _stream_bundle_to_shard(
                 if collection == "nodes":
                     message = graph_pb2.NodeRecord()
                     message.ParseFromString(payload)
+                    node = None
+                    if keep_node is not None:
+                        # The predicate is intentionally applied while the protobuf
+                        # record is live.  It lets package-sharded builds discard
+                        # imported dependency views without materialising a bundle.
+                        node = decode_node(message.SerializeToString())
+                        if not keep_node(node):
+                            continue
+                    if node is not None:
+                        node_id = node["id"]
+                    else:
+                        node_id = message.id
                     message.tier = tier_name
                     writer.add_node_payload(message.SerializeToString())
+                    retained_node_ids.add(node_id)
                     node_count += 1
                     continue
                 message = graph_pb2.EdgeRecord()
                 message.ParseFromString(payload)
                 message.source_tier = tier_name
                 message.relationship_class = collection
+                if keep_node is not None and message.source not in retained_node_ids:
+                    continue
                 writer.add_edge_payload(message.SerializeToString())
                 edge_count += 1
         shard_set.complete(str(shard_id), writer)
@@ -111,10 +137,12 @@ def run_frontend(
     output_dir: Optional[str] = None,
     timeout_seconds: int = 300,
     roots: Optional[Sequence[str]] = None,
+    keep_node: Optional[Callable[[dict], bool]] = None,
 ) -> FrontendSnapshot:
     if _in_process_applies(frontend, output_dir):
         snapshot = frontend.in_process(source_dir, roots)
-        _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"))
+        _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"),
+                       keep_node=keep_node)
         return snapshot
     temporary = None
     if output_dir is None:
@@ -151,6 +179,7 @@ def run_frontend(
         if shard_root:
             snapshot = _stream_bundle_to_shard(
                 output_dir, shard_root, completed.stdout, completed.stderr,
+                keep_node=keep_node,
             )
         else:
             snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)

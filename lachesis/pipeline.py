@@ -392,6 +392,7 @@ def run_project_streaming_parallel(
 
     readers = []
     snapshots = []
+    seen_external_ids: set[str] = set()
     previous = os.environ.get("LACHESIS_SHARD_ROOT")
     try:
         for frontend_id, package, compile_root, output_dir, roots in jobs:
@@ -402,9 +403,42 @@ def run_project_streaming_parallel(
             job_shard_root = os.path.join(shard_root, frontend_id, slug)
             os.makedirs(job_shard_root, exist_ok=True)
             os.environ["LACHESIS_SHARD_ROOT"] = job_shard_root
+
+            # A package compiler also sees imported workspace files.  Keep only the
+            # files owned by this exact root-list chunk; their owning chunk will emit
+            # the canonical, richer record.  This is the streaming equivalent of
+            # ``_merge_package_graphs``' ownership rule and prevents duplicate primary
+            # keys in Kùzu without retaining a graph-sized winner map.
+            owned_files = {os.path.abspath(path) for path in roots}
+            source_prefix = source_dir.rstrip(os.sep) + os.sep
+
+            def keep_node(node: dict) -> bool:
+                properties = node.get("properties") or {}
+                absolute = properties.get("absolute_file")
+                if not isinstance(absolute, str):
+                    relative = properties.get("file")
+                    if isinstance(relative, str) and not os.path.isabs(relative):
+                        absolute = os.path.abspath(os.path.join(compile_root, relative))
+                if isinstance(absolute, str):
+                    absolute = os.path.abspath(absolute)
+                    if absolute in owned_files:
+                        return True
+                    if not absolute.startswith(source_prefix):
+                        if node["id"] in seen_external_ids:
+                            return False
+                        seen_external_ids.add(node["id"])
+                        return True
+                    return False
+                # Synthetic/package/lib nodes have no source file. Keep one
+                # deterministic copy, matching the existing merge's first-wins rule.
+                if node["id"] in seen_external_ids:
+                    return False
+                seen_external_ids.add(node["id"])
+                return True
+
             snapshot = run_frontend(
                 registry.get(frontend_id), compile_root, output_dir, timeout_seconds,
-                roots=roots,
+                roots=roots, keep_node=keep_node,
             )
             snapshots.append(snapshot)
             readers.append(ShardSetReader(

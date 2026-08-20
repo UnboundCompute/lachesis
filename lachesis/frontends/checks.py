@@ -2785,7 +2785,7 @@ class CompilerFrontendTests(unittest.TestCase):
         )
 
     def test_streaming_parallel_packages_releases_snapshot_payloads(self) -> None:
-        from lachesis.pipeline import run_project_streaming_parallel
+        from lachesis.pipeline import run_project_parallel, run_project_streaming_parallel
 
         workspace = str(WORKSPACE_FIXTURE)
         with tempfile.TemporaryDirectory() as output:
@@ -2797,8 +2797,25 @@ class CompilerFrontendTests(unittest.TestCase):
             self.assertEqual(2, len(readers))
             self.assertEqual(2, len(snapshots))
             self.assertTrue(all(snapshot.released for snapshot in snapshots))
-            self.assertGreater(sum(1 for reader in readers for _ in reader.nodes()), 0)
-            self.assertGreater(sum(1 for reader in readers for _ in reader.edges()), 0)
+            nodes = [node for reader in readers for node in reader.nodes()]
+            edges = [edge for reader in readers for edge in reader.edges()]
+            self.assertEqual(len(nodes), len({node["id"] for node in nodes}))
+            self.assertGreater(len(nodes), 0)
+            self.assertGreater(len(edges), 0)
+            reference, _, _ = run_project_parallel(
+                workspace, os.path.join(output, "reference"), enrich=False,
+                max_workers=1, max_files_per_package=1,
+            )
+            self.assertEqual(
+                {node["id"] for node in reference["nodes"]},
+                {node["id"] for node in nodes},
+            )
+            self.assertEqual(
+                {(edge["kind"], edge["source"], edge["target"])
+                 for edge in reference["edges"]},
+                {(edge["kind"], edge["source"], edge["target"])
+                 for edge in edges},
+            )
 
     def test_parallel_package_build_matches_serial_over_the_same_partition(self) -> None:
         # Lever 3. The claim is narrow and deliberate: a pooled per-package build equals
