@@ -74,6 +74,12 @@ The `fs` result is intentionally retained as a failure boundary. A large-codebas
 optimization must move that row from “stopped” to a validated node/edge count; a
 smaller successful subsystem is not considered a substitute.
 
+The Linux `fs` cold-start source scan used for the current north-star measurement
+contains **2,185 C/C++/header files and 1,634,709 source lines** (about 50 MB). Its
+source-to-core run completed in 618.03s; the 64.98s shard-persistence and 150.66s
+Kùzu-materialization figures are warm/component measurements and must not be presented
+as cold-start user experience.
+
 The CLI/enrichment row is also a boundary, not a timing result: the frontend process
 must finish before composition and enrichment can begin. It is kept to prevent a
 misleading claim that pass 2 has been optimized when pass 1 has not yet completed on
