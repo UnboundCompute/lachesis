@@ -1773,64 +1773,76 @@ def main() -> int:
         if source_tier:
             edges_by_tier[source_tier].append(edge)
 
-    def serialized_payload(payload: dict) -> dict:
-        defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
+    defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
 
-        def with_defaults(item: dict) -> dict:
-            # ``as_dict`` has already allocated the emission record.  Copying that
-            # record and its properties again for every fact briefly doubled the
-            # largest tier at flush time; defaults are immutable contract values, so
-            # fill the existing mapping in place and keep only one record alive.
-            properties = item.setdefault("properties", {})
-            for key, value in defaults.items():
-                properties.setdefault(key, value)
-            return item
+    def with_defaults(item: dict) -> dict:
+        # The record is encoded immediately by ``write_tier``.  Keeping this mapping
+        # alive for one record rather than an entire tier removes a temporary second
+        # graph-sized allocation at C bundle flush time.
+        properties = item.setdefault("properties", {})
+        for key, value in defaults.items():
+            properties.setdefault(key, value)
+        return item
 
-        return {
-            **payload,
-            "nodes": [with_defaults(item) for item in payload["nodes"]],
-            "edges": [with_defaults(item) for item in payload["edges"]],
-            "expands_to": [with_defaults(item) for item in payload["expands_to"]],
-            "links": [with_defaults(item) for item in payload["links"]],
-        }
+    def edge_key(edge: Edge) -> tuple[str, str, str]:
+        return edge["kind"], edge["source"], edge["target"]
 
     for tier, name in TIERS.items():
-        payload = {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
-        payload["nodes"].extend(
-            graph.nodes[node_id].as_dict() for node_id in graph.nodes_by_tier.get(tier, ())
-        )
+        node_ids = sorted(graph.nodes_by_tier.get(tier, ()))
+        same_tier: List[Edge] = []
+        expands_to: List[Edge] = []
+        links: List[Tuple[Edge, str]] = []
         for edge in edges_by_tier.get(tier, ()):
             source_tier = tier
             target_tier = graph.node_tier.get(edge["target"])
             if source_tier != tier or not target_tier:
                 continue
             if source_tier == target_tier:
-                payload["edges"].append(edge.as_dict())
+                same_tier.append(edge)
             elif edge["kind"] in structural:
-                payload["expands_to"].append({
+                expands_to.append(edge)
+            else:
+                links.append((edge, target_tier))
+        same_tier.sort(key=edge_key)
+        expands_to.sort(key=edge_key)
+        links.sort(key=lambda item: edge_key(item[0]))
+
+        def node_records():
+            for node_id in node_ids:
+                yield with_defaults(graph.nodes[node_id].as_dict())
+
+        def edge_records():
+            for edge in same_tier:
+                yield with_defaults(edge.as_dict())
+
+        def expand_records():
+            for edge in expands_to:
+                yield with_defaults({
                     "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
                     "properties": {"via": edge["kind"]},
                 })
-            else:
-                payload["links"].append({
+
+        def link_records():
+            for edge, target_tier in links:
+                yield with_defaults({
                     **edge.as_dict(),
                     "properties": {**edge["properties"], "target_tier": target_tier},
                 })
-        payload["nodes"].sort(key=lambda item: item["id"])
-        for collection in ("edges", "expands_to", "links"):
-            payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
+
         tier_counts[tier] = {
-            "node_count": len(payload["nodes"]),
-            "edge_count": len(payload["edges"]),
-            "expands_to_count": len(payload["expands_to"]),
-            "cross_tier_link_count": len(payload["links"]),
+            "node_count": len(node_ids),
+            "edge_count": len(same_tier),
+            "expands_to_count": len(expands_to),
+            "cross_tier_link_count": len(links),
         }
-        emitted_edge_count += sum(
-            len(payload[collection]) for collection in ("edges", "expands_to", "links")
-        )
+        emitted_edge_count += len(same_tier) + len(expands_to) + len(links)
         tier_path = output_dir / f"{tier.lower()}_{name}.pb"
-        write_tier(tier_path, serialized_payload(payload))
-        del payload
+        write_tier(tier_path, {
+            "tier": tier, "name": name, "nodes": node_records(),
+            "edges": edge_records(), "expands_to": expand_records(),
+            "links": link_records(),
+        })
+        del node_ids, same_tier, expands_to, links
     emitted_node_count = len(graph.nodes)
     graph_edge_count = len(graph.edges)
     dropped_edge_count = graph_edge_count - emitted_edge_count
