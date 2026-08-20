@@ -30,7 +30,8 @@ arrays and preserves graph facts; the tradeoff is a larger/slightly slower store
 For a hard Kùzu cache ceiling, set `LACHESIS_KUZU_BUFFER_POOL_SIZE` to a byte count
 (for example `1073741824` for 1 GiB). This is especially important in GitHub Action
 runners, where automatic pool sizing can otherwise consume the runner before the
-graph is published.
+graph is published. The explicit `--stream-shards` path defaults to a 1 GiB pool;
+set the variable when tuning that bound for a particular runner.
 
 The bounded core-only path uses the same direct package command exposed in README:
 
