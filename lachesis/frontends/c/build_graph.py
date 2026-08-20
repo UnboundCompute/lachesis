@@ -585,7 +585,10 @@ class Graph:
         # one canonical string object instead of retaining a fresh copy per edge.
         node_id = sys.intern(node_id)
         kind = sys.intern(kind)
-        canonical = dict(properties)
+        # ``**properties`` is already a fresh per-call dictionary.  Copying it
+        # again doubled the live property-map allocation for every node on large
+        # trees without protecting any caller-owned mapping.
+        canonical = properties
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
             # Clang can spell the same included file with redundant ``./`` or
@@ -623,7 +626,9 @@ class Graph:
         kind = sys.intern(kind)
         source = sys.intern(source)
         target = sys.intern(target)
-        canonical = dict(properties)
+        # ``**properties`` is already a fresh per-call dictionary; retain it
+        # directly instead of allocating a second map for every edge.
+        canonical = properties
         if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
         self.edges.append(Edge(kind, source, target, canonical))
