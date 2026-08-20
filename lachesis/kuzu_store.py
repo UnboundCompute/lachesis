@@ -1240,16 +1240,38 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     for stmt in _index_ddl():
         conn.execute(stmt)
     codec = PropsCodec()
+    bulk = pa is not None and pq is not None
+    stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
+
+    def load_nodes(batch: list[dict]) -> None:
+        if not batch:
+            return
+        if bulk:
+            _load_nodes_bulk(conn, batch, elide=True, stage_dir=stage.name,
+                             codec=codec, id_codes=id_codes)
+        else:
+            _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
+
+    def load_edges(batch: list[dict]) -> None:
+        if not batch:
+            return
+        if bulk:
+            _load_edges_bulk(conn, batch, elide=True, stage_dir=stage.name,
+                             node_units=node_units, codec=codec, id_codes=id_codes)
+        else:
+            _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
+                                codec=codec, id_codes=id_codes)
+
     batch: list[dict] = []
     for node in shard_reader.nodes():
         if prune and node.get("kind") in PRUNE_NODE_KINDS:
             continue
         batch.append(node)
         if len(batch) >= 10_000:
-            _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
+            load_nodes(batch)
             batch.clear()
     if batch:
-        _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
+        load_nodes(batch)
 
     batch = []
     kept_edge_count = 0
@@ -1259,12 +1281,12 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         batch.append(edge)
         kept_edge_count += 1
         if len(batch) >= 10_000:
-            _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
-                                codec=codec, id_codes=id_codes)
+            load_edges(batch)
             batch.clear()
     if batch:
-        _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
-                            codec=codec, id_codes=id_codes)
+        load_edges(batch)
+    if stage is not None:
+        stage.cleanup()
 
     decl_rows = index_rows(build_decl_index(indexed_nodes, exported))
     callsite_rows = index_rows(build_callsite_index(indexed_nodes))
