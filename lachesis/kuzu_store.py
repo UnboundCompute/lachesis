@@ -994,9 +994,8 @@ def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
     conn.execute(f"COPY Node FROM '{path}'")
 
 
-def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
-                     node_units: dict, codec: PropsCodec,
-                     id_codes: Optional[dict] = None) -> None:
+def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
+                 codec: PropsCodec, id_codes: Optional[dict] = None) -> dict:
     # group edges by destination table; column order is the rel-COPY contract
     # (endpoint PKs first, then properties in table-definition order).
     hot: dict[str, dict[str, list]] = {
@@ -1028,6 +1027,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             cold["unit"].append(unit)
             cold["props"].append(stored)
 
+    tables = {}
     for kind, bucket in hot.items():
         if not bucket["src"]:
             continue
@@ -1036,9 +1036,7 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             "unit": _str_col(bucket["unit"]),
             "props": pa.array(bucket["props"], pa.binary()),
         })
-        path = os.path.join(stage_dir, f"rel_{kind}.parquet")
-        pq.write_table(table, path)
-        conn.execute(f"COPY {kind} FROM '{path}'")
+        tables[kind] = table
 
     if cold["src"]:
         table = pa.table({
@@ -1047,9 +1045,18 @@ def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
             "unit": _str_col(cold["unit"]),
             "props": pa.array(cold["props"], pa.binary()),
         })
-        path = os.path.join(stage_dir, "rel_EDGE.parquet")
+        tables["EDGE"] = table
+    return tables
+
+
+def _load_edges_bulk(conn, edges: list[dict], *, elide: bool, stage_dir: str,
+                     node_units: dict, codec: PropsCodec,
+                     id_codes: Optional[dict] = None) -> None:
+    for kind, table in _edge_tables(edges, elide=elide, node_units=node_units,
+                                    codec=codec, id_codes=id_codes).items():
+        path = os.path.join(stage_dir, f"rel_{kind}.parquet")
         pq.write_table(table, path)
-        conn.execute(f"COPY EDGE FROM '{path}'")
+        conn.execute(f"COPY {kind} FROM '{path}'")
 
 
 def _load_deferred_bulk(conn, deferred: list[dict], *, elide: bool, stage_dir: str,
@@ -1298,6 +1305,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     codec = PropsCodec()
     bulk = pa is not None and pq is not None
     stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
+    edge_writers = {}
+    edge_paths = {}
 
     def load_nodes(batch: list[dict]) -> None:
         if not batch:
@@ -1312,8 +1321,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         if not batch:
             return
         if bulk:
-            _load_edges_bulk(conn, batch, elide=True, stage_dir=stage.name,
-                             node_units=node_units, codec=codec, id_codes=id_codes)
+            for kind, table in _edge_tables(
+                batch, elide=True, node_units=node_units,
+                codec=codec, id_codes=id_codes,
+            ).items():
+                writer = edge_writers.get(kind)
+                if writer is None:
+                    path = os.path.join(stage.name, f"rel_{kind}.parquet")
+                    edge_paths[kind] = path
+                    writer = pq.ParquetWriter(path, table.schema)
+                    edge_writers[kind] = writer
+                writer.write_table(table)
         else:
             _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
                                 codec=codec, id_codes=id_codes)
@@ -1341,6 +1359,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             batch.clear()
     if batch:
         load_edges(batch)
+    if bulk:
+        for kind, writer in edge_writers.items():
+            writer.close()
+            conn.execute(f"COPY {kind} FROM '{edge_paths[kind]}'")
     index_stage.flush()
     index_stage.seek(0)
     indexed_nodes = (json.loads(line) for line in index_stage if line.strip())
