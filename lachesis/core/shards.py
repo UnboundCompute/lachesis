@@ -37,8 +37,16 @@ class ShardWriter:
         write_frame(self._nodes, encode_node(node))
         self.node_count += 1
 
+    def add_node_payload(self, payload: bytes) -> None:
+        write_frame(self._nodes, payload)
+        self.node_count += 1
+
     def add_edge(self, edge: dict) -> None:
         write_frame(self._edges, encode_edge(edge))
+        self.edge_count += 1
+
+    def add_edge_payload(self, payload: bytes) -> None:
+        write_frame(self._edges, payload)
         self.edge_count += 1
 
     def close(self) -> None:

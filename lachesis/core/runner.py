@@ -7,8 +7,10 @@ import tempfile
 from typing import Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
+from . import graph_pb2
+from .graph_wire import iter_tier_records
 from .shards import ShardSetWriter
-from .snapshot import iter_snapshot_records, load_manifest, load_snapshot
+from .snapshot import load_manifest, load_snapshot
 
 
 def _persist_shard(snapshot: FrontendSnapshot, root: Optional[str]) -> None:
@@ -42,11 +44,22 @@ def _stream_bundle_to_shard(
     writer = shard_set.start(str(shard_id))
     node_count = edge_count = 0
     try:
-        for collection, record in iter_snapshot_records(output_dir, manifest):
-            if collection == "nodes":
-                writer.add_node(record); node_count += 1
-            else:
-                writer.add_edge(record); edge_count += 1
+        for tier_name, tier_path in ((item.get("tier"), os.path.join(output_dir, item.get("file", "")))
+                                     for item in manifest.get("tiers", [])):
+            for collection, payload in iter_tier_records(tier_path, raw=True):
+                if collection == "nodes":
+                    message = graph_pb2.NodeRecord()
+                    message.ParseFromString(payload)
+                    message.tier = tier_name
+                    writer.add_node_payload(message.SerializeToString())
+                    node_count += 1
+                    continue
+                message = graph_pb2.EdgeRecord()
+                message.ParseFromString(payload)
+                message.source_tier = tier_name
+                message.relationship_class = collection
+                writer.add_edge_payload(message.SerializeToString())
+                edge_count += 1
         shard_set.complete(str(shard_id), writer)
     except Exception:
         writer.close()

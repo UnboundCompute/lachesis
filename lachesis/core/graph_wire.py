@@ -218,7 +218,7 @@ def _take_varint(buffer: bytearray):
     return None
 
 
-def iter_tier_records(path: str | Path):
+def iter_tier_records(path: str | Path, *, raw: bool = False):
     """Yield typed tier records while reading a tier file in bounded chunks."""
     buffer = bytearray()
     with open(path, "rb") as handle:
@@ -247,9 +247,10 @@ def iter_tier_records(path: str | Path):
                 payload = bytes(buffer[start:end])
                 del buffer[:end]
                 if number == 3:
-                    yield "nodes", decode_node(payload)
+                    yield "nodes", payload if raw else decode_node(payload)
                 elif number in (4, 5, 6):
-                    yield {4: "edges", 5: "expands_to", 6: "links"}[number], decode_edge(payload)
+                    collection = {4: "edges", 5: "expands_to", 6: "links"}[number]
+                    yield collection, payload if raw else decode_edge(payload)
             if eof:
                 if buffer:
                     raise ValueError(f"truncated protobuf tier: {path}")
