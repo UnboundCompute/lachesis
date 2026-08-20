@@ -269,8 +269,11 @@ def _compact(value, loc: _Loc):
     """Recursively drop stripped/empty keys and relativize any `file`+`line` pair."""
     if isinstance(value, dict):
         out = {}
+        if value.get("file"):
+            out["at"] = loc.of(value["file"], value.get("line"))
         for k, v in value.items():
-            if k in _STRIP_KEYS or v is None or v == [] or v == {}:
+            if k in _STRIP_KEYS or k == "file" or (k == "line" and value.get("file")) \
+                    or v is None or v == [] or v == {}:
                 continue
             out[k] = _compact(v, loc)
         return out
@@ -309,6 +312,10 @@ def _generic(tool_name: str, result: dict, offset: int, limit: int) -> str:
                             parts.append(loc.of(iv, item.get("line")))
                         elif ik == "line" and "file" in item:
                             continue
+                        elif isinstance(iv, dict):
+                            label = iv.get("name") or iv.get("type") or iv.get("kind") or ik
+                            suffix = f"@{iv['at']}" if iv.get("at") else ""
+                            parts.append(f"{ik}={label}{suffix}")
                         else:
                             parts.append(f"{ik}={iv}")
                     lines.append("    " + "  ".join(parts))

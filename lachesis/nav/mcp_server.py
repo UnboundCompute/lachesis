@@ -43,6 +43,7 @@ from lachesis.nav.folder_graph import build_folder_graph
 from lachesis.nav.file_graph import build_file_graph, _find_file_node
 from lachesis.nav import render as render_mod
 from lachesis.nav import skeleton as skeleton_mod
+from lachesis.nav.comprehension import Comprehension
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
@@ -105,6 +106,9 @@ OVERLAY_SEED_ARGS = {
 TOOL_ORDER = (
     "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
+    "unknowns", "coverage_map", "field_history", "sibling_compare",
+    "type_explain", "component_boundary", "indirect_targets",
+    "architecture_map", "execution_story",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
@@ -197,6 +201,10 @@ class _Ctx:
     @property
     def hubs(self):
         return self._analysis("hubs", lambda: Hubs(self.store.gl))
+
+    @property
+    def comprehension(self):
+        return self._analysis("comprehension", lambda: Comprehension(self.store))
 
     @property
     def candidate_bundle(self):
@@ -328,6 +336,59 @@ TOOLS = [
          "overlay": {"type": "string"},
          "profile": {"type": "string", "enum": ["all", "comprehension"]}},
          "required": ["path"]}},
+    {"name": "unknowns",
+     "description": "Explicit comprehension frontiers: unresolved calls, dynamic runtime "
+                    "behavior, and parser/compiler diagnostics. Distinguishes proven-absent "
+                    "from couldn't-cross instead of silently treating missing graph facts as none.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string", "description": "optional function name or node id"},
+         "limit": {"type": "integer", "default": 100}}}},
+    {"name": "coverage_map",
+     "description": "Deterministic indexed-graph coverage by component: files, callable bodies, "
+                    "diagnostics, and unmodeled frontiers. This reports graph coverage, not mutable "
+                    "per-client session activity.",
+     "inputSchema": {"type": "object", "properties": {
+         "component_depth": {"type": "integer", "default": 1}}}},
+    {"name": "field_history",
+     "description": "For a field/property, list graph-evidenced initialization, modification, "
+                    "reads, checks, and value-flow events with owning functions.",
+     "inputSchema": {"type": "object", "properties": {
+         "field": {"type": "string"},
+         "owner_type": {"type": "string", "description": "optional type name/id disambiguator"}},
+         "required": ["field"]}},
+    {"name": "sibling_compare",
+     "description": "Compare structurally similar callables by callees and control structure. "
+                    "Returns differences as facts only; it does not rank anomalies or issue verdicts.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}}, "required": ["symbol"]}},
+    {"name": "type_explain",
+     "description": "Explain a type from graph facts: fields and constructor, mutator, consumer, "
+                    "and destructor method roles.",
+     "inputSchema": {"type": "object", "properties": {
+         "type": {"type": "string"}}, "required": ["type"]}},
+    {"name": "component_boundary",
+     "description": "Show calls, callbacks, and type references crossing between two path "
+                    "components, in both directions, with confidence and source locations.",
+     "inputSchema": {"type": "object", "properties": {
+         "from_component": {"type": "string"}, "to_component": {"type": "string"}},
+         "required": ["from_component", "to_component"]}},
+    {"name": "indirect_targets",
+     "description": "Resolve function-pointer, callback, ops-table, and runtime dispatch sites "
+                    "inside a function. Keeps unresolved sites visible and reports confidence.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string"}}, "required": ["function"]}},
+    {"name": "architecture_map",
+     "description": "Deterministic file communities over the call + dependency graph, with "
+                    "internal/boundary edge counts and call-graph hubs. Returns no generated labels.",
+     "inputSchema": {"type": "object", "properties": {
+         "component_depth": {"type": "integer", "default": 2},
+         "max_communities": {"type": "integer", "default": 30}}}},
+    {"name": "execution_story",
+     "description": "Bounded forward call-and-branch trace from an entry point, including resolved "
+                    "indirect dispatch. Returns graph structure, not generated narrative prose.",
+     "inputSchema": {"type": "object", "properties": {
+         "entry": {"type": "string"}, "max_depth": {"type": "integer", "default": 5},
+         "max_steps": {"type": "integer", "default": 100}}, "required": ["entry"]}},
     {"name": "guards_top",
      "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
                     "name knowledge needed — a security-hunting entry point (for the spine of an "
@@ -590,6 +651,41 @@ def call_tool(name, args, format=None):
     cone = _fold_cone(c.store, name, args)
     store, gl = c.store, c.store.gl
     text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
+
+    if name == "unknowns":
+        result = c.comprehension.unknowns(
+            function=args.get("function"), limit=int(args.get("limit", 100)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "coverage_map":
+        result = c.comprehension.coverage_map(
+            component_depth=int(args.get("component_depth", 1)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "field_history":
+        result = c.comprehension.field_history(args["field"], args.get("owner_type"))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "sibling_compare":
+        result = c.comprehension.sibling_compare(args["symbol"])
+        return _emit(name, result, fmt, offset, limit)
+    if name == "type_explain":
+        result = c.comprehension.type_explain(args["type"])
+        return _emit(name, result, fmt, offset, limit)
+    if name == "component_boundary":
+        result = c.comprehension.component_boundary(
+            args["from_component"], args["to_component"])
+        return _emit(name, result, fmt, offset, limit)
+    if name == "indirect_targets":
+        return _emit(name, c.comprehension.indirect_targets(args["function"]),
+                     fmt, offset, limit)
+    if name == "architecture_map":
+        result = c.comprehension.architecture_map(
+            component_depth=int(args.get("component_depth", 2)),
+            max_communities=int(args.get("max_communities", 30)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "execution_story":
+        result = c.comprehension.execution_story(
+            args["entry"], max_depth=int(args.get("max_depth", 5)),
+            max_steps=int(args.get("max_steps", 100)))
+        return _emit(name, result, fmt, offset, limit)
 
     if name == "guards_top":
         rows = c.guards.top(int(args.get("n", 20)))
