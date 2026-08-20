@@ -58,6 +58,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `2c00f9d` | Linux `net` CLI + `--stream-shards` | >541* | — | partial | — | — | ~4.2* | Frontend completed; rowwise Kùzu load did not finish. Stream publication is now atomic. |
 | 2026-08-20 | `2db7808` | Linux `net` shard materialization, 1 GiB Kùzu pool | >298* | — | stopped | — | — | ~3.6* | Memory stayed bounded; stopped on host disk exhaustion before manifest publication. Not a valid graph result. |
 | 2026-08-20 | `109a3aa` | Linux `net` shard materialization, 1 GiB pool + 256 MiB checkpoints | — | — | 678.7 | 1,822,752 | 3,485,899 | ~4.1* | Completed and reopened; manifest/index counts match the Kùzu tables. Peak is the highest sampled RSS, not a kernel max-RSS reading. |
+| 2026-08-20 | `5bd50eb` | Linux `net` shard materialization, coalesced node/edge COPY | — | — | 94.66 | 1,822,752 | 3,485,899 | ~1.6* | Completed and reopened; all manifest/index counts match. One Parquet stream/COPY per table removes per-batch Kùzu overhead. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
