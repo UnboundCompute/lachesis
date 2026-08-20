@@ -224,6 +224,14 @@ the Python byte scanner was both slower and lossy, so it is not an accepted memo
 optimization. A future streaming parser must prove byte-for-byte graph parity before
 being used on large trees.
 
+### Rejected compact Clang raw-ID map
+
+An experiment normalized hexadecimal Clang declaration ids to integer dictionary keys
+(``raw-id`` micro-optimization). It lowered the 254-file ``net/netfilter`` sample by
+about 3.6 MiB, but the whole 1,738-file ``linux/net`` run rose from 3,442,147,328 to
+3,761,340,416 bytes peak RSS (wall time stayed near 219s). The change was reverted;
+the whole-tree result, not the small-subsystem result, is the acceptance gate.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
