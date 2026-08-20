@@ -556,10 +556,10 @@ class Graph:
         self.edge_keys = _EdgeKeys()
 
     def node(self, tier: str, node_id: str, kind: str, label: str, **properties) -> str:
-        canonical = {
-            "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-            **properties,
-        }
+        # Defaults are restored at bundle serialization. Keeping them out of every
+        # live node/edge property dict saves three repeated values per fact while all
+        # in-memory analysis sees the same effective defaults via ``.get``.
+        canonical = dict(properties)
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
             cached = RESOLVED_FILES.get(absolute_file)
@@ -588,10 +588,10 @@ class Graph:
     def edge(self, kind: str, source: Optional[str], target: Optional[str], **properties) -> None:
         if not source or not target or source == target:
             return
-        canonical = {
-            "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-            **properties,
-        }
+        # Defaults are restored at bundle serialization. Keeping them out of every
+        # live node/edge property dict saves three repeated values per fact while all
+        # in-memory analysis sees the same effective defaults via ``.get``.
+        canonical = dict(properties)
         if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
         self.edges.append({
@@ -1610,7 +1610,9 @@ def main() -> int:
         len(p["edges"]) + len(p["expands_to"]) + len(p["links"])
         for p in tier_payloads.values()
     )
-    dropped_edge_count = len(graph.edges) - emitted_edge_count
+    emitted_node_count = len(graph.nodes)
+    graph_edge_count = len(graph.edges)
+    dropped_edge_count = graph_edge_count - emitted_edge_count
 
     analyzed_file_count = len(files) - len(failed_files)
     # Honest coverage: a file that failed to parse contributes only its file node,
@@ -1644,7 +1646,7 @@ def main() -> int:
         "source_dir": str(source_dir), "root_file_count": len(files),
         "analyzed_file_count": analyzed_file_count,
         "failed_file_count": len(failed_files),
-        "node_count": len(graph.nodes), "edge_count": emitted_edge_count,
+        "node_count": emitted_node_count, "edge_count": emitted_edge_count,
         "dropped_edge_count": dropped_edge_count,
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
@@ -1667,12 +1669,36 @@ def main() -> int:
     # (the in-process route in snapshot.py forbids tuples / non-string keys and a
     # check enforces it), so marshal round-trips them identically to json. The tiny
     # manifest stays human-readable json.
+    defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
+
+    def serialized_payload(payload: dict) -> dict:
+        def node(item: dict) -> dict:
+            return {**item, "properties": {**defaults, **item.get("properties", {})}}
+
+        def edge(item: dict) -> dict:
+            return {**item, "properties": {**defaults, **item.get("properties", {})}}
+
+        return {
+            **payload,
+            "nodes": [node(item) for item in payload["nodes"]],
+            "edges": [edge(item) for item in payload["edges"]],
+            "expands_to": [edge(item) for item in payload["expands_to"]],
+            "links": [edge(item) for item in payload["links"]],
+        }
+
+    # The graph indexes are no longer needed once the tier lists own their records;
+    # dropping them before serializing prevents a second map/list copy from extending
+    # the peak on large kernel subsystems.
+    graph.nodes.clear()
+    graph.node_tier.clear()
+    graph.edges.clear()
+    graph.edge_keys = _EdgeKeys()
     for tier, payload in tier_payloads.items():
         (output_dir / f"{tier.lower()}_{TIERS[tier]}.bin").write_bytes(
-            marshal.dumps(payload),
+            marshal.dumps(serialized_payload(payload)),
         )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"Clang analyzed {len(files)} C files; emitted {len(graph.nodes)} nodes and {len(graph.edges)} edges to {output_dir}")
+    print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
     return 0
 
