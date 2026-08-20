@@ -27,6 +27,7 @@ EXPECTED_TOOLS = {
     "sources_of", "points_to", "aliases",
 }
 TYPE_KINDS = {"class", "interface", "type", "record", "enum"}
+FIELD_KINDS = {"property", "property-path", "variable"}
 
 
 class McpClient:
@@ -100,6 +101,16 @@ def _pick_type(client: McpClient, concept: dict, hint: str) -> str:
         if hit.get("kind") in TYPE_KINDS:
             return hit["name"]
     raise RuntimeError("MCP discovery found no explainable type")
+
+
+def _pick_field(client: McpClient) -> dict | None:
+    """Discover a field through MCP when the selected type declares none."""
+    for hint in ("value", "body", "name", "id"):
+        searched, _, _ = client.call("search", {"name": hint, "limit": 50}, structured=True)
+        for hit in searched.get("hits", []):
+            if hit.get("kind") in FIELD_KINDS:
+                return hit
+    return None
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -188,7 +199,8 @@ def run(args: argparse.Namespace) -> dict:
             "type_explain", {"type": type_name, "limit": 30}, structured=True
         )
         fields = [field for typ in explained.get("types", []) for field in typ.get("fields", [])]
-        field = fields[0] if fields else None
+        field_from_type = bool(fields)
+        field = fields[0] if fields else _pick_field(client)
 
         callees, _, _ = client.call("callees", {"name": symbol, "limit": 20}, structured=True)
         callee_rows = callees.get("callees", [])
@@ -233,13 +245,13 @@ def run(args: argparse.Namespace) -> dict:
             "points_to": {"value": value},
             "aliases": {"value": value},
         }
-        if field:
+        if field_from_type:
             calls["field_history"] = {"field": field["name"], "owner_type": type_name,
                                       "limit": 30}
+        elif field:
+            calls["field_history"] = {"field": field["name"], "limit": 30}
         else:
-            # Still exercise the tool with an MCP-discovered graph identifier. A clean
-            # empty history is preferable to smuggling a source-derived field name in.
-            calls["field_history"] = {"field": value, "limit": 30}
+            raise RuntimeError("MCP discovery found no field for field_history")
 
         held = {"concept_search"} if args.skip_concept else set()
         for name in sorted(EXPECTED_TOOLS - held):
