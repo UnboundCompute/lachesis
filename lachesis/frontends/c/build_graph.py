@@ -1740,6 +1740,13 @@ def main() -> int:
                 if owner:
                     graph.edge("CALLS", owner, definition, callsite=node_id)
 
+    # Edge identity is needed while facts are being emitted, but the deduplication
+    # table itself is dead after cross-TU linking.  On large trees it retains one
+    # hash entry per edge and otherwise overlaps the tier payload being serialized.
+    # Drop it before the five tier scans so peak RSS tracks the graph, not the graph
+    # plus a second edge-sized index.  No later code calls ``graph.edge``.
+    graph.edge_keys = None
+
     structural = {
         "DECLARES", "DECLARES_MEMBER", "DECLARES_VALUE", "CONTAINS_BODY",
         "AST_CHILD", "EVIDENCED_BY", "HAS_ARGUMENT",
