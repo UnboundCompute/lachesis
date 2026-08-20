@@ -246,12 +246,19 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
     # props in: materializing the same store twice must give byte-identical output, or
     # a downstream enrich is not reproducible.
     deferred = deferred_edges(index)
+    # Ordinary stores have neither deferred edges nor an overlay. Avoid allocating a
+    # second set of every node id in that common case; it is needed only when one of
+    # the following edge sources must be checked for resident endpoints.
+    overlay = getattr(index, "_overlay", None)
+    resident = ({node["id"] for node in nodes}
+                if deferred or (overlay is not None and overlay.derived_edges)
+                else None)
     # ``keep`` can contain an id named by a deferred edge even though no Node row for
     # that id exists in this store. Filtering against ``keep`` alone therefore admits
     # the very dangling edge a materialized subgraph promises never to contain.
-    resident = {node["id"] for node in nodes}
-    deferred = [e for e in deferred
-                if e["source"] in resident and e["target"] in resident]
+    if resident is not None:
+        deferred = [e for e in deferred
+                    if e["source"] in resident and e["target"] in resident]
     edges.extend(deferred)
 
     # A core-only store keeps additive dataflow facts in a sidecar overlay.  The
@@ -260,7 +267,6 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
     # Kùzu store (used by enrichment/parity callers).  Previously the lazy path
     # silently returned only base rows, dropping every derived node/edge from the
     # comparison while leaving ordinary navigation apparently healthy.
-    overlay = getattr(index, "_overlay", None)
     if overlay is not None:
         if overlay.node_props:
             for position, node in enumerate(nodes):
