@@ -7,9 +7,14 @@ answers into whatever narrative they need.
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+import os
 from pathlib import PurePosixPath
+from pathlib import Path
+import re
+import subprocess
 
 from .graphlib import CALLABLE_KINDS, CALL_EDGE_KINDS
+from .graphlib import camel_tokens
 
 
 TYPE_KINDS = frozenset({"class", "interface", "type", "record", "enum"})
@@ -21,6 +26,14 @@ FLOW_KINDS = frozenset({
 CONTROL_KINDS = frozenset({
     "CONDITION", "TRUE_BRANCH", "FALSE_BRANCH", "SHORT_CIRCUIT_LEFT",
     "SHORT_CIRCUIT_RIGHT", "SWITCH_CASE", "LOOP_TRUE", "EXCEPTION_BRANCH",
+})
+_TEST_FILE = re.compile(
+    r"(^|/)(tests?|__tests__)/|(^|/)(test_[^/]+|[^/]+[._](test|spec))\.[^.]+$",
+    re.IGNORECASE,
+)
+_TEXT_EXTENSIONS = frozenset({
+    ".c", ".h", ".cc", ".cpp", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx",
+    ".go", ".rs", ".java", ".kt", ".md", ".rst", ".txt", ".adoc",
 })
 
 
@@ -70,6 +83,45 @@ class Comprehension:
         self.gl = store.gl
         self.index = store.index
 
+    def _source_root(self) -> Path | None:
+        explicit = getattr(self.store, "source_dir", None)
+        if explicit and os.path.isdir(explicit):
+            return Path(explicit).resolve()
+        graph_path = getattr(self.store, "_core_path", None)
+        if graph_path:
+            try:
+                from lachesis.kuzu_store import read_store_manifest
+                recorded = read_store_manifest(graph_path).get("source_dir")
+                if recorded and os.path.isdir(recorded):
+                    return Path(recorded).resolve()
+            except (OSError, ValueError, TypeError):
+                pass
+        absolute = []
+        for file_node in self.index.nodes_of_kind("file"):
+            path = file_node.get("properties", {}).get("absolute_file")
+            if path and os.path.isabs(path):
+                absolute.append(path)
+        if not absolute:
+            return None
+        common = Path(os.path.commonpath(absolute))
+        return common if common.is_dir() else common.parent
+
+    def _source_files(self):
+        root = self._source_root()
+        if root is None:
+            return None, []
+        files = []
+        skipped = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
+                   ".venv", "venv", "__pycache__"}
+        for directory, names, filenames in os.walk(root):
+            names[:] = [name for name in names if name not in skipped and not name.startswith(".")]
+            base = Path(directory)
+            for filename in filenames:
+                path = base / filename
+                if path.suffix.lower() in _TEXT_EXTENSIONS:
+                    files.append(path)
+        return root, sorted(files)
+
     def unknowns(self, function: str | None = None, limit: int = 100) -> dict:
         """Return explicit graph frontiers, never turn absence into success."""
         owner_ids = None
@@ -82,7 +134,10 @@ class Comprehension:
 
         rows = []
         seen = set()
-        for call in self.index.nodes_of_kind("call", "construct"):
+        calls = (n for owner_id in owner_ids
+                 for n in self.index.nodes_owned_by(owner_id, "call", "construct")) \
+            if owner_ids is not None else self.index.nodes_of_kind("call", "construct")
+        for call in calls:
             owner = self.gl.owner_function(call)
             if owner_ids is not None and (not owner or owner["id"] not in owner_ids):
                 continue
@@ -98,7 +153,10 @@ class Comprehension:
                 rows.append({**_loc(self.gl, call), "frontier": "unresolved-call",
                              "resolution": resolution or "missing-target",
                              "owner": _owner(self.gl, call)})
-        for behavior in self.index.nodes_of_kind("dynamic-behavior"):
+        behaviors = (n for owner_id in owner_ids
+                     for n in self.index.nodes_owned_by(owner_id, "dynamic-behavior")) \
+            if owner_ids is not None else self.index.nodes_of_kind("dynamic-behavior")
+        for behavior in behaviors:
             props = behavior.get("properties", {})
             owner_id = props.get("owner_function_id")
             if owner_ids is not None and owner_id not in owner_ids:
@@ -564,3 +622,201 @@ class Comprehension:
                 "limits": {"max_depth": max_depth, "max_steps": max_steps},
                 "steps": steps, "frontier": frontier,
                 "complete": not queue and not frontier}
+
+    def change_context(self, symbol: str, limit: int = 12) -> dict:
+        """Join a graph symbol to Git history without interpreting commit intent."""
+        hits = _matches(self.gl, symbol)
+        if not hits:
+            return {"error": f"no symbol named {symbol!r}"}
+        root = self._source_root()
+        if root is None:
+            return {"error": "source tree unavailable; graph manifest has no usable source_dir"}
+        files = []
+        for node in hits:
+            path = self.gl.loc(node)[0]
+            if not path:
+                continue
+            candidate = Path(path)
+            if candidate.is_absolute():
+                try:
+                    path = candidate.resolve().relative_to(root).as_posix()
+                except ValueError:
+                    continue
+            if path not in files:
+                files.append(path)
+        if not files:
+            return {"error": f"symbol {symbol!r} has no source file"}
+        command = ["git", "-C", str(root), "log", f"-n{max(1, limit)}",
+                   "--format=%H%x1f%an%x1f%aI%x1f%s", "--", *files]
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        if completed.returncode != 0:
+            return {"error": "source tree is not readable as a Git worktree",
+                    "detail": completed.stderr.strip()[:500]}
+        commits = []
+        for line in completed.stdout.splitlines():
+            parts = line.split("\x1f", 3)
+            if len(parts) == 4:
+                commits.append({"commit": parts[0], "author": parts[1],
+                                "date": parts[2], "subject": parts[3]})
+        return {"move": "change_context", "symbol": symbol,
+                "matches": [_loc(self.gl, n) for n in hits],
+                "files": files, "commits": commits,
+                "status": "history-found" if commits else "no-history"}
+
+    def tests_for(self, symbol: str, limit: int = 50) -> dict:
+        """Find test references in the source tree that the production graph excludes."""
+        root, files = self._source_files()
+        if root is None:
+            return {"error": "source tree unavailable; graph manifest has no usable source_dir"}
+        pattern = re.compile(rf"\b{re.escape(symbol)}\b")
+        references = []
+        searched = 0
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            if not _TEST_FILE.search(relative):
+                continue
+            searched += 1
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for number, line in enumerate(lines, 1):
+                if not pattern.search(line):
+                    continue
+                nearby = " ".join(lines[max(0, number - 2):min(len(lines), number + 1)])
+                references.append({"file": relative, "line": number,
+                                   "snippet": line.strip()[:300],
+                                   "assertion_nearby": bool(re.search(
+                                       r"\b(assert|expect|should|require|CHECK|ASSERT)", nearby,
+                                       re.IGNORECASE))})
+                if len(references) >= max(1, limit):
+                    break
+            if len(references) >= max(1, limit):
+                break
+        return {"move": "tests_for", "symbol": symbol,
+                "test_files_searched": searched, "references": references,
+                "truncated": len(references) >= max(1, limit)}
+
+    def spec_links(self, symbol: str, limit: int = 50) -> dict:
+        """Link a symbol to docs, format definitions, standards URLs, and comments."""
+        root, files = self._source_files()
+        if root is None:
+            return {"error": "source tree unavailable; graph manifest has no usable source_dir"}
+        pattern = re.compile(rf"\b{re.escape(symbol)}\b", re.IGNORECASE)
+        references = []
+        docs_searched = 0
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            is_doc = path.suffix.lower() in {".md", ".rst", ".txt", ".adoc"}
+            if not is_doc and _TEST_FILE.search(relative):
+                continue
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            if is_doc:
+                docs_searched += 1
+            for number, line in enumerate(lines, 1):
+                stripped = line.strip()
+                is_comment = stripped.startswith(("//", "/*", "*", "#", "--"))
+                if not pattern.search(line) or (not is_doc and not is_comment):
+                    continue
+                urls = re.findall(r"https?://[^\s)>\]}]+", line)
+                references.append({"file": relative, "line": number,
+                                   "kind": "documentation" if is_doc else "comment",
+                                   "snippet": stripped[:300], "urls": urls})
+                if len(references) >= max(1, limit):
+                    break
+            if len(references) >= max(1, limit):
+                break
+        return {"move": "spec_links", "symbol": symbol,
+                "docs_searched": docs_searched, "references": references,
+                "truncated": len(references) >= max(1, limit)}
+
+    def context_pack(self, question: str, max_symbols: int = 6,
+                     max_neighbors: int = 30) -> dict:
+        """Compose a minimal factual neighborhood around question-relevant symbols."""
+        query_tokens = set(camel_tokens(question))
+        query_tokens.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]+", question.casefold()))
+        stop = {"a", "an", "and", "are", "does", "for", "from", "how", "in", "is",
+                "of", "the", "this", "to", "what", "where", "which", "why", "with"}
+        query_tokens -= stop
+        scored = []
+        for entry in self.store.entries:
+            if entry.get("granularity") not in ("function", "method", "type"):
+                continue
+            name_tokens = set(entry.get("tokens") or camel_tokens(entry.get("name", "")))
+            overlap = query_tokens & name_tokens
+            if not overlap:
+                continue
+            exact = entry.get("name", "").casefold() in question.casefold()
+            score = len(overlap) * 10 + (20 if exact else 0) + min(entry.get("degree", 0), 10)
+            scored.append((score, entry))
+        scored.sort(key=lambda item: (-item[0], item[1].get("file") or "",
+                                      item[1].get("line") or 0))
+        selected = scored[:max(1, max_symbols)]
+        seeds = [entry for _score, entry in selected]
+        if not seeds:
+            return {"move": "context_pack", "question": question,
+                    "status": "no-identifier-match", "selection_basis": "identifier-tokens",
+                    "semantic_search": "unavailable: configure concept_search embeddings",
+                    "symbols": [], "relationships": [], "conditions": [], "unknowns": []}
+
+        included = {entry["node_id"] for entry in seeds}
+        relationships = []
+        for entry in seeds:
+            node_id = entry["node_id"]
+            for edge in (*self.index.outgoing_of_kind(node_id, "CALLS"),
+                         *self.index.incoming_of_kind(node_id, "CALLS")):
+                other_id = edge["target"] if edge["source"] == node_id else edge["source"]
+                other = self.gl.nodes.get(other_id)
+                if not other:
+                    continue
+                included.add(other_id)
+                relationships.append({"kind": "CALLS", "source": _loc(
+                    self.gl, self.gl.nodes[edge["source"]]),
+                    "target": _loc(self.gl, self.gl.nodes[edge["target"]])})
+                if len(relationships) >= max(1, max_neighbors):
+                    break
+            if len(relationships) >= max(1, max_neighbors):
+                break
+
+        conditions = []
+        for node_id in included:
+            node = self.gl.nodes.get(node_id)
+            if not node or node.get("kind") not in CALLABLE_KINDS:
+                continue
+            for body in self.index.nodes_owned_by(node_id):
+                control = body.get("properties", {}).get("control_kind")
+                if control in {"if", "switch", "while", "for", "for-each", "try"}:
+                    conditions.append({**_loc(self.gl, body), "control": control,
+                                       "owner": _loc(self.gl, node)})
+
+        unknown_rows = []
+        for seed in seeds:
+            if seed.get("granularity") not in ("function", "method"):
+                continue
+            answer = self.unknowns(seed["node_id"], limit=20)
+            unknown_rows.extend(answer.get("unknowns", ()))
+        test_refs = self.tests_for(seeds[0]["name"], limit=20)
+        if "error" in test_refs:
+            test_refs = {"status": "source-unavailable", "references": []}
+        spec_refs = self.spec_links(seeds[0]["name"], limit=20)
+        if "error" in spec_refs:
+            spec_refs = {"status": "source-unavailable", "references": []}
+        symbols = [_loc(self.gl, self.gl.nodes[node_id]) for node_id in included
+                   if node_id in self.gl.nodes]
+        symbols.sort(key=lambda row: (row.get("file") or "", row.get("line") or 0))
+        return {"move": "context_pack", "question": question, "status": "complete",
+                "selection_basis": "identifier-token-relevance",
+                "semantic_search": "unavailable: configure concept_search embeddings",
+                "seeds": [{**_loc(self.gl, self.gl.nodes[entry["node_id"]]),
+                           "score": score} for score, entry in selected],
+                "symbols": symbols, "relationships": relationships,
+                "conditions": conditions, "tests": test_refs.get("references", []),
+                "specs": spec_refs.get("references", []), "unknowns": unknown_rows,
+                "limits": {"max_symbols": max_symbols, "max_neighbors": max_neighbors}}

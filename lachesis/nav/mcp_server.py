@@ -54,11 +54,13 @@ _PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
 # Set from LACHESIS_FORMAT in main(); defaults to text.
 _DEFAULT_FORMAT = "text"
 
-# The security-hunting tools. Under the DEFAULT "all" profile every one is exposed
-# exactly as before (TS surface unchanged). The opt-in "comprehension" profile hides
-# these four for a focused language-agnostic (C/kernel) understanding run — the only
-# mode that narrows the surface, and only when explicitly requested.
+# Hunting-only tools are excluded from the opt-in comprehension surface. The default
+# remains additive/backward-compatible; a caller has to request the narrower profile.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
+HUNTING_TOOLS = SECURITY_TOOLS + (
+    "candidates", "candidate_detail", "candidate_census", "skeleton",
+    "flow_pass", "flow_skeleton", "taint",
+)
 
 # Removed for now: each of these builds `GuardProfiles`, whose `_build()` scans every
 # guard-kind edge across the WHOLE graph (and `call_roles` also full-scans CALLS). On a
@@ -109,6 +111,8 @@ TOOL_ORDER = (
     "unknowns", "coverage_map", "field_history", "sibling_compare",
     "type_explain", "component_boundary", "indirect_targets",
     "architecture_map", "execution_story",
+    "change_context", "tests_for", "spec_links",
+    "context_pack",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
@@ -120,7 +124,7 @@ def _visible_tools():
     """TOOLS filtered by the active profile and sorted into canonical order."""
     hidden = set(DISABLED_TOOLS)
     if _PROFILE == "comprehension":
-        hidden |= set(SECURITY_TOOLS)
+        hidden |= set(HUNTING_TOOLS)
     tools = [t for t in TOOLS if t["name"] not in hidden]
     rank = {n: i for i, n in enumerate(TOOL_ORDER)}
     return sorted(tools, key=lambda t: rank.get(t["name"], len(rank)))
@@ -389,6 +393,34 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "entry": {"type": "string"}, "max_depth": {"type": "integer", "default": 5},
          "max_steps": {"type": "integer", "default": 100}}, "required": ["entry"]}},
+    {"name": "change_context",
+     "description": "Join a symbol to its Git history: exact commits, authors, dates, and subjects. "
+                    "Returns history facts and does not generate a why narrative.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 12}},
+         "required": ["symbol"]}},
+    {"name": "tests_for",
+     "description": "Find exact references to a symbol in test/spec files, including nearby "
+                    "assertion evidence. Reads the recorded source tree because tests are normally "
+                    "excluded from the production graph.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50}},
+         "required": ["symbol"]}},
+    {"name": "spec_links",
+     "description": "Link a symbol to documentation and source comments, preserving any standards "
+                    "URLs and exact file:line evidence.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50}},
+         "required": ["symbol"]}},
+    {"name": "context_pack",
+     "description": "Return a minimal coherent factual set for a code question: relevant symbols, "
+                    "call relationships, conditions, tests, specs, and explicit unknowns. Uses "
+                    "identifier/graph relevance until concept_search embeddings are configured.",
+     "inputSchema": {"type": "object", "properties": {
+         "question": {"type": "string"},
+         "max_symbols": {"type": "integer", "default": 6},
+         "max_neighbors": {"type": "integer", "default": 30}},
+         "required": ["question"]}},
     {"name": "guards_top",
      "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
                     "name knowledge needed — a security-hunting entry point (for the spine of an "
@@ -644,9 +676,9 @@ def call_tool(name, args, format=None):
     if name in DISABLED_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is disabled: it requires a "
                                      "whole-graph guard scan (removed for now)"}, fmt)
-    if _PROFILE == "comprehension" and name in SECURITY_TOOLS:
+    if _PROFILE == "comprehension" and name in HUNTING_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
-                                     "'comprehension' profile (security tool)"}, fmt)
+                                     "'comprehension' profile (hunting-only tool)"}, fmt)
     c = ctx()
     cone = _fold_cone(c.store, name, args)
     store, gl = c.store, c.store.gl
@@ -685,6 +717,23 @@ def call_tool(name, args, format=None):
         result = c.comprehension.execution_story(
             args["entry"], max_depth=int(args.get("max_depth", 5)),
             max_steps=int(args.get("max_steps", 100)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "change_context":
+        result = c.comprehension.change_context(
+            args["symbol"], limit=int(args.get("limit", 12)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "tests_for":
+        result = c.comprehension.tests_for(
+            args["symbol"], limit=int(args.get("limit", 50)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "spec_links":
+        result = c.comprehension.spec_links(
+            args["symbol"], limit=int(args.get("limit", 50)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "context_pack":
+        result = c.comprehension.context_pack(
+            args["question"], max_symbols=int(args.get("max_symbols", 6)),
+            max_neighbors=int(args.get("max_neighbors", 30)))
         return _emit(name, result, fmt, offset, limit)
 
     if name == "guards_top":

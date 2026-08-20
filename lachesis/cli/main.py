@@ -300,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "Point an agent client at this command with no other arguments.")
     _add_source_flags(mcp)
     mcp.add_argument("--profile", choices=("all", "comprehension"), default=None,
-                     help="'comprehension' hides the security tools")
+                     help="'comprehension' hides hunting-only tools")
     mcp.set_defaults(handler=command_mcp)
 
     index = subcommands.add_parser(

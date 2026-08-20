@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+import tempfile
 import types
 import unittest
 
@@ -111,7 +114,13 @@ class ComprehensionTests(unittest.TestCase):
                              "sibling_compare", "type_explain",
                              "component_boundary", "indirect_targets",
                              "architecture_map", "execution_story"} <= names)
+            mcp_server._PROFILE = "comprehension"
+            focused = {tool["name"] for tool in mcp_server._visible_tools()}
+            self.assertNotIn("candidates", focused)
+            self.assertNotIn("flow_skeleton", focused)
+            self.assertIn("context_pack", focused)
         finally:
+            mcp_server._PROFILE = "all"
             mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
 
     def test_wave_two_graph_algorithms_stay_deterministic(self):
@@ -135,6 +144,42 @@ class ComprehensionTests(unittest.TestCase):
         self.assertNotIn("node_id", text)
         self.assertNotIn("owner={'", text)
         self.assertIn("account.py:11", text)
+
+    def test_source_tree_integrations_are_evidence_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "api").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs").mkdir()
+            (root / "api/account.py").write_text(
+                "def loadMysqlConfig():\n    return 1\n", encoding="utf-8")
+            (root / "tests/test_account.py").write_text(
+                "def test_load():\n    assert loadMysqlConfig() == 1\n", encoding="utf-8")
+            (root / "docs/config.md").write_text(
+                "`loadMysqlConfig` implements https://example.test/config.\n",
+                encoding="utf-8")
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.test"],
+                           check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "add config loader"],
+                           check=True)
+            self.store.source_dir = str(root)
+
+            history = self.query.change_context("loadMysqlConfig")
+            self.assertEqual("add config loader", history["commits"][0]["subject"])
+            tests = self.query.tests_for("loadMysqlConfig")
+            self.assertTrue(tests["references"][0]["assertion_nearby"])
+            specs = self.query.spec_links("loadMysqlConfig")
+            self.assertEqual(["https://example.test/config."],
+                             specs["references"][0]["urls"])
+
+            pack = self.query.context_pack("How does load mysql config work?")
+            self.assertEqual("identifier-token-relevance", pack["selection_basis"])
+            self.assertIn("loadMysqlConfig", {seed["name"] for seed in pack["seeds"]})
+            self.assertTrue(pack["tests"])
+            self.assertTrue(pack["specs"])
 
 
 if __name__ == "__main__":
