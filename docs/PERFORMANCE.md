@@ -24,6 +24,10 @@ time python3.11 -m lachesis.cli.analyze \
   --frontend-out /tmp/lachesis-bench/frontends --prune --enrich
 ```
 
+When memory is the limiting resource during store materialization, add
+`LACHESIS_KUZU_LOW_MEMORY=1`. It removes the in-memory property-text compression
+arrays and preserves graph facts; the tradeoff is a larger/slightly slower store write.
+
 For a safe first run on a constrained machine, set `LACHESIS_C_JOBS=1`. The command
 still builds the complete subsystem; this only makes Clang scheduling predictable.
 For a warm incremental measurement, repeat with `--incremental` and the same
