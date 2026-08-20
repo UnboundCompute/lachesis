@@ -560,6 +560,10 @@ class Graph:
         # Defaults are restored at bundle serialization. Keeping them out of every
         # live node/edge property dict saves three repeated values per fact while all
         # in-memory analysis sees the same effective defaults via ``.get``.
+        # Stable IDs recur in node maps, edge endpoints, and cross-TU indexes.  Keep
+        # one canonical string object instead of retaining a fresh copy per edge.
+        node_id = sys.intern(node_id)
+        kind = sys.intern(kind)
         canonical = dict(properties)
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
@@ -592,6 +596,9 @@ class Graph:
         # Defaults are restored at bundle serialization. Keeping them out of every
         # live node/edge property dict saves three repeated values per fact while all
         # in-memory analysis sees the same effective defaults via ``.get``.
+        kind = sys.intern(kind)
+        source = sys.intern(source)
+        target = sys.intern(target)
         canonical = dict(properties)
         if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
@@ -614,24 +621,41 @@ class _EdgeKeys:
     __slots__ = ("_first", "_tied")
 
     def __init__(self) -> None:
-        self._first: Dict[Tuple[str, str, str], int] = {}
-        self._tied: Dict[Tuple[str, str, str], Set[str]] = {}
+        # A tuple of three long IDs for every edge is surprisingly expensive.  A
+        # hash normally identifies the triple; an explicit collision chain retains
+        # exact semantics even in the (rare) event of a hash collision.
+        self._first: Dict[int, object] = {}
+        self._tied: Dict[Tuple[int, int], Set[str]] = {}
 
     def add(
         self, kind: str, source: str, target: str, properties: dict,
         edges: List[dict],
     ) -> bool:
-        triple = (kind, source, target)
-        first = self._first.get(triple)
-        if first is None:
-            self._first[triple] = len(edges)
+        digest = hash((kind, source, target))
+        entry = self._first.get(digest)
+        if entry is None:
+            self._first[digest] = len(edges)
             return True
-        properties_seen = self._tied.get(triple)
+        candidates = (entry,) if isinstance(entry, int) else entry
+        first = None
+        for index in candidates:
+            existing = edges[index]
+            if (existing["kind"], existing["source"], existing["target"]) == (kind, source, target):
+                first = index
+                break
+        if first is None:
+            if isinstance(entry, int):
+                self._first[digest] = [entry, len(edges)]
+            else:
+                entry.append(len(edges))
+            return True
+        tied_key = (digest, first)
+        properties_seen = self._tied.get(tied_key)
         if properties_seen is None:
             properties_seen = {
                 json.dumps(edges[first]["properties"], sort_keys=True),
             }
-            self._tied[triple] = properties_seen
+            self._tied[tied_key] = properties_seen
         key = json.dumps(properties, sort_keys=True)
         if key in properties_seen:
             return False
@@ -1596,44 +1620,66 @@ def main() -> int:
         "DECLARES", "DECLARES_MEMBER", "DECLARES_VALUE", "CONTAINS_BODY",
         "AST_CHILD", "EVIDENCED_BY", "HAS_ARGUMENT",
     }
-    tier_payloads = {
-        tier: {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
-        for tier, name in TIERS.items()
-    }
-    for node_id, node in graph.nodes.items():
-        tier_payloads[graph.node_tier[node_id]]["nodes"].append(node)
-    for edge in graph.edges:
-        source_tier = graph.node_tier.get(edge["source"])
-        target_tier = graph.node_tier.get(edge["target"])
-        if not source_tier or not target_tier:
-            continue
-        if source_tier == target_tier:
-            tier_payloads[source_tier]["edges"].append(edge)
-        elif edge["kind"] in structural:
-            tier_payloads[source_tier]["expands_to"].append({
-                "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
-                "properties": {
-                    "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
-                    "via": edge["kind"],
-                },
-            })
-        else:
-            linked = dict(edge)
-            linked["properties"] = dict(edge["properties"], target_tier=target_tier)
-            tier_payloads[source_tier]["links"].append(linked)
-    for payload in tier_payloads.values():
+    # Serialize one tier at a time.  Keeping all tier lists alive alongside the
+    # canonical graph used to create a second full graph-sized object at peak
+    # memory on large subsystems.  The extra linear scans are intentional: bounded
+    # peak memory is more important than shaving a few seconds from finalization.
+    tier_counts = {}
+    emitted_edge_count = 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def serialized_payload(payload: dict) -> dict:
+        defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
+
+        def with_defaults(item: dict) -> dict:
+            return {**item, "properties": {**defaults, **item.get("properties", {})}}
+
+        return {
+            **payload,
+            "nodes": [with_defaults(item) for item in payload["nodes"]],
+            "edges": [with_defaults(item) for item in payload["edges"]],
+            "expands_to": [with_defaults(item) for item in payload["expands_to"]],
+            "links": [with_defaults(item) for item in payload["links"]],
+        }
+
+    for tier, name in TIERS.items():
+        payload = {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
+        payload["nodes"].extend(
+            node for node_id, node in graph.nodes.items()
+            if graph.node_tier.get(node_id) == tier
+        )
+        for edge in graph.edges:
+            source_tier = graph.node_tier.get(edge["source"])
+            target_tier = graph.node_tier.get(edge["target"])
+            if source_tier != tier or not target_tier:
+                continue
+            if source_tier == target_tier:
+                payload["edges"].append(edge)
+            elif edge["kind"] in structural:
+                payload["expands_to"].append({
+                    "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
+                    "properties": {"via": edge["kind"]},
+                })
+            else:
+                payload["links"].append({
+                    **edge,
+                    "properties": {**edge["properties"], "target_tier": target_tier},
+                })
         payload["nodes"].sort(key=lambda item: item["id"])
         for collection in ("edges", "expands_to", "links"):
             payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
-
-    # edge_count must reflect edges actually serialized into tier files. The
-    # distribution loop above drops any edge whose source/target has no tier
-    # (a dangling reference to a node that was never created); counting those
-    # in the manifest makes load_snapshot's edge tally disagree with the files.
-    emitted_edge_count = sum(
-        len(p["edges"]) + len(p["expands_to"]) + len(p["links"])
-        for p in tier_payloads.values()
-    )
+        tier_counts[tier] = {
+            "node_count": len(payload["nodes"]),
+            "edge_count": len(payload["edges"]),
+            "expands_to_count": len(payload["expands_to"]),
+            "cross_tier_link_count": len(payload["links"]),
+        }
+        emitted_edge_count += sum(
+            len(payload[collection]) for collection in ("edges", "expands_to", "links")
+        )
+        tier_path = output_dir / f"{tier.lower()}_{name}.bin"
+        tier_path.write_bytes(marshal.dumps(serialized_payload(payload)))
+        del payload
     emitted_node_count = len(graph.nodes)
     graph_edge_count = len(graph.edges)
     dropped_edge_count = graph_edge_count - emitted_edge_count
@@ -1675,41 +1721,16 @@ def main() -> int:
         "diagnostic_count": len(diagnostics),
         "identity_scheme": "v2:<owner>:<namespace>:<kind>:<digest>",
         "tiers": [
-            {
-                "tier": tier, "name": TIERS[tier],
-                "file": f"{tier.lower()}_{TIERS[tier]}.bin",
-                "node_count": len(tier_payloads[tier]["nodes"]),
-                "edge_count": len(tier_payloads[tier]["edges"]),
-                "expands_to_count": len(tier_payloads[tier]["expands_to"]),
-                "cross_tier_link_count": len(tier_payloads[tier]["links"]),
-            }
+            {"tier": tier, "name": TIERS[tier], "file": f"{tier.lower()}_{TIERS[tier]}.bin", **tier_counts[tier]}
             for tier in TIERS
         ],
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
     # Tier payloads are large and consumed only by our own parent process, so they
     # go out as marshal (binary, C-speed) instead of json.dumps — the same round-trip
     # fix applied to the in-memory AST spill. The payloads are already JSON-shaped
     # (the in-process route in snapshot.py forbids tuples / non-string keys and a
     # check enforces it), so marshal round-trips them identically to json. The tiny
     # manifest stays human-readable json.
-    defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
-
-    def serialized_payload(payload: dict) -> dict:
-        def node(item: dict) -> dict:
-            return {**item, "properties": {**defaults, **item.get("properties", {})}}
-
-        def edge(item: dict) -> dict:
-            return {**item, "properties": {**defaults, **item.get("properties", {})}}
-
-        return {
-            **payload,
-            "nodes": [node(item) for item in payload["nodes"]],
-            "edges": [edge(item) for item in payload["edges"]],
-            "expands_to": [edge(item) for item in payload["expands_to"]],
-            "links": [edge(item) for item in payload["links"]],
-        }
-
     # The graph indexes are no longer needed once the tier lists own their records;
     # dropping them before serializing prevents a second map/list copy from extending
     # the peak on large kernel subsystems.
@@ -1717,10 +1738,6 @@ def main() -> int:
     graph.node_tier.clear()
     graph.edges.clear()
     graph.edge_keys = _EdgeKeys()
-    for tier, payload in tier_payloads.items():
-        (output_dir / f"{tier.lower()}_{TIERS[tier]}.bin").write_bytes(
-            marshal.dumps(serialized_payload(payload)),
-        )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
