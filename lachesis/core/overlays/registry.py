@@ -55,7 +55,10 @@ class OverlayRegistry:
         """
         current = graph
         accumulator = None
-        index = GraphIndex(graph)
+        # Overlay predicates and folds only need kind and adjacency lookups. Defer
+        # navigation-only label/file/owner buckets so enrichment does not allocate
+        # three additional references for every node in a large graph.
+        index = GraphIndex(graph, compact=True)
         for overlay in self._overlays:
             if not overlay.applies(current, index):
                 continue
@@ -71,4 +74,3 @@ class OverlayRegistry:
                     len(delta.nodes), len(delta.edges),
                 )
         return current
-
