@@ -61,6 +61,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-20 | `5bd50eb` | Linux `net` shard materialization, coalesced node/edge COPY | — | — | 94.66 | 1,822,752 | 3,485,899 | ~1.6* | Completed and reopened; all manifest/index counts match. One Parquet stream/COPY per table removes per-batch Kùzu overhead. |
 | 2026-08-20 | `04a6a5b` | Linux `fs` bundle → language-neutral shard persistence | — | — | 64.98 | 3,157,724 | 6,210,355 | ~3.5* | Existing completed C bundle persisted without record-copy amplification; shard counts match the frontend manifest. |
 | 2026-08-20 | `a2404de` | Linux `fs` shard materialization, 2 GiB Kùzu pool | — | — | 171.76 | 3,157,724 | 6,210,355 | ~2.1* | Completed and reopened; manifest/index counts match. The 1 GiB default hit Kùzu buffer exhaustion, so this larger workload needs the documented pool override. |
+| 2026-08-20 | `84224eb` | Linux `fs` lazy dataflow enrichment from streamed core | — | >131* | not published | — | — | >5.4* | Overlay/index materialization exceeded the safety RSS ceiling before derived-cache publication; bounded Kùzu serialization did not remove this pre-writer peak. |
 
 `*` The first full-subsystem measurement was run with token and proof emission disabled
 and `LACHESIS_C_JOBS=1`; it predates this harness, so pass-level timings should be
