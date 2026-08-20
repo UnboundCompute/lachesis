@@ -313,7 +313,8 @@ def run_clang(
     )
 
 
-LARGE_PROJECT_FILE_LIMIT = 128
+MEDIUM_PROJECT_FILE_LIMIT = 128
+LARGE_PROJECT_FILE_LIMIT = 512
 
 
 def clang_jobs(path_count: Optional[int] = None) -> int:
@@ -326,8 +327,9 @@ def clang_jobs(path_count: Optional[int] = None) -> int:
     trades some of the available parallelism for a resident set that does not grow with
     the machine. Large projects use one AST at a time by default: a project with many
     roots is precisely the workload where two or more expanded kernel/header ASTs can
-    exhaust the runner before the pruning step. ``LACHESIS_C_JOBS`` overrides it, ``1``
-    restores the serial build, and small projects retain the faster parallel default.
+    exhaust the runner before the pruning step. Medium trees use two jobs by default
+    based on the measured ``net/ipv4`` boundary; ``LACHESIS_C_JOBS`` overrides it,
+    ``1`` restores the serial build, and small projects retain the faster parallel default.
     """
     configured = os.environ.get("LACHESIS_C_JOBS")
     if configured:
@@ -337,6 +339,8 @@ def clang_jobs(path_count: Optional[int] = None) -> int:
             pass
     if path_count is not None and path_count >= LARGE_PROJECT_FILE_LIMIT:
         return 1
+    if path_count is not None and path_count >= MEDIUM_PROJECT_FILE_LIMIT:
+        return 2
     return max(1, min(4, (os.cpu_count() or 1) // 2))
 
 

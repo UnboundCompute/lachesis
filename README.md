@@ -153,10 +153,11 @@ LACHESIS_C_JOBS=1 LACHESIS_EMIT_TOKENS=0 LACHESIS_EMIT_PROOFS=0 \
   /path/to/large-c-tree /tmp/lachesis-frontends
 ```
 
-The C frontend keeps small trees parallel, but automatically limits large trees to
-one Clang AST at a time so expanded headers cannot multiply the runner's peak memory.
-Set `LACHESIS_C_JOBS` explicitly when the runner has a measured safe capacity (the
-large Linux benchmark uses `LACHESIS_C_JOBS=1`).
+The C frontend keeps small trees parallel, uses two Clang ASTs by default for medium
+trees, and limits large trees to one AST at a time so expanded headers cannot multiply
+the runner's peak memory. Set `LACHESIS_C_JOBS` explicitly when the runner has a
+measured safe capacity (the large Linux benchmark uses `LACHESIS_C_JOBS=1`; the
+`net/ipv4` medium boundary measured 13.00s with `LACHESIS_C_JOBS=2`).
 
 For a core-only store on a large mixed-language tree, stream frontend shards directly
 into Kùzu to keep the parent process from composing one giant graph:
