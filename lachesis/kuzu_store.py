@@ -22,7 +22,7 @@ Storage contract:
   * one generic ``Node`` table; the columns nav filters on are promoted to typed columns,
     and ``props`` carries the *tail*, the properties no column holds. Reconstruction
     unions the two, so nothing is stored twice and nothing is lost.
-  * ``props`` is deflated UTF-8 JSON in a ``BLOB``, not a ``STRING``. That costs
+  * ``props`` is deflated protobuf bytes in a ``BLOB``, not a ``STRING``. That costs
     readability in a raw Cypher dump and buys the last easy allocation boundary; see
     ``STORE_COMPRESSION_SPEC.md`` 0.2 for why boundaries are the unit of account here.
     The deflate runs against a preset dictionary built from this store's own most
@@ -508,7 +508,7 @@ class PropsCodec:
     not safe to clone from concurrently, so a parallel writer needs one prototype each.
 
     `texts` is the second amortisation: the tails the dictionary pre-pass already built,
-    kept rather than discarded, so no row's properties are serialised to JSON twice. It
+    kept rather than discarded, so no row's properties are serialized to protobuf twice. It
     is positional against the collection it was built from, which is what makes a codec
     belong to exactly one of `nodes` / `edges` / `deferred` — the three are serialised
     with different arguments and a codec handed the wrong list would write the wrong
@@ -529,7 +529,7 @@ class PropsCodec:
 
     def blob(self, index: int, properties: dict, elide: bool,
              drop: frozenset = frozenset()) -> bytes:
-        """The `props` blob for row `index`: its tail, as deflated UTF-8 JSON."""
+        """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
         if self._prototype is None:
@@ -814,14 +814,14 @@ def write_kuzu_graph(
     # been seen. What does not have to stay is *rebuilding* the tails for the second
     # pass, so they are kept here and handed to the loaders. On a graph of this repo that
     # is ~740k tails and about 90 MB held for the length of the write, and it grows with
-    # the graph — the trade is memory against a second full JSON serialisation of every
+    # the graph — the trade is memory against a second full protobuf serialization of every
     # row.
     use_low_memory = (
         os.environ.get("LACHESIS_KUZU_LOW_MEMORY") == "1"
         if low_memory is None else low_memory
     )
     if use_low_memory:
-        # Rebuild each JSON tail on demand instead of retaining one serialized tail
+        # Rebuild each protobuf tail on demand instead of retaining one serialized tail
         # per node and edge. This trades the shared dictionary for a lower peak.
         props_dict = b""
         node_codec = PropsCodec()
@@ -920,11 +920,11 @@ def write_kuzu_graph(
     payload["pruned"] = bool(prune)
     if build_fingerprint:
         payload["build_fingerprint"] = build_fingerprint
-    # Base64 rather than raw bytes because the manifest is JSON, and in the manifest
+    # Base64 rather than raw bytes because the manifest Value field stores text, and in the manifest
     # rather than a sidecar file because losing it makes every `props` blob in the
     # store unreadable: it is part of the store, not metadata about it.
     payload[PROPS_DICT_KEY] = base64.b64encode(props_dict).decode("ascii")
-    # Plain JSON strings, not base64: the prefix table is short, and leaving it legible
+    # Plain strings, not base64: the prefix table is short, and leaving it legible
     # means a coded column can be read by hand from a Cypher dump. Same reason as the
     # dictionary for living here rather than in a sidecar — a code is an index into
     # this list, so losing it makes every coded value unreadable.

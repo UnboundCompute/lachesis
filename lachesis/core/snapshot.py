@@ -34,9 +34,6 @@ def _read_tiers(manifest: dict, output_dir: str) -> Iterator[Tuple[str, dict]]:
         if not tier_path.is_file():
             raise ContractError(f"missing tier file: {tier_path}")
         # Format is carried by the manifest-declared filename: a frontend that spills
-        # marshal (C's large tier payloads) names its files `.bin`; the json route
-        # (Python/TS) is unchanged. marshal only round-trips JSON-shaped values, which
-        # every frontend already emits (see snapshot_from_payloads' invariant).
         if tier_path.suffix == ".pb":
             yield tier_name, decode_tier(tier_path.read_bytes())
         else:
@@ -57,8 +54,8 @@ def _merge_tiers(
     for tier_name, payload in tiers:
         # Tier payloads are owned by this snapshot construction path. Stamp records
         # in place instead of copying every property dictionary with ``{**record}``:
-        # on large C bundles the copy and the still-live marshal payload briefly
-        # doubled the graph footprint before shard persistence could release it.
+        # on large C bundles the copy and the still-live tier payload briefly doubled
+        # the graph footprint before shard persistence could release it.
         tier_nodes = payload.get("nodes", [])
         for node in tier_nodes:
             node["tier"] = tier_name
@@ -126,10 +123,9 @@ def snapshot_from_payloads(
     round trip is most of the frontend's wall time, and nobody between the two ends
     of it wants the file.
 
-    One thing the file route does incidentally is normalise: ``json.dumps`` followed
-    by ``json.loads`` turns tuples into lists and non-string mapping keys into
-    strings. This route does no such thing, so a frontend wired in here has to emit
-    JSON-shaped values in the first place. That is not taken on trust —
+    The file route decodes typed protobuf values. This route does no serialization,
+    so a frontend wired in here has to emit the same JSON-shaped contract values in
+    the first place. That is not taken on trust —
     ``lachesis.frontends.checks`` builds a snapshot both ways and requires them to
     agree element for element.
     """
