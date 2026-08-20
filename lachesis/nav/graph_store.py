@@ -386,6 +386,10 @@ class GraphStore:
         write_kuzu_graph(enriched, None, cache, prune=False,
                          enriched=True, core_content_hash=core_hash)
         _copy_frontend_inventory(core_path, cache)
+        # The derived store is now authoritative; do not keep the materialized core
+        # and enriched graph alive while Kùzu reopens the cache. On large action runs
+        # this overlap was a transient second graph-sized RSS spike.
+        del enriched, core
         fresh = type(self)._open(cache, overlay_path=self._overlay_path)
         self.overlay = fresh.overlay
         self.graph = fresh.graph
