@@ -82,6 +82,49 @@ def joined_store_path(graph_path: str) -> str:
     return str(graph_path).rstrip("/") + ".joined"
 
 
+def _close_node_property_references(index, graph: dict) -> int:
+    """Add resident nodes named by ``*_id`` properties to a materialized cone.
+
+    Frontend value/path nodes are not always owned by the function whose call node
+    refers to them.  A cone selected only through ownership can therefore contain a
+    call with ``value_id=path`` but omit the path node. Runtime overlays legitimately
+    turn that property into an edge, and composition then (correctly) rejects the
+    dangling endpoint. Close those explicit graph references before enrichment.
+
+    Only canonical ids that actually exist in the backing index are admitted. The
+    closure is recursive because a value can name its owner or another path, but it
+    does not follow ordinary graph edges and therefore does not widen into another
+    function body.
+    """
+    resident = {node["id"]: node for node in graph["nodes"]}
+    frontier = list(graph["nodes"])
+    added = 0
+    while frontier:
+        node = frontier.pop()
+        for key, value in (node.get("properties") or {}).items():
+            if key == "evidence_ids":
+                continue
+            if key.endswith("_id"):
+                values = (value,)
+            elif key.endswith("_ids") and isinstance(value, (list, tuple, set)):
+                values = value
+            else:
+                continue
+            for candidate in values:
+                if (not isinstance(candidate, str) or not candidate.startswith("v2:")
+                        or candidate in resident):
+                    continue
+                referenced = index.nodes.get(candidate)
+                if referenced is None:
+                    continue
+                resident[candidate] = referenced
+                frontier.append(referenced)
+                added += 1
+    if added:
+        graph["nodes"] = sorted(resident.values(), key=lambda item: item["id"])
+    return added
+
+
 def _joined_cache_matches(cache_path: str, source_hash: str | None) -> bool:
     """True when ``cache_path`` is a rejoin of exactly this source tree.
 
@@ -407,7 +450,9 @@ class GraphStore:
         for member in members:
             wanted.update(self.index.by_owner.get(member, ()))
         core = materialize_subgraph(self.index, wanted)
+        _close_node_property_references(self.index, core)
         resident = {node["id"] for node in core["nodes"]}
+        wanted.update(resident)
         from lachesis.nav.kuzu_index import deferred_edges
         omitted = sum(
             1 for edge in deferred_edges(self.index)

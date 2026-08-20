@@ -9,6 +9,7 @@ import unittest
 
 from .comprehension import Comprehension
 from .graph_store import GraphStore
+from .graph_store import _close_node_property_references
 
 
 def node(node_id, kind, label, file=None, line=None, **properties):
@@ -75,6 +76,22 @@ class ComprehensionTests(unittest.TestCase):
         self.assertEqual("could-not-cross", answer["status"])
         self.assertEqual(["plugin.run(raw)"], [r["name"] for r in answer["unknowns"]])
         self.assertEqual("proven-absent", self.query.unknowns("parseConfig")["status"])
+
+    def test_cone_closes_explicit_value_and_path_references(self):
+        value_id = "v2:frontend:typescript-compiler-api:value:1"
+        path_id = "v2:frontend:typescript-compiler-api:path:2"
+        owner_id = "v2:frontend:typescript-compiler-api:function:3"
+        nodes = {
+            value_id: node(value_id, "value", "receiver", value_id=path_id),
+            path_id: node(path_id, "path", "result", owner_function_id=owner_id),
+            owner_id: node(owner_id, "function", "owner"),
+        }
+        graph = {"nodes": [nodes[value_id]], "edges": []}
+        added = _close_node_property_references(
+            types.SimpleNamespace(nodes=nodes), graph,
+        )
+        self.assertEqual(2, added)
+        self.assertEqual(set(nodes), {item["id"] for item in graph["nodes"]})
 
     def test_coverage_is_explicitly_graph_based(self):
         answer = self.query.coverage_map()
