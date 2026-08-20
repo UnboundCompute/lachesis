@@ -1205,7 +1205,12 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     kept_ids: set[str] = set()
     node_units: dict[str, str] = {}
     prefixes: set[str] = set()
-    indexed_nodes: list[dict] = []
+    # Index candidates are spilled while the large node/edge streams are loaded.
+    # Keeping hundreds of thousands of full property dictionaries alive here was a
+    # surprising multi-GB peak on Linux/net; the index builders only need them again
+    # after the graph tables are complete.
+    index_stage = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8",
+                                               prefix="lachesis-index-", delete=False)
     for node in shard_reader.nodes():
         kind = node.get("kind")
         if prune and kind in PRUNE_NODE_KINDS:
@@ -1220,7 +1225,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if match:
                 prefixes.add(match.group(1))
         if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
-            indexed_nodes.append(node)
+            index_stage.write(json.dumps(node, ensure_ascii=False, separators=(",", ":")))
+            index_stage.write("\n")
 
     exported: set[str] = set()
     unresolved_count = 0
@@ -1288,8 +1294,15 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             batch.clear()
     if batch:
         load_edges(batch)
+    index_stage.flush()
+    index_stage.seek(0)
+    indexed_nodes = (json.loads(line) for line in index_stage if line.strip())
     decl_rows = index_rows(build_decl_index(indexed_nodes, exported))
+    index_stage.seek(0)
+    indexed_nodes = (json.loads(line) for line in index_stage if line.strip())
     callsite_rows = index_rows(build_callsite_index(indexed_nodes))
+    index_stage.close()
+    os.unlink(index_stage.name)
     if bulk:
         _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
                          stage_dir=stage.name, id_codes=id_codes)
