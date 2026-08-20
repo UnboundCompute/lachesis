@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package lachesis.graph;
+
+// The on-disk graph record contract. Keep field numbers stable: shards are
+// immutable build artifacts and may outlive the Python process that wrote them.
+message Value {
+  oneof kind {
+    string text = 1;
+    sint64 integer = 2;
+    double real = 3;
+    bool boolean = 4;
+    bytes binary = 5;
+    ListValue list = 6;
+    ObjectValue object = 7;
+    NullValue null_value = 8;
+  }
+}
+
+message NullValue {}
+
+message ListValue {
+  repeated Value values = 1;
+}
+
+message Field {
+  string key = 1;
+  Value value = 2;
+}
+
+message ObjectValue {
+  repeated Field fields = 1;
+}
+
+message NodeRecord {
+  string id = 1;
+  string kind = 2;
+  string label = 3;
+  repeated Field properties = 4;
+  string tier = 5;
+}
+
+message EdgeRecord {
+  string kind = 1;
+  string source = 2;
+  string target = 3;
+  repeated Field properties = 4;
+  string source_tier = 5;
+  string relationship_class = 6;
+}
+
+message ShardManifest {
+  uint32 format_version = 1;
+  string frontend_id = 2;
+  string shard_id = 3;
+  uint64 node_count = 4;
+  uint64 edge_count = 5;
+  string nodes_file = 6;
+  string edges_file = 7;
+}
+
+message ShardSetEntry {
+  string shard_id = 1;
+  string directory = 2;
+  string status = 3;
+  uint64 node_count = 4;
+  uint64 edge_count = 5;
+}
+
+message ShardSetManifest {
+  uint32 format_version = 1;
+  string frontend_id = 2;
+  repeated ShardSetEntry shards = 3;
+}
+
+message DataflowOverlay {
+  string overlay_id = 1;
+  string source = 2;
+  uint32 version = 3;
+  string core_content_hash = 4;
+  repeated NodeRecord derived_nodes = 5;
+  repeated EdgeRecord derived_edges = 6;
+}

@@ -339,7 +339,7 @@ def run_project_streaming(
                 roots=groups[frontend_id],
             )
             snapshots.append(snapshot)
-            readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.json")))
+            readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
             snapshot.release()
     finally:
         if previous is None:

@@ -16,7 +16,7 @@ def test_shard_merger_deduplicates_and_streams(tmp_path):
     shard_set.complete("1", second)
 
     with ShardMerger(tmp_path / "merge.sqlite") as merger:
-        merger.ingest(ShardSetReader(shard_root / "shards.json"))
+        merger.ingest(ShardSetReader(shard_root / "shards.pb"))
         assert merger.counts() == (2, 1)
         assert [node["id"] for node in merger.iter_nodes()] == ["m", "n"]
         assert list(merger.iter_edges())[0]["kind"] == "CALLS"

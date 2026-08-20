@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import marshal
 import os
 import tempfile
 import sys
@@ -38,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lachesis.nav.graphlib import GraphLib
 from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
+from lachesis.core.graph_wire import decode_overlay, encode_overlay
 
 
 def node_view(node: dict) -> dict:
@@ -80,17 +80,16 @@ def enriched_store_path(graph_path: str) -> str:
 
 
 def dataflow_overlay_path(graph_path: str) -> str:
-    """Binary additive dataflow cache beside a core Kùzu store."""
-    return str(graph_path).rstrip("/") + ".dataflow.bin"
+    """Protobuf additive dataflow cache beside a core Kùzu store."""
+    return str(graph_path).rstrip("/") + ".dataflow.pb"
 
 
 def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
     if not core_hash or not os.path.isfile(path):
         return False
     try:
-        with open(path, "rb") as handle:
-            payload = marshal.load(handle)
-    except (OSError, ValueError, EOFError, TypeError):
+        payload = decode_overlay(Path(path).read_bytes())
+    except (OSError, ValueError, TypeError):
         return False
     return payload.get("version") == 1 and payload.get("core_content_hash") == core_hash
 
@@ -106,9 +105,8 @@ def _merge_overlays(primary: Overlay, secondary: Overlay) -> Overlay:
 
 
 def _load_dataflow_overlay(path: str) -> Overlay:
-    """Load the internal binary dataflow sidecar."""
-    with open(path, "rb") as handle:
-        return Overlay.from_dict(marshal.load(handle))
+    """Load the internal protobuf dataflow sidecar."""
+    return Overlay.from_dict(decode_overlay(Path(path).read_bytes()))
 
 
 def joined_store_path(graph_path: str) -> str:
@@ -396,7 +394,7 @@ class GraphStore:
         in-memory graph. Otherwise: materialize the core, fold the four overlay
         registries over it (``enriched = f(core_graph, languages, capabilities)`` —
         pure, so this is exactly what a build-time enrich would have produced), write
-        additive records to a compact sibling ``<store>.dataflow.bin`` sidecar keyed
+        additive records to a compact sibling ``<store>.dataflow.pb`` sidecar keyed
         by the core's content hash, and reopen against it. Non-additive overlays use
         the older full ``<store>.enriched`` Kùzu-cache fallback.
 
@@ -449,15 +447,12 @@ class GraphStore:
                                   if id(edge) not in core_edge_ids],
             }
             fd, temporary = tempfile.mkstemp(
-                prefix=".lachesis-dataflow-", suffix=".json",
+                prefix=".lachesis-dataflow-", suffix=".pb",
                 dir=os.path.dirname(os.path.abspath(cache)),
             )
             try:
                 with os.fdopen(fd, "wb") as handle:
-                    # marshal is stdlib, C-speed, and already used by the shard/AST
-                    # tiers. The cache is content-hash keyed, so Python-version
-                    # changes safely invalidate it rather than serving stale data.
-                    marshal.dump(payload, handle)
+                    handle.write(encode_overlay(payload))
                 os.replace(temporary, cache)
             finally:
                 if os.path.exists(temporary):

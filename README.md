@@ -175,7 +175,7 @@ LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
 streaming is the next integration step. The resulting store is explicitly marked
 core-only, so `GraphStore`/the GitHub Action builds the dataflow tier on its first
 security query rather than silently skipping enrichment. Additive derived records are
-cached in a compact internal `<store>.dataflow.bin` sidecar; JSON is reserved for
+cached in a compact internal `<store>.dataflow.pb` sidecar; JSON is reserved for
 user-facing output. A full `.enriched` Kùzu cache remains the fallback for overlays
 that mutate core records.
 

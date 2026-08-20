@@ -1,47 +1,23 @@
 """Language-neutral, bounded-memory graph shard storage.
 
 Frontends may emit immutable shards instead of one giant in-memory payload.  Records
-are length-framed marshal values: writing and reading are incremental, while the
-record shape remains the same JSON-shaped node/edge contract used by snapshots.
+are length-framed protobuf values: writing and reading are incremental, while the
+record shape remains the same language-neutral node/edge contract used by snapshots.
 """
 from __future__ import annotations
 
-import json
-import marshal
-import struct
 from itertools import chain
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
-
-SHARD_FORMAT_VERSION = 1
-_FRAME = struct.Struct("!I")
-
-
-def _write_record(handle, record: dict) -> None:
-    payload = marshal.dumps(record)
-    if len(payload) >= 2 ** 32:
-        raise ValueError("graph shard record exceeds 4 GiB frame limit")
-    handle.write(_FRAME.pack(len(payload)))
-    handle.write(payload)
+from . import graph_pb2
+from .graph_wire import (
+    WIRE_FORMAT_VERSION, decode_edge, decode_node, encode_edge, encode_node,
+    read_frames, write_frame,
+)
 
 
-def _read_records(path: Path) -> Iterator[dict]:
-    with path.open("rb") as handle:
-        while True:
-            header = handle.read(_FRAME.size)
-            if not header:
-                return
-            if len(header) != _FRAME.size:
-                raise ValueError(f"truncated shard frame header: {path}")
-            (size,) = _FRAME.unpack(header)
-            payload = handle.read(size)
-            if len(payload) != size:
-                raise ValueError(f"truncated shard frame: {path}")
-            record = marshal.loads(payload)
-            if not isinstance(record, dict):
-                raise ValueError(f"shard record is not an object: {path}")
-            yield record
+SHARD_FORMAT_VERSION = WIRE_FORMAT_VERSION
 
 
 class ShardWriter:
@@ -52,17 +28,17 @@ class ShardWriter:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.frontend_id = frontend_id
         self.shard_id = shard_id
-        self._nodes = (self.directory / "nodes.bin").open("wb")
-        self._edges = (self.directory / "edges.bin").open("wb")
+        self._nodes = (self.directory / "nodes.pb").open("wb")
+        self._edges = (self.directory / "edges.pb").open("wb")
         self.node_count = 0
         self.edge_count = 0
 
     def add_node(self, node: dict) -> None:
-        _write_record(self._nodes, node)
+        write_frame(self._nodes, encode_node(node))
         self.node_count += 1
 
     def add_edge(self, edge: dict) -> None:
-        _write_record(self._edges, edge)
+        write_frame(self._edges, encode_edge(edge))
         self.edge_count += 1
 
     def close(self) -> None:
@@ -70,18 +46,13 @@ class ShardWriter:
             return
         self._nodes.close()
         self._edges.close()
-        manifest = {
-            "shard_format_version": SHARD_FORMAT_VERSION,
-            "frontend_id": self.frontend_id,
-            "shard_id": self.shard_id,
-            "node_count": self.node_count,
-            "edge_count": self.edge_count,
-            "nodes_file": "nodes.bin",
-            "edges_file": "edges.bin",
-        }
-        (self.directory / "manifest.json").write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8",
+        manifest = graph_pb2.ShardManifest(
+            format_version=SHARD_FORMAT_VERSION,
+            frontend_id=self.frontend_id, shard_id=self.shard_id,
+            node_count=self.node_count, edge_count=self.edge_count,
+            nodes_file="nodes.pb", edges_file="edges.pb",
         )
+        (self.directory / "manifest.pb").write_bytes(manifest.SerializeToString())
 
     def __enter__(self) -> "ShardWriter":
         return self
@@ -95,17 +66,28 @@ class ShardReader:
 
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory)
-        self.manifest: Dict[str, object] = json.loads(
-            (self.directory / "manifest.json").read_text(encoding="utf-8"),
-        )
-        if self.manifest.get("shard_format_version") != SHARD_FORMAT_VERSION:
-            raise ValueError("unsupported graph shard format")
+        manifest_path = self.directory / "manifest.pb"
+        if manifest_path.is_file():
+            message = graph_pb2.ShardManifest()
+            message.ParseFromString(manifest_path.read_bytes())
+            if message.format_version != SHARD_FORMAT_VERSION:
+                raise ValueError("unsupported graph protobuf shard format")
+            self.manifest = {
+                "shard_format_version": message.format_version,
+                "frontend_id": message.frontend_id, "shard_id": message.shard_id,
+                "node_count": message.node_count, "edge_count": message.edge_count,
+                "nodes_file": message.nodes_file, "edges_file": message.edges_file,
+            }
+        else:
+            raise ValueError("missing protobuf shard manifest; rebuild shards")
 
     def nodes(self) -> Iterator[dict]:
-        yield from _read_records(self.directory / str(self.manifest["nodes_file"]))
+        path = self.directory / str(self.manifest["nodes_file"])
+        yield from (decode_node(payload) for payload in read_frames(path))
 
     def edges(self) -> Iterator[dict]:
-        yield from _read_records(self.directory / str(self.manifest["edges_file"]))
+        path = self.directory / str(self.manifest["edges_file"])
+        yield from (decode_edge(payload) for payload in read_frames(path))
 
 
 class ShardSetReader:
@@ -113,11 +95,23 @@ class ShardSetReader:
 
     def __init__(self, manifest_path: str | Path) -> None:
         self.manifest_path = Path(manifest_path)
-        self.manifest: Dict[str, object] = json.loads(
-            self.manifest_path.read_text(encoding="utf-8"),
-        )
-        if self.manifest.get("shard_format_version") != SHARD_FORMAT_VERSION:
-            raise ValueError("unsupported graph shard-set format")
+        if self.manifest_path.suffix == ".pb":
+            message = graph_pb2.ShardSetManifest()
+            message.ParseFromString(self.manifest_path.read_bytes())
+            if message.format_version != SHARD_FORMAT_VERSION:
+                raise ValueError("unsupported graph protobuf shard-set format")
+            self.manifest = {
+                "shard_format_version": message.format_version,
+                "frontend_id": message.frontend_id,
+                "shards": [
+                    {"shard_id": item.shard_id, "directory": item.directory,
+                     "status": item.status, "node_count": item.node_count,
+                     "edge_count": item.edge_count}
+                    for item in message.shards
+                ],
+            }
+        else:
+            raise ValueError("JSON shard-set manifests are no longer supported; rebuild shards")
         self._root = self.manifest_path.parent
 
     def _shards(self) -> Iterator[ShardReader]:
@@ -159,9 +153,22 @@ class ShardSetWriter:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.frontend_id = frontend_id
-        self.path = self.directory / "shards.json"
+        self.path = self.directory / "shards.pb"
         if self.path.is_file():
-            self.manifest = json.loads(self.path.read_text(encoding="utf-8"))
+            message = graph_pb2.ShardSetManifest()
+            message.ParseFromString(self.path.read_bytes())
+            if message.format_version != SHARD_FORMAT_VERSION:
+                raise ValueError("unsupported graph protobuf shard-set format")
+            self.manifest = {
+                "shard_format_version": message.format_version,
+                "frontend_id": message.frontend_id,
+                "shards": [
+                    {"shard_id": item.shard_id, "directory": item.directory,
+                     "status": item.status, "node_count": item.node_count,
+                     "edge_count": item.edge_count}
+                    for item in message.shards
+                ],
+            }
         else:
             self.manifest = {
                 "shard_format_version": SHARD_FORMAT_VERSION,
@@ -171,8 +178,22 @@ class ShardSetWriter:
             self._save()
 
     def _save(self) -> None:
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(self.manifest, indent=2) + "\n", encoding="utf-8")
+        message = graph_pb2.ShardSetManifest(
+            format_version=SHARD_FORMAT_VERSION,
+            frontend_id=str(self.manifest.get("frontend_id", self.frontend_id)),
+        )
+        for item in self.manifest.get("shards", []):
+            entry = message.shards.add(
+                shard_id=str(item.get("shard_id", "")),
+                directory=str(item.get("directory", "")),
+                status=str(item.get("status", "")),
+            )
+            if item.get("node_count") is not None:
+                entry.node_count = int(item["node_count"])
+            if item.get("edge_count") is not None:
+                entry.edge_count = int(item["edge_count"])
+        temporary = self.path.with_suffix(".pb.tmp")
+        temporary.write_bytes(message.SerializeToString())
         temporary.replace(self.path)
 
     def start(self, shard_id: str) -> ShardWriter:
