@@ -43,6 +43,8 @@ from lachesis.nav.folder_graph import build_folder_graph
 from lachesis.nav.file_graph import build_file_graph, _find_file_node
 from lachesis.nav import render as render_mod
 from lachesis.nav import skeleton as skeleton_mod
+from lachesis.nav.comprehension import Comprehension
+from lachesis.nav.concept import ConceptSearch, DEFAULT_MODEL
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
@@ -53,11 +55,13 @@ _PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
 # Set from LACHESIS_FORMAT in main(); defaults to text.
 _DEFAULT_FORMAT = "text"
 
-# The security-hunting tools. Under the DEFAULT "all" profile every one is exposed
-# exactly as before (TS surface unchanged). The opt-in "comprehension" profile hides
-# these four for a focused language-agnostic (C/kernel) understanding run — the only
-# mode that narrows the surface, and only when explicitly requested.
+# Hunting-only tools are excluded from the opt-in comprehension surface. The default
+# remains additive/backward-compatible; a caller has to request the narrower profile.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
+HUNTING_TOOLS = SECURITY_TOOLS + (
+    "candidates", "candidate_detail", "candidate_census", "skeleton",
+    "flow_pass", "flow_skeleton", "taint",
+)
 
 # Removed for now: each of these builds `GuardProfiles`, whose `_build()` scans every
 # guard-kind edge across the WHOLE graph (and `call_roles` also full-scans CALLS). On a
@@ -105,6 +109,11 @@ OVERLAY_SEED_ARGS = {
 TOOL_ORDER = (
     "load_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
+    "unknowns", "coverage_map", "field_history", "sibling_compare",
+    "type_explain", "component_boundary", "indirect_targets",
+    "architecture_map", "execution_story",
+    "change_context", "tests_for", "spec_links",
+    "concept_search", "context_pack",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
@@ -116,7 +125,7 @@ def _visible_tools():
     """TOOLS filtered by the active profile and sorted into canonical order."""
     hidden = set(DISABLED_TOOLS)
     if _PROFILE == "comprehension":
-        hidden |= set(SECURITY_TOOLS)
+        hidden |= set(HUNTING_TOOLS)
     tools = [t for t in TOOLS if t["name"] not in hidden]
     rank = {n: i for i, n in enumerate(TOOL_ORDER)}
     return sorted(tools, key=lambda t: rank.get(t["name"], len(rank)))
@@ -197,6 +206,13 @@ class _Ctx:
     @property
     def hubs(self):
         return self._analysis("hubs", lambda: Hubs(self.store.gl))
+
+    @property
+    def comprehension(self):
+        return self._analysis("comprehension", lambda: Comprehension(self.store))
+
+    def concepts(self, model=DEFAULT_MODEL):
+        return self._analysis(f"concept:{model}", lambda: ConceptSearch(self.store, model))
 
     @property
     def candidate_bundle(self):
@@ -289,7 +305,11 @@ def _fold_cone(store, name, args):
         "members": sum(f["members"] for f in folded),
         "nodes": sum(f["nodes"] for f in folded),
         "edges": sum(f["edges"] for f in folded),
+        "deferred_edges_omitted": sum(f.get("deferred_edges_omitted", 0)
+                                      for f in folded),
         "truncated": any(f["truncated"] for f in folded),
+        "complete": (not any(f["truncated"] for f in folded)
+                     and not any(f.get("deferred_edges_omitted", 0) for f in folded)),
     }}
 
 
@@ -328,6 +348,130 @@ TOOLS = [
          "overlay": {"type": "string"},
          "profile": {"type": "string", "enum": ["all", "comprehension"]}},
          "required": ["path"]}},
+    {"name": "unknowns",
+     "description": "Explicit comprehension frontiers: unresolved calls, dynamic runtime "
+                    "behavior, and parser/compiler diagnostics. Distinguishes proven-absent "
+                    "from couldn't-cross instead of silently treating missing graph facts as none.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string", "description": "optional function name or node id"},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}}}},
+    {"name": "coverage_map",
+     "description": "Deterministic indexed-graph coverage by component: files, callable bodies, "
+                    "diagnostics, and unmodeled frontiers. This reports graph coverage, not mutable "
+                    "per-client session activity.",
+     "inputSchema": {"type": "object", "properties": {
+         "component_depth": {"type": "integer", "default": 1},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}}}},
+    {"name": "field_history",
+     "description": "For a field/property, list graph-evidenced initialization, modification, "
+                    "reads, checks, and value-flow events with owning functions.",
+     "inputSchema": {"type": "object", "properties": {
+         "field": {"type": "string"},
+         "owner_type": {"type": "string", "description": "optional type name/id disambiguator"},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["field"]}},
+    {"name": "sibling_compare",
+     "description": "Compare structurally similar callables by callees and control structure. "
+                    "Returns differences as facts only; it does not rank anomalies or issue verdicts.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "call_offset": {"type": "integer", "default": 0}},
+         "required": ["symbol"]}},
+    {"name": "type_explain",
+     "description": "Explain a type from graph facts: fields and constructor, mutator, consumer, "
+                    "and destructor method roles.",
+     "inputSchema": {"type": "object", "properties": {
+         "type": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "member_offset": {"type": "integer", "default": 0}},
+         "required": ["type"]}},
+    {"name": "component_boundary",
+     "description": "Show calls, callbacks, and type references crossing between two path "
+                    "components, in both directions, with confidence and source locations.",
+     "inputSchema": {"type": "object", "properties": {
+         "from_component": {"type": "string"}, "to_component": {"type": "string"},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["from_component", "to_component"]}},
+    {"name": "indirect_targets",
+     "description": "Resolve function-pointer, callback, ops-table, and runtime dispatch sites "
+                    "inside a function. Keeps unresolved sites visible and reports confidence.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "target_offset": {"type": "integer", "default": 0}},
+         "required": ["function"]}},
+    {"name": "architecture_map",
+     "description": "Deterministic file communities over the call + dependency graph, with "
+                    "internal/boundary edge counts and call-graph hubs. Returns no generated labels.",
+     "inputSchema": {"type": "object", "properties": {
+         "component_depth": {"type": "integer", "default": 2},
+         "max_communities": {"type": "integer", "default": 30},
+         "max_files_per_community": {"type": "integer", "default": 50},
+         "offset": {"type": "integer", "default": 0},
+         "file_offset": {"type": "integer", "default": 0}}}},
+    {"name": "execution_story",
+     "description": "Bounded forward call-and-branch trace from an entry point, including resolved "
+                    "indirect dispatch. Returns graph structure, not generated narrative prose.",
+     "inputSchema": {"type": "object", "properties": {
+         "entry": {"type": "string"}, "max_depth": {"type": "integer", "default": 5},
+         "max_steps": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "branch_limit": {"type": "integer", "default": 20},
+         "branch_offset": {"type": "integer", "default": 0},
+         "frontier_offset": {"type": "integer", "default": 0}},
+         "required": ["entry"]}},
+    {"name": "change_context",
+     "description": "Join a symbol to its Git history: exact commits, authors, dates, and subjects. "
+                    "Returns history facts and does not generate a why narrative.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 12},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["symbol"]}},
+    {"name": "tests_for",
+     "description": "Find exact references to a symbol in test/spec files, including nearby "
+                    "assertion evidence. Reads the recorded source tree because tests are normally "
+                    "excluded from the production graph.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["symbol"]}},
+    {"name": "spec_links",
+     "description": "Link a symbol to documentation and source comments, preserving any standards "
+                    "URLs and exact file:line evidence.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["symbol"]}},
+    {"name": "context_pack",
+     "description": "Return a minimal coherent factual set for a code question: relevant symbols, "
+                    "call relationships, conditions, tests, specs, and explicit unknowns. Uses "
+                    "identifier/graph relevance until concept_search embeddings are configured.",
+     "inputSchema": {"type": "object", "properties": {
+         "question": {"type": "string"},
+         "max_symbols": {"type": "integer", "default": 6},
+         "max_neighbors": {"type": "integer", "default": 30},
+         "symbol_offset": {"type": "integer", "default": 0},
+         "relationship_offset": {"type": "integer", "default": 0},
+         "condition_offset": {"type": "integer", "default": 0},
+         "test_offset": {"type": "integer", "default": 0},
+         "spec_offset": {"type": "integer", "default": 0},
+         "unknown_offset": {"type": "integer", "default": 0}},
+         "required": ["question"]}},
+    {"name": "concept_search",
+     "description": "Search code by behavior rather than spelling using an optional local "
+                    "embedding model. Search is offline-only and never downloads implicitly; "
+                    "install the concept-search extra and run `lachesis concept-model download`.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string"}, "limit": {"type": "integer", "default": 20},
+         "min_score": {"type": "number", "default": 0.0},
+         "offset": {"type": "integer", "default": 0},
+         "model": {"type": "string", "default": "BAAI/bge-small-en-v1.5"}},
+         "required": ["query"]}},
     {"name": "guards_top",
      "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
                     "name knowledge needed — a security-hunting entry point (for the spine of an "
@@ -535,9 +679,10 @@ for _t in TOOLS:
     if _t["name"] != "load_graph":
         _t["inputSchema"].setdefault("properties", {})["format"] = {
             "type": "string", "enum": ["text", "json"],
-            "description": "text (compact, default) | json (full result dict)"}
-# Paging fields on the list-shaped moves: they window the TEXT rendering only (JSON is
-# always the full, un-paged result), so a call on a 400-caller hub stays bounded.
+            "description": "text (compact, default) | json (structured result page)"}
+# Paging fields on these legacy list-shaped moves window their text rendering. Newer
+# comprehension tools page structured results before they reach this layer and include
+# total/next-offset metadata in both JSON and compact text.
 for _name in ("hubs", "callers", "callees", "flow_pass", "flow_skeleton"):
     _tool = next(t for t in TOOLS if t["name"] == _name)
     _tool["inputSchema"]["properties"].update(
@@ -565,10 +710,10 @@ def _atropos_envelope(summary, *, full):
 
 
 def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
-    """Serialize a tool's result dict: full JSON, or compact text via the renderer.
+    """Serialize a tool result as structured JSON or compact agent-facing text.
 
-    JSON is byte-identical to the pre-render behavior; text applies id/handle/null
-    stripping, path relativization, and the offset/limit window (text-only paging)."""
+    Comprehension tools page evidence in the result contract itself. The renderer also
+    windows legacy list-shaped text results and strips redundant detail."""
     if fmt == "json":
         return json.dumps(result)
     return render_mod.render(name, result, offset=offset, limit=limit)
@@ -583,13 +728,106 @@ def call_tool(name, args, format=None):
     if name in DISABLED_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is disabled: it requires a "
                                      "whole-graph guard scan (removed for now)"}, fmt)
-    if _PROFILE == "comprehension" and name in SECURITY_TOOLS:
+    if _PROFILE == "comprehension" and name in HUNTING_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is hidden under the "
-                                     "'comprehension' profile (security tool)"}, fmt)
+                                     "'comprehension' profile (hunting-only tool)"}, fmt)
     c = ctx()
     cone = _fold_cone(c.store, name, args)
     store, gl = c.store, c.store.gl
     text = fmt != "json"  # text mode enriches callers/callees with dispatch slots
+
+    if name == "unknowns":
+        result = c.comprehension.unknowns(
+            function=args.get("function"), limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "coverage_map":
+        result = c.comprehension.coverage_map(
+            component_depth=int(args.get("component_depth", 1)),
+            limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "field_history":
+        result = c.comprehension.field_history(
+            args["field"], args.get("owner_type"), limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "sibling_compare":
+        result = c.comprehension.sibling_compare(
+            args["symbol"], limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)), call_offset=int(args.get("call_offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "type_explain":
+        result = c.comprehension.type_explain(
+            args["type"], limit=int(args.get("limit", 100)),
+            offset=int(args.get("offset", 0)),
+            member_offset=int(args.get("member_offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "component_boundary":
+        result = c.comprehension.component_boundary(
+            args["from_component"], args["to_component"],
+            limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "indirect_targets":
+        return _emit(name, c.comprehension.indirect_targets(
+                         args["function"], limit=int(args.get("limit", 100)),
+                         offset=int(args.get("offset", 0)),
+                         target_offset=int(args.get("target_offset", 0))),
+                     fmt, offset, limit)
+    if name == "architecture_map":
+        result = c.comprehension.architecture_map(
+            component_depth=int(args.get("component_depth", 2)),
+            max_communities=int(args.get("max_communities", 30)),
+            max_files_per_community=int(args.get("max_files_per_community", 50)),
+            offset=int(args.get("offset", 0)),
+            file_offset=int(args.get("file_offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "execution_story":
+        result = c.comprehension.execution_story(
+            args["entry"], max_depth=int(args.get("max_depth", 5)),
+            max_steps=int(args.get("max_steps", 100)),
+            offset=int(args.get("offset", 0)),
+            branch_limit=int(args.get("branch_limit", 20)),
+            branch_offset=int(args.get("branch_offset", 0)),
+            frontier_offset=int(args.get("frontier_offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "change_context":
+        result = c.comprehension.change_context(
+            args["symbol"], limit=int(args.get("limit", 12)),
+            offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "tests_for":
+        result = c.comprehension.tests_for(
+            args["symbol"], limit=int(args.get("limit", 50)),
+            offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "spec_links":
+        result = c.comprehension.spec_links(
+            args["symbol"], limit=int(args.get("limit", 50)),
+            offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "context_pack":
+        semantic = c.concepts(DEFAULT_MODEL).search(
+            args["question"], limit=max(6, int(args.get("max_symbols", 6)) * 3))
+        semantic_hits = semantic.get("results", []) if "error" not in semantic else []
+        semantic_status = (f"ready:{semantic.get('model')}" if semantic_hits
+                           else semantic.get("error", "no-semantic-matches"))
+        result = c.comprehension.context_pack(
+            args["question"], max_symbols=int(args.get("max_symbols", 6)),
+            max_neighbors=int(args.get("max_neighbors", 30)),
+            semantic_hits=semantic_hits, semantic_status=semantic_status,
+            symbol_offset=int(args.get("symbol_offset", 0)),
+            relationship_offset=int(args.get("relationship_offset", 0)),
+            condition_offset=int(args.get("condition_offset", 0)),
+            test_offset=int(args.get("test_offset", 0)),
+            spec_offset=int(args.get("spec_offset", 0)),
+            unknown_offset=int(args.get("unknown_offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "concept_search":
+        result = c.concepts(args.get("model", DEFAULT_MODEL)).search(
+            args["query"], limit=int(args.get("limit", 20)),
+            min_score=float(args.get("min_score", 0.0)),
+            offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
 
     if name == "guards_top":
         rows = c.guards.top(int(args.get("n", 20)))

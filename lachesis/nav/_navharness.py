@@ -35,6 +35,8 @@ def run_nav(store, calls: Iterable[NavCall]) -> dict:
     from .call_roles import CallRoles
     from .guards import GuardProfiles
     from .hubs import Hubs
+    from .comprehension import Comprehension
+    from .concept import ConceptSearch, DEFAULT_MODEL
     from .reachability import Reachability
     from .siblings import SiblingDiff
 
@@ -42,7 +44,8 @@ def run_nav(store, calls: Iterable[NavCall]) -> dict:
     mcp_server._CTX = types.SimpleNamespace(
         store=store, reach=Reachability(store), hubs=Hubs(store.gl),
         guards=guards, roles=CallRoles(store, guards=guards),
-        siblings=SiblingDiff(store),
+        siblings=SiblingDiff(store), comprehension=Comprehension(store),
+        concepts=lambda model=DEFAULT_MODEL: ConceptSearch(store, model),
     )
     mcp_server._PROFILE = "all"
     mcp_server._DEFAULT_FORMAT = "json"

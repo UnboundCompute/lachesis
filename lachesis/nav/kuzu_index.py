@@ -231,9 +231,12 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
     # props in: materializing the same store twice must give byte-identical output, or
     # a downstream enrich is not reproducible.
     deferred = deferred_edges(index)
-    if keep is not None:
-        deferred = [e for e in deferred
-                    if e["source"] in keep and e["target"] in keep]
+    # ``keep`` can contain an id named by a deferred edge even though no Node row for
+    # that id exists in this store. Filtering against ``keep`` alone therefore admits
+    # the very dangling edge a materialized subgraph promises never to contain.
+    resident = {node["id"] for node in nodes}
+    deferred = [e for e in deferred
+                if e["source"] in resident and e["target"] in resident]
     edges.extend(deferred)
     edges.sort(key=lambda e: (e["kind"], e["source"], e["target"],
                               json.dumps(e["properties"], sort_keys=True)))

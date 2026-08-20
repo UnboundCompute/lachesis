@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional, Protocol, runtime_checkable
 
+from .core.identities import identity_namespace, identity_owner
 from .indices import CALLSITE_KINDS, callee_name
 
 # Step 1's trust set. The `resolution` vocabulary is the frontends' own: `exact` and
@@ -220,7 +221,7 @@ class Resolver:
         if not name:
             return self._indirect_or_nothing(call_site_id)
 
-        candidates = self._candidates(name)
+        candidates = self._candidates(name, node)
         if candidates:
             path = properties.get("file")
             if _is_c(path):
@@ -263,9 +264,40 @@ class Resolver:
                            "invokes-edges", truncated=len(trusted) > CANDIDATE_CAP)
         return None
 
-    def _candidates(self, name: str) -> tuple:
-        """Declaration rows under a name, callables first and nothing thrown away."""
+    def _candidates(self, name: str, call_site: Mapping) -> tuple:
+        """Same-frontend declaration rows under a name, with callables preferred.
+
+        The declaration index is intentionally project-wide, but a source-language
+        call is not.  A Python ``append`` cannot fall through to a TypeScript
+        declaration merely because both frontends contributed to one repository
+        graph.  Compiler-resolved edges were already trusted by step one; this filter
+        applies only to the name-based recovery used after a frontend gave up.
+
+        Older/non-canonical fixtures may not have v2 identities.  They retain the old
+        behaviour unless both sides expose a language and those languages disagree.
+        """
         rows = tuple(self.index.decl_index(name) or ())
+        site_id = str(call_site.get("id") or "")
+        site_namespace = (identity_namespace(site_id)
+                          if identity_owner(site_id) == "frontend" else None)
+        site_language = str(_properties(call_site).get("language") or "")
+
+        compatible = []
+        for row in rows:
+            candidate_id = str(row.get("node_id") or "")
+            candidate_namespace = (identity_namespace(candidate_id)
+                                   if identity_owner(candidate_id) == "frontend"
+                                   else None)
+            if site_namespace and candidate_namespace:
+                if site_namespace == candidate_namespace:
+                    compatible.append(row)
+                continue
+            candidate = self.index.nodes.get(candidate_id)
+            candidate_language = str(_properties(candidate).get("language") or "")
+            if site_language and candidate_language and site_language != candidate_language:
+                continue
+            compatible.append(row)
+        rows = tuple(compatible)
         callable_rows = tuple(row for row in rows if row.get("kind") in CALLABLE_KINDS)
         return callable_rows or rows
 

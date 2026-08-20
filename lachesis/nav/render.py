@@ -6,16 +6,16 @@ programmatic caller that JSON is the contract; for an LLM consumer it is mostly
 waste — a 20-char hex `node_id` the agent never re-addresses, a `handle` that
 duplicates `file:line`, absolute-ish paths repeated on every row, and `null` /
 empty-list fields. This module renders the SAME result dict as terse text so a
-per-call payload drops ~3-5x, while `mcp_server` keeps emitting full JSON whenever
-`format="json"` is asked (byte-identical to the pre-render behavior).
+per-call payload drops ~3-5x, while `mcp_server` keeps emitting structured JSON whenever
+`format="json"` is asked. Comprehension results carry paging metadata in either format.
 
 The single entry point is `render(tool_name, result, root=None, offset=0, limit=40)`.
 It strips, in priority order: (1) `node_id`, (2) `handle`, (3) absolute paths
 (relativized to a project root, collapsing to `basename:line`), (4) `null` /
 empty-list fields, and renders lists one item per line. Every list is capped at
 `limit` items with a `… +K more (offset=N)` footer so a single call on a
-400-caller hub can never blow the budget. Truncation is a TEXT concern only —
-JSON is always the full, un-paged result.
+400-caller hub can never blow the budget. Legacy moves page at this text layer; newer
+comprehension moves page structured evidence and expose the next offset directly.
 
 A per-tool template exists for the high-traffic tools; any tool without one falls
 through to `_generic`, which applies the same strip rules to an arbitrary dict so
@@ -196,7 +196,6 @@ def _r_file_graph(result: dict, offset: int, limit: int) -> str:
     manifest = result.get("manifest") or {}
     nodes = result.get("nodes") or []
     decls = [n for n in nodes if n.get("kind") not in ("file",)]
-    loc = _Loc(_node_file(n) for n in decls)
     window, footer = _window(decls, offset, limit)
     base = _basename(manifest.get("file") or "?")
     lines = [f"    {n.get('label'):<24} {n.get('kind')}:{_node_line(n)}" for n in window]
@@ -269,8 +268,11 @@ def _compact(value, loc: _Loc):
     """Recursively drop stripped/empty keys and relativize any `file`+`line` pair."""
     if isinstance(value, dict):
         out = {}
+        if value.get("file"):
+            out["at"] = loc.of(value["file"], value.get("line"))
         for k, v in value.items():
-            if k in _STRIP_KEYS or v is None or v == [] or v == {}:
+            if k in _STRIP_KEYS or k == "file" or (k == "line" and value.get("file")) \
+                    or v is None or v == [] or v == {}:
                 continue
             out[k] = _compact(v, loc)
         return out
@@ -309,6 +311,10 @@ def _generic(tool_name: str, result: dict, offset: int, limit: int) -> str:
                             parts.append(loc.of(iv, item.get("line")))
                         elif ik == "line" and "file" in item:
                             continue
+                        elif isinstance(iv, dict):
+                            label = iv.get("name") or iv.get("type") or iv.get("kind") or ik
+                            suffix = f"@{iv['at']}" if iv.get("at") else ""
+                            parts.append(f"{ik}={label}{suffix}")
                         else:
                             parts.append(f"{ik}={iv}")
                     lines.append("    " + "  ".join(parts))
