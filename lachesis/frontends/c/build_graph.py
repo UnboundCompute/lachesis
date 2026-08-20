@@ -1756,7 +1756,14 @@ def main() -> int:
         defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
 
         def with_defaults(item: dict) -> dict:
-            return {**item, "properties": {**defaults, **item.get("properties", {})}}
+            # ``as_dict`` has already allocated the emission record.  Copying that
+            # record and its properties again for every fact briefly doubled the
+            # largest tier at flush time; defaults are immutable contract values, so
+            # fill the existing mapping in place and keep only one record alive.
+            properties = item.setdefault("properties", {})
+            for key, value in defaults.items():
+                properties.setdefault(key, value)
+            return item
 
         return {
             **payload,
