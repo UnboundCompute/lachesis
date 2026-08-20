@@ -18,6 +18,35 @@ _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
 _DEFAULT_LIFETIME_ENGINE = "object"
 
 
+def _apply_owned_return_contracts(F, contracts):
+    """Turn opaque ``returns=owned`` facts into alloc events on assigned results.
+
+    Function bodies remain authoritative: a contract whose name is defined in ``F`` is
+    ignored here, matching the object summary rule.  The graph itself is untouched; this
+    augments only the per-run flow IR consumed by summaries and skeletons.
+    """
+    owned = {
+        contract.name for contract in contracts
+        if getattr(contract.returns, "value", contract.returns) == "owned"
+        and contract.name not in F
+    }
+    if not owned:
+        return ()
+    for function in F.values():
+        events = function["events"]
+        seen = {(event.get("kind"), event.get("var"), event.get("node"))
+                for event in events}
+        for assign in function.get("assigns", ()):
+            if assign.get("callee") not in owned:
+                continue
+            key = ("alloc", assign.get("var"), assign.get("node"))
+            if key not in seen:
+                events.append({"kind": "alloc", "var": assign.get("var"),
+                               "line": assign.get("line"), "node": assign.get("node")})
+                seen.add(key)
+    return tuple(sorted(owned))
+
+
 def _lead_key(lead):
     # The two engines encode object display names differently; a differential is
     # about whether they agree on the finding site, not renderer spelling.
@@ -146,10 +175,14 @@ def run_pass(store, lang="c", lifetime_engine=None, manifest=None):
             "lifetime engine must be one of legacy, shadow, or object")
     object_requested = lang.lower() == "c" and requested != "legacy"
     if object_requested:
-        F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
+        F, succ, analysis_graph = build_F(
+            store, lang=lang, return_graph=True,
+            extra_alloc=extra_alloc, extra_dealloc=extra_dealloc)
     else:
-        F, succ = build_F(store, lang=lang)
+        F, succ = build_F(
+            store, lang=lang, extra_alloc=extra_alloc, extra_dealloc=extra_dealloc)
         analysis_graph = None
+    owned_alloc = _apply_owned_return_contracts(F, contracts)
     projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
@@ -163,7 +196,8 @@ def run_pass(store, lang="c", lifetime_engine=None, manifest=None):
     if object_requested:
         object_result = analyze_object_lifetimes(
             store, F, succ, lang=lang, graph=analysis_graph,
-            extra_alloc=extra_alloc, extra_dealloc=extra_dealloc,
+            extra_alloc=tuple(extra_alloc) + owned_alloc,
+            extra_dealloc=extra_dealloc,
             max_disjuncts=cfg_disjunct, contracts=contracts)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another

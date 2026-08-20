@@ -91,6 +91,83 @@ class ManifestDrivenLifetimeTests(unittest.TestCase):
             self.assertIn("memory.free", applied)
             self.assertIn("my_release", applied["memory.free"])
 
+    def test_manifest_allocator_makes_unreleased_assignment_a_leak(self):
+        source = r"""
+void *xmalloc(unsigned long);
+void unreleased_custom_alloc(void) {
+    char *p = xmalloc(8);
+    (void)p;
+}
+"""
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as output:
+            Path(source_dir, "alloc.c").write_text(source)
+            completed = subprocess.run(
+                [sys.executable, "-m", "lachesis.frontends.c.build_graph", source_dir, output],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            snapshot = load_snapshot(output)
+
+            baseline = run_pass(
+                GraphStore(semantic_snapshot_graph(snapshot)),
+                lang="c", lifetime_engine="object")
+            self.assertFalse(any(
+                lead["pattern"] == "leak"
+                and lead["entry"] == "unreleased_custom_alloc"
+                for lead in baseline["leads"]),
+                "an unknown allocator must not manufacture an allocation origin",
+            )
+
+            manifest = Manifest(project=ProjectFacts(memory=Memory(alloc=("xmalloc",))))
+            declared = run_pass(
+                GraphStore(semantic_snapshot_graph(snapshot)),
+                lang="c", lifetime_engine="object", manifest=manifest)
+            self.assertTrue(any(
+                lead["pattern"] == "leak"
+                and lead["entry"] == "unreleased_custom_alloc"
+                for lead in declared["leads"]),
+                "declaring xmalloc must emit an alloc event and expose the leak",
+            )
+
+    def test_owned_return_contract_makes_unreleased_result_a_leak(self):
+        source = r"""
+void *external_owned(void);
+void unreleased_owned_result(void) {
+    char *p = external_owned();
+    (void)p;
+}
+"""
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as output:
+            Path(source_dir, "owned.c").write_text(source)
+            completed = subprocess.run(
+                [sys.executable, "-m", "lachesis.frontends.c.build_graph", source_dir, output],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            snapshot = load_snapshot(output)
+
+            baseline = run_pass(
+                GraphStore(semantic_snapshot_graph(snapshot)),
+                lang="c", lifetime_engine="object")
+            self.assertFalse(any(
+                lead["pattern"] == "leak"
+                and lead["entry"] == "unreleased_owned_result"
+                for lead in baseline["leads"]),
+            )
+
+            manifest = Manifest(project=ProjectFacts(functions=(
+                FunctionContract(name="external_owned", returns=Ownership.OWNED),
+            )))
+            declared = run_pass(
+                GraphStore(semantic_snapshot_graph(snapshot)),
+                lang="c", lifetime_engine="object", manifest=manifest)
+            self.assertTrue(any(
+                lead["pattern"] == "leak"
+                and lead["entry"] == "unreleased_owned_result"
+                for lead in declared["leads"]),
+                "an opaque owned return must seed caller ownership",
+            )
+
     def test_manifest_config_extraction_and_audit(self):
         # No manifest -> empty knobs, empty audit.
         engine, alloc, dealloc, cap, contracts, applied = _manifest_config(None)
