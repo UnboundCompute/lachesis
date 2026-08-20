@@ -120,6 +120,8 @@ def main() -> None:
         parser.error("--stream-shards currently supports core-only stores")
     if args.stream_shards and args.incremental:
         parser.error("--stream-shards cannot combine with incremental builds")
+    if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
+        parser.error("streamed package shards are serialized; use --max-workers 1")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
     # same output defaults before the streaming branch as the ordinary path below.
     # Previously the early return skipped this block and made --stream-shards run

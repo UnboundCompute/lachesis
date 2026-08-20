@@ -1891,6 +1891,10 @@ def main() -> int:
     (output_dir / "manifest.pb").write_bytes(encode_document(manifest))
     print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
+    # The cache is module-global for cheap lookups while building one graph, but a
+    # long-lived in-process caller (for example an Action worker handling multiple
+    # projects) must not retain every prior project's resolved paths and hashes.
+    RESOLVED_FILES.clear()
     return 0
 
 
