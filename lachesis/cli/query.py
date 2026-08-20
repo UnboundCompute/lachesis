@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lachesis.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
+from lachesis.projections.layered import build_security_query_projection
 
 
 def load_graph(path: str) -> tuple[dict, dict]:
@@ -137,8 +138,13 @@ def parser() -> argparse.ArgumentParser:
 
 def execute(args: argparse.Namespace) -> dict:
     graph, metadata = load_graph(args.graph)
+    layered = (
+        build_security_query_projection(graph, metadata)
+        if args.command in {"security-path", "security-paths"}
+        else None
+    )
     query = ReasoningQuery(
-        graph, default_budget_tokens=args.budget_tokens,
+        graph, layered=layered, default_budget_tokens=args.budget_tokens,
         project_metadata=metadata,
     )
     command = args.command
