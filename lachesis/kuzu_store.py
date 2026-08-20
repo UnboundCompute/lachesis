@@ -128,7 +128,7 @@ CONSTANT_PROP_DEFAULTS = {
 KUZU_DB_FILENAME = "graph.kuzu"
 
 
-def _kuzu_buffer_pool_size() -> int:
+def _kuzu_buffer_pool_size(default: int = 0) -> int:
     """Return an optional bounded Kùzu buffer pool size in bytes.
 
     Kùzu's ``0`` default auto-sizes from host memory, which is unsafe for CI
@@ -138,7 +138,7 @@ def _kuzu_buffer_pool_size() -> int:
     """
     raw = os.environ.get("LACHESIS_KUZU_BUFFER_POOL_SIZE", "")
     if not raw:
-        return 0
+        return default
     try:
         value = int(raw)
     except ValueError as exc:
@@ -1261,7 +1261,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 prefixes.add(match.group(1))
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
-    db = kuzu.Database(db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size())
+    # Streamed materialization is explicitly the bounded-memory path. Keep a
+    # predictable 1 GiB cache by default; callers can raise/lower it with the env.
+    db = kuzu.Database(db_file(db_dir),
+                       buffer_pool_size=_kuzu_buffer_pool_size(1 << 30))
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
     for stmt in _rel_ddl():
