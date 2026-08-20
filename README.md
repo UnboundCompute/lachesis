@@ -187,7 +187,20 @@ LACHESIS_TIMINGS=1 LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
 ```
 
 `--stream-shards` is currently incompatible with `--enrich`; dataflow partition
-streaming is the next integration step. The resulting store is explicitly marked
+streaming is the next integration step. For a TypeScript monorepo whose packages
+or root lists do not fit in one compiler heap, combine it with the bounded package
+splitter. Shards are compiled serially so compiler heaps do not multiply, and each
+completed bundle is released before the next one starts:
+
+```bash
+LACHESIS_TS_MAX_OLD_SPACE_MB=4096 \
+  lachesis-analyze /path/to/monorepo /tmp/monorepo.kuzu \
+  --parallel-packages --shard-large-packages 100 \
+  --stream-shards /tmp/monorepo-shards --prune
+```
+
+This is a bounded fallback with an explicit package-resolution tradeoff; whole-program
+analysis remains the highest-fidelity mode when it fits. The resulting store is explicitly marked
 core-only, so `GraphStore`/the GitHub Action builds the dataflow tier on its first
 security query rather than silently skipping enrichment. Additive derived records are
 cached in a compact internal `<store>.dataflow.pb` sidecar; JSON is reserved for
@@ -195,8 +208,8 @@ user-facing output. A full `.enriched` Kùzu cache remains the fallback for over
 that mutate core records.
 
 For a TypeScript monorepo whose largest package does not fit in one compiler heap,
-the opt-in package-sharded build bounds each compiler root list (it is a semantic
-tradeoff, so the CLI reports cross-shard edges that could not be merged):
+the non-streaming opt-in package-sharded build bounds each compiler root list (it is a
+semantic tradeoff, so the CLI reports cross-shard edges that could not be merged):
 
 ```bash
 lachesis-analyze /path/to/monorepo /tmp/monorepo.kuzu \
