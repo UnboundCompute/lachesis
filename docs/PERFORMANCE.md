@@ -108,6 +108,14 @@ An `mmap` reader was benchmarked on a 400k-record shard stream (200k nodes and
 (0.225s versus 0.189s in the local run), so it was reverted in `eb249b8`. The current
 length-framed marshal format remains the faster measured implementation.
 
+### C frontend path-resolution reduction
+
+The C macro/dependency passes now memoize repeated preprocessor marker and dependency
+paths (`3ad17ad`). On the 4-file C fixture, the cProfile count of `Path.resolve()` calls
+dropped from 2,167 to 319; the emitted graph remained 442 nodes and 784 edges. This
+is a CPU/syscall reduction, not a large-codebase timing claim; the Linux `fs` run still
+needs a fresh bounded measurement before its pass-1 row can change.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
