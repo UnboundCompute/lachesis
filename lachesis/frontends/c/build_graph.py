@@ -70,15 +70,6 @@ CONTENT_HASHES: Dict[Path, str] = {}
 RESOLVED_FILES: Dict[str, Tuple[str, str]] = {}
 
 
-def _freeze(value: object) -> object:
-    """Order-independent hashable projection of a JSON-shaped value — an edge
-    dedup key without the per-edge json.dumps(sort_keys=True) string build."""
-    if isinstance(value, dict):
-        return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
-    if isinstance(value, list):
-        return tuple(_freeze(v) for v in value)
-    return value
-
 def stable_id(kind: str, *parts: object) -> str:
     raw = "\0".join(str(part) for part in parts)
     identity_digest = hashlib.sha256(
@@ -562,7 +553,7 @@ class Graph:
         self.nodes: Dict[str, dict] = {}
         self.node_tier: Dict[str, str] = {}
         self.edges: List[dict] = []
-        self.edge_keys = set()
+        self.edge_keys = _EdgeKeys()
 
     def node(self, tier: str, node_id: str, kind: str, label: str, **properties) -> str:
         canonical = {
@@ -601,14 +592,50 @@ class Graph:
             "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
             **properties,
         }
-        key = (kind, source, target, _freeze(canonical))
-        if key in self.edge_keys:
+        if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
-        self.edge_keys.add(key)
         self.edges.append({
             "kind": kind, "source": source, "target": target,
             "properties": canonical,
         })
+
+
+class _EdgeKeys:
+    """Deduplicate edges without retaining a frozen property copy for every edge.
+
+    Most edges have a unique ``(kind, source, target)`` triple.  Keeping a fully
+    frozen property tuple for all of them duplicates a large fraction of the graph's
+    live memory.  Remember the first edge's position instead, and serialize
+    properties only when a triple collides.  This is the same identity predicate as
+    the old ``_freeze`` key, with first-occurrence ordering preserved.
+    """
+
+    __slots__ = ("_first", "_tied")
+
+    def __init__(self) -> None:
+        self._first: Dict[Tuple[str, str, str], int] = {}
+        self._tied: Dict[Tuple[str, str, str], Set[str]] = {}
+
+    def add(
+        self, kind: str, source: str, target: str, properties: dict,
+        edges: List[dict],
+    ) -> bool:
+        triple = (kind, source, target)
+        first = self._first.get(triple)
+        if first is None:
+            self._first[triple] = len(edges)
+            return True
+        properties_seen = self._tied.get(triple)
+        if properties_seen is None:
+            properties_seen = {
+                json.dumps(edges[first]["properties"], sort_keys=True),
+            }
+            self._tied[triple] = properties_seen
+        key = json.dumps(properties, sort_keys=True)
+        if key in properties_seen:
+            return False
+        properties_seen.add(key)
+        return True
 
 
 def referenced_decl(node: dict) -> Optional[dict]:
