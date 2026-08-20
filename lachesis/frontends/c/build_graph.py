@@ -815,7 +815,12 @@ class AstStore:
 
     def add(self, path: Path, ast: dict, bodyful: bool = True) -> None:
         spill = self._directory / f"{len(self._entries)}.bin"
-        spill.write_bytes(marshal.dumps(ast))
+        # Stream the serialization directly to disk.  ``marshal.dumps`` briefly
+        # creates a second, full AST-sized bytes object before ``write_bytes`` copies
+        # it; a large kernel translation unit can make that avoidable duplication the
+        # frontend's peak allocation.
+        with spill.open("wb") as handle:
+            marshal.dump(ast, handle)
         self._entries.append((path, spill, bodyful))
 
     def __iter__(self) -> Iterator[Tuple[Path, dict]]:
