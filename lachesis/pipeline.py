@@ -197,7 +197,10 @@ def enrich_graph(
     from .ecosystems import default_ecosystem_registry
 
     graph = default_overlay_registry().enrich(graph, observer)
-    index = GraphIndex(graph)
+    # Ecosystem models consume kind/adjacency lookups and package_inventory only;
+    # defer navigation-only label/file/owner buckets, which otherwise retain several
+    # extra references per record during large pass-three enrichments.
+    index = GraphIndex(graph, compact=True)
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), set(languages), capabilities, index,
     )
