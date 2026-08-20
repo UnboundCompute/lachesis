@@ -1,0 +1,50 @@
+# Curl-shaped example manifest. Copy this beside a checkout and replace the symbols,
+# paths, and graph with facts for the build variant you actually ship.
+[project]
+name = "curl"
+language = "c"
+
+[project.source]
+roots = ["lib", "src"]
+exclude = ["tests", "**/vendor/**"]
+
+[project.build]
+config = ["USE_OPENSSL", "ENABLE_IPV6"]
+include = ["include", "lib"]
+defines = { CURL_DISABLE_FTP = 0 }
+
+[project.memory]
+alloc = ["curl_malloc", "Curl_saferealloc"]
+free = ["Curl_safefree"]
+
+[project.surface]
+entrypoints = ["curl_easy_perform"]
+untrusted = [
+  { fn = "Curl_read", at = "return" },
+  { fn = "curl_easy_setopt", at = "arg2" },
+]
+
+[project.trust]
+sanitizers = ["Curl_urldecode"]
+
+[project.functions.Curl_close]
+frees = ["arg0.data"]
+returns = "borrowed"
+
+[project.functions.Curl_dup]
+returns = "owned"
+
+[project.alias]
+noalias = [["Curl_easy.state", "Curl_easy.set"]]
+
+[project.dispatch]
+"Curl_handler.disconnect" = "ossl_disconnect"
+
+[project.typedefs]
+Curl_easy = "SessionHandle"
+
+[analysis]
+engine = "object"
+graph = "~/.lachesis/graphs/curl.kuzu"
+disjunct_cap = 64
+timeout_per_fn = "30s"

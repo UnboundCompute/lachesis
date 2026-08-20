@@ -43,7 +43,7 @@ from lachesis.nav.kuzu_index import materialize_graph
 from lachesis.planner.unbounded_copy import BranchRegions
 
 from . import atropos
-from .normalize import normalizer
+from .normalize import normalizer_with
 
 
 # --- small helpers ---------------------------------------------------------------
@@ -346,7 +346,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             "assigns": assigns, "returns": returns, "callees": callees}
 
 
-def build_F(store, lang="c", *, return_graph=False):
+def build_F(store, lang="c", *, return_graph=False, extra_alloc=(), extra_dealloc=()):
     """Build the whole-graph F dict + succ (callee-edge) map from an enriched store.
 
     Reproduces order.load's return so the pass is input-source agnostic. Taxonomy /
@@ -367,7 +367,10 @@ def build_F(store, lang="c", *, return_graph=False):
     nest = ControlNesting(graph)                   # loop/branch nesting from AST containment
     sinks = atropos.sink_catalog(lang)
     sink_names = set(sinks)
-    norm = normalizer(lang)                        # form oracle: canonicalize callee names
+    # Manifest lifecycle names are a run-local extension.  ``normalizer_with`` returns
+    # the shared catalog instance when both are empty, and an uncached instance otherwise,
+    # so one target's vocabulary can never leak into another analysis.
+    norm = normalizer_with(lang, extra_alloc, extra_dealloc)
 
     fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
     defined = {f.get("label") for f in fnodes if not _props(f).get("declaration_only")}
