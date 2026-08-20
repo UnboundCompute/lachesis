@@ -192,6 +192,25 @@ def _kuzu_checkpoint_threshold(default: int = -1) -> int:
         raise ValueError("LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be non-negative")
     return value
 
+
+def _stream_batch_rows(default: int = 25_000) -> int:
+    """Bound the number of records handed to each streamed Arrow batch.
+
+    Ten-thousand-row batches were chosen before the protobuf-to-Parquet path was
+    fused.  A moderately larger batch amortizes Python/Arrow writer calls without
+    allowing an environment override to create an unbounded transient allocation.
+    """
+    raw = os.environ.get("LACHESIS_STREAM_BATCH_ROWS", "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LACHESIS_STREAM_BATCH_ROWS must be an integer row count") from exc
+    if value < 1:
+        raise ValueError("LACHESIS_STREAM_BATCH_ROWS must be positive")
+    return min(value, 100_000)
+
 # Deliberately separate from the per-frontend
 # bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
 # two would collide the moment anyone points one at the other.
@@ -1417,6 +1436,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     edge_writer_paths = {}
     edge_path_lists = collections.defaultdict(list)
     edge_row_counts = collections.defaultdict(int)
+    batch_rows = _stream_batch_rows()
 
     def flush_edge_partition(kind: str) -> None:
         writer = edge_writers.pop(kind, None)
@@ -1467,7 +1487,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         if prune and node.get("kind") in PRUNE_NODE_KINDS:
             continue
         batch.append(node)
-        if len(batch) >= 10_000:
+        if len(batch) >= batch_rows:
             load_nodes(batch)
             batch.clear()
     if batch:
@@ -1484,7 +1504,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             continue
         batch.append(edge)
         kept_edge_count += 1
-        if len(batch) >= 10_000:
+        if len(batch) >= batch_rows:
             load_edges(batch)
             batch.clear()
     if batch:
