@@ -683,6 +683,15 @@ def _has_include_origin(node: dict) -> bool:
     return bool(loc.get("includedFrom") or begin.get("includedFrom"))
 
 
+def _has_function_body(node: dict) -> bool:
+    """Whether an AST contains a non-declaration function body worth walking."""
+    if node.get("kind") == "FunctionDecl" and any(
+        child.get("kind") == "CompoundStmt" for child in node.get("inner", ())
+    ):
+        return True
+    return any(_has_function_body(child) for child in node.get("inner", ()))
+
+
 class AstStore:
     """Disk-backed sequence of Clang ASTs, re-parsed one translation unit at a time.
 
@@ -696,18 +705,27 @@ class AstStore:
 
     def __init__(self, directory: Path) -> None:
         self._directory = directory
-        self._entries: List[Tuple[Path, Path]] = []
+        self._entries: List[Tuple[Path, Path, bool]] = []
 
-    def add(self, path: Path, ast: dict) -> None:
+    def add(self, path: Path, ast: dict, bodyful: bool = True) -> None:
         spill = self._directory / f"{len(self._entries)}.bin"
         spill.write_bytes(marshal.dumps(ast))
-        self._entries.append((path, spill))
+        self._entries.append((path, spill, bodyful))
 
     def __iter__(self) -> Iterator[Tuple[Path, dict]]:
-        for path, spill in self._entries:
+        for path, spill, _bodyful in self._entries:
             # Avoid materializing a second bytes-sized copy of a potentially huge
             # marshalled AST before ``marshal`` creates its object tree. The mapping
             # is released as soon as the one-TU object is handed to the pass.
+            with spill.open("rb") as handle:
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                    yield path, marshal.loads(mapped)
+
+    def body_asts(self) -> Iterator[Tuple[Path, dict]]:
+        """Reload only TUs that can emit function-body facts."""
+        for path, spill, bodyful in self._entries:
+            if not bodyful:
+                continue
             with spill.open("rb") as handle:
                 with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
                     yield path, marshal.loads(mapped)
@@ -845,7 +863,7 @@ def main() -> int:
                         or not _has_include_origin(child)
                         or child.get("kind") == "RecordDecl"
                     ]
-                    asts.add(path, ast)
+                    asts.add(path, ast, _has_function_body(ast))
                     recovered = True
                 else:
                     diagnostics.append((path, "Clang AST recovered no declarations"))
@@ -1438,7 +1456,7 @@ def main() -> int:
         for index, child in enumerate(node.get("inner", [])):
             bodies(child, path, owner, body_id, is_included, node, index)
 
-    for path, ast in asts:
+    for path, ast in asts.body_asts():
         bodies(ast, path)
 
     # Preprocessor-aware compiler tokens. These are deliberately partial: the
