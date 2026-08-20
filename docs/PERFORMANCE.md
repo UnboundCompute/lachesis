@@ -240,6 +240,13 @@ after their apparent last pass reduced the 254-file ``net/netfilter`` sample to 
 (from the 3,442,147,328-byte baseline). It was reverted; allocator/page-cache effects
 make the small-subsystem result non-predictive at whole-tree scale.
 
+### Rejected ``PYTHONMALLOC=malloc`` allocator setting
+
+The system allocator reduced the 254-file ``net/netfilter`` sample by about 26 MiB,
+but a whole ``linux/net`` run failed the 300-second cap before publishing and reached
+3,753,066,496 bytes peak RSS with substantially higher system time. It is not a safe
+GitHub Action default; the process allocator remains unchanged.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
