@@ -2784,6 +2784,22 @@ class CompilerFrontendTests(unittest.TestCase):
             package_root_for(str(workspace), "packages/api::shard-0001"),
         )
 
+    def test_streaming_parallel_packages_releases_snapshot_payloads(self) -> None:
+        from lachesis.pipeline import run_project_streaming_parallel
+
+        workspace = str(WORKSPACE_FIXTURE)
+        with tempfile.TemporaryDirectory() as output:
+            readers, snapshots = run_project_streaming_parallel(
+                workspace, os.path.join(output, "shards"),
+                os.path.join(output, "frontends"), timeout_seconds=60,
+                max_files_per_package=1,
+            )
+            self.assertEqual(2, len(readers))
+            self.assertEqual(2, len(snapshots))
+            self.assertTrue(all(snapshot.released for snapshot in snapshots))
+            self.assertGreater(sum(1 for reader in readers for _ in reader.nodes()), 0)
+            self.assertGreater(sum(1 for reader in readers for _ in reader.edges()), 0)
+
     def test_parallel_package_build_matches_serial_over_the_same_partition(self) -> None:
         # Lever 3. The claim is narrow and deliberate: a pooled per-package build equals
         # a *serial per-package* build exactly. It is NOT a claim that either equals a
