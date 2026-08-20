@@ -419,12 +419,18 @@ TOOLS = [
                     "indirect dispatch. Returns graph structure, not generated narrative prose.",
      "inputSchema": {"type": "object", "properties": {
          "entry": {"type": "string"}, "max_depth": {"type": "integer", "default": 5},
-         "max_steps": {"type": "integer", "default": 100}}, "required": ["entry"]}},
+         "max_steps": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0},
+         "branch_limit": {"type": "integer", "default": 20},
+         "branch_offset": {"type": "integer", "default": 0},
+         "frontier_offset": {"type": "integer", "default": 0}},
+         "required": ["entry"]}},
     {"name": "change_context",
      "description": "Join a symbol to its Git history: exact commits, authors, dates, and subjects. "
                     "Returns history facts and does not generate a why narrative.",
      "inputSchema": {"type": "object", "properties": {
-         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 12}},
+         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 12},
+         "offset": {"type": "integer", "default": 0}},
          "required": ["symbol"]}},
     {"name": "tests_for",
      "description": "Find exact references to a symbol in test/spec files, including nearby "
@@ -448,7 +454,13 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "question": {"type": "string"},
          "max_symbols": {"type": "integer", "default": 6},
-         "max_neighbors": {"type": "integer", "default": 30}},
+         "max_neighbors": {"type": "integer", "default": 30},
+         "symbol_offset": {"type": "integer", "default": 0},
+         "relationship_offset": {"type": "integer", "default": 0},
+         "condition_offset": {"type": "integer", "default": 0},
+         "test_offset": {"type": "integer", "default": 0},
+         "spec_offset": {"type": "integer", "default": 0},
+         "unknown_offset": {"type": "integer", "default": 0}},
          "required": ["question"]}},
     {"name": "concept_search",
      "description": "Search code by behavior rather than spelling using an optional local "
@@ -772,11 +784,16 @@ def call_tool(name, args, format=None):
     if name == "execution_story":
         result = c.comprehension.execution_story(
             args["entry"], max_depth=int(args.get("max_depth", 5)),
-            max_steps=int(args.get("max_steps", 100)))
+            max_steps=int(args.get("max_steps", 100)),
+            offset=int(args.get("offset", 0)),
+            branch_limit=int(args.get("branch_limit", 20)),
+            branch_offset=int(args.get("branch_offset", 0)),
+            frontier_offset=int(args.get("frontier_offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "change_context":
         result = c.comprehension.change_context(
-            args["symbol"], limit=int(args.get("limit", 12)))
+            args["symbol"], limit=int(args.get("limit", 12)),
+            offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "tests_for":
         result = c.comprehension.tests_for(
@@ -797,7 +814,13 @@ def call_tool(name, args, format=None):
         result = c.comprehension.context_pack(
             args["question"], max_symbols=int(args.get("max_symbols", 6)),
             max_neighbors=int(args.get("max_neighbors", 30)),
-            semantic_hits=semantic_hits, semantic_status=semantic_status)
+            semantic_hits=semantic_hits, semantic_status=semantic_status,
+            symbol_offset=int(args.get("symbol_offset", 0)),
+            relationship_offset=int(args.get("relationship_offset", 0)),
+            condition_offset=int(args.get("condition_offset", 0)),
+            test_offset=int(args.get("test_offset", 0)),
+            spec_offset=int(args.get("spec_offset", 0)),
+            unknown_offset=int(args.get("unknown_offset", 0)))
         return _emit(name, result, fmt, offset, limit)
     if name == "concept_search":
         result = c.concepts(args.get("model", DEFAULT_MODEL)).search(

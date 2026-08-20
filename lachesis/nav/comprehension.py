@@ -826,15 +826,18 @@ class Comprehension:
                 "communities": page, "page": paging}
 
     def execution_story(self, entry: str, max_depth: int = 5,
-                        max_steps: int = 100) -> dict:
+                        max_steps: int = 100, offset: int = 0,
+                        branch_limit: int = 20, branch_offset: int = 0,
+                        frontier_offset: int = 0) -> dict:
         """Forward call/branch trace.  The result is structure, never narrative prose."""
         hits = _matches(self.gl, entry, frozenset(CALLABLE_KINDS))
         if not hits:
             return {"error": f"no function named {entry!r}"}
         root = hits[0]
+        start, size = max(0, offset), max(1, max_steps)
         queue = deque([(root, 0, None, "entry")])
         visited, steps, frontier = set(), [], []
-        while queue and len(steps) < max(1, max_steps):
+        while queue and len(steps) < start + size:
             function, depth, caller, via = queue.popleft()
             if function["id"] in visited:
                 continue
@@ -844,13 +847,12 @@ class Comprehension:
                          "control": n.get("properties", {}).get("control_kind")}
                         for n in body if n.get("properties", {}).get("control_kind")
                         in {"if", "switch", "while", "for", "for-each", "try"}]
-            branch_limit = min(20, max(1, max_steps))
+            branch_page, branch_paging = _page(branches, branch_offset, branch_limit)
             step = {"sequence": len(steps), "depth": depth,
                     "function": _loc(self.gl, function),
                     "caller": _loc(self.gl, caller) if caller else None,
                     "via": via, "branch_count": len(branches),
-                    "branches": branches[:branch_limit],
-                    "branches_truncated": len(branches) > branch_limit}
+                    "branches": branch_page, "branches_page": branch_paging}
             steps.append(step)
             callees = [(n, "direct") for n in self.index.targets(function["id"], "CALLS")]
             for call in self.index.nodes_owned_by(function["id"], "call", "construct"):
@@ -875,15 +877,23 @@ class Comprehension:
                 queue.append((callee, depth + 1, function, call_via))
         if queue:
             frontier.extend(_loc(self.gl, fn) for fn, _depth, _caller, _via in queue)
+        step_page = steps[start:start + size]
+        step_has_more = bool(queue)
+        frontier_page, frontier_paging = _page(frontier, frontier_offset, size)
         return {"move": "execution_story", "entry": _loc(self.gl, root),
                 "algorithm": "bounded-forward-call-and-branch-trace",
-                "limits": {"max_depth": max_depth, "max_steps": max_steps},
-                "steps": steps, "frontier": frontier[:max(1, max_steps)],
+                "limits": {"max_depth": max_depth, "max_steps": max_steps,
+                           "branch_limit": branch_limit},
+                "steps": step_page,
+                "page": {"total": None if step_has_more else len(steps),
+                         "total_at_least": len(steps), "offset": start,
+                         "returned": len(step_page), "has_more": step_has_more,
+                         "next_offset": start + len(step_page) if step_has_more else None},
+                "frontier": frontier_page, "frontier_page": frontier_paging,
                 "frontier_count": len(frontier),
-                "frontier_truncated": len(frontier) > max(1, max_steps),
                 "complete": not queue and not frontier}
 
-    def change_context(self, symbol: str, limit: int = 12) -> dict:
+    def change_context(self, symbol: str, limit: int = 12, offset: int = 0) -> dict:
         """Join a graph symbol to Git history without interpreting commit intent."""
         hits = _matches(self.gl, symbol)
         if not hits:
@@ -906,7 +916,8 @@ class Comprehension:
                 files.append(path)
         if not files:
             return {"error": f"symbol {symbol!r} has no source file"}
-        command = ["git", "-C", str(root), "log", f"-n{max(1, limit)}",
+        start, size = max(0, offset), max(1, limit)
+        command = ["git", "-C", str(root), "log", f"--skip={start}", f"-n{size + 1}",
                    "--format=%H%x1f%an%x1f%aI%x1f%s", "--", *files]
         completed = subprocess.run(command, text=True, capture_output=True, check=False)
         if completed.returncode != 0:
@@ -918,9 +929,15 @@ class Comprehension:
             if len(parts) == 4:
                 commits.append({"commit": parts[0], "author": parts[1],
                                 "date": parts[2], "subject": parts[3]})
+        has_more = len(commits) > size
+        commits = commits[:size]
         return {"move": "change_context", "symbol": symbol,
                 "matches": [_loc(self.gl, n) for n in hits],
                 "files": files, "commits": commits,
+                "page": {"total": None if has_more else start + len(commits),
+                         "total_at_least": start + len(commits), "offset": start,
+                         "returned": len(commits), "has_more": has_more,
+                         "next_offset": start + len(commits) if has_more else None},
                 "status": "history-found" if commits else "no-history"}
 
     def tests_for(self, symbol: str, limit: int = 50, offset: int = 0) -> dict:
@@ -999,7 +1016,10 @@ class Comprehension:
 
     def context_pack(self, question: str, max_symbols: int = 6,
                      max_neighbors: int = 30, semantic_hits=None,
-                     semantic_status: str | None = None) -> dict:
+                     semantic_status: str | None = None,
+                     symbol_offset: int = 0, relationship_offset: int = 0,
+                     condition_offset: int = 0, test_offset: int = 0,
+                     spec_offset: int = 0, unknown_offset: int = 0) -> dict:
         """Compose a minimal factual neighborhood around question-relevant symbols."""
         query_tokens = set(camel_tokens(question))
         query_tokens.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]+", question.casefold()))
@@ -1055,10 +1075,6 @@ class Comprehension:
                 relationships.append({"kind": "CALLS", "source": _loc(
                     self.gl, self.gl.nodes[edge["source"]]),
                     "target": _loc(self.gl, self.gl.nodes[edge["target"]])})
-                if len(relationships) >= max(1, max_neighbors):
-                    break
-            if len(relationships) >= max(1, max_neighbors):
-                break
 
         conditions = []
         for node_id in included:
@@ -1075,17 +1091,43 @@ class Comprehension:
         for seed in seeds:
             if seed.get("granularity") not in ("function", "method"):
                 continue
-            answer = self.unknowns(seed["node_id"], limit=20)
+            # ``unknowns`` already computes its complete row set before paging. Keep
+            # that set in-process here, then expose only this context pack's page.
+            answer = self.unknowns(seed["node_id"], limit=1_000_000_000)
             unknown_rows.extend(answer.get("unknowns", ()))
-        test_refs = self.tests_for(seeds[0]["name"], limit=20)
+        test_refs = self.tests_for(
+            seeds[0]["name"], limit=max_neighbors, offset=test_offset,
+        )
         if "error" in test_refs:
             test_refs = {"status": "source-unavailable", "references": []}
-        spec_refs = self.spec_links(seeds[0]["name"], limit=20)
+        spec_refs = self.spec_links(
+            seeds[0]["name"], limit=max_neighbors, offset=spec_offset,
+        )
         if "error" in spec_refs:
             spec_refs = {"status": "source-unavailable", "references": []}
         symbols = [_loc(self.gl, self.gl.nodes[node_id]) for node_id in included
                    if node_id in self.gl.nodes]
         symbols.sort(key=lambda row: (row.get("file") or "", row.get("line") or 0))
+        relationships.sort(key=lambda row: (
+            row["source"].get("file") or "", row["source"].get("line") or 0,
+            row["target"].get("file") or "", row["target"].get("line") or 0,
+        ))
+        conditions.sort(key=lambda row: (
+            row.get("file") or "", row.get("line") or 0, row.get("node_id") or "",
+        ))
+        unknown_rows.sort(key=lambda row: (
+            row.get("file") or "", row.get("line") or 0, row.get("node_id") or "",
+        ))
+        symbols_page, symbols_paging = _page(symbols, symbol_offset, max_neighbors)
+        relationships_page, relationships_paging = _page(
+            relationships, relationship_offset, max_neighbors,
+        )
+        conditions_page, conditions_paging = _page(
+            conditions, condition_offset, max_neighbors,
+        )
+        unknowns_page, unknowns_paging = _page(
+            unknown_rows, unknown_offset, max_neighbors,
+        )
         return {"move": "context_pack", "question": question, "status": "complete",
                 "selection_basis": ("semantic-plus-identifier" if semantic_hits
                                     else "identifier-token-relevance"),
@@ -1093,7 +1135,13 @@ class Comprehension:
                                    "unavailable: configure concept_search embeddings",
                 "seeds": [{**_loc(self.gl, self.gl.nodes[entry["node_id"]]),
                            "score": score} for score, entry in selected],
-                "symbols": symbols, "relationships": relationships,
-                "conditions": conditions, "tests": test_refs.get("references", []),
-                "specs": spec_refs.get("references", []), "unknowns": unknown_rows,
-                "limits": {"max_symbols": max_symbols, "max_neighbors": max_neighbors}}
+                "symbols": symbols_page, "relationships": relationships_page,
+                "conditions": conditions_page, "tests": test_refs.get("references", []),
+                "specs": spec_refs.get("references", []), "unknowns": unknowns_page,
+                "pages": {"symbols": symbols_paging,
+                          "relationships": relationships_paging,
+                          "conditions": conditions_paging,
+                          "tests": test_refs.get("pagination", {}),
+                          "specs": spec_refs.get("pagination", {}),
+                          "unknowns": unknowns_paging},
+                "limits": {"max_symbols": max_symbols, "page_size": max_neighbors}}

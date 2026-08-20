@@ -174,6 +174,13 @@ class ComprehensionTests(unittest.TestCase):
             later = self.query.unknowns(limit=1, offset=unknowns["page"]["next_offset"])
             self.assertNotEqual(unknowns["unknowns"], later["unknowns"])
 
+        story = self.query.execution_story("loadMysqlConfig", max_steps=1)
+        self.assertTrue(story["page"]["has_more"])
+        story_later = self.query.execution_story(
+            "loadMysqlConfig", max_steps=1, offset=story["page"]["next_offset"],
+        )
+        self.assertNotEqual(story["steps"], story_later["steps"])
+
     def test_comprehension_answers_match_the_disk_store(self):
         from lachesis.kuzu_store import write_kuzu_graph
         from ._navharness import norm
@@ -246,6 +253,18 @@ class ComprehensionTests(unittest.TestCase):
             self.assertIn("loadMysqlConfig", {seed["name"] for seed in pack["seeds"]})
             self.assertTrue(pack["tests"])
             self.assertTrue(pack["specs"])
+
+            paged = self.query.context_pack(
+                "How does load mysql config work?", max_neighbors=1,
+            )
+            self.assertTrue(paged["pages"]["tests"]["has_more"])
+            later = self.query.context_pack(
+                "How does load mysql config work?", max_neighbors=1,
+                test_offset=paged["pages"]["tests"]["next_offset"],
+                spec_offset=paged["pages"]["specs"]["next_offset"],
+            )
+            self.assertNotEqual(paged["tests"], later["tests"])
+            self.assertNotEqual(paged["specs"], later["specs"])
 
 
 if __name__ == "__main__":

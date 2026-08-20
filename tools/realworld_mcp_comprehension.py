@@ -213,6 +213,55 @@ def run(args: argparse.Namespace) -> dict:
                                  if name != source_component), source_component)
         value = field["node_id"] if field else node_id
 
+        story_page, _, _ = client.call(
+            "execution_story", {"entry": node_id, "max_depth": 4, "max_steps": 1},
+            structured=True,
+        )
+        prove_next_page(
+            "execution_story", story_page,
+            {"entry": node_id, "max_depth": 4, "max_steps": 1},
+            story_page.get("page", {}),
+        )
+        history_page, _, _ = client.call(
+            "change_context", {"symbol": symbol, "limit": 1}, structured=True,
+        )
+        prove_next_page(
+            "change_context", history_page, {"symbol": symbol, "limit": 1},
+            history_page.get("page", {}),
+        )
+        tests_page, _, _ = client.call(
+            "tests_for", {"symbol": symbol, "limit": 1}, structured=True,
+        )
+        prove_next_page(
+            "tests_for", tests_page, {"symbol": symbol, "limit": 1},
+            tests_page.get("pagination", {}),
+        )
+        specs_page, _, _ = client.call(
+            "spec_links", {"symbol": symbol, "limit": 1}, structured=True,
+        )
+        prove_next_page(
+            "spec_links", specs_page, {"symbol": symbol, "limit": 1},
+            specs_page.get("pagination", {}),
+        )
+        context_page, _, _ = client.call(
+            "context_pack", {"question": args.question, "max_symbols": 6,
+                             "max_neighbors": 1}, structured=True,
+        )
+        for section, offset_key in (
+            ("symbols", "symbol_offset"),
+            ("relationships", "relationship_offset"),
+            ("conditions", "condition_offset"),
+            ("tests", "test_offset"),
+            ("specs", "spec_offset"),
+            ("unknowns", "unknown_offset"),
+        ):
+            prove_next_page(
+                f"context_pack.{section}", context_page,
+                {"question": args.question, "max_symbols": 6, "max_neighbors": 1},
+                context_page.get("pages", {}).get(section, {}),
+                offset_key=offset_key,
+            )
+
         # Every listed tool is called through its ordinary compact MCP response path.
         calls = {
             "load_graph": {"path": args.graph, "profile": "comprehension"},
