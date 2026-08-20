@@ -58,6 +58,10 @@ LACHESIS_TS_MAX_OLD_SPACE_MB=4096 \
 
 This bounds live compiler memory but changes package/type-resolution boundaries; use
 whole-program mode when it fits and record the shard size with the benchmark.
+The streaming writer applies the same ownership rule as the non-streaming package
+merge: imported workspace views are discarded in the importing shard, while one
+deterministic copy of external library/synthetic nodes is retained. This prevents
+duplicate Kùzu primary keys without holding a package-sized winner map.
 
 Do not compare a run with different `--prune`, token/proof emission, Python, Clang,
 or source revisions. Record those changes alongside the result.
@@ -100,6 +104,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-21 | working tree | n8n whole-repo TypeScript frontend, 4 GiB Node heap | >26.12* | — | — | — | — | >4.16* | 19,138 TypeScript/JavaScript files / 506,031 LOC; direct frontend, first-party dependency types only. V8 OOMed before bundle output at 4,470,030,336-byte RSS; no graph result is claimed. |
 | 2026-08-21 | working tree | n8n `packages/nodes-base` TypeScript frontend after compact edge dedup | >29.48* | — | — | — | — | >4.13* | 4,609 TypeScript/JavaScript files; direct frontend, 4 GiB Node heap. V8 still OOMed before output at 4,434,984,960-byte RSS, showing compiler-program/AST retention dominates the frontend heap rather than edge-key storage. |
 | 2026-08-21 | `28eafc8` | TypeScript workspace package-sharded streaming smoke test | 0.9 | — | — | 401 | 657 | — | Two package units, one root per shard; protobuf readers matched the emitted records without composing snapshots. Large n8n validation is intentionally pending a capped run. |
+| 2026-08-21 | `428e0cd` | TypeScript workspace sharded-stream parity audit | 1.4 | — | — | 392 | 647 | — | One-root chunks had zero duplicate node IDs; node IDs and edge triples exactly matched the existing serial package-partition reference. Imported workspace views were filtered by ownership. |
 | 2026-08-20 | `fe20eb8` | Linux `fs/netfs` direct CLI streamed core, typed protobuf tiers | 2.00 | — | 8.34 | 13,185 | 24,719 | ~0.54* | 27 files / 10,293 LOC; end-to-end 10.34s / 550 MiB max RSS, tokens/proofs disabled, `LACHESIS_C_JOBS=1`; pass 2 is total minus the direct frontend measurement and includes shard/Kùzu publication. |
 | 2026-08-20 | working tree | Linux `fs/netfs` CLI with bundle-to-shard streaming | 2.00 | — | 8.83 | 13,185 | 24,719 | ~0.38* | Cold output directory; end-to-end 10.83s / 377 MiB max RSS. Frontend protobuf tiers are parsed in bounded chunks and persisted directly to shards, avoiding a second full snapshot copy. |
 | 2026-08-21 | working tree | Linux `fs/netfs` CLI raw protobuf bundle-to-shard handoff | 2.00 | — | 1.78 | 13,185 | 24,719 | ~0.39* | Cold output directory; end-to-end 3.78s / 387 MiB max RSS. Raw NodeRecord/EdgeRecord bytes are retagged and framed without dict decode/re-encode. |
