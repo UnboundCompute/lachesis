@@ -174,6 +174,15 @@ LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
 `--stream-shards` is currently incompatible with `--enrich`; dataflow partition
 streaming is the next integration step.
 
+The streamed path defaults to a 1 GiB Kùzu buffer pool. For very large subsystems
+such as Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
+
+```bash
+LACHESIS_KUZU_BUFFER_POOL_SIZE=2147483648 \
+  lachesis-analyze /path/to/linux/fs /tmp/fs.kuzu \
+  --stream-shards /tmp/fs-shards --prune --timeout 900
+```
+
 Use a clean output directory and monitor the process on very large trees. The command
 builds the complete C graph directly; the token/proof switches remove only lexical
 facts that `--prune` discards later.
