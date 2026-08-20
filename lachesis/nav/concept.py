@@ -22,10 +22,15 @@ from .graphlib import CALLABLE_KINDS, camel_tokens
 
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
-INDEX_VERSION = 7
+INDEX_VERSION = 8
 EMBED_BATCH_SIZE = 32
 RICH_RERANK_CANDIDATES = 32
 CARD_KINDS = frozenset((*CALLABLE_KINDS, "class", "interface", "type", "record", "enum"))
+_NON_APPLICATION_PATH = re.compile(
+    r"(^|/)(node_modules|vendor|vendors|third_party|third-party|tests?|__tests__|js_tests)(/|$)"
+    r"|[._-](test|spec)(?:[._-]|$)",
+    re.IGNORECASE,
+)
 
 
 def cache_root() -> Path:
@@ -105,6 +110,14 @@ def _location(gl, node: dict) -> dict:
             "file": file, "line": line}
 
 
+def _application_card(gl, node: dict) -> bool:
+    file, _line, _end = gl.loc(node)
+    provenance = str((node.get("properties") or {}).get("provenance") or "").casefold()
+    return provenance not in {"external", "dependency", "vendor"} and not (
+        file and _NON_APPLICATION_PATH.search(file.replace("\\", "/"))
+    )
+
+
 def semantic_cards(store) -> list[dict]:
     """Compact graph-grounded documents; no whole raw body is embedded."""
     gl, index = store.gl, store.index
@@ -129,6 +142,8 @@ def semantic_cards(store) -> list[dict]:
             members_by_type.setdefault(edge["source"], set()).add(name)
 
     for node in index.nodes_of_kind(*CARD_KINDS):
+        if not _application_card(gl, node):
+            continue
         name = gl.label(node)
         if not name:
             continue

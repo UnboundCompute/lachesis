@@ -29,6 +29,10 @@ def _store():
          "properties": {"file": "src/input.py", "start_line": 2}},
         {"id": "query", "kind": "function", "label": "runDatabaseQuery",
          "properties": {"file": "src/db.py", "start_line": 5}},
+        {"id": "type-test", "kind": "function", "label": "testOnly",
+         "properties": {"file": "src/db.test-d.ts", "start_line": 1}},
+        {"id": "vendor", "kind": "function", "label": "bundledDependency",
+         "properties": {"file": "static/vendor/library.js", "start_line": 1}},
     ]
     return GraphStore({"nodes": nodes, "edges": []})
 

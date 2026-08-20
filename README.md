@@ -165,9 +165,11 @@ lachesis concept-model download          # model weights in the user cache
 lachesis concept-model status            # inspect without downloading
 ```
 
-The default is the small local `BAAI/bge-small-en-v1.5` model. Graph embeddings are
-cached separately by graph fingerprint and model ID. Set `LACHESIS_CONCEPT_CACHE` to
-choose where both the model and those derived indexes live.
+The default is the small local `BAAI/bge-small-en-v1.5` model. Search uses a global
+lexical/structural pass and embeds only a small source-rich shortlist; those vectors
+are cached separately by graph fingerprint and model ID. Set
+`LACHESIS_CONCEPT_CACHE` to choose where both the downloaded model and derived indexes
+live, outside the installed package.
 
 ---
 
