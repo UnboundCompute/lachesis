@@ -107,6 +107,37 @@ class ShardReader:
         yield from _read_records(self.directory / str(self.manifest["edges_file"]))
 
 
+class ShardSetReader:
+    """Read a completed shard-set manifest in deterministic shard order."""
+
+    def __init__(self, manifest_path: str | Path) -> None:
+        self.manifest_path = Path(manifest_path)
+        self.manifest: Dict[str, object] = json.loads(
+            self.manifest_path.read_text(encoding="utf-8"),
+        )
+        if self.manifest.get("shard_format_version") != SHARD_FORMAT_VERSION:
+            raise ValueError("unsupported graph shard-set format")
+        self._root = self.manifest_path.parent
+
+    def _shards(self) -> Iterator[ShardReader]:
+        entries = self.manifest.get("shards", [])
+        if not isinstance(entries, list):
+            raise ValueError("shard-set manifest has invalid `shards`")
+        for entry in sorted(entries, key=lambda item: str(item.get("shard_id", ""))):
+            if entry.get("status") != "complete":
+                continue
+            directory = self._root / str(entry["directory"])
+            yield ShardReader(directory)
+
+    def nodes(self) -> Iterator[dict]:
+        for shard in self._shards():
+            yield from shard.nodes()
+
+    def edges(self) -> Iterator[dict]:
+        for shard in self._shards():
+            yield from shard.edges()
+
+
 def write_snapshot_shard(
     directory: str | Path, *, frontend_id: str, shard_id: str,
     nodes: Iterable[dict], edges: Iterable[dict],

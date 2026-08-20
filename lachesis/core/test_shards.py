@@ -1,6 +1,6 @@
 import json
 
-from .shards import ShardReader, write_snapshot_shard
+from .shards import SHARD_FORMAT_VERSION, ShardReader, ShardSetReader, write_snapshot_shard
 
 
 def test_shards_round_trip_records_incrementally(tmp_path):
@@ -17,3 +17,19 @@ def test_shards_round_trip_records_incrementally(tmp_path):
     assert list(reader.edges())[1]["target"] == "n2"
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["shard_format_version"] == 1
+
+
+def test_shard_set_skips_incomplete_work_and_orders_shards(tmp_path):
+    for shard_id, value in (("1", "one"), ("0", "zero")):
+        write_snapshot_shard(
+            tmp_path / f"shard-{shard_id}", frontend_id="test", shard_id=shard_id,
+            nodes=({"id": value} for _ in range(1)), edges=(),
+        )
+    (tmp_path / "shards.json").write_text(
+        '{"shard_format_version": 1, "shards": ['
+        '{"shard_id": "1", "directory": "shard-1", "status": "complete"},'
+        '{"shard_id": "0", "directory": "shard-0", "status": "complete"},'
+        '{"shard_id": "2", "directory": "missing", "status": "running"}]}'
+    )
+    reader = ShardSetReader(tmp_path / "shards.json")
+    assert [node["id"] for node in reader.nodes()] == ["zero", "one"]
