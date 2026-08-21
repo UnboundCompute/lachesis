@@ -1,0 +1,37 @@
+name: Publish to MCP Registry
+
+# Publishes server.json to the official MCP registry
+# (registry.modelcontextprotocol.io) under the io.github.unboundcompute
+# namespace. Authentication is GitHub Actions OIDC: the registry reads the
+# workflow's repository_owner claim and grants io.github.<owner>/*, so no
+# interactive login, org app install, or personal token is involved.
+#
+# The published PyPI package must already carry the mcp-name ownership
+# marker in its description (it does as of 0.1.5), and server.json's package
+# version must match a version live on PyPI.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required to mint the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL \
+            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+
+      - name: Authenticate via GitHub Actions OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        run: ./mcp-publisher publish
