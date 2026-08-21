@@ -9,6 +9,8 @@ than left for you to discover.
 
 ## Unreleased
 
+- Require `lachesis cache clear --all` before deleting every cached graph; targeted
+  project clears remain unchanged.
 - All installed Lachesis console modules now support consistent `--version` and
   MCP exposes explicit `--help`/`--version` handling instead of treating flags as
   graph paths.

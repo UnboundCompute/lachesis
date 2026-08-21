@@ -200,6 +200,9 @@ def command_cache(args: argparse.Namespace) -> int:
             entry.discard()
             _stderr(f"removed the index for {entry.source_dir} ({human_size(freed)})")
             return EXIT_OK
+        if not args.all:
+            _stderr("refusing to clear every cached index; pass --all to confirm")
+            return EXIT_USAGE
         if not root.is_dir():
             _stderr("cache is already empty")
             return EXIT_OK
@@ -381,7 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
     cache_actions.add_parser("list", help="what is cached, and whether it is current")
     clear = cache_actions.add_parser("clear", help="delete cached indexes")
     clear.add_argument("path", nargs="?", default=None,
-                       help="a project to forget (default: everything)")
+                       help="a project to forget")
+    clear.add_argument("--all", action="store_true",
+                       help="delete every cached index (required without a project path)")
     prune = cache_actions.add_parser(
         "prune", help="remove missing or old indexes (dry-run unless --apply)")
     prune.add_argument("--older-than", type=_positive_days, default=30.0,
