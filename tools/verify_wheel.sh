@@ -47,6 +47,9 @@ say "the TypeScript compiler is inside the wheel"
 "$python_bin" - "$wheel" <<'PY'
 import sys, zipfile
 names = zipfile.ZipFile(sys.argv[1]).namelist()
+cache_entries = [n for n in names if "/__pycache__/" in n or n.endswith((".pyc", ".pyo"))]
+if cache_entries:
+    sys.exit(f"FAIL: wheel contains interpreter caches: {cache_entries[:3]}")
 prefix = "lachesis/frontends/typescript/vendor/typescript/"
 if prefix + "lib/typescript.js" not in names:
     sys.exit("FAIL: no vendored typescript.js -- run tools/vendor_typescript.py, rebuild")
