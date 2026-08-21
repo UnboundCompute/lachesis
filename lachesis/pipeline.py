@@ -184,9 +184,8 @@ def enrich_graph(
     import os
 
     from .core.overlays import (
-        default_model_overlay_registry,
         default_overlay_registry,
-        default_security_overlay_registry,
+        default_dataflow_overlay_registry,
     )
     from .core.query import GraphIndex
     from .ecosystems import default_ecosystem_registry
@@ -202,8 +201,10 @@ def enrich_graph(
     # The ecosystem index describes the pre-model graph and is no longer consulted;
     # drop its node/adjacency references before the remaining overlay registries run.
     del index
-    graph = default_model_overlay_registry().enrich(graph, observer)
-    graph = default_security_overlay_registry().enrich(graph, observer)
+    # Async model facts must be visible to taint, but both folds only need the same
+    # compact index surface. Run them in order through one registry so pass 2 does not
+    # rebuild a graph-sized index and accumulator between the two one-overlay registries.
+    graph = default_dataflow_overlay_registry().enrich(graph, observer)
 
     # Opt-in field-sensitive reaching-def tier. Additive and independent (its
     # applies() is a no-op unless the graph has the C AST + CFG edges), folded here

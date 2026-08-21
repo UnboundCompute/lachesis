@@ -421,6 +421,15 @@ collision path while preserving first-occurrence ordering and duplicate semantic
 The Python fixture still emits exactly 2,182 nodes and 2,968 edges (16 files); its
 cold direct run measured 0.12s and 32,079,872-byte peak RSS.
 
+### Shared pass-2 model/security index
+
+The async-model and taint/security overlays now run through one ordered registry
+(model first, security second), sharing the compact graph index and accumulator. The
+previous separate registries rebuilt both graph-sized structures between overlays.
+On the planner fixture, enriched output was byte-equivalent at 4,072 nodes / 7,876
+edges; three timing trials improved median pass-2 fold time from 0.1121s to 0.1075s.
+The large-workload gate is still required before assigning a whole-repository gain.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
