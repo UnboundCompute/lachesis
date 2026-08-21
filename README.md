@@ -259,7 +259,7 @@ pip install -e ".[dev]"                 # builder, nav, MCP server, tests
 npm install                             # the TypeScript compiler the TS frontend loads
 ```
 
-Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm install` step vendors the TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node 20 must be on your PATH for the TS frontend; C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
+Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm install` step vendors the TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node 20+ must be on your PATH for the TS frontend (CI verifies Node 20; the GitHub Action runs Node 22); C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
 
 Semantic `concept_search` is deliberately separate from the core install. Neither its
 FastEmbed runtime nor its model weights ship in the Lachesis wheel, and a search never
