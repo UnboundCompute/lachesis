@@ -76,6 +76,8 @@ than left for you to discover.
   and exercise its console scripts and vendored TypeScript payload, matching the wheel gate.
 - Clean wheel and sdist verifiers now disable pip prompts and bound package download waits,
   so unattended release checks fail rather than hanging on an unavailable index.
+- The top-level quickstart now leads with the product `lachesis scan`/`lachesis mcp`
+  workflow, while retaining the explicit graph commands for artifact-oriented users.
 
 ## [0.1.0] — unreleased
 
