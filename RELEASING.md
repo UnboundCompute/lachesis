@@ -44,7 +44,18 @@ python3.11 -m build                            # sdist + wheel
 
 `SOURCE_DATE_EPOCH` anchors archive timestamps to the release commit, so rebuilding
 the same source produces byte-identical distributions instead of changing hashes on
-every run.
+every run. For a local differential, normalize the sdist after each build before
+calculating hashes; setuptools can otherwise retain filesystem mtimes in the archive:
+
+```
+python3.11 tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
+sha256sum dist/* > /tmp/lachesis-first-build.sha256
+python3.11 -m build
+python3.11 tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
+sha256sum -c /tmp/lachesis-first-build.sha256
+```
+
+The tagged release workflow performs this normalization automatically.
 
 `--check` is not ceremony. Everything else in the build fails loudly when it goes
 wrong; a missing vendor directory does not, and the symptom surfaces on a stranger's
