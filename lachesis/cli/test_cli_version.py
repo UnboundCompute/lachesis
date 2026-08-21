@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class CliVersionTests(unittest.TestCase):
     def test_all_console_modules_report_version(self):
         modules = (
+            "lachesis.cli.main",
             "lachesis.cli.analyze",
             "lachesis.cli.query",
             "lachesis.planner.cli",
