@@ -22,6 +22,9 @@ graph explicitly: `lachesis-analyze` builds a store, `lachesis-query` reads it, 
 The PyPI package name is `lachesis-cpg`; use `python -m pip install lachesis-cpg` once
 you are installing a tagged release published to PyPI.
 
+The release-tested Python compatibility window is 3.10–3.12 (the CI matrix); use a
+newer interpreter only after verifying it against the Lachesis/Kùzu dependency set.
+
 For MCP clients, use the `lachesis-mcp` executable from the same environment
 that built the graph and pass an absolute `graph.kuzu` path. Source-checkout
 and interpreter troubleshooting examples are in

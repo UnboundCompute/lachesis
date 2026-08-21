@@ -11,9 +11,10 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
 ## Getting started
 
 1. Fork the repo and create a branch off `main`.
-2. Install it. Python 3.10 or newer is required, because the embedded Kuzu store is
-   the graph store. The TypeScript frontend shells out to the real compiler, so it
-   also needs the npm dev dependency:
+2. Install it. Python 3.10, 3.11, and 3.12 are the versions exercised by CI; newer
+   interpreters may work but are not release-supported until they are added to that
+   matrix. The embedded Kuzu store is the graph store. The TypeScript frontend shells
+   out to the real compiler, so it also needs the npm dev dependency:
    ```
    python -m pip install -e ".[dev]"
    npm ci
