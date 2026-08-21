@@ -311,6 +311,17 @@ the change versus 21.74s / 1,851,916,288 bytes after it. The small wall-time del
 was within run variance and RSS was slightly worse, so the change was reverted; the
 navigation index is not a demonstrated pass-3 memory bottleneck.
 
+### Rejected direct protobuf property append
+
+Pass-1 profiling showed property conversion as a medium-subsystem hotspot, so an
+experiment appended unique property fields directly into protobuf repeated fields
+instead of building a temporary Python list. `linux/net/ipv4` improved from 15.52s
+to 15.04s with essentially unchanged RSS, but the whole `linux/net/` gate rose to
+3,768,434,688 bytes RSS (3.77 GiB) despite a 210.21s wall time. The graph emitted
+1,833,812 nodes; the dirty checkout produced 3,507,809 edges versus the historical
+3,508,461. The memory regression exceeds the acceptance rule, so the experiment was
+reverted.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
