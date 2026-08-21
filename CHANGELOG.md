@@ -74,6 +74,8 @@ than left for you to discover.
   diagnostic instead of waiting indefinitely on a damaged or very large worktree.
 - Packaging CI and release verification now install the sdist in an isolated environment
   and exercise its console scripts and vendored TypeScript payload, matching the wheel gate.
+- Clean wheel and sdist verifiers now disable pip prompts and bound package download waits,
+  so unattended release checks fail rather than hanging on an unavailable index.
 
 ## [0.1.0] — unreleased
 

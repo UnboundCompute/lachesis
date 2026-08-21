@@ -77,8 +77,8 @@ cd "$workspace"
 
 say "install into a clean virtualenv"
 "$python_bin" -m venv v
-./v/bin/pip install --quiet --upgrade pip
-./v/bin/pip install --quiet "$wheel"
+./v/bin/pip install --quiet --disable-pip-version-check --no-input --timeout 60 --upgrade pip
+./v/bin/pip install --quiet --disable-pip-version-check --no-input --timeout 60 "$wheel"
 echo "installed into $workspace/v"
 
 say "imports resolve"
