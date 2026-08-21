@@ -329,6 +329,12 @@ class ComprehensionTests(unittest.TestCase):
         self.assertNotIn("owner={'", text)
         self.assertIn("account.py:11", text)
 
+    def test_relative_path_preserves_hidden_components(self):
+        self.assertEqual(
+            ".github/workflows/scan.yml",
+            self.query._relative_path("./.github/workflows/scan.yml"),
+        )
+
     def test_source_tree_integrations_are_evidence_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

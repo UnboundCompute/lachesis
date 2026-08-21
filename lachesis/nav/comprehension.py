@@ -163,7 +163,10 @@ class Comprehension:
                 return candidate.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 pass
-        return path.strip("./")
+        path = path.replace(os.sep, "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path or "."
 
     def _source_files(self):
         root = self._source_root()

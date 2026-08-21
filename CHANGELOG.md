@@ -66,6 +66,8 @@ than left for you to discover.
   graph simultaneously.
 - Frontend timeouts now terminate the whole compiler process group on POSIX runners,
   preventing a timed-out child compiler from lingering and retaining memory.
+- Comprehension source paths now preserve hidden and parent components while removing
+  only explicit `./` prefixes, keeping navigation locations exact.
 
 ## [0.1.0] — unreleased
 
