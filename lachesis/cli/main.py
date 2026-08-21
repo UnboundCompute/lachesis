@@ -271,7 +271,9 @@ def command_doctor(args: argparse.Namespace) -> int:
         present = languages_present(here)
     except Exception as error:  # noqa: BLE001 - a doctor must not itself crash
         _stderr(f"  could not inventory {here}: {error}")
-        return EXIT_OK
+        # A failed inventory means the requested diagnostic is incomplete. Returning
+        # success would make CI and wrappers treat an inaccessible tree as healthy.
+        return EXIT_FAILURE
     if present:
         _stderr(f"  {here} contains: {', '.join(sorted(present))}")
     else:

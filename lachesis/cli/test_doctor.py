@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import sys
 import unittest
+from argparse import Namespace
 from unittest.mock import patch
 
 from lachesis.cli import doctor
+import lachesis.cli.main as cli_main
 
 
 class DoctorCompatibilityTests(unittest.TestCase):
+    def test_inventory_failure_is_not_reported_as_success(self) -> None:
+        report = [doctor.Check("python", True, "ok")]
+        with patch.object(doctor, "full_report", return_value=report), \
+             patch.object(doctor, "languages_present", side_effect=OSError("permission denied")):
+            self.assertEqual(
+                cli_main.command_doctor(Namespace(path=".")),
+                cli_main.EXIT_FAILURE,
+            )
+
     def test_python_floor_matches_package_support(self) -> None:
         with patch.object(sys, "version_info", (3, 10, 0, "final", 0)):
             report = doctor.full_report()
