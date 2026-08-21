@@ -64,6 +64,8 @@ than left for you to discover.
 - Concurrent product CLI builds now serialize per cache entry and recheck freshness
   after acquiring the lock, preventing two callers from deleting or writing the same
   graph simultaneously.
+- Frontend timeouts now terminate the whole compiler process group on POSIX runners,
+  preventing a timed-out child compiler from lingering and retaining memory.
 
 ## [0.1.0] — unreleased
 
