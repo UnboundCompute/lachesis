@@ -56,6 +56,9 @@ than left for you to discover.
 - Implicit graph-cache freshness now includes output-affecting frontend environment
   settings, so changing token/proof emission, C flags, or compile-command inputs cannot
   reuse a graph built under different semantics.
+- Source discovery now ignores file symlinks that resolve outside the requested project,
+  preventing accidental traversal of external or generated trees while preserving
+  symlinks within the project.
 
 ## [0.1.0] — unreleased
 

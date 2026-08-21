@@ -140,6 +140,7 @@ def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
     is_test = None
     if not include_tests:
         from lachesis.nav.symbol_index import is_test_path as is_test
+    source_root = os.path.realpath(os.path.abspath(source_dir))
     result = []
     for root, directories, files in os.walk(os.path.abspath(source_dir)):
         directories[:] = sorted(
@@ -149,6 +150,18 @@ def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
         )
         for name in sorted(files):
             path = os.path.join(root, name)
+            # Directory links are not traversed by os.walk, but file links are
+            # returned as ordinary files and the compiler follows them. Keep a
+            # link that resolves inside the requested project, while refusing to
+            # pull arbitrary files from outside it into the graph or its cache key.
+            if os.path.islink(path):
+                target = os.path.realpath(path)
+                try:
+                    inside = os.path.commonpath((source_root, target)) == source_root
+                except ValueError:  # different drives on Windows
+                    inside = False
+                if not inside:
+                    continue
             if is_test is not None and is_test(path):
                 continue
             result.append(path)
