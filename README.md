@@ -15,6 +15,11 @@ lachesis-analyze ./my-project graph.kuzu     # parse a tree into a graph
 lachesis-mcp graph.kuzu                       # hand it to your agent over MCP
 ```
 
+For MCP clients, use the `lachesis-mcp` executable from the same environment
+that built the graph and pass an absolute `graph.kuzu` path. Source-checkout
+and interpreter troubleshooting examples are in
+[`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
+
 ---
 
 ## Why it exists

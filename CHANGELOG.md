@@ -9,6 +9,8 @@ than left for you to discover.
 
 ## Unreleased
 
+- Documented reliable MCP startup configurations for installed and source
+  checkouts, including interpreter, graph-path, and stderr troubleshooting.
 - Added a `make check` developer gate for the frontend parity suite; CI and release
   instructions now use the same command developers can run locally.
 - Require `lachesis cache clear --all` before deleting every cached graph; targeted

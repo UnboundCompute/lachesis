@@ -70,6 +70,54 @@ config entry like:
 }
 ```
 
+Use an absolute executable and graph path in a deployed client. For a wheel or
+editable install, the simplest form is the console script from that same
+environment:
+
+```json
+{
+  "mcpServers": {
+    "lachesis": {
+      "command": "/absolute/path/to/venv/bin/lachesis-mcp",
+      "args": ["/absolute/path/to/graph.kuzu"]
+    }
+  }
+}
+```
+
+When launching directly from a source checkout, install the checkout into the
+interpreter selected by the client and make the checkout importable:
+
+```bash
+cd /absolute/path/to/arachne
+python3.11 -m pip install -e ".[dev]"
+```
+
+```json
+{
+  "mcpServers": {
+    "lachesis": {
+      "command": "/absolute/path/to/python3.11",
+      "args": ["-m", "lachesis.nav.mcp_server", "/absolute/path/to/graph.kuzu"],
+      "env": {"PYTHONPATH": "/absolute/path/to/arachne"}
+    }
+  }
+}
+```
+
+If startup fails with `ModuleNotFoundError: No module named 'lachesis'`, the
+client is using a different interpreter or working directory. Check the exact
+interpreter with:
+
+```bash
+/absolute/path/to/python3.11 -c 'import lachesis; print(lachesis.__file__)'
+```
+
+Always pass a graph path. With no graph argument the server treats the current
+working directory as source and starts indexing it, which can look like a
+hung MCP launch on a large repository. Startup diagnostics are written to
+stderr; stdout is reserved for MCP JSON-RPC messages.
+
 Every tool except `load_graph` accepts an optional `format` argument, `text`
 (compact, the default) or `json` (the full result dict). The list-shaped tools
 also page their text rendering so a call against a function with hundreds of
