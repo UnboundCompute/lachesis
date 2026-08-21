@@ -332,6 +332,13 @@ for non-string mappings. The bounded `linux/net/ipv4` run measured 15.89s and
 420,970,496 bytes RSS, slower and slightly larger than the nearby 15.04s trial, so
 the change was reverted without spending another whole-net run on it.
 
+### Rejected cached-property tuple return
+
+Returning the immutable cached protobuf-field tuple directly (instead of copying it
+to the list expected by the existing serializer) was tested twice on `linux/net/ipv4`:
+15.60s / 419,872,768 bytes RSS and 15.64s / 421,445,632 bytes. Neither run improved
+the nearby 15.52s baseline, so the compatibility-preserving list copy remains.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
