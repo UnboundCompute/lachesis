@@ -76,4 +76,10 @@ class OverlayRegistry:
                     overlay.overlay_id, time.perf_counter() - started,
                     len(delta.nodes), len(delta.edges),
                 )
-        return accumulator.result() if accumulator is not None else current
+        if accumulator is None:
+            return current
+        # The compact index only supports delta production; release its node and
+        # adjacency references before the accumulator performs the final full-graph
+        # sort and returns the enriched view.
+        del index
+        return accumulator.result()
