@@ -362,6 +362,14 @@ reduce AST position-map duplication without global interning. The bounded
 15.52s / 419,528,704-byte baseline, which is within noise and slightly larger in
 RSS; the cache was reverted without a whole-net run.
 
+### Rejected slotted node-tier refactor
+
+Moving immutable tier membership from the separate `node_tier` dictionary into each
+slotted node looked like a graph-sized memory saving. The required whole `linux/net`
+gate emitted the same 1,833,812 nodes but reached 3,823,108,096 bytes RSS (218.79s)
+versus the 3,442,147,328-byte baseline (219.66s); the dirty checkout had 3,507,612
+edges. The large RSS regression caused the refactor to be reverted.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
