@@ -7,10 +7,11 @@ rebuild makes them responsible for a cache-invalidation problem we can just solv
 the product surface never takes a graph path. It takes a directory, and this module
 answers with a store that is either already correct or gets rebuilt.
 
-Freshness is content, not mtime. ``source_content_hash`` walks the same inventory the
-build would and digests it, so a touched-but-unchanged file keeps the cache and a
-restored older file loses it. That read costs a fraction of a compile, which is the
-trade that makes an implicit cache safe enough to hide.
+Freshness is source content plus output-affecting build settings, not mtime.
+``source_content_hash`` walks the same inventory the build would and digests it, while
+``build_options_fingerprint`` captures environment knobs that change emitted graph
+facts. A touched-but-unchanged file keeps the cache, a restored older file loses it,
+and a build under different output settings cannot reuse the old graph.
 
 Layout, one directory per source tree::
 
@@ -42,6 +43,25 @@ from lachesis.core.graph_wire import decode_document, encode_document
 # Bumping is what turns that into a miss instead of a wrong answer.
 CACHE_VERSION = 2
 _SLUG = re.compile(r"[^A-Za-z0-9._-]+")
+
+# These are semantic switches, not scheduling knobs. Keep this list aligned with the
+# pipeline's incremental bundle key: a changed value must never make a graph look fresh
+# when it would emit a different node/edge set.
+_OUTPUT_BEARING_ENVIRONMENT = (
+    "LACHESIS_EMIT_TOKENS", "LACHESIS_EMIT_PROOFS", "LACHESIS_CFLAGS",
+    "LACHESIS_COMPILE_COMMANDS", "LACHESIS_INCLUDE_DEP_TYPES",
+    "LACHESIS_MAX_DEPENDENCY_FILES",
+)
+
+
+def build_options_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for name in _OUTPUT_BEARING_ENVIRONMENT:
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(os.environ.get(name, "").encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def cache_root() -> Path:
@@ -101,13 +121,19 @@ class CacheEntry:
         if content_hash is None:
             from lachesis.pipeline import source_content_hash
             content_hash = source_content_hash(str(self.source_dir))
-        return "fresh" if meta.get("content_hash") == content_hash else "stale"
+        return (
+            "fresh"
+            if (meta.get("content_hash") == content_hash
+                and meta.get("build_options_fingerprint") == build_options_fingerprint())
+            else "stale"
+        )
 
     def write_meta(self, content_hash: str, **extra) -> None:
         payload = {
             "cache_version": CACHE_VERSION,
             "source_dir": str(self.source_dir),
             "content_hash": content_hash,
+            "build_options_fingerprint": build_options_fingerprint(),
             "built_at": time.time(),
             "lachesis_version": _version(),
             **extra,

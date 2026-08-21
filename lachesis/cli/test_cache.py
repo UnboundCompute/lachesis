@@ -9,11 +9,34 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lachesis.cache import entry_for
+from lachesis.cache import build_options_fingerprint, entry_for
 from lachesis.cli.main import command_cache, build_parser
 
 
 class CachePruneTests(unittest.TestCase):
+    def test_output_build_options_invalidate_cached_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as cache_dir, patch.dict(
+            os.environ, {"LACHESIS_EMIT_TOKENS": "1"}, clear=False
+        ):
+            old_value = os.environ.get("LACHESIS_CACHE_DIR")
+            os.environ["LACHESIS_CACHE_DIR"] = cache_dir
+            try:
+                entry = entry_for(Path(cache_dir, "source"))
+                entry.graph_path.parent.mkdir(parents=True)
+                entry.graph_path.write_bytes(b"graph")
+                entry.write_meta("hash")
+                self.assertEqual(entry.status("hash"), "fresh")
+                original = build_options_fingerprint()
+
+                os.environ["LACHESIS_EMIT_TOKENS"] = "0"
+                self.assertNotEqual(build_options_fingerprint(), original)
+                self.assertEqual(entry.status("hash"), "stale")
+            finally:
+                if old_value is None:
+                    os.environ.pop("LACHESIS_CACHE_DIR", None)
+                else:
+                    os.environ["LACHESIS_CACHE_DIR"] = old_value
+
     def test_clear_all_requires_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as cache_dir:
             old_value = os.environ.get("LACHESIS_CACHE_DIR")
