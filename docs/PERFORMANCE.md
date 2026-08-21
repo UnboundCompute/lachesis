@@ -301,8 +301,8 @@ The overlay registry now releases the original graph dictionary and its seed lis
 wrappers immediately after the first overlay is absorbed (`4f9fde2`). The accumulator
 already owns the canonical records, so retaining those wrappers through every later
 overlay and the final sort was redundant. Core overlay/ecosystem/projection parity
-tests pass; a fresh Kùzu-backed large pass-3 measurement is pending on an environment
-with Kùzu installed and is not claimed as a numeric improvement yet.
+tests pass. The fresh `net/ipv4` Kùzu-backed validation is recorded in the history
+(`c218e34`); it is a lifetime/parity datapoint, not a claimed whole-net improvement.
 
 ### Rejected ephemeral Kùzu-index release
 
