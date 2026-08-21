@@ -4,6 +4,9 @@
   "private": true,
   "description": "TypeScript compiler-API frontend for Lachesis. `npm install` provides the TypeScript compiler that lachesis/frontends/typescript/build_graph.mjs loads in a repo checkout; a built distribution carries its own vendored copy instead.",
   "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=20 <21"
+  },
   "type": "module",
   "devDependencies": {
     "typescript": "^5.4"
