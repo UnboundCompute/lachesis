@@ -204,6 +204,9 @@ def enrich_graph(
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), set(languages), capabilities, index,
     )
+    # The ecosystem index describes the pre-model graph and is no longer consulted;
+    # drop its node/adjacency references before the remaining overlay registries run.
+    del index
     graph = default_model_overlay_registry().enrich(graph, observer)
     graph = default_security_overlay_registry().enrich(graph, observer)
 
