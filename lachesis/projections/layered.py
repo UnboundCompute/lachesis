@@ -531,8 +531,15 @@ def _component_summaries(
     return sorted(result, key=lambda item: (-item["score"], item["label"]))[:25]
 
 
-def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) -> dict:
-    """Create layered-v2 artifacts without changing canonical graph facts."""
+def build_layered_graph(
+    graph: dict, project_metadata: Optional[dict] = None, *, manifest_only: bool = False,
+) -> dict:
+    """Create layered-v2 artifacts without changing canonical graph facts.
+
+    ``manifest_only`` keeps the exact manifest accounting but omits exposed tier
+    records and node/edge presentation payloads.  The query ``overview`` command
+    returns only that manifest, so retaining those payloads is pure peak-memory cost.
+    """
     index = GraphIndex(graph, compact=True)
     tier_of, untiered = _tier_assignments(index)
     project_id = _project_id(graph)
@@ -547,11 +554,11 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
                     "witnesses": [verdict["handler_id"]],
                 })
 
-    node_index = {
+    node_index = {} if manifest_only else {
         node_id: _locator(node, tier_of[node_id], owners[node_id])
         for node_id, node in index.nodes.items()
     }
-    tiers = {
+    tiers = {} if manifest_only else {
         tier: {
             "schema_version": SCHEMA_VERSION, "tier": tier, "name": TIER_NAMES[tier],
             "purpose": TIER_PURPOSES[tier], "nodes": [], "edges": [],
@@ -559,72 +566,114 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
         } for tier in TIER_ORDER
     }
 
-    verdict_by_call = {
-        call_id: verdict for verdict in verdicts for call_id in verdict["sink_call_ids"]
-    }
-    for node_id, node in index.nodes.items():
-        tier = tier_of[node_id]
-        roles = list(role_of.get(node_id, []))
-        exposed = _exposed_node(
-            node, tier, owners[node_id], roles,
-            _path_steps(node, index, node_index) if node["kind"] == "taint-reach" else None,
-        )
-        if node["kind"] == "sink":
-            verdict = verdict_by_call.get(node.get("properties", {}).get("callsite_id"))
-            if verdict:
-                exposed["details"]["guard"] = {
-                    "status": verdict["status"], "signal": verdict["guard_signal"],
-                    "handler_id": verdict["handler_id"],
-                    "differential_siblings": verdict.get("differential_siblings", []),
-                }
-        tiers[tier]["nodes"].append(exposed)
-
+    # Keep the full presentation build out of the overview path.  The compact
+    # counters below reproduce the manifest's tier accounting without allocating an
+    # exposed copy of every canonical node and edge.
+    tier_node_counts = Counter()
+    tier_edge_counts = Counter()
+    tier_expands_counts = Counter()
+    tier_link_counts = Counter()
     cross_count = 0
-    for edge in graph.get("edges", []):
-        if edge["source"] not in tier_of or edge["target"] not in tier_of:
-            continue
-        exposed = _exposed_edge(edge, tier_of)
-        source_tier, target_tier = exposed["source_tier"], exposed["target_tier"]
-        if source_tier == target_tier:
-            tiers[source_tier]["edges"].append(exposed)
-            continue
-        cross_count += 1
-        semantic = exposed["kind"]
-        if semantic in STRUCTURAL_DRILL_KINDS and (
-            STRUCTURAL_RANK[target_tier] - STRUCTURAL_RANK[source_tier] == 1
-        ):
-            drill = dict(exposed)
-            drill["kind"] = "EXPANDS_TO"
-            drill["relationship"] = semantic
-            tiers[source_tier]["expands_to"].append(drill)
-        else:
-            tiers[source_tier]["links"].append(exposed)
+    path_drill_count = 0
+    if not manifest_only:
+        verdict_by_call = {
+            call_id: verdict for verdict in verdicts for call_id in verdict["sink_call_ids"]
+        }
+        for node_id, node in index.nodes.items():
+            tier = tier_of[node_id]
+            roles = list(role_of.get(node_id, []))
+            exposed = _exposed_node(
+                node, tier, owners[node_id], roles,
+                _path_steps(node, index, node_index) if node["kind"] == "taint-reach" else None,
+            )
+            if node["kind"] == "sink":
+                verdict = verdict_by_call.get(node.get("properties", {}).get("callsite_id"))
+                if verdict:
+                    exposed["details"]["guard"] = {
+                        "status": verdict["status"], "signal": verdict["guard_signal"],
+                        "handler_id": verdict["handler_id"],
+                        "differential_siblings": verdict.get("differential_siblings", []),
+                    }
+            tiers[tier]["nodes"].append(exposed)
+        for tier in tier_of.values():
+            tier_node_counts[tier] += 1
 
-    # A taint reach is a derived T2 path entity. Materialize direct drills to
-    # every ordered witness so consumers never need to scan lower-tier files by
-    # opaque ID. These are projection edges, not additional canonical facts.
-    for reach in (node for node in index.nodes_of_kind("taint-reach")):
-        for position, witness_id in enumerate(
-            reach.get("properties", {}).get("witness_ids", [])
-        ):
+        for edge in graph.get("edges", []):
+            if edge["source"] not in tier_of or edge["target"] not in tier_of:
+                continue
+            exposed = _exposed_edge(edge, tier_of)
+            source_tier, target_tier = exposed["source_tier"], exposed["target_tier"]
+            if source_tier == target_tier:
+                tiers[source_tier]["edges"].append(exposed)
+                continue
+            cross_count += 1
+            semantic = exposed["kind"]
+            if semantic in STRUCTURAL_DRILL_KINDS and (
+                STRUCTURAL_RANK[target_tier] - STRUCTURAL_RANK[source_tier] == 1
+            ):
+                drill = dict(exposed)
+                drill["kind"] = "EXPANDS_TO"
+                drill["relationship"] = semantic
+                tiers[source_tier]["expands_to"].append(drill)
+            else:
+                tiers[source_tier]["links"].append(exposed)
+    else:
+        for tier in tier_of.values():
+            tier_node_counts[tier] += 1
+        for edge in graph.get("edges", []):
+            source_tier, target_tier = tier_of.get(edge["source"]), tier_of.get(edge["target"])
+            if source_tier is None or target_tier is None:
+                continue
+            if source_tier == target_tier:
+                tier_edge_counts[source_tier] += 1
+                continue
+            cross_count += 1
+            semantic = GraphIndex.semantic_edge_kind(edge)
+            if semantic in STRUCTURAL_DRILL_KINDS and (
+                STRUCTURAL_RANK[target_tier] - STRUCTURAL_RANK[source_tier] == 1
+            ):
+                tier_expands_counts[source_tier] += 1
+            else:
+                tier_link_counts[source_tier] += 1
+
+    # A taint reach is a derived T2 path entity. Materialize direct drills only in
+    # the full projection; manifest-only mode counts them without creating records.
+    for reach in index.nodes_of_kind("taint-reach"):
+        for position, witness_id in enumerate(reach.get("properties", {}).get("witness_ids", [])):
             if witness_id not in tier_of or tier_of[witness_id] == "T2":
                 continue
-            edge = _derived_edge("PATH_STEP", reach["id"], witness_id, {
-                "position": position, "target_tier": tier_of[witness_id],
-            })
-            edge.update({
-                "kind": "EXPANDS_TO", "relationship": "PATH_STEP",
-                "source_tier": "T2", "target_tier": tier_of[witness_id],
-            })
-            tiers["T2"]["expands_to"].append(edge)
+            path_drill_count += 1
+            if not manifest_only:
+                edge = _derived_edge("PATH_STEP", reach["id"], witness_id, {
+                    "position": position, "target_tier": tier_of[witness_id],
+                })
+                edge.update({
+                    "kind": "EXPANDS_TO", "relationship": "PATH_STEP",
+                    "source_tier": "T2", "target_tier": tier_of[witness_id],
+                })
+                tiers["T2"]["expands_to"].append(edge)
 
-    for tier, edge in _rollups(graph, index, tier_of, verdicts):
-        tiers[tier]["edges"].append(edge)
+    if manifest_only:
+        tier_expands_counts["T2"] += path_drill_count
 
-    for payload in tiers.values():
-        payload["nodes"].sort(key=lambda item: item["id"])
-        for collection in ("edges", "expands_to", "links"):
-            payload[collection].sort(key=lambda item: item["id"])
+    rollups = _rollups(graph, index, tier_of, verdicts)
+    for tier, edge in rollups:
+        if manifest_only:
+            tier_edge_counts[tier] += 1
+        else:
+            tiers[tier]["edges"].append(edge)
+
+    if not manifest_only:
+        for tier in TIER_ORDER:
+            payload = tiers[tier]
+            tier_node_counts[tier] = len(payload["nodes"])
+            tier_edge_counts[tier] = len(payload["edges"])
+            tier_expands_counts[tier] = len(payload["expands_to"])
+            tier_link_counts[tier] = len(payload["links"])
+        for payload in tiers.values():
+            payload["nodes"].sort(key=lambda item: item["id"])
+            for collection in ("edges", "expands_to", "links"):
+                payload[collection].sort(key=lambda item: item["id"])
 
     languages = sorted({
         node.get("properties", {}).get("language") for node in index.nodes.values()
@@ -659,14 +708,14 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
             },
             "canonical": {"node_count": len(index.nodes), "edge_count": len(graph.get("edges", []))},
         },
-        "node_index": {"file": "node_index.json", "count": len(node_index)},
+        "node_index": {"file": "node_index.json", "count": len(index.nodes)},
         "tiers": [{
             "tier": tier, "name": TIER_NAMES[tier], "purpose": TIER_PURPOSES[tier],
             "file": f"{tier.lower()}_{TIER_NAMES[tier]}.json",
-            "node_count": len(tiers[tier]["nodes"]),
-            "edge_count": len(tiers[tier]["edges"]),
-            "expands_to_count": len(tiers[tier]["expands_to"]),
-            "link_count": len(tiers[tier]["links"]),
+            "node_count": tier_node_counts[tier],
+            "edge_count": tier_edge_counts[tier],
+            "expands_to_count": tier_expands_counts[tier],
+            "link_count": tier_link_counts[tier],
             "operations": TIER_OPERATIONS[tier],
         } for tier in TIER_ORDER],
         "entry_points": _entry_points(index, role_of),
@@ -689,17 +738,18 @@ def build_layered_graph(graph: dict, project_metadata: Optional[dict] = None) ->
         "components": _component_summaries(index, role_of, owners),
         "integrity": {
             "untiered_kinds": untiered, "cross_tier_canonical_edges": cross_count,
-            "cross_tier_exposed_edges": sum(
+            "cross_tier_exposed_edges": cross_count if manifest_only else sum(
                 sum(not edge.get("derived", False) for edge in payload["expands_to"])
                 + len(payload["links"]) for payload in tiers.values()
             ),
             "derived_path_drills": sum(
                 sum(edge.get("relationship") == "PATH_STEP" for edge in payload["expands_to"])
                 for payload in tiers.values()
-            ),
+            ) if not manifest_only else path_drill_count,
         },
     }
-    return {"manifest": manifest, "node_index": node_index, "tiers": tiers}
+    return {"manifest": manifest, "node_index": {} if manifest_only else node_index,
+            "tiers": tiers}
 
 
 def write_layered_graph(layered: dict, out_dir: str) -> list[str]:

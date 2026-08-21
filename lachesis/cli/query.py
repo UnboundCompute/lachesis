@@ -11,7 +11,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lachesis.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
-from lachesis.projections.layered import build_security_query_projection
+from lachesis.projections.layered import (
+    build_layered_graph, build_security_query_projection,
+)
 
 
 def load_graph(path: str) -> tuple[dict, dict]:
@@ -158,6 +160,8 @@ def execute(args: argparse.Namespace) -> dict:
     layered = (
         build_security_query_projection(graph, metadata)
         if args.command in {"security-path", "security-paths"}
+        else build_layered_graph(graph, metadata, manifest_only=True)
+        if args.command == "overview"
         else None
     )
     query = ReasoningQuery(

@@ -432,6 +432,15 @@ On the planner fixture, enriched output was byte-equivalent at 4,072 nodes / 7,8
 edges; three timing trials improved median pass-2 fold time from 0.1121s to 0.1075s.
 The large-workload gate is still required before assigning a whole-repository gain.
 
+### Manifest-only overview projection
+
+The CLI `overview` query now requests a manifest-only layered projection. Its result
+is unchanged, but it no longer allocates exposed tier nodes/edges or layered
+adjacency that the command never returns. On the planner fixture, projection time
+fell from 0.0637s to 0.0262s and peak RSS from 76,169,216 to 62,652,416 bytes;
+manifest equality was exact. This specifically targets cold query memory; commands
+that expand or traverse entities retain the full projection.
+
 ### Pass-3 compact translation index
 
 `flow.translate.build_F` now uses a compact `GraphIndex` when projecting a materialized
