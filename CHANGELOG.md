@@ -9,6 +9,8 @@ than left for you to discover.
 
 ## Unreleased
 
+## [0.1.4]
+
 ### Added
 
 - `build_graph` MCP tool: build a graph from a source directory and attach it in one
