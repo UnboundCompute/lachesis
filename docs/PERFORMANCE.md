@@ -322,6 +322,13 @@ to 15.04s with essentially unchanged RSS, but the whole `linux/net/` gate rose t
 3,508,461. The memory regression exceeds the acceptance rule, so the experiment was
 reverted.
 
+### Rejected property-key sort fast path
+
+Avoiding `str()` calls for the usual string property keys was tested with a fallback
+for non-string mappings. The bounded `linux/net/ipv4` run measured 15.89s and
+420,970,496 bytes RSS, slower and slightly larger than the nearby 15.04s trial, so
+the change was reverted without spending another whole-net run on it.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
