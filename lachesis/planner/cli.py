@@ -24,6 +24,16 @@ from lachesis.nav.graph_store import GraphStore
 from lachesis.planner.constructors import GuardDifferential
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
 def _census_line(census: dict) -> str:
     return (f"{census['candidates']} candidate(s) from "
             f"{census['entrypoints_scanned']}/{census['entrypoints_total']} "
@@ -65,9 +75,9 @@ def _parser() -> argparse.ArgumentParser:
         prog="lachesis-plan",
         description="rank investigation capsules from a Lachesis graph")
     p.add_argument("graph", help="path to a .kuzu store")
-    p.add_argument("--limit", type=int, default=20,
+    p.add_argument("--limit", type=_nonnegative_int, default=20,
                    help="how many queued capsules to print (0 = all)")
-    p.add_argument("--entrypoints", type=int, default=0, metavar="N",
+    p.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
                    help="scan only the first N entrypoints (0 = all)")
     p.add_argument("--json", action="store_true",
                    help="print the full result as JSON on stdout")
