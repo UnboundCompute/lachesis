@@ -431,6 +431,15 @@ On the planner fixture, enriched output was byte-equivalent at 4,072 nodes / 7,8
 edges; three timing trials improved median pass-2 fold time from 0.1121s to 0.1075s.
 The large-workload gate is still required before assigning a whole-repository gain.
 
+### Pass-3 compact translation index
+
+`flow.translate.build_F` now uses a compact `GraphIndex` when projecting a materialized
+disk graph, instead of wrapping it in a full `GraphStore` index whose label/file/owner
+buckets are not needed by the translator. On a synthetic 120,000-node / 180,000-edge
+graph, index construction fell from 0.2855s / 242,778,112-byte peak RSS to 0.2496s /
+231,571,456 bytes. Fixture `F` and successor maps were exactly equal between the full
+and compact projections.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate

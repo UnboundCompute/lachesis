@@ -41,6 +41,7 @@ import re
 
 from lachesis.nav.graph_store import GraphStore
 from lachesis.nav.kuzu_index import materialize_graph
+from lachesis.core.query import GraphIndex
 from lachesis.planner.unbounded_copy import BranchRegions
 
 from . import atropos
@@ -363,7 +364,10 @@ def build_F(store, lang="c", *, return_graph=False):
     # ``_walk_function`` into another Kuzu query for each of thousands of functions.
     # The graph is a faithful snapshot taken after ensure_dataflow_tier(), so these
     # indexes have the same semantics and radically different access costs.
-    ix = source_ix if store.graph is not None else GraphStore(graph).index
+    # Flow translation only needs kind/adjacency/ownership access.  A full GraphStore
+    # wrapper would retain navigation-only label/file buckets over the materialized
+    # graph; the compact index defers those buckets until a caller explicitly asks.
+    ix = source_ix if store.graph is not None else GraphIndex(graph, compact=True)
     regions = BranchRegions(graph)
     nest = ControlNesting(graph)                   # loop/branch nesting from AST containment
     sinks = atropos.sink_catalog(lang)
