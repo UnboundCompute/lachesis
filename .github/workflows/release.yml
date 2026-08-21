@@ -36,6 +36,18 @@ jobs:
               )
           print(f"release version: {package_version}")
           PY
+      - name: Verify tag has changelog entry
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          heading = f"## [{version}]"
+          if heading not in Path("CHANGELOG.md").read_text(encoding="utf-8"):
+              raise SystemExit(f"CHANGELOG.md has no release heading for {version}")
+          print(f"changelog entry: {heading}")
+          PY
       - name: Install build tooling
         run: python -m pip install --upgrade pip build twine
       - name: Vendor the TypeScript compiler
