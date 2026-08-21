@@ -16,7 +16,7 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
    also needs the npm dev dependency:
    ```
    python -m pip install -e ".[dev]"
-   npm install
+   npm ci
    ```
    A built distribution carries its own copy of the compiler instead, fetched by
    `tools/vendor_typescript.py`; a checkout does not need that and prefers its own

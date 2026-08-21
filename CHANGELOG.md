@@ -80,6 +80,8 @@ than left for you to discover.
   workflow, while retaining the explicit graph commands for artifact-oriented users.
 - The quickstart now uses the working source-checkout install while the first PyPI
   release is unpublished, and labels `lachesis-cpg` as the tagged-release path.
+- Checkout, contributor, and release instructions now use `npm ci` with the committed
+  lockfile, preventing setup from silently rewriting the TypeScript dependency graph.
 
 ## [0.1.0] — unreleased
 

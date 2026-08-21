@@ -27,7 +27,7 @@ machine, and degrades to "no C analysis" when there is none.
    entry rather than in a patch release note nobody reads.
 3. Run the parity suite against a clean checkout:
    ```
-python3.11 -m pip install -e ".[dev]" && npm install
+python3.11 -m pip install -e ".[dev]" && npm ci
 make PYTHON=python3.11 check
    ```
    It must be fully green. The suite is the release gate — there is no separate one.
@@ -72,7 +72,7 @@ Then confirm all four of these:
   ```
 - **The console scripts exist and run**: `lachesis-analyze`, `lachesis-query`,
   `lachesis-mcp`, `lachesis-plan`.
-- **TypeScript analysis works with no `npm install` anywhere.** This is the vendoring
+- **TypeScript analysis works with no npm setup anywhere.** This is the vendoring
   check, and it is the one that fails when the vendor step was skipped:
   ```
   mkdir -p src && printf 'export function f(x: string) { return x; }\n' > src/a.ts

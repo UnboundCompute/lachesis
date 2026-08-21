@@ -10,7 +10,7 @@ Lachesis parses a codebase with real compilers, not regexes, and turns it into a
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
-python -m pip install -e ".[dev]" && npm install
+python -m pip install -e ".[dev]" && npm ci
 lachesis scan ./my-project                   # build/cache the graph and report findings
 lachesis mcp ./my-project                    # hand the same codebase to your agent over MCP
 ```
@@ -287,13 +287,13 @@ published wheels remain an explicit release artifact:
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
 python -m pip install --upgrade pip     # editable installs need pip >= 21.3
 python -m pip install -e ".[dev]"       # builder, nav, MCP server, tests
-npm install                             # the TypeScript compiler the TS frontend loads
+npm ci                                   # install the locked TypeScript compiler dependency
 ```
 
 After installing the checkout dependencies, run the same frontend parity gate used by
 CI with `make check` (or `make PYTHON=python3.11 check` when selecting an interpreter).
 
-Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm install` step vendors the TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node 20+ must be on your PATH for the TS frontend (CI verifies Node 20; the GitHub Action runs Node 22); C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
+Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm ci` step installs the locked TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node 20+ must be on your PATH for the TS frontend (CI verifies Node 20; the GitHub Action runs Node 22); C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
 
 Semantic `concept_search` is deliberately separate from the core install. Neither its
 FastEmbed runtime nor its model weights ship in the Lachesis wheel, and a search never
