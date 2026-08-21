@@ -412,7 +412,7 @@ class _Adjacency:
 class KuzuGraphIndex:
     semantic_edge_kind = staticmethod(GraphIndex.semantic_edge_kind)
 
-    def __init__(self, db_dir: str) -> None:
+    def __init__(self, db_dir: str, *, defer_maps: bool = False) -> None:
         if kuzu is None:
             raise RuntimeError(
                 "kuzu is not installed; the Kùzu index needs Python 3.10+ with `kuzu`."
@@ -464,7 +464,19 @@ class KuzuGraphIndex:
         self.nodes = _NodeMap(self)
         self.outgoing = _Adjacency(self, reverse=False)
         self.incoming = _Adjacency(self, reverse=True)
-        self._build_maps()
+        self._maps_deferred = defer_maps
+        if defer_maps:
+            # Ephemeral whole-graph queries only scan the store into a canonical
+            # graph for enrichment; they never use navigation buckets.  Keep the
+            # public attributes initialized for the shared accessor surface while
+            # avoiding four graph-sized bucket maps and their sort pass.
+            self.by_kind = defaultdict(list)
+            self.by_label = defaultdict(list)
+            self.by_file = defaultdict(list)
+            self.by_owner = defaultdict(list)
+            self._ids = []
+        else:
+            self._build_maps()
 
     # -- load-time light maps (one columnar scan, no props) -----------------
 

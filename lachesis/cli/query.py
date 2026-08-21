@@ -30,8 +30,9 @@ def load_graph(path: str) -> tuple[dict, dict]:
     from lachesis.nav.graph_store import GraphStore
     from lachesis.nav.kuzu_index import materialize_graph
 
-    store = GraphStore.load(path)
-    if os.environ.get("LACHESIS_QUERY_EPHEMERAL_ENRICH") == "1" \
+    ephemeral = os.environ.get("LACHESIS_QUERY_EPHEMERAL_ENRICH") == "1"
+    store = GraphStore.load(path, defer_maps=ephemeral)
+    if ephemeral \
             and not store.dataflow_ready:
         # A batch query (the GitHub Action's SARIF export) needs the enriched graph
         # only for this process and does not benefit from writing a second graph-sized
