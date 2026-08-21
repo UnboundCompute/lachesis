@@ -249,7 +249,6 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
                       "properties": _restore_node_props(row[3:-1], row[-1],
                                                         index._props_dict,
                                                         index._id_prefixes)})
-    nodes.sort(key=lambda n: n["id"])
     prefixes = index._id_prefixes
     edges = []
     for kind in HOT_REL_KINDS:
