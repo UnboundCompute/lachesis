@@ -68,6 +68,8 @@ than left for you to discover.
   preventing a timed-out child compiler from lingering and retaining memory.
 - Comprehension source paths now preserve hidden and parent components while removing
   only explicit `./` prefixes, keeping navigation locations exact.
+- Component-boundary queries now use the same lossless path normalization, so hidden
+  directory names are not stripped before matching.
 
 ## [0.1.0] — unreleased
 

@@ -330,6 +330,9 @@ class ComprehensionTests(unittest.TestCase):
         self.assertIn("account.py:11", text)
 
     def test_relative_path_preserves_hidden_components(self):
+        from .comprehension import _normalize_relative_path
+        self.assertEqual(".github/workflows/scan.yml",
+                         _normalize_relative_path("./.github/workflows/scan.yml"))
         self.assertEqual(
             ".github/workflows/scan.yml",
             self.query._relative_path("./.github/workflows/scan.yml"),

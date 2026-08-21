@@ -48,6 +48,13 @@ DEFAULT_DETAIL_LIMIT = 100
 COMMUNITY_FILE_LIMIT = 50
 
 
+def _normalize_relative_path(path: str) -> str:
+    path = path.replace(os.sep, "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path or "."
+
+
 def _loc(gl, node: dict) -> dict:
     file, line, _ = gl.loc(node)
     return {
@@ -163,10 +170,7 @@ class Comprehension:
                 return candidate.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 pass
-        path = path.replace(os.sep, "/")
-        while path.startswith("./"):
-            path = path[2:]
-        return path or "."
+        return _normalize_relative_path(path)
 
     def _source_files(self):
         root = self._source_root()
@@ -656,8 +660,8 @@ class Comprehension:
         def belongs(path, component):
             if not path:
                 return False
-            clean = (self._relative_path(path) or "").strip("./")
-            component = component.strip("./")
+            clean = _normalize_relative_path(self._relative_path(path) or "")
+            component = _normalize_relative_path(component)
             return clean == component or clean.startswith(component + "/")
 
         rows, seen = [], set()
