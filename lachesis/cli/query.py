@@ -44,7 +44,7 @@ def load_graph(path: str) -> tuple[dict, dict]:
         )
         from lachesis.pipeline import enrich_graph
         manifest = read_store_manifest(path)
-        core = materialize_graph(store.index)
+        core = materialize_graph(store.index, restore_defaults=False)
         graph = enrich_graph(core, manifest_languages(manifest),
                              manifest_capabilities(manifest))
     else:

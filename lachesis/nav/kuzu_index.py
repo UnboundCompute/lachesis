@@ -61,6 +61,16 @@ except Exception:  # pragma: no cover
     kuzu = None
 
 
+class _LazyDefaultProps(dict):
+    """Supply elided compiler constants without storing them on every row."""
+
+    def __missing__(self, key):
+        if key not in CONSTANT_PROP_DEFAULTS:
+            raise KeyError(key)
+        default = CONSTANT_PROP_DEFAULTS[key]
+        return list(default) if isinstance(default, list) else default
+
+
 def _query_threads() -> int:
     """Return the bounded Kùzu read parallelism for materialization/query scans."""
     raw = os.environ.get("LACHESIS_KUZU_QUERY_THREADS", "")
@@ -142,11 +152,15 @@ def _inflate(props_blob: bytes, zdict: bytes) -> bytes:
     return obj.decompress(props_blob) + obj.flush()
 
 
-def _restore(props_blob: Optional[bytes], zdict: bytes) -> dict:
+def _restore(
+    props_blob: Optional[bytes], zdict: bytes, *, restore_defaults: bool = True,
+) -> dict:
     """Inflate a stored ``props`` blob back into a properties dict.
 
     The blob is deflated protobuf metadata (see ``kuzu_store.PropsCodec``)."""
     props = decode_document(_inflate(props_blob, zdict)) if props_blob else {}
+    if not restore_defaults:
+        return _LazyDefaultProps(props)
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
             props[key] = list(default) if isinstance(default, list) else default
@@ -167,7 +181,8 @@ _CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
 
 
 def _restore_node_props(columns, props_blob: Optional[bytes],
-                        zdict: bytes, prefixes: Sequence[str]) -> dict:
+                        zdict: bytes, prefixes: Sequence[str], *,
+                        restore_defaults: bool = True) -> dict:
     """Union the promoted columns with the ``props`` tail.
 
     The tail wins on any overlap. Nothing overlaps in a store this version wrote —
@@ -183,14 +198,17 @@ def _restore_node_props(columns, props_blob: Optional[bytes],
     are decoded on the way out, so the coding is invisible above this function — which
     is the point of doing it in a column the reader already funnels through here.
     """
-    properties = {name: (decode_id(value, prefixes) if i in _CODED_AT else value)
-                  for i, (name, value) in enumerate(zip(_MERGED_COLUMNS, columns))
-                  if value is not None}
-    properties.update(_restore(props_blob, zdict))
+    props_type = dict if restore_defaults else _LazyDefaultProps
+    properties = props_type(
+        {name: (decode_id(value, prefixes) if i in _CODED_AT else value)
+         for i, (name, value) in enumerate(zip(_MERGED_COLUMNS, columns))
+         if value is not None}
+    )
+    properties.update(_restore(props_blob, zdict, restore_defaults=restore_defaults))
     return properties
 
 
-def materialize_subgraph(index: "KuzuGraphIndex", keep) -> dict:
+def materialize_subgraph(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True) -> dict:
     """The canonical ``{nodes, edges}`` dict restricted to the nodes ``keep`` holds.
 
     An edge survives only if *both* its endpoints do. A subgraph with an edge pointing
@@ -202,10 +220,10 @@ def materialize_subgraph(index: "KuzuGraphIndex", keep) -> dict:
     here is not in what the store reads but in what stays on the heap afterwards, which
     is the entire point of folding a cone instead of a repo.
     """
-    return _materialize(index, keep)
+    return _materialize(index, keep, restore_defaults=restore_defaults)
 
 
-def materialize_graph(index: "KuzuGraphIndex") -> dict:
+def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True) -> dict:
     """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
 
     The rest of this module exists precisely to avoid this — the per-node primitives
@@ -219,10 +237,10 @@ def materialize_graph(index: "KuzuGraphIndex") -> dict:
     matches ``combine_graphs`` (nodes by id, edges by ``(kind, source, target)``) so a
     materialized graph compares equal to a freshly composed one.
     """
-    return _materialize(index, None)
+    return _materialize(index, None, restore_defaults=restore_defaults)
 
 
-def _materialize(index: "KuzuGraphIndex", keep) -> dict:
+def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True) -> dict:
     """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
 
     One body rather than two because a subgraph that restored props even slightly
@@ -246,9 +264,9 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
         if keep is not None and nid not in keep:
             continue
         nodes.append({"id": nid, "kind": kind, "label": label,
-                      "properties": _restore_node_props(row[3:-1], row[-1],
-                                                        index._props_dict,
-                                                        index._id_prefixes)})
+                      "properties": _restore_node_props(
+                          row[3:-1], row[-1], index._props_dict, index._id_prefixes,
+                          restore_defaults=restore_defaults)})
     prefixes = index._id_prefixes
     edges = []
     for kind in HOT_REL_KINDS:
@@ -261,7 +279,8 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
             if keep is not None and (src not in keep or tgt not in keep):
                 continue
             edges.append({"source": src, "target": tgt, "kind": kind,
-                          "properties": _restore(props, index._props_dict)})
+                          "properties": _restore(
+                              props, index._props_dict, restore_defaults=restore_defaults)})
     res = index._conn.execute(
         "MATCH (a:Node)-[e:EDGE]->(b:Node) RETURN a.id, b.id, e.kind, e.props"
     )
@@ -271,12 +290,13 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
         if keep is not None and (src not in keep or tgt not in keep):
             continue
         edges.append({"source": src, "target": tgt, "kind": kind,
-                      "properties": _restore(props, index._props_dict)})
+                      "properties": _restore(
+                          props, index._props_dict, restore_defaults=restore_defaults)})
     # Kùzu does not promise a scan order, and two edges can share
     # ``(kind, source, target)`` while differing in props, so the tie-break folds the
     # props in: materializing the same store twice must give byte-identical output, or
     # a downstream enrich is not reproducible.
-    deferred = deferred_edges(index)
+    deferred = deferred_edges(index, restore_defaults=restore_defaults)
     # Ordinary stores have neither deferred edges nor an overlay. Avoid allocating a
     # second set of every node id in that common case; it is needed only when one of
     # the following edge sources must be checked for resident endpoints.
@@ -328,7 +348,7 @@ def _materialize(index: "KuzuGraphIndex", keep) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def deferred_edges(index: "KuzuGraphIndex") -> list:
+def deferred_edges(index: "KuzuGraphIndex", *, restore_defaults: bool = True) -> list:
     """The edges this store holds but cannot attach: one endpoint is not resident.
 
     Empty for every ordinary store. A spine-and-semantic store has many, and they are
@@ -350,7 +370,8 @@ def deferred_edges(index: "KuzuGraphIndex") -> list:
         kind, src, tgt, props = res.get_next()
         out.append({"source": decode_id(src, prefixes),
                     "target": decode_id(tgt, prefixes), "kind": kind,
-                    "properties": _restore(props, index._props_dict)})
+                    "properties": _restore(
+                        props, index._props_dict, restore_defaults=restore_defaults)})
     return out
 
 

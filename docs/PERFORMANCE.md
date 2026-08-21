@@ -442,6 +442,15 @@ fell from 0.0637s to 0.0262s and peak RSS from 76,169,216 to 62,652,416 bytes;
 manifest equality was exact. This specifically targets cold query memory; commands
 that expand or traverse entities retain the full projection.
 
+### Lazy default properties in ephemeral materialization
+
+Ephemeral Kùzu materialization can now keep the three elided compiler constants in a
+lazy mapping rather than inserting them into every node/edge properties dict. Eager
+materialization remains the default for parity and navigation callers. On a fresh
+`linux/net/ipv4` store, lazy and eager materialization produced identical manifests
+and security counts; the lazy overview measured 14.82s and 1,207,205,888-byte peak
+RSS versus the nearby eager overview's 15.32s and 1,228,439,552 bytes.
+
 ### Pass-3 compact translation index
 
 `flow.translate.build_F` now uses a compact `GraphIndex` when projecting a materialized
