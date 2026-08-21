@@ -16,6 +16,8 @@ than left for you to discover.
 - `lachesis doctor` now returns a failure status when it cannot inventory the
   requested source tree, so automation cannot mistake an incomplete check for
   a healthy install.
+- CI now installs the matrix package with `python -m pip`, guaranteeing each
+  Python job tests the interpreter it configured.
 - Added a `make check` developer gate for the frontend parity suite; CI and release
   instructions now use the same command developers can run locally.
 - Require `lachesis cache clear --all` before deleting every cached graph; targeted
