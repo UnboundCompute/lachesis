@@ -80,6 +80,7 @@ Once a graph is built, these are the moves, from the command line or as MCP tool
 | Does this source reach that sink? | `reaches`, a labeled witness path or an honest "no" |
 | What does this pointer point to? What aliases it? | `points_to`, `aliases` |
 | Where does untrusted input actually reach a dangerous sink? | `taint`, source→sink witnesses folded from the Atropos catalog onto this graph's own nodes |
+| Which entrypoints can reach sensitive effects without a recognized guard? | `scan`, the cached guard-differential queue with census/frontier counts (questions, not verdicts) |
 | Which safety-obligation sites should I inspect first? | `candidates`, ranked and exhaustive over bound facts across the whole sink taxonomy, with no safety verdict |
 | The full evidence for one site, or coverage across every family | `candidate_detail` (the neutral evidence capsule), `candidate_census` (constructor metadata, exhaustive counts, and the analysis frontier) |
 | Which code implements a behavior when I do not know its symbol name? | `concept_search` (optional local model, installed and downloaded separately) |
@@ -126,7 +127,7 @@ The result: builds stay lean, the graph opens in well under a second, and the ex
       v
   nav  (+ MCP)     hubs, search, callers/callees, read_body,
                    flow, reaches, sources_of, points_to, aliases,
-                   candidates, taint, folding the dataflow cone
+                   scan, candidates, taint, folding the dataflow cone
                    it needs, on demand
 ```
 

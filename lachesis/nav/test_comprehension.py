@@ -178,6 +178,46 @@ class ComprehensionTests(unittest.TestCase):
             mcp_server._PROFILE = "all"
             mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
 
+    def test_mcp_scan_returns_ranked_page_and_census(self):
+        from . import mcp_server
+        old_ctx, old_profile, old_format = (
+            mcp_server._CTX, mcp_server._PROFILE, mcp_server._DEFAULT_FORMAT,
+        )
+        fake_scan = {
+            "constructor": "GUARD_DIFFERENTIAL",
+            "census": {"entrypoints_total": 4, "entrypoints_scanned": 2,
+                       "entrypoints_skipped": 2, "queued": 2,
+                       "suppressed": 1, "closures_truncated": 0},
+            "queue": [
+                {"id": "low", "rank": 0.25},
+                {"id": "high", "rank": 0.9},
+            ],
+            "suppressions": [{"id": "kept"}],
+        }
+        try:
+            mcp_server._CTX = types.SimpleNamespace(
+                store=self.store,
+                scan_bundle_for=lambda _limit: fake_scan,
+            )
+            mcp_server._PROFILE = "all"
+            mcp_server._DEFAULT_FORMAT = "json"
+            answer = json.loads(mcp_server.call_tool(
+                "scan", {"entrypoints": 2, "min_rank": 0.5,
+                          "limit": 1, "include_suppressions": True},
+                format="json"))
+            self.assertEqual("scan", answer["move"])
+            self.assertEqual(["high"], [row["id"] for row in answer["queue"]])
+            self.assertEqual(1, answer["page"]["total"])
+            self.assertEqual(2, answer["census"]["entrypoints_skipped"])
+            self.assertEqual([{"id": "kept"}], answer["suppressions"])
+            names = {tool["name"] for tool in mcp_server._visible_tools()}
+            self.assertIn("scan", names)
+            mcp_server._PROFILE = "comprehension"
+            self.assertNotIn("scan", {tool["name"] for tool in mcp_server._visible_tools()})
+        finally:
+            mcp_server._PROFILE = old_profile
+            mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
+
     def test_wave_two_graph_algorithms_stay_deterministic(self):
         targets = self.query.indirect_targets("loadMysqlConfig")
         self.assertEqual(1, targets["counts"]["unresolved"])

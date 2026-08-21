@@ -112,6 +112,7 @@ The tools group by what they are for.
 | `guards` | The derived guard profile of a function: a score, a class (`guard`, `validate`, or `passthrough`), and the raw condition, short-circuit, and throw counts behind it. |
 | `call_roles` | Type a function's outgoing calls by derived security role (`verify`, `sanitize`, `authz`, `validate`, or `none`). These are security roles, not AST structural roles. |
 | `siblings` | The peer differential: form a symbol's cross-module family, classify each member guarded or unguarded with guard transitivity, and flag the unguarded outlier against the peer guard it lacks. This is the negative-space move that surfaces the missing check. |
+| `scan` | Run the cached guard-differential constructor over graph entrypoints. Returns ranked investigation capsules plus a census of scanned/skipped entrypoints, suppressed questions, and truncated closures. Use `entrypoints`, `min_rank`, and paging `limit`/`offset` to bound a request. Results are questions, not safety verdicts. |
 
 ### Candidate worklists: point the judge at every obligation
 

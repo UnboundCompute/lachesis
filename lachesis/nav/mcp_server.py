@@ -60,7 +60,7 @@ _DEFAULT_FORMAT = "text"
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 HUNTING_TOOLS = SECURITY_TOOLS + (
     "candidates", "candidate_detail", "candidate_census", "skeleton",
-    "flow_pass", "flow_skeleton", "taint",
+    "flow_pass", "flow_skeleton", "taint", "scan",
 )
 
 # Removed for now: each of these builds `GuardProfiles`, whose `_build()` scans every
@@ -114,6 +114,7 @@ TOOL_ORDER = (
     "architecture_map", "execution_story",
     "change_context", "tests_for", "spec_links",
     "concept_search", "context_pack",
+    "scan",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
@@ -250,6 +251,37 @@ class _Ctx:
             return run_pass(self.store)
 
         return self._analysis("flow-pass", build)
+
+    @property
+    def scan_bundle(self):
+        """The cached guard-differential scan used by the public CLI.
+
+        Scanning is deliberately shared with ``lachesis scan`` rather than being a
+        second MCP-only implementation.  The dataflow tier is materialized once on
+        first use; subsequent calls only page/filter the cached constructor result.
+        """
+        def build():
+            from lachesis.planner.constructors import GuardDifferential
+
+            self.store.ensure_dataflow_tier()
+            return GuardDifferential(self.store).run()
+
+        return self._analysis("guard-differential-scan", build)
+
+    def scan_bundle_for(self, limit_entrypoints: int = 0):
+        """Return a scan result, reusing the full result or a bounded variant."""
+        if not limit_entrypoints:
+            return self.scan_bundle
+
+        def build():
+            from lachesis.planner.constructors import GuardDifferential
+
+            self.store.ensure_dataflow_tier()
+            return GuardDifferential(self.store).run(
+                limit_entrypoints=max(0, int(limit_entrypoints)),
+            )
+
+        return self._analysis(f"guard-differential-scan:{int(limit_entrypoints)}", build)
 
 
 def ctx():
@@ -462,6 +494,20 @@ TOOLS = [
          "spec_offset": {"type": "integer", "default": 0},
          "unknown_offset": {"type": "integer", "default": 0}},
          "required": ["question"]}},
+    {"name": "scan",
+     "description": "Scan the graph for guard-differential investigation capsules: entrypoints "
+                    "that can reach sensitive effects without a recognized dominating guard. "
+                    "Returns ranked questions, not verdicts, plus an exhaustive census showing "
+                    "scanned/skipped entrypoints, suppressed capsules, truncated closures, and "
+                    "the explicit analysis frontier. Results are cached per graph; use "
+                    "entrypoints to bound the initial scan and min_rank/limit for the returned page.",
+     "inputSchema": {"type": "object", "properties": {
+         "entrypoints": {"type": "integer", "default": 0,
+                         "description": "scan only the first N entrypoints (0 = all)"},
+         "min_rank": {"type": "number", "default": 0.0},
+         "limit": {"type": "integer", "default": 20},
+         "include_suppressions": {"type": "boolean", "default": False}},
+         "required": []}},
     {"name": "concept_search",
      "description": "Search code by behavior rather than spelling using an optional local "
                     "embedding model. Search is offline-only and never downloads implicitly; "
@@ -827,6 +873,31 @@ def call_tool(name, args, format=None):
             args["query"], limit=int(args.get("limit", 20)),
             min_score=float(args.get("min_score", 0.0)),
             offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+
+    if name == "scan":
+        scan = c.scan_bundle_for(int(args.get("entrypoints", 0)))
+        minimum = float(args.get("min_rank", 0.0))
+        queue = [capsule for capsule in scan["queue"]
+                 if float(capsule.get("rank", 0.0)) >= minimum]
+        start, size = max(0, offset), max(1, limit)
+        page = queue[start:start + size]
+        next_offset = start + len(page)
+        page_meta = {
+            "total": len(queue), "offset": start, "returned": len(page),
+            "has_more": next_offset < len(queue),
+            "next_offset": next_offset if next_offset < len(queue) else None,
+        }
+        result = {
+            "move": "scan",
+            "constructor": scan["constructor"],
+            "census": scan["census"],
+            "queue": page,
+            "page": page_meta,
+            "min_rank": minimum,
+        }
+        if args.get("include_suppressions"):
+            result["suppressions"] = scan["suppressions"]
         return _emit(name, result, fmt, offset, limit)
 
     if name == "guards_top":
