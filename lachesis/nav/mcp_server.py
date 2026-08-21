@@ -108,7 +108,7 @@ OVERLAY_SEED_ARGS = {
 # navigation, then value-flow reasoning, then the security tools last. Ordering only —
 # a name missing here (or a future tool) still shows, appended in definition order.
 TOOL_ORDER = (
-    "load_graph",
+    "load_graph", "build_graph",
     "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "unknowns", "coverage_map", "field_history", "sibling_compare",
     "type_explain", "component_boundary", "indirect_targets",
@@ -383,6 +383,24 @@ TOOLS = [
          "overlay": {"type": "string"},
          "profile": {"type": "string", "enum": ["all", "comprehension"]}},
          "required": ["path"]}},
+    {"name": "build_graph",
+     "description": "Build a Lachesis graph from a source directory and attach it — the zero-config "
+                    "way to start on a repo that has no graph yet, no separate lachesis-analyze step "
+                    "needed. Content-addressed: an unchanged tree returns instantly from cache; pass "
+                    "refresh=true to force a rebuild. On success the new graph is loaded, so the next "
+                    "tool call reasons over it. Toolchain: Python needs nothing extra; TypeScript/"
+                    "JavaScript need `node` on PATH and C needs `clang` — a missing one comes back as "
+                    "an actionable 'missing toolchain prerequisite' error, not a crash. Builds run "
+                    "in-process and can take minutes on a large tree (capped by timeout_seconds, "
+                    "default 300); a build longer than the MCP client's own request timeout may need a "
+                    "smaller subtree or an out-of-band `lachesis-analyze`.",
+     "inputSchema": {"type": "object", "properties": {
+         "source": {"type": "string", "description": "path to the source directory to analyse"},
+         "refresh": {"type": "boolean", "default": False,
+                     "description": "force a rebuild even if the cached graph is current"},
+         "timeout_seconds": {"type": "integer", "default": 300,
+                             "description": "per-build compile timeout; raise for large trees"}},
+         "required": ["source"]}},
     {"name": "unknowns",
      "description": "Explicit comprehension frontiers: unresolved calls, dynamic runtime "
                     "behavior, and parser/compiler diagnostics. Distinguishes proven-absent "
@@ -1000,6 +1018,8 @@ def call_tool(name, args, format=None):
 
     if name == "load_graph":
         return _load_graph(args)
+    if name == "build_graph":
+        return _build_graph(args)
     if name in DISABLED_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is disabled: it requires a "
                                      "whole-graph guard scan (removed for now)"}, fmt)
@@ -1528,6 +1548,54 @@ def _taint(store, args):
             "sink_total": len(unwit["sinks"]),
         },
     }
+
+
+def _build_graph(args):
+    """Build (or reuse) a graph for a source directory, then attach it in one call.
+
+    Zero-config on-ramp: an agent that only has a repo path can call this and go, with no
+    prior `lachesis-analyze` step. In-process wrapper around `ensure_graph`, the same
+    build-or-reuse path the server's own startup uses — content-addressed, so a second
+    build of an unchanged tree returns instantly from cache. On success the freshly built
+    store is loaded exactly as `load_graph` would, so the next tool call hits it."""
+    source = args.get("source") or args.get("path")
+    if not source or not os.path.isdir(source):
+        return json.dumps({"error": f"source must be an existing directory: {source!r}"})
+    try:
+        timeout = int(args.get("timeout_seconds", 300))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "timeout_seconds must be an integer number of seconds"})
+    if timeout < 1:
+        return json.dumps({"error": "timeout_seconds must be greater than zero"})
+    refresh = bool(args.get("refresh"))
+    from lachesis.cache import entry_for
+    from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
+                                      ensure_graph)
+    try:
+        graph_path, rebuilt = ensure_graph(source, refresh=refresh,
+                                            timeout_seconds=timeout)
+    except EnvironmentProblem as error:
+        # A missing frontend toolchain (node for TS/JS, clang for C). Actionable, not a crash.
+        return json.dumps({"error": "missing toolchain prerequisite",
+                           "checks": [{"name": c.name, "detail": c.detail, "fix": c.fix}
+                                      for c in error.checks if not c.ok]})
+    except NoSourceFound as error:
+        return json.dumps({"error": str(error)})
+    except Exception as error:  # noqa: BLE001 - a frontend timeout or compile failure
+        return json.dumps({"error": f"build failed: {error}",
+                           "hint": "large trees can exceed timeout_seconds (default 300); "
+                                   "raise it and retry, or run lachesis-analyze out of band"})
+    meta = entry_for(source).meta() or {}
+    loaded = json.loads(_load_graph({"path": str(graph_path)}))
+    if "error" in loaded:  # built fine but could not attach — surface that, not a fake success
+        return json.dumps({"error": loaded["error"], "graph": str(graph_path),
+                           "rebuilt": rebuilt})
+    return json.dumps({"move": "build_graph", "graph": str(graph_path),
+                       "rebuilt": rebuilt,
+                       "nodes": meta.get("nodes", loaded.get("nodes")),
+                       "edges": meta.get("edges"),
+                       "frontends": meta.get("frontends", []),
+                       "profile": _PROFILE})
 
 
 def _load_graph(args):

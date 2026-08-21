@@ -26,9 +26,24 @@ The release-tested Python compatibility window is 3.10–3.12 (the CI matrix); u
 newer interpreter only after verifying it against the Lachesis/Kùzu dependency set.
 
 For MCP clients, use the `lachesis-mcp` executable from the same environment
-that built the graph and pass an absolute `graph.kuzu` path. Source-checkout
-and interpreter troubleshooting examples are in
-[`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
+that built the graph. You can hand it an absolute `graph.kuzu` path, but you do
+not have to: start it with no argument and the agent builds its own graph on
+demand with the `build_graph` tool — point it at a repo path and it compiles,
+caches, and attaches the graph in one call (an unchanged tree is served from
+cache; `refresh: true` forces a rebuild). That makes the server zero-config:
+
+```json
+{
+  "mcpServers": {
+    "lachesis": { "command": "lachesis-mcp" }
+  }
+}
+```
+
+Python analysis needs nothing beyond the package; TypeScript/JavaScript builds
+need `node` on `PATH` and C builds need `clang` — a missing one comes back as an
+actionable error, not a crash. Source-checkout and interpreter troubleshooting
+examples are in [`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
 
 ---
 

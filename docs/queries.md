@@ -51,13 +51,35 @@ taint-reach node prints the four-hop path from the public parameter to the
 ## The `lachesis-mcp` server
 
 ```
-lachesis-mcp <graph.kuzu> [overlay.json] [profile]
+lachesis-mcp [graph.kuzu | source-dir] [overlay.json] [profile]
 ```
 
 The server speaks MCP over stdio as `nav-reasoning`. It loads the graph once at
 startup, then every tool call hits the in-memory copy, so each call is cheap
-relative to the neighborhood it touches. Point an MCP-capable client at it with a
-config entry like:
+relative to the neighborhood it touches.
+
+**Zero-config is the default.** You do not have to build a graph first or pass any
+path. Start the server with no argument and the client config stays path-free:
+
+```json
+{
+  "mcpServers": {
+    "lachesis": { "command": "lachesis-mcp" }
+  }
+}
+```
+
+The agent then builds its own graph on demand with the `build_graph` tool — point
+it at a repo path and it compiles, caches, and attaches the graph in one call. The
+build is content-addressed, so an unchanged tree is served instantly from cache and
+`refresh: true` forces a rebuild. (Startup with a source directory as the argument,
+or none at all, does the same build-or-reuse for the working tree.) Toolchain: Python
+needs nothing beyond the package; TypeScript/JavaScript builds need `node` on `PATH`
+and C builds need `clang` — a missing one comes back as an actionable error, not a
+crash.
+
+**Or point it at a prebuilt graph.** When you already have a `graph.kuzu`, pass its
+absolute path and the server serves that graph directly:
 
 ```json
 {
