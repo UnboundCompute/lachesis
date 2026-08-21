@@ -272,6 +272,13 @@ Replacing the per-node Python line-offset search with ``bisect_right`` made whol
 baseline to 3.79 GiB. Since memory is the adoption constraint, the CPU-only change was
 reverted despite the wall-time improvement.
 
+### Rejected manual cyclic-GC tuning
+
+Disabling cyclic GC cut the whole ``linux/net`` builder to 206.20s, but retained
+garbage raised peak RSS to 3,779,624,960 bytes. Leaving normal GC enabled and forcing
+one final collection was slower still (231.77s / 3,689,349,120 bytes), so both runtime
+experiments were reverted.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
