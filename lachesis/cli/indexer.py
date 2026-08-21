@@ -70,7 +70,7 @@ def ensure_graph(
     import shutil
     for stale in (entry.graph_path, Path(str(entry.graph_path) + ".enriched")):
         if stale.is_dir():
-            shutil.rmtree(stale, ignore_errors=True)
+            shutil.rmtree(stale)
         elif stale.exists():
             stale.unlink()
     entry.directory.mkdir(parents=True, exist_ok=True)

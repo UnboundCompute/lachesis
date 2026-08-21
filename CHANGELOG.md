@@ -24,6 +24,8 @@ than left for you to discover.
   claiming an index was removed when the operating system rejected the delete.
 - `cache clear --all` now deletes only recognized Lachesis entries and preserves
   unrelated files under a user-configured cache directory.
+- Stale index cleanup now propagates permission and filesystem errors while
+  remaining idempotent when a partial directory has already disappeared.
 - Added a `make check` developer gate for the frontend parity suite; CI and release
   instructions now use the same command developers can run locally.
 - Require `lachesis cache clear --all` before deleting every cached graph; targeted
