@@ -370,6 +370,17 @@ gate emitted the same 1,833,812 nodes but reached 3,823,108,096 bytes RSS (218.7
 versus the 3,442,147,328-byte baseline (219.66s); the dirty checkout had 3,507,612
 edges. The large RSS regression caused the refactor to be reverted.
 
+### Rejected one-record default-property copy
+
+Pass-1 serialization was changed experimentally to copy only records missing
+default metadata, keeping canonical graph records smaller. Focused tests passed
+and two bounded `linux/net/ipv4` runs measured 15.56s / 416,366,592 bytes RSS
+and 15.62s / 416,989,184 bytes, compared with a nearby 15.52s /
+419,528,704-byte run. The required whole-`linux/net` gate was deliberately
+safety-stopped when the host began heating; therefore no whole-net result or
+acceptance claim is made. The experiment was reverted pending a cooler,
+single-run large-workload validation.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
