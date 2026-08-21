@@ -113,6 +113,15 @@ The tools group by what they are for.
 | `call_roles` | Type a function's outgoing calls by derived security role (`verify`, `sanitize`, `authz`, `validate`, or `none`). These are security roles, not AST structural roles. |
 | `siblings` | The peer differential: form a symbol's cross-module family, classify each member guarded or unguarded with guard transitivity, and flag the unguarded outlier against the peer guard it lacks. This is the negative-space move that surfaces the missing check. |
 | `scan` | Run the cached guard-differential constructor over graph entrypoints. Returns ranked investigation capsules plus a census of scanned/skipped entrypoints, suppressed questions, and truncated closures. Use `entrypoints`, `min_rank`, and paging `limit`/`offset` to bound a request. Results are questions, not safety verdicts. |
+| `wrapper_model` | Infer allocator, deallocator, I/O, and validator wrapper roles from resolved callee evidence without mutating the registry. |
+| `guard_dominance` | Check a bounded entry→effect call path for recognized guards and report dominant, skippable, or undecided evidence. |
+| `counterexample` | Find a bounded source→sink call path that avoids a named validator; truncation is reported explicitly. |
+| `invariant_trace` | Trace graph-evidenced producers, mutators, checkers, and consumers around a value or field. |
+| `representation_roundtrip` | Compare two functions/paths for call, control, dispatch, and side-effect shape differences. |
+| `cross_boundary_paths` | Rank calls, values, callbacks, and lifecycle crossings between two components by transition rarity. |
+| `range_analysis` | Reports the numeric-model frontier; full range reasoning is not silently approximated. |
+| `object_lifecycle` | Reports the lifecycle-constructor frontier; full state machines wait for free/deref facts. |
+| `error_path_summary` | Reports the exit/release-analysis frontier; complete transfer summaries wait for free/deref facts. |
 
 ### Candidate worklists: point the judge at every obligation
 

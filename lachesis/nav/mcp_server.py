@@ -60,7 +60,8 @@ _DEFAULT_FORMAT = "text"
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 HUNTING_TOOLS = SECURITY_TOOLS + (
     "candidates", "candidate_detail", "candidate_census", "skeleton",
-    "flow_pass", "flow_skeleton", "taint", "scan",
+    "flow_pass", "flow_skeleton", "taint", "scan", "guard_dominance",
+    "counterexample", "range_analysis", "object_lifecycle", "error_path_summary",
 )
 
 # Removed for now: each of these builds `GuardProfiles`, whose `_build()` scans every
@@ -114,7 +115,9 @@ TOOL_ORDER = (
     "architecture_map", "execution_story",
     "change_context", "tests_for", "spec_links",
     "concept_search", "context_pack",
-    "scan",
+    "scan", "wrapper_model", "guard_dominance", "counterexample", "invariant_trace",
+    "representation_roundtrip", "cross_boundary_paths", "range_analysis",
+    "object_lifecycle", "error_path_summary",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
@@ -508,6 +511,70 @@ TOOLS = [
          "limit": {"type": "integer", "default": 20},
          "include_suppressions": {"type": "boolean", "default": False}},
          "required": []}},
+    {"name": "wrapper_model",
+     "description": "Infer wrapper semantics from graph evidence: allocator, deallocator, "
+                    "I/O, validator, and forwarding call roles. This is evidence with "
+                    "confidence, not a registry mutation.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string"}, "limit": {"type": "integer", "default": 50}},
+         "required": ["function"]}},
+    {"name": "guard_dominance",
+     "description": "Check whether recognized guards on an entry-to-effect call path "
+                    "dominate the effect. Returns proven, skippable, or undecided evidence "
+                    "and never emits a safety verdict.",
+     "inputSchema": {"type": "object", "properties": {
+         "entry": {"type": "string"}, "effect": {"type": "string"},
+         "depth": {"type": "integer", "default": 6}},
+         "required": ["entry", "effect"]}},
+    {"name": "counterexample",
+     "description": "Find a bounded call path from src to sink that avoids a named "
+                    "validator/guard. This is the inverse reachability move; absence of a "
+                    "path is not proof when the search is truncated.",
+     "inputSchema": {"type": "object", "properties": {
+         "src": {"type": "string"}, "sink": {"type": "string"},
+         "validator": {"type": "string"}, "depth": {"type": "integer", "default": 6},
+         "limit": {"type": "integer", "default": 20}},
+         "required": ["src", "sink", "validator"]}},
+    {"name": "invariant_trace",
+     "description": "Trace graph-evidenced producers, mutators, checkers, and consumers "
+                    "of a value or field over a bounded local flow cone.",
+     "inputSchema": {"type": "object", "properties": {
+         "value": {"type": "string"}, "limit": {"type": "integer", "default": 100},
+         "depth": {"type": "integer", "default": 4}}, "required": ["value"]}},
+    {"name": "representation_roundtrip",
+     "description": "Compare two named paths/functions for graph-visible calls, controls, "
+                    "conversions, and side-effect differences. No semantic verdict is inferred.",
+     "inputSchema": {"type": "object", "properties": {
+         "left": {"type": "string"}, "right": {"type": "string"}},
+         "required": ["left", "right"]}},
+    {"name": "cross_boundary_paths",
+     "description": "List crossings between two components with boundary tags and rarity "
+                    "ranking, preserving direction and confidence.",
+     "inputSchema": {"type": "object", "properties": {
+         "from_component": {"type": "string"}, "to_component": {"type": "string"},
+         "limit": {"type": "integer", "default": 100},
+         "offset": {"type": "integer", "default": 0}},
+         "required": ["from_component", "to_component"]}},
+    {"name": "range_analysis",
+     "description": "Return lightweight numeric evidence when graph guards expose it. "
+                    "Full value-range analysis is explicitly unavailable until the numeric "
+                    "model is present; the response reports that frontier honestly.",
+     "inputSchema": {"type": "object", "properties": {
+         "value": {"type": "string"}, "function": {"type": "string"},
+         "limit": {"type": "integer", "default": 50}}}},
+    {"name": "object_lifecycle",
+     "description": "Report lifecycle analysis capability and graph constructors. Full "
+                    "created-to-released state machines remain blocked until free/deref "
+                    "constructors are emitted.",
+     "inputSchema": {"type": "object", "properties": {
+         "value": {"type": "string"}, "function": {"type": "string"}}}},
+    {"name": "error_path_summary",
+     "description": "Report exit-path evidence and lifecycle-analysis frontiers. Complete "
+                    "transfer/release summaries remain blocked until free/deref constructors "
+                    "are emitted.",
+     "inputSchema": {"type": "object", "properties": {
+         "function": {"type": "string"}, "limit": {"type": "integer", "default": 100}},
+         "required": ["function"]}},
     {"name": "concept_search",
      "description": "Search code by behavior rather than spelling using an optional local "
                     "embedding model. Search is offline-only and never downloads implicitly; "
@@ -765,6 +832,168 @@ def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
     return render_mod.render(name, result, offset=offset, limit=limit)
 
 
+def _capability_blocked(name, reason, prerequisite):
+    return {"move": name, "supported": False, "status": "blocked",
+            "reason": reason, "prerequisite": prerequisite}
+
+
+def _wrapper_model(store, token, limit=50):
+    """Infer wrapper roles from nearby callee names and graph effects."""
+    seeds = _seeds(store, token)
+    if not seeds:
+        return {"move": "wrapper_model", "error": f"no function named {token!r}"}
+    rows = []
+    role_words = {
+        "allocator": ("alloc", "malloc", "calloc", "realloc", "new", "create"),
+        "deallocator": ("free", "delete", "destroy", "release", "close"),
+        "io": ("read", "write", "recv", "send", "fread", "fwrite", "open"),
+        "validator": ("check", "valid", "verify", "parse", "sanitize"),
+    }
+    for seed in seeds:
+        callees = si.callees(store.gl, seed, resolver=store.resolver)
+        for callee in callees[:max(1, limit)]:
+            low = (callee.get("name") or "").lower()
+            roles = [role for role, words in role_words.items()
+                     if any(word in low for word in words)]
+            if not roles:
+                continue
+            rows.append({"wrapper": _ref(store, seed), "callee": callee,
+                         "roles": roles, "confidence": "heuristic-name",
+                         "evidence": "resolved callee name"})
+    return {"move": "wrapper_model", "functions": [_ref(store, s) for s in seeds],
+            "wrappers": rows[:limit], "count": len(rows),
+            "interpretation": "inference only; no registry facts were changed"}
+
+
+def _guard_dominance(store, args):
+    from lachesis.planner.dominance import Dominance
+
+    entry, effect = _seed(store, args.get("entry", "")), _seed(store, args.get("effect", ""))
+    if not entry or not effect:
+        return {"move": "guard_dominance", "error": "could not resolve entry/effect"}
+    depth = max(1, int(args.get("depth", 6)))
+    dominance = Dominance(store)
+    closure = dominance.call_closure(entry, depth=depth)
+    if effect not in closure:
+        return {"move": "guard_dominance", "entry": _ref(store, entry),
+                "effect": _ref(store, effect), "reachable": False,
+                "closure": closure.summary(), "guards": []}
+    verdict = dominance.verdict(entry, effect, depth=depth)
+    guards = dominance._recognitions_on(entry)
+    return {"move": "guard_dominance", "entry": _ref(store, entry),
+            "effect": _ref(store, effect), "reachable": True,
+            "closure": closure.summary(), "verdict": verdict,
+            "guards": guards}
+
+
+def _counterexample(store, args):
+    from collections import deque
+
+    src, sink = _seed(store, args.get("src", "")), _seed(store, args.get("sink", ""))
+    avoided = set(_seeds(store, args.get("validator", "")))
+    if not src or not sink or not avoided:
+        return {"move": "counterexample", "error": "could not resolve src/sink/validator"}
+    max_depth, budget = max(1, int(args.get("depth", 6))), max(1, int(args.get("limit", 20)))
+    queue, seen = deque([(src, [src])]), {src}
+    truncated = False
+    while queue:
+        node, path = queue.popleft()
+        if node == sink:
+            return {"move": "counterexample", "found": True, "avoided":
+                    [_ref(store, n) for n in avoided], "path": [_ref(store, n) for n in path],
+                    "truncated": truncated}
+        if len(path) - 1 >= max_depth:
+            continue
+        for callee in si.callees(store.gl, node):
+            target = callee["node_id"]
+            if target in avoided or target in seen:
+                continue
+            if len(seen) >= budget:
+                truncated = True
+                break
+            seen.add(target)
+            queue.append((target, path + [target]))
+    return {"move": "counterexample", "found": False, "avoided":
+            [_ref(store, n) for n in avoided], "visited": len(seen),
+            "truncated": truncated,
+            "interpretation": "no avoiding path found within the bounded call search"}
+
+
+def _invariant_trace(store, args):
+    seed = _seed(store, args.get("value", ""))
+    if not seed:
+        return {"move": "invariant_trace", "error": f"no value named {args.get('value')!r}"}
+    flow_kinds = {"DEFINES", "READS_FROM", "WRITES_TO", "VALUE_FLOWS_TO",
+                  "READS_HEAP", "WRITES_HEAP", "REACHING_DEF", "CONDITION",
+                  "PROPERTY_READ", "PROPERTY_WRITE"}
+    depth, limit = max(0, int(args.get("depth", 4))), max(1, int(args.get("limit", 100)))
+    frontier, seen, events = [(seed, 0)], {seed}, []
+    while frontier:
+        node_id, level = frontier.pop(0)
+        if level >= depth:
+            continue
+        for edge in (*store.index.incoming.get(node_id, ()),
+                     *store.index.outgoing.get(node_id, ())):
+            kind = edge.get("kind")
+            if kind not in flow_kinds:
+                continue
+            other = edge["source"] if edge["target"] == node_id else edge["target"]
+            if other not in store.gl.nodes:
+                continue
+            node = store.gl.nodes[other]
+            role = ("producer" if kind in {"DEFINES", "VALUE_FLOWS_TO", "REACHING_DEF"}
+                    else "mutator" if kind in {"WRITES_TO", "WRITES_HEAP"}
+                    else "checker" if kind == "CONDITION" else "consumer")
+            events.append({**_ref(store, other), "role": role, "via": kind, "depth": level + 1})
+            if other not in seen:
+                seen.add(other)
+                frontier.append((other, level + 1))
+    events.sort(key=lambda row: (row["depth"], row["role"], row["node_id"]))
+    return {"move": "invariant_trace", "value": _ref(store, seed),
+            "events": events[:limit], "count": len(events), "truncated": len(events) > limit}
+
+
+def _representation_roundtrip(store, args):
+    rows = []
+    for key in ("left", "right"):
+        seed = _seed(store, args.get(key, ""))
+        if not seed:
+            return {"move": "representation_roundtrip", "error": f"no callable named {args.get(key)!r}"}
+        calls = si.callees(store.gl, seed, with_dispatch=True, resolver=store.resolver)
+        controls = [n.get("properties", {}).get("control_kind")
+                    for n in store.gl.body_nodes(seed)
+                    if n.get("properties", {}).get("control_kind")]
+        rows.append({"side": key, "function": _ref(store, seed),
+                     "callees": calls, "control": sorted(controls)})
+    left_calls = {r["node_id"] for r in rows[0]["callees"]}
+    right_calls = {r["node_id"] for r in rows[1]["callees"]}
+    return {"move": "representation_roundtrip", "paths": rows,
+            "differences": {"left_only": sorted(left_calls - right_calls),
+                            "right_only": sorted(right_calls - left_calls),
+                            "control_left_only": sorted(set(rows[0]["control"]) - set(rows[1]["control"])),
+                            "control_right_only": sorted(set(rows[1]["control"]) - set(rows[0]["control"]))},
+            "interpretation": "structural differences only; no behavior verdict"}
+
+
+def _cross_boundary_paths(c, args):
+    result = c.comprehension.component_boundary(
+        args["from_component"], args["to_component"],
+        limit=max(1, int(args.get("limit", 1000))), offset=0)
+    rows = result.get("crossings", [])
+    counts = {}
+    for row in rows:
+        counts[row["kind"]] = counts.get(row["kind"], 0) + 1
+    for row in rows:
+        row["rarity"] = 1.0 / counts[row["kind"]]
+    rows.sort(key=lambda row: (-row["rarity"], row["kind"], row["source"]["node_id"]))
+    start, size = max(0, int(args.get("offset", 0))), max(1, int(args.get("limit", 100)))
+    page = rows[start:start + size]
+    return {"move": "cross_boundary_paths", "from": args["from_component"],
+            "to": args["to_component"], "crossings": page,
+            "count": len(rows), "page": {"offset": start, "returned": len(page),
+                                          "has_more": start + len(page) < len(rows)}}
+
+
 def call_tool(name, args, format=None):
     fmt = "json" if format == "json" else ("text" if format == "text" else _DEFAULT_FORMAT)
     offset, limit = int(args.get("offset", 0)), int(args.get("limit", render_mod.DEFAULT_LIMIT))
@@ -899,6 +1128,31 @@ def call_tool(name, args, format=None):
         if args.get("include_suppressions"):
             result["suppressions"] = scan["suppressions"]
         return _emit(name, result, fmt, offset, limit)
+    if name == "wrapper_model":
+        return _emit(name, _wrapper_model(store, args["function"],
+                                          int(args.get("limit", 50))), fmt, offset, limit)
+    if name == "guard_dominance":
+        return _emit(name, _guard_dominance(store, args), fmt, offset, limit)
+    if name == "counterexample":
+        return _emit(name, _counterexample(store, args), fmt, offset, limit)
+    if name == "invariant_trace":
+        return _emit(name, _invariant_trace(store, args), fmt, offset, limit)
+    if name == "representation_roundtrip":
+        return _emit(name, _representation_roundtrip(store, args), fmt, offset, limit)
+    if name == "cross_boundary_paths":
+        return _emit(name, _cross_boundary_paths(c, args), fmt, offset, limit)
+    if name == "range_analysis":
+        return _emit(name, _capability_blocked(
+            name, "numeric range constraints are not emitted by the current graph",
+            "local numeric model"), fmt, offset, limit)
+    if name == "object_lifecycle":
+        return _emit(name, _capability_blocked(
+            name, "lifecycle constructors are not yet emitted",
+            "memory.free and memory.deref constructors"), fmt, offset, limit)
+    if name == "error_path_summary":
+        return _emit(name, _capability_blocked(
+            name, "release/transfer events are not yet emitted on exits",
+            "memory.free and memory.deref constructors"), fmt, offset, limit)
 
     if name == "guards_top":
         rows = c.guards.top(int(args.get("n", 20)))

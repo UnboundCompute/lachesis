@@ -218,6 +218,24 @@ class ComprehensionTests(unittest.TestCase):
             mcp_server._PROFILE = old_profile
             mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
 
+    def test_backlog_capabilities_are_advertised_and_blocked_honestly(self):
+        from . import mcp_server
+        names = {tool["name"] for tool in mcp_server.TOOLS}
+        self.assertTrue({"wrapper_model", "guard_dominance", "counterexample",
+                         "invariant_trace", "representation_roundtrip",
+                         "cross_boundary_paths", "range_analysis",
+                         "object_lifecycle", "error_path_summary"} <= names)
+        old_ctx, old_format = mcp_server._CTX, mcp_server._DEFAULT_FORMAT
+        try:
+            mcp_server._CTX = types.SimpleNamespace(store=self.store)
+            mcp_server._DEFAULT_FORMAT = "json"
+            answer = json.loads(mcp_server.call_tool(
+                "range_analysis", {}, format="json"))
+            self.assertEqual("blocked", answer["status"])
+            self.assertIn("numeric", answer["reason"])
+        finally:
+            mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
+
     def test_wave_two_graph_algorithms_stay_deterministic(self):
         targets = self.query.indirect_targets("loadMysqlConfig")
         self.assertEqual(1, targets["counts"]["unresolved"])
