@@ -304,3 +304,14 @@ the resulting bundle. A meaningful regression is either:
 
 The GitHub Action can benefit from these engine improvements, but its cache-hit and
 cache-miss timings must be recorded separately in the action repository.
+
+## Scale boundary
+
+The local Linux checkout is approximately 2.0 GiB on disk. It contains about 64k
+C/C++ source/header files; `drivers/` alone contains 33,835 C/header files, while
+the north-star `net/` workload contains 1,738. A full-tree cold graph build is not
+currently an acceptable benchmark: it exceeds the ten-minute safety budget and
+would consume substantially more memory than the validated subsystem runs. We use
+`net/`, `drivers/usb`, and smaller `fs/*` slices as staged scale boundaries until
+the builder can process the full tree within that cap. No full-tree result is
+claimed or used to tune numbers.
