@@ -9,7 +9,11 @@ than left for you to discover.
 
 ## Unreleased
 
-## 0.1.2
+## [0.1.3]
+
+- Release the merged `main` workflow and documentation corrections.
+
+## [0.1.2]
 
 - Release the production-readiness and release-reference fixes from `main`.
 
