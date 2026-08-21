@@ -64,6 +64,9 @@ Changelog = "https://github.com/UnboundCompute/lachesis/blob/main/CHANGELOG.md"
 include = ["lachesis*"]
 exclude = ["*.__pycache__", "lachesis.*.__pycache__", "lachesis.private", "lachesis.private.*"]
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.package-data]
 # The TypeScript frontend is a Node script, the frontends declare capabilities in
 # JSON, and the test suite runs against the shipped fixture trees. `vendor/` is the
