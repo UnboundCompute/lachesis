@@ -21,6 +21,15 @@ class CliArgumentTests(unittest.TestCase):
                         parser.parse_args([command, "--timeout", value])
                     self.assertEqual(raised.exception.code, 2)
 
+    def test_scan_rejects_invalid_limits_and_ranks(self):
+        parser = build_parser()
+        for option, value in (("--limit", "-1"), ("--entrypoints", "-1"),
+                              ("--min-rank", "-0.1"), ("--min-rank", "1.1")):
+            with self.subTest(option=option, value=value):
+                with self.assertRaises(SystemExit) as raised:
+                    parser.parse_args(["scan", option, value])
+                self.assertEqual(raised.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

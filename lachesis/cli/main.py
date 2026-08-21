@@ -365,6 +365,26 @@ def _positive_seconds(value: str) -> int:
     return seconds
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def _rank(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number from 0.0 to 1.0") from error
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be a number from 0.0 to 1.0")
+    return parsed
+
+
 def _positive_days(value: str) -> float:
     try:
         days = float(value)
@@ -391,11 +411,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Index the tree if needed, then rank the reachable sensitive "
                     "effects that no recognised guard covers.")
     _add_source_flags(scan)
-    scan.add_argument("--limit", type=int, default=20, metavar="N",
+    scan.add_argument("--limit", type=_nonnegative_int, default=20, metavar="N",
                       help="how many findings to print (0 = all, default 20)")
-    scan.add_argument("--min-rank", type=float, default=0.0, metavar="R",
+    scan.add_argument("--min-rank", type=_rank, default=0.0, metavar="R",
                       help="drop findings ranked below R (0.0-1.0)")
-    scan.add_argument("--entrypoints", type=int, default=0, metavar="N",
+    scan.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
                       help="scan only the first N entrypoints (0 = all)")
     scan.add_argument("--json", action="store_true",
                       help="write the full result to stdout as JSON")
