@@ -85,7 +85,7 @@ say "imports resolve"
 ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner; print('ok')"
 
 say "console scripts are on PATH"
-for script in lachesis-analyze lachesis-query lachesis-mcp lachesis-plan; do
+for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan; do
   [[ -x "./v/bin/$script" ]] || { echo "FAIL: missing $script" >&2; exit 1; }
   echo "  $script"
 done
@@ -149,6 +149,48 @@ print(f"{len(tools)} tools: {', '.join(tools)}")
 for required in ("search", "callers", "callees", "reaches"):
     if required not in tools:
         sys.exit(f"FAIL: MCP server does not expose {required}")
+PY
+
+say "the product CLI can build and start MCP"
+./v/bin/python - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+server = subprocess.Popen(
+    [os.path.join(os.getcwd(), "v", "bin", "lachesis"), "mcp", "pyproject_src"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+)
+
+
+def call(message):
+    server.stdin.write(json.dumps(message) + "\n")
+    server.stdin.flush()
+    line = server.stdout.readline()
+    if not line:
+        raise SystemExit("FAIL: `lachesis mcp` exited before replying")
+    return json.loads(line)
+
+
+try:
+    initialized = call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                   "clientInfo": {"name": "verify", "version": "0"}}})
+    listed = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+finally:
+    server.terminate()
+    server.wait(timeout=10)
+
+if initialized.get("result", {}).get("serverInfo", {}).get("name") != "lachesis":
+    sys.exit("FAIL: `lachesis mcp` returned the wrong server identity")
+tools = {tool["name"] for tool in listed.get("result", {}).get("tools", [])}
+if "search" not in tools:
+    sys.exit("FAIL: `lachesis mcp` did not expose navigation tools")
+print(f"product CLI: {len(tools)} MCP tools")
 PY
 
 say "PASS"

@@ -48,6 +48,9 @@ than left for you to discover.
 - Added explicit prerequisite responses for numeric range, object lifecycle, and
   error-path capabilities that are not yet emitted by the graph.
 - Added clean-install release verification guidance.
+- The clean-wheel gate now starts the user-facing `lachesis mcp <source>` command,
+  completes its indexing handoff, and verifies the MCP initialize/tools handshake;
+  packaging CI therefore covers the same startup path used by the UI.
 
 ## [0.1.0] — unreleased
 

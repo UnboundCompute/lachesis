@@ -80,7 +80,10 @@ Then confirm all four of these:
   ./v/bin/lachesis-query --format text /tmp/rel.kuzu overview
   ```
   The output must name `typescript-compiler-api` among its frontends.
-- **The MCP server starts and lists its tools** over stdio against that graph.
+- **The MCP server starts and lists its tools** over stdio against that graph. The
+  verifier also launches the product command (`lachesis mcp <source>`) so the
+  source-indexing handoff and the MCP initialize/tools handshake are covered, not
+  only the lower-level `lachesis-mcp` entry point.
 
 `tools/verify_wheel.sh` runs this whole sequence. CI runs it on every push and pull
 request in the `package` job, which also builds the distribution and installs from
