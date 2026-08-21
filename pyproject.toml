@@ -62,7 +62,7 @@ Changelog = "https://github.com/UnboundCompute/lachesis/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["lachesis*"]
-exclude = ["*.__pycache__", "lachesis.*.__pycache__"]
+exclude = ["*.__pycache__", "lachesis.*.__pycache__", "lachesis.private", "lachesis.private.*"]
 
 [tool.setuptools.package-data]
 # The TypeScript frontend is a Node script, the frontends declare capabilities in
