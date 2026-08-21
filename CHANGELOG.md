@@ -9,6 +9,10 @@ than left for you to discover.
 
 ## Unreleased
 
+- Bound Kùzu and PyArrow runtime dependencies to the compatibility window exercised
+  by CI and the release suite; future major/minor upgrades now require an explicit
+  compatibility update.
+
 - Added the MCP capability surface from the graph-bughunt backlog, including bounded
   scans, wrapper evidence, guard dominance, counterexamples, invariant traces,
   representation comparisons, and boundary crossings.
