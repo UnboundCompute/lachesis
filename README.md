@@ -228,6 +228,24 @@ The GitHub Action's SARIF step sets `LACHESIS_QUERY_EPHEMERAL_ENRICH=1`: its bat
 security query uses the derived tier only for that process and avoids writing a second
 graph-sized cache. Local query commands keep persistent enriched-cache behavior.
 
+### Managing the local graph cache
+
+The product CLI keeps one content-addressed index per source tree. Inspect it with:
+
+```bash
+lachesis cache list
+```
+
+To see what can be reclaimed without deleting anything, use the dry-run prune. It
+targets entries whose source directory disappeared and entries older than 30 days:
+
+```bash
+lachesis cache prune --older-than 30
+```
+
+Add `--apply` only when you want those entries removed. `lachesis cache clear` remains
+the explicit command for deleting one project or the entire cache.
+
 The streamed path defaults to a 1 GiB Kùzu buffer pool. For very large subsystems
 such as Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
 

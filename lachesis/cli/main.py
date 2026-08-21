@@ -18,6 +18,7 @@ import argparse
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 EXIT_OK = 0
@@ -208,6 +209,33 @@ def command_cache(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     found = entries()
+    if args.cache_action == "prune":
+        cutoff = time.time() - (args.older_than * 86400)
+        candidates = []
+        for entry in found:
+            meta = entry.meta() or {}
+            missing_source = not entry.source_dir.is_dir()
+            old = float(meta.get("built_at", 0.0)) <= cutoff
+            if missing_source or old:
+                reason = "source missing" if missing_source else (
+                    f"older than {args.older_than:g} days"
+                )
+                candidates.append((entry, reason))
+        if not candidates:
+            _stderr("no cache entries match the prune policy")
+            return EXIT_OK
+        total = 0
+        for entry, reason in candidates:
+            size = directory_size(entry.directory)
+            total += size
+            action = "would remove" if not args.apply else "removed"
+            _stderr(f"{action} {human_size(size):>8}  {reason}: {entry.source_dir}")
+            if args.apply:
+                entry.discard()
+        action = "would reclaim" if not args.apply else "reclaimed"
+        _stderr(f"{action} {human_size(total)} across {len(candidates)} index(es)")
+        return EXIT_OK
+
     if not found:
         _stderr(f"no cached indexes (cache lives in {cache_root()})")
         return EXIT_OK
@@ -293,6 +321,16 @@ def _add_source_flags(parser: argparse.ArgumentParser) -> None:
                         help="how long one frontend may run (default 300)")
 
 
+def _positive_days(value: str) -> float:
+    try:
+        days = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number of days") from error
+    if days <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return days
+
+
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="lachesis",
@@ -344,6 +382,12 @@ def build_parser() -> argparse.ArgumentParser:
     clear = cache_actions.add_parser("clear", help="delete cached indexes")
     clear.add_argument("path", nargs="?", default=None,
                        help="a project to forget (default: everything)")
+    prune = cache_actions.add_parser(
+        "prune", help="remove missing or old indexes (dry-run unless --apply)")
+    prune.add_argument("--older-than", type=_positive_days, default=30.0,
+                       metavar="DAYS", help="age threshold (default: 30 days)")
+    prune.add_argument("--apply", action="store_true",
+                       help="actually delete matching entries")
     cache.set_defaults(handler=command_cache, cache_action="list", path=None)
 
     doctor = subcommands.add_parser(
