@@ -51,6 +51,8 @@ than left for you to discover.
 - The clean-wheel gate now starts the user-facing `lachesis mcp <source>` command,
   completes its indexing handoff, and verifies the MCP initialize/tools handshake;
   packaging CI therefore covers the same startup path used by the UI.
+- The product CLI now rejects zero and negative frontend timeouts consistently across
+  `scan`, `index`, and `mcp`, instead of passing an invalid safety bound into a build.
 
 ## [0.1.0] — unreleased
 

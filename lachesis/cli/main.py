@@ -351,8 +351,18 @@ def _add_source_flags(parser: argparse.ArgumentParser) -> None:
                         help="directory to analyse (default: the current one)")
     parser.add_argument("--refresh", action="store_true",
                         help="rebuild the index even if the source has not changed")
-    parser.add_argument("--timeout", type=int, default=300, metavar="SECONDS",
+    parser.add_argument("--timeout", type=_positive_seconds, default=300, metavar="SECONDS",
                         help="how long one frontend may run (default 300)")
+
+
+def _positive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer number of seconds") from error
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return seconds
 
 
 def _positive_days(value: str) -> float:
