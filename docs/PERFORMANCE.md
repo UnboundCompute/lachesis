@@ -255,6 +255,13 @@ to 226.94s / 3,450,372,096 bytes peak RSS versus the 219.66s / 3,442,147,328-byt
 baseline. The implementation was reverted; retaining the graph through serialization
 is currently the faster measured path.
 
+### Rejected shared empty edge-property map
+
+Sharing one empty property dictionary for propertyless edges lowered the 254-file
+``net/netfilter`` sample by about 8 MiB, but whole ``linux/net`` rose to 223.59s and
+3,752,067,072 bytes peak RSS. It was reverted; the serializer's copy-on-default path
+did not translate the local allocation saving to the aggregate workload.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
