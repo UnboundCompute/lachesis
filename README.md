@@ -9,19 +9,18 @@
 Lachesis parses a codebase with real compilers, not regexes, and turns it into a graph you can navigate. Syntax, symbols, calls, and the part that matters most: a full dataflow layer of value-flow, points-to, taint, and aliasing. That graph lives in an embedded columnar database and answers questions through a small navigation API and an MCP server, so a person or an LLM agent can reason about real source with compiler-level fidelity.
 
 ```bash
-python -m pip install lachesis-cpg
+git clone https://github.com/UnboundCompute/lachesis && cd lachesis
+python -m pip install -e ".[dev]" && npm install
 lachesis scan ./my-project                   # build/cache the graph and report findings
 lachesis mcp ./my-project                    # hand the same codebase to your agent over MCP
 ```
 
 The lower-level artifact commands remain available when you need to name and move a
 graph explicitly: `lachesis-analyze` builds a store, `lachesis-query` reads it, and
-`lachesis-mcp` serves it. To work from a checkout instead of the published package:
+`lachesis-mcp` serves it.
 
-```bash
-git clone https://github.com/UnboundCompute/lachesis && cd lachesis
-python -m pip install -e ".[dev]" && npm install
-```
+The PyPI package name is `lachesis-cpg`; use `python -m pip install lachesis-cpg` once
+you are installing a tagged release published to PyPI.
 
 For MCP clients, use the `lachesis-mcp` executable from the same environment
 that built the graph and pass an absolute `graph.kuzu` path. Source-checkout

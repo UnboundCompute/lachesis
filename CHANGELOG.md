@@ -78,6 +78,8 @@ than left for you to discover.
   so unattended release checks fail rather than hanging on an unavailable index.
 - The top-level quickstart now leads with the product `lachesis scan`/`lachesis mcp`
   workflow, while retaining the explicit graph commands for artifact-oriented users.
+- The quickstart now uses the working source-checkout install while the first PyPI
+  release is unpublished, and labels `lachesis-cpg` as the tagged-release path.
 
 ## [0.1.0] — unreleased
 
