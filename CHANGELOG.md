@@ -9,6 +9,8 @@ than left for you to discover.
 
 ## Unreleased
 
+- Pin the Lachesis self-test's Marketplace Action reference to the reviewed v1.0.0
+  release commit for reproducible CI.
 - Bound Kùzu and PyArrow runtime dependencies to the compatibility window exercised
   by CI and the release suite; future major/minor upgrades now require an explicit
   compatibility update.
