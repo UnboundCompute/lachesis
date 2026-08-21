@@ -63,6 +63,7 @@ Changelog = "https://github.com/UnboundCompute/lachesis/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["lachesis*"]
+exclude = ["*.__pycache__", "lachesis.*.__pycache__"]
 
 [tool.setuptools.package-data]
 # The TypeScript frontend is a Node script, the frontends declare capabilities in
@@ -81,6 +82,12 @@ include = ["lachesis*"]
 # The capsule schema is the artifact an external consumer validates against, and the
 # golden capsule is what the planner's own suite checks the serializer round-trips.
 "lachesis.planner" = ["*.json", "fixtures/*.json", "fixtures/project/*"]
+
+# Never ship interpreter caches in release artifacts.  Fixture trees are included
+# intentionally for frontend/runtime behavior, but their local `__pycache__`
+# directories must not make wheels platform- or interpreter-dependent.
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/**", "**/*.py[cod]"]
 
 [tool.pytest.ini_options]
 python_files = ["checks.py", "test_*.py"]
