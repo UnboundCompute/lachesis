@@ -7,6 +7,15 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## Unreleased
+
+- Added the MCP capability surface from the graph-bughunt backlog, including bounded
+  scans, wrapper evidence, guard dominance, counterexamples, invariant traces,
+  representation comparisons, and boundary crossings.
+- Added explicit prerequisite responses for numeric range, object lifecycle, and
+  error-path capabilities that are not yet emitted by the graph.
+- Added clean-install release verification guidance.
+
 ## [0.1.0] — unreleased
 
 First public release: `pip install lachesis-cpg`.

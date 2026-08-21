@@ -20,7 +20,8 @@ machine, and degrades to "no C analysis" when there is none.
 
 ## Before you tag
 
-1. Working tree is clean, and you are on `main` with everything merged.
+1. Working tree is clean, and you are on the release commit (normally `main` or an
+   annotated release candidate branch).
 2. Bump `version` in `pyproject.toml`. Lachesis is pre-1.0, so the graph schema and the
    nav tool surface may still change between minor versions; say so in the changelog
    entry rather than in a patch release note nobody reads.
@@ -106,3 +107,11 @@ upload is the irreversible step and the tag should record what actually shipped.
 Yank it (`pip` stops resolving to it, existing pins keep working) and release a patch
 version. Do not delete it: deletion frees the version number for reuse, which means two
 different sets of bytes can answer to the same name.
+
+## Production checklist
+
+- Build from a clean release commit; never publish from a moving branch.
+- Run the artifact verifier from outside the checkout and verify the sdist as well as
+  the wheel.
+- Use an immutable Lachesis tag in production GitHub Action workflows.
+- Keep the previous release available for rollback and never overwrite an artifact.
