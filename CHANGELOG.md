@@ -9,6 +9,14 @@ than left for you to discover.
 
 ## Unreleased
 
+### Added
+
+- `build_graph` MCP tool: build a graph from a source directory and attach it in one
+  call, so the server is zero-config — start `lachesis-mcp` with no graph path and the
+  agent provisions its own graph on demand. Content-addressed (an unchanged tree is
+  served from cache; `refresh: true` forces a rebuild) and toolchain-aware (a missing
+  `node`/`clang` returns an actionable error instead of crashing).
+
 ## [0.1.3]
 
 - Release the merged `main` workflow and documentation corrections.
