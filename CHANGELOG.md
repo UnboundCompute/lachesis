@@ -11,6 +11,8 @@ than left for you to discover.
 
 - Documented the Python 3.10–3.12 release-tested window so installation guidance does
   not imply unverified newer interpreters are supported.
+- The clean wheel verifier now covers the complete six-script console surface, including
+  `lachesis-candidates` and version responses, matching the sdist gate.
 - Documented reliable MCP startup configurations for installed and source
   checkouts, including interpreter, graph-path, and stderr troubleshooting.
 - Use `python -m pip` in user and contributor install commands so dependencies

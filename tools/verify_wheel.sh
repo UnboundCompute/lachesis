@@ -85,8 +85,9 @@ say "imports resolve"
 ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner; print('ok')"
 
 say "console scripts are on PATH"
-for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan; do
+for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan lachesis-candidates; do
   [[ -x "./v/bin/$script" ]] || { echo "FAIL: missing $script" >&2; exit 1; }
+  "./v/bin/$script" --version >/dev/null
   echo "  $script"
 done
 
