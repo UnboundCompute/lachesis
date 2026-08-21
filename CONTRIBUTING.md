@@ -15,7 +15,7 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
    the graph store. The TypeScript frontend shells out to the real compiler, so it
    also needs the npm dev dependency:
    ```
-   pip install -e ".[dev]"
+   python -m pip install -e ".[dev]"
    npm install
    ```
    A built distribution carries its own copy of the compiler instead, fetched by

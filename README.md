@@ -10,7 +10,7 @@ Lachesis parses a codebase with real compilers, not regexes, and turns it into a
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
-pip install -e ".[dev]" && npm install       # build from source (details below)
+python -m pip install -e ".[dev]" && npm install  # build from source (details below)
 lachesis-analyze ./my-project graph.kuzu     # parse a tree into a graph
 lachesis-mcp graph.kuzu                       # hand it to your agent over MCP
 ```
@@ -279,7 +279,7 @@ published wheels remain an explicit release artifact:
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
 python -m pip install --upgrade pip     # editable installs need pip >= 21.3
-pip install -e ".[dev]"                 # builder, nav, MCP server, tests
+python -m pip install -e ".[dev]"       # builder, nav, MCP server, tests
 npm install                             # the TypeScript compiler the TS frontend loads
 ```
 
@@ -293,7 +293,7 @@ FastEmbed runtime nor its model weights ship in the Lachesis wheel, and a search
 downloads them implicitly. Opt in and download the local model explicitly:
 
 ```bash
-pip install -e ".[concept-search]"       # optional ONNX embedding runtime
+python -m pip install -e ".[concept-search]" # optional ONNX embedding runtime
 lachesis concept-model download          # model weights in the user cache
 lachesis concept-model status            # inspect without downloading
 ```
