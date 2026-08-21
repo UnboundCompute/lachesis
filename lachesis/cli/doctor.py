@@ -153,9 +153,9 @@ def preflight(source_dir: str | os.PathLike) -> list[Check]:
 def full_report() -> list[Check]:
     """Everything, whether or not the current directory needs it."""
     return [
-        Check("python", sys.version_info >= (3, 11),
+        Check("python", sys.version_info >= (3, 10),
               f"{sys.version.split()[0]} at {sys.executable}",
-              "lachesis needs Python 3.11 or newer"),
+              "lachesis needs Python 3.10 or newer"),
         check_kuzu(),
         check_vendored_typescript(),
         # Neither tool is required in general — only for a tree that contains those
