@@ -394,8 +394,7 @@ def _run_engine(name: str, rest: list[str]) -> int:
     from lachesis.planner import cli as planner_cli
     sys.argv = [f"lachesis-{name}", *rest]
     if name == "analyze":
-        analyze.main()
-        return EXIT_OK
+        return analyze.main()
     return (query.main() if name == "query" else planner_cli.main()) or EXIT_OK
 
 

@@ -34,7 +34,7 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def main() -> None:
+def _run() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_dir")
     parser.add_argument(
@@ -258,5 +258,20 @@ def main() -> None:
     print("Node kinds: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())))
 
 
+def main() -> int:
+    try:
+        _run()
+    except KeyboardInterrupt:
+        print("lachesis-analyze: interrupted", file=sys.stderr)
+        return 130
+    except Exception as error:  # noqa: BLE001 - CLI converts build errors to guidance
+        if os.environ.get("LACHESIS_TRACEBACK"):
+            raise
+        print(f"lachesis-analyze: {error}", file=sys.stderr)
+        print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
