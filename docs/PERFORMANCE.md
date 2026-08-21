@@ -292,6 +292,15 @@ Macro recovery also streams preprocessor lines (`0fc41c5`) instead of creating a
 temporary `splitlines()` list, reducing transient memory without changing the fixture
 graph.
 
+### Pass-3 seed-container lifetime
+
+The overlay registry now releases the original graph dictionary and its seed list
+wrappers immediately after the first overlay is absorbed (`4f9fde2`). The accumulator
+already owns the canonical records, so retaining those wrappers through every later
+overlay and the final sort was redundant. Core overlay/ecosystem/projection parity
+tests pass; a fresh Kùzu-backed large pass-3 measurement is pending on an environment
+with Kùzu installed and is not claimed as a numeric improvement yet.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
