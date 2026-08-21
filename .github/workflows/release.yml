@@ -32,6 +32,11 @@ jobs:
 
       - name: Build distributions
         run: python -m build
+      - name: Verify reproducible distributions
+        run: |
+          sha256sum dist/* > /tmp/lachesis-first-build.sha256
+          python -m build
+          sha256sum -c /tmp/lachesis-first-build.sha256
       - name: Verify metadata and clean-install behavior
         run: |
           python -m twine check dist/*
