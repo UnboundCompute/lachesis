@@ -249,7 +249,8 @@ facts that `--prune` discards later.
 
 ## Install from source
 
-Lachesis installs from a clone — that's the supported path for now (a published wheel comes with the first release):
+Lachesis installs from a clone — this is the supported source workflow while
+published wheels remain an explicit release artifact:
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
