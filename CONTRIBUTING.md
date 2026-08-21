@@ -11,21 +11,22 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
 ## Getting started
 
 1. Fork the repo and create a branch off `main`.
-2. Install it. Python 3.10 or newer is required, because the embedded Kuzu store is
-   the graph store. The TypeScript frontend shells out to the real compiler, so it
-   also needs the npm dev dependency:
+2. Install it. Python 3.10, 3.11, and 3.12 are the versions exercised by CI; newer
+   interpreters may work but are not release-supported until they are added to that
+   matrix. The embedded Kuzu store is the graph store. The TypeScript frontend shells
+   out to the real compiler, so it also needs the npm dev dependency:
    ```
-   pip install -e ".[dev]"
-   npm install
+   python -m pip install -e ".[dev]"
+   npm ci
    ```
    A built distribution carries its own copy of the compiler instead, fetched by
    `tools/vendor_typescript.py`; a checkout does not need that and prefers its own
    `node_modules`, so the TypeScript version you develop against is the one
    `package.json` pins. See [`RELEASING.md`](./RELEASING.md).
 3. Make your change, with tests where it makes sense.
-4. Run the parity and checks suite before you open a PR:
+4. Run the local parity gate before you open a PR:
    ```
-   python3 -m pytest lachesis/frontends/checks.py
+   make check
    ```
    The graph has to stay at byte-identical parity between the JSON and Kùzu backends for the navigation and MCP tools, and the checks suite enforces that. If your change touches the store or the nav layer, make sure that test still passes.
 

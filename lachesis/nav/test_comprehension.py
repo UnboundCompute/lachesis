@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from .comprehension import Comprehension
 from .graph_store import GraphStore
@@ -329,6 +330,15 @@ class ComprehensionTests(unittest.TestCase):
         self.assertNotIn("owner={'", text)
         self.assertIn("account.py:11", text)
 
+    def test_relative_path_preserves_hidden_components(self):
+        from .comprehension import _normalize_relative_path
+        self.assertEqual(".github/workflows/scan.yml",
+                         _normalize_relative_path("./.github/workflows/scan.yml"))
+        self.assertEqual(
+            ".github/workflows/scan.yml",
+            self.query._relative_path("./.github/workflows/scan.yml"),
+        )
+
     def test_source_tree_integrations_are_evidence_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -384,6 +394,20 @@ class ComprehensionTests(unittest.TestCase):
             )
             self.assertNotEqual(paged["tests"], later["tests"])
             self.assertNotEqual(paged["specs"], later["specs"])
+
+    def test_change_context_bounds_git_history_lookup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "account.py"
+            source.write_text("def loadMysqlConfig():\n    return 1\n", encoding="utf-8")
+            self.store.source_dir = str(root)
+            with mock.patch(
+                "lachesis.nav.comprehension.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["git"], 30),
+            ):
+                answer = self.query.change_context("loadMysqlConfig")
+            self.assertEqual("Git history lookup timed out", answer["error"])
+            self.assertIn("30s", answer["detail"])
 
 
 if __name__ == "__main__":

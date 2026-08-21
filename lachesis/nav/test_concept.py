@@ -49,6 +49,7 @@ class ConceptSearchTests(unittest.TestCase):
         status = model_status()
         self.assertIn(status["runtime"], {"installed", "missing"})
         self.assertIn("concept-search", status["install"])
+        self.assertTrue(status["install"].startswith("python -m pip install"))
         self.assertEqual(2, len(semantic_cards(_store())))
 
     def test_missing_runtime_is_an_instruction_not_a_download(self):

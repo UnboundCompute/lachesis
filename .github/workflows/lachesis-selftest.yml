@@ -15,19 +15,20 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write   # upload SARIF to code scanning (same-repo only; fork PRs can't)
     steps:
       - uses: actions/checkout@v4
 
-      - uses: UnboundCompute/lachesis-action@v1   # the published Marketplace action
+      - uses: UnboundCompute/lachesis-action@v1
         with:
           # Scan the whole repo (Python + TypeScript + C), not just a fixture:
           # the real dogfood is Lachesis analyzing its own source.
           source: "."
           # Test the engine at this repo's own HEAD, not the Action's default main.
-          lachesis-ref: ${{ github.sha }}
+          lachesis-ref: v0.1.0
           analyze-args: "--prune --incremental"
           # Drop every bundled test fixture from the report (c/python/typescript
           # frontends + planner): they carry deliberate guard differentials that

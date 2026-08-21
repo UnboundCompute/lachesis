@@ -20,25 +20,31 @@ machine, and degrades to "no C analysis" when there is none.
 
 ## Before you tag
 
-1. Working tree is clean, and you are on `main` with everything merged.
+1. Working tree is clean, and you are on the release commit (normally `main` or an
+   annotated release candidate branch).
 2. Bump `version` in `pyproject.toml`. Lachesis is pre-1.0, so the graph schema and the
    nav tool surface may still change between minor versions; say so in the changelog
    entry rather than in a patch release note nobody reads.
 3. Run the parity suite against a clean checkout:
    ```
-   pip install -e ".[dev]" && npm install
-   python3 -m pytest lachesis/frontends/checks.py
+python3.11 -m pip install -e ".[dev]" && npm ci
+make PYTHON=python3.11 check
    ```
    It must be fully green. The suite is the release gate — there is no separate one.
 
 ## Build
 
 ```
-python3 tools/vendor_typescript.py          # fetch the pinned compiler
-python3 tools/vendor_typescript.py --check  # confirm it landed
+python3.11 tools/vendor_typescript.py          # fetch the pinned compiler
+python3.11 tools/vendor_typescript.py --check  # confirm it landed
 rm -rf dist build *.egg-info
-python3 -m build                            # sdist + wheel
+export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+python3.11 -m build                            # sdist + wheel
 ```
+
+`SOURCE_DATE_EPOCH` anchors archive timestamps to the release commit, so rebuilding
+the same source produces byte-identical distributions instead of changing hashes on
+every run.
 
 `--check` is not ceremony. Everything else in the build fails loudly when it goes
 wrong; a missing vendor directory does not, and the symptom surfaces on a stranger's
@@ -51,10 +57,10 @@ about a wheel. Test the built artifacts, in a virtualenv that has no relationshi
 this repository, from a directory that is not this repository.
 
 ```
-python3 -m twine check dist/*
+python3.11 -m twine check dist/*
 
 cd $(mktemp -d)
-python3 -m venv v && ./v/bin/pip install /path/to/dist/lachesis_cpg-*.whl
+python3.11 -m venv v && ./v/bin/pip install /path/to/dist/lachesis_cpg-*.whl
 ```
 
 Then confirm all four of these:
@@ -66,7 +72,7 @@ Then confirm all four of these:
   ```
 - **The console scripts exist and run**: `lachesis-analyze`, `lachesis-query`,
   `lachesis-mcp`, `lachesis-plan`.
-- **TypeScript analysis works with no `npm install` anywhere.** This is the vendoring
+- **TypeScript analysis works with no npm setup anywhere.** This is the vendoring
   check, and it is the one that fails when the vendor step was skipped:
   ```
   mkdir -p src && printf 'export function f(x: string) { return x; }\n' > src/a.ts
@@ -74,11 +80,18 @@ Then confirm all four of these:
   ./v/bin/lachesis-query --format text /tmp/rel.kuzu overview
   ```
   The output must name `typescript-compiler-api` among its frontends.
-- **The MCP server starts and lists its tools** over stdio against that graph.
+- **The MCP server starts and lists its tools** over stdio against that graph. The
+  verifier also launches the product command (`lachesis mcp <source>`) so the
+  source-indexing handoff and the MCP initialize/tools handshake are covered, not
+  only the lower-level `lachesis-mcp` entry point.
 
-`tools/verify_wheel.sh` runs this whole sequence. CI runs it on every push and pull
-request in the `package` job, which also builds the distribution and installs from
-the sdist, so a packaging mistake surfaces long before release day.
+`tools/verify_wheel.sh` and `tools/verify_sdist.sh` run these checks for both artifact
+types. CI runs them on every push and pull request in the `package` job, so a packaging
+mistake surfaces long before release day.
+
+The `release artifacts` workflow repeats the artifact gate for every `v*` tag and
+uploads the verified wheel and sdist as workflow artifacts. It does not publish
+automatically; the TestPyPI and PyPI uploads below remain an explicit release step.
 
 ## Publish
 
@@ -87,8 +100,8 @@ Upload to TestPyPI first, install from it, and repeat the four checks above agai
 after a round trip through an index.
 
 ```
-python3 -m twine upload --repository testpypi dist/*
-python3 -m twine upload dist/*
+python3.11 -m twine upload --repository testpypi dist/*
+python3.11 -m twine upload dist/*
 ```
 
 Use an API token scoped to this project, via `~/.pypirc` or `TWINE_PASSWORD`. Then tag
@@ -106,3 +119,11 @@ upload is the irreversible step and the tag should record what actually shipped.
 Yank it (`pip` stops resolving to it, existing pins keep working) and release a patch
 version. Do not delete it: deletion frees the version number for reuse, which means two
 different sets of bytes can answer to the same name.
+
+## Production checklist
+
+- Build from a clean release commit; never publish from a moving branch.
+- Run the artifact verifier from outside the checkout and verify the sdist as well as
+  the wheel.
+- Use an immutable Lachesis tag in production GitHub Action workflows.
+- Keep the previous release available for rollback and never overwrite an artifact.

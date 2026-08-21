@@ -20,11 +20,21 @@ if [[ -z "$wheel" ]]; then
   wheel="$(ls -t "$repo_root"/dist/lachesis_cpg-*.whl 2>/dev/null | head -1 || true)"
 fi
 if [[ -z "$wheel" || ! -f "$wheel" ]]; then
-  echo "no wheel found; run: python3 -m build" >&2
+  echo "no wheel found; run: python3.11 -m build" >&2
   exit 1
 fi
 wheel="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
 python_bin="${PYTHON:-python3}"
+
+"$python_bin" - <<'PY'
+import sys
+
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        f"verify_wheel.sh requires Python 3.10+ (found {sys.version.split()[0]}); "
+        "set PYTHON to a supported interpreter, e.g. PYTHON=python3.11"
+    )
+PY
 
 say() { printf '\n== %s\n' "$1"; }
 
@@ -47,6 +57,9 @@ say "the TypeScript compiler is inside the wheel"
 "$python_bin" - "$wheel" <<'PY'
 import sys, zipfile
 names = zipfile.ZipFile(sys.argv[1]).namelist()
+cache_entries = [n for n in names if "/__pycache__/" in n or n.endswith((".pyc", ".pyo"))]
+if cache_entries:
+    sys.exit(f"FAIL: wheel contains interpreter caches: {cache_entries[:3]}")
 prefix = "lachesis/frontends/typescript/vendor/typescript/"
 if prefix + "lib/typescript.js" not in names:
     sys.exit("FAIL: no vendored typescript.js -- run tools/vendor_typescript.py, rebuild")
@@ -64,16 +77,17 @@ cd "$workspace"
 
 say "install into a clean virtualenv"
 "$python_bin" -m venv v
-./v/bin/pip install --quiet --upgrade pip
-./v/bin/pip install --quiet "$wheel"
+./v/bin/pip install --quiet --disable-pip-version-check --no-input --timeout 60 --upgrade pip
+./v/bin/pip install --quiet --disable-pip-version-check --no-input --timeout 60 "$wheel"
 echo "installed into $workspace/v"
 
 say "imports resolve"
 ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner; print('ok')"
 
 say "console scripts are on PATH"
-for script in lachesis-analyze lachesis-query lachesis-mcp lachesis-plan; do
+for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan lachesis-candidates; do
   [[ -x "./v/bin/$script" ]] || { echo "FAIL: missing $script" >&2; exit 1; }
+  "./v/bin/$script" --version >/dev/null
   echo "  $script"
 done
 
@@ -136,6 +150,48 @@ print(f"{len(tools)} tools: {', '.join(tools)}")
 for required in ("search", "callers", "callees", "reaches"):
     if required not in tools:
         sys.exit(f"FAIL: MCP server does not expose {required}")
+PY
+
+say "the product CLI can build and start MCP"
+./v/bin/python - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+server = subprocess.Popen(
+    [os.path.join(os.getcwd(), "v", "bin", "lachesis"), "mcp", "pyproject_src"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+)
+
+
+def call(message):
+    server.stdin.write(json.dumps(message) + "\n")
+    server.stdin.flush()
+    line = server.stdout.readline()
+    if not line:
+        raise SystemExit("FAIL: `lachesis mcp` exited before replying")
+    return json.loads(line)
+
+
+try:
+    initialized = call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                   "clientInfo": {"name": "verify", "version": "0"}}})
+    listed = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+finally:
+    server.terminate()
+    server.wait(timeout=10)
+
+if initialized.get("result", {}).get("serverInfo", {}).get("name") != "lachesis":
+    sys.exit("FAIL: `lachesis mcp` returned the wrong server identity")
+tools = {tool["name"] for tool in listed.get("result", {}).get("tools", [])}
+if "search" not in tools:
+    sys.exit("FAIL: `lachesis mcp` did not expose navigation tools")
+print(f"product CLI: {len(tools)} MCP tools")
 PY
 
 say "PASS"

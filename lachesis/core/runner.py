@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import tempfile
 from typing import Callable, Optional, Sequence
@@ -11,6 +12,34 @@ from . import graph_pb2
 from .graph_wire import decode_node, iter_tier_records
 from .shards import ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
+
+
+def _run_frontend_command(
+    command: Sequence[str], *, cwd: str, env: dict[str, str], timeout: int,
+) -> subprocess.CompletedProcess:
+    """Run a frontend and terminate its whole process group on timeout."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:  # pragma: no cover - supported deployments are POSIX runners
+            process.kill()
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _persist_shard(
@@ -158,13 +187,10 @@ def run_frontend(
         environment["LACHESIS_ROOTS_FILE"] = roots_file
     command = frontend.render_command(source_dir, output_dir)
     try:
-        completed = subprocess.run(
+        completed = _run_frontend_command(
             command,
             cwd=frontend.working_directory,
             env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
             timeout=timeout_seconds,
         )
         if completed.returncode != 0:

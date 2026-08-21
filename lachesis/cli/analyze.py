@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lachesis.cache import _version
 from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuzu_shards
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
@@ -23,8 +24,20 @@ from lachesis.pipeline import (enrich_project_graph, run_project,
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
-def main() -> None:
+def _positive_int(value: str) -> int:
+    """Argparse type that prevents silently useless zero/negative limits."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _run() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("source_dir")
     parser.add_argument(
         "output_path", nargs="?", default="graph_out/compiler_project.kuzu",
@@ -72,7 +85,7 @@ def main() -> None:
              "no semantic layer to keep without it.",
     )
     parser.add_argument(
-        "--timeout", type=int, default=300, metavar="SECONDS",
+        "--timeout", type=_positive_int, default=300, metavar="SECONDS",
         help="how long one frontend subprocess may run before the build gives up on "
              "it (default 300). This bounds a single compile, not the whole build, so "
              "a project with three frontends can legitimately take three times this. "
@@ -96,12 +109,12 @@ def main() -> None:
              "by the largest single package, so this is not linear scaling.",
     )
     parser.add_argument(
-        "--max-workers", type=int, default=None, metavar="N",
+        "--max-workers", type=_positive_int, default=None, metavar="N",
         help="cap the --parallel-packages pool (default: one worker per package, "
         "never more than the core count). N=1 runs the same partition serially.",
     )
     parser.add_argument(
-        "--shard-large-packages", type=int, default=None, metavar="FILES",
+        "--shard-large-packages", type=_positive_int, default=None, metavar="FILES",
         help="with --parallel-packages, split any package larger than FILES roots "
         "into bounded compiler jobs; this is an opt-in semantic tradeoff and "
         "reports cross-shard edges that cannot be merged",
@@ -247,5 +260,20 @@ def main() -> None:
     print("Node kinds: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())))
 
 
+def main() -> int:
+    try:
+        _run()
+    except KeyboardInterrupt:
+        print("lachesis-analyze: interrupted", file=sys.stderr)
+        return 130
+    except Exception as error:  # noqa: BLE001 - CLI converts build errors to guidance
+        if os.environ.get("LACHESIS_TRACEBACK"):
+            raise
+        print(f"lachesis-analyze: {error}", file=sys.stderr)
+        print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

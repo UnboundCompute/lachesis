@@ -71,7 +71,7 @@ def model_status(model: str = DEFAULT_MODEL) -> dict:
         "model": model,
         "model_ready": bool(metadata.get("model") == model),
         "cache": str(model_cache()),
-        "install": "pip install 'lachesis-cpg[concept-search]'",
+        "install": "python -m pip install 'lachesis-cpg[concept-search]'",
         "download": f"lachesis concept-model download --model {model}",
         **{key: metadata[key] for key in ("dimensions", "runtime_version", "generation")
            if key in metadata},
@@ -81,7 +81,7 @@ def model_status(model: str = DEFAULT_MODEL) -> dict:
 def download_model(model: str = DEFAULT_MODEL) -> dict:
     if not runtime_available():
         raise RuntimeError("FastEmbed is not installed; run: "
-                           "pip install 'lachesis-cpg[concept-search]'")
+                           "python -m pip install 'lachesis-cpg[concept-search]'")
     from fastembed import TextEmbedding
 
     directory = model_cache()

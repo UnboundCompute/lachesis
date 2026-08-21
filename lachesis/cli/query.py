@@ -14,6 +14,27 @@ from lachesis.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
 from lachesis.projections.layered import (
     build_layered_graph, build_security_query_projection,
 )
+from lachesis.cache import _version
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
 
 
 def load_graph(path: str) -> tuple[dict, dict]:
@@ -120,9 +141,10 @@ def render_text(result: dict) -> str:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
+    root.add_argument("--version", action="version", version=_version())
     root.add_argument("graph", help="Lachesis graph store directory (.kuzu)")
     root.add_argument(
-        "--budget-tokens", type=int, default=DEFAULT_BUDGET_TOKENS,
+        "--budget-tokens", type=_positive_int, default=DEFAULT_BUDGET_TOKENS,
         help=f"approximate slice budget (default: {DEFAULT_BUDGET_TOKENS})",
     )
     root.add_argument("--format", choices=("json", "text"), default="json")
@@ -132,7 +154,7 @@ def parser() -> argparse.ArgumentParser:
     locate.add_argument("node_id")
     expand = commands.add_parser("expand")
     expand.add_argument("node_id")
-    expand.add_argument("--depth", type=int, default=1)
+    expand.add_argument("--depth", type=_nonnegative_int, default=1)
     find = commands.add_parser("find-entity")
     find.add_argument("name")
     find.add_argument("--kind")

@@ -10,10 +10,25 @@ Lachesis parses a codebase with real compilers, not regexes, and turns it into a
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
-pip install -e ".[dev]" && npm install       # build from source (details below)
-lachesis-analyze ./my-project graph.kuzu     # parse a tree into a graph
-lachesis-mcp graph.kuzu                       # hand it to your agent over MCP
+python -m pip install -e ".[dev]" && npm ci
+lachesis scan ./my-project                   # build/cache the graph and report findings
+lachesis mcp ./my-project                    # hand the same codebase to your agent over MCP
 ```
+
+The lower-level artifact commands remain available when you need to name and move a
+graph explicitly: `lachesis-analyze` builds a store, `lachesis-query` reads it, and
+`lachesis-mcp` serves it.
+
+The PyPI package name is `lachesis-cpg`; use `python -m pip install lachesis-cpg` once
+you are installing a tagged release published to PyPI.
+
+The release-tested Python compatibility window is 3.10–3.12 (the CI matrix); use a
+newer interpreter only after verifying it against the Lachesis/Kùzu dependency set.
+
+For MCP clients, use the `lachesis-mcp` executable from the same environment
+that built the graph and pass an absolute `graph.kuzu` path. Source-checkout
+and interpreter troubleshooting examples are in
+[`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
 
 ---
 
@@ -228,6 +243,25 @@ The GitHub Action's SARIF step sets `LACHESIS_QUERY_EPHEMERAL_ENRICH=1`: its bat
 security query uses the derived tier only for that process and avoids writing a second
 graph-sized cache. Local query commands keep persistent enriched-cache behavior.
 
+### Managing the local graph cache
+
+The product CLI keeps one content-addressed index per source tree. Inspect it with:
+
+```bash
+lachesis cache list
+```
+
+To see what can be reclaimed without deleting anything, use the dry-run prune. It
+targets entries whose source directory disappeared and entries older than 30 days:
+
+```bash
+lachesis cache prune --older-than 30
+```
+
+Add `--apply` only when you want those entries removed. To delete one project, pass its
+source path to `lachesis cache clear`; deleting the entire cache requires the explicit
+confirmation flag `lachesis cache clear --all`.
+
 The streamed path defaults to a 1 GiB Kùzu buffer pool. For very large subsystems
 such as Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
 
@@ -249,23 +283,27 @@ facts that `--prune` discards later.
 
 ## Install from source
 
-Lachesis installs from a clone — that's the supported path for now (a published wheel comes with the first release):
+Lachesis installs from a clone — this is the supported source workflow while
+published wheels remain an explicit release artifact:
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
 python -m pip install --upgrade pip     # editable installs need pip >= 21.3
-pip install -e ".[dev]"                 # builder, nav, MCP server, tests
-npm install                             # the TypeScript compiler the TS frontend loads
+python -m pip install -e ".[dev]"       # builder, nav, MCP server, tests
+npm ci                                   # install the locked TypeScript compiler dependency
 ```
 
-Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm install` step vendors the TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node must be on your PATH for the TS frontend; C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
+After installing the checkout dependencies, run the same frontend parity gate used by
+CI with `make check` (or `make PYTHON=python3.11 check` when selecting an interpreter).
+
+Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library. The `npm ci` step installs the locked TypeScript compiler the TS frontend loads — it's a build artifact, not checked in, so a fresh checkout needs it. Node 20+ must be on your PATH for the TS frontend (CI verifies Node 20; the GitHub Action runs Node 22); C additionally needs `clang`, and without it C files are simply skipped while every other language still builds.
 
 Semantic `concept_search` is deliberately separate from the core install. Neither its
 FastEmbed runtime nor its model weights ship in the Lachesis wheel, and a search never
 downloads them implicitly. Opt in and download the local model explicitly:
 
 ```bash
-pip install -e ".[concept-search]"       # optional ONNX embedding runtime
+python -m pip install -e ".[concept-search]" # optional ONNX embedding runtime
 lachesis concept-model download          # model weights in the user cache
 lachesis concept-model status            # inspect without downloading
 ```

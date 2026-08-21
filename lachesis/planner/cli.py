@@ -15,13 +15,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lachesis.nav.graph_store import GraphStore
+from lachesis.cache import _version
 from lachesis.planner.constructors import GuardDifferential
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
 
 
 def _census_line(census: dict) -> str:
@@ -64,10 +76,11 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lachesis-plan",
         description="rank investigation capsules from a Lachesis graph")
+    p.add_argument("--version", action="version", version=_version())
     p.add_argument("graph", help="path to a .kuzu store")
-    p.add_argument("--limit", type=int, default=20,
+    p.add_argument("--limit", type=_nonnegative_int, default=20,
                    help="how many queued capsules to print (0 = all)")
-    p.add_argument("--entrypoints", type=int, default=0, metavar="N",
+    p.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
                    help="scan only the first N entrypoints (0 = all)")
     p.add_argument("--json", action="store_true",
                    help="print the full result as JSON on stdout")
@@ -78,8 +91,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
-    store = GraphStore.load(args.graph)
-    store.ensure_dataflow_tier()
+    try:
+        store = GraphStore.load(args.graph)
+        store.ensure_dataflow_tier()
+    except Exception as error:  # noqa: BLE001 - CLI converts store errors to one-line guidance
+        if os.environ.get("LACHESIS_TRACEBACK"):
+            raise
+        print(f"lachesis-plan: {error}", file=sys.stderr)
+        print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
+        return 2
     result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
 
     print(_census_line(result["census"]), file=sys.stderr)

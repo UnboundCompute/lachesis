@@ -46,6 +46,14 @@ _TEXT_EXTENSIONS = frozenset({
 })
 DEFAULT_DETAIL_LIMIT = 100
 COMMUNITY_FILE_LIMIT = 50
+GIT_HISTORY_TIMEOUT_SECONDS = 30
+
+
+def _normalize_relative_path(path: str) -> str:
+    path = path.replace(os.sep, "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path or "."
 
 
 def _loc(gl, node: dict) -> dict:
@@ -163,7 +171,7 @@ class Comprehension:
                 return candidate.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 pass
-        return path.strip("./")
+        return _normalize_relative_path(path)
 
     def _source_files(self):
         root = self._source_root()
@@ -653,8 +661,8 @@ class Comprehension:
         def belongs(path, component):
             if not path:
                 return False
-            clean = (self._relative_path(path) or "").strip("./")
-            component = component.strip("./")
+            clean = _normalize_relative_path(self._relative_path(path) or "")
+            component = _normalize_relative_path(component)
             return clean == component or clean.startswith(component + "/")
 
         rows, seen = [], set()
@@ -986,7 +994,16 @@ class Comprehension:
         start, size = max(0, offset), max(1, limit)
         command = ["git", "-C", str(root), "log", f"--skip={start}", f"-n{size + 1}",
                    "--format=%H%x1f%an%x1f%aI%x1f%s", "--", *files]
-        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        try:
+            completed = subprocess.run(
+                command, text=True, capture_output=True, check=False,
+                timeout=GIT_HISTORY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "error": "Git history lookup timed out",
+                "detail": f"history search exceeded {GIT_HISTORY_TIMEOUT_SECONDS}s",
+            }
         if completed.returncode != 0:
             return {"error": "source tree is not readable as a Git worktree",
                     "detail": completed.stderr.strip()[:500]}
