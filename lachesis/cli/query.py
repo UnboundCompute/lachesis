@@ -14,6 +14,7 @@ from lachesis.reasoning import DEFAULT_BUDGET_TOKENS, ReasoningQuery
 from lachesis.projections.layered import (
     build_layered_graph, build_security_query_projection,
 )
+from lachesis.cache import _version
 
 
 def _positive_int(value: str) -> int:
@@ -140,6 +141,7 @@ def render_text(result: dict) -> str:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
+    root.add_argument("--version", action="version", version=_version())
     root.add_argument("graph", help="Lachesis graph store directory (.kuzu)")
     root.add_argument(
         "--budget-tokens", type=_positive_int, default=DEFAULT_BUDGET_TOKENS,

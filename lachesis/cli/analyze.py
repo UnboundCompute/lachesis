@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lachesis.cache import _version
 from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuzu_shards
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
@@ -36,6 +37,7 @@ def _positive_int(value: str) -> int:
 
 def _run() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("source_dir")
     parser.add_argument(
         "output_path", nargs="?", default="graph_out/compiler_project.kuzu",

@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lachesis.nav.graph_store import GraphStore
+from lachesis.cache import _version
 from lachesis.planner.constructors import GuardDifferential
 
 
@@ -75,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lachesis-plan",
         description="rank investigation capsules from a Lachesis graph")
+    p.add_argument("--version", action="version", version=_version())
     p.add_argument("graph", help="path to a .kuzu store")
     p.add_argument("--limit", type=_nonnegative_int, default=20,
                    help="how many queued capsules to print (0 = all)")

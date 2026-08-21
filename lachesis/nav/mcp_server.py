@@ -1555,6 +1555,13 @@ def send(obj):
 
 def main():
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _DEFAULT_FORMAT
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        print("usage: lachesis-mcp [graph.kuzu] [overlay] [profile]")
+        print("Serve a Lachesis graph over MCP stdio; --version prints the installed version.")
+        return 0
+    if len(sys.argv) == 2 and sys.argv[1] == "--version":
+        print(SERVER_VERSION)
+        return 0
     # Config precedence: explicit argv wins, else env. The graph path may come from
     # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
     _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")

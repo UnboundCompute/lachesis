@@ -9,6 +9,9 @@ than left for you to discover.
 
 ## Unreleased
 
+- All installed Lachesis console modules now support consistent `--version` and
+  MCP exposes explicit `--help`/`--version` handling instead of treating flags as
+  graph paths.
 - Pin the Lachesis self-test's Marketplace Action reference to the reviewed v1.0.0
   release commit for reproducible CI.
 - Bound Kùzu and PyArrow runtime dependencies to the compatibility window exercised
