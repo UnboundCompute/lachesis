@@ -102,8 +102,10 @@ jobs:
 
       - name: Verify reproducible distributions
         run: |
+          python tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
           sha256sum dist/* > /tmp/lachesis-first-build.sha256
           python -m build
+          python tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
           sha256sum -c /tmp/lachesis-first-build.sha256
 
       - name: Check the distribution metadata
