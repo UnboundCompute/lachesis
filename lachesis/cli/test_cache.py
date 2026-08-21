@@ -34,12 +34,32 @@ class CachePruneTests(unittest.TestCase):
             old_value = os.environ.get("LACHESIS_CACHE_DIR")
             os.environ["LACHESIS_CACHE_DIR"] = cache_dir
             try:
-                Path(cache_dir, "entry").mkdir(parents=True)
-                Path(cache_dir, "entry", "data").write_bytes(b"cache")
+                entry = entry_for(Path(cache_dir, "source"))
+                entry.write_meta("hash")
+                entry.graph_path.write_bytes(b"cache")
                 args = argparse.Namespace(cache_action="clear", path=None, all=True)
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(command_cache(args), 0)
                 self.assertFalse(Path(cache_dir).exists())
+            finally:
+                if old_value is None:
+                    os.environ.pop("LACHESIS_CACHE_DIR", None)
+                else:
+                    os.environ["LACHESIS_CACHE_DIR"] = old_value
+
+    def test_clear_all_preserves_unrecognized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as cache_dir:
+            old_value = os.environ.get("LACHESIS_CACHE_DIR")
+            os.environ["LACHESIS_CACHE_DIR"] = cache_dir
+            try:
+                entry = entry_for(Path(cache_dir, "source"))
+                entry.write_meta("hash")
+                entry.graph_path.write_bytes(b"cache")
+                Path(cache_dir, "do-not-delete.txt").write_text("keep")
+                args = argparse.Namespace(cache_action="clear", path=None, all=True)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(command_cache(args), 0)
+                self.assertTrue(Path(cache_dir, "do-not-delete.txt").exists())
             finally:
                 if old_value is None:
                     os.environ.pop("LACHESIS_CACHE_DIR", None)
@@ -86,12 +106,14 @@ class CachePruneTests(unittest.TestCase):
             old_value = os.environ.get("LACHESIS_CACHE_DIR")
             os.environ["LACHESIS_CACHE_DIR"] = cache_dir
             try:
-                Path(cache_dir, "entry").mkdir()
+                entry = entry_for(Path(cache_dir, "source"))
+                entry.write_meta("hash")
+                entry.graph_path.write_bytes(b"cache")
                 args = argparse.Namespace(cache_action="clear", path=None, all=True)
-                with patch("lachesis.cli.main.shutil.rmtree", side_effect=OSError("read-only")), \
+                with patch("lachesis.cache.shutil.rmtree", side_effect=OSError("read-only")), \
                      contextlib.redirect_stderr(io.StringIO()) as output:
                     self.assertEqual(command_cache(args), 4)
-                self.assertIn("could not remove cached indexes", output.getvalue())
+                self.assertIn("could not remove", output.getvalue())
             finally:
                 if old_value is None:
                     os.environ.pop("LACHESIS_CACHE_DIR", None)

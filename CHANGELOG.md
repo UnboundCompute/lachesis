@@ -20,6 +20,8 @@ than left for you to discover.
   Python job tests the interpreter it configured.
 - Cache deletion now fails closed and reports filesystem errors instead of
   claiming an index was removed when the operating system rejected the delete.
+- `cache clear --all` now deletes only recognized Lachesis entries and preserves
+  unrelated files under a user-configured cache directory.
 - Added a `make check` developer gate for the frontend parity suite; CI and release
   instructions now use the same command developers can run locally.
 - Require `lachesis cache clear --all` before deleting every cached graph; targeted

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -210,12 +209,30 @@ def command_cache(args: argparse.Namespace) -> int:
         if not root.is_dir():
             _stderr("cache is already empty")
             return EXIT_OK
-        freed = directory_size(root)
+        # Only remove entries with a valid Lachesis metadata envelope. The cache
+        # directory may be user-configured and can contain unrelated files; never
+        # recursively delete those just because --all was requested.
+        cached = entries()
+        if not cached:
+            _stderr(f"no recognized cached indexes under {root}; leaving it intact")
+            return EXIT_OK
+        freed = 0
+        for entry in cached:
+            size = directory_size(entry.directory)
+            try:
+                entry.discard()
+            except OSError as error:
+                _stderr(f"could not remove {entry.directory}: {error}")
+                return EXIT_FAILURE
+            freed += size
         try:
-            shutil.rmtree(root)
-        except OSError as error:
-            _stderr(f"could not remove cached indexes under {root}: {error}")
-            return EXIT_FAILURE
+            root.rmdir()
+        except OSError:
+            # An unrelated file or directory remains; that is intentional and
+            # safer than recursively deleting it.
+            _stderr(f"removed {len(cached)} cached index(es) ({human_size(freed)}); "
+                    f"left other files under {root}")
+            return EXIT_OK
         _stderr(f"removed every cached index ({human_size(freed)})")
         return EXIT_OK
 
