@@ -27,19 +27,19 @@ machine, and degrades to "no C analysis" when there is none.
    entry rather than in a patch release note nobody reads.
 3. Run the parity suite against a clean checkout:
    ```
-   pip install -e ".[dev]" && npm install
-   python3 -m pytest lachesis/frontends/checks.py
+python3.11 -m pip install -e ".[dev]" && npm install
+python3.11 -m pytest lachesis/frontends/checks.py
    ```
    It must be fully green. The suite is the release gate — there is no separate one.
 
 ## Build
 
 ```
-python3 tools/vendor_typescript.py          # fetch the pinned compiler
-python3 tools/vendor_typescript.py --check  # confirm it landed
+python3.11 tools/vendor_typescript.py          # fetch the pinned compiler
+python3.11 tools/vendor_typescript.py --check  # confirm it landed
 rm -rf dist build *.egg-info
 export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-python3 -m build                            # sdist + wheel
+python3.11 -m build                            # sdist + wheel
 ```
 
 `SOURCE_DATE_EPOCH` anchors archive timestamps to the release commit, so rebuilding
@@ -57,10 +57,10 @@ about a wheel. Test the built artifacts, in a virtualenv that has no relationshi
 this repository, from a directory that is not this repository.
 
 ```
-python3 -m twine check dist/*
+python3.11 -m twine check dist/*
 
 cd $(mktemp -d)
-python3 -m venv v && ./v/bin/pip install /path/to/dist/lachesis_cpg-*.whl
+python3.11 -m venv v && ./v/bin/pip install /path/to/dist/lachesis_cpg-*.whl
 ```
 
 Then confirm all four of these:
@@ -97,8 +97,8 @@ Upload to TestPyPI first, install from it, and repeat the four checks above agai
 after a round trip through an index.
 
 ```
-python3 -m twine upload --repository testpypi dist/*
-python3 -m twine upload dist/*
+python3.11 -m twine upload --repository testpypi dist/*
+python3.11 -m twine upload dist/*
 ```
 
 Use an API token scoped to this project, via `~/.pypirc` or `TWINE_PASSWORD`. Then tag

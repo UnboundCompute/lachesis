@@ -20,11 +20,21 @@ if [[ -z "$wheel" ]]; then
   wheel="$(ls -t "$repo_root"/dist/lachesis_cpg-*.whl 2>/dev/null | head -1 || true)"
 fi
 if [[ -z "$wheel" || ! -f "$wheel" ]]; then
-  echo "no wheel found; run: python3 -m build" >&2
+  echo "no wheel found; run: python3.11 -m build" >&2
   exit 1
 fi
 wheel="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
 python_bin="${PYTHON:-python3}"
+
+"$python_bin" - <<'PY'
+import sys
+
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        f"verify_wheel.sh requires Python 3.10+ (found {sys.version.split()[0]}); "
+        "set PYTHON to a supported interpreter, e.g. PYTHON=python3.11"
+    )
+PY
 
 say() { printf '\n== %s\n' "$1"; }
 
