@@ -28,7 +28,7 @@ machine, and degrades to "no C analysis" when there is none.
 3. Run the parity suite against a clean checkout:
    ```
 python3.11 -m pip install -e ".[dev]" && npm install
-python3.11 -m pytest lachesis/frontends/checks.py
+make PYTHON=python3.11 check
    ```
    It must be fully green. The suite is the release gate — there is no separate one.
 

@@ -23,9 +23,9 @@ Thanks for your interest in Lachesis. Contributions are welcome, whether that is
    `node_modules`, so the TypeScript version you develop against is the one
    `package.json` pins. See [`RELEASING.md`](./RELEASING.md).
 3. Make your change, with tests where it makes sense.
-4. Run the parity and checks suite before you open a PR:
+4. Run the local parity gate before you open a PR:
    ```
-   python3 -m pytest lachesis/frontends/checks.py
+   make check
    ```
    The graph has to stay at byte-identical parity between the JSON and Kùzu backends for the navigation and MCP tools, and the checks suite enforces that. If your change touches the store or the nav layer, make sure that test still passes.
 

@@ -9,6 +9,8 @@ than left for you to discover.
 
 ## Unreleased
 
+- Added a `make check` developer gate for the frontend parity suite; CI and release
+  instructions now use the same command developers can run locally.
 - Require `lachesis cache clear --all` before deleting every cached graph; targeted
   project clears remain unchanged.
 - All installed Lachesis console modules now support consistent `--version` and

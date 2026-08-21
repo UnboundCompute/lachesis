@@ -58,8 +58,8 @@ jobs:
       - name: Install Lachesis (${{ matrix.extras }})
         run: pip install -e ".[${{ matrix.extras }}]"
 
-      - name: Run the parity / checks suite
-        run: python -m pytest lachesis/frontends/checks.py -v
+      - name: Run the local parity gate
+        run: make check
 
   # A green checks job says nothing about what a user gets from PyPI: it runs from a
   # checkout, with an editable install, a node_modules and the repository root on
