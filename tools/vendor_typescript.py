@@ -173,7 +173,7 @@ def check() -> int:
         print(f"no vendored TypeScript at {VENDOR_DIR}", file=sys.stderr)
         print("run: python3 tools/vendor_typescript.py", file=sys.stderr)
         return 1
-    version = json.loads(manifest.read_text())["version"]
+    version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
     if version != TYPESCRIPT_VERSION:
         print(f"vendored typescript@{version}, pinned typescript@{TYPESCRIPT_VERSION}",
               file=sys.stderr)
