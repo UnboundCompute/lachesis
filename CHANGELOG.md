@@ -49,7 +49,7 @@ than left for you to discover.
 
 ## [0.1.0] — unreleased
 
-First public release: `pip install lachesis-cpg`.
+First public release: `python -m pip install lachesis-cpg`.
 
 ### Added
 
