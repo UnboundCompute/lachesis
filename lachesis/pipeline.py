@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
+from .core.composition import _EdgeKeys
 from .core.graph_wire import decode_document, encode_document
 from .core.runner import run_frontend
 from .core.snapshot import load_snapshot
@@ -65,7 +65,7 @@ def _combine_graphs(
     """
     nodes: Dict[str, GraphNode] = {}
     edges: List[GraphEdge] = []
-    edge_keys = set()
+    edge_keys = _EdgeKeys()
     for graph in graphs:
         for node in graph["nodes"]:
             existing = nodes.get(node["id"])
@@ -73,12 +73,7 @@ def _combine_graphs(
                 raise FrontendError(f"frontends emitted conflicting node id {node['id']}")
             nodes[node["id"]] = node
         for edge in graph["edges"]:
-            key = (
-                edge["kind"], edge["source"], edge["target"],
-                json.dumps(edge.get("properties", {}), sort_keys=True),
-            )
-            if key not in edge_keys:
-                edge_keys.add(key)
+            if edge_keys.add(edge):
                 edges.append(edge)
     known = set(nodes)
     dangling = [

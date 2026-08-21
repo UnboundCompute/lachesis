@@ -381,6 +381,23 @@ safety-stopped when the host began heating; therefore no whole-net result or
 acceptance claim is made. The experiment was reverted pending a cooler,
 single-run large-workload validation.
 
+### Protobuf edge identity in pipeline composition
+
+The non-streaming composition path used to serialize every edge's properties as a
+JSON string solely to deduplicate `(kind, source, target, properties)`. It now uses
+the deterministic protobuf document encoder, and the property payload is encoded
+only when a triple collides (the usual case is a unique triple). On a bounded
+200,001-node / 200,000-edge synthetic composition, the median fell from 0.249s
+(`json.dumps` for every edge) to 0.117s (protobuf only for collisions), with exact
+node/edge counts preserved. This removes JSON from that internal identity path and
+does not change the canonical graph contract; real-repository validation remains
+required before attributing a whole-build gain.
+
+The SQLite shard merge staging table was updated at the same boundary: its BLOB
+property column now stores the same protobuf document bytes instead of JSON text.
+This keeps intermediate shard composition binary and avoids a text encode/decode
+round trip; the existing shard-merger parity test passes.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
