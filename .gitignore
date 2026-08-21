@@ -42,3 +42,4 @@ private/
 lachesis/frontends/typescript/vendor/
 
 .claude/worktrees/
+*.md
