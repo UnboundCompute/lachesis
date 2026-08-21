@@ -247,6 +247,14 @@ but a whole ``linux/net`` run failed the 300-second cap before publishing and re
 3,753,066,496 bytes peak RSS with substantially higher system time. It is not a safe
 GitHub Action default; the process allocator remains unchanged.
 
+### Rejected post-build tier record release
+
+The serializer was changed to release each tier's node records immediately after its
+protobuf write. Fixture and cross-TU parity stayed exact, but whole ``linux/net`` rose
+to 226.94s / 3,450,372,096 bytes peak RSS versus the 219.66s / 3,442,147,328-byte
+baseline. The implementation was reverted; retaining the graph through serialization
+is currently the faster measured path.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
