@@ -302,6 +302,15 @@ overlay and the final sort was redundant. Core overlay/ecosystem/projection pari
 tests pass; a fresh Kùzu-backed large pass-3 measurement is pending on an environment
 with Kùzu installed and is not claimed as a numeric improvement yet.
 
+### Rejected ephemeral Kùzu-index release
+
+The Action-style ephemeral query was experimentally changed to drop its navigation
+index immediately after core materialization. On two fresh `linux/net/ipv4` runs the
+overview remained byte-compatible and took 21.93s / 1,835,646,976 bytes RSS before
+the change versus 21.74s / 1,851,916,288 bytes after it. The small wall-time delta
+was within run variance and RSS was slightly worse, so the change was reverted; the
+navigation index is not a demonstrated pass-3 memory bottleneck.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
