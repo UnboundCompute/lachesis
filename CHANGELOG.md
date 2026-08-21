@@ -70,6 +70,8 @@ than left for you to discover.
   only explicit `./` prefixes, keeping navigation locations exact.
 - Component-boundary queries now use the same lossless path normalization, so hidden
   directory names are not stripped before matching.
+- Git-backed comprehension history lookups now have a 30-second bound and return a
+  diagnostic instead of waiting indefinitely on a damaged or very large worktree.
 
 ## [0.1.0] — unreleased
 

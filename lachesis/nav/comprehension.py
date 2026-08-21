@@ -46,6 +46,7 @@ _TEXT_EXTENSIONS = frozenset({
 })
 DEFAULT_DETAIL_LIMIT = 100
 COMMUNITY_FILE_LIMIT = 50
+GIT_HISTORY_TIMEOUT_SECONDS = 30
 
 
 def _normalize_relative_path(path: str) -> str:
@@ -993,7 +994,16 @@ class Comprehension:
         start, size = max(0, offset), max(1, limit)
         command = ["git", "-C", str(root), "log", f"--skip={start}", f"-n{size + 1}",
                    "--format=%H%x1f%an%x1f%aI%x1f%s", "--", *files]
-        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        try:
+            completed = subprocess.run(
+                command, text=True, capture_output=True, check=False,
+                timeout=GIT_HISTORY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "error": "Git history lookup timed out",
+                "detail": f"history search exceeded {GIT_HISTORY_TIMEOUT_SECONDS}s",
+            }
         if completed.returncode != 0:
             return {"error": "source tree is not readable as a Git worktree",
                     "detail": completed.stderr.strip()[:500]}
