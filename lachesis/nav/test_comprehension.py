@@ -236,6 +236,31 @@ class ComprehensionTests(unittest.TestCase):
         finally:
             mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
 
+    def test_backlog_deterministic_moves_run_on_fixture_graph(self):
+        from . import mcp_server
+        old_ctx, old_format = mcp_server._CTX, mcp_server._DEFAULT_FORMAT
+        try:
+            mcp_server._CTX = types.SimpleNamespace(
+                store=self.store, comprehension=self.query,
+            )
+            mcp_server._DEFAULT_FORMAT = "json"
+            calls = [
+                ("wrapper_model", {"function": "loadMysqlConfig"}),
+                ("invariant_trace", {"value": "status"}),
+                ("representation_roundtrip", {
+                    "left": "loadMysqlConfig", "right": "loadPostgresConfig",
+                }),
+                ("cross_boundary_paths", {
+                    "from_component": "api", "to_component": "storage",
+                }),
+            ]
+            for name, args in calls:
+                answer = json.loads(mcp_server.call_tool(name, args, format="json"))
+                self.assertEqual(name, answer["move"])
+                self.assertNotIn("error", answer)
+        finally:
+            mcp_server._CTX, mcp_server._DEFAULT_FORMAT = old_ctx, old_format
+
     def test_wave_two_graph_algorithms_stay_deterministic(self):
         targets = self.query.indirect_targets("loadMysqlConfig")
         self.assertEqual(1, targets["counts"]["unresolved"])
