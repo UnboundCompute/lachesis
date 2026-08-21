@@ -38,8 +38,13 @@ machine, and degrades to "no C analysis" when there is none.
 python3 tools/vendor_typescript.py          # fetch the pinned compiler
 python3 tools/vendor_typescript.py --check  # confirm it landed
 rm -rf dist build *.egg-info
+export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
 python3 -m build                            # sdist + wheel
 ```
+
+`SOURCE_DATE_EPOCH` anchors archive timestamps to the release commit, so rebuilding
+the same source produces byte-identical distributions instead of changing hashes on
+every run.
 
 `--check` is not ceremony. Everything else in the build fails loudly when it goes
 wrong; a missing vendor directory does not, and the symptom surfaces on a stranger's

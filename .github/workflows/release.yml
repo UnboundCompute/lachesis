@@ -27,6 +27,9 @@ jobs:
         run: |
           python3 tools/vendor_typescript.py
           python3 tools/vendor_typescript.py --check
+      - name: Anchor release timestamps
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       - name: Build distributions
         run: python -m build
       - name: Verify metadata and clean-install behavior
