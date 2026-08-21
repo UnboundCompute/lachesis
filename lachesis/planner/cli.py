@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -88,8 +89,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
-    store = GraphStore.load(args.graph)
-    store.ensure_dataflow_tier()
+    try:
+        store = GraphStore.load(args.graph)
+        store.ensure_dataflow_tier()
+    except Exception as error:  # noqa: BLE001 - CLI converts store errors to one-line guidance
+        if os.environ.get("LACHESIS_TRACEBACK"):
+            raise
+        print(f"lachesis-plan: {error}", file=sys.stderr)
+        print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
+        return 2
     result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
 
     print(_census_line(result["census"]), file=sys.stderr)
