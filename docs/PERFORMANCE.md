@@ -346,6 +346,14 @@ reuse metadata shapes between tier files. The `linux/net/ipv4` run measured 15.7
 and 424,558,592 bytes RSS, worse than the nearby per-tier-cache baseline, so the
 experiment was reverted; each tier retains its own bounded cache.
 
+### Rejected macro line-slicing rewrite
+
+Macro recovery was changed experimentally to inspect continuation lines through the
+cached offset table instead of rebuilding `splitlines()` for each macro. Focused C
+and graph-wire tests passed, but `linux/net/ipv4` measured 15.55s and 419,463,168
+bytes RSS, indistinguishable from the existing 15.52s baseline. The rewrite was
+reverted without a whole-net run.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
