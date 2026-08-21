@@ -18,6 +18,8 @@ than left for you to discover.
   a healthy install.
 - CI now installs the matrix package with `python -m pip`, guaranteeing each
   Python job tests the interpreter it configured.
+- The CI package-verification job now has the same 20-minute timeout as the
+  release artifact gate, preventing a packaging hang from running indefinitely.
 - Cache deletion now fails closed and reports filesystem errors instead of
   claiming an index was removed when the operating system rejected the delete.
 - `cache clear --all` now deletes only recognized Lachesis entries and preserves
