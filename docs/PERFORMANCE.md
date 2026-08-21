@@ -339,6 +339,13 @@ to the list expected by the existing serializer) was tested twice on `linux/net/
 15.60s / 419,872,768 bytes RSS and 15.64s / 421,445,632 bytes. Neither run improved
 the nearby 15.52s baseline, so the compatibility-preserving list copy remains.
 
+### Rejected cross-tier property cache sharing
+
+Sharing the bounded protobuf property cache across the five C tiers was tested to
+reuse metadata shapes between tier files. The `linux/net/ipv4` run measured 15.70s
+and 424,558,592 bytes RSS, worse than the nearby per-tier-cache baseline, so the
+experiment was reverted; each tier retains its own bounded cache.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
