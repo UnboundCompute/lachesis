@@ -428,6 +428,10 @@ class GraphStore:
         cache = dataflow_overlay_path(core_path)
         core_node_ids = {id(node) for node in core["nodes"]}
         core_edge_ids = {id(edge) for edge in core["edges"]}
+        # The identity sets are all that cache classification needs from the core
+        # containers; release their list/dict wrapper before assembling the derived
+        # payload, which may itself retain the shared record objects.
+        del core
         enriched_node_ids = {id(node) for node in enriched["nodes"]}
         enriched_edge_ids = {id(edge) for edge in enriched["edges"]}
         additive = (
@@ -472,7 +476,7 @@ class GraphStore:
         # The derived graph is now represented by the attached cache. Release the
         # materialized lists before reopening so large action runs do not overlap
         # two graph-sized Python representations.
-        del enriched, core
+        del enriched
         self.overlay = fresh.overlay
         self.graph = fresh.graph
         self.gl = fresh.gl
