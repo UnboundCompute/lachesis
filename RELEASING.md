@@ -81,6 +81,10 @@ Then confirm all four of these:
 request in the `package` job, which also builds the distribution and installs from
 the sdist, so a packaging mistake surfaces long before release day.
 
+The `release artifacts` workflow repeats the artifact gate for every `v*` tag and
+uploads the verified wheel and sdist as workflow artifacts. It does not publish
+automatically; the TestPyPI and PyPI uploads below remain an explicit release step.
+
 ## Publish
 
 Upload to TestPyPI first, install from it, and repeat the four checks above against
