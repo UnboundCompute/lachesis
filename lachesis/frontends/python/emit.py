@@ -6,9 +6,10 @@ the canonical provenance shape every Lachesis frontend emits.
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from lachesis.core.composition import _EdgeKeys
 
 CONTRACT_VERSION = 2
 FRONTEND_ID = "cpython-ast"
@@ -200,7 +201,7 @@ class Graph:
         self.node_tier: Dict[str, str] = {}
         self.edges: List[dict] = []
         self.dropped_edges = 0  # endpoints that never became nodes; reported, never silent
-        self._edge_keys = set()
+        self._edge_keys = _EdgeKeys()
 
     def node(self, node_id: str, kind: str, label: str, **properties) -> str:
         canonical = {
@@ -249,13 +250,11 @@ class Graph:
             "fact_origin": "compiler", "confidence": "exact", "evidence_ids": [],
             **{name: value for name, value in properties.items() if value is not None},
         }
-        key = (kind, source, target, json.dumps(canonical, sort_keys=True))
-        if key in self._edge_keys:
-            return
-        self._edge_keys.add(key)
-        self.edges.append({
+        edge = {
             "kind": kind, "source": source, "target": target, "properties": canonical,
-        })
+        }
+        if self._edge_keys.add(edge):
+            self.edges.append(edge)
 
     def tier_payloads(self) -> Dict[str, dict]:
         """Split the flat graph into the on-disk tier files.

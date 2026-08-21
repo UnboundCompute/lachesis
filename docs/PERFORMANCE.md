@@ -410,6 +410,16 @@ time from 0.0134s to 0.0011s (~12x). The flow lifetime/integration suite remains
 large-store timing validation is still pending because Kùzu is only installed in the
 separate Python 3.9 environment on this host.
 
+### Language frontend edge identity
+
+The Python and C frontends now use the shared collision-aware edge identity helper;
+their common case hashes only `(kind, source, target)`, and the exact property payload
+is encoded in protobuf only when that triple collides. This removes JSON property
+serialization from the Python frontend's every-edge path and from the C frontend's
+collision path while preserving first-occurrence ordering and duplicate semantics.
+The Python fixture still emits exactly 2,182 nodes and 2,968 edges (16 files); its
+cold direct run measured 0.12s and 32,079,872-byte peak RSS.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate

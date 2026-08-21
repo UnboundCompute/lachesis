@@ -767,10 +767,10 @@ class _EdgeKeys:
         properties_seen = self._tied.get(tied_key)
         if properties_seen is None:
             properties_seen = {
-                json.dumps(edges[first]["properties"], sort_keys=True),
+                encode_document(edges[first]["properties"]),
             }
             self._tied[tied_key] = properties_seen
-        key = json.dumps(properties, sort_keys=True)
+        key = encode_document(properties)
         if key in properties_seen:
             return False
         properties_seen.add(key)
