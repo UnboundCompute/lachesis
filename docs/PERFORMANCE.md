@@ -399,6 +399,16 @@ property column now stores the same protobuf document bytes instead of JSON text
 This keeps intermediate shard composition binary and avoids a text encode/decode
 round trip; the existing shard-merger parity test passes.
 
+### Pass-3 sink taxonomy closure
+
+`flow.translate.build_F` now computes sink/lifecycle reachability with one reverse
+call-graph closure instead of starting a recursive traversal (and fresh visited set)
+from every function. A synthetic 5,020-function graph with a shared 20-function
+callee chain returned the same 5,020 reachable functions while dropping the closure
+time from 0.0134s to 0.0011s (~12x). The flow lifetime/integration suite remains green;
+large-store timing validation is still pending because Kùzu is only installed in the
+separate Python 3.9 environment on this host.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate

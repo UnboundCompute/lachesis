@@ -35,6 +35,7 @@ Known gaps vs the old clang parser (honest, not silent):
     signal -- does not depend on it.
 """
 import argparse
+from collections import defaultdict
 import json
 import re
 
@@ -384,19 +385,27 @@ def build_F(store, lang="c", *, return_graph=False):
     def is_lifecycle_or_sink(c):
         return c in sink_names or norm.is_alloc(c) or norm.is_dealloc(c)
 
-    def reaches_sink(name, seen):
-        if name in seen:
-            return False
-        seen.add(name)
-        r = recs.get(name)
-        if not r:
-            return False
-        for c in r["callees"]:
-            if is_lifecycle_or_sink(c):
-                return True
-            if c in defined and reaches_sink(c, seen):
-                return True
-        return False
+    # Compute the transitive caller closure once.  The old implementation launched a
+    # depth-first walk from every function, allocating a fresh ``seen`` set each time;
+    # on a large call graph that revisited the same shared callees O(functions) times.
+    # A reverse walk from functions with a direct lifecycle/sink callee is equivalent,
+    # including cyclic call components, and touches each recorded call edge at most
+    # once.
+    reverse_callers = defaultdict(set)
+    sink_reachable = set()
+    for name, record in recs.items():
+        for callee in record["callees"]:
+            if is_lifecycle_or_sink(callee):
+                sink_reachable.add(name)
+            elif callee in recs:
+                reverse_callers[callee].add(name)
+    pending = list(sink_reachable)
+    while pending:
+        callee = pending.pop()
+        for caller in reverse_callers.get(callee, ()):
+            if caller not in sink_reachable:
+                sink_reachable.add(caller)
+                pending.append(caller)
 
     callers = {n: set() for n in recs}
     for n, r in recs.items():
@@ -414,7 +423,7 @@ def build_F(store, lang="c", *, return_graph=False):
             taxo = "LS-UDF"
         elif is_leaf:
             taxo = "LUDF"
-        elif reaches_sink(n, set()):
+        elif n in sink_reachable:
             taxo = "S-UDF"
         else:
             taxo = "UDF"
