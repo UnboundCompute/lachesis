@@ -9,6 +9,16 @@ than left for you to discover.
 
 ## Unreleased
 
+## [0.1.6]
+
+### Fixed
+
+- Match the GitHub organization's exact casing in the MCP registry identity:
+  `server.json` and the README `mcp-name` marker now read
+  `io.github.UnboundCompute/lachesis`. The registry authorizes org namespaces
+  case-sensitively against the `repository_owner` claim, so the lowercase form
+  in 0.1.5 could not be published. No code or API changes.
+
 ## [0.1.5]
 
 ### Added

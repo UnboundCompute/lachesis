@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.unboundcompute/lachesis",
+  "name": "io.github.UnboundCompute/lachesis",
   "title": "Lachesis",
   "description": "Compiler-precise code property graph for C, Python, and TypeScript, navigable over MCP.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "repository": {
     "url": "https://github.com/UnboundCompute/lachesis",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "lachesis-cpg",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "runtimeHint": "uvx",
       "runtimeArguments": [
         { "type": "named", "name": "--from", "value": "lachesis-cpg" },

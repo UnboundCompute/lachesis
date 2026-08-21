@@ -1,4 +1,4 @@
-<!-- mcp-name: io.github.unboundcompute/lachesis -->
+<!-- mcp-name: io.github.UnboundCompute/lachesis -->
 
 # Lachesis
 
