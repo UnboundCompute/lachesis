@@ -9,6 +9,15 @@ than left for you to discover.
 
 ## Unreleased
 
+## [0.1.5]
+
+### Added
+
+- Registry metadata for the official MCP registry: a repo-root `server.json`
+  (`io.github.unboundcompute/lachesis`) describing the `lachesis-cpg` PyPI package
+  and its stdio transport, plus the `mcp-name` ownership marker in the README that
+  the registry checks against the published package. No code or API changes.
+
 ## [0.1.4]
 
 ### Added
