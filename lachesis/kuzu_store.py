@@ -1530,6 +1530,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 conn.execute(f"COPY {kind} FROM '{path}'")
                 os.unlink(path)
     timing("load edges")
+    kept_node_count = len(kept_ids)
+    # Endpoint filtering and edge unit attribution are complete.  The index rows
+    # and manifest need only the count, not these graph-sized lookup maps; release
+    # them before rebuilding the declaration/callsite indexes.
+    del kept_ids, node_units
     index_stage.close()
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
     decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
@@ -1551,7 +1556,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         stage.cleanup()
     payload = manifest_payload({"nodes": [], "edges": []}, snapshots)
     payload.update({
-        "node_count": len(kept_ids), "edge_count": kept_edge_count,
+        "node_count": kept_node_count, "edge_count": kept_edge_count,
         "unresolved_edge_count": unresolved_count,
         "dropped_node_count": 0, "deferred_edge_count": 0,
         "decl_index_count": len(decl_rows), "callsite_index_count": len(callsite_rows),
