@@ -9,6 +9,10 @@ than left for you to discover.
 
 ## Unreleased
 
+## 0.1.2
+
+- Release the production-readiness and release-reference fixes from `main`.
+
 - Documented the Python 3.10–3.12 release-tested window so installation guidance does
   not imply unverified newer interpreters are supported.
 - The clean wheel verifier now covers the complete six-script console surface, including
