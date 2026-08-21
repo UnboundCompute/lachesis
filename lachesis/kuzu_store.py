@@ -788,7 +788,7 @@ def write_kuzu_graph(
         raise RuntimeError(
             "kuzu is not installed; the Kùzu writer needs Python 3.10+ with `kuzu`. "
             "Create a venv (e.g. `python3.11 -m venv .venv-kuzu && "
-            ".venv-kuzu/bin/pip install kuzu`) and run there."
+            ".venv-kuzu/bin/python -m pip install kuzu`) and run there."
         )
     target_db_dir = os.path.abspath(db_dir)
     if os.path.exists(target_db_dir) and not overwrite:

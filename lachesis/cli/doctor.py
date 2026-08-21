@@ -102,7 +102,7 @@ def check_kuzu() -> Check:
         return Check("kuzu", True, f"{getattr(kuzu, '__version__', 'present')}")
     except ImportError as error:
         return Check("kuzu", False, f"import failed: {error}",
-                     "pip install --force-reinstall lachesis-cpg")
+                     "python -m pip install --force-reinstall lachesis-cpg")
 
 
 def check_cache() -> Check:

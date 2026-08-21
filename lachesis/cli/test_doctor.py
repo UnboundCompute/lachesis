@@ -47,6 +47,11 @@ class DoctorCompatibilityTests(unittest.TestCase):
             supported = doctor.check_node()
         self.assertTrue(supported.ok)
 
+    def test_kuzu_recovery_uses_selected_interpreter(self) -> None:
+        with patch.dict(sys.modules, {"kuzu": None}):
+            check = doctor.check_kuzu()
+        self.assertIn("python -m pip install", check.fix)
+
 
 if __name__ == "__main__":
     unittest.main()
