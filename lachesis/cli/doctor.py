@@ -52,7 +52,7 @@ def check_node(required: bool = True) -> Check:
     if not binary:
         return Check("node", False,
                      "not on PATH — TypeScript and JavaScript files cannot be analysed",
-                     "install Node.js 18 or newer: https://nodejs.org/", required)
+                     "install Node.js 20 or newer: https://nodejs.org/", required)
     version = _version_of([binary, "--version"])
     # The TypeScript compiler API we vendor is built against modern Node; an ancient
     # one fails deep inside the frontend rather than at startup, so say so here.
@@ -62,9 +62,9 @@ def check_node(required: bool = True) -> Check:
             major = int(version[1:].split(".", 1)[0])
         except ValueError:
             major = 0
-    if major and major < 18:
-        return Check("node", False, f"{version} at {binary} — too old, need 18 or newer",
-                     "install Node.js 18 or newer: https://nodejs.org/", required)
+    if major and major < 20:
+        return Check("node", False, f"{version} at {binary} — too old, need 20 or newer",
+                     "install Node.js 20 or newer: https://nodejs.org/", required)
     return Check("node", True, f"{version or 'present'} at {binary}", required=required)
 
 

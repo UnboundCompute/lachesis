@@ -23,6 +23,19 @@ class DoctorCompatibilityTests(unittest.TestCase):
         self.assertFalse(python_check.ok)
         self.assertEqual(python_check.fix, "lachesis needs Python 3.10 or newer")
 
+    def test_node_floor_matches_documented_runtime(self) -> None:
+        with patch.object(doctor.shutil, "which", return_value="/usr/bin/node"), \
+             patch.object(doctor, "_version_of", return_value="v19.9.0"):
+            old = doctor.check_node()
+        self.assertFalse(old.ok)
+        self.assertIn("need 20 or newer", old.detail)
+        self.assertEqual(old.fix, "install Node.js 20 or newer: https://nodejs.org/")
+
+        with patch.object(doctor.shutil, "which", return_value="/usr/bin/node"), \
+             patch.object(doctor, "_version_of", return_value="v20.0.0"):
+            supported = doctor.check_node()
+        self.assertTrue(supported.ok)
+
 
 if __name__ == "__main__":
     unittest.main()
