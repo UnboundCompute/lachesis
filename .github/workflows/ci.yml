@@ -10,6 +10,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref so a fast-follow push doesn't queue.
 concurrency:
   group: ci-${{ github.ref }}
