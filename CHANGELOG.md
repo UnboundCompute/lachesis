@@ -61,6 +61,9 @@ than left for you to discover.
   symlinks within the project.
 - Optional concept-search and Kùzu recovery hints now use `python -m pip`, keeping
   installs attached to the interpreter that runs Lachesis.
+- Concurrent product CLI builds now serialize per cache entry and recheck freshness
+  after acquiring the lock, preventing two callers from deleting or writing the same
+  graph simultaneously.
 
 ## [0.1.0] — unreleased
 

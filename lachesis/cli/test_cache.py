@@ -37,6 +37,12 @@ class CachePruneTests(unittest.TestCase):
                 else:
                     os.environ["LACHESIS_CACHE_DIR"] = old_value
 
+    def test_build_lock_is_stable_and_outside_cache(self) -> None:
+        entry = entry_for("/tmp/example-project")
+        self.assertNotEqual(entry.lock_path.parent, entry.directory.parent)
+        with entry.build_lock():
+            self.assertTrue(entry.lock_path.exists())
+
     def test_clear_all_requires_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as cache_dir:
             old_value = os.environ.get("LACHESIS_CACHE_DIR")

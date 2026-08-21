@@ -61,51 +61,59 @@ def ensure_graph(
         progress.note(f"index is current ({_age(entry)})")
         return entry.graph_path, False
 
-    if status == "stale":
-        progress.note("source changed since the last index, rebuilding")
-    # Rebuild the graph itself, but retain per-frontend bundles.  The incremental
-    # pipeline validates each bundle against its source digests and build options, so
-    # unchanged translation units can be loaded instead of reparsed.  The old graph
-    # and its derived dataflow tier must still go: they describe the previous source.
-    import shutil
-    for stale in (entry.graph_path, Path(str(entry.graph_path) + ".enriched")):
-        if stale.is_dir():
-            shutil.rmtree(stale)
-        elif stale.exists():
-            stale.unlink()
-    entry.directory.mkdir(parents=True, exist_ok=True)
-    frontend_cache = entry.directory / "frontend-cache"
+    # A second process may have completed the same build while this one was hashing
+    # the tree. Recheck after taking the per-entry lock before deleting anything.
+    with entry.build_lock():
+        content_hash = source_content_hash(str(source))
+        status = entry.status(content_hash)
+        if status == "fresh" and not refresh:
+            progress.note(f"index is current ({_age(entry)})")
+            return entry.graph_path, False
+        if status == "stale":
+            progress.note("source changed since the last index, rebuilding")
+        # Rebuild the graph itself, but retain per-frontend bundles. The incremental
+        # pipeline validates each bundle against its source digests and build options,
+        # so unchanged translation units can be loaded instead of reparsed. The old
+        # graph and its derived dataflow tier must still go: they describe old source.
+        import shutil
+        for stale in (entry.graph_path, Path(str(entry.graph_path) + ".enriched")):
+            if stale.is_dir():
+                shutil.rmtree(stale)
+            elif stale.exists():
+                stale.unlink()
+        entry.directory.mkdir(parents=True, exist_ok=True)
+        frontend_cache = entry.directory / "frontend-cache"
 
-    progress.phase("compiling")
-    try:
-        graph, snapshots = run_project_incremental(
-            str(source), str(frontend_cache), enrich=False,
-            timeout_seconds=timeout_seconds,
-            manifest_path=str(frontend_cache / "incremental_manifest.pb"),
-        )
-    except Exception:
-        progress.fail()
-        entry.discard()
-        raise
-    progress.done()
-    progress.note(f"{len(graph['nodes']):,} nodes, {len(graph['edges']):,} edges from "
-                  + ", ".join(sorted({item.frontend_id for item in snapshots})))
+        progress.phase("compiling")
+        try:
+            graph, snapshots = run_project_incremental(
+                str(source), str(frontend_cache), enrich=False,
+                timeout_seconds=timeout_seconds,
+                manifest_path=str(frontend_cache / "incremental_manifest.pb"),
+            )
+        except Exception:
+            progress.fail()
+            entry.discard()
+            raise
+        progress.done()
+        progress.note(f"{len(graph['nodes']):,} nodes, {len(graph['edges']):,} edges from "
+                      + ", ".join(sorted({item.frontend_id for item in snapshots})))
 
-    progress.phase("writing index")
-    try:
-        write_kuzu_graph(graph, snapshots, str(entry.graph_path), enriched=False)
-        entry.write_meta(
-            content_hash,
-            nodes=len(graph["nodes"]),
-            edges=len(graph["edges"]),
-            frontends=sorted({item.frontend_id for item in snapshots}),
-        )
-    except Exception:
-        progress.fail()
-        entry.discard()
-        raise
-    progress.done()
-    return entry.graph_path, True
+        progress.phase("writing index")
+        try:
+            write_kuzu_graph(graph, snapshots, str(entry.graph_path), enriched=False)
+            entry.write_meta(
+                content_hash,
+                nodes=len(graph["nodes"]),
+                edges=len(graph["edges"]),
+                frontends=sorted({item.frontend_id for item in snapshots}),
+            )
+        except Exception:
+            progress.fail()
+            entry.discard()
+            raise
+        progress.done()
+        return entry.graph_path, True
 
 
 def _age(entry: CacheEntry) -> str:

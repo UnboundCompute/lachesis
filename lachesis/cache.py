@@ -30,7 +30,9 @@ import hashlib
 import os
 import re
 import shutil
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -97,6 +99,35 @@ class CacheEntry:
     @property
     def meta_path(self) -> Path:
         return self.directory / "meta.pb"
+
+    @property
+    def lock_path(self) -> Path:
+        """Stable lock path outside the cache tree, so cleanup cannot unlink it."""
+        key = hashlib.sha256(str(self.directory).encode("utf-8")).hexdigest()[:32]
+        return Path(tempfile.gettempdir()) / f"lachesis-cache-{key}.lock"
+
+    @contextmanager
+    def build_lock(self):
+        """Serialize builders for this entry across processes.
+
+        The lock file intentionally lives in the system temporary directory rather
+        than beside the graph: failed builds remove their entry directory, and
+        deleting a lock inode while another process holds it would defeat locking.
+        Lachesis targets POSIX runners; on a platform without ``fcntl`` the context
+        is a no-op because the platform has no supported embedded-store runtime.
+        """
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - unsupported runtime platform
+            yield
+            return
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def meta(self) -> dict | None:
         try:
