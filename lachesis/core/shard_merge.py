@@ -1,10 +1,11 @@
 """Bounded-memory merge of language-neutral graph shards."""
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 from typing import Iterator
+
+from .graph_wire import decode_document, encode_document
 
 from .shards import ShardSetReader
 
@@ -39,7 +40,7 @@ class ShardMerger:
                     "INSERT OR IGNORE INTO nodes VALUES (?, ?, ?, ?)",
                     (
                         node["id"], node.get("kind", ""), node.get("label", node["id"]),
-                        json.dumps(node.get("properties", {}), sort_keys=True),
+                        encode_document(node.get("properties", {})),
                     ),
                 )
             for edge in shards.edges():
@@ -47,7 +48,7 @@ class ShardMerger:
                     "INSERT OR IGNORE INTO edges VALUES (?, ?, ?, ?)",
                     (
                         edge["kind"], edge["source"], edge["target"],
-                        json.dumps(edge.get("properties", {}), sort_keys=True),
+                        encode_document(edge.get("properties", {})),
                     ),
                 )
             self.connection.commit()
@@ -61,7 +62,7 @@ class ShardMerger:
         ):
             yield {
                 "id": node_id, "kind": kind, "label": label,
-                "properties": json.loads(properties),
+                "properties": decode_document(properties),
             }
 
     def iter_edges(self) -> Iterator[dict]:
@@ -71,7 +72,7 @@ class ShardMerger:
         ):
             yield {
                 "kind": kind, "source": source, "target": target,
-                "properties": json.loads(properties),
+                "properties": decode_document(properties),
             }
 
     def counts(self) -> tuple[int, int]:

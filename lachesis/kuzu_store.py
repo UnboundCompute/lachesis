@@ -192,6 +192,25 @@ def _kuzu_checkpoint_threshold(default: int = -1) -> int:
         raise ValueError("LACHESIS_KUZU_CHECKPOINT_THRESHOLD must be non-negative")
     return value
 
+
+def _stream_batch_rows(default: int = 10_000) -> int:
+    """Bound the number of records handed to each streamed Arrow batch.
+
+    Ten-thousand-row batches are the measured safe default on the USB north-star
+    workload. Callers may try a larger value experimentally without allowing an
+    environment override to create an unbounded transient allocation.
+    """
+    raw = os.environ.get("LACHESIS_STREAM_BATCH_ROWS", "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LACHESIS_STREAM_BATCH_ROWS must be an integer row count") from exc
+    if value < 1:
+        raise ValueError("LACHESIS_STREAM_BATCH_ROWS must be positive")
+    return min(value, 100_000)
+
 # Deliberately separate from the per-frontend
 # bundle manifest under --frontend-out (see pipeline.run_project_incremental), and the
 # two would collide the moment anyone points one at the other.
@@ -530,7 +549,7 @@ class PropsCodec:
     outside the writer gets.
     """
 
-    __slots__ = ("_prototype", "_texts")
+    __slots__ = ("_prototype", "_texts", "_cache")
 
     def __init__(self, zdict: bytes = b"",
                  texts: Optional[Sequence[bytes]] = None) -> None:
@@ -539,6 +558,11 @@ class PropsCodec:
         self._prototype = zlib.compressobj(
             _PROPS_ZLIB_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
             zlib.DEF_MEM_LEVEL, 0, zdict) if zdict else None
+        # Edge/node metadata repeats heavily (confidence, origin, empty tails), but
+        # a cache without a bound would turn a large graph into another graph-sized
+        # allocation. Short tails are the repeated case and a small fixed table keeps
+        # the optimization bounded; longer or unique tails take the normal path.
+        self._cache: dict[bytes, bytes] = {}
         self._texts = texts
 
     def blob(self, index: int, properties: dict, elide: bool,
@@ -546,10 +570,18 @@ class PropsCodec:
         """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
+        if len(text) <= 512:
+            cached = self._cache.get(text)
+            if cached is not None:
+                return cached
         if self._prototype is None:
-            return zlib.compress(text, _PROPS_ZLIB_LEVEL)
-        obj = self._prototype.copy()
-        return obj.compress(text) + obj.flush()
+            result = zlib.compress(text, _PROPS_ZLIB_LEVEL)
+        else:
+            obj = self._prototype.copy()
+            result = obj.compress(text) + obj.flush()
+        if len(text) <= 512 and len(self._cache) < 4096:
+            self._cache[text] = result
+        return result
 
 
 def build_props_dictionary(texts: Iterable[bytes]) -> bytes:
@@ -1417,6 +1449,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     edge_writer_paths = {}
     edge_path_lists = collections.defaultdict(list)
     edge_row_counts = collections.defaultdict(int)
+    batch_rows = _stream_batch_rows()
 
     def flush_edge_partition(kind: str) -> None:
         writer = edge_writers.pop(kind, None)
@@ -1467,7 +1500,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         if prune and node.get("kind") in PRUNE_NODE_KINDS:
             continue
         batch.append(node)
-        if len(batch) >= 10_000:
+        if len(batch) >= batch_rows:
             load_nodes(batch)
             batch.clear()
     if batch:
@@ -1484,7 +1517,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             continue
         batch.append(edge)
         kept_edge_count += 1
-        if len(batch) >= 10_000:
+        if len(batch) >= batch_rows:
             load_edges(batch)
             batch.clear()
     if batch:
@@ -1497,6 +1530,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 conn.execute(f"COPY {kind} FROM '{path}'")
                 os.unlink(path)
     timing("load edges")
+    kept_node_count = len(kept_ids)
+    # Endpoint filtering and edge unit attribution are complete.  The index rows
+    # and manifest need only the count, not these graph-sized lookup maps; release
+    # them before rebuilding the declaration/callsite indexes.
+    del kept_ids, node_units
     index_stage.close()
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
     decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
@@ -1518,7 +1556,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         stage.cleanup()
     payload = manifest_payload({"nodes": [], "edges": []}, snapshots)
     payload.update({
-        "node_count": len(kept_ids), "edge_count": kept_edge_count,
+        "node_count": kept_node_count, "edge_count": kept_edge_count,
         "unresolved_edge_count": unresolved_count,
         "dropped_node_count": 0, "deferred_edge_count": 0,
         "decl_index_count": len(decl_rows), "callsite_index_count": len(callsite_rows),

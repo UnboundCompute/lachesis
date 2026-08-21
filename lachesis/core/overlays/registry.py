@@ -66,6 +66,11 @@ class OverlayRegistry:
             delta = overlay.enrich(current, index)
             if accumulator is None:
                 accumulator = GraphAccumulator(graph["nodes"], graph["edges"])
+                # The accumulator has copied the seed sequences and now owns the
+                # canonical records.  Do not keep the original graph container alive
+                # through every later overlay and the final global sort; on large
+                # graphs that otherwise retains a redundant graph-sized pair of lists.
+                graph = None
             index.absorb(*accumulator.apply(delta))
             # Overlay predicates and indexes are order-independent.  Defer the
             # global node/edge sort until the fold is complete; sorting the full
@@ -76,4 +81,10 @@ class OverlayRegistry:
                     overlay.overlay_id, time.perf_counter() - started,
                     len(delta.nodes), len(delta.edges),
                 )
-        return accumulator.result() if accumulator is not None else current
+        if accumulator is None:
+            return current
+        # The compact index only supports delta production; release its node and
+        # adjacency references before the accumulator performs the final full-graph
+        # sort and returns the enriched view.
+        del index
+        return accumulator.result()

@@ -1,11 +1,11 @@
 """Deterministic composition of canonical graphs and overlay deltas."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Tuple
 
 from .contract import ContractError
+from .graph_wire import encode_document
 
 
 @dataclass
@@ -20,19 +20,13 @@ class GraphDelta:
 def _edge_key(edge: dict) -> tuple:
     """The identity of an edge for deduplication.
 
-    ``json.dumps`` is not an accident here and is not a placeholder for something
-    faster. A nested-tuple key over the same properties was measured at 0.739s against
-    0.488s for this, over the same 279,046 edges and producing the same number of
-    distinct keys. The C implementation wins; the cost that matters is how often this
-    is called, not what it costs once.
-
-    Kept as the reference definition of edge identity. ``_EdgeKeys`` is what the two
-    composition paths actually use, and it computes this same key only for the edges
-    that need it.
+    The property component is deterministic protobuf, matching the graph's internal
+    wire format rather than creating a JSON string. ``_EdgeKeys`` is what the two
+    composition paths actually use, and computes this key only for edges that need it.
     """
     return (
         edge["kind"], edge["source"], edge["target"],
-        json.dumps(edge.get("properties", {}), sort_keys=True),
+        encode_document(edge.get("properties", {})),
     )
 
 
@@ -43,9 +37,8 @@ class _EdgeKeys:
     the properties are what settles a question that the triple has already almost
     always answered. Measured over the 488,261 edges of one real composition: 487,364
     distinct triples, and 1,291 edges (0.264%) sharing a triple with anything at all.
-    Keying every edge by ``json.dumps`` therefore pays a full serialization per edge to
-    discriminate a quarter of a percent of them, and it costs 0.88s against 0.10s for
-    the triples alone.
+    Keying every edge by a serialized property payload would pay that cost for every
+    edge, so the property key is computed only for a colliding triple.
 
     So the first edge of a triple is remembered as itself, and the properties of that
     first edge are serialized only if a second edge ever arrives on the same triple.
@@ -72,9 +65,9 @@ class _EdgeKeys:
         properties = self._tied.get(triple)
         if properties is None:
             # The tie is real, so the first edge finally has to be serialized too.
-            properties = {json.dumps(first.get("properties", {}), sort_keys=True)}
+            properties = {encode_document(first.get("properties", {}))}
             self._tied[triple] = properties
-        key = json.dumps(edge.get("properties", {}), sort_keys=True)
+        key = encode_document(edge.get("properties", {}))
         if key in properties:
             return False
         properties.add(key)

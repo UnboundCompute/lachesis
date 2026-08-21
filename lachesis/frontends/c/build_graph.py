@@ -313,7 +313,8 @@ def run_clang(
     )
 
 
-LARGE_PROJECT_FILE_LIMIT = 128
+MEDIUM_PROJECT_FILE_LIMIT = 128
+LARGE_PROJECT_FILE_LIMIT = 512
 
 
 def clang_jobs(path_count: Optional[int] = None) -> int:
@@ -326,8 +327,9 @@ def clang_jobs(path_count: Optional[int] = None) -> int:
     trades some of the available parallelism for a resident set that does not grow with
     the machine. Large projects use one AST at a time by default: a project with many
     roots is precisely the workload where two or more expanded kernel/header ASTs can
-    exhaust the runner before the pruning step. ``LACHESIS_C_JOBS`` overrides it, ``1``
-    restores the serial build, and small projects retain the faster parallel default.
+    exhaust the runner before the pruning step. Medium trees use two jobs by default
+    based on the measured ``net/ipv4`` boundary; ``LACHESIS_C_JOBS`` overrides it,
+    ``1`` restores the serial build, and small projects retain the faster parallel default.
     """
     configured = os.environ.get("LACHESIS_C_JOBS")
     if configured:
@@ -337,6 +339,8 @@ def clang_jobs(path_count: Optional[int] = None) -> int:
             pass
     if path_count is not None and path_count >= LARGE_PROJECT_FILE_LIMIT:
         return 1
+    if path_count is not None and path_count >= MEDIUM_PROJECT_FILE_LIMIT:
+        return 2
     return max(1, min(4, (os.cpu_count() or 1) // 2))
 
 
@@ -567,6 +571,9 @@ class Graph:
     def __init__(self) -> None:
         self.nodes: Dict[str, dict] = {}
         self.node_tier: Dict[str, str] = {}
+        # Tier membership is stable when a node is first created.  Keeping compact
+        # id references avoids rescanning the complete node map once per emitted tier.
+        self.nodes_by_tier: Dict[str, List[str]] = defaultdict(list)
         self.edges: List[dict] = []
         self.edge_keys = _EdgeKeys()
 
@@ -578,7 +585,10 @@ class Graph:
         # one canonical string object instead of retaining a fresh copy per edge.
         node_id = sys.intern(node_id)
         kind = sys.intern(kind)
-        canonical = dict(properties)
+        # ``**properties`` is already a fresh per-call dictionary.  Copying it
+        # again doubled the live property-map allocation for every node on large
+        # trees without protecting any caller-owned mapping.
+        canonical = properties
         absolute_file = canonical.get("absolute_file")
         if absolute_file:
             # Clang can spell the same included file with redundant ``./`` or
@@ -602,6 +612,7 @@ class Graph:
         if node_id not in self.nodes:
             self.nodes[node_id] = Node(node_id, kind, label, canonical)
             self.node_tier[node_id] = tier
+            self.nodes_by_tier[tier].append(node_id)
         else:
             self.nodes[node_id]["properties"].update(canonical)
         return node_id
@@ -615,7 +626,9 @@ class Graph:
         kind = sys.intern(kind)
         source = sys.intern(source)
         target = sys.intern(target)
-        canonical = dict(properties)
+        # ``**properties`` is already a fresh per-call dictionary; retain it
+        # directly instead of allocating a second map for every edge.
+        canonical = properties
         if not self.edge_keys.add(kind, source, target, canonical, self.edges):
             return
         self.edges.append(Edge(kind, source, target, canonical))
@@ -754,10 +767,10 @@ class _EdgeKeys:
         properties_seen = self._tied.get(tied_key)
         if properties_seen is None:
             properties_seen = {
-                json.dumps(edges[first]["properties"], sort_keys=True),
+                encode_document(edges[first]["properties"]),
             }
             self._tied[tied_key] = properties_seen
-        key = json.dumps(properties, sort_keys=True)
+        key = encode_document(properties)
         if key in properties_seen:
             return False
         properties_seen.add(key)
@@ -865,6 +878,9 @@ class AstStore:
 
 
 def main() -> int:
+    # A frontend may be invoked repeatedly in one interpreter by library callers;
+    # discard any cache left by an interrupted prior build before resolving paths.
+    RESOLVED_FILES.clear()
     if len(sys.argv) < 2:
         raise SystemExit(
             "Usage: python3 lachesis/frontends/c/build_graph.py SRC_DIR [OUT_DIR]")
@@ -1740,6 +1756,13 @@ def main() -> int:
                 if owner:
                     graph.edge("CALLS", owner, definition, callsite=node_id)
 
+    # Edge identity is needed while facts are being emitted, but the deduplication
+    # table itself is dead after cross-TU linking.  On large trees it retains one
+    # hash entry per edge and otherwise overlaps the tier payload being serialized.
+    # Drop it before the five tier scans so peak RSS tracks the graph, not the graph
+    # plus a second edge-sized index.  No later code calls ``graph.edge``.
+    graph.edge_keys = None
+
     structural = {
         "DECLARES", "DECLARES_MEMBER", "DECLARES_VALUE", "CONTAINS_BODY",
         "AST_CHILD", "EVIDENCED_BY", "HAS_ARGUMENT",
@@ -1751,66 +1774,84 @@ def main() -> int:
     tier_counts = {}
     emitted_edge_count = 0
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Unlike the old per-tier full-graph scan, this partitions edges once.  The edge
+    # objects remain owned by ``graph.edges``; these are only short pointer lists.
+    edges_by_tier: Dict[str, List[Edge]] = defaultdict(list)
+    for edge in graph.edges:
+        source_tier = graph.node_tier.get(edge["source"])
+        if source_tier:
+            edges_by_tier[source_tier].append(edge)
 
-    def serialized_payload(payload: dict) -> dict:
-        defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
+    defaults = {"fact_origin": "compiler", "confidence": "exact", "evidence_ids": []}
 
-        def with_defaults(item: dict) -> dict:
-            # ``as_dict`` has already allocated the emission record.  Copying that
-            # record and its properties again for every fact briefly doubled the
-            # largest tier at flush time; defaults are immutable contract values, so
-            # fill the existing mapping in place and keep only one record alive.
-            properties = item.setdefault("properties", {})
-            for key, value in defaults.items():
-                properties.setdefault(key, value)
-            return item
+    def with_defaults(item: dict) -> dict:
+        # The record is encoded immediately by ``write_tier``.  Keeping this mapping
+        # alive for one record rather than an entire tier removes a temporary second
+        # graph-sized allocation at C bundle flush time.
+        properties = item.setdefault("properties", {})
+        for key, value in defaults.items():
+            properties.setdefault(key, value)
+        return item
 
-        return {
-            **payload,
-            "nodes": [with_defaults(item) for item in payload["nodes"]],
-            "edges": [with_defaults(item) for item in payload["edges"]],
-            "expands_to": [with_defaults(item) for item in payload["expands_to"]],
-            "links": [with_defaults(item) for item in payload["links"]],
-        }
+    def edge_key(edge: Edge) -> tuple[str, str, str]:
+        return edge["kind"], edge["source"], edge["target"]
 
     for tier, name in TIERS.items():
-        payload = {"tier": tier, "name": name, "nodes": [], "edges": [], "expands_to": [], "links": []}
-        payload["nodes"].extend(
-            node.as_dict() for node_id, node in graph.nodes.items()
-            if graph.node_tier.get(node_id) == tier
-        )
-        for edge in graph.edges:
-            source_tier = graph.node_tier.get(edge["source"])
+        node_ids = sorted(graph.nodes_by_tier.get(tier, ()))
+        same_tier: List[Edge] = []
+        expands_to: List[Edge] = []
+        links: List[Tuple[Edge, str]] = []
+        for edge in edges_by_tier.get(tier, ()):
+            source_tier = tier
             target_tier = graph.node_tier.get(edge["target"])
             if source_tier != tier or not target_tier:
                 continue
             if source_tier == target_tier:
-                payload["edges"].append(edge.as_dict())
+                same_tier.append(edge)
             elif edge["kind"] in structural:
-                payload["expands_to"].append({
+                expands_to.append(edge)
+            else:
+                links.append((edge, target_tier))
+        same_tier.sort(key=edge_key)
+        expands_to.sort(key=edge_key)
+        links.sort(key=lambda item: edge_key(item[0]))
+
+        def node_records():
+            for node_id in node_ids:
+                yield with_defaults(graph.nodes[node_id].as_dict())
+
+        def edge_records():
+            for edge in same_tier:
+                yield with_defaults(edge.as_dict())
+
+        def expand_records():
+            for edge in expands_to:
+                yield with_defaults({
                     "kind": "EXPANDS_TO", "source": edge["source"], "target": edge["target"],
                     "properties": {"via": edge["kind"]},
                 })
-            else:
-                payload["links"].append({
+
+        def link_records():
+            for edge, target_tier in links:
+                yield with_defaults({
                     **edge.as_dict(),
                     "properties": {**edge["properties"], "target_tier": target_tier},
                 })
-        payload["nodes"].sort(key=lambda item: item["id"])
-        for collection in ("edges", "expands_to", "links"):
-            payload[collection].sort(key=lambda item: (item["kind"], item["source"], item["target"]))
+
         tier_counts[tier] = {
-            "node_count": len(payload["nodes"]),
-            "edge_count": len(payload["edges"]),
-            "expands_to_count": len(payload["expands_to"]),
-            "cross_tier_link_count": len(payload["links"]),
+            "node_count": len(node_ids),
+            "edge_count": len(same_tier),
+            "expands_to_count": len(expands_to),
+            "cross_tier_link_count": len(links),
         }
-        emitted_edge_count += sum(
-            len(payload[collection]) for collection in ("edges", "expands_to", "links")
-        )
+        emitted_edge_count += len(same_tier) + len(expands_to) + len(links)
         tier_path = output_dir / f"{tier.lower()}_{name}.pb"
-        write_tier(tier_path, serialized_payload(payload))
-        del payload
+        write_tier(tier_path, {
+            "tier": tier, "name": name, "nodes": node_records(),
+            "edges": edge_records(), "expands_to": expand_records(),
+            "links": link_records(),
+        })
+        del node_ids, same_tier, expands_to, links
     emitted_node_count = len(graph.nodes)
     graph_edge_count = len(graph.edges)
     dropped_edge_count = graph_edge_count - emitted_edge_count
@@ -1867,11 +1908,17 @@ def main() -> int:
     # the peak on large kernel subsystems.
     graph.nodes.clear()
     graph.node_tier.clear()
+    graph.nodes_by_tier.clear()
     graph.edges.clear()
+    edges_by_tier.clear()
     graph.edge_keys = _EdgeKeys()
     (output_dir / "manifest.pb").write_bytes(encode_document(manifest))
     print(f"Clang analyzed {len(files)} C files; emitted {emitted_node_count} nodes and {graph_edge_count} edges to {output_dir}")
     ast_spill.cleanup()
+    # The cache is module-global for cheap lookups while building one graph, but a
+    # long-lived in-process caller (for example an Action worker handling multiple
+    # projects) must not retain every prior project's resolved paths and hashes.
+    RESOLVED_FILES.clear()
     return 0
 
 

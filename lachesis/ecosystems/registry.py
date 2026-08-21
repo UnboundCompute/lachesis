@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Iterable, Protocol, Tuple
 
-from ..core.composition import GraphDelta, compose
+from ..core.composition import GraphAccumulator, GraphDelta
 from ..core.contract import ContractError
 from ..core.query import GraphIndex
 
@@ -65,9 +65,9 @@ class EcosystemRegistry:
         """
         if index is None:
             index = GraphIndex(graph)
-        deltas = [GraphDelta("canonical-input", graph["nodes"], graph["edges"])]
+        accumulator = GraphAccumulator(graph["nodes"], graph["edges"])
         for model in self.applicable(
             graph, package_inventory, languages, capabilities,
         ):
-            deltas.append(model.enrich(graph, index))
-        return compose(deltas)
+            accumulator.apply(model.enrich(graph, index))
+        return accumulator.result()

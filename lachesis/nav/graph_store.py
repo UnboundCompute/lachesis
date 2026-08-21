@@ -311,7 +311,8 @@ class GraphStore:
         return self
 
     @classmethod
-    def load(cls, graph_path: str, overlay_path: str | None = None) -> "GraphStore":
+    def load(cls, graph_path: str, overlay_path: str | None = None,
+             *, defer_maps: bool = False) -> "GraphStore":
         """Open a Kùzu store directory. The disk-backed index satisfies the same
         accessor surface as the in-RAM one, so ``GraphLib`` and every nav tool are
         unchanged, and nothing loads the whole graph into memory.
@@ -355,7 +356,7 @@ class GraphStore:
                 if _dataflow_cache_matches(candidate, core_manifest.get("core_content_hash")):
                     dataflow_path = candidate
         self = cls._open(open_path, overlay_path=overlay_path,
-                         dataflow_path=dataflow_path)
+                         dataflow_path=dataflow_path, defer_maps=defer_maps)
         # The overlay sidecar and the caller-facing identity stay the *core* path even
         # when the derived cache is what is actually open: the cache is an
         # implementation detail, and its sidecar would be a second, divergent copy.
@@ -370,9 +371,10 @@ class GraphStore:
 
     @classmethod
     def _open(cls, path: str, overlay_path: str | None = None,
-              dataflow_path: str | None = None) -> "GraphStore":
+              dataflow_path: str | None = None,
+              *, defer_maps: bool = False) -> "GraphStore":
         from lachesis.nav.kuzu_index import KuzuGraphIndex
-        index = KuzuGraphIndex(path)
+        index = KuzuGraphIndex(path, defer_maps=defer_maps)
         ov_path = Path(overlay_path) if overlay_path else sidecar_path(path)
         overlay = Overlay.load(ov_path)
         if dataflow_path:
@@ -428,6 +430,10 @@ class GraphStore:
         cache = dataflow_overlay_path(core_path)
         core_node_ids = {id(node) for node in core["nodes"]}
         core_edge_ids = {id(edge) for edge in core["edges"]}
+        # The identity sets are all that cache classification needs from the core
+        # containers; release their list/dict wrapper before assembling the derived
+        # payload, which may itself retain the shared record objects.
+        del core
         enriched_node_ids = {id(node) for node in enriched["nodes"]}
         enriched_edge_ids = {id(edge) for edge in enriched["edges"]}
         additive = (
@@ -472,7 +478,7 @@ class GraphStore:
         # The derived graph is now represented by the attached cache. Release the
         # materialized lists before reopening so large action runs do not overlap
         # two graph-sized Python representations.
-        del enriched, core
+        del enriched
         self.overlay = fresh.overlay
         self.graph = fresh.graph
         self.gl = fresh.gl

@@ -75,7 +75,10 @@ class ReasoningQuery:
         project_metadata: Optional[dict] = None,
     ) -> None:
         self.graph = graph
-        self.index = GraphIndex(graph)
+        # Query construction mostly traverses kinds and adjacency.  Keep the
+        # navigation-only label/file/owner buckets lazy; find-entity and function
+        # slices still build the exact same buckets on first use.
+        self.index = GraphIndex(graph, compact=True)
         self.layered = layered or build_layered_graph(graph, project_metadata)
         self.node_index = self.layered["node_index"]
         self.default_budget_tokens = default_budget_tokens

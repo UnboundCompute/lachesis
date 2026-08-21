@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
+from .core.composition import _EdgeKeys
 from .core.graph_wire import decode_document, encode_document
 from .core.runner import run_frontend
 from .core.snapshot import load_snapshot
@@ -65,7 +65,7 @@ def _combine_graphs(
     """
     nodes: Dict[str, GraphNode] = {}
     edges: List[GraphEdge] = []
-    edge_keys = set()
+    edge_keys = _EdgeKeys()
     for graph in graphs:
         for node in graph["nodes"]:
             existing = nodes.get(node["id"])
@@ -73,12 +73,7 @@ def _combine_graphs(
                 raise FrontendError(f"frontends emitted conflicting node id {node['id']}")
             nodes[node["id"]] = node
         for edge in graph["edges"]:
-            key = (
-                edge["kind"], edge["source"], edge["target"],
-                json.dumps(edge.get("properties", {}), sort_keys=True),
-            )
-            if key not in edge_keys:
-                edge_keys.add(key)
+            if edge_keys.add(edge):
                 edges.append(edge)
     known = set(nodes)
     dangling = [
@@ -189,20 +184,27 @@ def enrich_graph(
     import os
 
     from .core.overlays import (
-        default_model_overlay_registry,
         default_overlay_registry,
-        default_security_overlay_registry,
+        default_dataflow_overlay_registry,
     )
     from .core.query import GraphIndex
     from .ecosystems import default_ecosystem_registry
 
     graph = default_overlay_registry().enrich(graph, observer)
-    index = GraphIndex(graph)
+    # Ecosystem models consume kind/adjacency lookups and package_inventory only;
+    # defer navigation-only label/file/owner buckets, which otherwise retain several
+    # extra references per record during large pass-three enrichments.
+    index = GraphIndex(graph, compact=True)
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), set(languages), capabilities, index,
     )
-    graph = default_model_overlay_registry().enrich(graph, observer)
-    graph = default_security_overlay_registry().enrich(graph, observer)
+    # The ecosystem index describes the pre-model graph and is no longer consulted;
+    # drop its node/adjacency references before the remaining overlay registries run.
+    del index
+    # Async model facts must be visible to taint, but both folds only need the same
+    # compact index surface. Run them in order through one registry so pass 2 does not
+    # rebuild a graph-sized index and accumulator between the two one-overlay registries.
+    graph = default_dataflow_overlay_registry().enrich(graph, observer)
 
     # Opt-in field-sensitive reaching-def tier. Additive and independent (its
     # applies() is a no-op unless the graph has the C AST + CFG edges), folded here
@@ -341,6 +343,109 @@ def run_project_streaming(
             )
             snapshots.append(snapshot)
             readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
+            snapshot.release()
+    finally:
+        if previous is None:
+            os.environ.pop("LACHESIS_SHARD_ROOT", None)
+        else:
+            os.environ["LACHESIS_SHARD_ROOT"] = previous
+    return readers, snapshots
+
+
+def run_project_streaming_parallel(
+    source_dir: str,
+    shard_root: str,
+    output_root: str,
+    registry: Optional[FrontendRegistry] = None,
+    timeout_seconds: int = 300,
+    include_tests: bool = False,
+    *,
+    max_files_per_package: Optional[int] = None,
+    workspace_root: Optional[str] = None,
+):
+    """Stream package/shard compiler jobs without composing their snapshots.
+
+    This is the bounded-memory counterpart to ``run_project_parallel``.  Jobs are
+    intentionally serialized: a TypeScript compiler process can already consume
+    gigabytes, so multiplying those heaps for wall-clock parallelism defeats the
+    purpose of this path.  Each completed bundle is converted to protobuf frames in
+    its own shard set and its released metadata is retained for the store manifest.
+    """
+    from .packages import detect_packages, split_large_packages
+
+    source_dir = os.path.abspath(source_dir)
+    shard_root = os.path.abspath(shard_root)
+    output_root = os.path.abspath(output_root)
+    registry = registry or default_registry(workspace_root)
+    packages = detect_packages(
+        source_dir, source_inventory(source_dir, include_tests=include_tests),
+    )
+    packages = split_large_packages(source_dir, packages, max_files_per_package)
+    jobs = package_jobs(source_dir, output_root, registry,
+                        include_tests=include_tests, packages=packages)
+    if not jobs:
+        supported = sorted({
+            extension for item in registry.frontends for extension in item.extensions
+        })
+        raise FrontendError(
+            f"no registered frontend supports files below {source_dir}; "
+            f"supported extensions: {', '.join(supported)}"
+        )
+
+    readers = []
+    snapshots = []
+    seen_external_ids: set[str] = set()
+    previous = os.environ.get("LACHESIS_SHARD_ROOT")
+    try:
+        for frontend_id, package, compile_root, output_dir, roots in jobs:
+            # A separate root prevents same-frontend shard manifests from being
+            # rewritten while another package is still being compiled and keeps the
+            # reader's ownership boundary explicit for future parallel scheduling.
+            slug = package.replace(os.sep, "__").replace("<", "").replace(">", "") or "root"
+            job_shard_root = os.path.join(shard_root, frontend_id, slug)
+            os.makedirs(job_shard_root, exist_ok=True)
+            os.environ["LACHESIS_SHARD_ROOT"] = job_shard_root
+
+            # A package compiler also sees imported workspace files.  Keep only the
+            # files owned by this exact root-list chunk; their owning chunk will emit
+            # the canonical, richer record.  This is the streaming equivalent of
+            # ``_merge_package_graphs``' ownership rule and prevents duplicate primary
+            # keys in Kùzu without retaining a graph-sized winner map.
+            owned_files = {os.path.abspath(path) for path in roots}
+            source_prefix = source_dir.rstrip(os.sep) + os.sep
+
+            def keep_node(node: dict) -> bool:
+                properties = node.get("properties") or {}
+                absolute = properties.get("absolute_file")
+                if not isinstance(absolute, str):
+                    relative = properties.get("file")
+                    if isinstance(relative, str) and not os.path.isabs(relative):
+                        absolute = os.path.abspath(os.path.join(compile_root, relative))
+                if isinstance(absolute, str):
+                    absolute = os.path.abspath(absolute)
+                    if absolute in owned_files:
+                        return True
+                    if not absolute.startswith(source_prefix):
+                        if node["id"] in seen_external_ids:
+                            return False
+                        seen_external_ids.add(node["id"])
+                        return True
+                    return False
+                # Synthetic/package/lib nodes have no source file. Keep one
+                # deterministic copy, matching the existing merge's first-wins rule.
+                if node["id"] in seen_external_ids:
+                    return False
+                seen_external_ids.add(node["id"])
+                return True
+
+            snapshot = run_frontend(
+                registry.get(frontend_id), compile_root, output_dir, timeout_seconds,
+                roots=roots, keep_node=keep_node,
+            )
+            snapshots.append(snapshot)
+            readers.append(ShardSetReader(
+                os.path.join(job_shard_root, frontend_id, "shards.pb")
+            ))
             snapshot.release()
     finally:
         if previous is None:
@@ -636,6 +741,7 @@ def run_project_parallel(
     *,
     enrich: bool = True,
     max_workers: Optional[int] = None,
+    max_files_per_package: Optional[int] = None,
     workspace_root: Optional[str] = None,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot], int]:
     """Compile each (frontend, package) unit in its own process, then compose.
@@ -656,7 +762,7 @@ def run_project_parallel(
     """
     from concurrent.futures import ProcessPoolExecutor
 
-    from .packages import detect_packages
+    from .packages import detect_packages, split_large_packages
 
     source_dir = os.path.abspath(source_dir)
     output_root = os.path.abspath(output_root)
@@ -664,6 +770,7 @@ def run_project_parallel(
     packages = detect_packages(
         source_dir, source_inventory(source_dir, include_tests=include_tests),
     )
+    packages = split_large_packages(source_dir, packages, max_files_per_package)
     jobs = package_jobs(source_dir, output_root, registry,
                         include_tests=include_tests, packages=packages)
     if not jobs:

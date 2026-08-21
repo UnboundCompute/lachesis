@@ -17,7 +17,8 @@ from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
 from lachesis.pipeline import (enrich_project_graph, run_project,
                                run_project_incremental, run_project_parallel,
-                               run_project_streaming, source_content_hash,
+                               run_project_streaming, run_project_streaming_parallel,
+                               source_content_hash,
                                default_manifest_path)
 from lachesis.projections import build_layered_graph, write_layered_graph
 
@@ -97,7 +98,13 @@ def main() -> None:
     parser.add_argument(
         "--max-workers", type=int, default=None, metavar="N",
         help="cap the --parallel-packages pool (default: one worker per package, "
-             "never more than the core count). N=1 runs the same partition serially.",
+        "never more than the core count). N=1 runs the same partition serially.",
+    )
+    parser.add_argument(
+        "--shard-large-packages", type=int, default=None, metavar="FILES",
+        help="with --parallel-packages, split any package larger than FILES roots "
+        "into bounded compiler jobs; this is an opt-in semantic tradeoff and "
+        "reports cross-shard edges that cannot be merged",
     )
     parser.add_argument(
         "--stream-shards", metavar="DIR", default=None,
@@ -107,10 +114,14 @@ def main() -> None:
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
             "incremental manifest keys bundles by frontend, not by package")
+    if args.shard_large_packages is not None and not args.parallel_packages:
+        parser.error("--shard-large-packages requires --parallel-packages")
     if args.stream_shards and (args.enrich or args.reduced or args.layered_out):
         parser.error("--stream-shards currently supports core-only stores")
-    if args.stream_shards and (args.parallel_packages or args.incremental):
-        parser.error("--stream-shards cannot combine with incremental or parallel builds")
+    if args.stream_shards and args.incremental:
+        parser.error("--stream-shards cannot combine with incremental builds")
+    if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
+        parser.error("streamed package shards are serialized; use --max-workers 1")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
     # same output defaults before the streaming branch as the ordinary path below.
     # Previously the early return skipped this block and made --stream-shards run
@@ -120,15 +131,30 @@ def main() -> None:
         os.environ.setdefault("LACHESIS_EMIT_PROOFS", "0")
     if args.stream_shards:
         frontend_out = args.frontend_out or os.path.join(args.stream_shards, "frontends")
-        readers, snapshots = run_project_streaming(
-            args.source_dir, args.stream_shards, frontend_out,
-            timeout_seconds=args.timeout,
-        )
+        if args.parallel_packages:
+            readers, snapshots = run_project_streaming_parallel(
+                args.source_dir, args.stream_shards, frontend_out,
+                timeout_seconds=args.timeout,
+                max_files_per_package=args.shard_large_packages,
+            )
+        else:
+            readers, snapshots = run_project_streaming(
+                args.source_dir, args.stream_shards, frontend_out,
+                timeout_seconds=args.timeout,
+            )
         stored = write_kuzu_shards(
             CompositeShardReader(readers), args.output_path, snapshots,
             prune=args.prune,
         )
         print(f"Streamed {len(snapshots)} frontends into {stored}")
+        if args.parallel_packages:
+            dropped = 0
+            for snapshot, reader in zip(snapshots, readers):
+                original = int(snapshot.manifest.get("edge_count", snapshot.payload_edge_count))
+                retained = sum(int(item.get("edge_count", 0))
+                               for item in reader.manifest.get("shards", []))
+                dropped += max(0, original - retained)
+            print(f"Dropped {dropped} imported-view edges (package-sharded streaming)")
         return
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
@@ -156,6 +182,7 @@ def main() -> None:
         graph, snapshots, dropped = run_project_parallel(
             args.source_dir, frontend_out, enrich=compile_enrich,
             max_workers=args.max_workers, timeout_seconds=args.timeout,
+            max_files_per_package=args.shard_large_packages,
         )
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, frontend_out,

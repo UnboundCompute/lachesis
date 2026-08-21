@@ -32,6 +32,20 @@ def default_security_overlay_registry() -> OverlayRegistry:
     return registry
 
 
+def default_dataflow_overlay_registry() -> OverlayRegistry:
+    """Return the ordered model + security fold used by the project pipeline.
+
+    These registries used to be folded separately even though both contain one
+    overlay and the security pass must simply observe the model facts. Keeping the
+    order in one registry lets both overlays share one compact GraphIndex and one
+    accumulator over the growing graph.
+    """
+    registry = OverlayRegistry()
+    registry.register(AsyncEvents())
+    registry.register(TaintPropagation())
+    return registry
+
+
 def default_model_overlay_registry() -> OverlayRegistry:
     registry = OverlayRegistry()
     registry.register(AsyncEvents())
@@ -54,5 +68,6 @@ __all__ = [
     "apply_parameter_property_effects",
     "default_overlay_registry",
     "default_model_overlay_registry",
+    "default_dataflow_overlay_registry",
     "default_security_overlay_registry",
 ]

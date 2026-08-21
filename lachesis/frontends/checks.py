@@ -2760,7 +2760,9 @@ class CompilerFrontendTests(unittest.TestCase):
         # Lever 3's partitioning unit. The two-package workspace fixture has a
         # package.json at the root *and* one per package, so a shallowest-match rule
         # would put everything in the root bucket and the build would not parallelize.
-        from lachesis.packages import ROOT_PACKAGE_KEY, detect_packages
+        from lachesis.packages import (
+            ROOT_PACKAGE_KEY, detect_packages, package_root_for, split_large_packages,
+        )
         from lachesis.pipeline import source_inventory
 
         workspace = WORKSPACE_FIXTURE
@@ -2775,6 +2777,45 @@ class CompilerFrontendTests(unittest.TestCase):
         self.assertEqual([str(workspace / "package.json"),
                           str(workspace / "tsconfig.json")], buckets["."])
         self.assertNotIn(ROOT_PACKAGE_KEY, buckets)
+        shards = split_large_packages(str(workspace), buckets, 1)
+        self.assertEqual(6, len(shards))
+        self.assertEqual(
+            str(workspace / "packages" / "api"),
+            package_root_for(str(workspace), "packages/api::shard-0001"),
+        )
+
+    def test_streaming_parallel_packages_releases_snapshot_payloads(self) -> None:
+        from lachesis.pipeline import run_project_parallel, run_project_streaming_parallel
+
+        workspace = str(WORKSPACE_FIXTURE)
+        with tempfile.TemporaryDirectory() as output:
+            readers, snapshots = run_project_streaming_parallel(
+                workspace, os.path.join(output, "shards"),
+                os.path.join(output, "frontends"), timeout_seconds=60,
+                max_files_per_package=1,
+            )
+            self.assertEqual(2, len(readers))
+            self.assertEqual(2, len(snapshots))
+            self.assertTrue(all(snapshot.released for snapshot in snapshots))
+            nodes = [node for reader in readers for node in reader.nodes()]
+            edges = [edge for reader in readers for edge in reader.edges()]
+            self.assertEqual(len(nodes), len({node["id"] for node in nodes}))
+            self.assertGreater(len(nodes), 0)
+            self.assertGreater(len(edges), 0)
+            reference, _, _ = run_project_parallel(
+                workspace, os.path.join(output, "reference"), enrich=False,
+                max_workers=1, max_files_per_package=1,
+            )
+            self.assertEqual(
+                {node["id"] for node in reference["nodes"]},
+                {node["id"] for node in nodes},
+            )
+            self.assertEqual(
+                {(edge["kind"], edge["source"], edge["target"])
+                 for edge in reference["edges"]},
+                {(edge["kind"], edge["source"], edge["target"])
+                 for edge in edges},
+            )
 
     def test_parallel_package_build_matches_serial_over_the_same_partition(self) -> None:
         # Lever 3. The claim is narrow and deliberate: a pooled per-package build equals

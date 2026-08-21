@@ -370,8 +370,12 @@ const analysisFileNames = analysisSourceFiles.map((sf) => normalize(sf.fileName)
 
 const nodes = new Map();
 const edges = [];
-const edgeKeys = new Set();
-const tierNodes = new Map(TIER_ORDER.map((tier) => [tier, new Set()]));
+// Most edges have a unique (kind, source, target) identity.  The previous set
+// retained a full JSON serialization of every edge's properties, which duplicated
+// a large part of the graph in V8's heap.  Keep only the endpoint key and the first
+// edge position; allocate property-key strings only when the same endpoints recur.
+// This preserves the old exact predicate while making the common path O(1) compact.
+const edgeKeys = new Map();
 const sourceFileIds = new Map();
 const entityByDeclaration = new Map();
 const valueByDeclaration = new Map();
@@ -491,7 +495,6 @@ function addNode(tier, id, kind, label, properties = {}) {
   });
   if (!nodes.has(id)) {
     nodes.set(id, { id, kind, label, properties: canonicalProperties, tier });
-    tierNodes.get(tier).add(id);
   } else {
     Object.assign(nodes.get(id).properties, canonicalProperties);
   }
@@ -503,9 +506,21 @@ function addEdge(kind, source, target, properties = {}) {
   const canonicalProperties = {
     fact_origin: "compiler", confidence: "exact", evidence_ids: [], ...properties,
   };
-  const key = `${kind}|${source}|${target}|${jsonKey(canonicalProperties)}`;
-  if (edgeKeys.has(key)) return;
-  edgeKeys.add(key);
+  const endpointKey = `${kind}|${source}|${target}`;
+  const seen = edgeKeys.get(endpointKey);
+  if (seen === undefined) {
+    edgeKeys.set(endpointKey, edges.length);
+  } else {
+    const propertyKey = jsonKey(canonicalProperties);
+    if (typeof seen === "number") {
+      const firstKey = jsonKey(edges[seen].properties);
+      if (firstKey === propertyKey) return;
+      edgeKeys.set(endpointKey, new Set([firstKey, propertyKey]));
+    } else {
+      if (seen.has(propertyKey)) return;
+      seen.add(propertyKey);
+    }
+  }
   edges.push({ kind, source, target, properties: canonicalProperties });
 }
 
