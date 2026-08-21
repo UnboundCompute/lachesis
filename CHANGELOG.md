@@ -12,6 +12,9 @@ than left for you to discover.
 - Bound Kùzu and PyArrow runtime dependencies to the compatibility window exercised
   by CI and the release suite; future major/minor upgrades now require an explicit
   compatibility update.
+- Added a dry-run-first `lachesis cache prune` command for reclaiming abandoned or
+  old graph indexes without deleting anything until `--apply` is supplied.
+- Aligned `lachesis doctor` with the published Python 3.10 and Node 20 support floors.
 
 - Added the MCP capability surface from the graph-bughunt backlog, including bounded
   scans, wrapper evidence, guard dominance, counterexamples, invariant traces,
