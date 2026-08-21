@@ -254,5 +254,5 @@ python3 -m lachesis.cli.analyze path/to/your/source graph.kuzu
 python3 -m lachesis.cli.query --format text graph.kuzu overview
 ```
 
-See [`KUZU_STORE_SPEC.md`](../KUZU_STORE_SPEC.md) for what the columnar store buys
+See [`KUZU_STORE_SPEC.md`](../docs/KUZU_STORE_SPEC.md) for what the columnar store buys
 you on a large graph, and how it is laid out on disk.
