@@ -37,8 +37,7 @@ than left for you to discover.
 - All installed Lachesis console modules now support consistent `--version` and
   MCP exposes explicit `--help`/`--version` handling instead of treating flags as
   graph paths.
-- Pin the Lachesis self-test's Marketplace Action reference to the reviewed v1.0.0
-  release commit for reproducible CI.
+- Use the reviewed `v1` Action and engine release tags in workflow references.
 - Bound Kùzu and PyArrow runtime dependencies to the compatibility window exercised
   by CI and the release suite; future major/minor upgrades now require an explicit
   compatibility update.
@@ -86,6 +85,12 @@ than left for you to discover.
   release is unpublished, and labels `lachesis-cpg` as the tagged-release path.
 - Checkout, contributor, and release instructions now use `npm ci` with the committed
   lockfile, preventing setup from silently rewriting the TypeScript dependency graph.
+
+## [0.1.1]
+
+- Normalize source distribution metadata so repeated release builds produce identical
+  sdist bytes, matching the wheel reproducibility gate.
+- Expand wheel verification to cover every declared console script and its version path.
 
 ## [0.1.0] — unreleased
 
