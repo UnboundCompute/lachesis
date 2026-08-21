@@ -115,16 +115,7 @@ jobs:
       - name: Verify an install from the sdist
         # pip falls back to the sdist whenever a wheel is unavailable, and that path
         # re-runs the build backend, so it can ship a different set of files.
-        run: |
-          python -m venv /tmp/sdist-venv
-          /tmp/sdist-venv/bin/pip install dist/*.tar.gz
-          /tmp/sdist-venv/bin/python - <<'EOF'
-          import pathlib
-          import lachesis.frontends.typescript as frontend
-          compiler = pathlib.Path(frontend.__file__).parent / "vendor" / "typescript"
-          assert (compiler / "lib" / "typescript.js").is_file(), "sdist lost the compiler"
-          print("sdist install carries the vendored compiler")
-          EOF
+        run: tools/verify_sdist.sh
 
       - name: Keep the artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

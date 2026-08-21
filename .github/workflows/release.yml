@@ -68,6 +68,7 @@ jobs:
         run: |
           python -m twine check dist/*
           tools/verify_wheel.sh
+          tools/verify_sdist.sh
       - name: Upload release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

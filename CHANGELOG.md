@@ -72,6 +72,8 @@ than left for you to discover.
   directory names are not stripped before matching.
 - Git-backed comprehension history lookups now have a 30-second bound and return a
   diagnostic instead of waiting indefinitely on a damaged or very large worktree.
+- Packaging CI and release verification now install the sdist in an isolated environment
+  and exercise its console scripts and vendored TypeScript payload, matching the wheel gate.
 
 ## [0.1.0] — unreleased
 

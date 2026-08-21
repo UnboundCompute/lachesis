@@ -85,9 +85,9 @@ Then confirm all four of these:
   source-indexing handoff and the MCP initialize/tools handshake are covered, not
   only the lower-level `lachesis-mcp` entry point.
 
-`tools/verify_wheel.sh` runs this whole sequence. CI runs it on every push and pull
-request in the `package` job, which also builds the distribution and installs from
-the sdist, so a packaging mistake surfaces long before release day.
+`tools/verify_wheel.sh` and `tools/verify_sdist.sh` run these checks for both artifact
+types. CI runs them on every push and pull request in the `package` job, so a packaging
+mistake surfaces long before release day.
 
 The `release artifacts` workflow repeats the artifact gate for every `v*` tag and
 uploads the verified wheel and sdist as workflow artifacts. It does not publish
