@@ -50,8 +50,12 @@ and the agent builds its own graph on demand with the `build_graph` tool — poi
 repo path and it compiles, caches, and attaches the graph in one call (an unchanged tree is
 served from cache; `refresh: true` forces a rebuild). That makes the server zero-config.
 
-Drop one of these into your MCP client's config (Claude Desktop, Cursor, Claude Code). If
-the package is already installed in the environment:
+**Cursor** — one click (uses `uvx`, no install step):
+
+[![Add lachesis to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=lachesis&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyItLWZyb20iLCJsYWNoZXNpcy1jcGciLCJsYWNoZXNpcy1tY3AiXX0=)
+
+Or configure any client by hand. Drop one of these into your MCP client's config
+(Claude Desktop, Cursor, Claude Code). If the package is already installed in the environment:
 
 ```json
 {
