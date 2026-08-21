@@ -96,6 +96,12 @@ jobs:
       - name: Build the sdist and wheel
         run: python -m build
 
+      - name: Verify reproducible distributions
+        run: |
+          sha256sum dist/* > /tmp/lachesis-first-build.sha256
+          python -m build
+          sha256sum -c /tmp/lachesis-first-build.sha256
+
       - name: Check the distribution metadata
         run: python -m twine check dist/*
 
