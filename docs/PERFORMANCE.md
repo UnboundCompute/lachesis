@@ -354,6 +354,14 @@ and graph-wire tests passed, but `linux/net/ipv4` measured 15.55s and 419,463,16
 bytes RSS, indistinguishable from the existing 15.52s baseline. The rewrite was
 reverted without a whole-net run.
 
+### Rejected per-build file-string cache
+
+Sharing repeated `properties.file` strings through a per-build cache was tested to
+reduce AST position-map duplication without global interning. The bounded
+`linux/net/ipv4` run measured 15.47s and 419,971,072 bytes RSS versus the nearby
+15.52s / 419,528,704-byte baseline, which is within noise and slightly larger in
+RSS; the cache was reverted without a whole-net run.
+
 ## Regression rules
 
 An optimization is not accepted on speed alone. Compare node/edge counts and validate
