@@ -264,6 +264,13 @@ Sharing one empty property dictionary for propertyless edges lowered the 254-fil
 3,752,067,072 bytes peak RSS. It was reverted; the serializer's copy-on-default path
 did not translate the local allocation saving to the aggregate workload.
 
+### Rejected C offset lookup via ``bisect_right``
+
+Replacing the per-node Python line-offset search with ``bisect_right`` made whole
+``linux/net`` pass one about 3s faster (216.64s), but peak RSS rose from the 3.44 GiB
+baseline to 3.79 GiB. Since memory is the adoption constraint, the CPU-only change was
+reverted despite the wall-time improvement.
+
 ### C frontend path-resolution reduction
 
 The C macro/dependency passes now memoize repeated preprocessor marker and dependency
