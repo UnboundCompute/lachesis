@@ -197,7 +197,11 @@ def command_cache(args: argparse.Namespace) -> int:
                 _stderr(f"nothing cached for {entry.source_dir}")
                 return EXIT_OK
             freed = directory_size(entry.directory)
-            entry.discard()
+            try:
+                entry.discard()
+            except OSError as error:
+                _stderr(f"could not remove the index for {entry.source_dir}: {error}")
+                return EXIT_FAILURE
             _stderr(f"removed the index for {entry.source_dir} ({human_size(freed)})")
             return EXIT_OK
         if not args.all:
@@ -207,7 +211,11 @@ def command_cache(args: argparse.Namespace) -> int:
             _stderr("cache is already empty")
             return EXIT_OK
         freed = directory_size(root)
-        shutil.rmtree(root, ignore_errors=True)
+        try:
+            shutil.rmtree(root)
+        except OSError as error:
+            _stderr(f"could not remove cached indexes under {root}: {error}")
+            return EXIT_FAILURE
         _stderr(f"removed every cached index ({human_size(freed)})")
         return EXIT_OK
 
@@ -234,7 +242,11 @@ def command_cache(args: argparse.Namespace) -> int:
             action = "would remove" if not args.apply else "removed"
             _stderr(f"{action} {human_size(size):>8}  {reason}: {entry.source_dir}")
             if args.apply:
-                entry.discard()
+                try:
+                    entry.discard()
+                except OSError as error:
+                    _stderr(f"could not remove {entry.directory}: {error}")
+                    return EXIT_FAILURE
         action = "would reclaim" if not args.apply else "reclaimed"
         _stderr(f"{action} {human_size(total)} across {len(candidates)} index(es)")
         return EXIT_OK

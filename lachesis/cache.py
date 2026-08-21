@@ -121,7 +121,7 @@ class CacheEntry:
 
     def discard(self) -> None:
         """Remove the entry, so a failed or superseded build cannot be read back."""
-        shutil.rmtree(self.directory, ignore_errors=True)
+        shutil.rmtree(self.directory)
 
 
 def _version() -> str:
