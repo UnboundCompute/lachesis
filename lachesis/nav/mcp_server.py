@@ -739,7 +739,11 @@ TOOLS = [
                     "urlopen SSRF); the rest are the engine's own generic-role reaches. Costs one "
                     "whole-graph value-flow build on first call per graph (cached after). A no-op with "
                     "a clear reason if the Atropos catalog is not checked out. Each witness carries "
-                    "`source_id`/`sink_id`, the exact graph node ids of the bound endpoints. "
+                    "`source_id`/`sink_id`, the exact graph node ids of the bound endpoints, plus "
+                    "`path` -- the ordered source->sink hops taint actually walked ({id,label,at} each). "
+                    "Adjudicate a witness from its `path` (read source at each hop); do NOT re-derive it "
+                    "with `reaches`, which follows a different edge set (VALUE_FLOWS_TO/POINTS_TO) and can "
+                    "return 0 hops for a pair taint reached over REACHING_DEF/summary edges. "
                     "`unwitnessed` lists bound sinks/sources that took part in no reach -- feed those "
                     "ids straight to `sources_of`/`flow`/`reaches` to trace why (on a C graph they mark "
                     "where value-flow gaps sever the chain); no name resolution needed since the "
@@ -1527,6 +1531,13 @@ def _taint(store, args):
         witnessed.add(kv)
         src_role, sink_role = marked.get(sv), marked.get(kv)
         model_props = (sink_role or src_role or {}).get("properties", {})
+        # The witness path taint actually walked, source->sink, as addressable hops.
+        # Taint propagates over REACHING_DEF/summary edges, which `reaches` does not
+        # walk (it follows VALUE_FLOWS_TO/POINTS_TO) -- so a witnessed pair can return
+        # 0 hops under `reaches`. Surfacing the path here lets an agent adjudicate the
+        # lead directly (read source at each hop) instead of re-deriving it.
+        witness_ids = props.get("witness_ids") or []
+        path = [{"id": vid, "label": _label(vid), "at": _loc(vid)} for vid in witness_ids]
         rows.append({
             "source": _label(sv), "source_at": _loc(sv), "source_id": sv,
             "sink": _label(kv), "sink_at": _loc(kv), "sink_id": kv,
@@ -1534,6 +1545,8 @@ def _taint(store, args):
             "sink_model": (sink_role or {}).get("properties", {}).get("model_id"),
             "cwe": model_props.get("cwe", []),
             "atropos_connected": bool(src_role or sink_role),
+            "hops": len(path),
+            "path": path,
         })
     # A catalog-driven reach is the point of the tool, so those sort first.
     rows.sort(key=lambda r: not r["atropos_connected"])
