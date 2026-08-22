@@ -32,12 +32,22 @@ CALLBACK_EDGES = ("REGISTERS_CALLBACK", "PASSES_CALLBACK", "SCHEDULES")
 class Hubs:
     """Degree ranking of function declarations over the union call graph."""
 
+    # Confidence tiers kept when `resolved_only` restricts the spine to precise calls.
+    _RESOLVED = frozenset({"exact", "high"})
+
     def __init__(self, gl: GraphLib, include_external: bool = False,
-                 include_tests: bool = False) -> None:
+                 include_tests: bool = False, resolved_only: bool = False) -> None:
         self.gl = gl
         self._prov = _file_provenance(gl)
         self._include_external = include_external
         self._include_tests = include_tests
+        # Rank over resolved DIRECT calls only, dropping the indirect-dispatch family and
+        # conservative over-approximation. On a duck-typed tree `.get(...)` resolves by NAME
+        # to every `get` method (a known attribute-dispatch blind spot), inflating a handful
+        # of collision nodes into false super-hubs; the union-graph spine is right for
+        # C function-pointer control flow but noisy for a human-facing report. Off by
+        # default so the MCP `hubs` tool and CLI keep their union-graph centrality.
+        self._resolved_only = resolved_only
         self._fan_in: dict[str, int] = {}
         self._fan_out: dict[str, int] = {}
         self._flags: dict[str, list[str]] = {}
@@ -50,13 +60,22 @@ class Hubs:
             return None
         return _caller_decl(self.gl, src) or src
 
+    def _edge_resolved(self, edge: dict) -> bool:
+        # A missing stamp is not evidence of over-approximation (direct compiler CALLS are
+        # exact); drop only edges explicitly conservative/low/unresolved.
+        conf = (edge.get("properties") or {}).get("confidence")
+        return conf is None or conf in self._RESOLVED
+
     def _build(self) -> None:
         gl = self.gl
         # Unique caller-decl -> callee pairs over the union graph (dedup so a function
         # called from ten call-sites counts its callee once, matching callees() dedup).
+        families = (CALL_EDGES,) if self._resolved_only else (CALL_EDGES, INDIRECT_CALL_EDGES)
         pairs: set[tuple[str, str]] = set()
-        for kinds in (CALL_EDGES, INDIRECT_CALL_EDGES):
+        for kinds in families:
             for edge in gl.index.edges_of_kind(*kinds):
+                if self._resolved_only and not self._edge_resolved(edge):
+                    continue
                 target = edge.get("target")
                 caller = self._decl_of_source(edge)
                 if caller is None or not target:

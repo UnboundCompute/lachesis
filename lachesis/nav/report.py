@@ -74,12 +74,14 @@ def build_report(store, title: str | None = None, hubs_n: int = 15,
     w(f"- **Languages:** {lang_str}")
 
     # ------------------------------------------------------------------ spine
-    hubs = Hubs(gl).top(hubs_n)
+    hubs = Hubs(gl, resolved_only=True).top(hubs_n)
     w("")
     w("## Start here — the spine")
     w("")
-    w("The highest-degree functions over the union call graph: what the codebase is built "
-      "around. Fan-in is how many functions call it; fan-out is how many it calls.")
+    w("The highest-degree functions over precise direct calls: what the codebase is built "
+      "around. Fan-in is how many functions call it; fan-out is how many it calls. "
+      "(Indirect name-dispatch is excluded here so the spine reads as real callers, not "
+      "attribute-dispatch collisions.)")
     w("")
     if hubs:
         w("| Function | Where | in | out | flags |")
