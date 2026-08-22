@@ -9,6 +9,22 @@ than left for you to discover.
 
 ## Unreleased
 
+## [0.1.7]
+
+### Added
+
+- **Architecture comprehension.** Function-level community detection groups the
+  call graph into cohesive modules, each labelled by its highest-degree member,
+  and an architecture report renders the map. New `lachesis communities` and
+  `lachesis report` subcommands, and matching `communities` and
+  `architecture_map` MCP tools.
+- **Container distribution.** The MCP server ships as a multi-arch image at
+  `ghcr.io/unboundcompute/lachesis` (linux/amd64 and linux/arm64), so a client
+  can run it with no Python, Node, or clang on the host. Published on every
+  release tag.
+- **One-click install.** README install buttons for Cursor and VS Code that
+  register the server through `uvx` with no prior install step.
+
 ## [0.1.6]
 
 ### Fixed
