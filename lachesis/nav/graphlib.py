@@ -13,8 +13,10 @@ decides a verdict.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -47,6 +49,57 @@ SECURITY_LEXICON = re.compile(
 _TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 # split a path segment into its own sub-tokens (driver-mysql -> driver, mysql).
 _SEG_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z])(?=[A-Z])")
+
+
+@lru_cache(maxsize=8)
+def _parse_source_map(spec: str) -> tuple[tuple[str, str], ...]:
+    """Parse ``old=new,old2=new2`` prefix rewrites (trailing slashes stripped)."""
+    pairs = []
+    for chunk in spec.replace(os.pathsep, ",").split(","):
+        chunk = chunk.strip()
+        if "=" not in chunk:
+            continue
+        old, _, new = chunk.partition("=")
+        old, new = old.strip().rstrip("/"), new.strip().rstrip("/")
+        if old and new:
+            pairs.append((old, new))
+    return tuple(pairs)
+
+
+def resolve_source_path(path: str) -> str:
+    """Map a build-time source path to one readable on the machine reading the graph.
+
+    A graph built in one environment (e.g. a Docker container that mounted the tree
+    under ``/src``) records absolute build paths that need not exist where the graph
+    is later queried. Two env vars bridge that gap, consulted *only when the recorded
+    path is missing* — so behaviour is byte-for-byte identical whenever the source is
+    already local:
+
+      LACHESIS_SOURCE_MAP   comma-separated ``old=new`` prefix rewrites, e.g.
+                            ``/src=/home/me/project``
+      LACHESIS_SOURCE_ROOT  a local root; the recorded path's trailing segments are
+                            matched under it, longest tail that exists winning (so a
+                            container ``/src/lib/x.c`` resolves against a root whose
+                            layout is ``<root>/lib/x.c`` without naming the prefix)
+
+    The build mounts sources read-only, so the local file is the same bytes as the one
+    the frontend parsed — recorded byte offsets stay valid against the resolved path.
+    """
+    if not path or os.path.exists(path):
+        return path
+    for old, new in _parse_source_map(os.environ.get("LACHESIS_SOURCE_MAP", "")):
+        if path == old or path.startswith(old + "/"):
+            candidate = new + path[len(old):]
+            if os.path.exists(candidate):
+                return candidate
+    root = os.environ.get("LACHESIS_SOURCE_ROOT", "").rstrip("/")
+    if root:
+        parts = [p for p in Path(path).parts if p not in ("/", "")]
+        for i in range(len(parts)):  # longest trailing sub-path first
+            candidate = os.path.join(root, *parts[i:])
+            if os.path.exists(candidate):
+                return candidate
+    return path
 
 
 def camel_tokens(name: str) -> list[str]:
@@ -161,7 +214,8 @@ class GraphLib:
     def _read_file(self, path: str) -> str | None:
         if path not in self._source_cache:
             try:
-                self._source_cache[path] = Path(path).read_text(encoding="utf-8")
+                resolved = resolve_source_path(path)
+                self._source_cache[path] = Path(resolved).read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 self._source_cache[path] = None
         return self._source_cache[path]
