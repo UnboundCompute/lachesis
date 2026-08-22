@@ -115,6 +115,80 @@ def command_scan(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------------- communities
+
+def _load_store_for(args: argparse.Namespace, verb: str):
+    """Index the tree if needed and load its store — the scan/mcp acquisition, shared."""
+    from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound, ensure_graph)
+    from lachesis.cli.progress import Progress
+    from lachesis.nav.graph_store import GraphStore
+
+    source = _resolved(args.path)
+    quiet = getattr(args, "json", False) or getattr(args, "stdout", False)
+    progress = Progress(enabled=not quiet)
+    if not quiet:
+        _stderr(f"lachesis {verb}: {source}")
+    try:
+        graph_path, _ = ensure_graph(source, refresh=args.refresh, progress=progress,
+                                     timeout_seconds=args.timeout)
+    except EnvironmentProblem as error:
+        return None, _report_environment(error), source
+    except NoSourceFound as error:
+        _stderr(f"lachesis {verb}: {error}")
+        return None, EXIT_USAGE, source
+    progress.phase("loading graph")
+    store = GraphStore.load(str(graph_path)).ensure_dataflow_tier()
+    progress.done()
+    return store, None, source
+
+
+def command_communities(args: argparse.Namespace) -> int:
+    store, failure, _ = _load_store_for(args, "communities")
+    if store is None:
+        return failure
+    from lachesis.nav.communities import Communities
+    comm = Communities(store.gl, include_dispatch=args.include_dispatch)
+    result = comm.summary(n=args.limit or 20, members=args.members,
+                          min_size=args.min_size)
+    if args.json:
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    _stderr()
+    print(f"{result['communities']} subsystems over {result['nodes']} functions  "
+          f"(modularity {result['modularity']})")
+    if result["connectors_removed"]:
+        names = ", ".join(f"{m['name']} ({m['degree']})" for m in result["connectors"])
+        print(f"cross-cutting connectors lifted out: {names}")
+    for r in result["partitions"]:
+        print(f"\n  #{r['id']}  {r['label']}  "
+              f"({r['size']} funcs, cohesion {r['cohesion']})")
+        for m in r["members"]:
+            print(f"      {m['degree']:4}  {m['name']}  {m['handle'] or ''}")
+        if r["files"]:
+            print(f"      spans: {', '.join(r['files'])}")
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------ report
+
+def command_report(args: argparse.Namespace) -> int:
+    store, failure, source = _load_store_for(args, "report")
+    if store is None:
+        return failure
+    from lachesis.nav.report import build_report
+    text = build_report(store, title=args.title or source.name)
+    if args.stdout:
+        print(text)
+        return EXIT_OK
+    from pathlib import Path
+    out = Path(args.out)
+    out.write_text(text, encoding="utf-8")
+    _stderr()
+    _stderr(f"wrote {out} ({len(text.splitlines())} lines)")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------- mcp
 
 def command_mcp(args: argparse.Namespace) -> int:
@@ -424,6 +498,37 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--quiet", "-q", action="store_true",
                       help="findings only, no progress or guidance")
     scan.set_defaults(handler=command_scan)
+
+    communities = subcommands.add_parser(
+        "communities", help="partition a codebase into subsystems (call-graph clusters)",
+        description="Index the tree if needed, then cluster the call graph into "
+                    "subsystems that call each other more than the rest of the tree — "
+                    "the structure the code has, independent of the directory layout.")
+    _add_source_flags(communities)
+    communities.add_argument("--limit", type=_nonnegative_int, default=20, metavar="N",
+                             help="how many subsystems to print (default 20)")
+    communities.add_argument("--members", type=_nonnegative_int, default=8, metavar="N",
+                             help="members and files listed per subsystem (default 8)")
+    communities.add_argument("--min-size", type=_nonnegative_int, default=2, metavar="N",
+                             help="drop subsystems smaller than this (default 2)")
+    communities.add_argument("--include-dispatch", action="store_true",
+                             help="also cluster over indirect dispatch (C function "
+                                  "pointers); noisy on duck-typed Python/TS")
+    communities.add_argument("--json", action="store_true",
+                             help="write the full result to stdout as JSON")
+    communities.set_defaults(handler=command_communities)
+
+    report = subcommands.add_parser(
+        "report", help="write a Markdown architecture report for a codebase",
+        description="Index the tree if needed, then assemble a one-page architecture "
+                    "report — the spine, the subsystems, and where to start reading.")
+    _add_source_flags(report)
+    report.add_argument("-o", "--out", default="GRAPH_REPORT.md",
+                        help="output path (default: GRAPH_REPORT.md)")
+    report.add_argument("--title", default=None, help="report title (default: dir name)")
+    report.add_argument("--stdout", action="store_true",
+                        help="print the report instead of writing a file")
+    report.set_defaults(handler=command_report)
 
     mcp = subcommands.add_parser(
         "mcp", help="serve a codebase to an AI agent over MCP",

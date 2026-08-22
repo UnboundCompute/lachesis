@@ -39,6 +39,7 @@ from lachesis.nav.call_roles import CallRoles
 from lachesis.nav.siblings import SiblingDiff
 from lachesis.nav import symbol_index as si
 from lachesis.nav.hubs import Hubs
+from lachesis.nav.communities import Communities
 from lachesis.nav.folder_graph import build_folder_graph
 from lachesis.nav.file_graph import build_file_graph, _find_file_node
 from lachesis.nav import render as render_mod
@@ -109,7 +110,7 @@ OVERLAY_SEED_ARGS = {
 # a name missing here (or a future tool) still shows, appended in definition order.
 TOOL_ORDER = (
     "load_graph", "build_graph",
-    "hubs", "search", "callers", "callees", "read_body", "open_file", "open_folder",
+    "hubs", "communities", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "unknowns", "coverage_map", "field_history", "sibling_compare",
     "type_explain", "component_boundary", "indirect_targets",
     "architecture_map", "execution_story",
@@ -210,6 +211,10 @@ class _Ctx:
     @property
     def hubs(self):
         return self._analysis("hubs", lambda: Hubs(self.store.gl))
+
+    @property
+    def communities(self):
+        return self._analysis("communities", lambda: Communities(self.store.gl))
 
     @property
     def comprehension(self):
@@ -621,6 +626,21 @@ TOOLS = [
                     "read_body to traverse.",
      "inputSchema": {"type": "object", "properties": {
          "n": {"type": "integer", "default": 20}}}},
+    {"name": "communities",
+     "description": "The codebase's SUBSYSTEMS: partitions the call graph into clusters that "
+                    "call each other more than the rest of the tree (label propagation), "
+                    "independent of the directory layout — the structure the code HAS, not "
+                    "how it was filed. Each community carries a label (its highest-degree "
+                    "member), size, cohesion, the files it spans, and its top members with "
+                    "node_id + handle. Reports the graph modularity and lifts out cross-"
+                    "cutting connector hubs. Partitions over precise compiler calls by "
+                    "default; set include_dispatch for C function-pointer trees. Use AFTER "
+                    "hubs to go from 'what is central' to 'what are the parts'.",
+     "inputSchema": {"type": "object", "properties": {
+         "n": {"type": "integer", "default": 20},
+         "members": {"type": "integer", "default": 8},
+         "min_size": {"type": "integer", "default": 2},
+         "include_dispatch": {"type": "boolean", "default": False}}}},
     {"name": "search",
      "description": "Resolve a function/method/type/file name to its canonical node id(s) with "
                     "file:line. Teleport to any symbol, fuzzy by default. Returns a real "
@@ -1188,6 +1208,14 @@ def call_tool(name, args, format=None):
         rows = c.hubs.top(int(args.get("n", 20)))
         return _emit(name, {"move": "hubs", "count": len(rows), "ranked": rows},
                      fmt, offset, limit)
+    if name == "communities":
+        disp = bool(args.get("include_dispatch"))
+        comm = c._analysis(f"communities:disp={disp}",
+                           lambda: Communities(c.store.gl, include_dispatch=disp))
+        result = comm.summary(n=int(args.get("n", 20)),
+                              members=int(args.get("members", 8)),
+                              min_size=int(args.get("min_size", 2)))
+        return _emit(name, {"move": "communities", **result}, fmt, offset, limit)
     if name == "search":
         page = si.search_page(store.entries, args["name"], "fuzzy",
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
