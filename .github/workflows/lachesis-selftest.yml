@@ -1,13 +1,14 @@
 # Dogfood: run the published Lachesis Action on this repo's own source.
-# Lachesis analyzing itself. A healthy run surfaces the guard differentials in
-# its own tree (fixtures excluded) into the Security tab as a deterministic
-# smoke test. The Action itself lives at UnboundCompute/lachesis-action.
+# Lachesis analyzing itself, as a deterministic smoke test that surfaces the
+# guard differentials in its own tree (fixtures excluded). On pull requests the
+# findings post as Lachesis[bot] comments; on push it just exercises the scan.
+# The Action itself lives at UnboundCompute/lachesis-action.
 name: lachesis-selftest
 
 on:
   workflow_dispatch:        # run on demand from the Actions tab
   push:
-    branches: [main]        # establish the default-branch baseline (what the Security tab shows by default)
+    branches: [main]        # exercise a full scan on the default branch
   pull_request:
     paths:
       - ".github/workflows/lachesis-selftest.yml"
@@ -18,11 +19,11 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      security-events: write   # upload SARIF to code scanning (same-repo only; fork PRs can't)
+      id-token: write          # prove the repo to the Lachesis app so it can post as Lachesis[bot]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: UnboundCompute/lachesis-action@v1.0.3
+      - uses: UnboundCompute/lachesis-action@v1.0.4
         with:
           # Scan the whole repo (Python + TypeScript + C), not just a fixture:
           # the real dogfood is Lachesis analyzing its own source.
