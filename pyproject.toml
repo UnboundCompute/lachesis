@@ -36,7 +36,7 @@ classifiers = [
 # (see CONTRIBUTING.md). Floors track the releases the suite is verified against
 # (kuzu 0.11.x, pyarrow 25.x); `pyarrow` only accelerates bulk load and the writer
 # falls back to row-wise inserts without it.
-dependencies = ["kuzu>=0.11,<0.12", "pyarrow>=17,<26", "protobuf>=6.30,<7"]
+dependencies = ["kuzu>=0.11,<0.12", "pyarrow>=17,<26", "protobuf>=6.30,<8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
