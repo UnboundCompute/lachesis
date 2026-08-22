@@ -76,11 +76,11 @@ def resolve_source_path(path: str) -> str:
     already local:
 
       LACHESIS_SOURCE_MAP   comma-separated ``old=new`` prefix rewrites, e.g.
-                            ``/src=/Users/me/targets/nifti_clib``
+                            ``/src=/home/me/project``
       LACHESIS_SOURCE_ROOT  a local root; the recorded path's trailing segments are
                             matched under it, longest tail that exists winning (so a
-                            container ``/src/nifti2/x.c`` resolves against a root whose
-                            layout is ``<root>/nifti2/x.c`` without naming the prefix)
+                            container ``/src/lib/x.c`` resolves against a root whose
+                            layout is ``<root>/lib/x.c`` without naming the prefix)
 
     The build mounts sources read-only, so the local file is the same bytes as the one
     the frontend parsed — recorded byte offsets stay valid against the resolved path.

@@ -31,7 +31,7 @@ class ResolveSourcePathTests(unittest.TestCase):
         _parse_source_map.cache_clear()
 
     def _tree(self, tmp):
-        f = Path(tmp) / "nifti2" / "nifti2_io.c"
+        f = Path(tmp) / "lib" / "parse.c"
         f.parent.mkdir(parents=True)
         f.write_text("int main(void){return 0;}\n")
         return f
@@ -43,8 +43,8 @@ class ResolveSourcePathTests(unittest.TestCase):
             self.assertEqual(resolve_source_path(str(f)), str(f))
 
     def test_missing_path_with_no_config_is_returned_unchanged(self):
-        self.assertEqual(resolve_source_path("/src/nifti2/nifti2_io.c"),
-                         "/src/nifti2/nifti2_io.c")
+        self.assertEqual(resolve_source_path("/src/lib/parse.c"),
+                         "/src/lib/parse.c")
 
     def test_prefix_map_rewrites_container_path(self):
         import tempfile
@@ -52,8 +52,8 @@ class ResolveSourcePathTests(unittest.TestCase):
             self._tree(tmp)
             os.environ["LACHESIS_SOURCE_MAP"] = f"/src={tmp}"
             _parse_source_map.cache_clear()
-            self.assertEqual(resolve_source_path("/src/nifti2/nifti2_io.c"),
-                             str(Path(tmp) / "nifti2" / "nifti2_io.c"))
+            self.assertEqual(resolve_source_path("/src/lib/parse.c"),
+                             str(Path(tmp) / "lib" / "parse.c"))
 
     def test_source_root_matches_longest_trailing_tail(self):
         import tempfile
@@ -61,9 +61,9 @@ class ResolveSourcePathTests(unittest.TestCase):
             self._tree(tmp)
             os.environ["LACHESIS_SOURCE_ROOT"] = tmp
             # container path carries an extra "/src" segment the root doesn't have;
-            # the longest tail that exists (<root>/nifti2/nifti2_io.c) wins.
-            self.assertEqual(resolve_source_path("/src/nifti2/nifti2_io.c"),
-                             str(Path(tmp) / "nifti2" / "nifti2_io.c"))
+            # the longest tail that exists (<root>/lib/parse.c) wins.
+            self.assertEqual(resolve_source_path("/src/lib/parse.c"),
+                             str(Path(tmp) / "lib" / "parse.c"))
 
     def test_map_takes_precedence_over_root(self):
         import tempfile
@@ -72,7 +72,7 @@ class ResolveSourcePathTests(unittest.TestCase):
             os.environ["LACHESIS_SOURCE_MAP"] = f"/src={tmp}"
             os.environ["LACHESIS_SOURCE_ROOT"] = "/nonexistent"
             _parse_source_map.cache_clear()
-            self.assertTrue(resolve_source_path("/src/nifti2/nifti2_io.c").startswith(tmp))
+            self.assertTrue(resolve_source_path("/src/lib/parse.c").startswith(tmp))
 
     def test_parse_source_map_ignores_malformed_chunks(self):
         self.assertEqual(_parse_source_map("garbage,,=,x="), ())
