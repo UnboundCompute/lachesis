@@ -21,7 +21,7 @@ jobs:
       contents: read
       id-token: write          # prove the repo to the Lachesis app so it can post as Lachesis[bot]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: UnboundCompute/lachesis-action@v1.0.4
         with:
