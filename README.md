@@ -52,9 +52,11 @@ and the agent builds its own graph on demand with the `build_graph` tool — poi
 repo path and it compiles, caches, and attaches the graph in one call (an unchanged tree is
 served from cache; `refresh: true` forces a rebuild). That makes the server zero-config.
 
-**Cursor** — one click (uses `uvx`, no install step):
+**One click** (uses `uvx`, no install step):
 
 [![Add lachesis to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=lachesis&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyItLWZyb20iLCJsYWNoZXNpcy1jcGciLCJsYWNoZXNpcy1tY3AiXX0=)
+&nbsp;
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Lachesis-0098FF?logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=lachesis&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22--from%22%2C%22lachesis-cpg%22%2C%22lachesis-mcp%22%5D%7D)
 
 Or configure any client by hand. Drop one of these into your MCP client's config
 (Claude Desktop, Cursor, Claude Code). If the package is already installed in the environment:
@@ -76,6 +78,26 @@ Or with no install step at all, letting `uvx` fetch it on first run:
   }
 }
 ```
+
+Or run it as a container — no Python, Node, or clang on the host, all three
+frontends inside the image:
+
+```json
+{
+  "mcpServers": {
+    "lachesis": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "-v", "/path/to/your/project:/src",
+               "ghcr.io/unboundcompute/lachesis:edge"]
+    }
+  }
+}
+```
+
+Mount your project (here `/src`) and point `build_graph` at it. In VS Code you
+can use `${workspaceFolder}` for the mount source. The image is published for
+linux/amd64 and linux/arm64; `:edge` tracks `main` and each release also
+publishes an `:x.y.z` tag.
 
 Source-checkout and interpreter troubleshooting examples are in
 [`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
