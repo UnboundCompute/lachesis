@@ -56,6 +56,7 @@ FROZEN_PATTERNS = {
     "leak": PatternSpec("leak", (EventKind.ORIGIN,)),
 }
 
+
 _LOOP_WIDEN_LIMIT = 32
 
 
@@ -379,6 +380,15 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                             sink_obj = obj or ObjRef(
                                 event.facts.get("callee", "sink"), generation="g0")
                             _record(hits, pattern, sink_obj, node, witness())
+                    control = set(event.facts.get("control") or ())
+                    if (patterns is None or "mem.copy.in-loop-unbounded" in wanted):
+                        if (family in {"buffer-write", "buffer-size"}
+                                and control & {"for", "while", "do"}
+                                and not event.facts.get("guarded", False)):
+                            sink_obj = obj or ObjRef(
+                                event.facts.get("callee", "sink"), generation="g0")
+                            _record(hits, "mem.copy.in-loop-unbounded", sink_obj,
+                                    node, witness())
                 # Sink facts are observations, not lifetime transitions; the
                 # remaining lifecycle branches below intentionally do not match
                 # EventKind.SINK.
