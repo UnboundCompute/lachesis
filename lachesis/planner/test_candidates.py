@@ -1179,5 +1179,40 @@ class AllFamilyRegistryTest(unittest.TestCase):
                          "c.db.mysql_query.a1")
 
 
+class GuardRelationTest(unittest.TestCase):
+    """A branch guards a size only when it COMPARES the variable's magnitude.
+
+    The region classifier used to flag any branch that merely NAMED a size variable,
+    so `if (p && ...)` read as a size guard and suppressed a real overflow/lifetime
+    bug. A guard must carry a magnitude relation (`< <= > >=`), not a nullness or
+    presence test."""
+
+    def _named(self, head, *idents):
+        import re as _re
+
+        from lachesis.planner.unbounded_copy import _relation_named
+        patterns = {i: _re.compile(r"\b" + _re.escape(i) + r"\b") for i in idents}
+        return _relation_named(head, patterns)
+
+    def test_magnitude_comparison_is_a_guard(self):
+        self.assertEqual(["cap", "len"], self._named("if (len < cap)", "len", "cap"))
+        self.assertEqual(["x"], self._named("if (x >= 0)", "x"))
+        self.assertEqual(["count", "i"], self._named("while (i < count)", "i", "count"))
+
+    def test_nullness_or_presence_is_not_a_guard(self):
+        self.assertEqual([], self._named("if (z && a && b)", "z", "a", "b"))
+        self.assertEqual([], self._named("if (p != NULL)", "p"))
+        self.assertEqual([], self._named("if (buf)", "buf"))
+
+    def test_bit_shift_is_not_a_relation(self):
+        self.assertEqual([], self._named("if (flags << 2)", "flags"))
+        self.assertEqual([], self._named("if (a >> b)", "a", "b"))
+
+    def test_only_the_operands_of_the_relation_clause_count(self):
+        # `ready` shares the head but sits in its own presence clause, not the bound.
+        self.assertEqual(["n", "size"],
+                         self._named("if (n <= size && ready)", "n", "size", "ready"))
+
+
 if __name__ == "__main__":
     unittest.main()
