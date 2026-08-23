@@ -76,8 +76,13 @@ class CoverageSchedulerTests(unittest.TestCase):
 
     def test_claus_does_not_claim_skipped_fragments_are_covered(self):
         graph = SkeletonGraph()
-        graph.add_node("worker:entry")
+        graph.add_node("source:entry", fragment="source")
+        graph.add_node("worker:entry", fragment="worker")
+        graph.add_node("skipped:entry", fragment="skipped")
+        graph.add_edge("source:entry", "worker:entry")
+        graph.add_fragment("source", "source:entry", ("source:entry",))
         graph.add_fragment("worker", "worker:entry", ("worker:entry",))
+        graph.add_fragment("skipped", "skipped:entry", ("skipped:entry",))
 
         coverage = {"regions": [{"state_keys": [["worker", "source"],
                                                    ["skipped", "source"]]}]}

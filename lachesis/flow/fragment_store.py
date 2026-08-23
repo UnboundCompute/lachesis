@@ -108,6 +108,46 @@ class Claus:
     def __init__(self, store: FragmentStore | None = None):
         self.fragments = store or FragmentStore()
 
+    @staticmethod
+    def _materialized_states(graph: SkeletonGraph, state_keys) -> list[tuple[str, str]]:
+        """Keep only source states with a concrete graph path to their target.
+
+        A fragment's existence is not enough evidence for a coverage state: the same
+        function can be reached from several external roots with different object
+        bindings.  The current graph representation does not yet serialize the full
+        abstract state on each edge, but it does preserve source fragments and seam
+        edges.  Requiring source-to-target reachability is therefore the strongest
+        honest accounting available at this boundary and avoids claiming disconnected
+        source cones were analysed.
+        """
+        materialized = []
+        for key in state_keys:
+            if len(key) != 2:
+                continue
+            target, source = key
+            source_fragment = graph.fragments.get(source)
+            target_fragment = graph.fragments.get(target)
+            if source_fragment is None or target_fragment is None:
+                continue
+            if source == target:
+                materialized.append((target, source))
+                continue
+            queue = [source_fragment.entry]
+            seen = set(queue)
+            reachable = False
+            while queue and not reachable:
+                node = queue.pop()
+                if graph.nodes[node].fragment == target:
+                    reachable = True
+                    break
+                for edge in graph.edges.get(node, ()):
+                    if edge.target not in seen:
+                        seen.add(edge.target)
+                        queue.append(edge.target)
+            if reachable:
+                materialized.append((target, source))
+        return materialized
+
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
               coverage=None, reach_summaries=None):
         cached = self.fragments.get(functions, lang, graph, summaries, coverage,
@@ -128,8 +168,7 @@ class Claus:
             # state keys whose function has an emitted fragment may be counted as
             # covered.  Otherwise `converged` could be true while the graph still
             # lacks the selected region.
-            materialized = [key for key in planned_keys
-                            if len(key) == 2 and key[0] in built.fragments]
+            materialized = self._materialized_states(built, planned_keys)
             self.fragments.mark_covered(materialized)
             pending = tuple(sorted(set(planned_keys) - set(materialized)))
             built.coverage.update({
