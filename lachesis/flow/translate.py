@@ -305,18 +305,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         line = _stmt_line(c)
         callees.append(callee)
         args = _arg_records(ix, c)
-        # Python/TS method calls carry the receiver separately from positional
-        # arguments.  Lifecycle operations act on that receiver, so expose it as
-        # the structural object argument without changing the source call ABI.
         cp = _props(c)
-        receiver_id = cp.get("receiver_value_id") or cp.get("receiver_symbol_id")
-        if receiver_id and not any(a.get("root") == receiver_id for a in args):
-            receiver = ix.nodes.get(receiver_id) or {}
-            receiver_label = receiver.get("label") or cp.get("receiver")
-            if receiver_label:
-                args.insert(0, {"pos": 0, "var": receiver_label, "value": receiver_label,
-                                "expr": receiver_label, "root": receiver_label,
-                                "provenance": _prov(receiver.get("kind"))})
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
         guard_status = _guard_status_for(regions, fid, idents, _span(c))
@@ -326,7 +315,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         # wrapper's `returns=alloc` seeds an alloc, a freed-return's `returns_dangling` seeds a
         # free. `alloc_dst` is the is_alloc-gated subset used for the alloc event and sink dst.
         assigned = _assigned_var(ix, c["id"])
-        alloc_dst = assigned if norm.is_alloc(callee) else None
+        alloc_dst = assigned if norm.is_acquire(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
                "guard_status": guard_status,
                "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
@@ -386,16 +375,26 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         # realloc is a release of the old generation and an acquire of the returned
         # generation.  Keep both facts in the structural stream; the matcher remains
         # completely unaware of the concrete allocator spelling.
-        if (norm.is_release(callee) or norm.is_realloc(callee)) and args and args[0]["root"]:
+        release_arg = args[0] if args and args[0].get("root") else None
+        if norm.is_release(callee) or norm.is_realloc(callee):
+            receiver_id = cp.get("receiver_value_id") or cp.get("receiver_symbol_id")
+            if release_arg is None and receiver_id:
+                receiver = ix.nodes.get(receiver_id) or {}
+                receiver_label = receiver.get("label") or cp.get("receiver")
+                if receiver_label:
+                    release_arg = {"root": receiver_label, "expr": receiver_label}
+            if release_arg is None or not release_arg.get("root"):
+                release_arg = None
+        if release_arg:
             events.append({"kind": "free", "family": ("memory.free" if norm.lang == "c"
                            else "lifecycle.release"),
-                           "var": _freed_identity(args[0]), "line": line,
+                           "var": _freed_identity(release_arg), "line": line,
                            "node": c["id"], "callee": callee})
 
     alloc_vars = {a["var"] for a in assigns}
     tracked_vars = set(params)
     tracked_vars.update(a["var"] for a in assigns
-                        if norm.is_alloc(a.get("callee"))
+                        if norm.is_acquire(a.get("callee"))
                         or a.get("callee") in atropos.source_catalog(norm.lang))
     tracked_vars.update(e["var"] for e in events if e["kind"] in ("alloc", "free"))
     # Expression-level reads are the structural use alphabet for all frontends.
@@ -422,6 +421,20 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                            else "lifecycle.release"), "var": root,
                            "line": p.get("start_line"), "node": n.get("id"),
                            "callee": p.get("release_method")})
+    # Clang represents delete/delete[] as an expression rather than a call.
+    # It is still a catalogue release and must enter the same structural stream.
+    if norm.lang == "c":
+        for n in ix.nodes_owned_by(fid):
+            p = _props(n)
+            syntax = p.get("syntax_kind") or n.get("kind")
+            label = n.get("label") or ""
+            if syntax != "CXXDeleteExpr" and not str(label).lstrip().startswith("delete"):
+                continue
+            root = _read_root(label, tracked_vars)
+            if root:
+                events.append({"kind": "free", "family": "memory.free", "var": root,
+                               "line": p.get("start_line"), "node": n.get("id"),
+                               "callee": "delete"})
     returns = _returns(ix, fid, alloc_vars, param_set, norm)
     for r in returns:                             # a returned alloc'd local escapes
         if r.get("kind") == "var" and r.get("prov") == "alloc":
@@ -473,7 +486,7 @@ def build_F(store, lang="c", *, return_graph=False):
         recs[name] = _walk_function(ix, regions, nest, sinks, norm, f)
 
     def is_lifecycle_or_sink(c):
-        return c in sink_names or norm.is_alloc(c) or norm.is_release(c) or norm.is_realloc(c)
+        return c in sink_names or norm.is_acquire(c) or norm.is_release(c) or norm.is_realloc(c)
 
     # Compute the transitive caller closure once.  The old implementation launched a
     # depth-first walk from every function, allocating a fresh ``seen`` set each time;

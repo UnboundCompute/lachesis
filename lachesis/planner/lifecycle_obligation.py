@@ -50,7 +50,7 @@ class LifecycleOperation:
                 continue
             from ..flow.normalize import normalizer
             norm = normalizer(lang)
-            if norm.is_alloc(callee) or norm.is_release(callee) or \
+            if norm.is_acquire(callee) or norm.is_release(callee) or \
                     callee in atropos.source_catalog(lang):
                 props = node.get("properties") or {}
                 for key in ("return_value_id", "value_id", "assigned_value_id"):

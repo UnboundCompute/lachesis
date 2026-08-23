@@ -76,6 +76,7 @@ class Normalizer:
         lc = atropos.detection("lifecycle-roles")
         alloc_kinds = set(lc.get("alloc_kinds") or [])
         alloc_extra = set((lc.get("alloc") or {}).get(lang) or [])
+        self.acquire_method_names = set((lc.get("acquire_methods") or {}).get(lang) or [])
         self.dealloc_names = set((lc.get("dealloc") or {}).get(lang) or [])
         # Managed-language destructors are method names in the source graph rather
         # than C-style free symbols.  Keep this vocabulary in the lifecycle catalog;
@@ -96,6 +97,11 @@ class Normalizer:
     def is_alloc(self, callee):
         """True if `callee` allocates an owned object (a lifecycle alloc event source)."""
         return self.canon_callee(callee) in self.alloc_names
+
+    def is_acquire(self, callee):
+        """True for a catalogue-managed acquisition returning a tracked resource."""
+        name = self.canon_callee(callee)
+        return name in self.alloc_names or name in self.acquire_method_names
 
     def is_dealloc(self, callee):
         """True if `callee` frees its pointer argument (a lifecycle free event source)."""
