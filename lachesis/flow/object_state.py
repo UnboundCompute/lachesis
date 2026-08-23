@@ -11,7 +11,7 @@ variable's spelling.
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Hashable, Iterable, Mapping, Sequence
 
@@ -424,6 +424,11 @@ class AnalysisResult:
     transfers: int
     widenings: int
     capped: bool
+    # Abstract states immediately before each CFG node's operations.  Consumers
+    # such as the semantic skeleton builder can reuse the field-sensitive,
+    # loop-widened identity domain instead of reconstructing it from a flat op
+    # stream.  States are snapshots, not mutable analyzer internals.
+    point_states: Mapping[Hashable, tuple[AbstractState, ...]] = field(default_factory=dict)
 
 
 class _DiscardFindings:
@@ -538,6 +543,10 @@ class ObjectStateAnalyzer:
         for node in nodes:
             if not successors.get(node):
                 exits.extend(self._transfer(incoming[node].values(), at.get(node, ()), findings).values())
+        point_states = {
+            node: tuple(state.clone() for state in states.values())
+            for node, states in incoming.items()
+        }
         return AnalysisResult(
             findings=findings,
             exit_states=tuple(exits),
@@ -545,4 +554,5 @@ class ObjectStateAnalyzer:
             transfers=transfers,
             widenings=widenings,
             capped=bool(work),
+            point_states=point_states,
         )

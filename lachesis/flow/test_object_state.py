@@ -196,6 +196,25 @@ class ObjectStateTests(unittest.TestCase):
                                                {"a": ["f"], "f": ["r"]}, ops)
         self.assertEqual({f.pattern for f in result.findings}, {"double-free"})
 
+    def test_point_states_expose_widened_field_sensitive_identity(self):
+        field = P.child("data")
+        alias = Q
+        ops = [
+            op(OpKind.ALLOC, "alloc", field, site="site"),
+            op(OpKind.COPY, "alias", alias, source=field),
+            op(OpKind.FREE, "free", field),
+            op(OpKind.USE, "use", alias),
+        ]
+        result = ObjectStateAnalyzer().analyze(
+            ["alloc", "alias", "free", "use"],
+            {"alloc": ["alias"], "alias": ["free"],
+             "free": ["use"], "use": []},
+            ops,
+        )
+        state = result.point_states["use"][0]
+        self.assertEqual(state.resolve(alias), state.resolve(field))
+        self.assertIn(ObjectFact.FREED, state.facts[state.resolve(alias)])
+
     def test_unplaced_operation_is_reported(self):
         missing = op(OpKind.FREE, "missing", P)
         result = ObjectStateAnalyzer().analyze(["entry"], {}, [missing])
