@@ -22,7 +22,7 @@ import json
 import os
 from collections import deque
 
-from .patterns import substrate, evaluate
+from .patterns import substrate, evaluate_all
 
 
 def match_reach(skel):
@@ -32,8 +32,7 @@ def match_reach(skel):
         if t["t"] != "sink":
             continue
         fact = substrate(t["family"], t["tainted"], t["bound"], t["guarded"])
-        ev = evaluate(t["family"], fact)
-        if ev:
+        for ev in evaluate_all(t["family"], fact):
             leads.append({"pattern": ev, "family": t["family"],
                           "at": f"{t['callee']}#{t['arg']}", "entry": skel["entry"],
                           "value": t.get("var"), "guarded": t["guarded"],

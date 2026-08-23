@@ -118,17 +118,25 @@ def evaluator_catalog():
 def evaluate(sink_kind, fact):
     """Route a substrate fact through the evaluator its kind selects. Returns the evaluator
     name if the pattern fires, else None (unknown kind, or predicate not satisfied)."""
-    ev = KIND_EVALUATOR.get(sink_kind)
-    if ev is None:
-        ev = evaluator_catalog().get("kind_evaluator", {}).get(sink_kind)
+    catalog = evaluator_catalog()
+    ev = catalog.get("kind_evaluator", {}).get(sink_kind, KIND_EVALUATOR.get(sink_kind))
     if ev is None:
         return None
     names = [ev] if isinstance(ev, str) else ev
-    for name in names:
-        evaluator = EVALUATORS.get(name)
-        if evaluator is not None and evaluator(fact):
-            return name
-    return None
+    matches = [name for name in names
+               if name in EVALUATORS and EVALUATORS[name](fact)]
+    return matches[0] if matches else None
+
+
+def evaluate_all(sink_kind, fact):
+    """Return every catalogued evaluator that fires for one substrate fact."""
+    catalog = evaluator_catalog()
+    ev = catalog.get("kind_evaluator", {}).get(sink_kind, KIND_EVALUATOR.get(sink_kind))
+    if ev is None:
+        return []
+    names = [ev] if isinstance(ev, str) else ev
+    return [name for name in names
+            if name in EVALUATORS and EVALUATORS[name](fact)]
 
 
 def is_call_level(sink_kind):
@@ -137,7 +145,6 @@ def is_call_level(sink_kind):
     fires even with constant arguments. Every other class is ARG-level: the occurrence is a
     (call, argument) pair carrying a value the taint/bound predicates read. Adding a new
     presence KIND needs no code; only a new occurrence granularity would."""
-    ev = KIND_EVALUATOR.get(sink_kind)
-    if ev is None:
-        ev = evaluator_catalog().get("kind_evaluator", {}).get(sink_kind)
+    catalog = evaluator_catalog()
+    ev = catalog.get("kind_evaluator", {}).get(sink_kind, KIND_EVALUATOR.get(sink_kind))
     return ev == "presence" or (isinstance(ev, list) and "presence" in ev)
