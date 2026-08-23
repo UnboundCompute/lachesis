@@ -392,11 +392,28 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                            "node": c["id"], "callee": callee})
 
     alloc_vars = {a["var"] for a in assigns}
-    tracked_vars = set(params)
+    tracked_vars = set()
     tracked_vars.update(a["var"] for a in assigns
                         if norm.is_acquire(a.get("callee"))
                         or a.get("callee") in atropos.source_catalog(norm.lang))
     tracked_vars.update(e["var"] for e in events if e["kind"] in ("alloc", "free"))
+    # Explicit frontend release nodes (Python `del`/context exit) are also
+    # evidence that their target is a tracked resource.  Collect them before
+    # scanning reads so a subsequent member/index access is in scope.
+    for n in ix.nodes_owned_by(fid, "release"):
+        target = ix.nodes.get((_props(n)).get("target_id")) or {}
+        root = _read_root(target.get("label") or n.get("label"), set(params))
+        if root:
+            tracked_vars.add(root)
+    if norm.lang == "c":
+        for n in ix.nodes_owned_by(fid):
+            p = _props(n)
+            syntax = p.get("syntax_kind") or n.get("kind")
+            label = n.get("label") or ""
+            if syntax == "CXXDeleteExpr" or str(label).lstrip().startswith("delete"):
+                root = _read_root(label, set(params))
+                if root:
+                    tracked_vars.add(root)
     # Expression-level reads are the structural use alphabet for all frontends.
     # They are emitted only when the base is already tracked by an acquisition,
     # release, or source; ordinary object/property reads never enter the stream.
