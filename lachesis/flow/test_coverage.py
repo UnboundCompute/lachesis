@@ -52,6 +52,25 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertNotIn(("only_a", "source_b"), region.state_keys)
         self.assertNotIn(("only_b", "source_a"), region.state_keys)
 
+    def test_source_sites_create_distinct_context_keys(self):
+        functions = {
+            "source": {
+                "source_sites": [
+                    {"node": "site_b", "callee": "read", "line": 20},
+                    {"node": "site_a", "callee": "read", "line": 10},
+                ],
+                "callers": [],
+            },
+            "deep": {"callers": ["source"]},
+        }
+        plan = CoverageScheduler(functions, {"source": ["deep"], "deep": []}).plan(["deep"])
+        self.assertEqual(plan.context_keys, (
+            ("deep", "source", "site_a"),
+            ("deep", "source", "site_b"),
+            ("source", "source", "site_a"),
+            ("source", "source", "site_b"),
+        ))
+
     def test_fragment_store_tracks_source_state_keys(self):
         store = FragmentStore()
         store.mark_covered([("worker", "source")])
@@ -63,6 +82,19 @@ class CoverageSchedulerTests(unittest.TestCase):
         functions = {"worker": {}}
         first = store.key(functions, "c", coverage={"state_keys": [["worker", "a"]]})
         second = store.key(functions, "c", coverage={"state_keys": [["worker", "b"]]})
+        self.assertNotEqual(first, second)
+
+    def test_fragment_cache_key_includes_source_contexts(self):
+        store = FragmentStore()
+        functions = {"worker": {}}
+        first = store.key(functions, "c", coverage={
+            "state_keys": [["worker", "source"]],
+            "context_keys": [["worker", "source", "site_a"]],
+        })
+        second = store.key(functions, "c", coverage={
+            "state_keys": [["worker", "source"]],
+            "context_keys": [["worker", "source", "site_b"]],
+        })
         self.assertNotEqual(first, second)
 
     def test_fragment_cache_reuses_a_coverage_superset(self):
@@ -132,6 +164,27 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertTrue(built.coverage["converged"])
         self.assertEqual(store.covered_states,
                          {("worker", "source_a"), ("worker", "source_b")})
+
+    def test_claus_records_materialized_source_contexts(self):
+        graph = SkeletonGraph()
+        graph.add_node("source:site_a:event", fragment="source")
+        graph.add_node("worker:entry", fragment="worker")
+        graph.add_edge("source:site_a:event", "worker:entry")
+        graph.add_fragment("source", "source:site_a:event", ("source:site_a:event",))
+        graph.add_fragment("worker", "worker:entry", ("worker:entry",))
+        graph.source_reachable.add("source:site_a:event")
+        coverage = {"regions": [{
+            "state_keys": [["worker", "source"]],
+            "context_keys": [["worker", "source", "site_a"]],
+        }], "state_keys": [["worker", "source"]],
+            "context_keys": [["worker", "source", "site_a"]]}
+        store = FragmentStore()
+        with patch("lachesis.flow.emit.build_semantic_graph", return_value=graph):
+            built = Claus(store).build(object(), {"worker": {}, "source": {}}, {},
+                                       coverage=coverage)
+        self.assertTrue(built.coverage["converged"])
+        self.assertEqual(store.covered_contexts,
+                         {("worker", "source", "site_a")})
 
     def test_incompatible_partial_cache_falls_back_instead_of_raising(self):
         store = FragmentStore()

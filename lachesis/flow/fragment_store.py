@@ -22,9 +22,10 @@ class FragmentStore:
 
     _graphs: dict[tuple[Any, ...], SkeletonGraph] = field(default_factory=dict)
     _coverage_graphs: dict[
-        tuple[Any, ...], list[tuple[frozenset[tuple[str, str]], SkeletonGraph]]
+        tuple[Any, ...], list[tuple[frozenset[tuple], SkeletonGraph]]
     ] = field(default_factory=dict)
     covered_states: set[tuple[str, str]] = field(default_factory=set)
+    covered_contexts: set[tuple[str, str, str]] = field(default_factory=set)
 
     @staticmethod
     def _coverage_key(coverage) -> tuple[tuple[str, str], ...]:
@@ -39,6 +40,23 @@ class FragmentStore:
         ))
 
     @staticmethod
+    def _context_key(coverage) -> tuple[tuple[str, str, str], ...]:
+        if coverage is None:
+            return ()
+        if hasattr(coverage, "context_keys"):
+            return tuple(sorted(tuple(key) for key in coverage.context_keys))
+        if hasattr(coverage, "to_dict"):
+            coverage = coverage.to_dict()
+        return tuple(sorted(tuple(key) for key in coverage.get("context_keys", ())))
+
+    @classmethod
+    def _coverage_signature(cls, coverage) -> frozenset[tuple]:
+        return frozenset(
+            [("state",) + key for key in cls._coverage_key(coverage)]
+            + [("context",) + key for key in cls._context_key(coverage)]
+        )
+
+    @staticmethod
     def _fingerprint(value: Any) -> str:
         """Stable content identity for semantic inputs rebuilt by each pass."""
         try:
@@ -51,7 +69,7 @@ class FragmentStore:
     def key(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None) -> tuple[Any, ...]:
         return self._base_key(functions, lang, graph, summaries, reach_summaries) + (
-            self._coverage_key(coverage),)
+            self._coverage_key(coverage), self._context_key(coverage))
 
     @staticmethod
     def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
@@ -68,7 +86,7 @@ class FragmentStore:
                                            reach_summaries))
         if exact is not None:
             return exact
-        requested = frozenset(self._coverage_key(coverage))
+        requested = self._coverage_signature(coverage)
         if not requested:
             return None
         base = self._base_key(functions, lang, graph, summaries, reach_summaries)
@@ -84,7 +102,7 @@ class FragmentStore:
         # their state sets cover the request; requiring one graph to be a
         # superset would throw away already-built regions and restart Claus.
         remaining = set(requested)
-        selected: list[tuple[frozenset[tuple[str, str]], SkeletonGraph]] = []
+        selected: list[tuple[frozenset[tuple], SkeletonGraph]] = []
         available = list(candidates)
         while remaining and available:
             index, (states, value) = max(
@@ -155,7 +173,7 @@ class FragmentStore:
         self._graphs[self.key(functions, lang, graph, summaries, coverage,
                               reach_summaries)] = semantic_graph
         base = self._base_key(functions, lang, graph, summaries, reach_summaries)
-        states = frozenset(self._coverage_key(coverage))
+        states = self._coverage_signature(coverage)
         entries = self._coverage_graphs.setdefault(base, [])
         entries[:] = [(known, value) for known, value in entries
                       if known != states]
@@ -165,12 +183,18 @@ class FragmentStore:
     def mark_covered(self, state_keys) -> None:
         self.covered_states.update(tuple(key) for key in state_keys)
 
+    def mark_contexts_covered(self, context_keys) -> None:
+        self.covered_contexts.update(tuple(key) for key in context_keys)
+
     def uncovered(self, state_keys):
         return tuple(sorted(set(tuple(key) for key in state_keys) - self.covered_states))
 
+    def uncovered_contexts(self, context_keys):
+        return tuple(sorted(set(tuple(key) for key in context_keys) - self.covered_contexts))
+
     def pending(self, plan):
         """Return the next deterministic source-rooted regions still uncovered."""
-        return plan.pending_regions(self.covered_states)
+        return plan.pending_regions(self.covered_states, self.covered_contexts)
 
 
 class Claus:
@@ -242,6 +266,55 @@ class Claus:
                 materialized.append((target, source))
         return materialized
 
+    @staticmethod
+    def _materialized_contexts(graph: SkeletonGraph, context_keys):
+        """Prove source-site contexts using the same pushdown walk as states."""
+        materialized = []
+        for key in context_keys:
+            if len(key) != 3:
+                continue
+            target, source, context = key
+            source_fragment = graph.fragments.get(source)
+            if source_fragment is None or target not in graph.fragments:
+                continue
+            if context == "__entry__":
+                starts = [source_fragment.entry]
+            else:
+                starts = sorted(
+                    node_id for node_id in graph.source_reachable
+                    if graph.nodes.get(node_id) is not None
+                    and graph.nodes[node_id].fragment == source
+                    and context in node_id)
+                # A declared source site without a corresponding emitted launch
+                # node is unresolved; do not silently credit it via the entry.
+                if not starts:
+                    continue
+            queue = [(entry, ()) for entry in starts]
+            seen = set(queue)
+            reachable = False
+            while queue and not reachable:
+                node, stack = queue.pop()
+                if graph.nodes[node].fragment == target:
+                    reachable = True
+                    break
+                for edge in graph.edges.get(node, ()):
+                    next_stack = stack
+                    if edge.kind == "call":
+                        if edge.return_to is None:
+                            continue
+                        next_stack = stack + (edge.return_to,)
+                    elif edge.kind == "return":
+                        if not stack or edge.target != stack[-1]:
+                            continue
+                        next_stack = stack[:-1]
+                    state = (edge.target, next_stack)
+                    if state not in seen:
+                        seen.add(state)
+                        queue.append(state)
+            if reachable:
+                materialized.append((target, source, context))
+        return materialized
+
     def _record_coverage(self, graph: SkeletonGraph, coverage) -> SkeletonGraph:
         """Attach honest coverage accounting to both fresh and cached graphs."""
         if coverage is None:
@@ -249,16 +322,23 @@ class Claus:
         graph.coverage = coverage.to_dict() if hasattr(coverage, "to_dict") else dict(coverage)
         planned_keys = [tuple(key) for region in graph.coverage.get("regions", [])
                         for key in region.get("state_keys", [])]
+        planned_contexts = [tuple(key) for region in graph.coverage.get("regions", [])
+                            for key in region.get("context_keys", [])]
         # A plan describes work that should be attempted; it is not proof that
         # the graph contains it.  Reuse the same pushdown-aware materialization
         # check for cache hits and freshly emitted graphs.
         materialized = self._materialized_states(graph, planned_keys)
+        materialized_contexts = self._materialized_contexts(graph, planned_contexts)
         self.fragments.mark_covered(materialized)
+        self.fragments.mark_contexts_covered(materialized_contexts)
         pending = tuple(sorted(set(planned_keys) - set(materialized)))
+        pending_contexts = tuple(sorted(set(planned_contexts) - set(materialized_contexts)))
         graph.coverage.update({
             "covered_states": [list(key) for key in sorted(self.fragments.covered_states)],
+            "covered_contexts": [list(key) for key in sorted(self.fragments.covered_contexts)],
             "uncovered_states": [list(key) for key in pending],
-            "converged": not pending,
+            "uncovered_contexts": [list(key) for key in pending_contexts],
+            "converged": not pending and not pending_contexts,
         })
         return graph
 

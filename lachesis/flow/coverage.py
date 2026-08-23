@@ -17,6 +17,7 @@ class CoverageRegion:
     sources: tuple[str, ...]
     functions: tuple[str, ...]
     state_keys: tuple[tuple[str, str], ...]
+    context_keys: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,13 @@ class CoveragePlan:
         """All source-rooted semantic states this plan requires, deterministically."""
         return tuple(sorted({key for region in self.regions for key in region.state_keys}))
 
-    def pending_regions(self, covered_states: Iterable[tuple[str, str]] = ()) -> tuple[CoverageRegion, ...]:
+    @property
+    def context_keys(self) -> tuple[tuple[str, str, str], ...]:
+        """Source-site-rooted contexts required by the region."""
+        return tuple(sorted({key for region in self.regions for key in region.context_keys}))
+
+    def pending_regions(self, covered_states: Iterable[tuple[str, str]] = (),
+                        covered_contexts: Iterable[tuple[str, str, str]] | None = None) -> tuple[CoverageRegion, ...]:
         """Return regions whose source/state work has not been materialized yet.
 
         Coverage is keyed by ``(function, source)`` rather than by a function
@@ -42,23 +49,34 @@ class CoveragePlan:
         boundary consumed by Claus/fragment stores.
         """
         covered = {tuple(key) for key in covered_states}
+        contexts = ({tuple(key) for key in covered_contexts}
+                    if covered_contexts is not None else None)
         return tuple(region for region in self.regions
-                     if any(tuple(key) not in covered for key in region.state_keys))
+                     if (any(tuple(key) not in covered for key in region.state_keys)
+                         or (contexts is not None
+                             and any(tuple(key) not in contexts for key in region.context_keys))))
 
-    def converged(self, covered_states: Iterable[tuple[str, str]] = ()) -> bool:
+    def converged(self, covered_states: Iterable[tuple[str, str]] = (),
+                  covered_contexts: Iterable[tuple[str, str, str]] | None = None) -> bool:
         """Whether every planned source-rooted state has been materialized."""
         covered = {tuple(key) for key in covered_states}
-        return all(tuple(key) in covered for key in self.state_keys)
+        contexts = ({tuple(key) for key in covered_contexts}
+                    if covered_contexts is not None else None)
+        return (all(tuple(key) in covered for key in self.state_keys)
+                and (contexts is None
+                     or all(tuple(key) in contexts for key in self.context_keys)))
 
     def to_dict(self) -> dict:
         return {
             "regions": [{"target": region.target, "sources": list(region.sources),
                          "functions": list(region.functions),
-                         "state_keys": [list(key) for key in region.state_keys]}
+                         "state_keys": [list(key) for key in region.state_keys],
+                         "context_keys": [list(key) for key in region.context_keys]}
                         for region in self.regions],
             "covered_functions": sorted(self.covered_functions),
             "uncovered_functions": sorted(self.uncovered_functions),
             "state_keys": [list(key) for key in self.state_keys],
+            "context_keys": [list(key) for key in self.context_keys],
         }
 
 
@@ -106,6 +124,15 @@ class CoverageScheduler:
                     queue.append(callee)
         return seen
 
+    def _source_contexts(self, source: str) -> tuple[str, ...]:
+        sites = self.functions.get(source, {}).get("source_sites", ())
+        contexts = []
+        for site in sites:
+            token = site.get("node") or (
+                f"{site.get('callee') or 'source'}@{site.get('line') or 0}")
+            contexts.append(str(token))
+        return tuple(sorted(set(contexts))) or ("__entry__",)
+
     def plan(self, targets: Iterable[str] | None = None) -> CoveragePlan:
         selected = sorted(set(targets) if targets is not None else self.functions)
         source_functions = set(self._source_functions())
@@ -143,7 +170,14 @@ class CoverageScheduler:
                 for source in sources
                 for function in sorted(forward_by_source.get(source, ()))
             )
-            regions.append(CoverageRegion(target, sources, tuple(sorted(forward)), state_keys))
+            context_keys = tuple(
+                (function, source, context)
+                for source in sources
+                for context in self._source_contexts(source)
+                for function in sorted(forward_by_source.get(source, ()))
+            )
+            regions.append(CoverageRegion(target, sources, tuple(sorted(forward)),
+                                          state_keys, context_keys))
             covered.update(forward)
         return CoveragePlan(tuple(regions), frozenset(covered),
                             frozenset(set(self.functions) - covered))
