@@ -68,6 +68,14 @@ class PipelineLifetimeTests(unittest.TestCase):
         successors = {"empty": [], "wrapper": ["alloc"], "alloc": []}
         self.assertEqual(set(_lifetime_slice(functions, successors)), {"wrapper", "alloc"})
 
+    def test_source_reachable_parameter_function_is_not_dropped_before_semantic_pass(self):
+        functions = {
+            "pointer_only": {"source_reachable": True, "params": ["buffer"],
+                              "file": "fixture.c", "line": 10},
+        }
+        self.assertEqual(set(_lifetime_slice(functions, {"pointer_only": []})),
+                         {"pointer_only"})
+
 
 if __name__ == "__main__":
     unittest.main()

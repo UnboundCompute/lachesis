@@ -45,7 +45,15 @@ def _lifetime_slice(F, succ, lang="c"):
 
     seeds = {
         name for name, function in F.items()
-        if (function.get("source_reachable") and carries_semantic_work(function))
+        # Source-rooted Pass 3 must not require a sink-shaped fact before it
+        # explores a function.  A pointer-arithmetic or language-specific
+        # semantic operation can be invisible to the generic operation census
+        # and still be the only route to a matcher pattern.  The source
+        # discovery result is the authoritative reachability gate; Claus and
+        # the matcher decide later whether the region contains useful facts.
+        if (function.get("source_reachable") and
+            (carries_semantic_work(function) or function.get("params") or
+             function.get("returns")))
         or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
         or any(call.get("is_sink") or call.get("callee") in sink_names
