@@ -55,6 +55,23 @@ class CoverageSchedulerTests(unittest.TestCase):
             semantic,
         )
 
+    def test_fragment_cache_uses_content_not_transient_summary_identity(self):
+        store = FragmentStore()
+        functions = {"worker": {"events": [{"kind": "alloc"}]}}
+        graph = object()
+        semantic = object()
+        store.put(functions, "c", graph, semantic,
+                  summaries={"worker": [["alloc"]]},
+                  coverage={"state_keys": [["worker", "a"]]})
+        equivalent_functions = {"worker": {"events": [{"kind": "alloc"}]}}
+        equivalent_summaries = {"worker": [["alloc"]]}
+        self.assertIs(
+            store.get(equivalent_functions, "c", graph,
+                      summaries=equivalent_summaries,
+                      coverage={"state_keys": [["worker", "a"]]}),
+            semantic,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

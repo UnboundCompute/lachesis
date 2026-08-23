@@ -9,6 +9,8 @@ changing the pipeline contract.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 from typing import Any, Mapping
 
 from .semantic_graph import SkeletonGraph
@@ -36,6 +38,16 @@ class FragmentStore:
             tuple(key) for key in coverage.get("state_keys", ())
         ))
 
+    @staticmethod
+    def _fingerprint(value: Any) -> str:
+        """Stable content identity for semantic inputs rebuilt by each pass."""
+        try:
+            encoded = json.dumps(value, sort_keys=True, default=repr,
+                                 separators=(",", ":"))
+        except (TypeError, ValueError):
+            encoded = repr(value)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     def key(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None) -> tuple[Any, ...]:
         return self._base_key(functions, lang, graph, summaries, reach_summaries) + (
@@ -44,8 +56,11 @@ class FragmentStore:
     @staticmethod
     def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
                   summaries: Any, reach_summaries: Any) -> tuple[Any, ...]:
-        return (lang, id(graph), id(summaries), tuple(sorted(functions)),
-                id(reach_summaries))
+        graph_key = (FragmentStore._fingerprint(graph)
+                     if isinstance(graph, (dict, list, tuple)) else id(graph))
+        return (lang, graph_key, FragmentStore._fingerprint(functions),
+                FragmentStore._fingerprint(summaries),
+                FragmentStore._fingerprint(reach_summaries))
 
     def get(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None):

@@ -178,7 +178,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # passing the whole-program plan here would mark functions absent from the
         # skeleton as covered and make Pass 3's convergence claim unsound.
         semantic_coverage = CoverageScheduler(object_functions, object_succ).plan()
-        semantic_graph = Claus().build(
+        # Keep the fragment store on the loaded graph session so repeated Pass 3
+        # requests can reuse covered semantic regions.  The store key fingerprints
+        # rebuilt summaries, so this is safe across fresh F dictionaries as long as
+        # the underlying graph and semantic inputs remain unchanged.
+        claus = getattr(store, "_pass3_claus", None)
+        if claus is None:
+            claus = Claus()
+            store._pass3_claus = claus
+        semantic_graph = claus.build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries, coverage=semantic_coverage,
             reach_summaries=summaries)
