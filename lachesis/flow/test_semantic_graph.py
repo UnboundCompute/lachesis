@@ -1,5 +1,6 @@
 import unittest
 
+from .emit import _cfg_guard_proofs
 from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph, match_graph
 
 
@@ -13,6 +14,15 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_fragment("main", events[0][0], [events[-1][0]])
         g.validate()
         return g
+
+    def test_relational_and_index_guards_keep_distinct_typed_proofs(self):
+        class Sub:
+            @staticmethod
+            def label(_node):
+                return "idx < bound"
+
+        proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
+        self.assertEqual([proof.kind for proof in proofs], ["VALUE", "BOUNDED"])
 
     def test_branch_arms_do_not_form_a_linear_false_positive(self):
         o = ObjRef("O_buf", generation="g0")

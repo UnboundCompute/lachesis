@@ -615,10 +615,18 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
     relational = re.match(r"^(.+?)(<=|>=|==|!=|<|>)(.+)$", condition)
     if relational and "NULL" not in condition:
         left, relation, right = relational.groups()
+        proofs = []
         if target_index:
             inverse = {"<": ">=", "<=": ">", ">": "<=", ">=": "<", "==": "!=", "!=": "=="}
             relation = inverse[relation]
-        return (GuardProof("VALUE", f"{left}{relation}{right}"),)
+        proofs.append(GuardProof("VALUE", f"{left}{relation}{right}"))
+        # An index comparison can additionally establish a bounded access on
+        # the true arm.  Keep VALUE as the general relational fact; BOUNDED is
+        # an orthogonal proof consumed by bounds-aware patterns.
+        if (target_index == 0 and relation in {"<", "<="}
+                and ("[" in condition or left.lower().endswith(("i", "idx", "index")))):
+            proofs.append(GuardProof("BOUNDED", f"{left},{right}"))
+        return tuple(proofs)
     return ()
 
 
