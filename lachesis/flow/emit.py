@@ -305,6 +305,22 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         prefix = f"{name}:"
         for n in cfg_nodes:
             result.add_node(prefix + n, fragment=name)
+        predecessors = defaultdict(int)
+        for source, targets in cfg.get("succ", {}).items():
+            for target in targets:
+                if target in cfg_nodes:
+                    predecessors[target] += 1
+        for n in cfg_nodes:
+            # Keep structure explicit in the graph even when the node has no
+            # operation attached.  A branch takes precedence over a join at a
+            # synthetic CFG node; real joins remain MERGE facts.
+            successors = tuple(target for target in cfg.get("succ", {}).get(n, ())
+                               if target in cfg_nodes)
+            if len(successors) > 1:
+                result.nodes[prefix + n].event = Event(
+                    EventKind.BRANCH, facts={"predicate": sub.label(n) or "branch"})
+            elif predecessors[n] > 1:
+                result.nodes[prefix + n].event = Event(EventKind.MERGE)
         # Native graph composition uses explicit seam edges for known callees.  Do not
         # flatten their SUMMARY effects into the caller as a second release/use stream;
         # that would manufacture double-frees when the callee fragment is also traversed.
@@ -331,6 +347,13 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             for index, op in enumerate(ops):
                 if op.kind == OpKind.ALLOC and op.target is not None:
                     target_key = (op.target.root, tuple(op.target.selectors))
+                    if target_key in generations:
+                        previous_generation = generations[target_key]
+                        if (isinstance(previous_generation, str) and previous_generation.startswith("g")
+                                and previous_generation[1:].isdigit()):
+                            generations[target_key] = f"g{int(previous_generation[1:]) + 1}"
+                    else:
+                        generations[target_key] = "g0"
                     obj = _semantic_obj(sub, op.target, generations.get(target_key, "g0"))
                     attempt_id = f"{anchor}:alloc:{index}:attempt"
                     branch_id = f"{anchor}:alloc:{index}:branch"
@@ -354,6 +377,17 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_edge(branch_id, failure_id, guard=(GuardProof("ISNULL", obj.render()),))
                     result.add_edge(success_id, merge_id)
                     result.add_edge(failure_id, merge_id)
+                    if obj.path:
+                        slot_id = f"{success_id}:slot"
+                        slot = ObjRef(obj.base, generation=obj.generation)
+                        result.add_node(slot_id, Event(EventKind.WRITE_STORAGE, base=slot,
+                                                       path="".join(obj.path), value=obj,
+                                                       obj=slot, line=op.line), fragment=name,
+                                         source_reachable=source_reachable)
+                        result.add_edge(success_id, slot_id)
+                        result.add_edge(slot_id, merge_id)
+                        result.edges[success_id] = [edge for edge in result.edges[success_id]
+                                                   if edge.target != merge_id]
                     previous = merge_id
                     continue
                 if op.kind == OpKind.REALLOC and op.target is not None:
@@ -387,13 +421,23 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     merge_id = f"{anchor}:realloc:{index}:merge"
                     result.add_node(success_origin, Event.origin(fresh, op.line), fragment=name,
                                      source_reachable=source_reachable)
+                    success_slot = None
+                    if old.path:
+                        success_slot = f"{success_origin}:slot"
+                        slot = ObjRef(old.base, generation=old.generation)
+                        result.add_node(success_slot, Event(EventKind.WRITE_STORAGE, base=slot,
+                                                            path="".join(old.path), value=fresh,
+                                                            obj=slot, line=op.line), fragment=name,
+                                         source_reachable=source_reachable)
                     result.add_node(failure_null, Event(EventKind.WRITE_STORAGE_NULL, obj=fresh, line=op.line), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(failure_lost, Event(EventKind.LOST_FROM_SLOT, obj=old, slot=old, line=op.line), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(merge_id, None, fragment=name, source_reachable=source_reachable)
                     result.add_edge(success_id, success_origin)
-                    result.add_edge(success_origin, merge_id)
+                    result.add_edge(success_origin, success_slot or merge_id)
+                    if success_slot:
+                        result.add_edge(success_slot, merge_id)
                     result.add_edge(failure_id, failure_null)
                     result.add_edge(failure_null, failure_lost)
                     result.add_edge(failure_lost, merge_id)
@@ -408,13 +452,21 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_edge(previous, event_id)
                     previous = event_id
             last_for_cfg[n] = previous
+        cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
         for n in cfg_nodes:
             source = last_for_cfg[n]
             targets = list(cfg.get("succ", {}).get(n, ()))
             for target_index, target in enumerate(targets):
                 if target in cfg_nodes:
-                    result.add_edge(source, prefix + target,
-                                    guard=_cfg_guard_proofs(sub, n, target_index, len(targets)))
+                    guard = _cfg_guard_proofs(sub, n, target_index, len(targets))
+                    if cfg_positions.get(target, 0) <= cfg_positions.get(n, 0):
+                        loop_id = f"{prefix}{n}:loop:{target_index}"
+                        result.add_node(loop_id, Event(EventKind.LOOP), fragment=name,
+                                         source_reachable=bool(functions[name].get("source_reachable", False)))
+                        result.add_edge(source, loop_id, guard=guard)
+                        result.add_edge(loop_id, prefix + target)
+                    else:
+                        result.add_edge(source, prefix + target, guard=guard)
         exits = {n for n in cfg_nodes if not cfg.get("succ", {}).get(n)}
         result.add_fragment(name, prefix + cfg_nodes[0],
                             (prefix + n for n in exits),
