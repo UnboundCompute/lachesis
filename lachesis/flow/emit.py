@@ -793,6 +793,34 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         if event is not None and event.kind == EventKind.RETURN_VALUE \
                                 and event.obj is not None:
                             return_binding.append((receiver_ref, event.obj))
+                    # A returned aggregate can carry aliases between its fields
+                    # (for example `result->borrowed = result->meta->name`).
+                    # Local DERIVE bindings otherwise disappear when the callee
+                    # returns, even though both paths are part of the returned
+                    # object's observable state. Export only relations rooted in
+                    # the returned object and rebase them onto the caller's
+                    # receiver; unrelated callee locals must not escape.
+                    returned_bases = {
+                        graph_node.event.obj.base
+                        for graph_node in result.nodes.values()
+                        if graph_node.fragment == callee
+                        and graph_node.event is not None
+                        and graph_node.event.kind == EventKind.RETURN_VALUE
+                        and graph_node.event.obj is not None
+                    }
+                    for graph_node in result.nodes.values():
+                        event = graph_node.event
+                        if (graph_node.fragment != callee
+                                or event is None
+                                or event.kind != EventKind.DERIVE
+                                or event.obj is None or event.value is None
+                                or event.obj.base not in returned_bases
+                                or event.value.base not in returned_bases):
+                            continue
+                        return_binding.append((
+                            ObjRef(receiver_ref.base, event.obj.path, event.obj.generation),
+                            ObjRef(receiver_ref.base, event.value.path, event.value.generation),
+                        ))
                 result.add_edge(
                     callee_exit, exit_node, kind="return",
                     binding=tuple(dict.fromkeys(return_binding)))
