@@ -297,6 +297,14 @@ def _semantic_event(sub, operation, generations=None):
                 Event(EventKind.INVALIDATE, obj=obj, line=operation.line),
                 Event.origin(fresh, operation.line)]
     if operation.kind == OpKind.USE and obj:
+        if operation.access == "pointer-arithmetic":
+            source_key = _semantic_key(sub, operation.source)
+            source = (_semantic_obj(sub, operation.source,
+                                    generations.get(source_key, "g0"), operation.node)
+                      if operation.source is not None else None)
+            return [Event(EventKind.POINTER_ARITHMETIC, obj=obj, base=source,
+                          line=operation.line,
+                          facts={"validated": False})]
         # A storage access is anchored at the owning object.  Its selectors belong
         # to the event path, not to the identity used for lifetime matching.  This
         # is what lets ``free(p); p->field`` match the same generation of ``p``.

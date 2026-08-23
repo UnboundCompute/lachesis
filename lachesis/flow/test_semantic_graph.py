@@ -82,6 +82,20 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(hit["pattern_id"],
                          "mem.arithmetic.overflow-before-bound")
 
+    def test_pointer_arithmetic_before_validation_has_public_id(self):
+        base = ObjRef("buffer")
+        derived = ObjRef("location")
+        events = [
+            ("derive", Event(EventKind.POINTER_ARITHMETIC,
+                              obj=derived, base=base, line=1)),
+            ("read", Event.read(derived, "*", 2)),
+        ]
+        g = self._graph(events, [("derive", "read")])
+        hit = next(hit for hit in match_graph(g)
+                   if hit["pattern"] == "pointer-arithmetic-before-validation")
+        self.assertEqual(hit["pattern_id"],
+                         "mem.pointer-arithmetic.before-validation")
+
     def test_checked_nullable_return_deref_is_not_unchecked(self):
         obj = ObjRef("result")
         events = [

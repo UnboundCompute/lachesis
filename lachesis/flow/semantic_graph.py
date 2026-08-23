@@ -34,6 +34,7 @@ class EventKind(str, Enum):
     SEAM_EXIT = "seam_exit"
     RETURN = "return"
     SINK = "sink"
+    POINTER_ARITHMETIC = "pointer_arithmetic"
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,9 @@ FROZEN_PATTERNS = {
     "mem.lifetime.realloc-failure-leak": PatternSpec(
         "mem.lifetime.realloc-failure-leak", (EventKind.REALLOC_FAILED,)),
     "leak": PatternSpec("leak", (EventKind.ORIGIN,)),
+    "pointer-arithmetic-before-validation": PatternSpec(
+        "pointer-arithmetic-before-validation", (EventKind.POINTER_ARITHMETIC,
+                                                   EventKind.READ_STORAGE)),
 }
 
 
@@ -267,6 +271,7 @@ class _State:
     sink_allocs: tuple[tuple[str, str], ...] = ()
     nullable: frozenset[ObjRef] = frozenset()
     realloc_lost: frozenset[ObjRef] = frozenset()
+    pointer_arithmetic: frozenset[tuple[ObjRef, ObjRef | None]] = frozenset()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -302,6 +307,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             tuple(sorted(set(left.sink_allocs) | set(right.sink_allocs))),
             left.nullable | right.nullable,
             left.realloc_lost | right.realloc_lost,
+            left.pointer_arithmetic | right.pointer_arithmetic,
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -324,6 +330,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         sink_allocs = dict(state.sink_allocs)
         nullable = set(state.nullable)
         realloc_lost = set(state.realloc_lost)
+        pointer_arithmetic = set(state.pointer_arithmetic)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -426,6 +433,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             if event is not None and event.kind == EventKind.DERIVE and event.obj and event.value:
                 bindings[event.obj] = canonical(event.value) or event.value
                 obj = canonical(event.obj)
+            if event is not None and event.kind == EventKind.POINTER_ARITHMETIC and obj:
+                pointer_arithmetic.add((obj, canonical(event.base)))
             is_null_write = (event.kind == EventKind.WRITE_STORAGE_NULL or
                              (event.kind == EventKind.WRITE_STORAGE and event.facts.get("null")))
             if is_null_write and raw_obj:
@@ -445,6 +454,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
             elif event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE) and base and not is_null_write:
+                if ("pointer-arithmetic-before-validation" in wanted
+                        and any(equivalent(pointer, base)
+                                for pointer, _source in pointer_arithmetic)):
+                    _record(hits, "pointer-arithmetic-before-validation", base,
+                            node, witness())
                 if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released):
                     _record(hits, "uaf.deref", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
@@ -521,6 +535,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                              if (rebased := rebase(nullable_obj)) is not None}
             next_realloc_lost = {rebased for lost_obj in realloc_lost
                                  if (rebased := rebase(lost_obj)) is not None}
+            next_pointer_arithmetic = {
+                (rebased_pointer, rebase(source) if source is not None else None)
+                for pointer, source in pointer_arithmetic
+                if (rebased_pointer := rebase(pointer)) is not None
+            }
             for formal, actual in edge.binding:
                 if formal in next_nulls:
                     next_nulls.add(actual)
@@ -570,6 +589,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 tuple(sorted(sink_allocs.items())),
                                 frozenset(next_nullable),
                                 frozenset(next_realloc_lost))
+            next_state = _State(
+                next_state.node, next_state.released, next_state.origins,
+                next_state.stack, next_state.bindings, next_state.nulls,
+                next_state.escaped, next_state.sink_allocs, next_state.nullable,
+                next_state.realloc_lost, frozenset(next_pointer_arithmetic))
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 bucket_key = (edge.target, stack)

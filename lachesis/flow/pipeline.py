@@ -35,7 +35,8 @@ def _lifetime_slice(F, succ, lang="c"):
     sink_names = set(atropos.sink_catalog(lang))
     seeds = {
         name for name, function in F.items()
-        if any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
+        if function.get("source_reachable")
+        or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
         or any(call.get("is_sink") or call.get("callee") in sink_names
                for call in function.get("calls", ()))

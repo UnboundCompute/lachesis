@@ -159,6 +159,20 @@ def _rhs_kind(sub, ap_builder, norm, rhs):
     return OpKind.CLOBBER, None, _is_null(sub, rhs)
 
 
+def _pointer_arithmetic_source(sub, ap_builder, rhs):
+    """Return the pointer base of a declaration initialized by pointer arithmetic."""
+    expression = _peel(sub, rhs)
+    if expression is None or sub.kind(expression) != "BinaryOperator":
+        return None
+    if (sub.operator(expression) or "") not in {"+", "-"}:
+        return None
+    for child in sub.ast_children.get(expression, ()):
+        path = _path(ap_builder, child)
+        if path is not None:
+            return path
+    return None
+
+
 def _initializer(sub, declaration):
     return sub.initializer_source.get(declaration)
 
@@ -319,6 +333,16 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             anchor = _place(sub, cfg_nodes, _peel(sub, initializer), node)
             operations.append(_op(kind, anchor, target=target, source=payload,
                                   line=_line(sub, node), ordinal=1, is_null=is_null))
+            arithmetic_source = _pointer_arithmetic_source(sub, ap_builder, initializer)
+            if arithmetic_source is not None:
+                # Preserve the derived pointer and its source object as a
+                # semantic fact. The lifetime engine may ignore this USE, but
+                # the reusable skeleton can match a later dereference against
+                # the derived pointer without reparsing the expression.
+                operations.append(_op(
+                    OpKind.USE, anchor, target=target, source=arithmetic_source,
+                    line=_line(sub, node), ordinal=2,
+                    access="pointer-arithmetic"))
 
     # A real memory read/write through an access expression uses its base object.
     for node in owned:
