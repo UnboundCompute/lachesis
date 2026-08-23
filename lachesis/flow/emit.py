@@ -349,7 +349,7 @@ def _semantic_event(sub, operation, generations=None):
 
 
 def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None,
-                         reach_summaries=None):
+                         reach_summaries=None, state_artifacts=None):
     """Build the production frozen-v1 graph from the enriched third-pass substrate.
 
     The existing object interpreter supplies identity-bearing operations and a real structured
@@ -448,6 +448,37 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         operations = extract_operations(
             sub, norm, fid, functions[name], functions, obj_summaries, cfg)
         operation_generations, realloc_generations = _operation_generations(sub, operations)
+        artifact = (state_artifacts or {}).get(name)
+
+        def abstract_facts(operation):
+            """Serialize point-state identities without making them matcher verdicts."""
+            if artifact is None:
+                return {}
+            states = artifact.point_states.get(operation.node, ())
+            if not states:
+                return {}
+            facts = {"abstract_state_count": len(states)}
+            target_ids = {
+                repr(state.resolve(operation.target, create=False))
+                for state in states if operation.target is not None
+            }
+            target_ids.discard("None")
+            if target_ids:
+                facts["abstract_object_ids"] = sorted(target_ids)
+            source_ids = {
+                repr(state.resolve(operation.source, create=False))
+                for state in states if operation.source is not None
+            }
+            source_ids.discard("None")
+            if source_ids:
+                facts["abstract_source_ids"] = sorted(source_ids)
+            return facts
+
+        def annotate(events, operation):
+            facts = abstract_facts(operation)
+            for event in events:
+                event.facts.update(facts)
+            return events
         by_anchor = defaultdict(list)
         source_callees = {item.get("callee") for item in functions[name].get("source_calls", ())}
         source_roots = {root for call in functions[name].get("calls", ())
@@ -578,7 +609,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         result.add_edge(failure_lost, merge_id)
                     previous = merge_id
                     continue
-                for event_index, event in enumerate(_semantic_event(sub, op, operation_generations)):
+                for event_index, event in enumerate(
+                        annotate(_semantic_event(sub, op, operation_generations), op)):
                     event_id = f"{anchor}:event:{index}:{event_index}"
                     result.add_node(event_id, event, fragment=name,
                                     source_reachable=source_reachable,

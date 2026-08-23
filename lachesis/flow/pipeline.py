@@ -212,7 +212,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
         semantic_graph = claus.build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries, coverage=semantic_coverage,
-            reach_summaries=summaries)
+            reach_summaries=summaries, state_artifacts=object_result.artifacts)
         semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another

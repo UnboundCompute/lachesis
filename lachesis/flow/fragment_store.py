@@ -257,7 +257,7 @@ class Claus:
         return graph
 
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
-              coverage=None, reach_summaries=None):
+              coverage=None, reach_summaries=None, state_artifacts=None):
         cached = self.fragments.get(functions, lang, graph, summaries, coverage,
                                     reach_summaries)
         if cached is not None:
@@ -265,7 +265,8 @@ class Claus:
         from .emit import build_semantic_graph
         built = build_semantic_graph(store, functions, successors, lang=lang,
                                      graph=graph, summaries=summaries,
-                                     reach_summaries=reach_summaries)
+                                     reach_summaries=reach_summaries,
+                                     state_artifacts=state_artifacts)
         self._record_coverage(built, coverage)
         return self.fragments.put(functions, lang, graph, built, summaries, coverage,
                                   reach_summaries)
