@@ -43,6 +43,10 @@ def _lifetime_slice(F, succ, lang="c"):
         return bool(function.get("events") or function.get("calls")
                     or function.get("source_calls") or function.get("source_sites"))
 
+    def materializable(function):
+        return (carries_semantic_work(function) or function.get("params") or
+                function.get("returns"))
+
     seeds = {
         name for name, function in F.items()
         # Source-rooted Pass 3 must not require a sink-shaped fact before it
@@ -52,8 +56,7 @@ def _lifetime_slice(F, succ, lang="c"):
         # discovery result is the authoritative reachability gate; Claus and
         # the matcher decide later whether the region contains useful facts.
         if (function.get("source_reachable") and
-            (carries_semantic_work(function) or function.get("params") or
-             function.get("returns")))
+            materializable(function))
         or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
         or any(call.get("is_sink") or call.get("callee") in sink_names
@@ -70,7 +73,8 @@ def _lifetime_slice(F, succ, lang="c"):
     while queue:
         name = queue.popleft()
         for neighbour in set(succ.get(name, ())) | set(reverse.get(name, ())):
-            if neighbour in F and neighbour not in region:
+            if (neighbour in F and neighbour not in region and
+                (materializable(F[neighbour]) or succ.get(neighbour))):
                 region.add(neighbour)
                 queue.append(neighbour)
     return {name: F[name] for name in region}

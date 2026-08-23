@@ -76,6 +76,16 @@ class PipelineLifetimeTests(unittest.TestCase):
         self.assertEqual(set(_lifetime_slice(functions, {"pointer_only": []})),
                          {"pointer_only"})
 
+    def test_empty_compiler_artifact_cannot_keep_region_unconverged(self):
+        functions = {
+            "wrapper": {"source_reachable": True,
+                        "calls": [{"callee": "alloc"}], "file": "fixture.c"},
+            "artifact": {"source_reachable": True, "file": "builtin.c"},
+            "alloc": {"events": [{"kind": "alloc"}], "file": "fixture.c"},
+        }
+        successors = {"wrapper": ["alloc", "artifact"], "alloc": [], "artifact": []}
+        self.assertEqual(set(_lifetime_slice(functions, successors)), {"wrapper", "alloc"})
+
 
 if __name__ == "__main__":
     unittest.main()
