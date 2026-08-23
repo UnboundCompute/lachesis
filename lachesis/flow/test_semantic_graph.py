@@ -46,6 +46,14 @@ class SemanticGraphTests(unittest.TestCase):
         g = self._graph(events, [("start", "derive"), ("derive", "free"), ("free", "use")])
         self.assertTrue(any(h["pattern"] == "uaf.deref" for h in match_graph(g)))
 
+    def test_compare_is_a_dangling_value_use_not_a_deref(self):
+        obj = ObjRef("p", generation="g0")
+        events = [("origin", Event.origin(obj)), ("free", Event.release(obj, 2)),
+                  ("compare", Event(EventKind.COMPARE_VALUE, obj=obj, line=3))]
+        g = self._graph(events, [("origin", "free"), ("free", "compare")])
+        patterns = {hit["pattern"] for hit in match_graph(g)}
+        self.assertEqual(patterns, {"use.dangling"})
+
     def test_null_rebind_is_not_a_second_free_and_null_deref_is_distinct(self):
         obj = ObjRef("p", generation="g0")
         events = [("start", Event.origin(obj)),

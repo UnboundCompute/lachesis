@@ -193,6 +193,14 @@ def _is_unevaluated(sub, node):
     return False
 
 
+def _is_pointer_comparison(sub, node):
+    """Whether a binary expression observes pointer values without dereferencing."""
+    if sub.kind(node) != "BinaryOperator":
+        return False
+    operator = sub.operator(node) or ""
+    return operator in {"==", "!=", "<", "<=", ">", ">="}
+
+
 def _argument_path(sub, ap_builder, call_node, position):
     argument = sub.role_child_at(call_node, "ARGUMENT", position)
     return _path(ap_builder, argument)
@@ -267,6 +275,14 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
 
     # A real memory read/write through an access expression uses its base object.
     for node in owned:
+        if _is_pointer_comparison(sub, node):
+            for child in sub.ast_children.get(node, ()):
+                path = _path(ap_builder, child)
+                if path is not None and _is_pointer(sub, child):
+                    operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
+                                          target=path, line=_line(node), ordinal=1,
+                                          access="compare"))
+            continue
         parent = sub.ast_parent.get(node)
         if parent is not None and sub.is_plain_assign(parent):
             lhs, _rhs = _assignment_operands(sub, parent)

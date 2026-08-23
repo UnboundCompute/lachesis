@@ -243,6 +243,8 @@ def _semantic_event(sub, operation, generations=None):
         storage_obj = ObjRef(obj.base, generation=obj.generation)
         if operation.access == "pass":
             return [Event.pass_value(obj, operation.line)]
+        if operation.access == "compare":
+            return [Event(EventKind.COMPARE_VALUE, obj=obj, line=operation.line)]
         if operation.access == "return":
             return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line)]
         if operation.access == "write":
