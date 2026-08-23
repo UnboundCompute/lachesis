@@ -666,6 +666,48 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
 
 
 def _call_bindings(sub, call, formals):
+    def actual_ref(arg):
+        """Instantiate an actual argument as a field-sensitive object reference.
+
+        Translation keeps both the resolved root and the source expression.  The
+        root alone is insufficient for seams such as ``destroy(node->meta)``:
+        the callee's formal must bind to ``node.*meta``, not to a new object named
+        ``meta``.  This small expression projection mirrors APBuilder's universal
+        selectors while remaining independent of any C library vocabulary.
+        """
+        root = arg.get("root")
+        expression = (arg.get("expr") or "").strip()
+        if not root:
+            return None
+        if not expression or expression == root:
+            return ObjRef(str(root), generation="g0")
+        expression = expression.strip("() ").replace("->", " -> ")
+        tokens = re.findall(r"[A-Za-z_]\w*|->|\.|\*|&|\[[^]]*\]", expression)
+        if not tokens:
+            return ObjRef(str(root), generation="g0")
+        base = tokens[0]
+        if not re.match(r"^[A-Za-z_]\w*$", base):
+            return ObjRef(str(root), generation="g0")
+        selectors = []
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "->" and index + 1 < len(tokens):
+                selectors.extend(("*", tokens[index + 1]))
+                index += 2
+            elif token == "." and index + 1 < len(tokens):
+                selectors.append(tokens[index + 1])
+                index += 2
+            elif token in {"*", "&"}:
+                selectors.append(token)
+                index += 1
+            elif token.startswith("["):
+                selectors.extend((token, "*"))
+                index += 1
+            else:
+                index += 1
+        return ObjRef(base, tuple(selectors), "g0")
+
     bindings = []
     for arg in call.get("args", ()):
         pos = arg.get("pos")
@@ -673,10 +715,10 @@ def _call_bindings(sub, call, formals):
         if not isinstance(pos, int) or pos >= len(formals) or not actual:
             continue
         formal = sub.label(str(formals[pos])) or str(formals[pos])
-        actual = sub.label(str(actual)) or str(actual)
+        actual_ref_value = actual_ref(arg)
         if formal:
             bindings.append((ObjRef(formal, generation="g0"),
-                             ObjRef(actual, generation="g0")))
+                             actual_ref_value or ObjRef(str(actual), generation="g0")))
     return tuple(bindings)
 
 
