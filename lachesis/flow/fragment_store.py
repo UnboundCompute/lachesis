@@ -19,6 +19,9 @@ class FragmentStore:
     """Subsumption-keyed in-memory store for built semantic graphs."""
 
     _graphs: dict[tuple[Any, ...], SkeletonGraph] = field(default_factory=dict)
+    _coverage_graphs: dict[
+        tuple[Any, ...], list[tuple[frozenset[tuple[str, str]], SkeletonGraph]]
+    ] = field(default_factory=dict)
     covered_states: set[tuple[str, str]] = field(default_factory=set)
 
     @staticmethod
@@ -35,19 +38,42 @@ class FragmentStore:
 
     def key(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None) -> tuple[Any, ...]:
+        return self._base_key(functions, lang, graph, summaries, reach_summaries) + (
+            self._coverage_key(coverage),)
+
+    @staticmethod
+    def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
+                  summaries: Any, reach_summaries: Any) -> tuple[Any, ...]:
         return (lang, id(graph), id(summaries), tuple(sorted(functions)),
-                id(reach_summaries), self._coverage_key(coverage))
+                id(reach_summaries))
 
     def get(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None):
-        return self._graphs.get(self.key(functions, lang, graph, summaries, coverage,
-                                          reach_summaries))
+        exact = self._graphs.get(self.key(functions, lang, graph, summaries, coverage,
+                                           reach_summaries))
+        if exact is not None:
+            return exact
+        requested = frozenset(self._coverage_key(coverage))
+        if not requested:
+            return None
+        base = self._base_key(functions, lang, graph, summaries, reach_summaries)
+        # Reuse only a true source/state superset under identical semantic inputs.
+        candidates = self._coverage_graphs.get(base, ())
+        supersets = [(len(states), value) for states, value in candidates
+                     if requested <= states]
+        return min(supersets, key=lambda item: item[0])[1] if supersets else None
 
     def put(self, functions: Mapping[str, Mapping], lang: str, graph: Any,
             semantic_graph: SkeletonGraph, summaries: Any = None,
             coverage=None, reach_summaries: Any = None) -> SkeletonGraph:
         self._graphs[self.key(functions, lang, graph, summaries, coverage,
                               reach_summaries)] = semantic_graph
+        base = self._base_key(functions, lang, graph, summaries, reach_summaries)
+        states = frozenset(self._coverage_key(coverage))
+        entries = self._coverage_graphs.setdefault(base, [])
+        entries[:] = [(known, value) for known, value in entries
+                      if known != states]
+        entries.append((states, semantic_graph))
         return semantic_graph
 
     def mark_covered(self, state_keys) -> None:

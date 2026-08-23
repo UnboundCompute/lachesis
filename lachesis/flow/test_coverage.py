@@ -42,6 +42,19 @@ class CoverageSchedulerTests(unittest.TestCase):
         second = store.key(functions, "c", coverage={"state_keys": [["worker", "b"]]})
         self.assertNotEqual(first, second)
 
+    def test_fragment_cache_reuses_a_coverage_superset(self):
+        store = FragmentStore()
+        functions = {"worker": {}}
+        graph = object()
+        semantic = object()
+        store.put(functions, "c", graph, semantic,
+                  coverage={"state_keys": [["worker", "a"], ["worker", "b"]]})
+        self.assertIs(
+            store.get(functions, "c", graph,
+                      coverage={"state_keys": [["worker", "a"]]}),
+            semantic,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
