@@ -1196,6 +1196,21 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertEqual(uaf["metadata"]["matcher_pattern"], "uaf.deref")
         self.assertEqual(double_free["metadata"]["matcher_pattern"], "double-free")
 
+    def test_temporal_candidates_are_language_neutral(self):
+        graph = {
+            "nodes": [
+                _node("free:py", "release", "release(buf)", object_id="obj:buf",
+                      owner_function_id="fn:destroy", file="destroy.py", start_line=8),
+                _node("read:py", "read_storage", "buf.data", object_id="obj:buf",
+                      owner_function_id="fn:use", file="use.py", start_line=19),
+            ],
+            "edges": [],
+        }
+        registry = default_candidate_registry(graph)
+        rows = registry.candidates(constructor="mem.lifetime.use-after-free")["candidates"]
+        self.assertEqual(rows[0]["language"], "python")
+        self.assertEqual(rows[0]["observations"]["event_kind"], "read_storage")
+
     def test_every_catalogued_lifecycle_pattern_has_observation_routing(self):
         from lachesis.flow import atropos
         from lachesis.planner import taxonomy
