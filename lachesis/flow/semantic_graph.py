@@ -512,7 +512,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
 
 def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
             witness: tuple[str, ...] = ()) -> None:
-    key = (pattern, obj.render(), node.id, node.event.line if node.event else None)
+    # A shared callee may be reached from several source-rooted callers.  Those
+    # are distinct witnesses even when the sink node and normalized object are
+    # identical; collapsing them loses the coverage proof the graph was built
+    # to preserve.
+    # Keep caller identity in the key, but collapse repeated CFG/loop steps in
+    # the same call context.  Full path keys turn one loop witness into
+    # thousands of equivalent leads; seam identities are the stable source-root
+    # distinction that matters for shared callees.
+    seam_context = tuple(sorted({step for step in witness if ":seam_enter:" in step}))
+    key = (pattern, obj.render(), node.id, node.event.line if node.event else None,
+           seam_context)
     reachable = bool(node.metadata.get("source_reachable", False))
     influenced = bool(node.metadata.get("source_influenced", False))
     hits.setdefault(key, {"pattern": pattern, "object": obj.render(), "node": node.id,

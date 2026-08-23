@@ -193,7 +193,7 @@ def build_universal_skeletons(store, F, succ, lang="c", graph=None):
     per-function CFG, interprocedural summaries) so identity/field-sensitivity match it."""
     from .object_lifetime import analyze_object_lifetimes
 
-    functions = _lifetime_slice(F, succ)
+    functions = _lifetime_slice(F, succ, lang=lang)
     if not functions:
         return []
     sub_succ = {n: [c for c in succ.get(n, ()) if c in functions] for n in functions}
@@ -329,7 +329,8 @@ def _semantic_event(sub, operation, generations=None):
     return []
 
 
-def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None):
+def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None,
+                         reach_summaries=None):
     """Build the production frozen-v1 graph from the enriched third-pass substrate.
 
     The existing object interpreter supplies identity-bearing operations and a real structured
@@ -337,7 +338,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     ``semantic_graph.match_graph``.  Calls are represented by seam nodes and return-site
     continuations, so a shared callee cannot return into another caller's path.
     """
-    functions = _lifetime_slice(F, succ)
+    functions = _lifetime_slice(F, succ, lang=lang)
     if not functions:
         return SkeletonGraph()
     analysis_graph = graph if graph is not None else store.graph
@@ -558,6 +559,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             # mutate object state, while its evaluator can consume guards,
             # size expressions, control nesting, and provenance.
             for call_index, call in enumerate(functions[name].get("calls", ())):
+                if reach_summaries is not None:
+                    continue
                 if call.get("node") != n:
                     continue
                 catalog_entry = sink_catalog.get(call.get("callee")) or {}
@@ -596,6 +599,54 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         sink_id,
                         Event(EventKind.SINK, obj=sink_obj,
                               line=call.get("line"), facts=facts),
+                        fragment=name, source_reachable=source_reachable,
+                        source_influenced=bool(facts["tainted"]),
+                    )
+                    result.add_edge(previous, sink_id)
+                    previous = sink_id
+            if reach_summaries is not None and n == cfg_nodes[0]:
+                # The old summary composer already resolves source provenance,
+                # interprocedural argument flow, and guard dominance. Preserve
+                # those facts as semantic sink observations; the old renderer
+                # is no longer needed to consume them.
+                for flow_index, flow in enumerate(
+                        reach_summaries.get(name, {}).get("sink_flows", ())):
+                    sink_name, _, pos_text = flow.get("sink", "").rpartition(".a")
+                    try:
+                        arg_pos = int(pos_text)
+                    except (TypeError, ValueError):
+                        continue
+                    catalog_entry = sink_catalog.get(sink_name) or {}
+                    family = (catalog_entry.get("kinds") or {}).get(arg_pos)
+                    if not family:
+                        family = catalog_entry.get("family")
+                    if not family:
+                        continue
+                    recipe = evaluator_for(family)
+                    relational = (recipe == "relational" or
+                                  isinstance(recipe, (list, tuple))
+                                  and "relational" in recipe)
+                    guarded = bool(flow.get("guarded"))
+                    root = flow.get("root") or flow.get("value") or sink_name
+                    sink_obj = ObjRef(str(root), generation="g0")
+                    call = next((candidate for candidate in functions[name].get("calls", ())
+                                 if candidate.get("callee") == flow.get("via")), None)
+                    facts = {
+                        "family": family,
+                        "callee": sink_name,
+                        "arg": arg_pos,
+                        "tainted": flow.get("provenance") != "const",
+                        "guarded": guarded,
+                        "bound": ("bounded" if guarded else "unbounded")
+                                 if relational else None,
+                        "via": flow.get("via"),
+                        "control": (call or {}).get("control") or (),
+                    }
+                    sink_id = f"{anchor}:summary-sink:{flow_index}"
+                    result.add_node(
+                        sink_id,
+                        Event(EventKind.SINK, obj=sink_obj,
+                              line=(call or {}).get("line") or flow.get("line"), facts=facts),
                         fragment=name, source_reachable=source_reachable,
                         source_influenced=bool(facts["tainted"]),
                     )

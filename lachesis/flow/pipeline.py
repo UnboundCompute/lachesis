@@ -22,12 +22,23 @@ _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
 _DEFAULT_LIFETIME_ENGINE = "object"
 
 
-def _lifetime_slice(F, succ):
-    """Restrict object analysis to the call-graph region carrying lifecycle events."""
+def _lifetime_slice(F, succ, lang="c"):
+    """Select the semantic call-graph region carrying lifecycle or sink facts.
+
+    The name is retained for API compatibility.  The production skeleton must
+    also include sink-only functions (for example a standalone bounded-copy
+    helper) and realloc-only functions, otherwise Atropos reach patterns would
+    remain stranded in the retired renderer.
+    """
+    from . import atropos
+
+    sink_names = set(atropos.sink_catalog(lang))
     seeds = {
         name for name, function in F.items()
-        if any(event.get("kind") in {"alloc", "free", "escape"}
+        if any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
+        or any(call.get("is_sink") or call.get("callee") in sink_names
+               for call in function.get("calls", ()))
     }
     if not seeds:
         return {}
@@ -147,15 +158,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
     # typestate renderer for legacy/shadow operation and for an explicit
     # fallback only; object mode still uses its reach skeletons for Atropos's
     # non-lifetime evaluators.
-    skeletons = build_skeletons(
-        F, summaries, lang=lang, include_typestate=not object_requested or requested == "shadow")
+    skeletons = ([] if object_requested else
+                 build_skeletons(F, summaries, lang=lang, include_typestate=True))
     skeletons_done = perf_counter()
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
     legacy_leads = None
     leads = []
     if object_requested:
-        object_functions = _lifetime_slice(F, succ)
+        object_functions = _lifetime_slice(F, succ, lang=lang)
         object_succ = {
             name: [callee for callee in succ.get(name, ()) if callee in object_functions]
             for name in object_functions
@@ -165,7 +176,8 @@ def run_pass(store, lang="c", lifetime_engine=None):
         semantic_coverage = CoverageScheduler(F, succ).plan(object_functions)
         semantic_graph = Claus().build(
             store, F, succ, lang=lang, graph=analysis_graph,
-            summaries=object_result.summaries, coverage=semantic_coverage)
+            summaries=object_result.summaries, coverage=semantic_coverage,
+            reach_summaries=summaries)
         semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
@@ -195,16 +207,23 @@ def run_pass(store, lang="c", lifetime_engine=None):
                 object_flow=object_flow)
         else:
             fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
+            if seed_unsafe and not skeletons:
+                skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
             legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
             # The frozen graph/matcher is now the production lifetime path.  Keep the old
             # matcher only for non-lifetime reach leads and as a diagnostic fallback for
             # functions whose object projection could not be emitted.
-            reach_leads = [lead for lead in legacy_leads
-                           if lead.get("pattern") in {"reachability", "relational", "presence"}]
+            # Atropos sink observations now live in the semantic graph.  The
+            # compatibility matcher contributes only lifetime fallback leads
+            # for functions whose object analysis failed.
+            reach_leads = []
+            fallback_lifetime = [lead for lead in legacy_leads
+                                 if lead.get("pattern") in _LIFETIME_PATTERNS
+                                 and lead.get("entry") in seed_unsafe]
             # Object mode is source-rooted semantic-graph production.  A failed
             # object projection is reported in diagnostics, not silently converted
             # back into the legacy name-keyed lifetime verdicts.
-            leads = reach_leads + semantic_leads
+            leads = fallback_lifetime + semantic_leads
             differential = {
                 "computed": False,
                 "reason": "set LACHESIS_LIFETIME_ENGINE=shadow for a full differential",
