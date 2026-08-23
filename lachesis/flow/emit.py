@@ -480,6 +480,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             for event in events:
                 event.facts.update(facts)
             return events
+
+        def annotate_event(event, operation):
+            event.facts.update(abstract_facts(operation))
+            return event
         by_anchor = defaultdict(list)
         source_callees = {item.get("callee") for item in functions[name].get("source_calls", ())}
         source_roots = {root for call in functions[name].get("calls", ())
@@ -507,16 +511,17 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     success_id = f"{anchor}:alloc:{index}:success"
                     failure_id = f"{anchor}:alloc:{index}:failure"
                     merge_id = f"{anchor}:alloc:{index}:merge"
-                    result.add_node(attempt_id, Event.alloc_attempt(result=obj, line=op.line), fragment=name,
+                    result.add_node(attempt_id, annotate_event(
+                                     Event.alloc_attempt(result=obj, line=op.line), op), fragment=name,
                                      source_reachable=source_reachable,
                                      source_influenced=op.target and op.target.root in source_roots)
                     result.add_node(branch_id, Event(EventKind.BRANCH, obj=obj, line=op.line,
                                                      facts={"predicate": "alloc_result"}), fragment=name,
                                      source_reachable=source_reachable)
-                    result.add_node(success_id, Event.origin(
+                    result.add_node(success_id, annotate_event(Event.origin(
                         obj, op.line,
                         facts={"allocation_site": str(op.site or op.node),
-                               "generation": obj.generation}), fragment=name,
+                               "generation": obj.generation}), op), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(failure_id, Event(EventKind.WRITE_STORAGE, obj=obj, base=obj,
                                                      slot=obj, facts={"null": True,
@@ -556,7 +561,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     fresh = _semantic_obj(sub, op.target, target_generation, op.node)
                     attempt_id = f"{anchor}:realloc:{index}:attempt"
                     branch_id = f"{anchor}:realloc:{index}:branch"
-                    result.add_node(attempt_id, Event.realloc_attempt(old, op.line), fragment=name,
+                    result.add_node(attempt_id, annotate_event(
+                                     Event.realloc_attempt(old, op.line), op), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(branch_id, Event(EventKind.BRANCH, obj=old, line=op.line,
                                                      facts={"predicate": "realloc_result"}), fragment=name,
@@ -565,10 +571,12 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_edge(attempt_id, branch_id)
                     success_id = f"{anchor}:realloc:{index}:success"
                     failure_id = f"{anchor}:realloc:{index}:failure"
-                    result.add_node(success_id, Event(EventKind.INVALIDATE, obj=old, line=op.line), fragment=name,
+                    result.add_node(success_id, annotate_event(
+                                     Event(EventKind.INVALIDATE, obj=old, line=op.line), op), fragment=name,
                                      source_reachable=source_reachable)
-                    result.add_node(failure_id, Event(EventKind.REALLOC_FAILED, obj=old, slot=old,
-                                                     facts={"result": "NULL"}, line=op.line), fragment=name,
+                    result.add_node(failure_id, annotate_event(
+                                     Event(EventKind.REALLOC_FAILED, obj=old, slot=old,
+                                           facts={"result": "NULL"}, line=op.line), op), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_edge(branch_id, success_id, guard=(GuardProof("NONNULL", "realloc_result"),))
                     result.add_edge(branch_id, failure_id, guard=(GuardProof("ISNULL", "realloc_result"),))
