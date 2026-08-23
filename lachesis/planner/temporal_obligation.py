@@ -128,21 +128,12 @@ def temporal_constructor(spec):
                   if item.get("id") == spec["id"]), {})
     matcher = entry.get("matcher") or {}
     pattern = matcher.get("pattern") or spec.get("matcher_pattern")
-    # Event vocabulary is intentionally described by the catalog requirement;
-    # the two standard temporal patterns map to their semantic trigger kinds.
-    # Candidate rows are intentionally broad observation sites.  They are not
-    # findings; the graph matcher still has to prove the temporal relation.  Keep
-    # this vocabulary in one generic routing table so every catalog-declared
-    # lifecycle pattern can enter candidate_census without a constructor per bug.
-    triggers = {
-        "double-free": ("release",),
-        "uaf.deref": ("read", "write", "read_storage", "write_storage"),
-        "leak": ("origin",),
-        "use.dangling": ("pass_value", "compare_value", "return_value"),
-        "mem.lifetime.realloc-failure-leak": ("realloc_failed",),
-        "null-deref": ("read", "write", "read_storage", "write_storage"),
-        "use-after-return": ("return_value",),
-    }.get(pattern, ())
+    # The Atropos pattern declaration owns the event vocabulary.  Keeping this
+    # routing data beside the public obligation means a new lifecycle pattern can
+    # enter candidate_census without an engine-side family list or a new
+    # constructor.  Candidate rows remain observations, never findings: the
+    # semantic matcher must still prove the temporal relation.
+    triggers = tuple(matcher.get("event_kinds") or ())
     return type("Temporal_" + spec["family"].replace("-", "_"),
                 (TemporalLifecycle,), {
                     "trigger": triggers,
