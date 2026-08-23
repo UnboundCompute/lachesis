@@ -69,14 +69,35 @@ _OP_VERB = {
 }
 
 
-def _readable_root(sub, root: str) -> str:
+def _readable_root(sub, root: str, scope=None) -> str:
     """Render an AccessPath root (``decl:<id>`` / ``param``) as a stable, readable base.
 
     Identity is per-skeleton (one function), so a variable's own name is a stable key here;
     the raw decl id is opaque and collides across nothing within a single function."""
     if root.startswith("decl:"):
         node_id = root[len("decl:"):]
-        return sub.label(node_id) or node_id
+        label = sub.label(node_id) or node_id
+        shadowed = getattr(sub, "_shadowed_roots", None)
+        if shadowed is None:
+            declarations = []
+            for candidate in sub.idx.nodes_of_kind("variable", "parameter"):
+                props = candidate.get("properties") or {}
+                owner = props.get("owner_function_id") or props.get("function_id")
+                if not owner:
+                    continue
+                declarations.append((owner, candidate.get("label")))
+            # Only labels with multiple declarations in one function need a
+            # declaration discriminator; ordinary output remains readable.
+            counts = defaultdict(int)
+            for owner, name in declarations:
+                counts[(owner, name)] += 1
+            shadowed = {(owner, name) for owner, name in declarations
+                        if counts[(owner, name)] > 1}
+            sub._shadowed_roots = shadowed
+        owner = sub.props(node_id).get("owner_function_id") or sub.props(node_id).get("function_id")
+        if (owner, label) in shadowed:
+            return f"{label}@{node_id}"
+        return label
     return root
 
 
@@ -208,10 +229,10 @@ def build_universal_skeletons(store, F, succ, lang="c", graph=None):
     return skels
 
 
-def _semantic_obj(sub, path, generation="g0"):
+def _semantic_obj(sub, path, generation="g0", scope=None):
     if path is None:
         return None
-    return ObjRef(base=_readable_root(sub, path.root), path=tuple(path.selectors),
+    return ObjRef(base=_readable_root(sub, path.root, scope), path=tuple(path.selectors),
                   generation=generation)
 
 
@@ -262,7 +283,7 @@ def _semantic_event(sub, operation, generations=None):
     generations = generations or {}
     target_key = _semantic_key(sub, operation.target)
     generation = generations.get(operation, generations.get(target_key, "g0"))
-    obj = _semantic_obj(sub, operation.target, generation)
+    obj = _semantic_obj(sub, operation.target, generation, operation.node)
     if operation.kind == OpKind.ALLOC:
         return [Event.alloc_attempt(result=obj, line=operation.line), Event.origin(obj, operation.line)] if obj else []
     if operation.kind == OpKind.FREE:
@@ -290,13 +311,13 @@ def _semantic_event(sub, operation, generations=None):
         if operation.access == "write":
             source_key = _semantic_key(sub, operation.source)
             value = (_semantic_obj(sub, operation.source,
-                                   generations.get(source_key, "g0"))
+                                   generations.get(source_key, "g0"), operation.node)
                      if operation.source is not None else None)
             return [Event.write(storage_obj, access_path, operation.line, value=value)]
         return [Event.read(storage_obj, access_path, operation.line)]
     if operation.kind == OpKind.COPY and obj:
         source_key = _semantic_key(sub, operation.source)
-        source = _semantic_obj(sub, operation.source, generations.get(source_key, "g0"))
+        source = _semantic_obj(sub, operation.source, generations.get(source_key, "g0"), operation.node)
         return [Event(EventKind.DERIVE, obj=obj, value=source, line=operation.line)]
     if operation.kind == OpKind.CLOBBER and obj:
         if operation.access == "source":
@@ -396,7 +417,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             for index, op in enumerate(ops):
                 if op.kind == OpKind.ALLOC and op.target is not None:
                     target_key = _semantic_key(sub, op.target)
-                    obj = _semantic_obj(sub, op.target, operation_generations.get(op, "g0"))
+                    obj = _semantic_obj(sub, op.target, operation_generations.get(op, "g0"), op.node)
                     attempt_id = f"{anchor}:alloc:{index}:attempt"
                     branch_id = f"{anchor}:alloc:{index}:branch"
                     success_id = f"{anchor}:alloc:{index}:success"
@@ -438,7 +459,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                 if op.kind == OpKind.REALLOC and op.target is not None:
                     target_key = _semantic_key(sub, op.target)
                     old_generation = operation_generations.get(op, "g0")
-                    old = _semantic_obj(sub, op.target, old_generation)
+                    old = _semantic_obj(sub, op.target, old_generation, op.node)
                     fresh_generation = realloc_generations.get(op, _next_generation(old_generation))
                     fresh = ObjRef(old.base, old.path, fresh_generation)
                     attempt_id = f"{anchor}:realloc:{index}:attempt"
