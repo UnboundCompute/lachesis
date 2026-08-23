@@ -337,7 +337,10 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             destination = next((candidate for candidate in owned
                                 if sub.kind(candidate) == "variable" and
                                 sub.label(candidate) == assigned), None)
-            target = _path(ap_builder, destination)
+            # `_assigned_var` is already the canonical display root.  Some
+            # frontends do not retain a variable node for a call-result edge,
+            # so do not require a declaration-node lookup here.
+            target = _path(ap_builder, destination) if destination is not None else AccessPath(str(assigned))
             if target is not None:
                 operations.append(_op(OpKind.CLOBBER, anchor, target=target, line=line,
                                       ordinal=5, access="source"))
