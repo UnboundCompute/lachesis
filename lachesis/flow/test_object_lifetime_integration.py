@@ -55,6 +55,15 @@ void caller_alias_effect(void) {
     release_argument(second);
     consume(first);
 }
+
+void loop_reuse(void) {
+    char *item = malloc(8);
+    for (int i = 0; i < 2; ++i) {
+        free(item);
+        item = malloc(8);
+    }
+    *item = 1;
+}
 """
 
 
@@ -83,6 +92,9 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
             self.assertTrue(any(lead["entry"] == "caller_alias_effect" and
                                 lead["pattern"] == "use.dangling"
                                 for lead in result["leads"]))
+            self.assertFalse(any(lead["entry"] == "loop_reuse" and
+                                 lead["pattern"] == "uaf.deref"
+                                 for lead in result["leads"]))
             # Leak remains on the legacy property domain during this migration.
             self.assertTrue(any(lead["pattern"] == "leak" for lead in result["leads"]))
             self.assertEqual(result["lifetime"]["active"], "object")

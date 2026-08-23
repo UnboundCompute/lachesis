@@ -215,6 +215,44 @@ def _semantic_obj(sub, path, generation="g0"):
                   generation=generation)
 
 
+def _semantic_key(sub, path):
+    if path is None:
+        return None
+    return (_readable_root(sub, path.root), tuple(path.selectors))
+
+
+def _next_generation(current):
+    if isinstance(current, str) and current.startswith("g") and current[1:].isdigit():
+        return f"g{int(current[1:]) + 1}"
+    return "g1"
+
+
+def _operation_generations(sub, operations):
+    """Assign incarnation generations in source order, independent of CFG layout."""
+    current = {}
+    generations = {}
+    fresh = {}
+    ordered = sorted(operations, key=lambda op: (sub.offset(op.node), op.line or 0,
+                                                  op.ordinal, op.kind.value))
+    for operation in ordered:
+        key = _semantic_key(sub, operation.target)
+        if key is None:
+            continue
+        generation = current.get(key, "g0")
+        if operation.kind == OpKind.ALLOC:
+            if key in current:
+                generation = _next_generation(generation)
+            current[key] = generation
+        elif operation.kind == OpKind.REALLOC:
+            generations[operation] = generation
+            fresh_generation = _next_generation(generation)
+            fresh[operation] = fresh_generation
+            current[key] = fresh_generation
+            continue
+        generations[operation] = generation
+    return generations, fresh
+
+
 def _semantic_event(sub, operation, generations=None):
     """Translate one object-engine fact to a frozen-schema event.
 
@@ -222,8 +260,9 @@ def _semantic_event(sub, operation, generations=None):
     :func:`match_graph` derives those findings later.
     """
     generations = generations or {}
-    target_key = (operation.target.root, tuple(operation.target.selectors)) if operation.target else None
-    obj = _semantic_obj(sub, operation.target, generations.get(target_key, "g0"))
+    target_key = _semantic_key(sub, operation.target)
+    generation = generations.get(operation, generations.get(target_key, "g0"))
+    obj = _semantic_obj(sub, operation.target, generation)
     if operation.kind == OpKind.ALLOC:
         return [Event.alloc_attempt(result=obj, line=operation.line), Event.origin(obj, operation.line)] if obj else []
     if operation.kind == OpKind.FREE:
@@ -251,7 +290,7 @@ def _semantic_event(sub, operation, generations=None):
             return [Event.write(storage_obj, access_path, operation.line)]
         return [Event.read(storage_obj, access_path, operation.line)]
     if operation.kind == OpKind.COPY and obj:
-        source_key = (operation.source.root, tuple(operation.source.selectors)) if operation.source else None
+        source_key = _semantic_key(sub, operation.source)
         source = _semantic_obj(sub, operation.source, generations.get(source_key, "g0"))
         return [Event(EventKind.DERIVE, obj=obj, value=source, line=operation.line)]
     if operation.kind == OpKind.CLOBBER and obj:
@@ -327,8 +366,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         # that would manufacture double-frees when the callee fragment is also traversed.
         operations = extract_operations(
             sub, norm, fid, functions[name], functions, obj_summaries, cfg)
+        operation_generations, realloc_generations = _operation_generations(sub, operations)
         by_anchor = defaultdict(list)
-        generations = {}
         source_callees = {item.get("callee") for item in functions[name].get("source_calls", ())}
         source_roots = {root for call in functions[name].get("calls", ())
                         if call.get("callee") in source_callees
@@ -348,15 +387,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             ops = sorted(by_anchor.get(n, ()), key=lambda x: (x.line or 0, x.ordinal))
             for index, op in enumerate(ops):
                 if op.kind == OpKind.ALLOC and op.target is not None:
-                    target_key = (op.target.root, tuple(op.target.selectors))
-                    if target_key in generations:
-                        previous_generation = generations[target_key]
-                        if (isinstance(previous_generation, str) and previous_generation.startswith("g")
-                                and previous_generation[1:].isdigit()):
-                            generations[target_key] = f"g{int(previous_generation[1:]) + 1}"
-                    else:
-                        generations[target_key] = "g0"
-                    obj = _semantic_obj(sub, op.target, generations.get(target_key, "g0"))
+                    target_key = _semantic_key(sub, op.target)
+                    obj = _semantic_obj(sub, op.target, operation_generations.get(op, "g0"))
                     attempt_id = f"{anchor}:alloc:{index}:attempt"
                     branch_id = f"{anchor}:alloc:{index}:branch"
                     success_id = f"{anchor}:alloc:{index}:success"
@@ -393,12 +425,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     previous = merge_id
                     continue
                 if op.kind == OpKind.REALLOC and op.target is not None:
-                    target_key = (op.target.root, tuple(op.target.selectors))
-                    old_generation = generations.get(target_key, "g0")
+                    target_key = _semantic_key(sub, op.target)
+                    old_generation = operation_generations.get(op, "g0")
                     old = _semantic_obj(sub, op.target, old_generation)
-                    fresh_generation = f"g{int(old_generation[1:]) + 1}" if (
-                        isinstance(old_generation, str) and old_generation.startswith("g") and
-                        old_generation[1:].isdigit()) else f"{old_generation}+1"
+                    fresh_generation = realloc_generations.get(op, _next_generation(old_generation))
                     fresh = ObjRef(old.base, old.path, fresh_generation)
                     attempt_id = f"{anchor}:realloc:{index}:attempt"
                     branch_id = f"{anchor}:realloc:{index}:branch"
@@ -443,10 +473,9 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_edge(failure_id, failure_null)
                     result.add_edge(failure_null, failure_lost)
                     result.add_edge(failure_lost, merge_id)
-                    generations[target_key] = fresh_generation
                     previous = merge_id
                     continue
-                for event_index, event in enumerate(_semantic_event(sub, op, generations)):
+                for event_index, event in enumerate(_semantic_event(sub, op, operation_generations)):
                     event_id = f"{anchor}:event:{index}:{event_index}"
                     result.add_node(event_id, event, fragment=name,
                                     source_reachable=source_reachable,
