@@ -40,6 +40,19 @@ def test_lifecycle_release_and_use_census_all_supported_languages():
         assert use["census"]["enumerated"] == 1
 
 
+def test_lifecycle_use_excludes_bare_reads_and_acquire_is_catalogued():
+    graph = _fixture(".py", "open", False)
+    graph["nodes"].append({
+        "id": "bare", "kind": "read", "label": "resource",
+        "properties": {"target_id": "resource", "definition_id": "resource",
+                        "start_line": 4, "absolute_file": "fixture.py",
+                        "owner_function_id": "f"},
+    })
+    registry = default_candidate_registry(graph)
+    assert registry.census("lifecycle.acquire")["constructors"][0]["census"]["enumerated"] == 1
+    assert registry.census("lifecycle.use")["constructors"][0]["census"]["enumerated"] == 1
+
+
 def test_lifecycle_skeleton_families_preserve_c_specializations():
     c = _typestate_skel("f", "p", [
         {"kind": "alloc"}, {"kind": "free"}, {"kind": "use"},

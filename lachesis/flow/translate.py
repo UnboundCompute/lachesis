@@ -436,7 +436,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         if root:
             events.append({"kind": "free", "family": ("memory.free" if norm.lang == "c"
                            else "lifecycle.release"), "var": root,
-                           "line": p.get("start_line"), "node": n.get("id"),
+                           "line": p.get("release_line") or p.get("start_line"),
+                           "node": n.get("id"),
                            "callee": p.get("release_method")})
     # Clang represents delete/delete[] as an expression rather than a call.
     # It is still a catalogue release and must enter the same structural stream.

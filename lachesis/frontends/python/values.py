@@ -352,11 +352,13 @@ class ValueWalk:
         if target_id is None:
             return
         position = self.source.position(node)
+        release_line = position.get("end_line") if method == "__exit__" else position.get("start_line")
         node_id = stable_id("release", self.source.display,
                             position["start_offset"], position["end_offset"], target_id,
                             method)
         self.graph.node(node_id, "release", compact(self.source.excerpt(target)),
                         **position, release_method=method, target_id=target_id,
+                        release_line=release_line,
                         owner_function_id=frame.owner_function_id)
         body_id = self.bodies.get(id(node))
         if body_id:

@@ -12,6 +12,7 @@ import os
 import re
 
 from ..flow import atropos
+from ..flow.normalize import normalizer
 
 
 class LifecycleOperation:
@@ -35,8 +36,20 @@ class LifecycleOperation:
         callee = self._callee(node)
         if not callee:
             return False
-        from ..flow.normalize import normalizer
         return normalizer(lang).is_release(callee)
+
+    @staticmethod
+    def _is_structural_use(node):
+        """Keep bare variable reads out of the lifecycle-use census."""
+        p = node.get("properties") or {}
+        syntax = p.get("syntax_kind")
+        if syntax in {"MemberExpr", "ArraySubscriptExpr", "UnaryOperator",
+                      "property-path", "index", "member"}:
+            return True
+        if node.get("kind") != "read":
+            return False
+        label = str(node.get("label") or "")
+        return any(mark in label for mark in ("->", ".", "["))
 
     def _tracked_reads(self):
         # Track values by explicit lifecycle/source call participation.  This is
@@ -53,7 +66,6 @@ class LifecycleOperation:
             callee = self._callee(node)
             if not callee:
                 continue
-            from ..flow.normalize import normalizer
             norm = normalizer(lang)
             if norm.is_acquire(callee) or norm.is_release(callee) or \
                     callee in atropos.source_catalog(lang):
@@ -97,7 +109,8 @@ class LifecycleOperation:
             "observations": {
                 "callee": self._callee(node), "site": node.get("label"),
                 "file": p.get("absolute_file") or p.get("file"),
-                "line": p.get("start_line"), "expression": expression or node.get("label"),
+                "line": p.get("release_line") or p.get("start_line"),
+                "expression": expression or node.get("label"),
                 "lifecycle_family": family,
             },
             "inferences": {"tainted": "not-applicable", "cap": "not-applicable",
@@ -114,19 +127,30 @@ class LifecycleOperation:
         tracked_labels = self._tracked_labels(tracked)
         for node in self.nodes.values():
             lang = self._language(node)
-            if self.operation == "release":
+            if self.operation == "acquire":
+                if node.get("kind") not in ("call", "construct"):
+                    continue
+                callee = self._callee(node)
+                if not callee:
+                    continue
+                norm = normalizer(lang)
+                if norm.is_acquire(callee) or callee in atropos.source_catalog(lang):
+                    rows.append(self._candidate(node, self.metadata["id"]))
+            elif self.operation == "release":
                 if node.get("kind") == "release" or \
                         (node.get("kind") in ("call", "construct") and
-                         self._matches_release(node, lang)):
+                         (self._matches_release(node, lang) or
+                          normalizer(lang).is_realloc(self._callee(node)))) or \
+                        (lang == "c" and
+                         ((node.get("properties") or {}).get("syntax_kind") == "CXXDeleteExpr" or
+                          str(node.get("label") or "").lstrip().startswith("delete"))):
                     rows.append(self._candidate(node, self.metadata["id"]))
             elif self.operation == "use" and node.get("kind") in ("read", "expression"):
                 p = node.get("properties") or {}
                 syntax = p.get("syntax_kind")
                 label = node.get("label") or ""
                 base = re.match(r"\s*(?:\*\s*)?([A-Za-z_]\w*)", label)
-                is_structural = node.get("kind") == "read" or syntax in {
-                    "MemberExpr", "ArraySubscriptExpr", "UnaryOperator",
-                }
+                is_structural = self._is_structural_use(node)
                 rooted = base and base.group(1) in tracked_labels
                 if is_structural and (p.get("target_id") in tracked
                                       or p.get("definition_id") in tracked or rooted):
