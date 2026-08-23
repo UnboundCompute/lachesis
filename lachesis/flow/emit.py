@@ -519,7 +519,11 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     guard = _cfg_guard_proofs(sub, n, target_index, len(targets))
                     if cfg_positions.get(target, 0) <= cfg_positions.get(n, 0):
                         loop_id = f"{prefix}{n}:loop:{target_index}"
-                        result.add_node(loop_id, Event(EventKind.LOOP), fragment=name,
+                        result.add_node(loop_id, Event(EventKind.LOOP, facts={
+                            "generation_widening": "join",
+                            "back_edge": f"{prefix}{target}",
+                            "iteration_identity": "path-local",
+                        }), fragment=name,
                                          source_reachable=bool(functions[name].get("source_reachable", False)))
                         result.add_edge(source, loop_id, guard=guard)
                         result.add_edge(loop_id, prefix + target)

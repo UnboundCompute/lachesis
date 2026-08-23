@@ -14,6 +14,7 @@ from .match import match_all, match_leak, match_reach, match_typestate
 from .cfg import cfg_bundle
 from .object_lifetime import analyze_object_lifetimes
 from .semantic_graph import match_graph
+from .fragment_store import Claus
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
@@ -151,8 +152,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
         }
         object_result = analyze_object_lifetimes(
             store, object_functions, object_succ, lang=lang, graph=analysis_graph)
-        from .emit import build_semantic_graph
-        semantic_graph = build_semantic_graph(
+        semantic_graph = Claus().build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries)
         semantic_leads = match_graph(semantic_graph)
