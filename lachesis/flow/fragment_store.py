@@ -120,10 +120,18 @@ class Claus:
                                      reach_summaries=reach_summaries)
         if coverage is not None:
             built.coverage = coverage.to_dict() if hasattr(coverage, "to_dict") else dict(coverage)
-            state_keys = [key for region in built.coverage.get("regions", [])
-                          for key in region.get("state_keys", [])]
-            self.fragments.mark_covered(state_keys)
-            pending = self.fragments.uncovered(state_keys)
+            planned_keys = [tuple(key) for region in built.coverage.get("regions", [])
+                            for key in region.get("state_keys", [])]
+            # A plan describes work that should be attempted; it is not proof that
+            # Claus materialized it.  Reaching-definition failures and unsupported
+            # frontend regions are intentionally skipped by the emitter, so only
+            # state keys whose function has an emitted fragment may be counted as
+            # covered.  Otherwise `converged` could be true while the graph still
+            # lacks the selected region.
+            materialized = [key for key in planned_keys
+                            if len(key) == 2 and key[0] in built.fragments]
+            self.fragments.mark_covered(materialized)
+            pending = tuple(sorted(set(planned_keys) - set(materialized)))
             built.coverage.update({
                 "covered_states": [list(key) for key in sorted(self.fragments.covered_states)],
                 "uncovered_states": [list(key) for key in pending],

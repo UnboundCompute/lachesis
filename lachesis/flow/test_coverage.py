@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from .coverage import CoverageScheduler
-from .fragment_store import FragmentStore
+from .fragment_store import Claus, FragmentStore
+from .semantic_graph import SkeletonGraph
 
 
 class CoverageSchedulerTests(unittest.TestCase):
@@ -71,6 +73,23 @@ class CoverageSchedulerTests(unittest.TestCase):
                       coverage={"state_keys": [["worker", "a"]]}),
             semantic,
         )
+
+    def test_claus_does_not_claim_skipped_fragments_are_covered(self):
+        graph = SkeletonGraph()
+        graph.add_node("worker:entry")
+        graph.add_fragment("worker", "worker:entry", ("worker:entry",))
+
+        coverage = {"regions": [{"state_keys": [["worker", "source"],
+                                                   ["skipped", "source"]]}]}
+        fragment_store = FragmentStore()
+        claus = Claus(fragment_store)
+        with patch("lachesis.flow.emit.build_semantic_graph", return_value=graph):
+            built = claus.build(object(), {"worker": {}, "skipped": {}}, {},
+                                coverage=coverage)
+
+        self.assertEqual(built.coverage["covered_states"], [["worker", "source"]])
+        self.assertEqual(built.coverage["uncovered_states"], [["skipped", "source"]])
+        self.assertFalse(built.coverage["converged"])
 
 
 if __name__ == "__main__":
