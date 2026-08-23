@@ -206,7 +206,7 @@ def _argument_path(sub, ap_builder, call_node, position):
     return _path(ap_builder, argument)
 
 
-def _aggregate_field_paths(sub, ap_builder) -> tuple[tuple[str, ...], ...]:
+def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, ...], ...]:
     """Collect field paths present in the program for bulk struct copies.
 
     ``memcpy(dst, src, sizeof(T))`` has no field AST children of its own.  The
@@ -214,10 +214,10 @@ def _aggregate_field_paths(sub, ap_builder) -> tuple[tuple[str, ...], ...]:
     destructors, which gives us the field layout needed to materialize the
     field-wise alias facts without teaching the matcher about memcpy.
     """
-    cached = getattr(sub, "_aggregate_field_paths_cache", None)
-    if cached is not None:
-        return cached
-    paths = set()
+    cache = getattr(sub, "_aggregate_field_paths_cache", None)
+    if cache is None:
+        cache = defaultdict(set)
+        sub._aggregate_field_paths_cache = cache
     for item in sub.idx.nodes_of_kind("expression"):
         node = item.get("id") if isinstance(item, dict) else item
         item_props = item.get("properties", {}) if isinstance(item, dict) else {}
@@ -229,10 +229,14 @@ def _aggregate_field_paths(sub, ap_builder) -> tuple[tuple[str, ...], ...]:
         # recovered by following those field objects later; emitting every nested
         # combination here causes avoidable state multiplication in summaries.
         if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
-            paths.add(path.selectors)
-    cached = tuple(sorted(paths, key=repr))
-    sub._aggregate_field_paths_cache = cached
-    return cached
+            root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
+            root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
+            cache[root_type].add(path.selectors)
+    if type_key is None:
+        paths = set().union(*cache.values()) if cache else set()
+    else:
+        paths = cache.get(type_key) or cache.get("<unknown>", set())
+    return tuple(sorted(paths, key=repr))
 
 
 def _place(sub, cfg_nodes, anchor, fallback=None):
@@ -345,7 +349,9 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             destination = _argument_path(sub, ap_builder, call_node, 0)
             source = _argument_path(sub, ap_builder, call_node, 1)
             if destination is not None and source is not None:
-                for selectors in _aggregate_field_paths(sub, ap_builder):
+                source_id = source.root[len("decl:"):] if source.root.startswith("decl:") else None
+                source_type = sub.props(source_id).get("type") if source_id else None
+                for selectors in _aggregate_field_paths(sub, ap_builder, source_type):
                     operations.append(_op(
                         OpKind.COPY, anchor,
                         target=AccessPath(destination.root,
