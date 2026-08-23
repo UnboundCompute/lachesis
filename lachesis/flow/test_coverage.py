@@ -20,6 +20,9 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(region.functions, ("bridge", "deep", "source"))
         self.assertIn(("deep", "source"), region.state_keys)
         self.assertIn("unrelated", plan.uncovered_functions)
+        self.assertEqual(plan.pending_regions([]), (region,))
+        self.assertFalse(plan.converged([]))
+        self.assertTrue(plan.converged(plan.state_keys))
 
     def test_structural_root_is_fallback_when_catalog_has_no_source(self):
         functions = {"entry": {"callers": []}, "deep": {"callers": ["entry"]}}

@@ -28,6 +28,28 @@ class CoveragePlan:
     def for_target(self, target: str) -> CoverageRegion | None:
         return next((region for region in self.regions if region.target == target), None)
 
+    @property
+    def state_keys(self) -> tuple[tuple[str, str], ...]:
+        """All source-rooted semantic states this plan requires, deterministically."""
+        return tuple(sorted({key for region in self.regions for key in region.state_keys}))
+
+    def pending_regions(self, covered_states: Iterable[tuple[str, str]] = ()) -> tuple[CoverageRegion, ...]:
+        """Return regions whose source/state work has not been materialized yet.
+
+        Coverage is keyed by ``(function, source)`` rather than by a function
+        name alone: the same function may need separate exploration under
+        different externally reachable object states.  This is the worklist
+        boundary consumed by Claus/fragment stores.
+        """
+        covered = {tuple(key) for key in covered_states}
+        return tuple(region for region in self.regions
+                     if any(tuple(key) not in covered for key in region.state_keys))
+
+    def converged(self, covered_states: Iterable[tuple[str, str]] = ()) -> bool:
+        """Whether every planned source-rooted state has been materialized."""
+        covered = {tuple(key) for key in covered_states}
+        return all(tuple(key) in covered for key in self.state_keys)
+
     def to_dict(self) -> dict:
         return {
             "regions": [{"target": region.target, "sources": list(region.sources),
@@ -36,6 +58,7 @@ class CoveragePlan:
                         for region in self.regions],
             "covered_functions": sorted(self.covered_functions),
             "uncovered_functions": sorted(self.uncovered_functions),
+            "state_keys": [list(key) for key in self.state_keys],
         }
 
 
@@ -109,4 +132,3 @@ class CoverageScheduler:
             covered.update(forward)
         return CoveragePlan(tuple(regions), frozenset(covered),
                             frozenset(set(self.functions) - covered))
-

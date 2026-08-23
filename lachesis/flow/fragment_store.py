@@ -40,6 +40,10 @@ class FragmentStore:
     def uncovered(self, state_keys):
         return tuple(sorted(set(tuple(key) for key in state_keys) - self.covered_states))
 
+    def pending(self, plan):
+        """Return the next deterministic source-rooted regions still uncovered."""
+        return plan.pending_regions(self.covered_states)
+
 
 class Claus:
     """Source-rooted Phase-3 driver over the existing semantic emitter."""
@@ -60,4 +64,10 @@ class Claus:
             state_keys = [key for region in built.coverage.get("regions", [])
                           for key in region.get("state_keys", [])]
             self.fragments.mark_covered(state_keys)
+            pending = self.fragments.uncovered(state_keys)
+            built.coverage.update({
+                "covered_states": [list(key) for key in sorted(self.fragments.covered_states)],
+                "uncovered_states": [list(key) for key in pending],
+                "converged": not pending,
+            })
         return self.fragments.put(functions, lang, graph, built, summaries)
