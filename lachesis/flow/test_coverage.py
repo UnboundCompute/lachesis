@@ -31,6 +31,27 @@ class CoverageSchedulerTests(unittest.TestCase):
         plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()
         self.assertEqual(plan.for_target("deep").sources, ("entry",))
 
+    def test_multiple_sources_do_not_cross_product_forward_cones(self):
+        functions = {
+            "source_a": {"source_sites": [{"callee": "read_a"}], "callers": []},
+            "source_b": {"source_sites": [{"callee": "read_b"}], "callers": []},
+            "shared": {"callers": ["source_a", "source_b"]},
+            "only_a": {"callers": ["source_a"]},
+            "only_b": {"callers": ["source_b"]},
+            "target": {"callers": ["only_a", "only_b", "shared"]},
+        }
+        plan = CoverageScheduler(functions, {
+            "source_a": ["shared", "only_a"], "source_b": ["shared", "only_b"],
+            "shared": ["target"], "only_a": ["target"], "only_b": ["target"],
+            "target": [],
+        }).plan(["target"])
+        region = plan.for_target("target")
+        self.assertEqual(region.sources, ("source_a", "source_b"))
+        self.assertIn(("only_a", "source_a"), region.state_keys)
+        self.assertIn(("only_b", "source_b"), region.state_keys)
+        self.assertNotIn(("only_a", "source_b"), region.state_keys)
+        self.assertNotIn(("only_b", "source_a"), region.state_keys)
+
     def test_fragment_store_tracks_source_state_keys(self):
         store = FragmentStore()
         store.mark_covered([("worker", "source")])

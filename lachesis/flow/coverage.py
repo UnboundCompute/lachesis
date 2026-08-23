@@ -121,13 +121,28 @@ class CoverageScheduler:
             if not sources:
                 sources = tuple(sorted(name for name in backward
                                        if not self.reverse.get(name)))
-            forward = set()
-            for source in sources:
-                forward.update(self._forward_cone(source) & backward)
-            if not forward and target in backward:
-                forward.add(target)
-            state_keys = tuple((function, source)
-                               for source in sources for function in sorted(forward))
+            # Keep each source cone separate.  Unioning the cones first and then
+            # pairing that union with every source invents impossible states when
+            # two external roots reach different parts of the same backward cone
+            # (for example, ``(callee, source_a)`` where only source_b reaches the
+            # callee).  Pass 3 coverage is source-rooted, so the state key must
+            # preserve that relation all the way into Claus's cache.
+            forward_by_source = {
+                source: self._forward_cone(source) & backward
+                for source in sources
+            }
+            if not any(forward_by_source.values()) and target in backward:
+                # A target with no graph successor from its selected structural
+                # root remains an explicit unresolved state rather than silently
+                # disappearing from the plan.
+                fallback_source = sources[0] if sources else target
+                forward_by_source.setdefault(fallback_source, set()).add(target)
+            forward = set().union(*forward_by_source.values()) if forward_by_source else set()
+            state_keys = tuple(
+                (function, source)
+                for source in sources
+                for function in sorted(forward_by_source.get(source, ()))
+            )
             regions.append(CoverageRegion(target, sources, tuple(sorted(forward)), state_keys))
             covered.update(forward)
         return CoveragePlan(tuple(regions), frozenset(covered),
