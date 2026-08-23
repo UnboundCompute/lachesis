@@ -17,11 +17,9 @@
 
 ## Watch it work
 
-<video src="https://raw.githubusercontent.com/UnboundCompute/lachesis/main/docs/media/lachesis-demo.mp4" poster="https://raw.githubusercontent.com/UnboundCompute/lachesis/main/docs/media/lachesis-demo-poster.png" controls muted loop playsinline width="100%"></video>
+[![Watch the 55-second Lachesis walkthrough](https://raw.githubusercontent.com/UnboundCompute/lachesis/main/docs/media/lachesis-demo-poster.png)](https://unboundcompute.com/lachesis.html)
 
-[![Lachesis flags SQL injection on a live pull request](docs/media/lachesis-demo-poster.png)](https://github.com/UnboundCompute/lachesis-action-demo/pull/5)
-
-A 55-second walkthrough: a Flask control plane where three handlers reach the same SQL sink unguarded while two sibling handlers authorize first. Lachesis follows the value, flags the three, and names their guarded twins — [**see it live on the pull request →**](https://github.com/UnboundCompute/lachesis-action-demo/pull/5)
+▶ **[Play the 55-second walkthrough](https://unboundcompute.com/lachesis.html)** — a Flask control plane where three handlers reach the same SQL sink unguarded while two sibling handlers authorize first. Lachesis follows the value, flags the three, and names their guarded twins — [**see it live on the pull request →**](https://github.com/UnboundCompute/lachesis-action-demo/pull/5)
 
 Lachesis parses a codebase with real compilers, not regexes, and turns it into a graph you can navigate. Syntax, symbols, calls, and the part that matters most: a full dataflow layer of value-flow, points-to, taint, and aliasing. That graph lives in an embedded columnar database and answers questions through a small navigation API and an MCP server, so a person or an LLM agent can reason about real source with compiler-level fidelity.
 
