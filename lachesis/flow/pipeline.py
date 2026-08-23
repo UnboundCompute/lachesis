@@ -185,9 +185,10 @@ def run_pass(store, lang="c", lifetime_engine=None):
             # functions whose object projection could not be emitted.
             reach_leads = [lead for lead in legacy_leads
                            if lead.get("pattern") in {"reachability", "relational", "presence"}]
-            fallback_lifetime = [lead for lead in legacy_leads
-                                 if lead.get("entry") in seed_unsafe]
-            leads = reach_leads + semantic_leads + fallback_lifetime
+            # Object mode is source-rooted semantic-graph production.  A failed
+            # object projection is reported in diagnostics, not silently converted
+            # back into the legacy name-keyed lifetime verdicts.
+            leads = reach_leads + semantic_leads
             differential = {
                 "computed": False,
                 "reason": "set LACHESIS_LIFETIME_ENGINE=shadow for a full differential",
