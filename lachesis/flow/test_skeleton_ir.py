@@ -18,6 +18,20 @@ def _find(hits, pattern):
 
 
 class TestRoleBinding(unittest.TestCase):
+    def test_legacy_events_expose_lifecycle_families(self):
+        from lachesis.flow.skeleton import _typestate_skel
+        c = _typestate_skel("f", "p", [
+            {"kind": "alloc"}, {"kind": "free"},
+            {"kind": "use"}, {"kind": "escape"},
+        ], 0, "c")
+        self.assertEqual([t["family"] for t in c[1:-1]],
+                         ["memory.alloc", "memory.free", "memory.deref", "lifecycle.escape"])
+        managed = _typestate_skel("f", "p", [
+            {"kind": "alloc"}, {"kind": "free"}, {"kind": "use"},
+        ], 0, "python")
+        self.assertEqual([t["family"] for t in managed[1:-1]],
+                         ["lifecycle.acquire", "lifecycle.release", "lifecycle.use"])
+
     def test_verb_maps_to_role(self):
         self.assertIn(Role.RELEASE, roles_for("free"))
         self.assertIn(Role.RELEASE, roles_for("close"))

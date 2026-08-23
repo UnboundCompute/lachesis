@@ -77,6 +77,11 @@ class Normalizer:
         alloc_kinds = set(lc.get("alloc_kinds") or [])
         alloc_extra = set((lc.get("alloc") or {}).get(lang) or [])
         self.dealloc_names = set((lc.get("dealloc") or {}).get(lang) or [])
+        # Managed-language destructors are method names in the source graph rather
+        # than C-style free symbols.  Keep this vocabulary in the lifecycle catalog;
+        # the reader only asks the catalog whether a call is a release operation.
+        self.release_method_names = set((lc.get("release_methods") or {}).get(lang) or [])
+        self.release_qualified_names = set((lc.get("release_qualified") or {}).get(lang) or [])
         # realloc-family is BOTH a free (of its first argument's old block) and an alloc
         # (of the returned block). It keeps its `alloc-size` sink identity below (its size
         # argument is a spatial sink); this set adds only the lifetime fact -- that the old
@@ -95,6 +100,12 @@ class Normalizer:
     def is_dealloc(self, callee):
         """True if `callee` frees its pointer argument (a lifecycle free event source)."""
         return self.canon_callee(callee) in self.dealloc_names
+
+    def is_release(self, callee):
+        """True for a catalogue release, including managed receiver methods."""
+        name = self.canon_callee(callee)
+        return (name in self.dealloc_names or name in self.release_qualified_names
+                or name.rsplit(".", 1)[-1] in self.release_method_names)
 
     def is_realloc(self, callee):
         """True if `callee` reallocates its first pointer argument -- freeing the old block

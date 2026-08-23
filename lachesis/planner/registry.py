@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from . import taxonomy
 from .sink_obligation import sink_constructor
 from .unbounded_copy import MemoryCopyCapacity
+from .lifecycle_obligation import constructors as lifecycle_constructors
 
 # The one family whose obligation is richer than a single argument (it pairs a
 # copy size with a write destination) earns a specialized enumerator. Every other
@@ -14,6 +15,7 @@ from .unbounded_copy import MemoryCopyCapacity
 # -- that comes entirely from `taxonomy.family_specs()`.
 _SPECIALIZED: dict[str, type] = {
     MemoryCopyCapacity.metadata["id"]: MemoryCopyCapacity,
+    **lifecycle_constructors(),
 }
 
 

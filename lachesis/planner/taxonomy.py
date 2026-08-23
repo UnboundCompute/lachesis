@@ -27,6 +27,19 @@ from __future__ import annotations
 # domain -> {title, meaning, obligation, primary, languages, families}
 # family -> {kinds: (atropos sink kinds), obligation, constructor: id|None}
 SINK_TAXONOMY: dict[str, dict] = {
+    "lifecycle": {
+        "title": "Resource lifecycle",
+        "meaning": "an operation that acquires, releases, uses, or transfers a tracked resource",
+        "obligation": "resource operations stay within the object's lifetime",
+        "primary": True,
+        "languages": ("c", "python", "javascript", "typescript"),
+        "families": {
+            "acquire": {"kinds": (), "obligation": "resource acquisition", "constructor": "lifecycle.acquire"},
+            "release": {"kinds": (), "obligation": "resource release", "constructor": "lifecycle.release"},
+            "use": {"kinds": (), "obligation": "tracked resource use", "constructor": "lifecycle.use"},
+            "escape": {"kinds": (), "obligation": "resource ownership transfer", "constructor": "lifecycle.escape"},
+        },
+    },
     "memory": {
         "title": "Memory safety",
         "meaning": "an operation that takes a size or writes into a buffer",

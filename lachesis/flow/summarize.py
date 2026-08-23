@@ -193,7 +193,8 @@ def summarize_one(name, F, summaries):
                 # a phantom double-free of the C destructor idiom (free the members, free the
                 # container). So skip the free here; fn["events"] is its single, correctly-keyed
                 # source. This loop emits only the pointer-as-arg USE.
-                if norm.is_dealloc(call["callee"]) and a["pos"] == 0:
+                if (norm.is_release(call["callee"]) or norm.is_realloc(call["callee"])) \
+                        and a["pos"] == 0:
                     continue
                 stream.append(("use", call["line"], call.get("node")))
         for ev in fn["events"]:

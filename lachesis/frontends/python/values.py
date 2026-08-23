@@ -346,6 +346,21 @@ class ValueWalk:
         self.write_count += 1
         return node_id
 
+    def release(self, node: ast.Delete, frame) -> None:
+        """Emit ``del`` as a structural release of its tracked target."""
+        for target in node.targets:
+            target_id = self.target_of(target, frame)
+            if target_id is None:
+                continue
+            position = self.source.position(node)
+            node_id = stable_id("release", self.source.display,
+                                position["start_offset"], position["end_offset"], target_id)
+            self.graph.node(node_id, "release", compact(self.source.excerpt(target)),
+                            **position, release_method="del", target_id=target_id,
+                            owner_function_id=frame.owner_function_id)
+            self.graph.edge("EVIDENCED_BY", node_id, self.bodies.get(id(node))) \
+                if self.bodies.get(id(node)) else None
+
     # -- allocations ---------------------------------------------------------
 
     def allocation(
@@ -406,7 +421,9 @@ class ValueWalk:
 
     def visit(self, node: ast.AST, frame) -> None:
         """Called once per AST node, in the traversal BodyWalk already performs."""
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+        if isinstance(node, ast.Delete):
+            self.release(node, frame)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
                              ast.NamedExpr)):
             self._assignment(node, frame)
         elif isinstance(node, (ast.For, ast.AsyncFor)):

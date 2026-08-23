@@ -155,11 +155,28 @@ def _expand_reach(fn, flow, F, summaries, catalog, depth, guarded_acc, chain):
 
 
 # --- typestate skeleton (already ordered; re-serialise into tokens) ---------------
-def _typestate_skel(fn, var, events, depth):
+def _lifecycle_family(kind, lang):
+    """Map the legacy event verb to the public structural family.
+
+    C already exposes memory.alloc/free/deref and those names are part of its
+    compatibility surface. Managed frontends use the language-neutral lifecycle
+    alphabet; the event verb remains available for rendering/debugging.
+    """
+    if lang == "c":
+        return {"alloc": "memory.alloc", "free": "memory.free", "use": "memory.deref",
+                "escape": "lifecycle.escape"}.get(kind, "lifecycle." + kind)
+    return {"alloc": "lifecycle.acquire", "free": "lifecycle.release",
+            "use": "lifecycle.use", "escape": "lifecycle.escape"}.get(
+                kind, "lifecycle." + kind)
+
+
+def _typestate_skel(fn, var, events, depth, lang="c"):
     toks = [{"t": "enter", "fn": fn, "depth": depth}]
     for e in events:
-        toks.append({"t": e["kind"], "var": var, "line": e.get("line"),
-                     "node": e.get("node"), "fn": fn, "depth": depth + 1})
+        toks.append({"t": e["kind"], "family": e.get("family") or
+                     _lifecycle_family(e["kind"], lang), "var": var,
+                     "line": e.get("line"), "node": e.get("node"), "fn": fn,
+                     "depth": depth + 1})
     toks.append({"t": "exit", "fn": fn, "depth": depth})
     return toks
 
@@ -187,11 +204,11 @@ def build_skeletons(F, summaries, lang="c", *, include_typestate=True):
         if include_typestate:
             for var, events in s.get("typestate", {}).items():
                 skels.append({"kind": "typestate", "entry": fn, "is_source": is_src, "var": var,
-                              "complete": True, "tokens": _typestate_skel(fn, var, events, 0)})
+                              "complete": True, "tokens": _typestate_skel(fn, var, events, 0, lang)})
             for var, events in s.get("param_typestate", {}).items():
                 skels.append({"kind": "typestate", "entry": fn, "is_source": is_src,
                               "var": "param:" + var, "complete": True,
-                              "tokens": _typestate_skel(fn, "param:" + var, events, 0)})
+                              "tokens": _typestate_skel(fn, "param:" + var, events, 0, lang)})
     return skels
 
 
@@ -222,7 +239,8 @@ def render_text(skel):
                          f"var={t['var']}{tt}{b} {g}{ctrl}{sz}{dst}{trunc}")
         else:                                            # lifecycle
             ln = f"@{t['line']}" if t.get("line") is not None else ""
-            lines.append(f"{pad}{t['t']} {t['var']}{ln}")
+            fam = f" {t['family']}" if t.get("family") else ""
+            lines.append(f"{pad}{t['t']}{fam} {t['var']}{ln}")
     return "\n".join(lines)
 
 
