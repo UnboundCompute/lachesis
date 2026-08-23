@@ -96,6 +96,26 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(built.coverage["uncovered_states"], [["skipped", "source"]])
         self.assertFalse(built.coverage["converged"])
 
+    def test_materialization_requires_a_valid_pushdown_return(self):
+        graph = SkeletonGraph()
+        for node, fragment in (("source:entry", "source"),
+                               ("callee:entry", "callee"),
+                               ("callee:exit", "callee"),
+                               ("wrong:entry", "wrong")):
+            graph.add_node(node, fragment=fragment)
+        graph.add_edge("source:entry", "callee:entry", kind="call",
+                       return_to="source:after")
+        # This continuation does not match the pushed return site.  Ordinary
+        # reachability would count it; coverage must not.
+        graph.add_edge("callee:entry", "callee:exit")
+        graph.add_edge("callee:exit", "wrong:entry", kind="return")
+        for name, entry in (("source", "source:entry"), ("callee", "callee:entry"),
+                            ("wrong", "wrong:entry")):
+            graph.add_fragment(name, entry, (entry,))
+
+        self.assertEqual(
+            Claus._materialized_states(graph, [("wrong", "source")]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

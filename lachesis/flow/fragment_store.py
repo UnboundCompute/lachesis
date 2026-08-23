@@ -132,18 +132,35 @@ class Claus:
             if source == target:
                 materialized.append((target, source))
                 continue
-            queue = [source_fragment.entry]
+            # Coverage must use the same call/return discipline as the matcher.
+            # Plain graph reachability can walk from a callee to a continuation
+            # belonging to a different caller (or accept a malformed return edge),
+            # then incorrectly mark the target source-state as analysed.  The
+            # fragment graph already carries the explicit continuation on call
+            # edges, so a small pushdown walk is enough; this remains independent
+            # of any vulnerability pattern.
+            queue = [(source_fragment.entry, ())]
             seen = set(queue)
             reachable = False
             while queue and not reachable:
-                node = queue.pop()
+                node, stack = queue.pop()
                 if graph.nodes[node].fragment == target:
                     reachable = True
                     break
                 for edge in graph.edges.get(node, ()):
-                    if edge.target not in seen:
-                        seen.add(edge.target)
-                        queue.append(edge.target)
+                    next_stack = stack
+                    if edge.kind == "call":
+                        if edge.return_to is None:
+                            continue
+                        next_stack = stack + (edge.return_to,)
+                    elif edge.kind == "return":
+                        if not stack or edge.target != stack[-1]:
+                            continue
+                        next_stack = stack[:-1]
+                    state = (edge.target, next_stack)
+                    if state not in seen:
+                        seen.add(state)
+                        queue.append(state)
             if reachable:
                 materialized.append((target, source))
         return materialized
