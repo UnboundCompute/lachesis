@@ -130,7 +130,10 @@ def run_pass(store, lang="c", lifetime_engine=None):
     if requested not in {"legacy", "shadow", "object"}:
         raise ValueError(
             "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")
-    object_requested = lang.lower() == "c" and requested != "legacy"
+    # Pass 3 is a language-neutral semantic pipeline.  Frontends select the
+    # appropriate catalog/normalizer and contribute their own graph facts; the
+    # scheduler, Claus graph, and matcher must not make C the dispatch gate.
+    object_requested = requested != "legacy"
     if object_requested:
         F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
     else:
