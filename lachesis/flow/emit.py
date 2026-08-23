@@ -619,9 +619,28 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                             binding=_call_bindings(sub, call, functions.get(callee, {}).get("params", ())))
             result.add_edge(exit_node, f"{caller}:{continuation}")
             for callee_exit in result.fragments[callee].exits:
+                return_binding = list(_return_bindings(
+                    sub, call, functions.get(callee, {})))
+                receiver = call.get("assigned")
+                if receiver:
+                    receiver_ref = ObjRef(
+                        sub.label(str(receiver)) or str(receiver), generation="g0")
+                    # Return metadata may not carry an expression for a field
+                    # return (for example `return buffer->data`). Recover the
+                    # precise value from the emitted RETURN_VALUE event instead
+                    # of guessing from source names. This is language-neutral at
+                    # the skeleton boundary: frontends only need to emit the
+                    # return event.
+                    for return_node, return_graph_node in result.nodes.items():
+                        if return_graph_node.fragment != callee:
+                            continue
+                        event = return_graph_node.event
+                        if event is not None and event.kind == EventKind.RETURN_VALUE \
+                                and event.obj is not None:
+                            return_binding.append((receiver_ref, event.obj))
                 result.add_edge(
                     callee_exit, exit_node, kind="return",
-                    binding=_return_bindings(sub, call, functions.get(callee, {})))
+                    binding=tuple(dict.fromkeys(return_binding)))
     result.source_reachable = set()
     for name in functions:
         if name not in result.fragments:
@@ -767,7 +786,10 @@ def _return_bindings(sub, call, callee):
             continue
         local = sub.label(str(local)) or str(local)
         receiver_ref = ObjRef(receiver, generation="g0")
-        bindings.append((ObjRef(local, generation="g0"), receiver_ref))
+        # Canonical bindings point the caller's result at the callee's returned
+        # value.  This direction lets a later caller-side use of `result` resolve
+        # through the return seam to the actual object released through a formal.
+        bindings.append((receiver_ref, ObjRef(local, generation="g0")))
         if local in {sub.label(str(formal)) or str(formal) for formal in formals}:
             position = next((index for index, formal in enumerate(formals)
                              if (sub.label(str(formal)) or str(formal)) == local), None)
@@ -776,7 +798,7 @@ def _return_bindings(sub, call, callee):
                                if arg.get("pos") == position and arg.get("root")), None)
                 if actual:
                     actual = sub.label(str(actual)) or str(actual)
-                    bindings.append((ObjRef(actual, generation="g0"), receiver_ref))
+                    bindings.append((receiver_ref, ObjRef(actual, generation="g0")))
     return tuple(bindings)
 
 

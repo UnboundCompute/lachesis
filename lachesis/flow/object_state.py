@@ -75,6 +75,14 @@ class ParamEffect:
     selectors: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, order=True)
+class ReturnEffect:
+    """A return value borrowed from one formal parameter access path."""
+
+    position: int
+    selectors: tuple[str, ...] = ()
+
+
 ObjectId = tuple
 
 
@@ -118,7 +126,7 @@ class AbstractState:
         env: Mapping[str, ObjectId] | None = None,
         facts: Mapping[ObjectId, frozenset[ObjectFact]] | None = None,
         slots: Mapping[tuple[ObjectId, str], ObjectId] | None = None,
-        trace: Sequence[ParamEffect] = (),
+        trace: Sequence[ParamEffect | ReturnEffect] = (),
         freed_paths: Mapping[AccessPath, ObjectId] | None = None,
     ):
         self.env = dict(env or {})
@@ -193,6 +201,13 @@ class AbstractState:
             return
         effect = ParamEffect(kind, oid[1], oid[2])
         if self.trace.count(effect) < 2 and len(self.trace) < self.TRACE_LIMIT:
+            self.trace += (effect,)
+
+    def _record_return_effect(self, oid: ObjectId) -> None:
+        if not (isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
+            return
+        effect = ReturnEffect(oid[1], oid[2])
+        if self.trace.count(effect) < 2 and len(self.trace) < AbstractState.TRACE_LIMIT:
             self.trace += (effect,)
 
     def _merge_object(self, destination: ObjectId, source: ObjectId) -> None:
@@ -323,6 +338,8 @@ class AbstractState:
             return
         if op.kind == OpKind.USE:
             self._record_param_effect(OpKind.USE, oid)
+            if op.access == "return":
+                self._record_return_effect(oid)
             facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
             # A summary object may-be-freed abstracts distinct concrete cells; a use of it
             # is not a proven violation of the same object, so it stays a weak (no-finding).

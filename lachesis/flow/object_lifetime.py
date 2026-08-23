@@ -29,6 +29,7 @@ from .object_state import (
     OpKind,
     Operation,
     ParamEffect,
+    ReturnEffect,
 )
 from .order import build_order
 
@@ -390,6 +391,24 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             for alternative in callee_summary:
                 effects = []
                 for effect in alternative:
+                    if isinstance(effect, ReturnEffect):
+                        assigned = call.get("assigned")
+                        if not assigned:
+                            continue
+                        destination = next((candidate for candidate in owned
+                                            if sub.kind(candidate) == "variable"
+                                            and sub.label(candidate) == assigned), None)
+                        receiver = (_path(ap_builder, destination)
+                                    if destination is not None else AccessPath(str(assigned)))
+                        actual = _argument_path(
+                            sub, ap_builder, call_node, effect.position)
+                        if receiver is None or actual is None:
+                            continue
+                        effects.append(_op(
+                            OpKind.COPY, anchor, target=receiver,
+                            source=_compose(actual, effect.selectors), line=line,
+                            ordinal=20 + len(effects), access="return-alias"))
+                        continue
                     actual = _argument_path(sub, ap_builder, call_node, effect.position)
                     if actual is None:
                         continue

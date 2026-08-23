@@ -18,6 +18,8 @@ void free(void *);
 void consume(void *);
 void memcpy(void *, const void *, unsigned long);
 char *identity(char *value) { return value; }
+struct Buffer { char *data; };
+char *borrowed_field(struct Buffer *buffer) { return buffer->data; }
 
 struct Aggregate { char *owned; };
 
@@ -85,6 +87,15 @@ void caller_return_alias(void) {
     free(second);
     *first = 1;
 }
+
+void caller_return_field_alias(void) {
+    struct Buffer *buffer = malloc(sizeof(struct Buffer));
+    if (!buffer) return;
+    buffer->data = malloc(8);
+    char *borrowed = borrowed_field(buffer);
+    free(buffer->data);
+    *borrowed = 1;
+}
 """
 
 
@@ -117,6 +128,9 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
                                  lead["pattern"] == "uaf.deref"
                                  for lead in result["leads"]))
             self.assertTrue(any(lead["entry"] == "caller_return_alias" and
+                                lead["pattern"] == "uaf.deref"
+                                for lead in result["leads"]))
+            self.assertTrue(any(lead["entry"] == "caller_return_field_alias" and
                                 lead["pattern"] == "uaf.deref"
                                 for lead in result["leads"]))
             self.assertTrue(any(lead["entry"] == "aggregate_copy" and
