@@ -57,9 +57,7 @@ class Claus:
                                      graph=graph, summaries=summaries)
         if coverage is not None:
             built.coverage = coverage.to_dict() if hasattr(coverage, "to_dict") else dict(coverage)
-            self.fragments.mark_covered(
-                built.coverage.get("regions", [])
-                and [key for region in built.coverage["regions"]
-                     for key in region.get("state_keys", [])]
-                or ())
+            state_keys = [key for region in built.coverage.get("regions", [])
+                          for key in region.get("state_keys", [])]
+            self.fragments.mark_covered(state_keys)
         return self.fragments.put(functions, lang, graph, built, summaries)
