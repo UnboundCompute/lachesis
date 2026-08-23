@@ -132,6 +132,17 @@ def _rhs_kind(sub, ap_builder, norm, rhs):
     rhs = _peel(sub, rhs)
     if rhs is None:
         return OpKind.CLOBBER, None, False
+    if sub.kind(rhs) == "ConditionalOperator":
+        # A common ownership idiom stores a field or alias on the non-null arm
+        # and NULL on the other arm.  Preserve the value-producing arm as a
+        # COPY fact; treating the whole conditional as an opaque clobber loses
+        # the alias relation before any interprocedural matcher can use it.
+        children = sub.ast_children.get(rhs, ())
+        for candidate in children[1:]:
+            source = _path(ap_builder, candidate)
+            if source is not None:
+                return OpKind.COPY, source, False
+        return OpKind.CLOBBER, None, any(_is_null(sub, child) for child in children[1:])
     if sub.is_call(rhs):
         callee = _callee(sub, rhs)
         # realloc BEFORE alloc: it frees the old block its first argument names (source)
