@@ -767,6 +767,7 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
     object_name = obj.render()
     from . import atropos
     catalog_id = atropos.flow_pattern_id(pattern, family)
+    evaluator = atropos.flow_pattern_evaluator(pattern, family)
     hits.setdefault(key, {"pattern": pattern, "object": object_name, "node": node.id,
                           "entry": node.fragment, "line": node.event.line if node.event else None,
                           # Keep the lead contract shared with the reachability
@@ -779,6 +780,7 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
                           "var": object_name,
                           "at": node.id,
                           "pattern_id": catalog_id,
+                          "evaluator": evaluator,
                           "source_reachable": reachable,
                           "source_influenced": influenced,
                           "witness": list(witness),

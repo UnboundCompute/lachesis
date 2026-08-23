@@ -208,9 +208,35 @@ def flow_pattern_id(matcher_pattern, family=None):
     return None
 
 
+def flow_pattern_evaluator(matcher_pattern, family=None):
+    """Resolve the executable evaluator class for a graph-pattern finding."""
+    for entry in pattern_catalog():
+        matcher = entry.get("matcher") or {}
+        if matcher.get("pattern") != matcher_pattern:
+            continue
+        families = matcher.get("families") or []
+        if families and family not in families:
+            continue
+        return entry.get("evaluator")
+    return None
+
+
 def evaluator_catalog():
     """Return the Atropos evaluator vocabulary and kind routing table."""
     return detection("evaluators")
+
+
+def event_evaluator(event_kind):
+    """Return the evaluator recipe for a semantic skeleton event.
+
+    Sink ``kind_evaluator`` routing remains for single-node observations.  Lifecycle
+    events are a separate axis: their meaning depends on ordering, identity, guards,
+    call/return context, and allocation generation, so the temporal graph matcher owns
+    the evaluation.  Atropos still owns the vocabulary and declares which events enter
+    that evaluator.
+    """
+    catalog = evaluator_catalog()
+    return (catalog.get("event_evaluator") or {}).get(event_kind)
 
 
 def sink_catalog(lang):

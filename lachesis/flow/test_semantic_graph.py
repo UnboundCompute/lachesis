@@ -20,6 +20,8 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(atropos.flow_pattern_id("leak"), "mem.lifetime.leak")
         self.assertEqual(atropos.flow_pattern_id("use.dangling"),
                          "mem.lifetime.dangling-use")
+        self.assertEqual(atropos.flow_pattern_evaluator("uaf.deref"), "typestate")
+        self.assertEqual(atropos.flow_pattern_evaluator("double-free"), "typestate")
         self.assertEqual(atropos.flow_pattern_id("relational", "buffer-write"),
                          "mem.write.tainted-unbounded")
 
@@ -32,6 +34,7 @@ class SemanticGraphTests(unittest.TestCase):
         )
         hits = match_graph(g, patterns={"mem.lifetime.use-after-free"})
         self.assertEqual({hit["pattern"] for hit in hits}, {"uaf.deref"})
+        self.assertEqual({hit["evaluator"] for hit in hits}, {"typestate"})
 
     def test_relational_and_index_guards_keep_distinct_typed_proofs(self):
         class Sub:

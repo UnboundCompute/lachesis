@@ -91,6 +91,16 @@ def _arithmetic_overflow_guard(fact):
                for predicate in fact.get("guard_predicates", ()))
 
 
+def _typestate(fact):
+    """Mark a semantic lifecycle fact for the temporal graph evaluator.
+
+    The ordering decision is intentionally not made from one sink fact.  This predicate
+    is the routing primitive used by Atropos's event vocabulary; ``semantic_graph`` then
+    evaluates the actual compatible path, object identity, call stack, and generation.
+    """
+    return bool(fact.get("event_kind") or fact.get("temporal_event"))
+
+
 EVALUATORS = {
     "reachability": _reachability,
     "relational":   _relational,
@@ -98,6 +108,7 @@ EVALUATORS = {
     "missing-guard": _missing_guard,
     "inverted-capacity-guard": _inverted_capacity_guard,
     "arithmetic-overflow-guard": _arithmetic_overflow_guard,
+    "typestate": _typestate,
 }
 
 
@@ -196,6 +207,15 @@ def evaluate_all(sink_kind, fact):
                 and pattern in EVALUATORS and EVALUATORS[pattern](fact)):
             matches.append(pattern)
     return matches
+
+
+def evaluator_for_event(event_kind):
+    """Return the Atropos-declared evaluator for a semantic event kind."""
+    try:
+        from .atropos import event_evaluator
+        return event_evaluator(event_kind)
+    except (ImportError, OSError, ValueError, AttributeError):
+        return None
 
 
 def is_call_level(sink_kind):
