@@ -1,6 +1,7 @@
 import unittest
 
 from .emit import _cfg_guard_proofs
+from . import atropos
 from .semantic_graph import Edge, Event, EventKind, GuardProof, ObjRef, SkeletonGraph, match_graph
 
 
@@ -14,6 +15,13 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_fragment("main", events[0][0], [events[-1][0]])
         g.validate()
         return g
+
+    def test_atropos_public_ids_cover_generic_lifetime_and_write_findings(self):
+        self.assertEqual(atropos.flow_pattern_id("leak"), "mem.lifetime.leak")
+        self.assertEqual(atropos.flow_pattern_id("use.dangling"),
+                         "mem.lifetime.dangling-use")
+        self.assertEqual(atropos.flow_pattern_id("relational", "buffer-write"),
+                         "mem.write.tainted-unbounded")
 
     def test_relational_and_index_guards_keep_distinct_typed_proofs(self):
         class Sub:
