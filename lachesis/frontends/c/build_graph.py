@@ -537,8 +537,19 @@ def position_from_ast(
     begin = ast_node.get("range", {}).get("begin", {})
     end = ast_node.get("range", {}).get("end", {})
     loc = ast_node.get("loc", {})
-    start = begin.get("offset", loc.get("offset", 0))
-    finish = end.get("offset", start) + end.get("tokLen", loc.get("tokLen", 0))
+
+    # Macro-expanded operations are spelled in a header but executed at a
+    # source call site.  Clang puts the useful source coordinates in
+    # ``expansionLoc`` and leaves the header coordinates in ``spellingLoc``.
+    # Prefer the expansion for graph identity and source witnesses whenever it
+    # is available; ordinary AST nodes retain their existing range behaviour.
+    begin_source = begin.get("expansionLoc", begin)
+    end_source = end.get("expansionLoc", end)
+    loc_source = loc.get("expansionLoc", loc)
+    start = begin_source.get("offset", loc_source.get("offset", 0))
+    finish = end_source.get("offset", start) + end_source.get(
+        "tokLen", loc_source.get("tokLen", 0)
+    )
     text = source_text(path, texts)
     starts = line_starts(path, text, line_starts_cache)
 
@@ -557,10 +568,10 @@ def position_from_ast(
     return {
         "file": str(path), "absolute_file": str(path),
         "start_offset": start, "end_offset": finish,
-        "start_line": loc.get("line", begin.get("line", start_line)),
-        "start_column": loc.get("col", begin.get("col", start_column)),
-        "end_line": end.get("line", end_line),
-        "end_column": end.get("col", end_column),
+        "start_line": loc_source.get("line", begin_source.get("line", start_line)),
+        "start_column": loc_source.get("col", begin_source.get("col", start_column)),
+        "end_line": end_source.get("line", end_line),
+        "end_column": end_source.get("col", end_column),
     }
 
 
@@ -839,6 +850,13 @@ def _has_include_origin(node: dict) -> bool:
     """
     loc = node.get("loc", {})
     begin = node.get("range", {}).get("begin", {})
+    # A macro expansion rooted in the current source file is source-visible,
+    # even when its spelling location is in an included header.  This keeps
+    # fortified libc/compiler builtins in the semantic graph without admitting
+    # the header implementation itself.
+    expansion = loc.get("expansionLoc") or begin.get("expansionLoc")
+    if isinstance(expansion, dict) and expansion.get("file"):
+        return False
     return bool(loc.get("includedFrom") or begin.get("includedFrom"))
 
 
@@ -1413,14 +1431,38 @@ def main() -> int:
             "BinaryOperator", "UnaryOperator", "ConditionalOperator",
             "IntegerLiteral", "StringLiteral", "CharacterLiteral",
         }
-        if not node.get("isImplicit") and not is_included and is_body:
+        # Some source-visible library/builtin calls (notably fortified or macro
+        # lowered calls) are marked implicit by Clang but still carry the only
+        # semantic operation at their source span. Retain those CallExpr nodes;
+        # expression-only compiler scaffolding remains filtered out.
+        expansion = (
+            node.get("range", {}).get("begin", {}).get("expansionLoc")
+            or node.get("loc", {}).get("expansionLoc")
+        )
+        source_call = kind == "CallExpr" and isinstance(expansion, dict) and bool(
+            expansion.get("file")
+        )
+        call_reference = (
+            referenced_decl(node.get("inner", [{}])[0])
+            if kind == "CallExpr" and node.get("inner") else None
+        )
+        if (not node.get("isImplicit") or source_call) and not is_included and is_body:
             position = position_from_ast(node, path, texts, line_starts_cache)
             # Clang offsets are BYTE positions; slice the raw bytes so a multi-byte
             # character upstream does not shift the snippet (see source_bytes).
             snippet = compact(source_span(source_bytes(path, raw_texts),
                                           position["start_offset"], position["end_offset"]))
             node_kind = "call" if kind == "CallExpr" else "statement" if kind.endswith("Stmt") else "expression"
-            body_id = stable_id("body", path, position["start_offset"], position["end_offset"], kind)
+            # Fortified/macro-lowered calls can contain multiple CallExpr nodes
+            # at one source span (the wrapper and its builtin helpers). Include
+            # the resolved callee in the identity so those semantic operations
+            # do not overwrite one another in the graph.
+            identity_parts = [
+                "body", path, position["start_offset"], position["end_offset"], kind,
+            ]
+            if kind == "CallExpr" and expansion:
+                identity_parts.append((call_reference or {}).get("name", ""))
+            body_id = stable_id(*identity_parts)
             graph.node(
                 "T3", body_id, node_kind, snippet or kind, **position,
                 syntax_kind=kind, type=node.get("type", {}).get("qualType"),
@@ -1439,7 +1481,7 @@ def main() -> int:
             if kind == "CallExpr":
                 # Clang stores the callee as the first CallExpr child. Looking
                 # through the whole call can incorrectly select an argument.
-                reference = referenced_decl(node.get("inner", [{}])[0])
+                reference = call_reference
                 target = declarations_by_raw_id.get((reference or {}).get("id", ""))
                 if not target and reference:
                     candidates = declarations_by_name.get((reference.get("kind", "FunctionDecl"), reference.get("name", "")), [])
