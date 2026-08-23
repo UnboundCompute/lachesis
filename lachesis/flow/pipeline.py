@@ -45,7 +45,7 @@ def _lifetime_slice(F, succ, lang="c"):
 
     def materializable(function):
         return (carries_semantic_work(function) or function.get("params") or
-                function.get("returns"))
+                function.get("returns") or function.get("body_node_count", 0) > 0)
 
     seeds = {
         name for name, function in F.items()

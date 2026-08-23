@@ -86,6 +86,13 @@ class PipelineLifetimeTests(unittest.TestCase):
         successors = {"wrapper": ["alloc", "artifact"], "alloc": [], "artifact": []}
         self.assertEqual(set(_lifetime_slice(functions, successors)), {"wrapper", "alloc"})
 
+    def test_body_only_function_is_materialized_for_non_sink_semantics(self):
+        functions = {
+            "global_reader": {"source_reachable": True, "body_node_count": 4},
+        }
+        self.assertEqual(set(_lifetime_slice(functions, {"global_reader": []})),
+                         {"global_reader"})
+
 
 if __name__ == "__main__":
     unittest.main()

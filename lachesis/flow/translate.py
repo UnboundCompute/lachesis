@@ -294,6 +294,11 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     graph, so every downstream fact -- sink lookup, alloc/free events, summaries, skeletons --
     speaks one vocabulary. The graph node keeps its surface name; only this IR is rewritten."""
     fid = fnode["id"]
+    owned_nodes = ix.nodes_owned_by(fid)
+    body_node_count = sum(
+        1 for node in owned_nodes
+        if node.get("kind") not in {"cfg-entry", "cfg-exit", "cfg-merge", "cfg-condition"}
+    )
     params = [p.get("label") for p in _by_offset(ix.nodes_owned_by(fid, "parameter"))]
     param_set = set(params)
     calls, callees, events, assigns = [], [], [], []
@@ -461,7 +466,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     return {"name": fnode.get("label"),
             "file": _props(fnode).get("file"), "line": _props(fnode).get("start_line"),
             "params": params, "calls": calls, "events": events,
-            "assigns": assigns, "returns": returns, "callees": callees}
+            "assigns": assigns, "returns": returns, "callees": callees,
+            "body_node_count": body_node_count}
 
 
 def build_F(store, lang="c", *, return_graph=False):
@@ -556,6 +562,7 @@ def build_F(store, lang="c", *, return_graph=False):
             "sink_ldf_callees": sink_ldf, "callers": sorted(callers[n]),
             "calls": r["calls"], "events": r["events"],
             "assigns": r["assigns"], "returns": r["returns"],
+            "body_node_count": r.get("body_node_count", 0),
             # Pass-2 source facts are retained separately from reachability.  A
             # callerless function is only a structural entry; an actual source call
             # is the operation from which Claus should launch.
