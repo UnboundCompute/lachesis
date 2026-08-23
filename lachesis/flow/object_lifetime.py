@@ -341,8 +341,7 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                                       line=line, ordinal=20))
             continue
 
-        if (callee in {"memcpy", "memmove", "__builtin_memcpy", "__builtin_memmove"}
-                and "sizeof" in (sub.label(call_node) or "")):
+        if norm.is_aggregate_copy(callee, sub.label(call_node) or ""):
             destination = _argument_path(sub, ap_builder, call_node, 0)
             source = _argument_path(sub, ap_builder, call_node, 1)
             if destination is not None and source is not None:

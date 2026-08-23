@@ -83,6 +83,7 @@ class Normalizer:
         # generation may be freed -- so an un-rebased interior pointer reads as a dangling
         # use-after-free. DATA-DRIVEN from the same catalog; no name is hard-coded here.
         self.realloc_names = set((lc.get("realloc") or {}).get(lang) or [])
+        self.aggregate_copy_specs = dict((lc.get("aggregate_copy") or {}).get(lang) or {})
         cat = atropos.sink_catalog(lang)
         self.alloc_names = {m for m, c in cat.items()
                             if c.get("family") in alloc_kinds} | alloc_extra
@@ -100,6 +101,16 @@ class Normalizer:
         (it may move) and returning a fresh one. Checked before is_alloc by the lifetime
         emitter so realloc carries its free-of-old-generation semantics, not a plain alloc."""
         return self.canon_callee(callee) in self.realloc_names
+
+    def is_aggregate_copy(self, callee, expression=""):
+        """Whether a call carries a catalogued aggregate-copy semantic role."""
+        name = self.canon_callee(callee)
+        requirement = self.aggregate_copy_specs.get(name)
+        if requirement is None:
+            return False
+        if isinstance(requirement, str):
+            return requirement in (expression or "")
+        return bool(requirement)
 
     def canon_callee(self, name):
         """The canonical callee/sink name for a surface name (identity if unmapped).
@@ -119,7 +130,8 @@ class Normalizer:
         return {"lang": self.lang, "alias_sections": sorted(self.alias_sections),
                 "callee_rewrites": len(self.callee_rewrites), "opaque_kinds": len(self.opaque),
                 "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names),
-                "realloc_names": len(self.realloc_names)}
+                "realloc_names": len(self.realloc_names),
+                "aggregate_copy_names": len(self.aggregate_copy_specs)}
 
 
 _CACHE = {}

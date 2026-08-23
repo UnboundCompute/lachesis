@@ -1,6 +1,7 @@
 import unittest
 
 from .coverage import CoverageScheduler
+from .fragment_store import FragmentStore
 
 
 class CoverageSchedulerTests(unittest.TestCase):
@@ -24,6 +25,12 @@ class CoverageSchedulerTests(unittest.TestCase):
         functions = {"entry": {"callers": []}, "deep": {"callers": ["entry"]}}
         plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()
         self.assertEqual(plan.for_target("deep").sources, ("entry",))
+
+    def test_fragment_store_tracks_source_state_keys(self):
+        store = FragmentStore()
+        store.mark_covered([("worker", "source")])
+        self.assertEqual(store.uncovered([("worker", "source"), ("worker", "other")]),
+                         (("worker", "other"),))
 
 
 if __name__ == "__main__":
