@@ -1260,6 +1260,23 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertEqual(leak["candidates"][0]["handles"]["enclosing_function_id"], "make")
         self.assertNotIn("verdict", leak["candidates"][0])
 
+    def test_serialized_semantic_language_survives_without_file_metadata(self):
+        graph = {
+            "language": "python",
+            "nodes": [], "edges": [],
+            "semantic_graph": {
+                "language": "python",
+                "nodes": {
+                    "read": {"event": {"kind": "READ_STORAGE", "obj": "buf#g0"},
+                             "fragment": "use", "metadata": {}},
+                },
+                "edges": {}, "fragments": {},
+            },
+        }
+        row = default_candidate_registry(graph).candidates(
+            constructor="mem.lifetime.use-after-free")["candidates"][0]
+        self.assertEqual(row["language"], "python")
+
 
 class GuardRelationTest(unittest.TestCase):
     """A branch guards a size only when it COMPARES the variable's magnitude.

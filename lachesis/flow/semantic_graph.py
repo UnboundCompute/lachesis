@@ -187,6 +187,7 @@ class SkeletonGraph:
     fragments: dict[str, Fragment] = field(default_factory=dict)
     source_reachable: set[str] = field(default_factory=set)
     coverage: dict[str, Any] = field(default_factory=dict)
+    language: str | None = None
 
     def add_node(self, node_id: str, event: Event | None = None, *, fragment: str | None = None,
                  **metadata: Any) -> GraphNode:
@@ -241,6 +242,7 @@ class SkeletonGraph:
                           for n, f in self.fragments.items()},
             "source_reachable": sorted(self.source_reachable),
             "coverage": self.coverage,
+            "language": self.language,
         }
 
 

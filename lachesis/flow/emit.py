@@ -360,7 +360,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     """
     functions = _lifetime_slice(F, succ, lang=lang)
     if not functions:
-        return SkeletonGraph()
+        return SkeletonGraph(language=lang)
     analysis_graph = graph if graph is not None else store.graph
     from lachesis.nav.graph_store import GraphStore
     analysis_store = store if analysis_graph is store.graph else GraphStore(analysis_graph)
@@ -379,7 +379,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             by_name[name] = node["id"]
     sub.warm_owned(by_name.values())
 
-    result = SkeletonGraph()
+    result = SkeletonGraph(language=lang)
     pending_calls = []
     fragment_cfg = {}
     fragment_last = {}

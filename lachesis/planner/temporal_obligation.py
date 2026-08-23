@@ -46,7 +46,9 @@ class TemporalLifecycle:
         # accepting it keeps the registry useful before and after graph
         # publication without coupling it to the C frontend.
         semantic = graph.get("semantic_graph") or {}
+        self.language = graph.get("language")
         if isinstance(semantic, dict):
+            self.language = self.language or semantic.get("language")
             semantic_nodes = semantic.get("nodes", ())
             if isinstance(semantic_nodes, dict):
                 self.nodes.extend([{"id": node_id, **(node or {})}
@@ -57,7 +59,7 @@ class TemporalLifecycle:
     def _language(self, node):
         props = node.get("properties") or {}
         path = props.get("absolute_file") or props.get("file") or node.get("file") or ""
-        return atropos.lang_of(path)
+        return atropos.lang_of(path) if path else (self.language or "c")
 
     def _candidate(self, node):
         props = node.get("properties") or {}

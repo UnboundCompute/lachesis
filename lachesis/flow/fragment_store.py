@@ -140,6 +140,10 @@ class FragmentStore:
         """
         merged = SkeletonGraph()
         for graph in graphs:
+            if merged.language is None:
+                merged.language = graph.language
+            elif graph.language is not None and merged.language != graph.language:
+                raise ValueError("incompatible cached graph languages")
             for node_id, node in graph.nodes.items():
                 existing = merged.nodes.get(node_id)
                 if existing is None:
