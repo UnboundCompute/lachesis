@@ -158,6 +158,10 @@ class Edge:
     guard: tuple[GuardProof, ...] = ()
     return_to: str | None = None
     binding: tuple[tuple[ObjRef, ObjRef], ...] = ()
+    # Abstract object identities are local to a Claus fragment.  This optional
+    # relation translates those identities at an interprocedural seam without
+    # pretending they are source-level ObjRefs.
+    provenance: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -195,11 +199,12 @@ class SkeletonGraph:
 
     def add_edge(self, source: str, target: str, *, kind: str = "normal",
                  guard: Iterable[GuardProof] = (), return_to: str | None = None,
-                 binding: Iterable[tuple[ObjRef, ObjRef]] = ()) -> None:
+                 binding: Iterable[tuple[ObjRef, ObjRef]] = (),
+                 provenance: Iterable[tuple[str, str]] = ()) -> None:
         if source not in self.nodes or target not in self.nodes:
             raise KeyError(f"edge endpoint not in graph: {source}->{target}")
         self.edges.setdefault(source, []).append(
-            Edge(target, kind, tuple(guard), return_to, tuple(binding)))
+            Edge(target, kind, tuple(guard), return_to, tuple(binding), tuple(provenance)))
 
     def add_fragment(self, name: str, entry: str, exits: Iterable[str] = (),
                      params: Iterable[str] = ()) -> Fragment:
@@ -228,7 +233,9 @@ class SkeletonGraph:
             "edges": {n: [{"target": e.target, "kind": e.kind,
                            "guard": [{"kind": p.kind, "value": p.value} for p in e.guard],
                            "return_to": e.return_to,
-                           "binding": [[a.render(), b.render()] for a, b in e.binding]}
+                           "binding": [[a.render(), b.render()] for a, b in e.binding],
+                           **({"provenance": [list(pair) for pair in e.provenance]}
+                              if e.provenance else {})}
                           for e in es] for n, es in self.edges.items()},
             "fragments": {n: {"entry": f.entry, "exits": sorted(f.exits), "params": f.params}
                           for n, f in self.fragments.items()},
@@ -292,6 +299,9 @@ class _State:
     nullable: frozenset[ObjRef] = frozenset()
     realloc_lost: frozenset[ObjRef] = frozenset()
     pointer_arithmetic: frozenset[tuple[ObjRef, ObjRef | None]] = frozenset()
+    abstract_bindings: tuple[tuple[str, str], ...] = ()
+    abstract_released: frozenset[tuple[str, str]] = frozenset()
+    abstract_contexts: tuple[tuple[tuple[str, str], ...], ...] = ()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -328,6 +338,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             left.nullable | right.nullable,
             left.realloc_lost | right.realloc_lost,
             left.pointer_arithmetic | right.pointer_arithmetic,
+            tuple(sorted(set(left.abstract_bindings) | set(right.abstract_bindings))),
+            left.abstract_released | right.abstract_released,
+            left.abstract_contexts,
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -351,6 +364,22 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         nullable = set(state.nullable)
         realloc_lost = set(state.realloc_lost)
         pointer_arithmetic = set(state.pointer_arithmetic)
+        abstract_bindings = dict(state.abstract_bindings)
+        abstract_released = set(state.abstract_released)
+        abstract_contexts = state.abstract_contexts
+
+        def abstract_ids(event: Event | None) -> tuple[str, ...]:
+            if event is None:
+                return ()
+            values = event.facts.get("abstract_object_ids") or ()
+            return tuple(str(value) for value in values)
+
+        def abstract_canonical(value: str) -> str:
+            visited = set()
+            while value in abstract_bindings and value not in visited:
+                visited.add(value)
+                value = abstract_bindings[value]
+            return value
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -464,12 +493,28 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 obj = None
             if event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
+            # Local abstract IDs are intentionally ignored until a seam has
+            # supplied a formal->actual translation.  Otherwise loop joins could
+            # turn two generations in one fragment into a false lifecycle hit.
+            event_abstract = (tuple(abstract_canonical(value) for value in abstract_ids(event))
+                              if abstract_bindings else ())
             if event.kind == EventKind.RELEASE and obj:
                 prior_sites = {site for released_obj, site in released if released_obj == obj}
                 if "double-free" in wanted and any(site != node.id for site in prior_sites):
                     _record(hits, "double-free", obj, node, witness())
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
+                if event_abstract:
+                    if "double-free" in wanted and any(
+                            prior_value != node.id
+                            for prior_value in (site for value, site in abstract_released
+                                                 if value in event_abstract)):
+                        _record(hits, "double-free", obj, node, witness())
+                    abstract_released = {
+                        (value, site) for value, site in abstract_released
+                        if value not in event_abstract
+                    }
+                    abstract_released.update((value, node.id) for value in event_abstract)
             elif event.kind == EventKind.INVALIDATE and obj:
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
@@ -480,6 +525,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     _record(hits, "pointer-arithmetic-before-validation", base,
                             node, witness())
                 if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released):
+                    _record(hits, "uaf.deref", base, node, witness())
+                if "uaf.deref" in wanted and any(
+                        value in {released_value for released_value, _ in abstract_released}
+                        for value in event_abstract):
                     _record(hits, "uaf.deref", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
                     _record(hits, "null-deref", base, node, witness())
@@ -537,6 +586,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             stack = state.stack
             next_bindings = dict(bindings)
             next_bindings.update(edge.binding)
+            next_abstract_bindings = dict(abstract_bindings)
+            next_abstract_bindings.update(edge.provenance)
+            next_abstract_contexts = abstract_contexts
             def rebase(value):
                 seen_bindings = set()
                 while value in next_bindings and value not in seen_bindings:
@@ -593,12 +645,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if edge.return_to is None:
                     raise ValueError(f"call edge {state.node}->{edge.target} lacks return_to")
                 stack = stack + (edge.return_to,)
+                next_abstract_contexts = abstract_contexts + (
+                    (tuple(sorted(abstract_bindings.items()))),)
             elif edge.kind == "return":
                 if not stack:
                     continue
                 if edge.target != stack[-1]:
                     continue
                 stack = stack[:-1]
+                if abstract_contexts:
+                    next_abstract_bindings = dict(abstract_contexts[-1])
+                    next_abstract_contexts = abstract_contexts[:-1]
                 # The callee's return value is now a caller-local receiver;
                 # it is no longer an exit escape for the caller's leak query.
                 for _formal, receiver in edge.binding:
@@ -608,12 +665,16 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 frozenset(next_escaped),
                                 tuple(sorted(sink_allocs.items())),
                                 frozenset(next_nullable),
-                                frozenset(next_realloc_lost))
+                                frozenset(next_realloc_lost), frozenset(next_pointer_arithmetic),
+                                tuple(sorted(next_abstract_bindings.items())),
+                                frozenset(abstract_released), next_abstract_contexts)
             next_state = _State(
                 next_state.node, next_state.released, next_state.origins,
                 next_state.stack, next_state.bindings, next_state.nulls,
                 next_state.escaped, next_state.sink_allocs, next_state.nullable,
-                next_state.realloc_lost, frozenset(next_pointer_arithmetic))
+                next_state.realloc_lost, frozenset(next_pointer_arithmetic),
+                next_state.abstract_bindings, next_state.abstract_released,
+                next_state.abstract_contexts)
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 bucket_key = (edge.target, stack)

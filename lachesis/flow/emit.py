@@ -40,6 +40,7 @@ engine's ObjectId through is the next increment.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 from collections import defaultdict
@@ -50,8 +51,8 @@ from lachesis.nav.dataflow.substrate import Substrate
 from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
 from .patterns import evaluator_for
-from .object_lifetime import extract_operations, _props
-from .object_state import OpKind
+from .object_lifetime import APBuilder, _argument_path, extract_operations, _props
+from .object_state import AccessPath, OpKind
 from .pipeline import _lifetime_slice
 from .semantic_graph import Event, EventKind, GuardProof, ObjRef, SkeletonGraph
 
@@ -817,7 +818,12 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             result.add_edge(enter, f"{callee}:{fragment_cfg[callee][1]['nodes'][0]}",
                             kind="call", return_to=exit_node,
                             guard=_call_guard_proofs(call),
-                            binding=_call_bindings(sub, call, functions.get(callee, {}).get("params", ())))
+                            binding=_call_bindings(sub, call, functions.get(callee, {}).get("params", ())),
+                            provenance=_seam_provenance(
+                                sub, call, functions.get(callee, {}).get("params", ()),
+                                (state_artifacts or {}).get(caller), anchor,
+                                [graph_node for graph_node in result.nodes.values()
+                                 if graph_node.fragment == callee]))
             result.add_edge(exit_node, f"{caller}:{continuation}")
             for callee_exit in result.fragments[callee].exits:
                 return_binding = list(_return_bindings(
@@ -1029,6 +1035,72 @@ def _return_bindings(sub, call, callee):
                     actual = sub.label(str(actual)) or str(actual)
                     bindings.append((receiver_ref, ObjRef(actual, generation="g0")))
     return tuple(bindings)
+
+
+def _seam_provenance(sub, call, formals, caller_artifact, caller_node, callee_nodes):
+    """Translate callee-local abstract parameter IDs to caller-local IDs.
+
+    Object-state snapshots intentionally use parameter ordinals, so a callee's
+    ``('param', 0, ...)`` is not directly comparable with the caller's allocation
+    identity.  This relation is kept separate from ObjRef bindings and is consumed
+    only by the optional provenance channel in the semantic matcher.
+    """
+    if caller_artifact is None:
+        return ()
+    states = caller_artifact.point_states.get(caller_node, ())
+    if not states:
+        return ()
+    # Use the frontend's declaration-rooted access path for abstract-state lookup.
+    # The display-oriented ObjRef binding intentionally uses source labels (``b``),
+    # while AbstractState.env is keyed by declaration IDs (``decl:<id>``).
+    ap_builder = APBuilder(sub)
+    by_position = {
+        argument.get("pos"): _argument_path(sub, ap_builder, call.get("node"),
+                                             argument.get("pos"))
+        for argument in call.get("args", ())
+        if isinstance(argument.get("pos"), int)
+        and argument.get("pos") < len(formals)
+    }
+    by_position = {position: path for position, path in by_position.items()
+                   if path is not None}
+    if not by_position:
+        return ()
+    mappings: defaultdict[str, set[str]] = defaultdict(set)
+    for node in callee_nodes:
+        event = node.event
+        if event is None:
+            continue
+        for raw in event.facts.get("abstract_object_ids") or ():
+            try:
+                parsed = ast.literal_eval(str(raw))
+            except (SyntaxError, ValueError):
+                continue
+            if not (isinstance(parsed, tuple) and len(parsed) == 3
+                    and parsed[0] == "param" and isinstance(parsed[1], int)):
+                continue
+            actual = by_position.get(parsed[1])
+            if actual is None:
+                continue
+            relative = tuple(parsed[2])
+            for state in states:
+                resolved = state.resolve(
+                    AccessPath(actual.root, actual.selectors + relative), create=False)
+                # Do not export weak/phi heap cells through the auxiliary channel.
+                # Those IDs intentionally summarize multiple loop/field instances;
+                # ObjRef matching remains the authority for them until a future
+                # context-sensitive heap relation is available.
+                concrete = (isinstance(resolved, tuple) and resolved
+                            and ((resolved[0] == "param") or
+                                 (resolved[0] == "alloc" and len(resolved) > 1
+                                  and resolved[1] == "recent")))
+                if concrete:
+                    mappings[str(raw)].add(repr(resolved))
+    # A single formal abstract ID mapping to multiple caller objects is a weak
+    # join, not a sound identity transfer.  Leave that case to the ordinary
+    # ObjRef/call-context matcher rather than manufacturing cross-object frees.
+    return tuple(sorted((source, next(iter(targets)))
+                        for source, targets in mappings.items()
+                        if len(targets) == 1))
 
 
 def main():

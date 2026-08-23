@@ -331,6 +331,28 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_edge("exit", "use", kind="return")
         self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_abstract_provenance_composes_across_a_call_seam(self):
+        formal = ObjRef("formal")
+        actual = ObjRef("actual")
+        formal_id = repr(("param", 0, ()))
+        actual_id = repr(("alloc", "recent", "caller-site"))
+        g = SkeletonGraph()
+        g.add_node("caller", Event.origin(actual))
+        g.add_node("enter", Event(EventKind.SEAM_ENTER))
+        g.add_node("free", Event(EventKind.RELEASE, obj=formal,
+                                   facts={"abstract_object_ids": [formal_id]}))
+        g.add_node("exit", Event(EventKind.SEAM_EXIT))
+        g.add_node("use", Event(EventKind.READ_STORAGE, obj=actual, base=actual,
+                                  facts={"abstract_object_ids": [actual_id]}))
+        g.add_fragment("caller", "caller", ["use"])
+        g.add_fragment("callee", "enter", ["exit"])
+        g.add_edge("caller", "enter", kind="call", return_to="use",
+                   binding=((formal, actual),), provenance=((formal_id, actual_id),))
+        g.add_edge("enter", "free")
+        g.add_edge("free", "exit")
+        g.add_edge("exit", "use", kind="return")
+        self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_source_tiers_are_preserved_on_leads(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

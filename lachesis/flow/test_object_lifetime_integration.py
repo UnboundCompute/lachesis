@@ -145,6 +145,10 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
                 node.event is not None
                 and node.event.facts.get("abstract_object_ids")
                 for node in result["semantic_graph"].nodes.values()))
+            self.assertTrue(any(
+                edge.provenance
+                for edges in result["semantic_graph"].edges.values()
+                for edge in edges))
             self.assertTrue(all(lead.get("tier") in {1, 2} for lead in result["leads"]
                                 if lead.get("pattern") in {"leak", "uaf.deref", "use.dangling",
                                                              "double-free", "null-deref"}))
