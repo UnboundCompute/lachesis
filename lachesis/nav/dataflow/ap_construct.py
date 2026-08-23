@@ -109,10 +109,14 @@ class APBuilder:
             if not ch:
                 return (("unk", nid), [])
             base, tail = self._build_rev(ch[0], depth + 1)
-            # indirectFieldAccess p->f : prepend FIELD then Indirection ; fieldAccess x.f : prepend FIELD
-            tail.append(Const(field))
+            # `_build_rev` stores the path in reverse construction order.  An
+            # outer member therefore has to be placed before the already-built
+            # tail; appending it reverses nested expressions such as
+            # `p->input->data` into `p->data->input` after the final reverse.
+            prefix = [Const(field)]
             if arrow:
-                tail.append(Ind())
+                prefix.append(Ind())
+            tail = prefix + tail
             return (base, tail)
 
         if k == "ArraySubscriptExpr":
@@ -129,9 +133,9 @@ class APBuilder:
             index_child = next((child for child in ch if child != base_child), None)
             base, tail = self._build_rev(base_child, depth + 1)
             idx_tok = self._index_token(index_child) if index_child is not None else VPS()
-            # indirectIndexAccess p[i] : prepend Indirection then SHIFT (build), final <i> *
-            tail.append(idx_tok)
-            tail.append(Ind())
+            # As with members, prefix the outer operation in reverse-build
+            # order so nested subscripts retain source order after `reverse()`.
+            tail = [idx_tok, Ind()] + tail
             return (base, tail)
 
         if k == "UnaryOperator":
@@ -141,11 +145,11 @@ class APBuilder:
                 return (("unk", nid), [])
             if op == "*":
                 base, tail = self._build_rev(ch[0], depth + 1)
-                tail.append(Ind())
+                tail = [Ind()] + tail
                 return (base, tail)
             if op == "&":
                 base, tail = self._build_rev(ch[0], depth + 1)
-                tail.append(Addr())
+                tail = [Addr()] + tail
                 return (base, tail)
             # ++/--/! etc: not an access-path op; treat operand as the value
             return self._build_rev(ch[0], depth + 1)
