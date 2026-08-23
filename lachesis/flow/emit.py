@@ -287,7 +287,11 @@ def _semantic_event(sub, operation, generations=None):
         if operation.access == "return":
             return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line)]
         if operation.access == "write":
-            return [Event.write(storage_obj, access_path, operation.line)]
+            source_key = _semantic_key(sub, operation.source)
+            value = (_semantic_obj(sub, operation.source,
+                                   generations.get(source_key, "g0"))
+                     if operation.source is not None else None)
+            return [Event.write(storage_obj, access_path, operation.line, value=value)]
         return [Event.read(storage_obj, access_path, operation.line)]
     if operation.kind == OpKind.COPY and obj:
         source_key = _semantic_key(sub, operation.source)

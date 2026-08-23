@@ -120,8 +120,10 @@ class Event:
         return cls(EventKind.READ_STORAGE, base=base, path=path, obj=base, line=line)
 
     @classmethod
-    def write(cls, base: ObjRef, path: str = "*", line: int | None = None) -> "Event":
-        return cls(EventKind.WRITE_STORAGE, base=base, path=path, obj=base, line=line)
+    def write(cls, base: ObjRef, path: str = "*", line: int | None = None,
+              value: ObjRef | None = None) -> "Event":
+        return cls(EventKind.WRITE_STORAGE, base=base, path=path, obj=base,
+                   value=value, line=line)
 
 
 @dataclass(frozen=True)

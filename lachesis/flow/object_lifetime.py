@@ -250,8 +250,10 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             line = _line(sub, node)
             base = _deref_base(sub, ap_builder, lhs)
             if base is not None and not _is_unevaluated(sub, lhs):
+                rhs_source = _path(ap_builder, rhs)
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
-                                      target=base, line=line, ordinal=0, access="write"))
+                                      target=base, source=rhs_source, line=line, ordinal=0,
+                                      access="write"))
             # Only pointer-valued stores alter this lifetime environment. Scalar
             # ``*p = 0`` is a use of p, not a rebinding of p.
             if not _is_pointer(sub, lhs):
