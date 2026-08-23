@@ -42,6 +42,10 @@ class LifecycleOperation:
         # intentionally conservative: no proof of lineage means no lifecycle.use.
         tracked = set()
         for node in self.nodes.values():
+            if node.get("kind") == "release":
+                target_id = (node.get("properties") or {}).get("target_id")
+                if target_id:
+                    tracked.add(target_id)
             if node.get("kind") not in ("call", "construct"):
                 continue
             lang = self._language(node)
@@ -59,6 +63,13 @@ class LifecycleOperation:
                 if props.get("receiver_value_id"):
                     tracked.add(props["receiver_value_id"])
                 tracked.update(props.get("argument_value_ids") or ())
+        # Member/index reads target a property-path node, while lifecycle calls
+        # usually identify the base value. Promote only paths whose base is
+        # already tracked; ordinary property reads remain out of scope.
+        for node in self.nodes.values():
+            if node.get("kind") == "property-path" and \
+                    (node.get("properties") or {}).get("base_value_id") in tracked:
+                tracked.add(node.get("id"))
         return tracked
 
     def _candidate(self, node, family, expression=None):
