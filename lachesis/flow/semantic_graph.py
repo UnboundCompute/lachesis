@@ -168,6 +168,7 @@ class SkeletonGraph:
     edges: dict[str, list[Edge]] = field(default_factory=dict)
     fragments: dict[str, Fragment] = field(default_factory=dict)
     source_reachable: set[str] = field(default_factory=set)
+    coverage: dict[str, Any] = field(default_factory=dict)
 
     def add_node(self, node_id: str, event: Event | None = None, *, fragment: str | None = None,
                  **metadata: Any) -> GraphNode:
@@ -218,6 +219,7 @@ class SkeletonGraph:
             "fragments": {n: {"entry": f.entry, "exits": sorted(f.exits), "params": f.params}
                           for n, f in self.fragments.items()},
             "source_reachable": sorted(self.source_reachable),
+            "coverage": self.coverage,
         }
 
 
@@ -268,6 +270,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
     starts = sorted(graph.source_reachable) if graph.source_reachable else [f.entry for f in graph.fragments.values()]
     starts = starts or list(graph.nodes)
     queue = deque(_State(s) for s in starts)
+    predecessors: dict[_State, _State | None] = {
+        _State(s): None for s in starts
+    }
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
     exits = {x for f in graph.fragments.values() for x in f.exits}
@@ -334,6 +339,14 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 frontier.extend(reverse.get(current, ()))
             return False
 
+        def witness() -> tuple[str, ...]:
+            path = []
+            current: _State | None = state
+            while current is not None:
+                path.append(current.node)
+                current = predecessors.get(current)
+            return tuple(reversed(path))
+
         if event:
             raw_obj = event.obj
             raw_base = event.base
@@ -355,7 +368,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             if event.kind == EventKind.RELEASE and obj:
                 prior_sites = {site for released_obj, site in released if released_obj == obj}
                 if "double-free" in wanted and any(site != node.id for site in prior_sites):
-                    _record(hits, "double-free", obj, node)
+                    _record(hits, "double-free", obj, node, witness())
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
             elif event.kind == EventKind.INVALIDATE and obj:
@@ -363,12 +376,12 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                             if released_obj != obj} | {(obj, node.id)}
             elif event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE) and base and not is_null_write:
                 if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released):
-                    _record(hits, "uaf.deref", base, node)
+                    _record(hits, "uaf.deref", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
-                    _record(hits, "null-deref", base, node)
+                    _record(hits, "null-deref", base, node, witness())
             elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
                 if "use.dangling" in wanted and any(released_obj == obj for released_obj, _ in released):
-                    _record(hits, "use.dangling", obj, node)
+                    _record(hits, "use.dangling", obj, node, witness())
                 if event.kind == EventKind.RETURN_VALUE:
                     escaped.add(obj)
             elif event.kind == EventKind.ORIGIN and obj:
@@ -389,7 +402,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 escaped_live = any(equivalent(escaped_obj, live_obj) for escaped_obj in escaped)
                 held_live = any(equivalent(held_obj, live_obj) for held_obj in held)
                 if not released_live and not escaped_live and not held_live:
-                    _record(hits, "leak", live_obj or obj, node)
+                    _record(hits, "leak", live_obj or obj, node, witness())
 
         for edge in graph.edges.get(state.node, ()):
             stack = state.stack
@@ -452,14 +465,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # it is no longer an exit escape for the caller's leak query.
                 for _formal, receiver in edge.binding:
                     next_escaped.discard(rebase(receiver))
-            queue.append(_State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
+            next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 state.guards | frozenset(edge.guard),
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
-                                frozenset(next_escaped), frozenset(next_held)))
+                                frozenset(next_escaped), frozenset(next_held))
+            predecessors.setdefault(next_state, state)
+            queue.append(next_state)
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
 
 
-def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode) -> None:
+def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
+            witness: tuple[str, ...] = ()) -> None:
     key = (pattern, obj.render(), node.id, node.event.line if node.event else None)
     reachable = bool(node.metadata.get("source_reachable", False))
     influenced = bool(node.metadata.get("source_influenced", False))
@@ -467,4 +483,5 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode) -> None:
                           "entry": node.fragment, "line": node.event.line if node.event else None,
                           "source_reachable": reachable,
                           "source_influenced": influenced,
+                          "witness": list(witness),
                           "tier": 1 if reachable and influenced else 2 if reachable else None})

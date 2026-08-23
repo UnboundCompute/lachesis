@@ -36,6 +36,7 @@ class SemanticGraphTests(unittest.TestCase):
         # does not invent a free->use order by flattening the false arm into the true arm.
         self.assertEqual(len(match_graph(g)), 1)
         self.assertEqual(match_graph(g)[0]["pattern"], "uaf.deref")
+        self.assertEqual(match_graph(g)[0]["witness"], ["start", "true_free", "merge", "use"])
 
     def test_storage_free_does_not_free_pointee(self):
         buf = ObjRef("O_buf", generation="g0")
