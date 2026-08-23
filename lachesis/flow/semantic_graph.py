@@ -104,8 +104,9 @@ class Event:
     proofs: tuple[GuardProof, ...] = ()
 
     @classmethod
-    def origin(cls, obj: ObjRef, line: int | None = None) -> "Event":
-        return cls(EventKind.ORIGIN, obj=obj, line=line)
+    def origin(cls, obj: ObjRef, line: int | None = None,
+               facts: dict[str, Any] | None = None) -> "Event":
+        return cls(EventKind.ORIGIN, obj=obj, line=line, facts=dict(facts or {}))
 
     @classmethod
     def alloc_attempt(cls, *, result: ObjRef | None = None, line: int | None = None) -> "Event":

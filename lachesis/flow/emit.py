@@ -286,16 +286,23 @@ def _semantic_event(sub, operation, generations=None):
     generation = generations.get(operation, generations.get(target_key, "g0"))
     obj = _semantic_obj(sub, operation.target, generation, operation.node)
     if operation.kind == OpKind.ALLOC:
-        return [Event.alloc_attempt(result=obj, line=operation.line), Event.origin(obj, operation.line)] if obj else []
+        if not obj:
+            return []
+        facts = {"allocation_site": str(operation.site or operation.node),
+                 "generation": generation}
+        return [Event.alloc_attempt(result=obj, line=operation.line),
+                Event.origin(obj, operation.line, facts=facts)]
     if operation.kind == OpKind.FREE:
         return [Event.release(obj, operation.line)] if obj else []
     if operation.kind == OpKind.REALLOC:
         if not obj:
             return []
         fresh = ObjRef(obj.base, obj.path, f"{obj.generation}+1")
+        facts = {"allocation_site": str(operation.site or operation.node),
+                 "generation": fresh.generation, "incarnation": "realloc-success"}
         return [Event.realloc_attempt(obj, operation.line),
                 Event(EventKind.INVALIDATE, obj=obj, line=operation.line),
-                Event.origin(fresh, operation.line)]
+                Event.origin(fresh, operation.line, facts=facts)]
     if operation.kind == OpKind.USE and obj:
         if operation.access == "pointer-arithmetic":
             source_key = _semantic_key(sub, operation.source)
@@ -474,7 +481,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_node(branch_id, Event(EventKind.BRANCH, obj=obj, line=op.line,
                                                      facts={"predicate": "alloc_result"}), fragment=name,
                                      source_reachable=source_reachable)
-                    result.add_node(success_id, Event.origin(obj, op.line), fragment=name,
+                    result.add_node(success_id, Event.origin(
+                        obj, op.line,
+                        facts={"allocation_site": str(op.site or op.node),
+                               "generation": obj.generation}), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(failure_id, Event(EventKind.WRITE_STORAGE, obj=obj, base=obj,
                                                      slot=obj, facts={"null": True,
@@ -534,7 +544,11 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     failure_null = f"{failure_id}:null"
                     failure_lost = f"{failure_id}:lost"
                     merge_id = f"{anchor}:realloc:{index}:merge"
-                    result.add_node(success_origin, Event.origin(fresh, op.line), fragment=name,
+                    result.add_node(success_origin, Event.origin(
+                        fresh, op.line,
+                        facts={"allocation_site": str(op.site or op.node),
+                               "generation": fresh.generation,
+                               "incarnation": "realloc-success"}), fragment=name,
                                      source_reachable=source_reachable)
                     success_slot = None
                     if overwrites_slot and op.target.selectors:
