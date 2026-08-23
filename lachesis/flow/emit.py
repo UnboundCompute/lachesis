@@ -294,6 +294,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     pending_calls = []
     fragment_cfg = {}
     fragment_last = {}
+    source_launch_nodes = defaultdict(list)
     for name, fid in by_name.items():
         cfg = ReachingDef(sub).analyze(fid, reaching_defs=False)
         if not cfg or cfg.get("bailed"):
@@ -450,6 +451,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                                     source_reachable=source_reachable,
                                     source_influenced=bool(event.obj and event.obj.base in source_roots))
                     result.add_edge(previous, event_id)
+                    if op.access == "source" and event.kind == EventKind.ORIGIN:
+                        source_launch_nodes[name].append(event_id)
                     previous = event_id
             last_for_cfg[n] = previous
         cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
@@ -512,11 +515,14 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         if name not in result.fragments:
             continue
         source_calls = F.get(name, {}).get("source_calls", ())
-        anchors = [call.get("node") for call in source_calls if call.get("node") in fragment_cfg.get(name, ({}, {}))[1].get("nodes", ())]
-        if anchors:
-            result.source_reachable.update(f"{name}:{anchor}" for anchor in anchors)
-        elif F.get(name, {}).get("source_reachable", F.get(name, {}).get("is_source")):
-            result.source_reachable.add(result.fragments[name].entry)
+        if source_launch_nodes.get(name):
+            result.source_reachable.update(source_launch_nodes[name])
+        else:
+            anchors = [call.get("node") for call in source_calls if call.get("node") in fragment_cfg.get(name, ({}, {}))[1].get("nodes", ())]
+            if anchors:
+                result.source_reachable.update(f"{name}:{anchor}" for anchor in anchors)
+            elif F.get(name, {}).get("source_reachable", F.get(name, {}).get("is_source")):
+                result.source_reachable.add(result.fragments[name].entry)
     result.validate()
     return result
 
