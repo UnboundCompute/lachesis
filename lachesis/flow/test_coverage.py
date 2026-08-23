@@ -35,6 +35,13 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(store.uncovered([("worker", "source"), ("worker", "other")]),
                          (("worker", "other"),))
 
+    def test_fragment_cache_key_includes_coverage_states(self):
+        store = FragmentStore()
+        functions = {"worker": {}}
+        first = store.key(functions, "c", coverage={"state_keys": [["worker", "a"]]})
+        second = store.key(functions, "c", coverage={"state_keys": [["worker", "b"]]})
+        self.assertNotEqual(first, second)
+
 
 if __name__ == "__main__":
     unittest.main()

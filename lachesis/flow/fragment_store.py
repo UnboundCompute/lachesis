@@ -21,17 +21,31 @@ class FragmentStore:
     _graphs: dict[tuple[Any, ...], SkeletonGraph] = field(default_factory=dict)
     covered_states: set[tuple[str, str]] = field(default_factory=set)
 
+    @staticmethod
+    def _coverage_key(coverage) -> tuple[tuple[str, str], ...]:
+        if coverage is None:
+            return ()
+        if hasattr(coverage, "state_keys"):
+            return tuple(sorted(tuple(key) for key in coverage.state_keys))
+        if hasattr(coverage, "to_dict"):
+            coverage = coverage.to_dict()
+        return tuple(sorted(
+            tuple(key) for key in coverage.get("state_keys", ())
+        ))
+
     def key(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
-            summaries: Any = None) -> tuple[Any, ...]:
-        return (lang, id(graph), id(summaries), tuple(sorted(functions)))
+            summaries: Any = None, coverage=None) -> tuple[Any, ...]:
+        return (lang, id(graph), id(summaries), tuple(sorted(functions)),
+                self._coverage_key(coverage))
 
     def get(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
-            summaries: Any = None):
-        return self._graphs.get(self.key(functions, lang, graph, summaries))
+            summaries: Any = None, coverage=None):
+        return self._graphs.get(self.key(functions, lang, graph, summaries, coverage))
 
     def put(self, functions: Mapping[str, Mapping], lang: str, graph: Any,
-            semantic_graph: SkeletonGraph, summaries: Any = None) -> SkeletonGraph:
-        self._graphs[self.key(functions, lang, graph, summaries)] = semantic_graph
+            semantic_graph: SkeletonGraph, summaries: Any = None,
+            coverage=None) -> SkeletonGraph:
+        self._graphs[self.key(functions, lang, graph, summaries, coverage)] = semantic_graph
         return semantic_graph
 
     def mark_covered(self, state_keys) -> None:
@@ -53,7 +67,7 @@ class Claus:
 
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
               coverage=None):
-        cached = self.fragments.get(functions, lang, graph, summaries)
+        cached = self.fragments.get(functions, lang, graph, summaries, coverage)
         if cached is not None:
             return cached
         from .emit import build_semantic_graph
@@ -70,4 +84,4 @@ class Claus:
                 "uncovered_states": [list(key) for key in pending],
                 "converged": not pending,
             })
-        return self.fragments.put(functions, lang, graph, built, summaries)
+        return self.fragments.put(functions, lang, graph, built, summaries, coverage)
