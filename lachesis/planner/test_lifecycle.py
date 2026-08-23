@@ -11,12 +11,17 @@ def _fixture(extension, callee, receiver=False):
         props["receiver_value_id"] = "resource"
     else:
         props["argument_value_ids"] = ["resource"]
+    use_kind = "expression" if extension == ".c" else "read"
+    use_properties = {"target_id": "resource", "definition_id": "resource",
+                      "start_line": 3, "absolute_file": "fixture" + extension,
+                      "owner_function_id": "f"}
+    if extension == ".c":
+        use_properties["syntax_kind"] = "UnaryOperator"
     return {"nodes": [
         {"id": "release", "kind": "call", "label": callee, "properties": props},
-        {"id": "use", "kind": "read", "label": "resource.field",
-         "properties": {"target_id": "resource", "definition_id": "resource",
-                         "start_line": 3, "absolute_file": "fixture" + extension,
-                         "owner_function_id": "f"}},
+        {"id": "use", "kind": use_kind,
+         "label": "*resource" if extension == ".c" else "resource.field",
+         "properties": use_properties},
     ], "edges": []}
 
 

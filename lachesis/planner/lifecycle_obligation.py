@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 
 from ..flow import atropos
 
@@ -72,6 +73,15 @@ class LifecycleOperation:
                 tracked.add(node.get("id"))
         return tracked
 
+    def _tracked_labels(self, tracked):
+        labels = set()
+        for node_id in tracked:
+            node = self.nodes.get(node_id) or {}
+            label = node.get("label")
+            if label:
+                labels.add(label)
+        return labels
+
     def _candidate(self, node, family, expression=None):
         p = node.get("properties") or {}
         site = node.get("id", "")
@@ -101,6 +111,7 @@ class LifecycleOperation:
     def enumerate(self):
         rows = []
         tracked = self._tracked_reads() if self.operation == "use" else set()
+        tracked_labels = self._tracked_labels(tracked)
         for node in self.nodes.values():
             lang = self._language(node)
             if self.operation == "release":
@@ -108,9 +119,17 @@ class LifecycleOperation:
                         (node.get("kind") in ("call", "construct") and
                          self._matches_release(node, lang)):
                     rows.append(self._candidate(node, self.metadata["id"]))
-            elif self.operation == "use" and node.get("kind") == "read":
+            elif self.operation == "use" and node.get("kind") in ("read", "expression"):
                 p = node.get("properties") or {}
-                if p.get("target_id") in tracked or p.get("definition_id") in tracked:
+                syntax = p.get("syntax_kind")
+                label = node.get("label") or ""
+                base = re.match(r"\s*(?:\*\s*)?([A-Za-z_]\w*)", label)
+                is_structural = node.get("kind") == "read" or syntax in {
+                    "MemberExpr", "ArraySubscriptExpr", "UnaryOperator",
+                }
+                rooted = base and base.group(1) in tracked_labels
+                if is_structural and (p.get("target_id") in tracked
+                                      or p.get("definition_id") in tracked or rooted):
                     rows.append(self._candidate(node, self.metadata["id"], node.get("label")))
         rows.sort(key=lambda r: (r["observations"].get("file") or "", r["observations"].get("line") or 0))
         return {"constructor": self.metadata["id"], "domain": "lifecycle",
