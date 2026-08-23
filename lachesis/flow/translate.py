@@ -47,6 +47,7 @@ from lachesis.planner.unbounded_copy import BranchRegions
 from . import atropos
 from .normalize import normalizer
 from .source_discovery import discover_sources
+from .coverage import CoverageScheduler
 
 
 # --- small helpers ---------------------------------------------------------------
@@ -458,6 +459,8 @@ def build_F(store, lang="c", *, return_graph=False):
 
     succ = {n: [c for c in F[n]["udf_callees"] if c in F] for n in F}
     discovery = discover_sources(F, succ, atropos.source_catalog(lang))
+    coverage = CoverageScheduler(F, succ).plan()
+    coverage_by_target = {region.target: region for region in coverage.regions}
     by_function_bindings = {}
     for binding in discovery.bindings:
         by_function_bindings.setdefault(binding.caller, []).append({
@@ -475,6 +478,11 @@ def build_F(store, lang="c", *, return_graph=False):
         record["seam_bindings"] = by_function_bindings.get(name, [])
         record["source_reachable"] = name in discovery.reachable_functions
         record["source_influenced_roots"] = discovery.influenced_roots.get(name, ())
+        region = coverage_by_target.get(name)
+        record["coverage_sources"] = region.sources if region else ()
+        record["coverage_functions"] = region.functions if region else ()
+        record["coverage_state_keys"] = region.state_keys if region else ()
+        record["coverage_unresolved"] = name in coverage.uncovered_functions
     return (F, succ, graph) if return_graph else (F, succ)
 
 
