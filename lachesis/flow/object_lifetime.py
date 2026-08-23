@@ -282,7 +282,7 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                 path = _path(ap_builder, child)
                 if path is not None and _is_pointer(sub, child):
                     operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
-                                          target=path, line=_line(node), ordinal=1,
+                                          target=path, line=_line(sub, node), ordinal=1,
                                           access="compare"))
             continue
         parent = sub.ast_parent.get(node)
