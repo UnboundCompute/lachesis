@@ -110,7 +110,7 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
                 node.event.kind.value if hasattr(node.event.kind, "value") else node.event.kind
                 for node in result["semantic_graph"].nodes.values() if node.event is not None
             }
-            self.assertTrue({"branch", "merge", "loop"} <= structural_kinds)
+            self.assertTrue({"branch", "merge", "loop", "return"} <= structural_kinds)
             self.assertTrue(all(lead.get("tier") in {1, 2} for lead in result["leads"]
                                 if lead.get("pattern") in {"leak", "uaf.deref", "use.dangling",
                                                              "double-free", "null-deref"}))

@@ -285,7 +285,8 @@ def _semantic_event(sub, operation, generations=None):
         if operation.access == "compare":
             return [Event(EventKind.COMPARE_VALUE, obj=obj, line=operation.line)]
         if operation.access == "return":
-            return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line)]
+            return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line),
+                    Event(EventKind.RETURN, obj=obj, line=operation.line)]
         if operation.access == "write":
             source_key = _semantic_key(sub, operation.source)
             value = (_semantic_obj(sub, operation.source,
