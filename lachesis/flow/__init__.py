@@ -16,5 +16,9 @@ Everything downstream of `translate` touches only the IR, never the graph again.
 from .translate import load_graph, build_F
 from .skeleton import build_skeletons, render_text
 from .match import match_all
+from .semantic_graph import (Event, EventKind, FROZEN_PATTERNS, Fragment, GuardProof, ObjRef,
+                             PatternSpec, SkeletonGraph, match_graph)
 
-__all__ = ["load_graph", "build_F", "build_skeletons", "render_text", "match_all"]
+__all__ = ["load_graph", "build_F", "build_skeletons", "render_text", "match_all",
+           "Event", "EventKind", "Fragment", "GuardProof", "ObjRef", "SkeletonGraph",
+           "PatternSpec", "FROZEN_PATTERNS", "match_graph"]

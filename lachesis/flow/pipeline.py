@@ -13,6 +13,7 @@ from .skeleton import build_skeletons, _summaries_for
 from .match import match_all, match_leak, match_reach, match_typestate
 from .cfg import cfg_bundle
 from .object_lifetime import analyze_object_lifetimes
+from .semantic_graph import match_graph
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
@@ -150,6 +151,11 @@ def run_pass(store, lang="c", lifetime_engine=None):
         }
         object_result = analyze_object_lifetimes(
             store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+        from .emit import build_semantic_graph
+        semantic_graph = build_semantic_graph(
+            store, F, succ, lang=lang, graph=analysis_graph,
+            summaries=object_result.summaries)
+        semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.
@@ -174,9 +180,14 @@ def run_pass(store, lang="c", lifetime_engine=None):
         else:
             fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
             legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
-            leads, _ = _select_lifetime_leads(
-                legacy_leads, object_result.leads, requested, covered_entries=covered,
-                object_flow=object_flow)
+            # The frozen graph/matcher is now the production lifetime path.  Keep the old
+            # matcher only for non-lifetime reach leads and as a diagnostic fallback for
+            # functions whose object projection could not be emitted.
+            reach_leads = [lead for lead in legacy_leads
+                           if lead.get("pattern") in {"reachability", "relational", "presence"}]
+            fallback_lifetime = [lead for lead in legacy_leads
+                                 if lead.get("entry") in seed_unsafe]
+            leads = reach_leads + semantic_leads + fallback_lifetime
             differential = {
                 "computed": False,
                 "reason": "set LACHESIS_LIFETIME_ENGINE=shadow for a full differential",
@@ -192,6 +203,9 @@ def run_pass(store, lang="c", lifetime_engine=None):
             "diagnostics": diagnostics,
             "fallback_functions": sorted(seed_unsafe),
             "candidate_functions": len(object_functions),
+            "semantic_graph_nodes": len(semantic_graph.nodes),
+            "semantic_graph_edges": sum(len(edges) for edges in semantic_graph.edges.values()),
+            "semantic_leads": len(semantic_leads),
         })
     else:
         legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
@@ -206,5 +220,6 @@ def run_pass(store, lang="c", lifetime_engine=None):
         "total_seconds": round(finished - started, 6),
     }
     return {"F": F, "succ": succ, "summaries": summaries,
-            "skeletons": skeletons, "leads": leads, "lifetime": lifetime,
+            "skeletons": skeletons, "semantic_graph": locals().get("semantic_graph"),
+            "leads": leads, "lifetime": lifetime,
             "timings": timings}

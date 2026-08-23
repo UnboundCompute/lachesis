@@ -56,6 +56,8 @@ class Operation:
     ordinal: int = 0
     # Each alternative is an ordered sequence of already-instantiated FREE/USE ops.
     alternatives: tuple[tuple["Operation", ...], ...] = ()
+    # Access form for the frozen skeleton split: dereference, pointer-value pass, or return.
+    access: str = "deref"
 
 
 @dataclass(frozen=True, order=True)
@@ -407,12 +409,30 @@ class AnalysisResult:
     capped: bool
 
 
+class _DiscardFindings:
+    """Sink used by the production summary interpreter.
+
+    Abstract-state transfer still computes lifecycle facts; vulnerability conclusions belong to
+    the semantic graph matcher and are therefore not accumulated here.
+    """
+    def add(self, _finding):
+        return None
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+
 class ObjectStateAnalyzer:
-    def __init__(self, *, max_disjuncts: int = 64, transfer_cap: int | None = None):
+    def __init__(self, *, max_disjuncts: int = 64, transfer_cap: int | None = None,
+                 collect_findings: bool = True):
         if max_disjuncts < 1:
             raise ValueError("max_disjuncts must be positive")
         self.max_disjuncts = max_disjuncts
         self.transfer_cap = transfer_cap
+        self.collect_findings = collect_findings
 
     @staticmethod
     def _transfer(
@@ -463,7 +483,7 @@ class ObjectStateAnalyzer:
         work = deque([nodes[0]])
         queued = {nodes[0]}
         widened: set[Hashable] = set()
-        findings: set[Finding] = set()
+        findings = set() if self.collect_findings else _DiscardFindings()
         transfers = widenings = 0
         cap = self.transfer_cap or max(10000, len(nodes) * 500)
 

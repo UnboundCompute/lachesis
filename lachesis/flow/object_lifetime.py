@@ -221,9 +221,10 @@ def _place(sub, cfg_nodes, anchor, fallback=None):
 
 
 def _op(kind, node, *, target=None, source=None, line=None, ordinal=0,
-        is_null=False, alternatives=()):
+        is_null=False, alternatives=(), access="deref"):
     return Operation(kind, node, target=target, source=source, site=node, line=line,
-                     ordinal=ordinal, is_null=is_null, alternatives=alternatives)
+                     ordinal=ordinal, is_null=is_null, alternatives=alternatives,
+                     access=access)
 
 
 def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
@@ -242,7 +243,7 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             base = _deref_base(sub, ap_builder, lhs)
             if base is not None and not _is_unevaluated(sub, lhs):
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
-                                      target=base, line=line, ordinal=0))
+                                      target=base, line=line, ordinal=0, access="write"))
             # Only pointer-valued stores alter this lifetime environment. Scalar
             # ``*p = 0`` is a use of p, not a rebinding of p.
             if not _is_pointer(sub, lhs):
@@ -266,6 +267,14 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
 
     # A real memory read/write through an access expression uses its base object.
     for node in owned:
+        parent = sub.ast_parent.get(node)
+        if parent is not None and sub.is_plain_assign(parent):
+            lhs, _rhs = _assignment_operands(sub, parent)
+            if lhs is not None and _peel(sub, lhs) == _peel(sub, node):
+                # The assignment scan above emits the LHS as WRITE_STORAGE.  Do not
+                # duplicate it as a READ_STORAGE merely because the same access
+                # expression is also visited by the generic dereference scan.
+                continue
         base = _deref_base(sub, ap_builder, node)
         if base is not None and not _is_unevaluated(sub, node):
             operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, node), target=base,
@@ -310,7 +319,8 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                 target = _argument_path(sub, ap_builder, call_node, argument.get("pos"))
                 if target is not None:
                     operations.append(_op(OpKind.USE, anchor, target=target, line=line,
-                                          ordinal=10 + int(argument.get("pos") or 0)))
+                                          ordinal=10 + int(argument.get("pos") or 0),
+                                          access="pass"))
 
     # Returning a freed pointer is the escape form of this family. Preserve the
     # existing public pattern name by representing the observation as USE for now.
@@ -321,7 +331,8 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             target = _path(ap_builder, child)
             if target is not None:
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
-                                      target=target, line=_line(sub, node), ordinal=30))
+                                      target=target, line=_line(sub, node), ordinal=30,
+                                      access="return"))
                 break
 
     # The same semantic event can be visible via the assignment scan and the generic
@@ -329,7 +340,7 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
     unique = {}
     for operation in operations:
         key = (operation.kind, operation.node, operation.target, operation.source,
-               operation.is_null, operation.alternatives)
+               operation.is_null, operation.alternatives, operation.access)
         unique[key] = operation
     return tuple(sorted(unique.values(), key=lambda item: (
         sub.offset(item.node) if item.node in owned else 0, item.ordinal, item.kind.value,
@@ -378,7 +389,7 @@ def _analyze_prepared(prepared):
     # Widening sooner makes them converge within budget; the join is an over-
     # approximation, so recall (uncapped functions) rises at a marginal precision cost,
     # which is the right trade for a finder (capping is a guaranteed false negative).
-    result = ObjectStateAnalyzer(max_disjuncts=32).analyze(
+    result = ObjectStateAnalyzer(max_disjuncts=32, collect_findings=False).analyze(
         nodes, successors, operations, initial=initial)
     alternatives = {state.trace for state in result.exit_states}
     return tuple(sorted(alternatives, key=repr)), result
