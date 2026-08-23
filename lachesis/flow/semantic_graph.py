@@ -33,6 +33,7 @@ class EventKind(str, Enum):
     SEAM_ENTER = "seam_enter"
     SEAM_EXIT = "seam_exit"
     RETURN = "return"
+    SINK = "sink"
 
 
 @dataclass(frozen=True)
@@ -363,7 +364,25 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             raw_base = event.base
             obj = canonical(event.obj)
             base = canonical(event.base)
-            if event.kind == EventKind.DERIVE and event.obj and event.value:
+            if event.kind == EventKind.SINK:
+                from .patterns import evaluate_all, substrate
+                family = event.facts.get("family")
+                if family:
+                    fact = substrate(
+                        family,
+                        event.facts.get("tainted", False),
+                        event.facts.get("bound"),
+                        event.facts.get("guarded", False),
+                    )
+                    for pattern in evaluate_all(family, fact):
+                        if patterns is None or pattern in wanted:
+                            sink_obj = obj or ObjRef(
+                                event.facts.get("callee", "sink"), generation="g0")
+                            _record(hits, pattern, sink_obj, node, witness())
+                # Sink facts are observations, not lifetime transitions; the
+                # remaining lifecycle branches below intentionally do not match
+                # EventKind.SINK.
+            if event is not None and event.kind == EventKind.DERIVE and event.obj and event.value:
                 bindings[event.obj] = canonical(event.value) or event.value
                 obj = canonical(event.obj)
             is_null_write = (event.kind == EventKind.WRITE_STORAGE_NULL or

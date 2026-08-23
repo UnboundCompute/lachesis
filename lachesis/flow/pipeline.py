@@ -143,7 +143,12 @@ def run_pass(store, lang="c", lifetime_engine=None):
     projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
-    skeletons = build_skeletons(F, summaries, lang=lang)
+    # The semantic graph is the production lifetime substrate.  Keep the old
+    # typestate renderer for legacy/shadow operation and for an explicit
+    # fallback only; object mode still uses its reach skeletons for Atropos's
+    # non-lifetime evaluators.
+    skeletons = build_skeletons(
+        F, summaries, lang=lang, include_typestate=not object_requested or requested == "shadow")
     skeletons_done = perf_counter()
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
@@ -176,6 +181,11 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
         # filtered per-object by the object-flow map. Legacy fallback covers seed-unsafe.
         seed_unsafe = set(diagnostics.get("seed_unsafe_functions", unsafe))
+        if seed_unsafe and requested == "object":
+            # Re-enable the compatibility typestate stream only for functions
+            # whose semantic object analysis could not produce a trustworthy
+            # graph. Healthy object-mode paths never depend on the old flow.
+            skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
         object_flow = diagnostics.get("unsafe_object_flow", {})
         covered = set(F) - seed_unsafe
         if requested == "shadow":

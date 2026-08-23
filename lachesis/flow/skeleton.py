@@ -165,7 +165,7 @@ def _typestate_skel(fn, var, events, depth):
 
 
 # --- driver ----------------------------------------------------------------------
-def build_skeletons(F, summaries, lang="c"):
+def build_skeletons(F, summaries, lang="c", *, include_typestate=True):
     """Every sink-bearing flow in the graph, rendered as an ordered token skeleton.
 
     A reach skeleton is emitted from EVERY function that carries the flow, so both the
@@ -184,13 +184,14 @@ def build_skeletons(F, summaries, lang="c"):
             skels.append({"kind": "reach", "entry": fn, "is_source": is_src,
                           "sink": flow["sink"], "value": flow.get("value"),
                           "complete": ok, "tokens": toks})
-        for var, events in s.get("typestate", {}).items():
-            skels.append({"kind": "typestate", "entry": fn, "is_source": is_src, "var": var,
-                          "complete": True, "tokens": _typestate_skel(fn, var, events, 0)})
-        for var, events in s.get("param_typestate", {}).items():
-            skels.append({"kind": "typestate", "entry": fn, "is_source": is_src,
-                          "var": "param:" + var, "complete": True,
-                          "tokens": _typestate_skel(fn, "param:" + var, events, 0)})
+        if include_typestate:
+            for var, events in s.get("typestate", {}).items():
+                skels.append({"kind": "typestate", "entry": fn, "is_source": is_src, "var": var,
+                              "complete": True, "tokens": _typestate_skel(fn, var, events, 0)})
+            for var, events in s.get("param_typestate", {}).items():
+                skels.append({"kind": "typestate", "entry": fn, "is_source": is_src,
+                              "var": "param:" + var, "complete": True,
+                              "tokens": _typestate_skel(fn, "param:" + var, events, 0)})
     return skels
 
 

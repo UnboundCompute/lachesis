@@ -47,8 +47,9 @@ from collections import defaultdict
 from lachesis.nav.dataflow.reaching_def import ReachingDef
 from lachesis.nav.dataflow.substrate import Substrate
 
-from . import skeleton_ir as ir
+from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
+from .patterns import evaluator_for
 from .object_lifetime import extract_operations, _props
 from .object_state import OpKind
 from .pipeline import _lifetime_slice
@@ -347,6 +348,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         store, functions, sub_succ, lang=lang, graph=graph).summaries
     sub = Substrate(analysis_store.index).load().load_initializers()
     norm = normalizer(lang)
+    sink_catalog = atropos.sink_catalog(lang)
     by_name = {}
     for node in analysis_store.index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
@@ -551,6 +553,54 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     if op.access == "source" and event.kind == EventKind.ORIGIN:
                         source_launch_nodes[name].append(event_id)
                     previous = event_id
+            # Atropos sink observations belong in the same semantic graph as
+            # lifetime facts. They are separate events because a sink does not
+            # mutate object state, while its evaluator can consume guards,
+            # size expressions, control nesting, and provenance.
+            for call_index, call in enumerate(functions[name].get("calls", ())):
+                if call.get("node") != n:
+                    continue
+                catalog_entry = sink_catalog.get(call.get("callee")) or {}
+                for arg_pos in catalog_entry.get("sink_args", ()):
+                    argument = next((arg for arg in call.get("args", ())
+                                     if arg.get("pos") == arg_pos), None)
+                    if argument is None:
+                        continue
+                    family = (catalog_entry.get("kinds") or {}).get(arg_pos)
+                    if not family:
+                        family = catalog_entry.get("family")
+                    if not family:
+                        continue
+                    recipe = evaluator_for(family)
+                    relational = (recipe == "relational" or
+                                  isinstance(recipe, (list, tuple))
+                                  and "relational" in recipe)
+                    guarded = bool(call.get("guards"))
+                    root = argument.get("root") or argument.get("var")
+                    sink_obj = ObjRef(str(root or call.get("callee") or "sink"),
+                                      generation="g0")
+                    facts = {
+                        "family": family,
+                        "callee": call.get("callee"),
+                        "arg": arg_pos,
+                        "tainted": argument.get("provenance") != "const",
+                        "guarded": guarded,
+                        "bound": ("bounded" if guarded else "unbounded")
+                                 if relational else None,
+                        "size_expr": call.get("size_expr"),
+                        "dst": call.get("dst"),
+                        "control": call.get("control") or (),
+                    }
+                    sink_id = f"{anchor}:sink:{call_index}:{arg_pos}"
+                    result.add_node(
+                        sink_id,
+                        Event(EventKind.SINK, obj=sink_obj,
+                              line=call.get("line"), facts=facts),
+                        fragment=name, source_reachable=source_reachable,
+                        source_influenced=bool(facts["tainted"]),
+                    )
+                    result.add_edge(previous, sink_id)
+                    previous = sink_id
             last_for_cfg[n] = previous
         cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
         internal_call_anchors = {
