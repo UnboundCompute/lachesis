@@ -33,7 +33,7 @@ import argparse
 import json
 
 from . import atropos
-from .patterns import KIND_EVALUATOR
+from .patterns import evaluator_for
 from .translate import load_graph
 from .traverse import traverse_all
 from .order import tarjan_scc, is_cyclic
@@ -108,7 +108,10 @@ def _expand_reach(fn, flow, F, summaries, catalog, depth, guarded_acc, chain):
         guarded = bool(site_guards) or guarded_acc
         kind = _kind_of(callee, pos, catalog)
         bound = None
-        if KIND_EVALUATOR.get(kind) == "relational":       # size sink: the guard IS the bound
+        recipe = evaluator_for(kind)
+        relational = (recipe == "relational" or
+                      isinstance(recipe, (list, tuple)) and "relational" in recipe)
+        if relational:                                      # size sink: the guard IS the bound
             bound = "bounded" if guarded else "unbounded"
         tok = {"t": "sink", "family": kind, "callee": callee, "arg": pos,
                "var": flow.get("value"), "tainted": flow.get("provenance") != "const",

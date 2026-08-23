@@ -115,6 +115,18 @@ def evaluator_catalog():
         return {"evaluators": EVALUATORS, "kind_evaluator": KIND_EVALUATOR}
 
 
+def evaluator_for(sink_kind):
+    """Return the catalogued evaluator recipe for a sink kind.
+
+    Recipes may be a single evaluator or a list; keeping this lookup in the
+    Atropos adapter prevents renderers from silently falling back to the old
+    compatibility table when the catalog adds a second evaluator to a kind.
+    """
+    catalog = evaluator_catalog()
+    return catalog.get("kind_evaluator", {}).get(sink_kind,
+                                                   KIND_EVALUATOR.get(sink_kind))
+
+
 def evaluate(sink_kind, fact):
     """Route a substrate fact through the evaluator its kind selects. Returns the evaluator
     name if the pattern fires, else None (unknown kind, or predicate not satisfied)."""
