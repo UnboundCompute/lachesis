@@ -14,14 +14,18 @@ from ..flow import atropos
 
 def _event_kind(node):
     props = node.get("properties") or {}
-    return str(props.get("event_kind") or node.get("kind") or "").lower()
+    event = node.get("event") or {}
+    return str(props.get("event_kind") or event.get("kind") or
+               node.get("kind") or "").lower().replace("eventkind.", "")
 
 
 def _object_id(node):
     props = node.get("properties") or {}
-    for key in ("object_id", "target_id", "value_id", "obj"):
-        if props.get(key):
-            return props[key]
+    event = node.get("event") or {}
+    for source in (props, event):
+        for key in ("object_id", "target_id", "value_id", "obj", "base"):
+            if source.get(key):
+                return source[key]
     return None
 
 
@@ -32,13 +36,23 @@ class TemporalLifecycle:
     def __init__(self, graph, bind_summary=None):
         self.graph = graph
         self.bind_summary = bind_summary or {}
-        self.nodes = list(graph.get("nodes", ()))
+        raw_nodes = graph.get("nodes", ())
+        if isinstance(raw_nodes, dict):
+            self.nodes = [{"id": node_id, **(node or {})}
+                          for node_id, node in raw_nodes.items()]
+        else:
+            self.nodes = list(raw_nodes)
         # Some callers attach the materialized semantic graph under this key;
         # accepting it keeps the registry useful before and after graph
         # publication without coupling it to the C frontend.
         semantic = graph.get("semantic_graph") or {}
         if isinstance(semantic, dict):
-            self.nodes.extend(semantic.get("nodes", ()))
+            semantic_nodes = semantic.get("nodes", ())
+            if isinstance(semantic_nodes, dict):
+                self.nodes.extend([{"id": node_id, **(node or {})}
+                                   for node_id, node in semantic_nodes.items()])
+            else:
+                self.nodes.extend(semantic_nodes)
 
     def _language(self, node):
         props = node.get("properties") or {}
@@ -47,6 +61,8 @@ class TemporalLifecycle:
 
     def _candidate(self, node):
         props = node.get("properties") or {}
+        metadata = node.get("metadata") or {}
+        event = node.get("event") or {}
         site = node.get("id", "")
         pattern_id = self.metadata["id"]
         raw = f"{pattern_id}\0{site}"
@@ -58,15 +74,19 @@ class TemporalLifecycle:
             "obligation": self.metadata["obligation"],
             "handles": {
                 "site_node_id": site,
-                "enclosing_function_id": props.get("owner_function_id"),
+                "enclosing_function_id": (props.get("owner_function_id") or
+                                            metadata.get("owner_function_id") or
+                                            node.get("fragment")),
                 "obligation_value_ids": ([obj] if (obj := _object_id(node)) else []),
             },
             "observations": {
                 "site": node.get("label"),
                 "event_kind": _event_kind(node),
                 "object_id": _object_id(node),
-                "file": props.get("absolute_file") or props.get("file") or node.get("file"),
-                "line": props.get("start_line") or props.get("line"),
+                "file": (props.get("absolute_file") or props.get("file") or
+                         node.get("file")),
+                "line": (props.get("start_line") or props.get("line") or
+                         event.get("line")),
                 "pattern": self.metadata["matcher_pattern"],
                 "requires": list(self.metadata["requires"]),
             },

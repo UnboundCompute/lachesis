@@ -43,6 +43,23 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2))
         return 2
 
+    # Lifecycle constructors enumerate semantic observation sites rather than
+    # catalog role nodes.  Attach the cached Pass 3 skeleton only when the
+    # selected constructor is catalog-declared temporal work; ordinary sink
+    # census remains catalog-only and keeps its lightweight behavior.
+    from lachesis.planner.taxonomy import family_specs
+    temporal_ids = {spec["id"] for spec in family_specs() if spec.get("temporal")}
+    if args.constructor in temporal_ids:
+        from lachesis.flow.pipeline import run_pass
+        semantic_nodes = {}
+        for language in summary.get("languages") or ("c",):
+            flow = run_pass(store, lang=language, lifetime_engine="object")
+            semantic = flow.get("semantic_graph")
+            if semantic is not None:
+                semantic_nodes.update(semantic.to_dict().get("nodes", {}))
+        if semantic_nodes:
+            stamped["semantic_graph"] = {"nodes": semantic_nodes}
+
     registry = default_candidate_registry(stamped, summary)
     if args.candidate_id:
         result = registry.detail(args.candidate_id)

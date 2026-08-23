@@ -227,9 +227,10 @@ class _Ctx:
     def candidate_bundle(self):
         """The catalog-stamped graph and its cached obligation registry.
 
-        Candidate enumeration binds catalog facts against the core symbol index. It
-        deliberately does not build value flow or judge the resulting sites; the AI
-        chooses follow-up graph tools for candidates it wants to investigate.
+        Candidate enumeration binds catalog facts against the core symbol index and
+        also publishes the cached semantic skeleton to temporal constructors.  The
+        constructors still emit observations, never verdicts; the graph matcher
+        remains the authority for proving a lifecycle relation.
         """
         def build():
             from lachesis.integrations.atropos.enrich import atropos_enrich
@@ -238,6 +239,21 @@ class _Ctx:
 
             graph = materialize_graph(self.store.index)
             stamped, summary = atropos_enrich(graph, complete_dataflow=False)
+            # Temporal candidate families observe semantic operations (release,
+            # origin, dereference, and so on), which do not exist as catalog role
+            # nodes in the base CPG.  Reuse the same cached Pass 3 graph exposed
+            # by flow_pass instead of creating a second traversal or teaching the
+            # candidate registry a language-specific lifecycle extractor.
+            from lachesis.flow.pipeline import run_pass
+            semantic_nodes = {}
+            for language in summary.get("languages") or ("c",):
+                flow = (self.flow_bundle if language == "c" else
+                        run_pass(self.store, lang=language, lifetime_engine="object"))
+                semantic = flow.get("semantic_graph")
+                if semantic is not None:
+                    semantic_nodes.update(semantic.to_dict().get("nodes", {}))
+            if semantic_nodes:
+                stamped["semantic_graph"] = {"nodes": semantic_nodes}
             return {
                 "registry": default_candidate_registry(stamped, summary),
                 "stamped": stamped,

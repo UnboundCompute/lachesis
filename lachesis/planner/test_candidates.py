@@ -1222,6 +1222,29 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertNotIn("verdict", row)
         self.assertEqual(row["inferences"]["same_object"], "not-queried")
 
+    def test_temporal_registry_consumes_serialized_semantic_skeleton(self):
+        graph = {
+            "nodes": [], "edges": [],
+            "semantic_graph": {
+                "nodes": {
+                    "origin": {"event": {"kind": "ORIGIN", "obj": "O#g0",
+                                           "line": 10},
+                               "fragment": "make", "metadata": {}},
+                    "release": {"event": {"kind": "RELEASE", "obj": "O#g0",
+                                            "line": 20},
+                                 "fragment": "destroy", "metadata": {}},
+                },
+                "edges": {}, "fragments": {},
+            },
+        }
+        registry = default_candidate_registry(graph)
+        leak = registry.candidates(constructor="mem.lifetime.leak")
+        double_free = registry.candidates(constructor="mem.lifetime.double-free")
+        self.assertEqual(leak["total"], 1)
+        self.assertEqual(double_free["total"], 1)
+        self.assertEqual(leak["candidates"][0]["handles"]["enclosing_function_id"], "make")
+        self.assertNotIn("verdict", leak["candidates"][0])
+
 
 class GuardRelationTest(unittest.TestCase):
     """A branch guards a size only when it COMPARES the variable's magnitude.
