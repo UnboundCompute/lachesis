@@ -381,6 +381,25 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(hit["witness_complete"])
         self.assertEqual(hit["witness_edges"][0]["guards"][0]["kind"], "NONNULL")
 
+    def test_witness_keeps_the_edge_taken_when_parallel_guards_share_nodes(self):
+        obj = ObjRef("p", generation="g0")
+        g = SkeletonGraph()
+        g.add_node("start", Event.origin(obj), fragment="main")
+        g.add_node("free", Event.release(obj), fragment="main")
+        g.add_node("use", Event.read(obj), fragment="main")
+        # The ISNULL arm cannot release p; only the NONNULL arm reaches the
+        # lifecycle violation.  Both arms intentionally have the same nodes,
+        # so choosing the first graph edge during report reconstruction would
+        # attach the wrong proof to the witness.
+        g.add_edge("start", "free", guard=(GuardProof("ISNULL", "p#g0"),))
+        g.add_edge("start", "free", guard=(GuardProof("NONNULL", "p#g0"),))
+        g.add_edge("free", "use")
+        g.add_fragment("main", "start", ["use"])
+        hit = next(item for item in match_graph(g) if item["pattern"] == "uaf.deref")
+        self.assertTrue(hit["witness_complete"])
+        self.assertEqual(hit["witness_edges"][0]["guards"],
+                         [{"kind": "NONNULL", "value": "p#g0"}])
+
     def test_call_returns_only_to_pushed_continuation(self):
         o = ObjRef("O", generation="g0")
         g = SkeletonGraph()

@@ -306,6 +306,15 @@ class _State:
     abstract_contexts: tuple[tuple[tuple[str, str], ...], ...] = ()
 
 
+class _WitnessPath(tuple):
+    """Node witness plus the concrete graph edges traversed to reach it."""
+
+    def __new__(cls, nodes: tuple[str, ...], edges: tuple["Edge", ...] = ()):
+        value = super().__new__(cls, nodes)
+        value.edges = edges
+        return value
+
+
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
     """Find facts on compatible pushdown paths.
 
@@ -320,6 +329,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
     predecessors: dict[_State, _State | None] = {
         _State(s): None for s in starts
     }
+    predecessor_edges: dict[_State, Edge] = {}
     superseded: set[_State] = set()
     loop_buckets: dict[tuple[str, tuple[str, ...]], list[_State]] = {}
 
@@ -424,13 +434,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             """Compare canonical representatives after seam/derive composition."""
             return canonical(left) == canonical(right)
 
-        def witness() -> tuple[str, ...]:
+        def witness() -> _WitnessPath:
             path = []
+            edges = []
             current: _State | None = state
             while current is not None:
                 path.append(current.node)
+                edge = predecessor_edges.get(current)
+                if edge is not None:
+                    edges.append(edge)
                 current = predecessors.get(current)
-            return tuple(reversed(path))
+            return _WitnessPath(tuple(reversed(path)), tuple(reversed(edges)))
 
         if event:
             raw_obj = event.obj
@@ -686,7 +700,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     superseded.add(prior)
                     next_state = join_loop_states(prior, next_state)
                 bucket.append(next_state)
-            predecessors.setdefault(next_state, state)
+            if next_state not in predecessors:
+                predecessors[next_state] = state
+                predecessor_edges[next_state] = edge
             queue.append(next_state)
     # Keep the compact node-id witness for compatibility, but also expose the
     # source-level trace needed by reports and downstream triage.  The graph is
@@ -706,9 +722,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         hit["witness_trace"] = trace
         edge_trace = []
         witness = tuple(hit.get("witness", ()))
-        for source, target in zip(witness, witness[1:]):
-            edge = next((candidate for candidate in graph.edges.get(source, ())
-                         if candidate.target == target), None)
+        traversed_edges = hit.pop("_witness_edge_path", ())
+        for source, target, edge in zip(witness, witness[1:], traversed_edges):
             if edge is None:
                 continue
             edge_trace.append({
@@ -767,4 +782,5 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
                           "source_reachable": reachable,
                           "source_influenced": influenced,
                           "witness": list(witness),
+                          "_witness_edge_path": tuple(getattr(witness, "edges", ())),
                           "tier": 1 if reachable and influenced else 2 if reachable else None})
