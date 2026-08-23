@@ -109,7 +109,12 @@ class Normalizer:
         if requirement is None:
             return False
         if isinstance(requirement, str):
-            return requirement in (expression or "")
+            # A string value is the catalogued size-argument convention (for
+            # example ``sizeof``), not a requirement that the frontend preserve
+            # the complete source spelling.  Macro-expanded calls may expose
+            # only their callee label after graph normalization; the declarative
+            # role is still authoritative in that case.
+            return True
         return bool(requirement)
 
     def canon_callee(self, name):

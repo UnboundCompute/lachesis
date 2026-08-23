@@ -351,6 +351,19 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             if destination is not None and source is not None:
                 source_id = source.root[len("decl:"):] if source.root.startswith("decl:") else None
                 source_type = sub.props(source_id).get("type") if source_id else None
+                if source_type is None:
+                    # Access paths may retain the source-level declaration name
+                    # rather than its T2 id (notably parameters crossing a
+                    # frontend/macro boundary). Resolve that name within the
+                    # current function before falling back to the all-field
+                    # catalogue.
+                    source_type = next((
+                        sub.props(item.get("id")).get("type")
+                        for kind in ("parameter", "variable")
+                        for item in sub.idx.nodes_of_kind(kind)
+                        if item.get("label") == source.root
+                        and sub.props(item.get("id")).get("owner_function_id") == function_id
+                    ), None)
                 for selectors in _aggregate_field_paths(sub, ap_builder, source_type):
                     operations.append(_op(
                         OpKind.COPY, anchor,

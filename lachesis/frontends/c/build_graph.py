@@ -546,6 +546,15 @@ def position_from_ast(
     begin_source = begin.get("expansionLoc", begin)
     end_source = end.get("expansionLoc", end)
     loc_source = loc.get("expansionLoc", loc)
+    # Macro arguments all share the invocation's expansion offset. Their
+    # spelling locations, however, retain the distinct source expressions
+    # needed for argument/value identity (e.g. memcpy(dst, src, ...)).
+    if begin_source.get("isMacroArgExpansion"):
+        begin_source = begin.get("spellingLoc", begin_source)
+    if end_source.get("isMacroArgExpansion"):
+        end_source = end.get("spellingLoc", end_source)
+    if loc_source.get("isMacroArgExpansion"):
+        loc_source = loc.get("spellingLoc", loc_source)
     start = begin_source.get("offset", loc_source.get("offset", 0))
     finish = end_source.get("offset", start) + end_source.get(
         "tokLen", loc_source.get("tokLen", 0)
