@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from time import perf_counter
 from typing import Iterable
@@ -627,6 +627,9 @@ class ObjectLifetimeResult:
     leads: tuple[dict, ...]
     summaries: dict[str, tuple[tuple[ParamEffect, ...], ...]]
     diagnostics: dict
+    # Per-function abstract-state snapshots are retained for semantic consumers;
+    # the summary API remains unchanged for callers that only need effects.
+    artifacts: dict[str, object] = field(default_factory=dict)
 
 
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None):
@@ -852,4 +855,4 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     diagnostics["unsafe_object_flow"] = unsafe_object_flow
     diagnostics["total_seconds"] = round(perf_counter() - started, 6)
 
-    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics)
+    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics, artifacts)
