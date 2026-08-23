@@ -57,6 +57,22 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertIn("null-deref", patterns)
         self.assertNotIn("double-free", patterns)
 
+    def test_nulling_one_alias_does_not_null_the_other_slot(self):
+        obj = ObjRef("p", generation="g0")
+        alias = ObjRef("q", generation="g0")
+        events = [
+            ("origin", Event.origin(obj)),
+            ("derive", Event(EventKind.DERIVE, obj=alias, value=obj)),
+            ("null_p", Event(EventKind.WRITE_STORAGE_NULL, obj=obj)),
+            ("free_q", Event.release(alias, 4)),
+            ("use_q", Event.read(alias, "*", 5)),
+        ]
+        g = self._graph(events, [("origin", "derive"), ("derive", "null_p"),
+                                 ("null_p", "free_q"), ("free_q", "use_q")])
+        patterns = {hit["pattern"] for hit in match_graph(g)}
+        self.assertIn("uaf.deref", patterns)
+        self.assertNotIn("null-deref", patterns)
+
     def test_source_tiers_are_preserved_on_leads(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

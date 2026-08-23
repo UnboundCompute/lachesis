@@ -266,15 +266,19 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             return value
 
         if event:
+            raw_obj = event.obj
+            raw_base = event.base
             obj = canonical(event.obj)
             base = canonical(event.base)
             if event.kind == EventKind.DERIVE and event.obj and event.value:
                 bindings[event.obj] = canonical(event.value) or event.value
                 obj = canonical(event.obj)
             if event.kind == EventKind.WRITE_STORAGE_NULL and obj:
-                nulls.add(obj)
+                # NULL is a value in this storage slot, not a property of the
+                # heap object reached through another alias.
+                nulls.add(raw_obj)
                 obj = None
-            if event.kind == EventKind.RELEASE and obj in nulls:
+            if event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
             if event.kind == EventKind.RELEASE and obj:
                 prior_sites = {site for released_obj, site in released if released_obj == obj}
@@ -289,7 +293,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 live_proven = GuardProof("LIVE", base.render()) in state.guards
                 if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released) and not live_proven:
                     _record(hits, "uaf.deref", base, node)
-                if "null-deref" in wanted and base in nulls:
+                if "null-deref" in wanted and raw_base in nulls:
                     _record(hits, "null-deref", base, node)
             elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
                 if "use.dangling" in wanted and any(released_obj == obj for released_obj, _ in released):
@@ -298,7 +302,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 origins.add(obj)
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
-                nulls.discard(obj)
+                nulls.discard(raw_obj)
 
         if "leak" in wanted and node.id in exits:
             for obj in origins:
@@ -319,8 +323,13 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                             if (rebased := rebase(origin)) is not None}
             next_released = {(rebased, site) for released_obj, site in released
                              if (rebased := rebase(released_obj)) is not None}
-            next_nulls = {rebased for null_obj in nulls
-                          if (rebased := rebase(null_obj)) is not None}
+            # Local DERIVE aliases must not rebase NULL slot facts: ``q = p``
+            # followed by ``p = NULL`` leaves q's value unchanged.  A seam
+            # binding does transfer a formal's value/nullness to its actual.
+            next_nulls = set(nulls)
+            for formal, actual in edge.binding:
+                if formal in next_nulls:
+                    next_nulls.add(actual)
             known = set(next_origins) | set(next_nulls) | {obj for obj, _ in next_released}
             for proof in edge.guard:
                 guarded_obj = None
