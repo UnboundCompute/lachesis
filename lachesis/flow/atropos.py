@@ -59,7 +59,8 @@ def _entries(lang):
     d = os.path.join(ATROPOS_ROOT, "models", lang)
     for path in sorted(glob.glob(os.path.join(d, "*.json"))):
         try:
-            doc = json.load(open(path))
+            with open(path, encoding="utf-8") as stream:
+                doc = json.load(stream)
         except (OSError, ValueError):
             continue
         for e in doc.get("entries", []):
@@ -133,7 +134,8 @@ def _load_profile(lang, layer):
     so every form it uses lands in the 'unnormalized' ledger (honest, not a crash)."""
     path = os.path.join(ATROPOS_ROOT, "profiles", lang, f"{layer}.json")
     try:
-        return json.load(open(path))
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
     except (OSError, ValueError):
         return {}
 
@@ -167,7 +169,8 @@ def detection(name):
     if name not in _DETECTION_CACHE:
         path = os.path.join(ATROPOS_ROOT, "detection", f"{name}.json")
         try:
-            _DETECTION_CACHE[name] = json.load(open(path))
+            with open(path, encoding="utf-8") as stream:
+                _DETECTION_CACHE[name] = json.load(stream)
         except (OSError, ValueError):
             _DETECTION_CACHE[name] = {}
     return _DETECTION_CACHE[name]
