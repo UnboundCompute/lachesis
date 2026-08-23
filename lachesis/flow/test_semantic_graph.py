@@ -150,6 +150,55 @@ class SemanticGraphTests(unittest.TestCase):
         g = self._graph(events, [("start", "derive"), ("derive", "free"), ("free", "use")])
         self.assertTrue(any(h["pattern"] == "uaf.deref" for h in match_graph(g)))
 
+    def test_address_and_deref_algebra_survives_a_call_seam(self):
+        """A multi-level address chain must identify the released pointee.
+
+        The shape is deliberately expressed only in the skeleton alphabet: the caller
+        builds ``p1 = &object`` and ``p2 = &p1``; the callee receives ``p2`` as a
+        triple-pointer formal and releases ``**formal``.  The unrelated alias must still
+        match the release after the pushdown return.
+        """
+        obj = ObjRef("object", generation="g0")
+        alias = ObjRef("alias", generation="g0")
+        p1 = ObjRef("p1", generation="g0")
+        p2 = ObjRef("p2", generation="g0")
+        formal = ObjRef("formal", generation="g0")
+        target = ObjRef("target", generation="g0")
+
+        g = SkeletonGraph()
+        for node, event in [
+                ("start", Event.origin(obj)),
+                ("alias", Event(EventKind.DERIVE, obj=alias, value=obj)),
+                ("p1", Event(EventKind.DERIVE, obj=p1,
+                              value=ObjRef(obj.base, ("&",), obj.generation))),
+                ("p2", Event(EventKind.DERIVE, obj=p2,
+                              value=ObjRef(p1.base, ("&",), p1.generation))),
+                ("enter", Event(EventKind.SEAM_ENTER)),
+                ("target", Event(EventKind.DERIVE, obj=target,
+                                  value=ObjRef(formal.base, ("*", "*"), formal.generation))),
+                ("free", Event.release(target)),
+                ("return", Event(EventKind.SEAM_EXIT)),
+                ("use", Event.read(alias)),
+                ("exit", None),
+        ]:
+            g.add_node(node, event, fragment="main")
+        g.add_edge("start", "alias")
+        g.add_edge("alias", "p1")
+        g.add_edge("p1", "p2")
+        g.add_edge("p2", "enter")
+        g.add_edge("enter", "target", kind="call", return_to="return",
+                    binding=((formal, p2),))
+        g.add_edge("target", "free")
+        g.add_edge("free", "return", kind="return")
+        g.add_edge("return", "use")
+        g.add_edge("use", "exit")
+        g.add_fragment("main", "start", ["exit"])
+        g.validate()
+
+        hits = match_graph(g)
+        self.assertTrue(any(hit["pattern"] == "uaf.deref"
+                            and hit["node"] == "use" for hit in hits))
+
     def test_compare_is_a_dangling_value_use_not_a_deref(self):
         obj = ObjRef("p", generation="g0")
         events = [("origin", Event.origin(obj)), ("free", Event.release(obj, 2)),
