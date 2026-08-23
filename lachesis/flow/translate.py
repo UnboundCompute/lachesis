@@ -46,6 +46,7 @@ from lachesis.planner.unbounded_copy import BranchRegions
 
 from . import atropos
 from .normalize import normalizer
+from .source_discovery import discover_sources
 
 
 # --- small helpers ---------------------------------------------------------------
@@ -285,6 +286,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         alloc_dst = assigned if norm.is_alloc(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
                "is_sink": cat is not None,
+               "assigned": assigned,
                "node": c["id"],                             # graph node = CFG anchor for events
                "control": nest.enclosing(c["id"])}          # loop/branch nesting, outer->inner
         if cat is not None:
@@ -373,6 +375,7 @@ def build_F(store, lang="c", *, return_graph=False):
     sinks = atropos.sink_catalog(lang)
     sink_names = set(sinks)
     norm = normalizer(lang)                        # form oracle: canonicalize callee names
+    source_methods = set(atropos.source_catalog(lang))
 
     fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
     defined = {f.get("label") for f in fnodes if not _props(f).get("declaration_only")}
@@ -439,9 +442,38 @@ def build_F(store, lang="c", *, return_graph=False):
             "sink_ldf_callees": sink_ldf, "callers": sorted(callers[n]),
             "calls": r["calls"], "events": r["events"],
             "assigns": r["assigns"], "returns": r["returns"],
+            # Pass-2 source facts are retained separately from reachability.  A
+            # callerless function is only a structural entry; an actual source call
+            # is the operation from which Claus should launch.
+            "source_calls": [
+                {"callee": call["callee"], "line": call.get("line"), "node": call.get("node"),
+                 "assigned": call.get("assigned"),
+                 "args": [arg.get("pos") for arg in call.get("args", ())]}
+                for call in r["calls"] if call.get("callee") in source_methods
+            ],
+            "source_reachable": bool(len(callers[n]) == 0 or
+                                      any(call.get("callee") in source_methods
+                                          for call in r["calls"])),
         }
 
     succ = {n: [c for c in F[n]["udf_callees"] if c in F] for n in F}
+    discovery = discover_sources(F, succ, atropos.source_catalog(lang))
+    by_function_bindings = {}
+    for binding in discovery.bindings:
+        by_function_bindings.setdefault(binding.caller, []).append({
+            "callee": binding.callee, "call_node": binding.call_node,
+            "formal_to_actual": list(binding.formal_to_actual),
+            "return_to": binding.return_to,
+        })
+    for name, record in F.items():
+        record["source_sites"] = [
+            {"node": site.node, "callee": site.callee, "line": site.line,
+             "arguments": list(site.arguments), "influenced_roots": list(site.influenced_roots),
+             "kind": site.kind}
+            for site in discovery.sites_for(name)
+        ]
+        record["seam_bindings"] = by_function_bindings.get(name, [])
+        record["source_reachable"] = name in discovery.reachable_functions
     return (F, succ, graph) if return_graph else (F, succ)
 
 

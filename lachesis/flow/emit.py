@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import defaultdict
 
 from lachesis.nav.dataflow.reaching_def import ReachingDef
@@ -235,13 +236,18 @@ def _semantic_event(sub, operation, generations=None):
                 Event(EventKind.INVALIDATE, obj=obj, line=operation.line),
                 Event.origin(fresh, operation.line)]
     if operation.kind == OpKind.USE and obj:
+        # A storage access is anchored at the owning object.  Its selectors belong
+        # to the event path, not to the identity used for lifetime matching.  This
+        # is what lets ``free(p); p->field`` match the same generation of ``p``.
+        access_path = "".join(operation.target.selectors) or "*"
+        storage_obj = ObjRef(obj.base, generation=obj.generation)
         if operation.access == "pass":
             return [Event.pass_value(obj, operation.line)]
         if operation.access == "return":
             return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line)]
         if operation.access == "write":
-            return [Event.write(obj, "*", operation.line)]
-        return [Event.read(obj, "*", operation.line)]
+            return [Event.write(storage_obj, access_path, operation.line)]
+        return [Event.read(storage_obj, access_path, operation.line)]
     if operation.kind == OpKind.COPY and obj:
         source_key = (operation.source.root, tuple(operation.source.selectors)) if operation.source else None
         source = _semantic_obj(sub, operation.source, generations.get(source_key, "g0"))
@@ -492,10 +498,21 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
         variable, true_kind = condition.replace("!=NULL", "").replace("NULL!=", ""), "NONNULL"
     elif "==NULL" in condition or "NULL==" in condition:
         variable, true_kind = condition.replace("==NULL", "").replace("NULL==", ""), "ISNULL"
-    if not variable or true_kind is None:
-        return ()
-    kind = true_kind if target_index == 0 else ("NONNULL" if true_kind == "ISNULL" else "ISNULL")
-    return (GuardProof(kind, f"{variable}#g0"),)
+    if variable and true_kind is not None:
+        kind = true_kind if target_index == 0 else ("NONNULL" if true_kind == "ISNULL" else "ISNULL")
+        return (GuardProof(kind, f"{variable}#g0"),)
+
+    # Preserve relational branch facts as typed VALUE proofs.  The matcher does
+    # not treat these as lifetime verdicts, but downstream properties can consume
+    # them without having to reinterpret a raw predicate string.
+    relational = re.match(r"^(.+?)(<=|>=|==|!=|<|>)(.+)$", condition)
+    if relational and "NULL" not in condition:
+        left, relation, right = relational.groups()
+        if target_index:
+            inverse = {"<": ">=", "<=": ">", ">": "<=", ">=": "<", "==": "!=", "!=": "=="}
+            relation = inverse[relation]
+        return (GuardProof("VALUE", f"{left}{relation}{right}"),)
+    return ()
 
 
 def _call_bindings(sub, call, formals):
