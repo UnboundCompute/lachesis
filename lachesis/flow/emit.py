@@ -656,6 +656,36 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     )
                     result.add_edge(previous, sink_id)
                     previous = sink_id
+            # Pointer-returning calls are nullable until a compatible edge
+            # proves otherwise. Keep this as an origin fact so the matcher can
+            # distinguish an unchecked dereference from a guarded return; the
+            # allocator/reallocator branches already emit their own NULL arms.
+            for call_index, call in enumerate(functions[name].get("calls", ())):
+                if call.get("node") != n or not call.get("assigned"):
+                    continue
+                callee = call.get("callee")
+                if norm.is_alloc(callee) or norm.is_realloc(callee):
+                    continue
+                assigned = call.get("assigned")
+                variable = next((candidate for candidate in sub.idx.nodes_of_kind(
+                    "variable", "parameter")
+                    if sub.label(candidate.get("id")) == assigned
+                    and sub.props(candidate.get("id")).get("owner_function_id") == fid), None)
+                if variable is None or "*" not in (sub.props(variable.get("id")).get("type") or ""):
+                    continue
+                return_id = f"{anchor}:return-origin:{call_index}"
+                result.add_node(
+                    return_id,
+                    Event(EventKind.ORIGIN,
+                          obj=ObjRef(str(assigned), generation="g0"),
+                          line=call.get("line"),
+                          facts={"return_may_null": True,
+                                 "callee": callee}),
+                    fragment=name, source_reachable=source_reachable,
+                    source_influenced=bool(call.get("args")),
+                )
+                result.add_edge(previous, return_id)
+                previous = return_id
             last_for_cfg[n] = previous
         cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
         internal_call_anchors = {

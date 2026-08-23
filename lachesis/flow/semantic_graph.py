@@ -52,6 +52,8 @@ FROZEN_PATTERNS = {
                                                      EventKind.COMPARE_VALUE,
                                                      EventKind.RETURN_VALUE)),
     "use-after-return": PatternSpec("use-after-return", (EventKind.RETURN_VALUE,)),
+    "unchecked-return-deref": PatternSpec("unchecked-return-deref",
+                                           (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE)),
     "double-free": PatternSpec("double-free", (EventKind.RELEASE,)),
     "null-deref": PatternSpec("null-deref", (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE)),
     "leak": PatternSpec("leak", (EventKind.ORIGIN,)),
@@ -261,6 +263,7 @@ class _State:
     nulls: frozenset[ObjRef] = frozenset()
     escaped: frozenset[ObjRef] = frozenset()
     sink_allocs: tuple[tuple[str, str], ...] = ()
+    nullable: frozenset[ObjRef] = frozenset()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -294,6 +297,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             left.nulls | right.nulls,
             left.escaped | right.escaped,
             tuple(sorted(set(left.sink_allocs) | set(right.sink_allocs))),
+            left.nullable | right.nullable,
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -314,6 +318,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         bindings = dict(state.bindings)
         escaped = set(state.escaped)
         sink_allocs = dict(state.sink_allocs)
+        nullable = set(state.nullable)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -436,6 +441,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     _record(hits, "uaf.deref", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
                     _record(hits, "null-deref", base, node, witness())
+                if "unchecked-return-deref" in wanted and base in nullable:
+                    _record(hits, "unchecked-return-deref", base, node, witness())
             elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
                 if "use.dangling" in wanted and any(released_obj == obj for released_obj, _ in released):
                     _record(hits, "use.dangling", obj, node, witness())
@@ -450,6 +457,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
                 nulls.discard(raw_obj)
+                if event.facts.get("return_may_null"):
+                    nullable.add(obj)
+                else:
+                    nullable.discard(obj)
             elif event.kind == EventKind.LOST_FROM_SLOT and raw_obj:
                 # Losing the owning slot does not free the object.  A DERIVE
                 # alias remains a live root; without one, the origin is leaked.
@@ -484,6 +495,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             # followed by ``p = NULL`` leaves q's value unchanged.  A seam
             # binding does transfer a formal's value/nullness to its actual.
             next_nulls = set(nulls)
+            next_nullable = {rebased for nullable_obj in nullable
+                             if (rebased := rebase(nullable_obj)) is not None}
             for formal, actual in edge.binding:
                 if formal in next_nulls:
                     next_nulls.add(actual)
@@ -509,8 +522,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if proof.kind == "ISNULL":
                     next_origins.discard(guarded_obj)
                     next_nulls.add(guarded_obj)
+                    next_nullable.discard(guarded_obj)
                 elif proof.kind == "NONNULL":
                     next_nulls.discard(guarded_obj)
+                    next_nullable.discard(guarded_obj)
             if edge.kind == "call":
                 if edge.return_to is None:
                     raise ValueError(f"call edge {state.node}->{edge.target} lacks return_to")
@@ -528,7 +543,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
                                 frozenset(next_escaped),
-                                tuple(sorted(sink_allocs.items())))
+                                tuple(sorted(sink_allocs.items())),
+                                frozenset(next_nullable))
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 bucket_key = (edge.target, stack)

@@ -39,6 +39,20 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertIn("mem.alloc-copy.size-mismatch",
                       {hit["pattern"] for hit in match_graph(g)})
 
+    def test_checked_nullable_return_deref_is_not_unchecked(self):
+        obj = ObjRef("result")
+        events = [
+            ("origin", Event(EventKind.ORIGIN, obj=obj,
+                              facts={"return_may_null": True})),
+            ("check", None),
+            ("use", Event.read(obj)),
+        ]
+        g = self._graph(events, [("origin", "check"), ("check", "use")])
+        g.edges["check"][0] = Edge(
+            target="use", guard=(GuardProof("NONNULL", obj.render()),))
+        self.assertNotIn("unchecked-return-deref",
+                         {hit["pattern"] for hit in match_graph(g)})
+
     def test_branch_arms_do_not_form_a_linear_false_positive(self):
         o = ObjRef("O_buf", generation="g0")
         events = [("start", None), ("true_free", Event.release(o, 2)),
