@@ -186,6 +186,24 @@ def pattern_catalog():
     return detection("flow-patterns").get("patterns", [])
 
 
+def flow_pattern_id(matcher_pattern, family=None):
+    """Resolve an engine finding to Atropos's public flow-pattern identifier.
+
+    The engine keeps its compact evaluator/lifetime names for compatibility, while
+    Atropos owns the user-facing taxonomy.  Family constraints prevent a generic
+    evaluator such as ``relational`` from being mislabelled across sink classes.
+    """
+    for entry in pattern_catalog():
+        matcher = entry.get("matcher") or {}
+        if matcher.get("pattern") != matcher_pattern:
+            continue
+        families = matcher.get("families") or []
+        if families and family not in families:
+            continue
+        return entry.get("id")
+    return None
+
+
 def evaluator_catalog():
     """Return the Atropos evaluator vocabulary and kind routing table."""
     return detection("evaluators")

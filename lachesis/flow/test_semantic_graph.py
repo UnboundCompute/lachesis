@@ -36,8 +36,9 @@ class SemanticGraphTests(unittest.TestCase):
             })),
         ]
         g = self._graph(events, [("alloc", "copy")])
-        self.assertIn("mem.alloc-copy.size-mismatch",
-                      {hit["pattern"] for hit in match_graph(g)})
+        hit = next(hit for hit in match_graph(g)
+                   if hit["pattern"] == "mem.alloc-copy.size-mismatch")
+        self.assertEqual(hit["pattern_id"], "mem.alloc-copy.size-mismatch")
 
     def test_fall_through_guard_routes_to_missing_bounds(self):
         event = Event(EventKind.SINK, obj=ObjRef("buf"), facts={
@@ -45,7 +46,8 @@ class SemanticGraphTests(unittest.TestCase):
             "tainted": True, "guarded": False, "guard_status": "fall-through",
         })
         g = self._graph([("sink", event)], [])
-        self.assertIn("missing-guard", {hit["pattern"] for hit in match_graph(g)})
+        hit = next(hit for hit in match_graph(g) if hit["pattern"] == "missing-guard")
+        self.assertEqual(hit["pattern_id"], "mem.write.missing-bounds")
 
     def test_checked_nullable_return_deref_is_not_unchecked(self):
         obj = ObjRef("result")

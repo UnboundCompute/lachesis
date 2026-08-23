@@ -394,7 +394,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                         if patterns is None or pattern in wanted:
                             sink_obj = obj or ObjRef(
                                 event.facts.get("callee", "sink"), generation="g0")
-                            _record(hits, pattern, sink_obj, node, witness())
+                            _record(hits, pattern, sink_obj, node, witness(), family)
                     control = set(event.facts.get("control") or ())
                     if (patterns is None or "mem.copy.in-loop-unbounded" in wanted):
                         if (family in {"buffer-write", "buffer-size"}
@@ -403,7 +403,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                             sink_obj = obj or ObjRef(
                                 event.facts.get("callee", "sink"), generation="g0")
                             _record(hits, "mem.copy.in-loop-unbounded", sink_obj,
-                                    node, witness())
+                                    node, witness(), family)
                     dst = event.facts.get("dst")
                     size_expr = event.facts.get("size_expr")
                     if dst and size_expr is not None:
@@ -417,7 +417,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                             sink_obj = obj or ObjRef(
                                 event.facts.get("callee", "sink"), generation="g0")
                             _record(hits, "mem.alloc-copy.size-mismatch", sink_obj,
-                                    node, witness())
+                                    node, witness(), family)
                 # Sink facts are observations, not lifetime transitions; the
                 # remaining lifecycle branches below intentionally do not match
                 # EventKind.SINK.
@@ -599,7 +599,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
 
 
 def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
-            witness: tuple[str, ...] = ()) -> None:
+            witness: tuple[str, ...] = (), family: str | None = None) -> None:
     # A shared callee may be reached from several source-rooted callers.  Those
     # are distinct witnesses even when the sink node and normalized object are
     # identical; collapsing them loses the coverage proof the graph was built
@@ -614,6 +614,8 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
     reachable = bool(node.metadata.get("source_reachable", False))
     influenced = bool(node.metadata.get("source_influenced", False))
     object_name = obj.render()
+    from . import atropos
+    catalog_id = atropos.flow_pattern_id(pattern, family)
     hits.setdefault(key, {"pattern": pattern, "object": object_name, "node": node.id,
                           "entry": node.fragment, "line": node.event.line if node.event else None,
                           # Keep the lead contract shared with the reachability
@@ -625,6 +627,7 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
                           "value": object_name,
                           "var": object_name,
                           "at": node.id,
+                          "pattern_id": catalog_id,
                           "source_reachable": reachable,
                           "source_influenced": influenced,
                           "witness": list(witness),
