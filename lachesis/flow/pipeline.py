@@ -136,6 +136,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
+    coverage = CoverageScheduler(F, succ).plan()
     projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
@@ -153,10 +154,10 @@ def run_pass(store, lang="c", lifetime_engine=None):
         }
         object_result = analyze_object_lifetimes(
             store, object_functions, object_succ, lang=lang, graph=analysis_graph)
-        coverage = CoverageScheduler(F, succ).plan(object_functions)
+        semantic_coverage = CoverageScheduler(F, succ).plan(object_functions)
         semantic_graph = Claus().build(
             store, F, succ, lang=lang, graph=analysis_graph,
-            summaries=object_result.summaries, coverage=coverage)
+            summaries=object_result.summaries, coverage=semantic_coverage)
         semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
