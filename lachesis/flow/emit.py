@@ -255,6 +255,8 @@ def _semantic_event(sub, operation, generations=None):
         source = _semantic_obj(sub, operation.source, generations.get(source_key, "g0"))
         return [Event(EventKind.DERIVE, obj=obj, value=source, line=operation.line)]
     if operation.kind == OpKind.CLOBBER and obj:
+        if operation.access == "source":
+            return [Event.origin(obj, operation.line)]
         kind = EventKind.WRITE_STORAGE_NULL if operation.is_null else EventKind.DERIVE
         return [Event(kind, obj=obj, line=operation.line)]
     return []

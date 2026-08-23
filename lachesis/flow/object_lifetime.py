@@ -328,6 +328,20 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                                       alternatives=tuple(alternatives)))
             continue
 
+        # External sources create a fresh value at their assigned destination.
+        # Keep this as an ORIGIN fact in the frozen graph; it is not an allocator
+        # attempt and must remain distinct from allocation failure semantics.
+        source_callees = {item.get("callee") for item in function_ir.get("source_calls", ())}
+        if callee in source_callees and call.get("assigned"):
+            assigned = call["assigned"]
+            destination = next((candidate for candidate in owned
+                                if sub.kind(candidate) == "variable" and
+                                sub.label(candidate) == assigned), None)
+            target = _path(ap_builder, destination)
+            if target is not None:
+                operations.append(_op(OpKind.CLOBBER, anchor, target=target, line=line,
+                                      ordinal=5, access="source"))
+
         # Unknown callees may dereference pointer arguments. Lifecycle primitives are
         # modeled by their contracts above and allocator arguments are not pointee uses.
         if not norm.is_alloc(callee):
