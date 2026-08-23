@@ -224,5 +224,6 @@ def run_pass(store, lang="c", lifetime_engine=None):
     }
     return {"F": F, "succ": succ, "summaries": summaries,
             "skeletons": skeletons, "semantic_graph": locals().get("semantic_graph"),
+            "coverage": locals().get("coverage"),
             "leads": leads, "lifetime": lifetime,
             "timings": timings}
