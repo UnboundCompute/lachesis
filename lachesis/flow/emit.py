@@ -563,8 +563,6 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             # mutate object state, while its evaluator can consume guards,
             # size expressions, control nesting, and provenance.
             for call_index, call in enumerate(functions[name].get("calls", ())):
-                if reach_summaries is not None:
-                    continue
                 if call.get("node") != n:
                     continue
                 catalog_entry = sink_catalog.get(call.get("callee")) or {}
@@ -627,6 +625,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     if not family:
                         continue
                     recipe = evaluator_for(family)
+                    recipe_names = ([recipe] if isinstance(recipe, str)
+                                    else tuple(recipe or ()))
+                    if not ({"reachability", "presence"} & set(recipe_names)):
+                        continue
                     relational = (recipe == "relational" or
                                   isinstance(recipe, (list, tuple))
                                   and "relational" in recipe)

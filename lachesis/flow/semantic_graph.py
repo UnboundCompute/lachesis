@@ -574,8 +574,18 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
            seam_context)
     reachable = bool(node.metadata.get("source_reachable", False))
     influenced = bool(node.metadata.get("source_influenced", False))
-    hits.setdefault(key, {"pattern": pattern, "object": obj.render(), "node": node.id,
+    object_name = obj.render()
+    hits.setdefault(key, {"pattern": pattern, "object": object_name, "node": node.id,
                           "entry": node.fragment, "line": node.event.line if node.event else None,
+                          # Keep the lead contract shared with the reachability
+                          # renderer.  Semantic leads are source-rooted graph
+                          # findings, but callers still expect these display and
+                          # triage fields even when the old skeleton is retired.
+                          "is_source": reachable,
+                          "guarded": False,
+                          "value": object_name,
+                          "var": object_name,
+                          "at": node.id,
                           "source_reachable": reachable,
                           "source_influenced": influenced,
                           "witness": list(witness),
