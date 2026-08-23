@@ -260,6 +260,25 @@ def _normalized_path(path: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _requested_patterns(patterns: Iterable[str] | None) -> set[str]:
+    """Normalize internal evaluator names and Atropos public pattern IDs."""
+    if patterns is None:
+        return set(FROZEN_PATTERNS)
+    requested = set(patterns)
+    try:
+        from . import atropos
+        for entry in atropos.pattern_catalog():
+            public_id = entry.get("id")
+            matcher = entry.get("matcher") or {}
+            internal_name = matcher.get("pattern")
+            if public_id in requested and internal_name:
+                requested.add(internal_name)
+    except (ImportError, OSError, ValueError, AttributeError):
+        # The semantic matcher remains usable without the optional sibling catalog.
+        pass
+    return requested
+
+
 @dataclass(frozen=True)
 class _State:
     node: str
@@ -282,7 +301,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
     means a shared fragment cannot return to a different caller.  The released set is keyed by
     the exact object and generation, so freeing a storage object never frees its pointee.
     """
-    wanted = set(FROZEN_PATTERNS if patterns is None else patterns)
+    wanted = _requested_patterns(patterns)
     starts = sorted(graph.source_reachable) if graph.source_reachable else [f.entry for f in graph.fragments.values()]
     starts = starts or list(graph.nodes)
     queue = deque(_State(s) for s in starts)

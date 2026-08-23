@@ -23,6 +23,16 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(atropos.flow_pattern_id("relational", "buffer-write"),
                          "mem.write.tainted-unbounded")
 
+    def test_public_atropos_pattern_id_selects_the_internal_matcher(self):
+        obj = ObjRef("object", generation="g0")
+        g = self._graph(
+            [("origin", Event.origin(obj)), ("free", Event.release(obj)),
+             ("use", Event.read(obj))],
+            [("origin", "free"), ("free", "use")],
+        )
+        hits = match_graph(g, patterns={"mem.lifetime.use-after-free"})
+        self.assertEqual({hit["pattern"] for hit in hits}, {"uaf.deref"})
+
     def test_relational_and_index_guards_keep_distinct_typed_proofs(self):
         class Sub:
             @staticmethod

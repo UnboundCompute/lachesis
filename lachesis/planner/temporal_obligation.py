@@ -1,0 +1,128 @@
+"""Candidate census for graph-temporal lifecycle patterns.
+
+Temporal candidates are deliberately not findings.  They are the semantic
+operation sites that a graph matcher must relate across compatible paths.  The
+pattern identity and required event vocabulary come from Atropos; this module
+only turns observable graph facts into the common candidate capsule shape.
+"""
+from __future__ import annotations
+
+import hashlib
+
+from ..flow import atropos
+
+
+def _event_kind(node):
+    props = node.get("properties") or {}
+    return str(props.get("event_kind") or node.get("kind") or "").lower()
+
+
+def _object_id(node):
+    props = node.get("properties") or {}
+    for key in ("object_id", "target_id", "value_id", "obj"):
+        if props.get(key):
+            return props[key]
+    return None
+
+
+class TemporalLifecycle:
+    metadata = {}
+    trigger = ()
+
+    def __init__(self, graph, bind_summary=None):
+        self.graph = graph
+        self.bind_summary = bind_summary or {}
+        self.nodes = list(graph.get("nodes", ()))
+        # Some callers attach the materialized semantic graph under this key;
+        # accepting it keeps the registry useful before and after graph
+        # publication without coupling it to the C frontend.
+        semantic = graph.get("semantic_graph") or {}
+        if isinstance(semantic, dict):
+            self.nodes.extend(semantic.get("nodes", ()))
+
+    def _language(self, node):
+        props = node.get("properties") or {}
+        path = props.get("absolute_file") or props.get("file") or node.get("file") or ""
+        return atropos.lang_of(path)
+
+    def _candidate(self, node):
+        props = node.get("properties") or {}
+        site = node.get("id", "")
+        pattern_id = self.metadata["id"]
+        raw = f"{pattern_id}\0{site}"
+        return {
+            "candidate_id": "temporal_" + hashlib.sha256(raw.encode()).hexdigest()[:20],
+            "constructor": pattern_id,
+            "domain": "lifecycle",
+            "language": self._language(node),
+            "obligation": self.metadata["obligation"],
+            "handles": {
+                "site_node_id": site,
+                "enclosing_function_id": props.get("owner_function_id"),
+                "obligation_value_ids": ([obj] if (obj := _object_id(node)) else []),
+            },
+            "observations": {
+                "site": node.get("label"),
+                "event_kind": _event_kind(node),
+                "object_id": _object_id(node),
+                "file": props.get("absolute_file") or props.get("file") or node.get("file"),
+                "line": props.get("start_line") or props.get("line"),
+                "pattern": self.metadata["matcher_pattern"],
+                "requires": list(self.metadata["requires"]),
+            },
+            "inferences": {
+                "path_relation": "not-queried",
+                "same_object": "not-queried",
+                "same_generation": "not-queried",
+            },
+            "rank": None,
+            "rank_reasons": [],
+            "completeness": "PARTIAL",
+            "next_op": {"tool": "skeleton", "why": "inspect compatible temporal context"},
+        }
+
+    def enumerate(self):
+        rows = [self._candidate(node) for node in self.nodes
+                if _event_kind(node) in self.trigger]
+        rows.sort(key=lambda row: (row["observations"].get("file") or "",
+                                   row["observations"].get("line") or 0,
+                                   row["handles"]["site_node_id"]))
+        return {
+            "constructor": self.metadata["id"],
+            "domain": "lifecycle",
+            "metadata": dict(self.metadata),
+            "candidates": rows,
+            "census": {"enumerated": len(rows),
+                       "by_status": {"not-queried": len(rows)}},
+            "frontiers": {"unresolved_calls": 0, "unbound_models": 0,
+                           "unbound_sinks": [], "truncated_walks": 0,
+                           "missing_optional_capabilities": [],
+                           "unselected_configs": []},
+            "complete_for_observable_graph": True,
+        }
+
+
+def temporal_constructor(spec):
+    """Build a constructor directly from one Atropos candidate declaration."""
+    entry = next((item for item in atropos.pattern_catalog()
+                  if item.get("id") == spec["id"]), {})
+    matcher = entry.get("matcher") or {}
+    pattern = matcher.get("pattern") or spec.get("matcher_pattern")
+    # Event vocabulary is intentionally described by the catalog requirement;
+    # the two standard temporal patterns map to their semantic trigger kinds.
+    triggers = {"double-free": ("release",),
+                "uaf.deref": ("read", "write", "read_storage", "write_storage")}.get(
+                    pattern, ())
+    return type("Temporal_" + spec["family"].replace("-", "_"),
+                (TemporalLifecycle,), {
+                    "trigger": triggers,
+                    "metadata": {
+                        "id": spec["id"], "domain": "lifecycle",
+                        "family": spec["family"], "languages": spec["languages"],
+                        "required_capabilities": ("semantic-events",),
+                        "optional_capabilities": ("value-flow", "calls"),
+                        "obligation": spec["obligation"],
+                        "matcher_pattern": pattern,
+                        "requires": spec.get("requires", ()),
+                    },
+                })

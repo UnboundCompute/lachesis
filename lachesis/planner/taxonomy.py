@@ -212,6 +212,45 @@ SOURCE_KINDS: tuple[str, ...] = (
 SUMMARY_KINDS: tuple[str, ...] = ("copy", "concat", "alias", "transform")
 
 
+def _add_catalog_flow_families() -> None:
+    """Expose Atropos flow patterns that have a planner candidate contract.
+
+    Sink taxonomy entries describe node-local obligations.  Temporal patterns
+    are different: their evidence is a relationship between semantic events,
+    so they are declared by the flow-pattern catalog and routed here only when
+    Atropos explicitly marks them as candidate-producing.  This keeps the
+    planner vocabulary synchronized with the pattern library without making
+    the planner the owner of detector IDs.
+    """
+    try:
+        from ..flow import atropos
+        entries = atropos.pattern_catalog()
+    except (ImportError, OSError, ValueError, AttributeError):
+        entries = ()
+    lifecycle = SINK_TAXONOMY["lifecycle"]
+    for entry in entries:
+        candidate = entry.get("candidate") or {}
+        if not candidate:
+            continue
+        domain_id = candidate.get("domain")
+        family_id = candidate.get("family")
+        if not domain_id or not family_id or domain_id != "lifecycle":
+            continue
+        matcher = entry.get("matcher") or {}
+        lifecycle["families"].setdefault(family_id, {
+            "kinds": (),
+            "obligation": entry.get("name") or "temporal lifecycle relationship",
+            "constructor": entry.get("id"),
+            "obligation_cwe": tuple(entry.get("cwe") or ()),
+            "temporal": True,
+            "matcher_pattern": matcher.get("pattern"),
+            "requires": tuple(entry.get("requires") or ()),
+        })
+
+
+_add_catalog_flow_families()
+
+
 def all_sink_kinds() -> set[str]:
     """Every sink kind the taxonomy places, across all domains."""
     return {kind
@@ -242,6 +281,9 @@ def family_specs() -> list[dict]:
                 "obligation_cwe": tuple(family.get("obligation_cwe", ())),
                 "languages": tuple(domain["languages"]),
                 "primary": domain["primary"],
+                "temporal": bool(family.get("temporal")),
+                "matcher_pattern": family.get("matcher_pattern"),
+                "requires": tuple(family.get("requires", ())),
             })
     return specs
 

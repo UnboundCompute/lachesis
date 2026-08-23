@@ -1178,6 +1178,32 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertEqual(query[0]["observations"]["atropos_model_id"],
                          "c.db.mysql_query.a1")
 
+    def test_temporal_flow_patterns_are_candidate_families(self):
+        graph = {
+            "nodes": [
+                _node("free:1", "release", "free(p)", object_id="obj:p",
+                      owner_function_id="fn:destroy", file="destroy.c", start_line=8),
+                _node("read:1", "read", "p->field", object_id="obj:p",
+                      owner_function_id="fn:use", file="use.c", start_line=19),
+            ],
+            "edges": [],
+        }
+        registry = default_candidate_registry(graph)
+        uaf = registry.census("mem.lifetime.use-after-free")["constructors"][0]
+        double_free = registry.census("mem.lifetime.double-free")["constructors"][0]
+        self.assertEqual(uaf["census"]["enumerated"], 1)
+        self.assertEqual(double_free["census"]["enumerated"], 1)
+        self.assertEqual(uaf["metadata"]["matcher_pattern"], "uaf.deref")
+        self.assertEqual(double_free["metadata"]["matcher_pattern"], "double-free")
+
+    def test_temporal_candidate_rows_are_not_verdicts(self):
+        graph = {"nodes": [_node("free:1", "release", "free(p)" )], "edges": []}
+        registry = default_candidate_registry(graph)
+        row = registry.candidates(constructor="mem.lifetime.double-free",
+                                  detail="full")["candidates"][0]
+        self.assertNotIn("verdict", row)
+        self.assertEqual(row["inferences"]["same_object"], "not-queried")
+
 
 class GuardRelationTest(unittest.TestCase):
     """A branch guards a size only when it COMPARES the variable's magnitude.
