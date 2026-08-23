@@ -15,6 +15,7 @@ from .cfg import cfg_bundle
 from .object_lifetime import analyze_object_lifetimes
 from .semantic_graph import match_graph
 from .fragment_store import Claus
+from .coverage import CoverageScheduler
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
@@ -152,9 +153,10 @@ def run_pass(store, lang="c", lifetime_engine=None):
         }
         object_result = analyze_object_lifetimes(
             store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+        coverage = CoverageScheduler(F, succ).plan(object_functions)
         semantic_graph = Claus().build(
             store, F, succ, lang=lang, graph=analysis_graph,
-            summaries=object_result.summaries)
+            summaries=object_result.summaries, coverage=coverage)
         semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
