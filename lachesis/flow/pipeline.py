@@ -33,9 +33,19 @@ def _lifetime_slice(F, succ, lang="c"):
     from . import atropos
 
     sink_names = set(atropos.sink_catalog(lang))
+    def carries_semantic_work(function):
+        # A frontend may expose an inline/compiler artifact as a nominal source
+        # function with no body, calls, lifecycle facts, or sink observations.
+        # Such a node cannot contribute an object state and should not create a
+        # permanently unresolved Pass 3 region. Real source wrappers remain
+        # seeds because they carry calls/source sites even when their lifecycle
+        # effect is entirely in a callee.
+        return bool(function.get("events") or function.get("calls")
+                    or function.get("source_calls") or function.get("source_sites"))
+
     seeds = {
         name for name, function in F.items()
-        if function.get("source_reachable")
+        if (function.get("source_reachable") and carries_semantic_work(function))
         or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
         or any(call.get("is_sink") or call.get("callee") in sink_names

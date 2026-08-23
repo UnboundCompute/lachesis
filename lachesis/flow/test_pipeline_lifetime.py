@@ -59,6 +59,15 @@ class PipelineLifetimeTests(unittest.TestCase):
         successors = {"caller": ["alloc"], "alloc": [], "unrelated": []}
         self.assertEqual(set(_lifetime_slice(functions, successors)), {"alloc", "caller"})
 
+    def test_empty_source_artifacts_do_not_seed_lifetime_slice(self):
+        functions = {
+            "empty": {"source_reachable": True},
+            "wrapper": {"source_reachable": True, "calls": [{"callee": "alloc"}]},
+            "alloc": {"events": [{"kind": "alloc"}]},
+        }
+        successors = {"empty": [], "wrapper": ["alloc"], "alloc": []}
+        self.assertEqual(set(_lifetime_slice(functions, successors)), {"wrapper", "alloc"})
+
 
 if __name__ == "__main__":
     unittest.main()
