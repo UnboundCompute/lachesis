@@ -595,6 +595,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 "line": event.line if event else None,
             })
         hit["witness_trace"] = trace
+        first = trace[0] if trace else {}
+        hit["source_node"] = first.get("node")
+        hit["source_entry"] = first.get("fragment")
+        hit["source_line"] = first.get("line")
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
 
 
