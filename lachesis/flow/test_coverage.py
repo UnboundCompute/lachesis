@@ -104,6 +104,35 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertIsInstance(merged, SkeletonGraph)
         self.assertEqual(set(merged.nodes), {"worker:entry", "worker:a", "worker:b"})
 
+    def test_claus_records_coverage_when_composed_cache_is_reused(self):
+        store = FragmentStore()
+        functions = {"source_a": {}, "source_b": {}, "worker": {}}
+        graph = object()
+
+        def partial(source, leaf):
+            result = SkeletonGraph()
+            result.add_node(f"{source}:entry", fragment=source)
+            result.add_node("worker:entry", fragment="worker")
+            result.add_node(leaf, fragment="worker")
+            result.add_edge(f"{source}:entry", "worker:entry")
+            result.add_edge("worker:entry", leaf)
+            result.add_fragment(source, f"{source}:entry", (f"{source}:entry",))
+            result.add_fragment("worker", "worker:entry", (leaf,))
+            return result
+
+        store.put(functions, "c", graph, partial("source_a", "worker:a"),
+                  coverage={"state_keys": [["worker", "source_a"]]})
+        store.put(functions, "c", graph, partial("source_b", "worker:b"),
+                  coverage={"state_keys": [["worker", "source_b"]]})
+        coverage = {"regions": [{"state_keys": [["worker", "source_a"],
+                                                   ["worker", "source_b"]]}],
+                    "state_keys": [["worker", "source_a"], ["worker", "source_b"]]}
+        built = Claus(store).build(object(), functions, {}, graph=graph,
+                                    coverage=coverage)
+        self.assertTrue(built.coverage["converged"])
+        self.assertEqual(store.covered_states,
+                         {("worker", "source_a"), ("worker", "source_b")})
+
     def test_fragment_cache_uses_content_not_transient_summary_identity(self):
         store = FragmentStore()
         functions = {"worker": {"events": [{"kind": "alloc"}]}}

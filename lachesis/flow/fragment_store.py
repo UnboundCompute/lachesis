@@ -229,33 +229,36 @@ class Claus:
                 materialized.append((target, source))
         return materialized
 
+    def _record_coverage(self, graph: SkeletonGraph, coverage) -> SkeletonGraph:
+        """Attach honest coverage accounting to both fresh and cached graphs."""
+        if coverage is None:
+            return graph
+        graph.coverage = coverage.to_dict() if hasattr(coverage, "to_dict") else dict(coverage)
+        planned_keys = [tuple(key) for region in graph.coverage.get("regions", [])
+                        for key in region.get("state_keys", [])]
+        # A plan describes work that should be attempted; it is not proof that
+        # the graph contains it.  Reuse the same pushdown-aware materialization
+        # check for cache hits and freshly emitted graphs.
+        materialized = self._materialized_states(graph, planned_keys)
+        self.fragments.mark_covered(materialized)
+        pending = tuple(sorted(set(planned_keys) - set(materialized)))
+        graph.coverage.update({
+            "covered_states": [list(key) for key in sorted(self.fragments.covered_states)],
+            "uncovered_states": [list(key) for key in pending],
+            "converged": not pending,
+        })
+        return graph
+
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
               coverage=None, reach_summaries=None):
         cached = self.fragments.get(functions, lang, graph, summaries, coverage,
                                     reach_summaries)
         if cached is not None:
-            return cached
+            return self._record_coverage(cached, coverage)
         from .emit import build_semantic_graph
         built = build_semantic_graph(store, functions, successors, lang=lang,
                                      graph=graph, summaries=summaries,
                                      reach_summaries=reach_summaries)
-        if coverage is not None:
-            built.coverage = coverage.to_dict() if hasattr(coverage, "to_dict") else dict(coverage)
-            planned_keys = [tuple(key) for region in built.coverage.get("regions", [])
-                            for key in region.get("state_keys", [])]
-            # A plan describes work that should be attempted; it is not proof that
-            # Claus materialized it.  Reaching-definition failures and unsupported
-            # frontend regions are intentionally skipped by the emitter, so only
-            # state keys whose function has an emitted fragment may be counted as
-            # covered.  Otherwise `converged` could be true while the graph still
-            # lacks the selected region.
-            materialized = self._materialized_states(built, planned_keys)
-            self.fragments.mark_covered(materialized)
-            pending = tuple(sorted(set(planned_keys) - set(materialized)))
-            built.coverage.update({
-                "covered_states": [list(key) for key in sorted(self.fragments.covered_states)],
-                "uncovered_states": [list(key) for key in pending],
-                "converged": not pending,
-            })
+        self._record_coverage(built, coverage)
         return self.fragments.put(functions, lang, graph, built, summaries, coverage,
                                   reach_summaries)
