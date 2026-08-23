@@ -456,9 +456,21 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         for child in sub.ast_children.get(node, ()):
             target = _path(ap_builder, child)
             if target is not None:
+                root_id = target.root.removeprefix("decl:")
+                root_props = sub.props(root_id)
+                root_kind = sub.kind(root_id)
+                # A returned array decays to a pointer to its automatic
+                # storage.  Explicit address-of paths cover scalar/struct
+                # locals; heap-returning locals are deliberately excluded.
+                stack_local = (
+                    root_kind in {"variable", "VarDecl"}
+                    and root_props.get("owner_function_id") == function_id
+                    and ("[" in (root_props.get("type") or "")
+                         or "&" in target.selectors)
+                )
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
                                       target=target, line=_line(sub, node), ordinal=30,
-                                      access="return"))
+                                      access="return-stack" if stack_local else "return"))
                 break
 
     # The same semantic event can be visible via the assignment scan and the generic

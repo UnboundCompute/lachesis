@@ -51,6 +51,7 @@ FROZEN_PATTERNS = {
     "use.dangling": PatternSpec("use.dangling", (EventKind.PASS_VALUE,
                                                      EventKind.COMPARE_VALUE,
                                                      EventKind.RETURN_VALUE)),
+    "use-after-return": PatternSpec("use-after-return", (EventKind.RETURN_VALUE,)),
     "double-free": PatternSpec("double-free", (EventKind.RELEASE,)),
     "null-deref": PatternSpec("null-deref", (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE)),
     "leak": PatternSpec("leak", (EventKind.ORIGIN,)),
@@ -438,6 +439,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
                 if "use.dangling" in wanted and any(released_obj == obj for released_obj, _ in released):
                     _record(hits, "use.dangling", obj, node, witness())
+                if (event.kind == EventKind.RETURN_VALUE
+                        and event.facts.get("stack_local")
+                        and "use-after-return" in wanted):
+                    _record(hits, "use-after-return", obj, node, witness())
                 if event.kind == EventKind.RETURN_VALUE:
                     escaped.add(obj)
             elif event.kind == EventKind.ORIGIN and obj:
