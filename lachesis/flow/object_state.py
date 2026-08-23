@@ -28,6 +28,7 @@ class OpKind(str, Enum):
     CLOBBER = "clobber"
     COPY = "copy"
     FREE = "free"
+    REALLOC = "realloc"
     USE = "use"
     SUMMARY = "summary"
 
@@ -248,6 +249,39 @@ class AbstractState:
         if freed_param is not None:
             self._record_param_effect(OpKind.ALLOC, freed_param)
 
+    def _free_object(
+        self,
+        oid: ObjectId | None,
+        path: AccessPath | None,
+        node: Hashable,
+        line: int | None,
+        findings: set[Finding],
+    ) -> None:
+        # Mark the object `oid` (named via `path`) freed, raising double-free if it was
+        # already freed.  Shared verbatim by FREE and the free-half of REALLOC: realloc
+        # may relocate its block, so the object its first argument names is (may-be) freed
+        # exactly as free() frees its argument -- no bug-specific logic, both callers get
+        # identical typestate, and any surviving alias is caught by the USE-on-FREED path.
+        if oid is None:
+            return
+        self._record_param_effect(OpKind.FREE, oid)
+        if (path is not None and path.selectors
+                and isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
+            # Remember the freed pointer-field so a later reassignment through it
+            # (see _compensate_reassignment) can net the summary back to live.
+            self.freed_paths[path] = oid
+        facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
+        # A summary object (identity formed through a variable subscript) may-be-freed
+        # abstracts distinct concrete cells; a repeat free of it is not a proven
+        # violation of the same object, so it does not raise a strong finding.
+        weak = _is_summary_object(oid)
+        if ObjectFact.FREED in facts and not weak:
+            findings.add(Finding("double-free", line, path, node))
+        if facts != frozenset({ObjectFact.NULL}):
+            freed = frozenset({ObjectFact.FREED})
+            is_summary = len(oid) > 1 and oid[1] == "summary"
+            self.facts[oid] = (facts | freed) if is_summary else freed
+
     def apply(self, op: Operation, findings: set[Finding]) -> None:
         if op.kind == OpKind.ALLOC:
             self._compensate_reassignment(op)
@@ -262,6 +296,22 @@ class AbstractState:
             self._compensate_reassignment(op)
             self.bind(op.target, self.resolve(op.source, create=True))
             return
+        if op.kind == OpKind.REALLOC:
+            # realloc(source): the block `source` names may move, so its object is
+            # (may-be) freed exactly as free() would -- an interior pointer or alias still
+            # bound to it now dangles, and the existing USE-on-FREED check raises the
+            # use-after-free with no per-bug rule.  The call also returns a fresh (possibly
+            # relocated) object, bound to target like an allocation.  Order matters: the
+            # source object is resolved and freed BEFORE target is rebound, so an in-place
+            # `p = realloc(p, ...)` still frees the old generation the aliases hold.
+            if op.source is not None:
+                self._free_object(
+                    self.resolve(op.source, create=True),
+                    op.source, op.node, op.line, findings,
+                )
+            self._compensate_reassignment(op)
+            self._fresh(op, ObjectFact.ALLOCATED)
+            return
         if op.kind not in (OpKind.FREE, OpKind.USE):
             raise ValueError(f"cannot directly apply {op.kind}")
 
@@ -269,28 +319,16 @@ class AbstractState:
         oid = self.resolve(op.target, create=(op.kind == OpKind.FREE))
         if oid is None:
             return
-        self._record_param_effect(op.kind, oid)
-        if (op.kind == OpKind.FREE and op.target is not None and op.target.selectors
-                and isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
-            # Remember the freed pointer-field so a later reassignment through it
-            # (see _compensate_reassignment) can net the summary back to live.
-            self.freed_paths[op.target] = oid
-        facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
-        # A summary object (identity formed through a variable subscript) may-be-freed
-        # abstracts distinct concrete cells; a repeat free/use of it is not a proven
-        # violation of the same object, so it does not raise a strong finding.
-        weak = _is_summary_object(oid)
         if op.kind == OpKind.USE:
-            if ObjectFact.FREED in facts and not weak:
+            self._record_param_effect(OpKind.USE, oid)
+            facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
+            # A summary object may-be-freed abstracts distinct concrete cells; a use of it
+            # is not a proven violation of the same object, so it stays a weak (no-finding).
+            if ObjectFact.FREED in facts and not _is_summary_object(oid):
                 findings.add(Finding("use-after-free", op.line, op.target, op.node))
             return
 
-        if ObjectFact.FREED in facts and not weak:
-            findings.add(Finding("double-free", op.line, op.target, op.node))
-        if facts != frozenset({ObjectFact.NULL}):
-            freed = frozenset({ObjectFact.FREED})
-            is_summary = len(oid) > 1 and oid[1] == "summary"
-            self.facts[oid] = (facts | freed) if is_summary else freed
+        self._free_object(oid, op.target, op.node, op.line, findings)
 
 
 def join_states(states: Iterable[AbstractState], node: Hashable) -> AbstractState:

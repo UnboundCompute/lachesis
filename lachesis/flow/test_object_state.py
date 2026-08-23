@@ -154,6 +154,48 @@ class ObjectStateTests(unittest.TestCase):
         state.apply(op(OpKind.ALLOC, "malloc", P), set())
         self.assertEqual(state.trace, (ParamEffect(OpKind.FREE, 0, ()),))
 
+    def test_realloc_dangles_unrebased_interior_alias(self):
+        # cursor = data; data = realloc(data, ...); use cursor
+        # realloc may relocate the block, so the old generation `cursor` still holds is
+        # freed. The use-after-free must fall out of the EXISTING USE-on-FREED machinery
+        # -- there is no realloc-specific finding rule in the engine.
+        data, cursor = AccessPath("data"), AccessPath("cursor")
+        ops = [
+            op(OpKind.ALLOC, "a", data),
+            op(OpKind.COPY, "c", cursor, source=data),
+            op(OpKind.REALLOC, "r", data, source=data),
+            op(OpKind.USE, "u", cursor),
+        ]
+        result = ObjectStateAnalyzer().analyze(["a", "c", "r", "u"], {
+            "a": ["c"], "c": ["r"], "r": ["u"],
+        }, ops)
+        self.assertEqual({f.pattern for f in result.findings}, {"use-after-free"})
+
+    def test_realloc_rebased_pointer_is_live(self):
+        # data = realloc(data, ...); use data -- the name itself was rebased onto the
+        # returned (fresh) block, so a use of it is NOT a use-after-free.
+        data = AccessPath("data")
+        ops = [
+            op(OpKind.ALLOC, "a", data),
+            op(OpKind.REALLOC, "r", data, source=data),
+            op(OpKind.USE, "u", data),
+        ]
+        result = ObjectStateAnalyzer().analyze(["a", "r", "u"],
+                                               {"a": ["r"], "r": ["u"]}, ops)
+        self.assertEqual(result.findings, set())
+
+    def test_realloc_of_freed_pointer_is_double_free(self):
+        # free(p); q = realloc(p, ...) -- reallocating an already-freed block is a
+        # double-free, caught by the same freed-marking FREE uses (shared _free_object).
+        ops = [
+            op(OpKind.ALLOC, "a", P),
+            op(OpKind.FREE, "f", P),
+            op(OpKind.REALLOC, "r", Q, source=P),
+        ]
+        result = ObjectStateAnalyzer().analyze(["a", "f", "r"],
+                                               {"a": ["f"], "f": ["r"]}, ops)
+        self.assertEqual({f.pattern for f in result.findings}, {"double-free"})
+
     def test_unplaced_operation_is_reported(self):
         missing = op(OpKind.FREE, "missing", P)
         result = ObjectStateAnalyzer().analyze(["entry"], {}, [missing])

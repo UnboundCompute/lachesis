@@ -60,6 +60,7 @@ from .pipeline import _lifetime_slice
 _OP_VERB = {
     OpKind.ALLOC: "alloc",
     OpKind.FREE: "free",
+    OpKind.REALLOC: "realloc",  # INVALIDATE(old generation) + REINIT(new) -- see VERB_ROLES
     OpKind.USE: "deref",
     OpKind.COPY: "copy",
     OpKind.CLOBBER: "reassign",
@@ -119,8 +120,9 @@ def _generations(ordered, sub):
     for op in ordered:
         target = op.target
         tkey = (target.root, tuple(target.selectors)) if target is not None else None
-        if op.kind in (OpKind.ALLOC, OpKind.CLOBBER) and tkey is not None:
-            # a rebind of an already-seen path opens a new generation
+        if op.kind in (OpKind.ALLOC, OpKind.CLOBBER, OpKind.REALLOC) and tkey is not None:
+            # a rebind of an already-seen path opens a new generation (realloc rebases the
+            # name onto a fresh block; the old generation the aliases hold is now dead)
             if tkey in gen:
                 gen[tkey] += 1
         out.append(gen[tkey] if tkey is not None else 0)

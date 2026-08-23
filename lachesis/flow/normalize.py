@@ -77,6 +77,12 @@ class Normalizer:
         alloc_kinds = set(lc.get("alloc_kinds") or [])
         alloc_extra = set((lc.get("alloc") or {}).get(lang) or [])
         self.dealloc_names = set((lc.get("dealloc") or {}).get(lang) or [])
+        # realloc-family is BOTH a free (of its first argument's old block) and an alloc
+        # (of the returned block). It keeps its `alloc-size` sink identity below (its size
+        # argument is a spatial sink); this set adds only the lifetime fact -- that the old
+        # generation may be freed -- so an un-rebased interior pointer reads as a dangling
+        # use-after-free. DATA-DRIVEN from the same catalog; no name is hard-coded here.
+        self.realloc_names = set((lc.get("realloc") or {}).get(lang) or [])
         cat = atropos.sink_catalog(lang)
         self.alloc_names = {m for m, c in cat.items()
                             if c.get("family") in alloc_kinds} | alloc_extra
@@ -88,6 +94,12 @@ class Normalizer:
     def is_dealloc(self, callee):
         """True if `callee` frees its pointer argument (a lifecycle free event source)."""
         return self.canon_callee(callee) in self.dealloc_names
+
+    def is_realloc(self, callee):
+        """True if `callee` reallocates its first pointer argument -- freeing the old block
+        (it may move) and returning a fresh one. Checked before is_alloc by the lifetime
+        emitter so realloc carries its free-of-old-generation semantics, not a plain alloc."""
+        return self.canon_callee(callee) in self.realloc_names
 
     def canon_callee(self, name):
         """The canonical callee/sink name for a surface name (identity if unmapped).
@@ -106,7 +118,8 @@ class Normalizer:
         """Small dict describing what this normalizer will apply -- for a coverage line."""
         return {"lang": self.lang, "alias_sections": sorted(self.alias_sections),
                 "callee_rewrites": len(self.callee_rewrites), "opaque_kinds": len(self.opaque),
-                "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names)}
+                "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names),
+                "realloc_names": len(self.realloc_names)}
 
 
 _CACHE = {}

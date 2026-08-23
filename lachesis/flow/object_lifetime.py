@@ -133,7 +133,13 @@ def _rhs_kind(sub, ap_builder, norm, rhs):
     if rhs is None:
         return OpKind.CLOBBER, None, False
     if sub.is_call(rhs):
-        return ((OpKind.ALLOC, None, False) if norm.is_alloc(_callee(sub, rhs))
+        callee = _callee(sub, rhs)
+        # realloc BEFORE alloc: it frees the old block its first argument names (source)
+        # and returns a fresh one bound to the target. The engine's REALLOC op carries
+        # both halves, so an interior pointer not rebased to the result dangles.
+        if norm.is_realloc(callee):
+            return OpKind.REALLOC, _argument_path(sub, ap_builder, rhs, 0), False
+        return ((OpKind.ALLOC, None, False) if norm.is_alloc(callee)
                 else (OpKind.CLOBBER, None, False))
     source = _path(ap_builder, rhs)
     if source is not None:
