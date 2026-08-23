@@ -623,9 +623,17 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                 for event_index, event in enumerate(
                         annotate(_semantic_event(sub, op, operation_generations), op)):
                     event_id = f"{anchor}:event:{index}:{event_index}"
+                    metadata = {
+                        "source_reachable": source_reachable,
+                        "source_influenced": bool(event.obj and event.obj.base in source_roots),
+                    }
+                    # Coverage contexts are source-site identities, not substrings of
+                    # generated node ids.  Preserve the originating CFG site explicitly
+                    # so similarly named launch sites cannot credit one another.
+                    if op.access == "source" and event.kind == EventKind.ORIGIN:
+                        metadata["source_site"] = str(op.node)
                     result.add_node(event_id, event, fragment=name,
-                                    source_reachable=source_reachable,
-                                    source_influenced=bool(event.obj and event.obj.base in source_roots))
+                                    **metadata)
                     result.add_edge(previous, event_id)
                     if op.access == "source" and event.kind == EventKind.ORIGIN:
                         source_launch_nodes[name].append(event_id)

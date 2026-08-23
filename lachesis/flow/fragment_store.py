@@ -300,11 +300,29 @@ class Claus:
             if context == "__entry__":
                 starts = [source_fragment.entry]
             else:
-                starts = sorted(
+                launch_nodes = [
                     node_id for node_id in graph.source_reachable
                     if graph.nodes.get(node_id) is not None
                     and graph.nodes[node_id].fragment == source
-                    and context in node_id)
+                ]
+                explicit = [
+                    node_id for node_id in launch_nodes
+                    if str(graph.nodes[node_id].metadata.get("source_site", ""))
+                    == str(context)
+                ]
+                if explicit:
+                    starts = sorted(explicit)
+                elif any("source_site" in graph.nodes[node_id].metadata
+                         for node_id in launch_nodes):
+                    # The graph has explicit launch metadata, so an unmatched
+                    # context is genuinely unresolved. Do not fall back to a
+                    # loose node-id heuristic and credit a neighbouring site.
+                    starts = []
+                else:
+                    # Compatibility for pre-metadata serialized graphs. New
+                    # production graphs always take the exact branch above.
+                    starts = sorted(node_id for node_id in launch_nodes
+                                    if context in node_id)
                 # A declared source site without a corresponding emitted launch
                 # node is unresolved; do not silently credit it via the entry.
                 if not starts:

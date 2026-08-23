@@ -194,6 +194,23 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(store.covered_contexts,
                          {("worker", "source", "site_a")})
 
+    def test_source_contexts_do_not_match_by_colliding_node_id_substrings(self):
+        graph = SkeletonGraph()
+        graph.add_node("source:site_a:event", fragment="source",
+                       source_site="site_a")
+        graph.add_node("source:site_ab:event", fragment="source",
+                       source_site="site_ab")
+        graph.add_node("worker:entry", fragment="worker")
+        graph.add_edge("source:site_a:event", "worker:entry")
+        graph.add_fragment("source", "source:site_a:event",
+                           ("source:site_a:event", "source:site_ab:event"))
+        graph.add_fragment("worker", "worker:entry", ("worker:entry",))
+        graph.source_reachable.update({"source:site_a:event", "source:site_ab:event"})
+        store = FragmentStore()
+        context = Claus(store)._materialized_contexts(
+            graph, [("worker", "source", "site_a")])
+        self.assertEqual(context, [("worker", "source", "site_a")])
+
     def test_incompatible_partial_cache_falls_back_instead_of_raising(self):
         store = FragmentStore()
         functions = {"worker": {}}
