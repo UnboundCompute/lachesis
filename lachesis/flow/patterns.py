@@ -21,7 +21,7 @@ Three layers, kept separable so each graduates to its destination:
 
 
 # ---- (c) SUBSTRATE -------------------------------------------------------------------------
-def substrate(sink_kind, tainted, value_bound, guarded):
+def substrate(sink_kind, tainted, value_bound, guarded, guard_status=None):
     """The dimensions every pattern predicates over, built once per sink occurrence:
       kind        -- the op / effect identity (atropos sink-arg kind)
       tainted     -- does an attacker-controlled value reach this arg (reach substrate)
@@ -29,7 +29,8 @@ def substrate(sink_kind, tainted, value_bound, guarded):
       guarded     -- is there a control guard on the value at the sink
     """
     return {"kind": sink_kind, "tainted": bool(tainted),
-            "value_bound": value_bound, "guarded": guarded}
+            "value_bound": value_bound, "guarded": guarded,
+            "guard_status": guard_status}
 
 
 # ---- (b) EVALUATORS (closed set) -----------------------------------------------------------
@@ -54,7 +55,7 @@ def _presence(fact):
 
 def _missing_guard(fact):
     """Fire only when a validation exists but the sink is on its fall-through arm."""
-    return fact["guarded"] == "fall-through"
+    return fact.get("guard_status") == "fall-through"
 
 
 EVALUATORS = {

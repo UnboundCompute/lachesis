@@ -39,6 +39,14 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertIn("mem.alloc-copy.size-mismatch",
                       {hit["pattern"] for hit in match_graph(g)})
 
+    def test_fall_through_guard_routes_to_missing_bounds(self):
+        event = Event(EventKind.SINK, obj=ObjRef("buf"), facts={
+            "family": "buffer-write", "callee": "memcpy", "arg": 2,
+            "tainted": True, "guarded": False, "guard_status": "fall-through",
+        })
+        g = self._graph([("sink", event)], [])
+        self.assertIn("missing-guard", {hit["pattern"] for hit in match_graph(g)})
+
     def test_checked_nullable_return_deref_is_not_unchecked(self):
         obj = ObjRef("result")
         events = [

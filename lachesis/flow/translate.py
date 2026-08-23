@@ -230,6 +230,19 @@ def _guards_for(regions, fid, idents, span):
     return out
 
 
+def _guard_status_for(regions, fid, idents, span):
+    """Return the Atropos guard-dimension status without collapsing it to a bool.
+
+    ``guarded-region`` and ``fall-through`` are distinct semantic observations;
+    the latter is the missing-bounds shape.  Keeping the status beside the typed
+    guard list lets sink evaluators consume it without weakening lifetime/null
+    guard handling.
+    """
+    if not idents or span is None:
+        return "not-computed"
+    return regions.classify(fid, idents, span).get("status", "not-computed")
+
+
 def _returns(ix, fid, alloc_vars, params, norm):
     """Return records: alloc-owned / param passthrough / call result / plain value.
 
@@ -278,6 +291,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         args = _arg_records(ix, c)
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
+        guard_status = _guard_status_for(regions, fid, idents, _span(c))
         cat = sinks.get(callee)
         # the variable this call's result is assigned to (any callee, not just allocators), so
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
@@ -286,6 +300,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         assigned = _assigned_var(ix, c["id"])
         alloc_dst = assigned if norm.is_alloc(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
+               "guard_status": guard_status,
                "is_sink": cat is not None,
                "assigned": assigned,
                "node": c["id"],                             # graph node = CFG anchor for events
@@ -319,6 +334,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             callees.append(hcallee)
             hcat = sinks.get(hcallee)
             hrec = {"callee": hcallee, "line": line, "args": args, "guards": guards,
+                    "guard_status": guard_status,
                     "is_sink": hcat is not None, "node": c["id"],
                     "control": rec["control"], "dispatch": "may-invoke"}
             if hcat is not None:

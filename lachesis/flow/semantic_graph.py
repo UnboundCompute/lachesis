@@ -388,6 +388,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                         event.facts.get("tainted", False),
                         event.facts.get("bound"),
                         event.facts.get("guarded", False),
+                        event.facts.get("guard_status"),
                     )
                     for pattern in evaluate_all(family, fact):
                         if patterns is None or pattern in wanted:

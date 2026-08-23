@@ -597,6 +597,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         "arg": arg_pos,
                         "tainted": argument.get("provenance") != "const",
                         "guarded": guarded,
+                        "guard_status": call.get("guard_status"),
                         "bound": ("bounded" if guarded else "unbounded")
                                  if relational else None,
                         "size_expr": call.get("size_expr"),
@@ -650,6 +651,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         "arg": arg_pos,
                         "tainted": flow.get("provenance") != "const",
                         "guarded": guarded,
+                        "guard_status": flow.get("guard_status"),
                         "bound": ("bounded" if guarded else "unbounded")
                                  if relational else None,
                         "via": flow.get("via"),
