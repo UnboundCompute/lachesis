@@ -16,6 +16,7 @@ SOURCE = r"""
 void *malloc(unsigned long);
 void free(void *);
 void consume(void *);
+char *identity(char *value) { return value; }
 
 void alias_release(void) {
     char *first = malloc(8);
@@ -64,6 +65,13 @@ void loop_reuse(void) {
     }
     *item = 1;
 }
+
+void caller_return_alias(void) {
+    char *first = malloc(8);
+    char *second = identity(first);
+    free(second);
+    *first = 1;
+}
 """
 
 
@@ -95,6 +103,9 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
             self.assertFalse(any(lead["entry"] == "loop_reuse" and
                                  lead["pattern"] == "uaf.deref"
                                  for lead in result["leads"]))
+            self.assertTrue(any(lead["entry"] == "caller_return_alias" and
+                                lead["pattern"] == "uaf.deref"
+                                for lead in result["leads"]))
             structural_kinds = {
                 node.event.kind.value if hasattr(node.event.kind, "value") else node.event.kind
                 for node in result["semantic_graph"].nodes.values() if node.event is not None

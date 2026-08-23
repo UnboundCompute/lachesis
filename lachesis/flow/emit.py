@@ -486,11 +486,20 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     previous = event_id
             last_for_cfg[n] = previous
         cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
+        internal_call_anchors = {
+            call.get("node") for call in functions[name].get("calls", ())
+            if call.get("callee") in functions
+        }
         for n in cfg_nodes:
             source = last_for_cfg[n]
             targets = list(cfg.get("succ", {}).get(n, ()))
             for target_index, target in enumerate(targets):
                 if target in cfg_nodes:
+                    # A resolved internal call is represented by its seam and
+                    # pushed continuation.  Keeping the raw CFG successor here
+                    # would invent a path that skips the callee entirely.
+                    if n in internal_call_anchors and targets:
+                        continue
                     guard = _cfg_guard_proofs(sub, n, target_index, len(targets))
                     if cfg_positions.get(target, 0) <= cfg_positions.get(n, 0):
                         loop_id = f"{prefix}{n}:loop:{target_index}"
@@ -628,13 +637,23 @@ def _return_bindings(sub, call, callee):
         return ()
     receiver = sub.label(str(receiver)) or str(receiver)
     bindings = []
+    formals = tuple(callee.get("params", ()))
     for returned in callee.get("returns", ()):
         local = returned.get("var")
         if not local:
             continue
         local = sub.label(str(local)) or str(local)
-        bindings.append((ObjRef(local, generation="g0"),
-                         ObjRef(receiver, generation="g0")))
+        receiver_ref = ObjRef(receiver, generation="g0")
+        bindings.append((ObjRef(local, generation="g0"), receiver_ref))
+        if local in {sub.label(str(formal)) or str(formal) for formal in formals}:
+            position = next((index for index, formal in enumerate(formals)
+                             if (sub.label(str(formal)) or str(formal)) == local), None)
+            if position is not None:
+                actual = next((arg.get("root") for arg in call.get("args", ())
+                               if arg.get("pos") == position and arg.get("root")), None)
+                if actual:
+                    actual = sub.label(str(actual)) or str(actual)
+                    bindings.append((ObjRef(actual, generation="g0"), receiver_ref))
     return tuple(bindings)
 
 

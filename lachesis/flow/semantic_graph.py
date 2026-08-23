@@ -267,6 +267,27 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 value = bindings[value]
             return value
 
+        def equivalent(left: ObjRef | None, right: ObjRef | None) -> bool:
+            """Treat seam/derive bindings as an alias relation for conclusions."""
+            if left is None or right is None:
+                return left == right
+            frontier = [left]
+            visited = set()
+            reverse = {}
+            for source, target in bindings.items():
+                reverse.setdefault(target, set()).add(source)
+            while frontier:
+                current = frontier.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                if current == right:
+                    return True
+                if current in bindings:
+                    frontier.append(bindings[current])
+                frontier.extend(reverse.get(current, ()))
+            return False
+
         if event:
             raw_obj = event.obj
             raw_base = event.base
@@ -310,9 +331,12 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
 
         if "leak" in wanted and node.id in exits and not state.stack:
             for obj in origins:
-                if (not any(released_obj == obj for released_obj, _ in released)
-                        and obj not in escaped):
-                    _record(hits, "leak", obj, node)
+                live_obj = canonical(obj)
+                released_live = any(equivalent(released_obj, live_obj)
+                                     for released_obj, _ in released)
+                escaped_live = any(equivalent(escaped_obj, live_obj) for escaped_obj in escaped)
+                if not released_live and not escaped_live:
+                    _record(hits, "leak", live_obj or obj, node)
 
         for edge in graph.edges.get(state.node, ()):
             stack = state.stack
