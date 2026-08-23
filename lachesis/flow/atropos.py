@@ -33,7 +33,11 @@ _DEFAULT_ATROPOS_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "atropos"))
 ATROPOS_ROOT = os.environ.get("ATROPOS_ROOT", _DEFAULT_ATROPOS_ROOT)
 
-_EXT_LANG = {".c": "c", ".h": "c", ".py": "python", ".js": "javascript", ".ts": "typescript"}
+_EXT_LANG = {
+    ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".cxx": "c", ".hpp": "c",
+    ".py": "python", ".js": "javascript", ".jsx": "javascript",
+    ".mjs": "javascript", ".ts": "typescript", ".tsx": "typescript",
+}
 
 
 def lang_of(path):
