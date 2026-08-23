@@ -138,11 +138,19 @@ def _rhs_kind(sub, ap_builder, norm, rhs):
         # and NULL on the other arm.  Preserve the value-producing arm as a
         # COPY fact; treating the whole conditional as an opaque clobber loses
         # the alias relation before any interprocedural matcher can use it.
-        children = sub.ast_children.get(rhs, ())
-        for candidate in children[1:]:
+        # Do not infer the arm from child position: Clang's child ordering puts
+        # the condition between the true and false expressions for some
+        # conditional forms.  The typed TRUE_VALUE role is the stable semantic
+        # boundary and preserves nested field paths such as `n->meta->name`.
+        candidates = tuple(_roles(sub, rhs).get("TRUE_VALUE", ()))
+        if not candidates:
+            children = sub.ast_children.get(rhs, ())
+            candidates = tuple(children[1:])
+        for candidate in candidates:
             source = _path(ap_builder, candidate)
             if source is not None:
                 return OpKind.COPY, source, False
+        children = sub.ast_children.get(rhs, ())
         return OpKind.CLOBBER, None, any(_is_null(sub, child) for child in children[1:])
     if sub.is_call(rhs):
         callee = _callee(sub, rhs)
