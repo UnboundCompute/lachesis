@@ -119,9 +119,16 @@ class APBuilder:
             ch = self._children(nid)
             if not ch:
                 return (("unk", nid), [])
-            # child[0] = the array/pointer base, child[1] = index
-            base, tail = self._build_rev(ch[0], depth + 1)
-            idx_tok = self._index_token(ch[1]) if len(ch) > 1 else VPS()
+            # Sibling AST edges can be reordered during graph composition when
+            # implicit casts/macros are present. Select the indexable operand by
+            # type instead of assuming child[0] is always the base.
+            def is_indexable(child):
+                typ = self.sub.props(child).get("type") or ""
+                return "*" in typ or "[" in typ
+            base_child = next((child for child in ch if is_indexable(child)), ch[0])
+            index_child = next((child for child in ch if child != base_child), None)
+            base, tail = self._build_rev(base_child, depth + 1)
+            idx_tok = self._index_token(index_child) if index_child is not None else VPS()
             # indirectIndexAccess p[i] : prepend Indirection then SHIFT (build), final <i> *
             tail.append(idx_tok)
             tail.append(Ind())
