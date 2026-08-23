@@ -184,6 +184,22 @@ class ObjectStateTests(unittest.TestCase):
                                                {"a": ["r"], "r": ["u"]}, ops)
         self.assertEqual(result.findings, set())
 
+    def test_post_states_expose_realloc_generation_distinct_from_alias(self):
+        data, saved = AccessPath("data"), AccessPath("saved")
+        result = ObjectStateAnalyzer().analyze(
+            ["alloc", "save", "realloc", "use"],
+            {"alloc": ["save"], "save": ["realloc"],
+             "realloc": ["use"], "use": []},
+            [op(OpKind.ALLOC, "alloc", data, site="site"),
+             op(OpKind.COPY, "save", saved, source=data),
+             op(OpKind.REALLOC, "realloc", data, source=data),
+             op(OpKind.USE, "use", saved)],
+        )
+        post = result.post_states["realloc"][0]
+        self.assertNotEqual(post.resolve(data), post.resolve(saved))
+        self.assertIn(ObjectFact.ALLOCATED, post.facts[post.resolve(data)])
+        self.assertIn(ObjectFact.FREED, post.facts[post.resolve(saved)])
+
     def test_realloc_of_freed_pointer_is_double_free(self):
         # free(p); q = realloc(p, ...) -- reallocating an already-freed block is a
         # double-free, caught by the same freed-marking FREE uses (shared _free_object).

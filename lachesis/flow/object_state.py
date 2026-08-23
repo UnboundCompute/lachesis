@@ -429,6 +429,10 @@ class AnalysisResult:
     # loop-widened identity domain instead of reconstructing it from a flat op
     # stream.  States are snapshots, not mutable analyzer internals.
     point_states: Mapping[Hashable, tuple[AbstractState, ...]] = field(default_factory=dict)
+    # States immediately after the operations anchored at each CFG point.  These
+    # are retained separately because an ALLOC/REALLOC success has a new identity
+    # that cannot be recovered from its incoming state.
+    post_states: Mapping[Hashable, tuple[AbstractState, ...]] = field(default_factory=dict)
 
 
 class _DiscardFindings:
@@ -505,6 +509,9 @@ class ObjectStateAnalyzer:
         work = deque([nodes[0]])
         queued = {nodes[0]}
         widened: set[Hashable] = set()
+        post_snapshots: dict[Hashable, dict[tuple, AbstractState]] = {
+            node: {} for node in nodes
+        }
         findings = set() if self.collect_findings else _DiscardFindings()
         transfers = widenings = 0
         cap = self.transfer_cap or max(10000, len(nodes) * 500)
@@ -513,6 +520,8 @@ class ObjectStateAnalyzer:
             node = work.popleft()
             queued.discard(node)
             outgoing = self._transfer(incoming[node].values(), at.get(node, ()), findings)
+            post_snapshots[node].update(
+                (key, state.clone()) for key, state in outgoing.items())
             transfers += len(outgoing)
             for successor in successors.get(node, ()):
                 if successor not in incoming:
@@ -547,6 +556,9 @@ class ObjectStateAnalyzer:
             node: tuple(state.clone() for state in states.values())
             for node, states in incoming.items()
         }
+        post_states = {
+            node: tuple(states.values()) for node, states in post_snapshots.items()
+        }
         return AnalysisResult(
             findings=findings,
             exit_states=tuple(exits),
@@ -555,4 +567,5 @@ class ObjectStateAnalyzer:
             widenings=widenings,
             capped=bool(work),
             point_states=point_states,
+            post_states=post_states,
         )

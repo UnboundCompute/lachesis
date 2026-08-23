@@ -451,11 +451,12 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         operation_generations, realloc_generations = _operation_generations(sub, operations)
         artifact = (state_artifacts or {}).get(name)
 
-        def abstract_facts(operation):
+        def abstract_facts(operation, *, post=False):
             """Serialize point-state identities without making them matcher verdicts."""
             if artifact is None:
                 return {}
-            states = artifact.point_states.get(operation.node, ())
+            snapshots = artifact.post_states if post else artifact.point_states
+            states = snapshots.get(operation.node, ())
             if not states:
                 return {}
             facts = {"abstract_state_count": len(states)}
@@ -481,8 +482,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                 event.facts.update(facts)
             return events
 
-        def annotate_event(event, operation):
-            event.facts.update(abstract_facts(operation))
+        def annotate_event(event, operation, *, post=False):
+            event.facts.update(abstract_facts(operation, post=post))
             return event
         by_anchor = defaultdict(list)
         source_callees = {item.get("callee") for item in functions[name].get("source_calls", ())}
@@ -521,7 +522,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_node(success_id, annotate_event(Event.origin(
                         obj, op.line,
                         facts={"allocation_site": str(op.site or op.node),
-                               "generation": obj.generation}), op), fragment=name,
+                               "generation": obj.generation}), op, post=True), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(failure_id, Event(EventKind.WRITE_STORAGE, obj=obj, base=obj,
                                                      slot=obj, facts={"null": True,
@@ -584,11 +585,12 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     failure_null = f"{failure_id}:null"
                     failure_lost = f"{failure_id}:lost"
                     merge_id = f"{anchor}:realloc:{index}:merge"
-                    result.add_node(success_origin, Event.origin(
+                    result.add_node(success_origin, annotate_event(Event.origin(
                         fresh, op.line,
                         facts={"allocation_site": str(op.site or op.node),
                                "generation": fresh.generation,
-                               "incarnation": "realloc-success"}), fragment=name,
+                               "incarnation": "realloc-success"}),
+                        op, post=True), fragment=name,
                                      source_reachable=source_reachable)
                     success_slot = None
                     if overwrites_slot and op.target.selectors:
