@@ -72,14 +72,17 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
             result = run_pass(store, lang="c", lifetime_engine="object")
             by_function = defaultdict(set)
             for lead in result["leads"]:
-                if lead["pattern"] in {"double-free", "use-after-free"}:
+                if lead["pattern"] in {"double-free", "uaf.deref"}:
                     by_function[lead["entry"]].add(lead["pattern"])
 
             self.assertEqual(by_function["alias_release"], {"double-free"})
             self.assertEqual(by_function["reset_release"], set())
             self.assertEqual(by_function["exclusive_release"], set())
-            self.assertEqual(by_function["write_after_release"], {"use-after-free"})
-            self.assertEqual(by_function["caller_alias_effect"], {"use-after-free"})
+            self.assertEqual(by_function["write_after_release"], {"uaf.deref"})
+            self.assertEqual(by_function["caller_alias_effect"], set())
+            self.assertTrue(any(lead["entry"] == "caller_alias_effect" and
+                                lead["pattern"] == "use.dangling"
+                                for lead in result["leads"]))
             # Leak remains on the legacy property domain during this migration.
             self.assertTrue(any(lead["pattern"] == "leak" for lead in result["leads"]))
             self.assertEqual(result["lifetime"]["active"], "object")
