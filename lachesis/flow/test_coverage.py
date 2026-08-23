@@ -133,6 +133,25 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(store.covered_states,
                          {("worker", "source_a"), ("worker", "source_b")})
 
+    def test_incompatible_partial_cache_falls_back_instead_of_raising(self):
+        store = FragmentStore()
+        functions = {"worker": {}}
+        graph = object()
+
+        first = SkeletonGraph()
+        first.add_node("worker:entry")
+        first.add_fragment("worker", "worker:entry", ("worker:entry",))
+        second = SkeletonGraph()
+        second.add_node("worker:other")
+        second.add_fragment("worker", "worker:other", ("worker:other",))
+        store.put(functions, "c", graph, first,
+                  coverage={"state_keys": [["worker", "a"]]})
+        store.put(functions, "c", graph, second,
+                  coverage={"state_keys": [["worker", "b"]]})
+        self.assertIsNone(store.get(
+            functions, "c", graph,
+            coverage={"state_keys": [["worker", "a"], ["worker", "b"]]}))
+
     def test_fragment_cache_uses_content_not_transient_summary_identity(self):
         store = FragmentStore()
         functions = {"worker": {"events": [{"kind": "alloc"}]}}

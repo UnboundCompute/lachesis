@@ -102,7 +102,14 @@ class FragmentStore:
         if len(graphs) == 1:
             return graphs[0]
         if all(isinstance(value, SkeletonGraph) for value in graphs):
-            return self._merge_graphs(graphs)
+            try:
+                return self._merge_graphs(graphs)
+            except ValueError:
+                # A partial cache entry must never make Pass 3 fail.  The
+                # caller will rebuild under the same semantic key, preserving
+                # correctness when independently materialized fragments carry
+                # incompatible structure.
+                return None
         return None
 
     @staticmethod
