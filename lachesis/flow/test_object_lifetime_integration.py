@@ -16,7 +16,20 @@ SOURCE = r"""
 void *malloc(unsigned long);
 void free(void *);
 void consume(void *);
+void memcpy(void *, const void *, unsigned long);
 char *identity(char *value) { return value; }
+
+struct Aggregate { char *owned; };
+
+void aggregate_copy(void) {
+    struct Aggregate *src = malloc(sizeof(struct Aggregate));
+    struct Aggregate *clone = malloc(sizeof(struct Aggregate));
+    if (!src || !clone) return;
+    src->owned = malloc(8);
+    memcpy(clone, src, sizeof(struct Aggregate));
+    free(src->owned);
+    free(clone->owned);
+}
 
 void alias_release(void) {
     char *first = malloc(8);
@@ -105,6 +118,9 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
                                  for lead in result["leads"]))
             self.assertTrue(any(lead["entry"] == "caller_return_alias" and
                                 lead["pattern"] == "uaf.deref"
+                                for lead in result["leads"]))
+            self.assertTrue(any(lead["entry"] == "aggregate_copy" and
+                                lead["pattern"] == "double-free"
                                 for lead in result["leads"]))
             structural_kinds = {
                 node.event.kind.value if hasattr(node.event.kind, "value") else node.event.kind

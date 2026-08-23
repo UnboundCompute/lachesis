@@ -233,6 +233,17 @@ def _event_dict(event: Event | None) -> dict[str, Any] | None:
             "facts": event.facts, "proofs": [{"kind": p.kind, "value": p.value} for p in event.proofs]}
 
 
+def _normalized_path(path: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize address/dereference selectors at an identity boundary."""
+    result: list[str] = []
+    for selector in path:
+        if result and ((result[-1], selector) in {("&", "*"), ("*", "&")}):
+            result.pop()
+        else:
+            result.append(selector)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class _State:
     node: str
@@ -277,10 +288,30 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
-            while value in bindings and value not in seen:
+            while value is not None and value not in seen:
                 seen.add(value)
-                value = bindings[value]
-            return value
+                direct = bindings.get(value)
+                if direct is not None:
+                    value = ObjRef(direct.base, _normalized_path(direct.path), direct.generation)
+                    continue
+                # A binding for p also binds p&, p**, and field paths rooted at
+                # p. Compose the suffix instead of treating those as unrelated
+                # storage names. This is the address-of/multi-deref algebra used
+                # by the frozen access-path representation.
+                candidates = [source for source in bindings
+                              if source.base == value.base
+                              and value.path[:len(source.path)] == source.path]
+                if not candidates:
+                    break
+                source = max(candidates, key=lambda item: len(item.path))
+                target = bindings[source]
+                suffix = value.path[len(source.path):]
+                value = ObjRef(target.base,
+                               _normalized_path(target.path + suffix),
+                               target.generation)
+            if value is None:
+                return None
+            return ObjRef(value.base, _normalized_path(value.path), value.generation)
 
         def equivalent(left: ObjRef | None, right: ObjRef | None) -> bool:
             """Treat seam/derive bindings as an alias relation for conclusions."""

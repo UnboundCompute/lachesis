@@ -139,6 +139,44 @@ class SemanticGraphTests(unittest.TestCase):
         g.edges["free"][0] = Edge(target="use", guard=(GuardProof("LIVE", obj.render()),))
         self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_address_and_deref_bindings_cancel_across_multiple_derives(self):
+        node = ObjRef("node")
+        p1 = ObjRef("p1")
+        p2 = ObjRef("p2")
+        target = ObjRef("target")
+        alias = ObjRef("alias")
+        events = [
+            ("origin", Event.origin(node)),
+            ("p1", Event(EventKind.DERIVE, obj=p1, value=ObjRef("node", ("&",)))),
+            ("p2", Event(EventKind.DERIVE, obj=p2, value=ObjRef("p1", ("&",)))),
+            ("target", Event(EventKind.DERIVE, obj=target,
+                             value=ObjRef("p2", ("*", "*")))),
+            ("release", Event.release(target)),
+            ("alias", Event(EventKind.DERIVE, obj=alias, value=node)),
+            ("use", Event.write(alias)),
+        ]
+        g = self._graph(events, [(events[i][0], events[i + 1][0]) for i in range(len(events) - 1)])
+        self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
+    def test_field_binding_composes_across_a_call_seam(self):
+        formal = ObjRef("formal", ("*", "data"))
+        actual = ObjRef("actual", ("*", "data"))
+        g = SkeletonGraph()
+        for node, event in [("caller", Event.origin(ObjRef("actual"))),
+                            ("enter", Event(EventKind.SEAM_ENTER)),
+                            ("free", Event.release(formal)),
+                            ("exit", Event(EventKind.SEAM_EXIT)),
+                            ("use", Event.write(actual))]:
+            g.add_node(node, event)
+        g.add_fragment("caller", "caller", ["use"])
+        g.add_fragment("callee", "enter", ["exit"])
+        g.add_edge("caller", "enter", kind="call", return_to="use",
+                   binding=((ObjRef("formal"), ObjRef("actual")),))
+        g.add_edge("enter", "free")
+        g.add_edge("free", "exit")
+        g.add_edge("exit", "use", kind="return")
+        self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_source_tiers_are_preserved_on_leads(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

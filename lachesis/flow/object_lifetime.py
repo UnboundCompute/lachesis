@@ -206,6 +206,35 @@ def _argument_path(sub, ap_builder, call_node, position):
     return _path(ap_builder, argument)
 
 
+def _aggregate_field_paths(sub, ap_builder) -> tuple[tuple[str, ...], ...]:
+    """Collect field paths present in the program for bulk struct copies.
+
+    ``memcpy(dst, src, sizeof(T))`` has no field AST children of its own.  The
+    surrounding CPG still contains the member accesses used by constructors and
+    destructors, which gives us the field layout needed to materialize the
+    field-wise alias facts without teaching the matcher about memcpy.
+    """
+    cached = getattr(sub, "_aggregate_field_paths_cache", None)
+    if cached is not None:
+        return cached
+    paths = set()
+    for item in sub.idx.nodes_of_kind("expression"):
+        node = item.get("id") if isinstance(item, dict) else item
+        item_props = item.get("properties", {}) if isinstance(item, dict) else {}
+        item_kind = item_props.get("syntax_kind") or (item.get("kind") if isinstance(item, dict) else None)
+        if node is None or item_kind != "MemberExpr":
+            continue
+        path = _path(ap_builder, node)
+        # A bulk copy aliases the destination's direct fields.  Nested paths are
+        # recovered by following those field objects later; emitting every nested
+        # combination here causes avoidable state multiplication in summaries.
+        if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
+            paths.add(path.selectors)
+    cached = tuple(sorted(paths, key=repr))
+    sub._aggregate_field_paths_cache = cached
+    return cached
+
+
 def _place(sub, cfg_nodes, anchor, fallback=None):
     """Place a semantic event on its nearest expression-CFG representative."""
     for seed in (anchor, fallback):
@@ -310,6 +339,20 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             if target is not None:
                 operations.append(_op(OpKind.FREE, anchor, target=target,
                                       line=line, ordinal=20))
+            continue
+
+        if (callee in {"memcpy", "memmove", "__builtin_memcpy", "__builtin_memmove"}
+                and "sizeof" in (sub.label(call_node) or "")):
+            destination = _argument_path(sub, ap_builder, call_node, 0)
+            source = _argument_path(sub, ap_builder, call_node, 1)
+            if destination is not None and source is not None:
+                for selectors in _aggregate_field_paths(sub, ap_builder):
+                    operations.append(_op(
+                        OpKind.COPY, anchor,
+                        target=AccessPath(destination.root,
+                                          destination.selectors + selectors),
+                        source=AccessPath(source.root, source.selectors + selectors),
+                        line=line, ordinal=15 + len(operations), access="aggregate-copy"))
             continue
 
         callee_summary = summaries.get(callee)
