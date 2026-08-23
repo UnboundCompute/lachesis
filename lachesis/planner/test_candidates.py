@@ -1196,6 +1196,20 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertEqual(uaf["metadata"]["matcher_pattern"], "uaf.deref")
         self.assertEqual(double_free["metadata"]["matcher_pattern"], "double-free")
 
+    def test_unchecked_return_deref_is_discoverable_as_a_temporal_candidate(self):
+        graph = {
+            "nodes": [
+                _node("read:1", "read_storage", "result->field", object_id="obj:result",
+                      owner_function_id="fn:caller", file="caller.c", start_line=14),
+            ],
+            "edges": [],
+        }
+        registry = default_candidate_registry(graph)
+        result = registry.census("ctrl.unchecked-return-deref")["constructors"][0]
+        self.assertEqual(result["metadata"]["matcher_pattern"],
+                         "unchecked-return-deref")
+        self.assertEqual(result["census"]["enumerated"], 1)
+
     def test_temporal_candidates_are_language_neutral(self):
         graph = {
             "nodes": [
