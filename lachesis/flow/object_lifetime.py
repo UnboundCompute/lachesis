@@ -374,7 +374,11 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         anchor = _place(sub, cfg_nodes, call_node)
         callee = call.get("callee")
         line = call.get("line")
-        if norm.is_dealloc(callee):
+        # `is_release` is the language-neutral lifecycle predicate.  It includes
+        # C deallocators and the Atropos-managed method vocabulary (close,
+        # dispose, release, ...), so the object engine consumes the same
+        # catalogue-backed fact that the translator emits.
+        if norm.is_release(callee):
             target = _argument_path(sub, ap_builder, call_node, 0)
             if target is not None:
                 operations.append(_op(OpKind.FREE, anchor, target=target,
