@@ -229,6 +229,7 @@ class _State:
     guards: frozenset[GuardProof] = frozenset()
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
+    escaped: frozenset[ObjRef] = frozenset()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -257,6 +258,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         origins = set(state.origins)
         nulls = set(state.nulls)
         bindings = dict(state.bindings)
+        escaped = set(state.escaped)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -298,15 +300,18 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
                 if "use.dangling" in wanted and any(released_obj == obj for released_obj, _ in released):
                     _record(hits, "use.dangling", obj, node)
+                if event.kind == EventKind.RETURN_VALUE:
+                    escaped.add(obj)
             elif event.kind == EventKind.ORIGIN and obj:
                 origins.add(obj)
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
                 nulls.discard(raw_obj)
 
-        if "leak" in wanted and node.id in exits:
+        if "leak" in wanted and node.id in exits and not state.stack:
             for obj in origins:
-                if not any(released_obj == obj for released_obj, _ in released):
+                if (not any(released_obj == obj for released_obj, _ in released)
+                        and obj not in escaped):
                     _record(hits, "leak", obj, node)
 
         for edge in graph.edges.get(state.node, ()):
@@ -330,6 +335,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             for formal, actual in edge.binding:
                 if formal in next_nulls:
                     next_nulls.add(actual)
+            next_escaped = {rebased for escaped_obj in escaped
+                            if (rebased := rebase(escaped_obj)) is not None}
             known = set(next_origins) | set(next_nulls) | {obj for obj, _ in next_released}
             for proof in edge.guard:
                 guarded_obj = None
@@ -362,9 +369,14 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if edge.target != stack[-1]:
                     continue
                 stack = stack[:-1]
+                # The callee's return value is now a caller-local receiver;
+                # it is no longer an exit escape for the caller's leak query.
+                for _formal, receiver in edge.binding:
+                    next_escaped.discard(rebase(receiver))
             queue.append(_State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 state.guards | frozenset(edge.guard),
-                                tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls)))
+                                tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
+                                frozenset(next_escaped)))
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
 
 

@@ -54,6 +54,18 @@ class SemanticGraphTests(unittest.TestCase):
         patterns = {hit["pattern"] for hit in match_graph(g)}
         self.assertEqual(patterns, {"use.dangling"})
 
+    def test_leak_requires_a_non_escaped_origin_at_top_level_exit(self):
+        leaked = ObjRef("leaked", generation="g0")
+        g = self._graph([("origin", Event.origin(leaked)), ("exit", None)],
+                        [("origin", "exit")])
+        self.assertEqual({hit["pattern"] for hit in match_graph(g)}, {"leak"})
+
+        returned = ObjRef("returned", generation="g0")
+        g = self._graph([("origin", Event.origin(returned)),
+                         ("return", Event(EventKind.RETURN_VALUE, obj=returned)),
+                         ("exit", None)], [("origin", "return"), ("return", "exit")])
+        self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(g)})
+
     def test_null_rebind_is_not_a_second_free_and_null_deref_is_distinct(self):
         obj = ObjRef("p", generation="g0")
         events = [("start", Event.origin(obj)),
