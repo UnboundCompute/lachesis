@@ -435,6 +435,27 @@ def source_text(path: Path, cache: Dict[Path, str]) -> str:
     return cache[path]
 
 
+def source_bytes(path: Path, cache: Dict[Path, bytes]) -> bytes:
+    """Raw file bytes, for slicing spans by Clang's BYTE offsets.
+
+    Clang reports ``offset``/``tokLen`` as byte positions into the file, but
+    ``source_text`` returns a ``str`` of Unicode code points. Indexing that ``str``
+    with a byte offset drifts by one position per extra UTF-8 byte seen so far, so a
+    single multi-byte character anywhere in a file corrupts the snippet of every span
+    after it (and the drift grows downstream). Slice the bytes, then decode."""
+    if path not in cache:
+        try:
+            cache[path] = path.read_bytes()
+        except OSError:
+            cache[path] = b""
+    return cache[path]
+
+
+def source_span(raw: bytes, start: int, finish: int) -> str:
+    """Decode a byte span [start, finish) as the source snippet it spells."""
+    return raw[start:finish].decode("utf-8", "replace")
+
+
 def display_path(target: Path, source_dir: Path) -> str:
     """Canonical `properties.file` key for a file node.
 
@@ -903,6 +924,7 @@ def main() -> int:
 
     graph = Graph()
     texts: Dict[Path, str] = {}
+    raw_texts: Dict[Path, bytes] = {}
     line_starts_cache: Dict[Path, List[int]] = {}
     file_ids: Dict[Path, str] = {}
     declarations_by_raw_id: Dict[str, str] = {}
@@ -1393,8 +1415,10 @@ def main() -> int:
         }
         if not node.get("isImplicit") and not is_included and is_body:
             position = position_from_ast(node, path, texts, line_starts_cache)
-            text = source_text(path, texts)
-            snippet = compact(text[position["start_offset"]:position["end_offset"]])
+            # Clang offsets are BYTE positions; slice the raw bytes so a multi-byte
+            # character upstream does not shift the snippet (see source_bytes).
+            snippet = compact(source_span(source_bytes(path, raw_texts),
+                                          position["start_offset"], position["end_offset"]))
             node_kind = "call" if kind == "CallExpr" else "statement" if kind.endswith("Stmt") else "expression"
             body_id = stable_id("body", path, position["start_offset"], position["end_offset"], kind)
             graph.node(
