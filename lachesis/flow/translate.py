@@ -458,6 +458,26 @@ def build_F(store, lang="c", *, return_graph=False):
         }
 
     succ = {n: [c for c in F[n]["udf_callees"] if c in F] for n in F}
+    # A function-valued argument is an indirect call-graph edge even when the
+    # immediate callee is a callback formal (``callback(value)``). Preserve it
+    # in the generic successor relation so source discovery, coverage cones,
+    # object slicing, and Claus all include the eventual target. This relies on
+    # canonical function identities already present in F; no callback names or
+    # language-specific conventions are embedded here.
+    for caller, record in F.items():
+        for call in record.get("calls", ()):
+            callee = call.get("callee")
+            callee_record = F.get(callee)
+            if callee_record is None:
+                continue
+            formals = tuple(callee_record.get("params", ()))
+            for argument in call.get("args", ()):
+                position = argument.get("pos")
+                actual = argument.get("root")
+                if (isinstance(position, int) and position < len(formals)
+                        and actual in F and actual != callee):
+                    succ[caller].append(actual)
+        succ[caller] = sorted(set(succ[caller]))
     discovery = discover_sources(F, succ, atropos.source_catalog(lang))
     coverage = CoverageScheduler(F, succ).plan()
     coverage_by_target = {region.target: region for region in coverage.regions}

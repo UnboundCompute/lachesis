@@ -361,6 +361,36 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     fragment_cfg = {}
     fragment_last = {}
     source_launch_nodes = defaultdict(list)
+
+    # Resolve function-valued arguments through formal callback parameters.  A
+    # callback invocation often appears in the callee as ``callback(value)``
+    # with no direct target edge, while the caller's call site carries the real
+    # function value.  Keep this data-driven over the projected IR: any actual
+    # argument whose root is a known function becomes a target for the matching
+    # formal parameter, regardless of language or callback name.
+    callback_targets = defaultdict(set)
+    for caller_ir in functions.values():
+        for call in caller_ir.get("calls", ()):
+            callee = call.get("callee")
+            callee_ir = functions.get(callee)
+            if callee_ir is None:
+                continue
+            formals = tuple(callee_ir.get("params", ()))
+            for argument in call.get("args", ()):
+                position = argument.get("pos")
+                actual = argument.get("root")
+                if (not isinstance(position, int) or position >= len(formals)
+                        or actual not in functions):
+                    continue
+                formal = formals[position]
+                callback_targets[(callee, formal)].add(actual)
+
+    def dispatch_targets(caller, call):
+        callee = call.get("callee")
+        if callee in functions:
+            return (callee,)
+        return tuple(sorted(callback_targets.get((caller, callee), ())))
+
     for name, fid in by_name.items():
         cfg = ReachingDef(sub).analyze(fid, reaching_defs=False)
         if not cfg or cfg.get("bailed"):
@@ -525,7 +555,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
         internal_call_anchors = {
             call.get("node") for call in functions[name].get("calls", ())
-            if call.get("callee") in functions
+            if dispatch_targets(name, call)
         }
         for n in cfg_nodes:
             source = last_for_cfg[n]
@@ -560,9 +590,11 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     # before its callee in graph iteration order would silently lose its return binding.
     for caller, function_ir in functions.items():
         for call in function_ir.get("calls", ()):
-            callee = call.get("callee")
-            if caller in fragment_cfg and callee in fragment_cfg:
-                pending_calls.append((caller, call, callee, fragment_last[caller]))
+            for callee in dispatch_targets(caller, call):
+                if caller in fragment_cfg and callee in fragment_cfg:
+                    routed_call = dict(call)
+                    routed_call["callee"] = callee
+                    pending_calls.append((caller, routed_call, callee, fragment_last[caller]))
 
     # Add seam edges after all fragment nodes exist.  The return site is explicit and is pushed
     # on the matcher stack by the call edge.
