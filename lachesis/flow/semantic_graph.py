@@ -556,6 +556,22 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 bucket.append(next_state)
             predecessors.setdefault(next_state, state)
             queue.append(next_state)
+    # Keep the compact node-id witness for compatibility, but also expose the
+    # source-level trace needed by reports and downstream triage.  The graph is
+    # the authority for locations; no source reparse or pattern-specific lookup
+    # is involved here.
+    for hit in hits.values():
+        trace = []
+        for node_id in hit["witness"]:
+            witness_node = graph.nodes.get(node_id)
+            event = witness_node.event if witness_node else None
+            trace.append({
+                "node": node_id,
+                "fragment": witness_node.fragment if witness_node else None,
+                "kind": str(event.kind) if event else None,
+                "line": event.line if event else None,
+            })
+        hit["witness_trace"] = trace
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
 
 

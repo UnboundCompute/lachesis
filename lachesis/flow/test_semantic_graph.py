@@ -66,6 +66,11 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(len(match_graph(g)), 1)
         self.assertEqual(match_graph(g)[0]["pattern"], "uaf.deref")
         self.assertEqual(match_graph(g)[0]["witness"], ["start", "true_free", "merge", "use"])
+        trace = match_graph(g)[0]["witness_trace"]
+        self.assertEqual([item["node"] for item in trace],
+                         ["start", "true_free", "merge", "use"])
+        self.assertEqual(trace[1]["kind"], str(EventKind.RELEASE))
+        self.assertEqual(trace[-1]["line"], 5)
 
     def test_storage_free_does_not_free_pointee(self):
         buf = ObjRef("O_buf", generation="g0")
