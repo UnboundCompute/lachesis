@@ -70,6 +70,18 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(hit["pattern_id"],
                          "mem.write.inverted-capacity-guard")
 
+    def test_arithmetic_overflow_guard_is_catalogued(self):
+        event = Event(EventKind.SINK, obj=ObjRef("data"), facts={
+            "family": "buffer-size", "callee": "memset", "arg": 2,
+            "tainted": True, "guarded": True,
+            "guard_predicates": ("offset + length <= capacity",),
+        })
+        g = self._graph([("sink", event)], [])
+        hit = next(hit for hit in match_graph(g)
+                   if hit["pattern"] == "arithmetic-overflow-guard")
+        self.assertEqual(hit["pattern_id"],
+                         "mem.arithmetic.overflow-before-bound")
+
     def test_checked_nullable_return_deref_is_not_unchecked(self):
         obj = ObjRef("result")
         events = [

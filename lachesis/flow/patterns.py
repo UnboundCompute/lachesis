@@ -77,12 +77,27 @@ def _inverted_capacity_guard(fact):
                for predicate in fact.get("guard_predicates", ()))
 
 
+def _arithmetic_overflow_guard(fact):
+    """Detect a tainted additive expression used as a pre-write bound check.
+
+    The predicate is intentionally language-neutral at this layer: translators
+    provide normalized guard text, while the evaluator only recognizes the
+    generic ``addition followed by an upper-bound comparison`` shape.
+    """
+    if not fact.get("tainted") or not fact.get("guarded"):
+        return False
+    return any("+" in str(predicate)
+               and re.search(r"(?:<=|<)", str(predicate))
+               for predicate in fact.get("guard_predicates", ()))
+
+
 EVALUATORS = {
     "reachability": _reachability,
     "relational":   _relational,
     "presence":     _presence,
     "missing-guard": _missing_guard,
     "inverted-capacity-guard": _inverted_capacity_guard,
+    "arithmetic-overflow-guard": _arithmetic_overflow_guard,
 }
 
 
