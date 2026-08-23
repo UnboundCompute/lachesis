@@ -57,6 +57,19 @@ class SemanticGraphTests(unittest.TestCase):
         hit = next(hit for hit in match_graph(g) if hit["pattern"] == "missing-guard")
         self.assertEqual(hit["pattern_id"], "mem.write.missing-bounds")
 
+    def test_inverted_capacity_guard_is_catalogued_and_generic(self):
+        event = Event(EventKind.SINK, obj=ObjRef("name"), facts={
+            "family": "buffer-write", "callee": "memcpy", "arg": 0,
+            "tainted": True, "guarded": True,
+            "guard_status": "guarded-region", "size_expr": "incoming",
+            "guard_predicates": ("incoming >= capacity",),
+        })
+        g = self._graph([("sink", event)], [])
+        hit = next(hit for hit in match_graph(g)
+                   if hit["pattern"] == "inverted-capacity-guard")
+        self.assertEqual(hit["pattern_id"],
+                         "mem.write.inverted-capacity-guard")
+
     def test_checked_nullable_return_deref_is_not_unchecked(self):
         obj = ObjRef("result")
         events = [

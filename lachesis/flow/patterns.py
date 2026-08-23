@@ -19,9 +19,12 @@ Three layers, kept separable so each graduates to its destination:
                        these dimensions (op/effect, object reachability, value, control).
 """
 
+import re
+
 
 # ---- (c) SUBSTRATE -------------------------------------------------------------------------
-def substrate(sink_kind, tainted, value_bound, guarded, guard_status=None):
+def substrate(sink_kind, tainted, value_bound, guarded, guard_status=None,
+              size_expr=None, guard_predicates=()):
     """The dimensions every pattern predicates over, built once per sink occurrence:
       kind        -- the op / effect identity (atropos sink-arg kind)
       tainted     -- does an attacker-controlled value reach this arg (reach substrate)
@@ -30,7 +33,8 @@ def substrate(sink_kind, tainted, value_bound, guarded, guard_status=None):
     """
     return {"kind": sink_kind, "tainted": bool(tainted),
             "value_bound": value_bound, "guarded": guarded,
-            "guard_status": guard_status}
+            "guard_status": guard_status, "size_expr": size_expr,
+            "guard_predicates": tuple(guard_predicates or ())}
 
 
 # ---- (b) EVALUATORS (closed set) -----------------------------------------------------------
@@ -58,11 +62,27 @@ def _missing_guard(fact):
     return fact.get("guard_status") == "fall-through"
 
 
+def _inverted_capacity_guard(fact):
+    """Detect a size guard that permits the copy when length is at/over capacity.
+
+    This is intentionally expression-shape based, not C-name based: the translator
+    supplies normalized predicates and the evaluator only recognizes the generic
+    ordering relation between the sink's size expression and a capacity expression.
+    """
+    size = str(fact.get("size_expr") or "").replace(" ", "")
+    if not size or not fact.get("tainted"):
+        return False
+    escaped = re.escape(size)
+    return any(re.search(rf"(?:^|[(&|!]){escaped}(?:>=|>)", str(predicate).replace(" ", ""))
+               for predicate in fact.get("guard_predicates", ()))
+
+
 EVALUATORS = {
     "reachability": _reachability,
     "relational":   _relational,
     "presence":     _presence,
     "missing-guard": _missing_guard,
+    "inverted-capacity-guard": _inverted_capacity_guard,
 }
 
 
@@ -148,8 +168,19 @@ def evaluate_all(sink_kind, fact):
     if ev is None:
         return []
     names = [ev] if isinstance(ev, str) else ev
-    return [name for name in names
-            if name in EVALUATORS and EVALUATORS[name](fact)]
+    matches = [name for name in names
+               if name in EVALUATORS and EVALUATORS[name](fact)]
+    # Atropos may publish a structural matcher whose evaluator is not the
+    # primary kind recipe. Discover those family bindings from the pattern
+    # catalog so adding a new pattern remains declarative.
+    for entry in pattern_catalog():
+        matcher = entry.get("matcher") or {}
+        pattern = matcher.get("pattern")
+        families = matcher.get("families") or []
+        if (sink_kind in families and pattern not in matches
+                and pattern in EVALUATORS and EVALUATORS[pattern](fact)):
+            matches.append(pattern)
+    return matches
 
 
 def is_call_level(sink_kind):

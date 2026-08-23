@@ -598,6 +598,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         "tainted": argument.get("provenance") != "const",
                         "guarded": guarded,
                         "guard_status": call.get("guard_status"),
+                        "guard_predicates": call.get("guard_predicates") or (),
                         "bound": ("bounded" if guarded else "unbounded")
                                  if relational else None,
                         "size_expr": call.get("size_expr"),

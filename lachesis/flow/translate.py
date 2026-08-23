@@ -301,6 +301,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         alloc_dst = assigned if norm.is_alloc(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
                "guard_status": guard_status,
+               "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                "is_sink": cat is not None,
                "assigned": assigned,
                "node": c["id"],                             # graph node = CFG anchor for events
@@ -335,6 +336,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             hcat = sinks.get(hcallee)
             hrec = {"callee": hcallee, "line": line, "args": args, "guards": guards,
                     "guard_status": guard_status,
+                    "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                     "is_sink": hcat is not None, "node": c["id"],
                     "control": rec["control"], "dispatch": "may-invoke"}
             if hcat is not None:
