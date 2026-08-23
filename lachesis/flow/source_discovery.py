@@ -37,6 +37,7 @@ class SourceDiscovery:
     bindings: tuple[SeamBinding, ...] = ()
     launch_nodes: dict[str, tuple[str, ...]] = field(default_factory=dict)
     reachable_functions: set[str] = field(default_factory=set)
+    influenced_roots: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def sites_for(self, function: str) -> tuple[SourceSite, ...]:
         return tuple(site for site in self.sites if site.function == function)
@@ -54,6 +55,7 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
     sites: list[SourceSite] = []
     bindings: list[SeamBinding] = []
     launches: dict[str, list[str]] = {}
+    influenced: dict[str, set[str]] = {function: set() for function in F}
 
     for caller, record in F.items():
         for call in record.get("calls", ()):
@@ -76,6 +78,7 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
             roots = [call.get("assigned")]
             roots.extend(arg.get("root") for arg in args)
             roots = tuple(sorted({str(root) for root in roots if root}))
+            influenced[caller].update(roots)
             spec = source_methods.get(callee) if isinstance(source_methods, Mapping) else None
             kind = spec.get("kind", "external-input") if isinstance(spec, Mapping) else "external-input"
             site = SourceSite(caller, call.get("node"), callee, call.get("line"),
@@ -101,6 +104,32 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
                 reachable.add(callee)
                 work.append(callee)
 
-    return SourceDiscovery(tuple(sites), tuple(bindings),
-                           {name: tuple(nodes) for name, nodes in launches.items()}, reachable)
+    # Propagate source influence through actual/formal seams and returned values.
+    # Reachability is intentionally computed independently above: a reachable
+    # callee may still have no influenced root and must remain Tier 2 coverage.
+    changed = True
+    while changed:
+        changed = False
+        for caller, record in F.items():
+            for call in record.get("calls", ()):
+                callee = call.get("callee")
+                if callee not in F:
+                    continue
+                formals = tuple(F[callee].get("params", ()))
+                for arg in call.get("args", ()):
+                    actual = arg.get("root")
+                    pos = arg.get("pos")
+                    if actual in influenced.get(caller, set()) and isinstance(pos, int) and pos < len(formals):
+                        formal = str(formals[pos])
+                        if formal not in influenced[callee]:
+                            influenced[callee].add(formal)
+                            changed = True
+                if call.get("assigned") and influenced.get(callee):
+                    assigned = str(call["assigned"])
+                    if assigned not in influenced[caller]:
+                        influenced[caller].add(assigned)
+                        changed = True
 
+    return SourceDiscovery(tuple(sites), tuple(bindings),
+                           {name: tuple(nodes) for name, nodes in launches.items()}, reachable,
+                           {name: tuple(sorted(roots)) for name, roots in influenced.items()})

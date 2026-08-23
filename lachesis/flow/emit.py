@@ -335,6 +335,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         for root in ([call.get("assigned")] +
                                      [arg.get("root") for arg in call.get("args", ())])
                         if root}
+        source_roots.update(functions[name].get("source_influenced_roots", ()))
         source_reachable = bool(functions[name].get("source_reachable", False))
         for op in operations:
             if op.kind == OpKind.SUMMARY:

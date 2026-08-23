@@ -474,6 +474,7 @@ def build_F(store, lang="c", *, return_graph=False):
         ]
         record["seam_bindings"] = by_function_bindings.get(name, [])
         record["source_reachable"] = name in discovery.reachable_functions
+        record["source_influenced_roots"] = discovery.influenced_roots.get(name, ())
     return (F, succ, graph) if return_graph else (F, succ)
 
 

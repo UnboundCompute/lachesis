@@ -19,6 +19,8 @@ class SourceDiscoveryTests(unittest.TestCase):
         self.assertEqual(result.sites[0].kind, "user-input")
         self.assertEqual(result.bindings[0].formal_to_actual, (("value", "buf"),))
         self.assertEqual(result.reachable_functions, {"handle", "worker"})
+        self.assertIn("buf", result.influenced_roots["handle"])
+        self.assertIn("value", result.influenced_roots["worker"])
 
     def test_empty_catalog_keeps_structural_entry_fallback(self):
         result = discover_sources({"main": {"callers": [], "params": (), "calls": []}},
