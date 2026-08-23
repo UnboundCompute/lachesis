@@ -495,10 +495,15 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     continue
                 if op.kind == OpKind.REALLOC and op.target is not None:
                     target_key = _semantic_key(sub, op.target)
+                    old_path = op.source or op.target
+                    old_key = _semantic_key(sub, old_path)
                     old_generation = operation_generations.get(op, "g0")
-                    old = _semantic_obj(sub, op.target, old_generation, op.node)
-                    fresh_generation = realloc_generations.get(op, _next_generation(old_generation))
-                    fresh = ObjRef(old.base, old.path, fresh_generation)
+                    old = _semantic_obj(sub, old_path, old_generation, op.node)
+                    overwrites_slot = old_key == target_key
+                    target_generation = (realloc_generations.get(
+                        op, _next_generation(old_generation))
+                        if overwrites_slot else "g0")
+                    fresh = _semantic_obj(sub, op.target, target_generation, op.node)
                     attempt_id = f"{anchor}:realloc:{index}:attempt"
                     branch_id = f"{anchor}:realloc:{index}:branch"
                     result.add_node(attempt_id, Event.realloc_attempt(old, op.line), fragment=name,
@@ -524,29 +529,31 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_node(success_origin, Event.origin(fresh, op.line), fragment=name,
                                      source_reachable=source_reachable)
                     success_slot = None
-                    if old.path:
+                    if overwrites_slot and op.target.selectors:
                         success_slot = f"{success_origin}:slot"
-                        slot = ObjRef(old.base, generation=old.generation)
+                        slot = ObjRef(fresh.base, generation=old.generation)
                         result.add_node(success_slot, Event(EventKind.WRITE_STORAGE, base=slot,
-                                                            path="".join(old.path), value=fresh,
+                                                            path="".join(op.target.selectors), value=fresh,
                                                             obj=slot, line=op.line), fragment=name,
                                          source_reachable=source_reachable)
-                    result.add_node(failure_null, Event(EventKind.WRITE_STORAGE, obj=old, base=old,
-                                                       slot=old, facts={"null": True,
-                                                                        "storage_slot": True,
-                                                                        "result": "NULL",
-                                                                        "value": fresh.render()}, line=op.line), fragment=name,
-                                     source_reachable=source_reachable)
-                    result.add_node(failure_lost, Event(EventKind.LOST_FROM_SLOT, obj=old, slot=old, line=op.line), fragment=name,
-                                     source_reachable=source_reachable)
+                    if overwrites_slot:
+                        result.add_node(failure_null, Event(EventKind.WRITE_STORAGE, obj=old, base=old,
+                                                           slot=old, facts={"null": True,
+                                                                            "storage_slot": True,
+                                                                            "result": "NULL",
+                                                                            "value": fresh.render()}, line=op.line), fragment=name,
+                                         source_reachable=source_reachable)
+                        result.add_node(failure_lost, Event(EventKind.LOST_FROM_SLOT, obj=old, slot=old, line=op.line), fragment=name,
+                                         source_reachable=source_reachable)
                     result.add_node(merge_id, None, fragment=name, source_reachable=source_reachable)
                     result.add_edge(success_id, success_origin)
                     result.add_edge(success_origin, success_slot or merge_id)
                     if success_slot:
                         result.add_edge(success_slot, merge_id)
-                    result.add_edge(failure_id, failure_null)
-                    result.add_edge(failure_null, failure_lost)
-                    result.add_edge(failure_lost, merge_id)
+                    result.add_edge(failure_id, failure_null if overwrites_slot else merge_id)
+                    if overwrites_slot:
+                        result.add_edge(failure_null, failure_lost)
+                        result.add_edge(failure_lost, merge_id)
                     previous = merge_id
                     continue
                 for event_index, event in enumerate(_semantic_event(sub, op, operation_generations)):

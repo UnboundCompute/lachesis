@@ -162,7 +162,8 @@ class SemanticGraphTests(unittest.TestCase):
             ("exit", None),
         ]
         g = self._graph(events, [(events[i][0], events[i + 1][0]) for i in range(len(events) - 1)])
-        self.assertEqual({hit["pattern"] for hit in match_graph(g)}, {"leak"})
+        self.assertEqual({hit["pattern"] for hit in match_graph(g)},
+                         {"leak", "mem.lifetime.realloc-failure-leak"})
 
     def test_live_is_not_a_frozen_guard_proof(self):
         obj = ObjRef("p", generation="g0")

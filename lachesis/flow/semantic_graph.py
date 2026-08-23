@@ -56,6 +56,8 @@ FROZEN_PATTERNS = {
                                            (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE)),
     "double-free": PatternSpec("double-free", (EventKind.RELEASE,)),
     "null-deref": PatternSpec("null-deref", (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE)),
+    "mem.lifetime.realloc-failure-leak": PatternSpec(
+        "mem.lifetime.realloc-failure-leak", (EventKind.REALLOC_FAILED,)),
     "leak": PatternSpec("leak", (EventKind.ORIGIN,)),
 }
 
@@ -264,6 +266,7 @@ class _State:
     escaped: frozenset[ObjRef] = frozenset()
     sink_allocs: tuple[tuple[str, str], ...] = ()
     nullable: frozenset[ObjRef] = frozenset()
+    realloc_lost: frozenset[ObjRef] = frozenset()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -298,6 +301,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             left.escaped | right.escaped,
             tuple(sorted(set(left.sink_allocs) | set(right.sink_allocs))),
             left.nullable | right.nullable,
+            left.realloc_lost | right.realloc_lost,
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -319,6 +323,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         escaped = set(state.escaped)
         sink_allocs = dict(state.sink_allocs)
         nullable = set(state.nullable)
+        realloc_lost = set(state.realloc_lost)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -465,6 +470,20 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # Losing the owning slot does not free the object.  A DERIVE
                 # alias remains a live root; without one, the origin is leaked.
                 nulls.add(raw_obj)
+                realloc_lost.add(obj or raw_obj)
+
+        if "mem.lifetime.realloc-failure-leak" in wanted and node.id in exits:
+            for lost_obj in realloc_lost:
+                live_obj = canonical(lost_obj)
+                released_live = any(equivalent(released_obj, live_obj)
+                                    for released_obj, _ in released)
+                escaped_live = any(equivalent(escaped_obj, live_obj)
+                                   for escaped_obj in escaped)
+                alias_live = any(alias != live_obj and equivalent(alias, live_obj)
+                                 for alias in bindings)
+                if not released_live and not escaped_live and not alias_live:
+                    _record(hits, "mem.lifetime.realloc-failure-leak",
+                            live_obj or lost_obj, node, witness())
 
         if "leak" in wanted and node.id in exits and not state.stack:
             for obj in origins:
@@ -497,6 +516,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             next_nulls = set(nulls)
             next_nullable = {rebased for nullable_obj in nullable
                              if (rebased := rebase(nullable_obj)) is not None}
+            next_realloc_lost = {rebased for lost_obj in realloc_lost
+                                 if (rebased := rebase(lost_obj)) is not None}
             for formal, actual in edge.binding:
                 if formal in next_nulls:
                     next_nulls.add(actual)
@@ -544,7 +565,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
                                 frozenset(next_escaped),
                                 tuple(sorted(sink_allocs.items())),
-                                frozenset(next_nullable))
+                                frozenset(next_nullable),
+                                frozenset(next_realloc_lost))
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 bucket_key = (edge.target, stack)
