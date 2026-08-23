@@ -702,6 +702,29 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 "line": event.line if event else None,
             })
         hit["witness_trace"] = trace
+        edge_trace = []
+        witness = tuple(hit.get("witness", ()))
+        for source, target in zip(witness, witness[1:]):
+            edge = next((candidate for candidate in graph.edges.get(source, ())
+                         if candidate.target == target), None)
+            if edge is None:
+                continue
+            edge_trace.append({
+                "source": source,
+                "target": target,
+                "kind": edge.kind,
+                "return_to": edge.return_to,
+                "guards": [{"kind": proof.kind, "value": proof.value}
+                            for proof in edge.guard],
+                "bindings": [[left.render(), right.render()]
+                             for left, right in edge.binding],
+                "provenance": [list(pair) for pair in edge.provenance],
+            })
+        hit["witness_edges"] = edge_trace
+        launch_contexts = [node_id for node_id in witness
+                           if node_id in graph.source_reachable]
+        hit["source_context"] = launch_contexts[0] if launch_contexts else None
+        hit["witness_complete"] = len(edge_trace) == max(0, len(witness) - 1)
         first = trace[0] if trace else {}
         hit["source_node"] = first.get("node")
         hit["source_entry"] = first.get("fragment")

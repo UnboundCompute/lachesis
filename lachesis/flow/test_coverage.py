@@ -77,6 +77,14 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(store.uncovered([("worker", "source"), ("worker", "other")]),
                          (("worker", "other"),))
 
+    def test_coverage_ledger_round_trips_states_and_contexts(self):
+        store = FragmentStore()
+        store.mark_covered([("worker", "source")])
+        store.mark_contexts_covered([("worker", "source", "site_a")])
+        restored = FragmentStore()
+        restored.restore_coverage(store.coverage_snapshot())
+        self.assertEqual(restored.coverage_snapshot(), store.coverage_snapshot())
+
     def test_fragment_cache_key_includes_coverage_states(self):
         store = FragmentStore()
         functions = {"worker": {}}

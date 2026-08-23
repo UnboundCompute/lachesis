@@ -192,6 +192,22 @@ class FragmentStore:
     def uncovered_contexts(self, context_keys):
         return tuple(sorted(set(tuple(key) for key in context_keys) - self.covered_contexts))
 
+    def coverage_snapshot(self) -> dict[str, list[list[str]]]:
+        """Return a JSON-safe ledger of materialized source states and contexts."""
+        return {
+            "covered_states": [list(key) for key in sorted(self.covered_states)],
+            "covered_contexts": [list(key) for key in sorted(self.covered_contexts)],
+        }
+
+    def restore_coverage(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore only coverage facts; graph materialization remains independently verified."""
+        for key in snapshot.get("covered_states", ()):
+            if len(key) == 2:
+                self.covered_states.add((str(key[0]), str(key[1])))
+        for key in snapshot.get("covered_contexts", ()):
+            if len(key) == 3:
+                self.covered_contexts.add((str(key[0]), str(key[1]), str(key[2])))
+
     def pending(self, plan):
         """Return the next deterministic source-rooted regions still uncovered."""
         return plan.pending_regions(self.covered_states, self.covered_contexts)
