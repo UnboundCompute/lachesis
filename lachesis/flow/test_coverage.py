@@ -211,6 +211,23 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(
             Claus._materialized_states(graph, [("wrong", "source")]), [])
 
+    def test_materialization_starts_at_external_launch_nodes(self):
+        graph = SkeletonGraph()
+        for node, fragment in (("source:entry", "source"),
+                               ("source:launch", "source"),
+                               ("source:internal", "source"),
+                               ("target:entry", "target")):
+            graph.add_node(node, fragment=fragment)
+        graph.add_edge("source:entry", "source:internal")
+        graph.add_edge("source:entry", "source:launch")
+        graph.add_edge("source:internal", "target:entry")
+        graph.add_fragment("source", "source:entry", ("source:internal", "source:launch"))
+        graph.add_fragment("target", "target:entry", ("target:entry",))
+        graph.source_reachable.add("source:launch")
+
+        self.assertEqual(
+            Claus._materialized_states(graph, [("target", "source")]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

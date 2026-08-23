@@ -200,8 +200,14 @@ class Claus:
             target_fragment = graph.fragments.get(target)
             if source_fragment is None or target_fragment is None:
                 continue
+            launch_nodes = sorted(
+                node_id for node_id in graph.source_reachable
+                if graph.nodes.get(node_id) is not None
+                and graph.nodes[node_id].fragment == source)
+            starts = launch_nodes or [source_fragment.entry]
             if source == target:
-                materialized.append((target, source))
+                if launch_nodes or not graph.source_reachable:
+                    materialized.append((target, source))
                 continue
             # Coverage must use the same call/return discipline as the matcher.
             # Plain graph reachability can walk from a callee to a continuation
@@ -210,7 +216,7 @@ class Claus:
             # fragment graph already carries the explicit continuation on call
             # edges, so a small pushdown walk is enough; this remains independent
             # of any vulnerability pattern.
-            queue = [(source_fragment.entry, ())]
+            queue = [(entry, ()) for entry in starts]
             seen = set(queue)
             reachable = False
             while queue and not reachable:
