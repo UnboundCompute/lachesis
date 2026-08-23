@@ -78,6 +78,32 @@ class CoverageSchedulerTests(unittest.TestCase):
             semantic,
         )
 
+    def test_fragment_cache_composes_disjoint_source_regions(self):
+        store = FragmentStore()
+        functions = {"worker": {}}
+        graph = object()
+        first = SkeletonGraph()
+        first.add_node("worker:entry")
+        first.add_node("worker:a")
+        first.add_edge("worker:entry", "worker:a")
+        first.add_fragment("worker", "worker:entry", ("worker:a",))
+        second = SkeletonGraph()
+        second.add_node("worker:entry")
+        second.add_node("worker:b")
+        second.add_edge("worker:entry", "worker:b")
+        second.add_fragment("worker", "worker:entry", ("worker:b",))
+        store.put(functions, "c", graph, first,
+                  coverage={"state_keys": [["worker", "source_a"]]})
+        store.put(functions, "c", graph, second,
+                  coverage={"state_keys": [["worker", "source_b"]]})
+
+        merged = store.get(
+            functions, "c", graph,
+            coverage={"state_keys": [["worker", "source_a"],
+                                      ["worker", "source_b"]]})
+        self.assertIsInstance(merged, SkeletonGraph)
+        self.assertEqual(set(merged.nodes), {"worker:entry", "worker:a", "worker:b"})
+
     def test_fragment_cache_uses_content_not_transient_summary_identity(self):
         store = FragmentStore()
         functions = {"worker": {"events": [{"kind": "alloc"}]}}

@@ -76,7 +76,71 @@ class FragmentStore:
         candidates = self._coverage_graphs.get(base, ())
         supersets = [(len(states), value) for states, value in candidates
                      if requested <= states]
-        return min(supersets, key=lambda item: item[0])[1] if supersets else None
+        if supersets:
+            return min(supersets, key=lambda item: item[0])[1]
+
+        # Pass 3 may materialize source cones incrementally.  A collection of
+        # partial graphs under the same semantic inputs is a valid cache hit if
+        # their state sets cover the request; requiring one graph to be a
+        # superset would throw away already-built regions and restart Claus.
+        remaining = set(requested)
+        selected: list[tuple[frozenset[tuple[str, str]], SkeletonGraph]] = []
+        available = list(candidates)
+        while remaining and available:
+            index, (states, value) = max(
+                enumerate(available),
+                key=lambda item: len(item[1][0] & remaining))
+            gain = states & remaining
+            if not gain:
+                break
+            selected.append((states, value))
+            remaining -= gain
+            available.pop(index)
+        if remaining or not selected:
+            return None
+        graphs = [value for _states, value in selected]
+        if len(graphs) == 1:
+            return graphs[0]
+        if all(isinstance(value, SkeletonGraph) for value in graphs):
+            return self._merge_graphs(graphs)
+        return None
+
+    @staticmethod
+    def _merge_graphs(graphs: list[SkeletonGraph]) -> SkeletonGraph:
+        """Union compatible cached fragments without changing graph identity.
+
+        Each graph was built from the same base cache key, so duplicate node ids
+        represent the same semantic fact.  A conflicting duplicate is rejected
+        rather than silently preferring one source-state projection.
+        """
+        merged = SkeletonGraph()
+        for graph in graphs:
+            for node_id, node in graph.nodes.items():
+                existing = merged.nodes.get(node_id)
+                if existing is None:
+                    merged.add_node(node_id, node.event, fragment=node.fragment,
+                                    **node.metadata)
+                elif (existing.event != node.event or
+                      existing.fragment != node.fragment or
+                      existing.metadata != node.metadata):
+                    raise ValueError(f"incompatible cached node: {node_id}")
+            for source, edges in graph.edges.items():
+                for edge in edges:
+                    if edge not in merged.edges.setdefault(source, []):
+                        merged.edges[source].append(edge)
+            for name, fragment in graph.fragments.items():
+                existing = merged.fragments.get(name)
+                if existing is None:
+                    merged.add_fragment(name, fragment.entry, fragment.exits, fragment.params)
+                elif (existing.entry != fragment.entry or
+                      existing.params != fragment.params):
+                    raise ValueError(f"incompatible cached fragment: {name}")
+                else:
+                    existing.exits.update(fragment.exits)
+            merged.source_reachable.update(graph.source_reachable)
+            merged.coverage.update(graph.coverage)
+        merged.validate()
+        return merged
 
     def put(self, functions: Mapping[str, Mapping], lang: str, graph: Any,
             semantic_graph: SkeletonGraph, summaries: Any = None,
