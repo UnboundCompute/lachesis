@@ -24,6 +24,21 @@ class SemanticGraphTests(unittest.TestCase):
         proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
         self.assertEqual([proof.kind for proof in proofs], ["VALUE", "BOUNDED"])
 
+    def test_atropos_sink_history_matches_size_mismatch(self):
+        events = [
+            ("alloc", Event(EventKind.SINK, obj=ObjRef("buf"), facts={
+                "family": "alloc-size", "callee": "malloc", "dst": "buf",
+                "size_expr": "capacity", "tainted": True, "guarded": False,
+            })),
+            ("copy", Event(EventKind.SINK, obj=ObjRef("buf"), facts={
+                "family": "buffer-write", "callee": "memcpy", "dst": "buf",
+                "size_expr": "incoming", "tainted": True, "guarded": False,
+            })),
+        ]
+        g = self._graph(events, [("alloc", "copy")])
+        self.assertIn("mem.alloc-copy.size-mismatch",
+                      {hit["pattern"] for hit in match_graph(g)})
+
     def test_branch_arms_do_not_form_a_linear_false_positive(self):
         o = ObjRef("O_buf", generation="g0")
         events = [("start", None), ("true_free", Event.release(o, 2)),

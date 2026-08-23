@@ -259,6 +259,7 @@ class _State:
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
     escaped: frozenset[ObjRef] = frozenset()
+    sink_allocs: tuple[tuple[str, str], ...] = ()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -291,6 +292,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             tuple(sorted(merged_bindings.items(), key=repr)),
             left.nulls | right.nulls,
             left.escaped | right.escaped,
+            tuple(sorted(set(left.sink_allocs) | set(right.sink_allocs))),
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -310,6 +312,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         nulls = set(state.nulls)
         bindings = dict(state.bindings)
         escaped = set(state.escaped)
+        sink_allocs = dict(state.sink_allocs)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -388,6 +391,20 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                             sink_obj = obj or ObjRef(
                                 event.facts.get("callee", "sink"), generation="g0")
                             _record(hits, "mem.copy.in-loop-unbounded", sink_obj,
+                                    node, witness())
+                    dst = event.facts.get("dst")
+                    size_expr = event.facts.get("size_expr")
+                    if dst and size_expr is not None:
+                        if family == "alloc-size":
+                            sink_allocs[str(dst)] = str(size_expr)
+                        elif (family in {"buffer-write", "buffer-size"}
+                              and str(dst) in sink_allocs
+                              and sink_allocs[str(dst)] != str(size_expr)
+                              and (patterns is None
+                                   or "mem.alloc-copy.size-mismatch" in wanted)):
+                            sink_obj = obj or ObjRef(
+                                event.facts.get("callee", "sink"), generation="g0")
+                            _record(hits, "mem.alloc-copy.size-mismatch", sink_obj,
                                     node, witness())
                 # Sink facts are observations, not lifetime transitions; the
                 # remaining lifecycle branches below intentionally do not match
@@ -505,7 +522,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     next_escaped.discard(rebase(receiver))
             next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
-                                frozenset(next_escaped))
+                                frozenset(next_escaped),
+                                tuple(sorted(sink_allocs.items())))
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 bucket_key = (edge.target, stack)
