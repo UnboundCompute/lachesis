@@ -125,6 +125,17 @@ class Event:
         return cls(EventKind.WRITE_STORAGE, base=base, path=path, obj=base,
                    value=value, line=line)
 
+    @classmethod
+    def write_null(cls, slot: ObjRef, line: int | None = None) -> "Event":
+        """Store NULL in a pointer slot.
+
+        NULL is a value of WRITE_STORAGE, not a separate event kind in the frozen
+        schema.  ``storage_slot`` keeps the write from being mistaken for a
+        dereference of the slot itself.
+        """
+        return cls(EventKind.WRITE_STORAGE, obj=slot, base=slot, line=line,
+                   facts={"null": True, "storage_slot": True})
+
 
 @dataclass(frozen=True)
 class Edge:
@@ -232,6 +243,7 @@ class _State:
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
     escaped: frozenset[ObjRef] = frozenset()
+    held: frozenset[ObjRef] = frozenset()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -261,6 +273,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         nulls = set(state.nulls)
         bindings = dict(state.bindings)
         escaped = set(state.escaped)
+        held = set(state.held)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -298,7 +311,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             if event.kind == EventKind.DERIVE and event.obj and event.value:
                 bindings[event.obj] = canonical(event.value) or event.value
                 obj = canonical(event.obj)
-            if event.kind == EventKind.WRITE_STORAGE_NULL and obj:
+                held.add(event.obj)
+            is_null_write = (event.kind == EventKind.WRITE_STORAGE_NULL or
+                             (event.kind == EventKind.WRITE_STORAGE and event.facts.get("null")))
+            if is_null_write and raw_obj:
                 # NULL is a value in this storage slot, not a property of the
                 # heap object reached through another alias.
                 nulls.add(raw_obj)
@@ -314,9 +330,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             elif event.kind == EventKind.INVALIDATE and obj:
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
-            elif event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE) and base:
-                live_proven = GuardProof("LIVE", base.render()) in state.guards
-                if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released) and not live_proven:
+            elif event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE) and base and not is_null_write:
+                if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released):
                     _record(hits, "uaf.deref", base, node)
                 if "null-deref" in wanted and raw_base in nulls:
                     _record(hits, "null-deref", base, node)
@@ -330,6 +345,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
                 nulls.discard(raw_obj)
+            elif event.kind == EventKind.LOST_FROM_SLOT and raw_obj:
+                # Losing the owning slot does not free the object.  A DERIVE
+                # alias remains a live root; without one, the origin is leaked.
+                nulls.add(raw_obj)
 
         if "leak" in wanted and node.id in exits and not state.stack:
             for obj in origins:
@@ -337,7 +356,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 released_live = any(equivalent(released_obj, live_obj)
                                      for released_obj, _ in released)
                 escaped_live = any(equivalent(escaped_obj, live_obj) for escaped_obj in escaped)
-                if not released_live and not escaped_live:
+                held_live = any(equivalent(held_obj, live_obj) for held_obj in held)
+                if not released_live and not escaped_live and not held_live:
                     _record(hits, "leak", live_obj or obj, node)
 
         for edge in graph.edges.get(state.node, ()):
@@ -363,6 +383,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     next_nulls.add(actual)
             next_escaped = {rebased for escaped_obj in escaped
                             if (rebased := rebase(escaped_obj)) is not None}
+            next_held = {rebased for held_obj in held
+                         if (rebased := rebase(held_obj)) is not None}
             known = set(next_origins) | set(next_nulls) | {obj for obj, _ in next_released}
             for proof in edge.guard:
                 guarded_obj = None
@@ -402,7 +424,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             queue.append(_State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 state.guards | frozenset(edge.guard),
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
-                                frozenset(next_escaped)))
+                                frozenset(next_escaped), frozenset(next_held)))
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
 
 

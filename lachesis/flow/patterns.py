@@ -29,7 +29,7 @@ def substrate(sink_kind, tainted, value_bound, guarded):
       guarded     -- is there a control guard on the value at the sink
     """
     return {"kind": sink_kind, "tainted": bool(tainted),
-            "value_bound": value_bound, "guarded": bool(guarded)}
+            "value_bound": value_bound, "guarded": guarded}
 
 
 # ---- (b) EVALUATORS (closed set) -----------------------------------------------------------
@@ -52,10 +52,16 @@ def _presence(fact):
     return True
 
 
+def _missing_guard(fact):
+    """Fire only when a validation exists but the sink is on its fall-through arm."""
+    return fact["guarded"] == "fall-through"
+
+
 EVALUATORS = {
     "reachability": _reachability,
     "relational":   _relational,
     "presence":     _presence,
+    "missing-guard": _missing_guard,
 }
 
 
@@ -83,7 +89,7 @@ KIND_EVALUATOR = {
     # size / memory -> relational (taint AND unbounded length vs capacity)
     "alloc-size":         "relational",
     "buffer-size":        "relational",
-    "buffer-write":       "relational",
+    "buffer-write":       ["relational", "missing-guard"],
     # configuration -> presence (taint-independent; the call is the bug)
     "weak-crypto":        "presence",
     "insecure-tls":       "presence",
@@ -91,13 +97,38 @@ KIND_EVALUATOR = {
 }
 
 
+def pattern_catalog():
+    """Expose Atropos's declarative structural library to matcher clients."""
+    try:
+        from .atropos import pattern_catalog as _catalog
+        return _catalog()
+    except (ImportError, OSError, ValueError):
+        return []
+
+
+def evaluator_catalog():
+    """Use Atropos routing when installed, retaining the compatibility table otherwise."""
+    try:
+        from .atropos import evaluator_catalog as _catalog
+        return _catalog()
+    except (ImportError, OSError, ValueError):
+        return {"evaluators": EVALUATORS, "kind_evaluator": KIND_EVALUATOR}
+
+
 def evaluate(sink_kind, fact):
     """Route a substrate fact through the evaluator its kind selects. Returns the evaluator
     name if the pattern fires, else None (unknown kind, or predicate not satisfied)."""
     ev = KIND_EVALUATOR.get(sink_kind)
     if ev is None:
+        ev = evaluator_catalog().get("kind_evaluator", {}).get(sink_kind)
+    if ev is None:
         return None
-    return ev if EVALUATORS[ev](fact) else None
+    names = [ev] if isinstance(ev, str) else ev
+    for name in names:
+        evaluator = EVALUATORS.get(name)
+        if evaluator is not None and evaluator(fact):
+            return name
+    return None
 
 
 def is_call_level(sink_kind):
@@ -106,4 +137,7 @@ def is_call_level(sink_kind):
     fires even with constant arguments. Every other class is ARG-level: the occurrence is a
     (call, argument) pair carrying a value the taint/bound predicates read. Adding a new
     presence KIND needs no code; only a new occurrence granularity would."""
-    return KIND_EVALUATOR.get(sink_kind) == "presence"
+    ev = KIND_EVALUATOR.get(sink_kind)
+    if ev is None:
+        ev = evaluator_catalog().get("kind_evaluator", {}).get(sink_kind)
+    return ev == "presence" or (isinstance(ev, list) and "presence" in ev)

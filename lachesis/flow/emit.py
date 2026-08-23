@@ -301,8 +301,9 @@ def _semantic_event(sub, operation, generations=None):
     if operation.kind == OpKind.CLOBBER and obj:
         if operation.access == "source":
             return [Event.origin(obj, operation.line)]
-        kind = EventKind.WRITE_STORAGE_NULL if operation.is_null else EventKind.DERIVE
-        return [Event(kind, obj=obj, line=operation.line)]
+        if operation.is_null:
+            return [Event.write_null(obj, operation.line)]
+        return [Event(EventKind.DERIVE, obj=obj, line=operation.line)]
     return []
 
 
@@ -409,8 +410,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                                      source_reachable=source_reachable)
                     result.add_node(success_id, Event.origin(obj, op.line), fragment=name,
                                      source_reachable=source_reachable)
-                    result.add_node(failure_id, Event(EventKind.WRITE_STORAGE_NULL, obj=obj, slot=obj,
-                                                     facts={"result": "NULL"}, line=op.line), fragment=name,
+                    result.add_node(failure_id, Event(EventKind.WRITE_STORAGE, obj=obj, base=obj,
+                                                     slot=obj, facts={"null": True,
+                                                                      "storage_slot": True,
+                                                                      "result": "NULL"}, line=op.line), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(merge_id, None, fragment=name, source_reachable=source_reachable)
                     result.add_edge(previous, attempt_id)
@@ -470,8 +473,11 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                                                             path="".join(old.path), value=fresh,
                                                             obj=slot, line=op.line), fragment=name,
                                          source_reachable=source_reachable)
-                    result.add_node(failure_null, Event(EventKind.WRITE_STORAGE_NULL, obj=fresh, slot=old,
-                                                       facts={"result": "NULL"}, line=op.line), fragment=name,
+                    result.add_node(failure_null, Event(EventKind.WRITE_STORAGE, obj=old, base=old,
+                                                       slot=old, facts={"null": True,
+                                                                        "storage_slot": True,
+                                                                        "result": "NULL",
+                                                                        "value": fresh.render()}, line=op.line), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(failure_lost, Event(EventKind.LOST_FROM_SLOT, obj=old, slot=old, line=op.line), fragment=name,
                                      source_reachable=source_reachable)

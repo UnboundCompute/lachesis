@@ -1,7 +1,7 @@
 import unittest
 
 from .emit import _cfg_guard_proofs
-from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph, match_graph
+from .semantic_graph import Edge, Event, EventKind, GuardProof, ObjRef, SkeletonGraph, match_graph
 
 
 class SemanticGraphTests(unittest.TestCase):
@@ -102,6 +102,42 @@ class SemanticGraphTests(unittest.TestCase):
         patterns = {hit["pattern"] for hit in match_graph(g)}
         self.assertIn("uaf.deref", patterns)
         self.assertNotIn("null-deref", patterns)
+
+    def test_realloc_failure_loses_slot_but_preserves_an_existing_alias(self):
+        old = ObjRef("p", generation="g0")
+        saved = ObjRef("saved", generation="g0")
+        events = [
+            ("origin", Event.origin(old)),
+            ("derive", Event(EventKind.DERIVE, obj=saved, value=old)),
+            ("failed", Event.realloc_failed(old, old)),
+            ("null", Event.write_null(old)),
+            ("lost", Event(EventKind.LOST_FROM_SLOT, obj=old, slot=old)),
+            ("exit", None),
+        ]
+        g = self._graph(events, [(events[i][0], events[i + 1][0]) for i in range(len(events) - 1)])
+        self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(g)})
+
+    def test_realloc_failure_without_an_alias_is_a_leak(self):
+        old = ObjRef("p", generation="g0")
+        events = [
+            ("origin", Event.origin(old)),
+            ("failed", Event.realloc_failed(old, old)),
+            ("null", Event.write_null(old)),
+            ("lost", Event(EventKind.LOST_FROM_SLOT, obj=old, slot=old)),
+            ("exit", None),
+        ]
+        g = self._graph(events, [(events[i][0], events[i + 1][0]) for i in range(len(events) - 1)])
+        self.assertEqual({hit["pattern"] for hit in match_graph(g)}, {"leak"})
+
+    def test_live_is_not_a_frozen_guard_proof(self):
+        obj = ObjRef("p", generation="g0")
+        g = self._graph(
+            [("origin", Event.origin(obj)), ("free", Event.release(obj)),
+             ("use", Event.read(obj))],
+            [("origin", "free"), ("free", "use", "normal")],
+        )
+        g.edges["free"][0] = Edge(target="use", guard=(GuardProof("LIVE", obj.render()),))
+        self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
 
     def test_source_tiers_are_preserved_on_leads(self):
         obj = ObjRef("p", generation="g0")

@@ -173,6 +173,21 @@ def detection(name):
     return _DETECTION_CACHE[name]
 
 
+def pattern_catalog():
+    """Return the language-neutral declarative flow-pattern library.
+
+    Pattern definitions belong to Atropos alongside evaluator recipes and lifecycle
+    roles.  A missing catalog remains a valid empty result for older installations;
+    callers can then use their compatibility defaults.
+    """
+    return detection("flow-patterns").get("patterns", [])
+
+
+def evaluator_catalog():
+    """Return the Atropos evaluator vocabulary and kind routing table."""
+    return detection("evaluators")
+
+
 def sink_catalog(lang):
     return load(lang)[0]
 
