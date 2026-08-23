@@ -173,7 +173,11 @@ def run_pass(store, lang="c", lifetime_engine=None):
         }
         object_result = analyze_object_lifetimes(
             store, object_functions, object_succ, lang=lang, graph=analysis_graph)
-        semantic_coverage = CoverageScheduler(F, succ).plan(object_functions)
+        # The semantic skeleton is deliberately built over the lifecycle/sink slice,
+        # not over every translated function.  Give Claus the matching coverage plan;
+        # passing the whole-program plan here would mark functions absent from the
+        # skeleton as covered and make Pass 3's convergence claim unsound.
+        semantic_coverage = CoverageScheduler(object_functions, object_succ).plan()
         semantic_graph = Claus().build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries, coverage=semantic_coverage,
@@ -242,6 +246,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
             "semantic_graph_nodes": len(semantic_graph.nodes),
             "semantic_graph_edges": sum(len(edges) for edges in semantic_graph.edges.values()),
             "semantic_leads": len(semantic_leads),
+            "coverage": semantic_graph.coverage,
         })
     else:
         legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
