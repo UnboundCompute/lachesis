@@ -55,6 +55,8 @@ FROZEN_PATTERNS = {
     "leak": PatternSpec("leak", (EventKind.ORIGIN,)),
 }
 
+_LOOP_WIDEN_LIMIT = 32
+
 
 @dataclass(frozen=True, order=True)
 class ObjRef:
@@ -252,11 +254,9 @@ class _State:
     released: frozenset[tuple[ObjRef, str]] = frozenset()
     origins: frozenset[ObjRef] = frozenset()
     stack: tuple[str, ...] = ()
-    guards: frozenset[GuardProof] = frozenset()
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
     escaped: frozenset[ObjRef] = frozenset()
-    held: frozenset[ObjRef] = frozenset()
 
 
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -273,12 +273,31 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
     predecessors: dict[_State, _State | None] = {
         _State(s): None for s in starts
     }
+    superseded: set[_State] = set()
+    loop_buckets: dict[tuple[str, tuple[str, ...]], list[_State]] = {}
+
+    def join_loop_states(left: _State, right: _State) -> _State:
+        left_bindings, right_bindings = dict(left.bindings), dict(right.bindings)
+        merged_bindings = dict(left_bindings)
+        for key, value in right_bindings.items():
+            merged_bindings.setdefault(key, value)
+        return _State(
+            right.node,
+            left.released | right.released,
+            left.origins | right.origins,
+            right.stack,
+            tuple(sorted(merged_bindings.items(), key=repr)),
+            left.nulls | right.nulls,
+            left.escaped | right.escaped,
+        )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
     exits = {x for f in graph.fragments.values() for x in f.exits}
 
     while queue:
         state = queue.popleft()
+        if state in superseded:
+            continue
         if state in seen:
             continue
         seen.add(state)
@@ -289,15 +308,19 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         nulls = set(state.nulls)
         bindings = dict(state.bindings)
         escaped = set(state.escaped)
-        held = set(state.held)
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
+            used_bindings = set()
             while value is not None and value not in seen:
                 seen.add(value)
                 direct = bindings.get(value)
-                if direct is not None:
+                if direct is not None and value not in used_bindings:
+                    used_bindings.add(value)
+                    old_base = value.base
                     value = ObjRef(direct.base, _normalized_path(direct.path), direct.generation)
+                    if direct.base == old_base:
+                        break
                     continue
                 # A binding for p also binds p&, p**, and field paths rooted at
                 # p. Compose the suffix instead of treating those as unrelated
@@ -305,39 +328,27 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # by the frozen access-path representation.
                 candidates = [source for source in bindings
                               if source.base == value.base
+                              and source not in used_bindings
                               and value.path[:len(source.path)] == source.path]
                 if not candidates:
                     break
                 source = max(candidates, key=lambda item: len(item.path))
+                used_bindings.add(source)
                 target = bindings[source]
                 suffix = value.path[len(source.path):]
+                old_base = value.base
                 value = ObjRef(target.base,
                                _normalized_path(target.path + suffix),
                                target.generation)
+                if target.base == old_base:
+                    break
             if value is None:
                 return None
             return ObjRef(value.base, _normalized_path(value.path), value.generation)
 
         def equivalent(left: ObjRef | None, right: ObjRef | None) -> bool:
-            """Treat seam/derive bindings as an alias relation for conclusions."""
-            if left is None or right is None:
-                return left == right
-            frontier = [left]
-            visited = set()
-            reverse = {}
-            for source, target in bindings.items():
-                reverse.setdefault(target, set()).add(source)
-            while frontier:
-                current = frontier.pop()
-                if current in visited:
-                    continue
-                visited.add(current)
-                if current == right:
-                    return True
-                if current in bindings:
-                    frontier.append(bindings[current])
-                frontier.extend(reverse.get(current, ()))
-            return False
+            """Compare canonical representatives after seam/derive composition."""
+            return canonical(left) == canonical(right)
 
         def witness() -> tuple[str, ...]:
             path = []
@@ -355,7 +366,6 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             if event.kind == EventKind.DERIVE and event.obj and event.value:
                 bindings[event.obj] = canonical(event.value) or event.value
                 obj = canonical(event.obj)
-                held.add(event.obj)
             is_null_write = (event.kind == EventKind.WRITE_STORAGE_NULL or
                              (event.kind == EventKind.WRITE_STORAGE and event.facts.get("null")))
             if is_null_write and raw_obj:
@@ -400,8 +410,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 released_live = any(equivalent(released_obj, live_obj)
                                      for released_obj, _ in released)
                 escaped_live = any(equivalent(escaped_obj, live_obj) for escaped_obj in escaped)
-                held_live = any(equivalent(held_obj, live_obj) for held_obj in held)
-                if not released_live and not escaped_live and not held_live:
+                alias_live = any(alias != live_obj and equivalent(alias, live_obj)
+                                 for alias in bindings)
+                if not released_live and not escaped_live and not alias_live:
                     _record(hits, "leak", live_obj or obj, node, witness())
 
         for edge in graph.edges.get(state.node, ()):
@@ -427,8 +438,6 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     next_nulls.add(actual)
             next_escaped = {rebased for escaped_obj in escaped
                             if (rebased := rebase(escaped_obj)) is not None}
-            next_held = {rebased for held_obj in held
-                         if (rebased := rebase(held_obj)) is not None}
             known = set(next_origins) | set(next_nulls) | {obj for obj, _ in next_released}
             for proof in edge.guard:
                 guarded_obj = None
@@ -466,9 +475,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 for _formal, receiver in edge.binding:
                     next_escaped.discard(rebase(receiver))
             next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
-                                state.guards | frozenset(edge.guard),
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
-                                frozenset(next_escaped), frozenset(next_held))
+                                frozenset(next_escaped))
+            target_event = graph.nodes[edge.target].event
+            if target_event is not None and target_event.kind == EventKind.LOOP:
+                bucket_key = (edge.target, stack)
+                bucket = loop_buckets.setdefault(bucket_key, [])
+                if len(bucket) >= _LOOP_WIDEN_LIMIT:
+                    prior = bucket.pop(0)
+                    superseded.add(prior)
+                    next_state = join_loop_states(prior, next_state)
+                bucket.append(next_state)
             predecessors.setdefault(next_state, state)
             queue.append(next_state)
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
