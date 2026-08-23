@@ -343,8 +343,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         if not cfg_nodes:
             continue
         prefix = f"{name}:"
+        function_source_reachable = bool(functions[name].get("source_reachable", False))
         for n in cfg_nodes:
-            result.add_node(prefix + n, fragment=name)
+            result.add_node(prefix + n, fragment=name,
+                            source_reachable=function_source_reachable)
         predecessors = defaultdict(int)
         for source, targets in cfg.get("succ", {}).items():
             for target in targets:

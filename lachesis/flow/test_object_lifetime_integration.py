@@ -111,6 +111,9 @@ class ObjectLifetimeIntegrationTests(unittest.TestCase):
                 for node in result["semantic_graph"].nodes.values() if node.event is not None
             }
             self.assertTrue({"branch", "merge", "loop"} <= structural_kinds)
+            self.assertTrue(all(lead.get("tier") in {1, 2} for lead in result["leads"]
+                                if lead.get("pattern") in {"leak", "uaf.deref", "use.dangling",
+                                                             "double-free", "null-deref"}))
             # Leak remains on the legacy property domain during this migration.
             self.assertTrue(any(lead["pattern"] == "leak" for lead in result["leads"]))
             self.assertEqual(result["lifetime"]["active"], "object")
