@@ -7,6 +7,34 @@ from .semantic_graph import (Edge, Event, EventKind, GuardProof, ObjRef,
 
 
 class SemanticGraphTests(unittest.TestCase):
+    def test_ownerless_roots_are_declaration_qualified(self):
+        from .emit import _readable_root
+
+        class Index:
+            @staticmethod
+            def nodes_of_kind(*_kinds):
+                return [
+                    {"id": "global-id", "label": "state", "properties": {}},
+                    {"id": "local-id", "label": "state", "properties":
+                     {"owner_function_id": "worker"}},
+                ]
+
+        class Sub:
+            idx = Index()
+
+            @staticmethod
+            def label(node_id):
+                return {"global-id": "state", "local-id": "state"}[node_id]
+
+            @staticmethod
+            def props(node_id):
+                return {"global-id": {},
+                        "local-id": {"owner_function_id": "worker"}}[node_id]
+
+        sub = Sub()
+        self.assertEqual(_readable_root(sub, "decl:global-id"), "state@global-id")
+        self.assertEqual(_readable_root(sub, "decl:local-id"), "state")
+
     def test_default_pattern_registry_covers_every_atropos_matcher(self):
         from lachesis.flow.patterns import EVALUATORS
         from lachesis.flow.semantic_graph import FROZEN_PATTERNS
