@@ -21,6 +21,14 @@ STATE_KINDS = frozenset({
     "import-cycle",
 })
 
+# These are deliberately observations, not safe validators.  A string-prefix
+# comparison is a common attempted path-containment check, but it admits sibling
+# paths (`/tmp/foo-bar` for `/tmp/foo`).  `commonpath` is the component-aware form.
+PATH_GUARD_METHODS = {
+    "startswith": ("path-prefix", "weak"),
+    "commonpath": ("path-containment", "stronger"),
+}
+
 
 def _call_name(call: dict) -> str:
     properties = call.get("properties", {})
@@ -58,6 +66,59 @@ def classify_sinks(graph: dict, index: GraphIndex | None = None) -> dict[str, di
             "evidence": sink["id"],
         }
     return result
+
+
+def detect_path_guards(graph: dict, index: GraphIndex | None = None) -> list[dict]:
+    """Expose path-containment checks as evidence without treating them as proofs.
+
+    The frontend already emits the call and enclosing statement.  We use those
+    canonical facts only: a path method counts when it is present in an ``if`` or
+    other control statement in the same function.  Prefix checks remain ``weak``
+    so candidate enumeration and taint reachability are never suppressed.
+    """
+    index = index or GraphIndex(graph, compact=True)
+    calls_by_function = defaultdict(list)
+    for call in index.nodes_of_kind("call", "construct"):
+        owner = call.get("properties", {}).get("owner_function_id")
+        method = _call_name(call).lower()
+        if owner and method in PATH_GUARD_METHODS:
+            calls_by_function[owner].append(call)
+
+    result = []
+    for function_id, calls in calls_by_function.items():
+        function = index.nodes.get(function_id)
+        if not function:
+            continue
+        owned = index.nodes_owned_by(function_id)
+        control_labels = [
+            str(node.get("label") or "")
+            for node in owned
+            if node.get("kind") == "statement"
+            and node.get("properties", {}).get("control_kind")
+            in {"if", "while", "for", "switch"}
+        ]
+        for call in calls:
+            method = _call_name(call).lower()
+            if not any(method in label.lower() for label in control_labels):
+                continue
+            kind, strength = PATH_GUARD_METHODS[method]
+            props = function.get("properties", {})
+            result.append({
+                "function_id": function_id,
+                "function": function.get("label", function_id),
+                "file": props.get("absolute_file") or props.get("file"),
+                "line": call.get("properties", {}).get("start_line"),
+                "method": method,
+                "kind": kind,
+                "strength": strength,
+                "suppresses_path_candidate": strength != "weak",
+                "call_id": call["id"],
+                "predicate": next(
+                    label for label in control_labels if method in label.lower()
+                ),
+            })
+    return sorted(result, key=lambda item: (item["file"] or "", item["line"] or 0,
+                                             item["call_id"]))
 
 
 def derive_roles(

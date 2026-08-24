@@ -53,6 +53,12 @@ SINK_TAXONOMY: dict[str, dict] = {
                 "constructor": "memory.copy.capacity",
                 "obligation_cwe": ("CWE-787", "CWE-120", "CWE-125"),
             },
+            "index": {
+                "kinds": (),
+                "obligation": "array index must remain below the allocated element count",
+                "constructor": "memory.index.capacity",
+                "obligation_cwe": ("CWE-787", "CWE-193"),
+            },
             "alloc": {
                 "kinds": ("alloc-size",),
                 "obligation": "allocation size must be bounded (no overflow, not attacker-huge)",

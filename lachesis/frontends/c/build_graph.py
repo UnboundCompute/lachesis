@@ -557,6 +557,11 @@ def position_from_ast(
     finish = end_source.get("offset", start) + end_source.get(
         "tokLen", loc_source.get("tokLen", 0)
     )
+    # A function-like macro can carry its begin and end from different expansion
+    # contexts, so the end's expansion offset occasionally lands before begin's,
+    # leaving finish < start. Clamp to a zero-length span at start, matching the
+    # convention position_from_line already uses, so provenance stays well-formed.
+    finish = max(start, finish)
     text = source_text(path, texts)
     starts = line_starts(path, text, line_starts_cache)
 

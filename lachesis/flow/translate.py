@@ -235,6 +235,106 @@ def _arg_records(ix, call):
     return out
 
 
+def _expression_root(label):
+    """Return the lexical root of a neutral expression, when one is visible."""
+    match = re.match(r"\s*(?:[*&]\s*)*([A-Za-z_]\w*)", str(label or ""))
+    return match.group(1) if match else None
+
+
+def _catalog_sink(sinks, callee, call_props):
+    """Look up a sink by canonical name, then by a simple module receiver.
+
+    Python's AST frontend keeps ``os.makedirs`` as method ``makedirs`` plus
+    receiver ``os``.  Atropos models the qualified library symbol, while
+    receiver methods such as ``cursor.execute`` intentionally use the bare
+    method key.  This neutral lookup preserves both forms without embedding a
+    library-specific list in the flow layer.
+    """
+    direct = sinks.get(callee)
+    if direct is not None:
+        return direct, callee
+    receiver = (call_props.get("receiver") or call_props.get("receiver_root")
+                or call_props.get("receiver_value"))
+    module = _expression_root(receiver)
+    qualified = f"{module}.{callee}" if module and module != callee else None
+    return (sinks.get(qualified), qualified) if qualified else (None, None)
+
+
+def _dynamic_property_writes(ix, regions, nest, fid):
+    """Project computed member writes into the common sink vocabulary.
+
+    Library sinks are represented by call-model rows, but a computed write such as
+    ``target[key] = value`` has no callee to model.  Frontends already preserve this
+    fact either as a T3 ``computed-property-write`` behavior (JS/TS) or as a write
+    whose property path contains a dynamic segment (Python/C).  Keep the rule here,
+    at the language-neutral boundary, so every frontend gets the same sink family.
+
+    Literal member writes deliberately do not enter this projection: ``target.foo``
+    is a named field, not an attacker-selected prototype key.
+    """
+    records, seen = [], set()
+
+    def add(node, props, target, key_expression, key_node=None):
+        target_props = _props(target)
+        if not target or not target_props.get("dynamic"):
+            return
+        anchor = props.get("site_id") or props.get("evidenced_by") or node.get("id")
+        dedupe = (anchor, props.get("target_id"), key_expression)
+        if dedupe in seen:
+            return
+        seen.add(dedupe)
+        key_label = (key_node or {}).get("label") if key_node else key_expression
+        key_root = _expression_root(key_label)
+        key_provenance = _prov((key_node or {}).get("kind")) if key_node else "local"
+        span = _span(node)
+        idents = {key_root} if key_root else set()
+        guards = _guards_for(regions, fid, idents, span)
+        record = {
+            "callee": "__computed_property_write__",
+            "line": _stmt_line(node),
+            "args": [{"pos": 0, "var": key_root, "value": key_root or key_expression,
+                      "expr": key_expression, "root": key_root,
+                      "provenance": key_provenance}],
+            "guards": guards,
+            "guard_status": _guard_status_for(regions, fid, idents, span),
+            "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
+            "is_sink": True,
+            "sink_family": "prototype-pollution",
+            "sink_arg": 0,
+            "dynamic_property_write": True,
+            "target_id": props.get("target_id"),
+            "key_expression": key_expression,
+            "dst": target.get("label"),
+            "node": anchor,
+            "control": nest.enclosing(anchor),
+        }
+        records.append(record)
+
+    # TypeScript/JavaScript emits the key's value node and target path directly.
+    for node in _by_offset(ix.nodes_owned_by(fid, "dynamic-behavior")):
+        props = _props(node)
+        if props.get("behavior_kind") != "computed-property-write":
+            continue
+        target = ix.nodes.get(props.get("target_id"))
+        key_node = ix.nodes.get(props.get("key_value_id"))
+        add(node, props, target, props.get("key_expression"), key_node)
+
+    # Python, C, and any future frontend can use the shared write/property-path
+    # contract without needing a frontend-specific behavior marker.
+    for node in _by_offset(ix.nodes_owned_by(fid, "write")):
+        props = _props(node)
+        target = ix.nodes.get(props.get("target_id"))
+        target_props = _props(target)
+        segments = target_props.get("path_segments") or ()
+        dynamic = [segment for segment in segments
+                   if isinstance(segment, dict) and segment.get("dynamic")]
+        if not dynamic:
+            continue
+        key_expression = dynamic[-1].get("key")
+        add(node, props, target, key_expression)
+    return records
+
+
 def _expanded_macro_size(call, args, macro_defs, callee):
     """Recover an allocator's size expression when Clang lowered a macro call.
 
@@ -351,7 +451,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
         guard_status = _guard_status_for(regions, fid, idents, _span(c))
-        cat = sinks.get(callee)
+        cat, catalog_name = _catalog_sink(sinks, callee, cp)
         # the variable this call's result is assigned to (any callee, not just allocators), so
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
         # wrapper's `returns=alloc` seeds an alloc, a freed-return's `returns_dangling` seeds a
@@ -362,6 +462,12 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                "guard_status": guard_status,
                "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                "is_sink": cat is not None,
+               "sink_name": catalog_name,
+               # Keep the catalog's semantic kind on the F record.  `is_sink`
+               # alone is not enough for the language-neutral matcher/security
+               # projections: it used to make every non-prototype Python sink
+               # visible only as an untyped call.
+               "sink_family": cat.get("family") if cat is not None else None,
                "assigned": assigned,
                # Managed-language lifecycle methods place the resource on the
                # receiver, not in an argument slot. Preserve that neutral
@@ -405,7 +511,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             hrec = {"callee": hcallee, "line": line, "args": args, "guards": guards,
                     "guard_status": guard_status,
                     "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
-                    "is_sink": hcat is not None, "node": c["id"],
+                    "is_sink": hcat is not None,
+                    "sink_name": hcallee if hcat is not None else None,
+                    "sink_family": hcat.get("family") if hcat is not None else None,
+                    "node": c["id"],
                     "control": rec["control"], "dispatch": "may-invoke"}
             if hcat is not None:
                 hsize = hcat.get("size_arg")
@@ -441,6 +550,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                            else "lifecycle.release"),
                            "var": _freed_identity(release_arg), "line": line,
                            "node": c["id"], "callee": callee})
+
+    dynamic_writes = _dynamic_property_writes(ix, regions, nest, fid)
+    calls.extend(dynamic_writes)
+    callees.extend(record["callee"] for record in dynamic_writes)
 
     alloc_vars = {a["var"] for a in assigns}
     tracked_vars = set()
@@ -584,14 +697,33 @@ def build_F(store, lang="c", *, return_graph=False):
     fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
     defined = {f.get("label") for f in fnodes if not _props(f).get("declaration_only")}
 
+    # Python permits many methods with the same surface name (`extract`, `close`,
+    # `execute`, ...).  The old name-keyed projection silently discarded every
+    # definition after the first one, which could erase the only source/sink body
+    # in a class hierarchy.  Preserve a stable qualified identity when the frontend
+    # gives us a class owner; retain the old spelling for unique functions and for
+    # non-class callables so existing language-neutral consumers remain compatible.
+    def function_key(fnode):
+        name = fnode.get("label")
+        props = _props(fnode)
+        owner = ix.nodes.get(props.get("owner_id")) if props.get("owner_id") else None
+        if owner and owner.get("kind") == "class" and owner.get("label"):
+            return f"{owner['label']}.{name}"
+        if sum(1 for candidate in fnodes
+               if candidate.get("label") == name
+               and not _props(candidate).get("declaration_only")) > 1:
+            return f"{name}@{props.get('absolute_file') or props.get('file')}:{props.get('start_line')}"
+        return name
+
     recs = {}
     for f in fnodes:
         if _props(f).get("declaration_only"):
             continue
-        name = f.get("label")
-        if not name or name in recs:              # first defined record wins (static dupes)
+        name = function_key(f)
+        if not name or name in recs:
             continue
         recs[name] = _walk_function(ix, regions, nest, sinks, norm, f)
+        recs[name]["name"] = name
 
     def is_lifecycle_or_sink(c):
         return c in sink_names or norm.is_acquire(c) or norm.is_release(c) or norm.is_realloc(c)
@@ -605,8 +737,9 @@ def build_F(store, lang="c", *, return_graph=False):
     reverse_callers = defaultdict(set)
     sink_reachable = set()
     for name, record in recs.items():
-        for callee in record["callees"]:
-            if is_lifecycle_or_sink(callee):
+        for call in record["calls"]:
+            callee = call.get("callee")
+            if call.get("sink_family") or is_lifecycle_or_sink(callee):
                 sink_reachable.add(name)
             elif callee in recs:
                 reverse_callers[callee].add(name)
