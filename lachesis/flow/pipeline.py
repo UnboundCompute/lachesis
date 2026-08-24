@@ -267,8 +267,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
             # Shadow mode is an explicit differential, so it must materialize
             # the legacy stream even when object analysis has no fallback
             # functions.  Otherwise the comparison silently becomes
-            # legacy-empty versus semantic and cannot audit recall.
-            skeletons = build_skeletons(F, summaries, lang=lang,
+            # legacy-empty versus semantic and cannot audit recall.  Restrict
+            # the diagnostic to the same source-rooted lifecycle slice as the
+            # production semantic graph; unrelated sink-only functions do not
+            # contribute lifetime recall and can make the old renderer explode
+            # in size on mature graphs.
+            legacy_functions = {name: F[name] for name in object_functions}
+            legacy_summaries = {name: summaries.get(name, ())
+                                for name in object_functions}
+            skeletons = build_skeletons(legacy_functions, legacy_summaries, lang=lang,
                                         include_typestate=True)
         if seed_unsafe and requested == "object":
             # Re-enable the compatibility typestate stream only for functions
