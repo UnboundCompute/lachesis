@@ -1083,6 +1083,18 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertIn("uaf.deref", patterns)
         self.assertNotIn("leak", patterns)
 
+    def test_pointer_slot_value_propagates_to_release_and_read(self):
+        item = ObjRef("item", generation="g0")
+        slot = ObjRef("items", ("[i]",), generation="g0")
+        g = self._graph([
+            ("origin", Event.origin(item)),
+            ("store", Event.write(slot, value=item)),
+            ("release", Event.release(slot)),
+            ("read", Event.read(slot)),
+        ], [("origin", "store"), ("store", "release"), ("release", "read")])
+        self.assertIn("uaf.deref",
+                      {hit["pattern"] for hit in match_graph(g)})
+
     def test_witness_keeps_the_edge_taken_when_parallel_guards_share_nodes(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

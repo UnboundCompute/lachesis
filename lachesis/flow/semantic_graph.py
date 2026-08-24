@@ -829,6 +829,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 pointer_arithmetic.add((obj, canonical(event.base)))
             is_null_write = (event.kind == EventKind.WRITE_STORAGE_NULL or
                              (event.kind == EventKind.WRITE_STORAGE and event.facts.get("null")))
+            if temporal_event and event.kind == EventKind.WRITE_STORAGE:
+                # Pointer-slot writes carry the value stored in the slot. Keep
+                # that relation separate from ordinary DERIVE aliases so a
+                # later ``free(slot)`` or slot read resolves the pointee, while
+                # nulling the slot does not rebind aliases captured earlier.
+                slot = event.slot or event.base or raw_obj
+                if slot is not None:
+                    if is_null_write:
+                        slot_bindings.pop(slot, None)
+                    elif event.value is not None:
+                        slot_bindings[slot] = canonical(event.value)
             if temporal_event and is_null_write and raw_obj:
                 # NULL is a value in this storage slot, not a property of the
                 # heap object reached through another alias.
