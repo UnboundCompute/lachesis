@@ -8,8 +8,9 @@ Lachesis never imports the binder. They agree only on this JSON-shaped dict:
       "format": "atropos-symbol-index", "version": 1,
       "language": ..., "source": ...,
       "callsites": [
-        {"id", "callee": {"name","module","receiver_type","arity","static"},
-         "call_value_id", "receiver_value_id", "arg_value_ids": [...],
+         {"id", "callee": {"name","module","receiver_type","arity","static"},
+         "call_value_id", "receiver_value_id", "receiver_expression",
+         "receiver_name", "receiver_provenance", "arg_value_ids": [...],
          "file", "line"}
       ]
     }
@@ -33,6 +34,7 @@ handle either way for ``ReturnValue`` endpoints.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 
@@ -59,6 +61,29 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
             has_arg_by_call.setdefault(edge["source"], []).append((pos, edge["target"]))
 
     callsites: List[Dict[str, Any]] = []
+    # A Python value returned by ``connection.cursor()`` often has no static
+    # type in a framework application.  Retain the lexical evidence needed by
+    # Atropos's DB-API fallback without making the binder inspect Lachesis nodes.
+    cursor_result_ids = set()
+    cursor_target_names = set()
+    for node in graph.get("nodes", ()):
+        if node.get("kind") not in {"call", "construct"}:
+            continue
+        props = node.get("properties", {})
+        if (props.get("callee_name") or props.get("method_name")
+                or props.get("callee")) == "cursor":
+            cursor_result_ids.add(props.get("value_id") or node.get("id"))
+    for node in graph.get("nodes", ()):
+        if node.get("kind") != "write":
+            continue
+        props = node.get("properties", {})
+        if props.get("value_id") not in cursor_result_ids:
+            continue
+        target = next((candidate for candidate in graph.get("nodes", ())
+                       if candidate.get("id") == props.get("target_id")), None)
+        if target and target.get("label"):
+            cursor_target_names.add(str(target["label"]))
+
     for node in graph.get("nodes", ()):
         if node.get("kind") != "call":
             continue
@@ -69,6 +94,18 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
             continue
         raw = arg_nodes_by_call.get(node["id"]) or has_arg_by_call.get(node["id"], [])
         ordered = [target for _, target in sorted(raw, key=lambda t: t[0])]
+        receiver_expression = props.get("receiver")
+        receiver_name = None
+        if receiver_expression:
+            receiver_name = re.search(r"([A-Za-z_]\w*)\s*$",
+                                       str(receiver_expression))
+            receiver_name = receiver_name.group(1) if receiver_name else None
+        receiver_provenance = None
+        if receiver_name in cursor_target_names:
+            receiver_provenance = "cursor-factory"
+        elif receiver_expression and re.search(r"\.cursor\s*\(\s*\)\s*$",
+                                                str(receiver_expression)):
+            receiver_provenance = "cursor-factory"
         callsites.append({
             "id": node["id"],
             "callee": {
@@ -80,6 +117,9 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
             },
             "call_value_id": props.get("value_id") or node["id"],
             "receiver_value_id": props.get("receiver_value_id"),
+            "receiver_expression": receiver_expression,
+            "receiver_name": receiver_name,
+            "receiver_provenance": receiver_provenance,
             "arg_value_ids": ordered,
             "file": props.get("absolute_file") or props.get("file"),
             "line": props.get("start_line"),
