@@ -794,6 +794,24 @@ class SemanticGraphTests(unittest.TestCase):
         hits = match_graph(graph)
         self.assertIn("use.dangling", {hit["pattern"] for hit in hits})
 
+    def test_loop_entry_resets_predicates_from_previous_loop(self):
+        obj = ObjRef("matrix", generation="g0")
+        graph = SkeletonGraph()
+        graph.add_node("start", Event(EventKind.BRANCH, facts={"predicate": "i < 5"}))
+        graph.add_node("entry", Event(EventKind.LOOP, facts={"loop_entry": True}))
+        graph.add_node("header", Event(EventKind.BRANCH, facts={"predicate": "i < 5"}))
+        graph.add_node("first_free", Event.release(obj, 1))
+        graph.add_node("second_free", Event.release(obj, 2))
+        graph.add_fragment("f", "start", ["second_free"])
+        graph.source_reachable = {"start"}
+        graph.add_edge("start", "entry", guard=(GuardProof("VALUE", "i>=5"),))
+        graph.add_edge("entry", "header")
+        graph.add_edge("header", "first_free", guard=(GuardProof("VALUE", "i<5"),))
+        graph.add_edge("first_free", "second_free")
+
+        hits = match_graph(graph)
+        self.assertIn("double-free", {hit["pattern"] for hit in hits})
+
     def test_abstract_identity_prevents_same_named_local_false_uaf(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

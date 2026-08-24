@@ -1489,6 +1489,18 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                 previous = return_id
             last_for_cfg[n] = previous
         cfg_positions = {node: index for index, node in enumerate(cfg_nodes)}
+        # A loop marker on the back-edge is enough to widen repeated object
+        # generations, but it is too late for path predicates when a later
+        # loop reinitializes a source variable (for example two independent
+        # ``for (i = 0; ...)`` loops).  Mark the first forward entry into every
+        # structurally detected loop header as well; the matcher uses that
+        # boundary to discard predicates from the preceding loop iteration.
+        loop_headers = {
+            target for source, targets in cfg.get("succ", {}).items()
+            for target in targets
+            if target in cfg_positions
+            and cfg_positions[target] <= cfg_positions.get(source, -1)
+        }
         internal_call_anchors = {
             call.get("node") for call in functions[name].get("calls", ())
             if dispatch_targets(name, call)
@@ -1515,7 +1527,23 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         result.add_edge(source, loop_id, guard=guard)
                         result.add_edge(loop_id, prefix + target)
                     else:
-                        result.add_edge(source, prefix + target, guard=guard)
+                        if target in loop_headers:
+                            entry_id = f"{prefix}{target}:loop-entry:{n}:{target_index}"
+                            if entry_id not in result.nodes:
+                                result.add_node(
+                                    entry_id,
+                                    Event(EventKind.LOOP, facts={
+                                        "loop_entry": True,
+                                        "back_edge_target": f"{prefix}{target}",
+                                    }),
+                                    fragment=name,
+                                    source_reachable=bool(
+                                        functions[name].get("source_reachable", False)),
+                                )
+                            result.add_edge(source, entry_id, guard=guard)
+                            result.add_edge(entry_id, prefix + target)
+                        else:
+                            result.add_edge(source, prefix + target, guard=guard)
         # A CFG terminal may have a semantic event chain appended to it (most
         # importantly RETURN_VALUE -> RETURN).  The matcher must enter/leave a
         # fragment after that chain, not at the raw CFG node, otherwise a

@@ -1222,7 +1222,12 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 next_state.abstract_contexts, next_state.launch_context)
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
-                next_state = widen_loop_state(next_state)
+                # Loop-entry markers reset path predicates for a newly
+                # initialized loop variable, but they are not back-edges and
+                # must not create a fresh generation/widening bucket on the
+                # first iteration.
+                if not target_event.facts.get("loop_entry"):
+                    next_state = widen_loop_state(next_state)
                 bucket_key = (edge.target, stack, next_state.launch_context)
                 bucket = loop_buckets.setdefault(bucket_key, [])
                 if len(bucket) >= _LOOP_WIDEN_LIMIT:
