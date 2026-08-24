@@ -263,6 +263,13 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
         # filtered per-object by the object-flow map. Legacy fallback covers seed-unsafe.
         seed_unsafe = set(diagnostics.get("seed_unsafe_functions", unsafe))
+        if requested == "shadow":
+            # Shadow mode is an explicit differential, so it must materialize
+            # the legacy stream even when object analysis has no fallback
+            # functions.  Otherwise the comparison silently becomes
+            # legacy-empty versus semantic and cannot audit recall.
+            skeletons = build_skeletons(F, summaries, lang=lang,
+                                        include_typestate=True)
         if seed_unsafe and requested == "object":
             # Re-enable the compatibility typestate stream only for functions
             # whose semantic object analysis could not produce a trustworthy
