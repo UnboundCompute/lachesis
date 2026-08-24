@@ -802,6 +802,27 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_edge("exit", "wrong", kind="return")
         self.assertEqual([h["node"] for h in match_graph(g) if h["pattern"] == "uaf.deref"], ["after"])
 
+    def test_semantic_graph_dict_round_trip_preserves_identity_and_seams(self):
+        obj = ObjRef("buf", ("*", "data", "&"), "g7")
+        formal = ObjRef("formal", ("*",), "g0")
+        g = SkeletonGraph(language="c")
+        g.add_node("start", Event.origin(obj, 4), fragment="main",
+                   source_site="read@4")
+        g.add_node("use", Event.read(obj, "data", 9), fragment="main")
+        g.add_edge("start", "use", kind="call", return_to="use",
+                   guard=(GuardProof("NONNULL", "buf#g7"),),
+                   binding=((formal, obj),), provenance=(("a", "b"),))
+        g.add_fragment("main", "start", ("use",), ("p",))
+        g.source_reachable.add("start")
+        g.coverage = {"converged": True, "covered_states": [["main", "main"]]}
+
+        restored = SkeletonGraph.from_dict(g.to_dict())
+        self.assertEqual(restored.nodes["start"].event.obj, obj)
+        self.assertEqual(restored.edges["start"][0].binding, ((formal, obj),))
+        self.assertEqual(restored.edges["start"][0].provenance, (("a", "b"),))
+        self.assertEqual(restored.source_reachable, {"start"})
+        self.assertEqual(restored.coverage["converged"], True)
+
 
 if __name__ == "__main__":
     unittest.main()

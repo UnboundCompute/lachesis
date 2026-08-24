@@ -203,6 +203,53 @@ class FragmentStore:
             "covered_contexts": [list(key) for key in sorted(self.covered_contexts)],
         }
 
+    def snapshot(self) -> dict[str, Any]:
+        """Export reusable semantic fragments and their coverage ledger.
+
+        The snapshot contains no cache key guesswork: callers must provide the
+        current semantic inputs to :meth:`restore_snapshot`, which recomputes
+        the base key before accepting a fragment.  This prevents a graph from a
+        different source revision or language from being treated as covered.
+        """
+        entries = []
+        for candidates in self._coverage_graphs.values():
+            for states, graph in candidates:
+                if not isinstance(graph, SkeletonGraph):
+                    continue
+                state_keys = [list(key[1:]) for key in states if key and key[0] == "state"]
+                context_keys = [list(key[1:]) for key in states if key and key[0] == "context"]
+                entries.append({
+                    "state_keys": state_keys,
+                    "context_keys": context_keys,
+                    "graph": graph.to_dict(),
+                })
+        return {"version": 1, "coverage": self.coverage_snapshot(),
+                "fragments": entries}
+
+    def restore_snapshot(self, payload: Mapping[str, Any], functions: Mapping[str, Mapping],
+                         lang: str, graph: Any = None, summaries: Any = None,
+                         reach_summaries: Any = None) -> int:
+        """Restore only fragments matching the supplied semantic input identity.
+
+        Returns the number of accepted fragments.  Invalid or incompatible
+        fragments are rejected by the same graph validation and cache-key path
+        used for live Claus builds; a stale snapshot is therefore a cache miss,
+        never a source of fabricated coverage.
+        """
+        accepted = 0
+        for entry in payload.get("fragments", ()) or ():
+            try:
+                semantic = SkeletonGraph.from_dict(entry["graph"])
+                coverage = {"state_keys": entry.get("state_keys", ()),
+                            "context_keys": entry.get("context_keys", ())}
+                self.put(functions, lang, graph, semantic, summaries, coverage,
+                         reach_summaries)
+            except (KeyError, TypeError, ValueError):
+                continue
+            accepted += 1
+        self.restore_coverage(payload.get("coverage", {}) or {})
+        return accepted
+
     def restore_coverage(self, snapshot: Mapping[str, Any]) -> None:
         """Restore only coverage facts; graph materialization remains independently verified."""
         for key in snapshot.get("covered_states", ()):

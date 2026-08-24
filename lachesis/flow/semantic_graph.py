@@ -243,6 +243,8 @@ class SkeletonGraph:
                            "guard": [{"kind": p.kind, "value": p.value} for p in e.guard],
                            "return_to": e.return_to,
                            "binding": [[a.render(), b.render()] for a, b in e.binding],
+                           "binding_refs": [[_obj_dict(a), _obj_dict(b)]
+                                            for a, b in e.binding],
                            **({"provenance": [list(pair) for pair in e.provenance]}
                               if e.provenance else {})}
                           for e in es] for n, es in self.edges.items()},
@@ -253,17 +255,113 @@ class SkeletonGraph:
             "language": self.language,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SkeletonGraph":
+        """Reconstruct a semantic graph from :meth:`to_dict` output.
+
+        Object references are restored from the structured ``*_ref`` fields
+        emitted by current versions.  The readable renderings remain in the
+        public payload for reports and older consumers; legacy payloads without
+        structured fields are accepted through the conservative renderer parser
+        below.  This makes persisted Pass-3 fragments independent of Python
+        object identity while retaining backwards compatibility.
+        """
+        graph = cls(language=payload.get("language"))
+        for node_id, raw in (payload.get("nodes") or {}).items():
+            event = _event_from_dict(raw.get("event")) if raw.get("event") else None
+            graph.add_node(node_id, event, fragment=raw.get("fragment"),
+                          **dict(raw.get("metadata") or {}))
+        for source, raw_edges in (payload.get("edges") or {}).items():
+            for raw in raw_edges or ():
+                guards = tuple(GuardProof(str(item.get("kind", "")),
+                                           str(item.get("value", "")))
+                               for item in raw.get("guard", ()) or ())
+                binding_payload = raw.get("binding_refs") or raw.get("binding", ())
+                bindings = tuple(
+                    (_obj_from_payload(left), _obj_from_payload(right))
+                    for left, right in binding_payload
+                )
+                graph.add_edge(source, raw["target"], kind=raw.get("kind", "normal"),
+                               guard=guards, return_to=raw.get("return_to"),
+                               binding=bindings,
+                               provenance=tuple(tuple(pair) for pair in
+                                                 raw.get("provenance", ()) or ()))
+        for name, raw in (payload.get("fragments") or {}).items():
+            graph.add_fragment(name, raw["entry"], raw.get("exits", ()),
+                               raw.get("params", ()))
+        graph.source_reachable.update(payload.get("source_reachable", ()) or ())
+        graph.coverage = dict(payload.get("coverage") or {})
+        graph.validate()
+        return graph
+
 
 def _event_dict(event: Event | None) -> dict[str, Any] | None:
     if event is None:
         return None
     kind = event.kind.value if isinstance(event.kind, EventKind) else event.kind
     return {"kind": kind, "obj": event.obj.render() if event.obj else None,
+            "obj_ref": _obj_dict(event.obj),
             "base": event.base.render() if event.base else None,
+            "base_ref": _obj_dict(event.base),
             "path": event.path,
             "value": event.value.render() if event.value else None,
-            "slot": event.slot.render() if event.slot else None, "line": event.line,
+            "value_ref": _obj_dict(event.value),
+            "slot": event.slot.render() if event.slot else None,
+            "slot_ref": _obj_dict(event.slot), "line": event.line,
             "facts": event.facts, "proofs": [{"kind": p.kind, "value": p.value} for p in event.proofs]}
+
+
+def _obj_dict(value: ObjRef | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return {"base": value.base, "path": list(value.path), "generation": value.generation}
+
+
+def _obj_from_payload(value: Any) -> ObjRef:
+    """Decode a structured ObjRef or a legacy rendered reference."""
+    if isinstance(value, dict):
+        return ObjRef(str(value.get("base", "")), tuple(value.get("path", ()) or ()),
+                      value.get("generation", "G0"))
+    text = str(value)
+    base_generation = text.rsplit("#", 1)
+    rendered, generation = (base_generation if len(base_generation) == 2
+                            else (text, "G0"))
+    # Old renderings are inherently ambiguous for adjacent field selectors.
+    # Preserve the common address/field forms and treat the remaining suffix as
+    # one selector; new payloads always use the lossless structured form above.
+    match = re.match(r"^([^*&.\[]+)((?:[&*]|\.[^.&*\[]+|\[[^]]+\])*)$", rendered)
+    if not match:
+        return ObjRef(rendered, generation=generation)
+    base, suffix = match.groups()
+    selectors = []
+    for token in re.findall(r"[&*]|\.([^.&*\[]+)|(\[[^]]+\])", suffix):
+        selectors.append(next(part for part in token if part))
+    return ObjRef(base, tuple(selectors), generation)
+
+
+def _event_from_dict(raw: dict[str, Any]) -> Event:
+    kind_value = raw.get("kind")
+    try:
+        kind = EventKind(kind_value)
+    except ValueError:
+        kind = kind_value
+    return Event(kind, obj=_obj_from_payload(raw["obj_ref"])
+                 if raw.get("obj_ref") is not None else
+                 (_obj_from_payload(raw["obj"]) if raw.get("obj") else None),
+                 base=_obj_from_payload(raw["base_ref"])
+                 if raw.get("base_ref") is not None else
+                 (_obj_from_payload(raw["base"]) if raw.get("base") else None),
+                 path=raw.get("path"),
+                 value=_obj_from_payload(raw["value_ref"])
+                 if raw.get("value_ref") is not None else
+                 (_obj_from_payload(raw["value"]) if raw.get("value") else None),
+                 slot=_obj_from_payload(raw["slot_ref"])
+                 if raw.get("slot_ref") is not None else
+                 (_obj_from_payload(raw["slot"]) if raw.get("slot") else None),
+                 line=raw.get("line"), facts=dict(raw.get("facts") or {}),
+                 proofs=tuple(GuardProof(str(p.get("kind", "")),
+                                         str(p.get("value", "")))
+                              for p in raw.get("proofs", ()) or ()))
 
 
 def _normalized_path(path: tuple[str, ...]) -> tuple[str, ...]:

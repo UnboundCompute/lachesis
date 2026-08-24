@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -98,9 +99,37 @@ class CoverageSchedulerTests(unittest.TestCase):
         store = FragmentStore()
         store.mark_covered([("worker", "source")])
         store.mark_contexts_covered([("worker", "source", "site_a")])
+        json.dumps(original.snapshot())
         restored = FragmentStore()
         restored.restore_coverage(store.coverage_snapshot())
         self.assertEqual(restored.coverage_snapshot(), store.coverage_snapshot())
+
+    def test_fragment_snapshot_round_trips_graph_and_coverage(self):
+        functions = {"source": {}, "worker": {}}
+        graph_key = {"nodes": ["source", "worker"]}
+        semantic = SkeletonGraph(language="c")
+        semantic.add_node("source:entry", fragment="source")
+        semantic.add_node("worker:entry", fragment="worker")
+        semantic.add_edge("source:entry", "worker:entry")
+        semantic.add_fragment("source", "source:entry", ("source:entry",))
+        semantic.add_fragment("worker", "worker:entry", ("worker:entry",))
+
+        original = FragmentStore()
+        original.put(functions, "c", graph_key, semantic,
+                    coverage={"state_keys": [["worker", "source"]],
+                              "context_keys": [["worker", "source", "site"]]})
+        original.mark_covered([("worker", "source")])
+        original.mark_contexts_covered([("worker", "source", "site")])
+
+        restored = FragmentStore()
+        self.assertEqual(restored.restore_snapshot(
+            original.snapshot(), functions, "c", graph_key), 1)
+        self.assertEqual(restored.coverage_snapshot(), original.coverage_snapshot())
+        cached = restored.get(
+            functions, "c", graph_key,
+            coverage={"state_keys": [["worker", "source"]],
+                      "context_keys": [["worker", "source", "site"]]})
+        self.assertEqual(set(cached.nodes), set(semantic.nodes))
 
     def test_fragment_cache_key_includes_coverage_states(self):
         store = FragmentStore()
