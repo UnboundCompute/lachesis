@@ -518,7 +518,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     ``semantic_graph.match_graph``.  Calls are represented by seam nodes and return-site
     continuations, so a shared callee cannot return into another caller's path.
     """
-    if not _native_object_substrate(graph):
+    available_graph = graph if graph is not None else getattr(store, "graph", None)
+    if not _native_object_substrate(available_graph):
         return _build_ir_semantic_graph(F, succ, lang=lang)
     functions = _lifetime_slice(F, succ, lang=lang)
     if not functions:
