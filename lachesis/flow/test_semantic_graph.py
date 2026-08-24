@@ -698,6 +698,7 @@ class SemanticGraphTests(unittest.TestCase):
 
     def test_pointer_arithmetic_before_validation_has_public_id(self):
         self.assertEqual(atropos.event_evaluator("pointer_arithmetic"), "typestate")
+        self.assertEqual(atropos.event_evaluator("derive"), "typestate")
         base = ObjRef("buffer")
         derived = ObjRef("location")
         events = [
