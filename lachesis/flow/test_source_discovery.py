@@ -16,6 +16,7 @@ class SourceDiscoveryTests(unittest.TestCase):
         result = discover_sources(functions, {"handle": ["worker"], "worker": []},
                                   {"read_input": {"kind": "user-input"}})
         self.assertEqual(result.launch_nodes["handle"], ("read",))
+        self.assertEqual(result.launch_provenance["handle"], "catalog")
         self.assertEqual(result.sites[0].kind, "user-input")
         self.assertEqual(result.bindings[0].formal_to_actual, (("value", "buf"),))
         self.assertEqual(result.reachable_functions, {"handle", "worker"})
@@ -26,6 +27,7 @@ class SourceDiscoveryTests(unittest.TestCase):
         result = discover_sources({"main": {"callers": [], "params": (), "calls": []}},
                                   {"main": []})
         self.assertEqual(result.launch_nodes, {"main": ("__entry__",)})
+        self.assertEqual(result.launch_provenance, {"main": "structural"})
         self.assertEqual(result.sites, ())
 
 

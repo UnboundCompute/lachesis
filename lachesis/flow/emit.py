@@ -1136,9 +1136,11 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             continue
         prefix = f"{name}:"
         function_source_reachable = bool(functions[name].get("source_reachable", False))
+        source_provenance = functions[name].get("source_provenance", "unknown")
         for n in cfg_nodes:
             result.add_node(prefix + n, fragment=name,
-                            source_reachable=function_source_reachable)
+                            source_reachable=function_source_reachable,
+                            source_provenance=source_provenance)
         predecessors = defaultdict(int)
         for source, targets in cfg.get("succ", {}).items():
             for target in targets:

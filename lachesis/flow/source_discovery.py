@@ -36,6 +36,11 @@ class SourceDiscovery:
     sites: tuple[SourceSite, ...] = ()
     bindings: tuple[SeamBinding, ...] = ()
     launch_nodes: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # ``catalog`` means an observed external-source call. ``structural`` is a
+    # callerless fallback used when a frontend does not publish entry/export
+    # metadata; it is coverage-rooted, but must not be reported as proof of an
+    # externally exported entry point.
+    launch_provenance: dict[str, str] = field(default_factory=dict)
     reachable_functions: set[str] = field(default_factory=set)
     influenced_roots: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -55,6 +60,7 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
     sites: list[SourceSite] = []
     bindings: list[SeamBinding] = []
     launches: dict[str, list[str]] = {}
+    launch_provenance: dict[str, str] = {}
     influenced: dict[str, set[str]] = {function: set() for function in F}
 
     for caller, record in F.items():
@@ -86,6 +92,7 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
             sites.append(site)
             if call.get("node"):
                 launches.setdefault(caller, []).append(call["node"])
+                launch_provenance[caller] = "catalog"
 
     # Structural entries are a fallback only. Catalog-backed source sites remain the preferred
     # launch points and carry influence roots for Tier 1 ranking.
@@ -94,6 +101,7 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
             continue
         if not record.get("callers"):
             launches[function] = ["__entry__"]
+            launch_provenance[function] = "structural"
 
     reachable = set(launches)
     work = list(reachable)
@@ -131,5 +139,6 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
                         changed = True
 
     return SourceDiscovery(tuple(sites), tuple(bindings),
-                           {name: tuple(nodes) for name, nodes in launches.items()}, reachable,
+                           {name: tuple(nodes) for name, nodes in launches.items()},
+                           launch_provenance, reachable,
                            {name: tuple(sorted(roots)) for name, roots in influenced.items()})
