@@ -452,6 +452,26 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             """Compare canonical representatives after seam/derive composition."""
             return canonical(left) == canonical(right)
 
+        def escaped_reaches(value: ObjRef | None) -> bool:
+            """Whether an escaped object keeps this object/path reachable.
+
+            Returning an owning aggregate (``return b``) also returns ownership
+            of allocations stored in its fields (``b->data``).  Exact identity
+            equality is insufficient for that case, while treating every
+            escaped object as a root would incorrectly discharge unrelated
+            allocations.  A canonical path-prefix relation is the precise
+            field-sensitive boundary.
+            """
+            value = canonical(value)
+            if value is None:
+                return False
+            return any(
+                root.base == value.base
+                and root.generation == value.generation
+                and value.path[:len(root.path)] == root.path
+                for root in escaped
+            )
+
         def witness() -> _WitnessPath:
             path = []
             edges = []
@@ -602,8 +622,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 live_obj = canonical(lost_obj)
                 released_live = any(equivalent(released_obj, live_obj)
                                     for released_obj, _ in released)
-                escaped_live = any(equivalent(escaped_obj, live_obj)
-                                   for escaped_obj in escaped)
+                escaped_live = escaped_reaches(live_obj)
                 alias_live = any(alias != live_obj and equivalent(alias, live_obj)
                                  for alias in bindings)
                 if not released_live and not escaped_live and not alias_live:
@@ -615,7 +634,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 live_obj = canonical(obj)
                 released_live = any(equivalent(released_obj, live_obj)
                                      for released_obj, _ in released)
-                escaped_live = any(equivalent(escaped_obj, live_obj) for escaped_obj in escaped)
+                escaped_live = escaped_reaches(live_obj)
                 alias_live = any(alias != live_obj and equivalent(alias, live_obj)
                                  for alias in bindings)
                 if not released_live and not escaped_live and not alias_live:

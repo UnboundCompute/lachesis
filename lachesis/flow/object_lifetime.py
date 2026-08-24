@@ -490,7 +490,12 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         if sub.kind(node) != "ReturnStmt":
             continue
         for child in sub.ast_children.get(node, ()):
-            target = _path(ap_builder, child)
+            # Return expressions are commonly wrapped in an implicit cast or
+            # parenthesized expression.  Resolve the value after peeling those
+            # transparent nodes, otherwise a returned heap object is omitted
+            # from the semantic RETURN_VALUE fact and is incorrectly reported
+            # as a leak at the fragment exit.
+            target = _path(ap_builder, _peel(sub, child))
             if target is not None:
                 root_id = target.root.removeprefix("decl:")
                 root_props = sub.props(root_id)

@@ -800,9 +800,15 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         result.add_edge(loop_id, prefix + target)
                     else:
                         result.add_edge(source, prefix + target, guard=guard)
-        exits = {n for n in cfg_nodes if not cfg.get("succ", {}).get(n)}
+        # A CFG terminal may have a semantic event chain appended to it (most
+        # importantly RETURN_VALUE -> RETURN).  The matcher must enter/leave a
+        # fragment after that chain, not at the raw CFG node, otherwise a
+        # caller can return before observing the returned object and the leak
+        # matcher reports a false positive for every returned allocation.
+        exits = {last_for_cfg[n] for n in cfg_nodes
+                 if not cfg.get("succ", {}).get(n)}
         result.add_fragment(name, prefix + cfg_nodes[0],
-                            (prefix + n for n in exits),
+                            exits,
                             params=tuple(functions[name].get("params", ())))
         fragment_last[name] = last_for_cfg
 
