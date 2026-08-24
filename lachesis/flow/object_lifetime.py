@@ -240,6 +240,25 @@ def _argument_path(sub, ap_builder, call_node, position):
     return _path(ap_builder, argument)
 
 
+def _receiver_path(sub, ap_builder, call_node):
+    """Resolve a method receiver as an object access path.
+
+    C-style deallocators take the object in argument zero, but managed and
+    C++-style release operations can put ownership on the receiver
+    (``handle.close()`` / ``owner.reset()``). The graph overlay records that
+    receiver independently of positional arguments.
+    """
+    props = sub.props(call_node)
+    receiver = (props.get("receiver_value_id") or props.get("receiver_symbol_id")
+                or props.get("receiver_id"))
+    if receiver is not None:
+        path = _path(ap_builder, _peel(sub, receiver))
+        if path is not None:
+            return path
+    receiver_node = sub.role_child_at(call_node, "RECEIVER", 0)
+    return _path(ap_builder, _peel(sub, receiver_node))
+
+
 def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, ...], ...]:
     """Collect field paths present in the program for bulk struct copies.
 
@@ -387,7 +406,8 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         # dispose, release, ...), so the object engine consumes the same
         # catalogue-backed fact that the translator emits.
         if norm.is_release(callee):
-            target = _argument_path(sub, ap_builder, call_node, 0)
+            target = (_argument_path(sub, ap_builder, call_node, 0)
+                      or _receiver_path(sub, ap_builder, call_node))
             if target is not None:
                 operations.append(_op(OpKind.FREE, anchor, target=target,
                                       line=line, ordinal=20))
