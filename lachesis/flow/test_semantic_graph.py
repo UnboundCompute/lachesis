@@ -84,6 +84,34 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["pattern"] == "uaf.deref" for hit in hits))
         self.assertTrue(all(hit["witness_complete"] for hit in hits))
 
+    def test_frontend_ir_fallback_routes_sink_facts_through_atropos(self):
+        from unittest.mock import patch
+        from .emit import build_semantic_graph
+
+        functions = {
+            "entry": {
+                "is_source": True,
+                "source_reachable": True,
+                "events": [],
+                "calls": [{"callee": "copy_like", "line": 8,
+                           "is_sink": True,
+                           "args": [{"pos": 0, "root": "input",
+                                     "provenance": "param"}],
+                           "guards": [], "guard_status": "none-observed",
+                           "guard_predicates": (), "control": [],
+                           "size_expr": "length", "dst": "buffer"}],
+                "params": ["input"],
+            },
+        }
+        catalog = {"copy_like": {"sink_args": (0,),
+                                  "kinds": {0: "buffer-write"}}}
+        with patch("lachesis.flow.emit.atropos.sink_catalog",
+                   return_value=catalog):
+            graph = build_semantic_graph(object(), functions, {"entry": []},
+                                         lang="python", graph={})
+        hits = match_graph(graph)
+        self.assertTrue(any(hit["pattern"] == "relational" for hit in hits))
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:

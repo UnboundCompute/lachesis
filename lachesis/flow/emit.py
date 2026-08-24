@@ -486,14 +486,21 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                 sink_id = f"{fn}:ir:sink:{index}:{arg_pos}"
                 sink_obj = ref(argument.get("root") or argument.get("var")
                                or callee)
+                recipe = evaluator_for(family)
+                relational = (recipe == "relational" or
+                              isinstance(recipe, (list, tuple))
+                              and "relational" in recipe)
+                guarded = bool(item.get("guards"))
                 facts = {
                     "family": family,
                     "callee": callee,
                     "arg": arg_pos,
                     "tainted": argument.get("provenance") != "const",
-                    "guarded": bool(item.get("guards")),
+                    "guarded": guarded,
                     "guard_status": item.get("guard_status"),
                     "guard_predicates": item.get("guard_predicates") or (),
+                    "bound": ("bounded" if guarded else "unbounded")
+                             if relational else None,
                     "size_expr": item.get("size_expr"),
                     "dst": item.get("dst"),
                     "control": item.get("control") or (),
