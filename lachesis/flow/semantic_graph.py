@@ -296,6 +296,7 @@ class _State:
     stack: tuple[str, ...] = ()
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
+    nonnull: frozenset[ObjRef] = frozenset()
     escaped: frozenset[ObjRef] = frozenset()
     sink_allocs: tuple[tuple[str, str], ...] = ()
     nullable: frozenset[ObjRef] = frozenset()
@@ -345,6 +346,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             right.stack,
             tuple(sorted(merged_bindings.items(), key=repr)),
             left.nulls | right.nulls,
+            left.nonnull | right.nonnull,
             left.escaped | right.escaped,
             tuple(sorted(set(left.sink_allocs) | set(right.sink_allocs))),
             left.nullable | right.nullable,
@@ -370,6 +372,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         released = set(state.released)
         origins = set(state.origins)
         nulls = set(state.nulls)
+        nonnull = set(state.nonnull)
         bindings = dict(state.bindings)
         escaped = set(state.escaped)
         sink_allocs = dict(state.sink_allocs)
@@ -392,6 +395,21 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 visited.add(value)
                 value = abstract_bindings[value]
             return value
+
+        def guard_stem(value: str) -> str:
+            """Normalize source-level member spelling to ObjRef path spelling."""
+            return str(value).replace("->", "*").replace(".", "*")
+
+        def guard_reference(value: str) -> ObjRef | None:
+            """Resolve a source-level guard operand in the current seam scope."""
+            if "#" not in str(value):
+                return None
+            stem, generation = str(value).rsplit("#", 1)
+            normalized = guard_stem(stem)
+            parts = tuple(part for part in normalized.split("*") if part)
+            if not parts:
+                return None
+            return canonical(ObjRef(parts[0], parts[1:], generation))
 
         def canonical(value: ObjRef | None) -> ObjRef | None:
             seen = set()
@@ -506,6 +524,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # NULL is a value in this storage slot, not a property of the
                 # heap object reached through another alias.
                 nulls.add(raw_obj)
+                nonnull.discard(raw_obj)
+                if obj is not None:
+                    nonnull.discard(obj)
                 obj = None
             if event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
@@ -566,8 +587,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 nulls.discard(raw_obj)
                 if event.facts.get("return_may_null"):
                     nullable.add(obj)
+                    nonnull.discard(obj)
                 else:
                     nullable.discard(obj)
+                    nonnull.add(obj)
             elif event.kind == EventKind.LOST_FROM_SLOT and raw_obj:
                 # Losing the owning slot does not free the object.  A DERIVE
                 # alias remains a live root; without one, the origin is leaked.
@@ -619,6 +642,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             # followed by ``p = NULL`` leaves q's value unchanged.  A seam
             # binding does transfer a formal's value/nullness to its actual.
             next_nulls = set(nulls)
+            next_nonnull = {rebased for nonnull_obj in nonnull
+                            if (rebased := rebase(nonnull_obj)) is not None}
             next_nullable = {rebased for nullable_obj in nullable
                              if (rebased := rebase(nullable_obj)) is not None}
             next_realloc_lost = {rebased for lost_obj in realloc_lost
@@ -631,32 +656,51 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             for formal, actual in edge.binding:
                 if formal in next_nulls:
                     next_nulls.add(actual)
+                if formal in next_nonnull:
+                    next_nonnull.add(actual)
             next_escaped = {rebased for escaped_obj in escaped
                             if (rebased := rebase(escaped_obj)) is not None}
-            known = set(next_origins) | set(next_nulls) | {obj for obj, _ in next_released}
+            known = (set(next_origins) | set(next_nulls) | set(next_nonnull)
+                     | {obj for obj, _ in next_released})
+            contradictory_guard = False
             for proof in edge.guard:
-                guarded_obj = None
+                candidates = []
                 if "#" in proof.value:
-                    stem = proof.value.rsplit("#", 1)[0]
+                    reference = guard_reference(proof.value)
                     # Null tests constrain the current variable binding, not a stale
                     # allocation incarnation. Prefer active origins/nulls and the
                     # highest numeric generation when the source-level proof says `p`.
-                    candidates = [candidate for candidate in (next_origins | next_nulls)
-                                  if candidate.render().rsplit("#", 1)[0] == stem]
+                    if reference is not None:
+                        candidates = [candidate for candidate in
+                                      (next_origins | next_nulls | next_nonnull)
+                                      if (candidate.base, candidate.path) ==
+                                      (reference.base, reference.path)]
                     if not candidates:
                         candidates = [candidate for candidate in known
-                                      if candidate.render() == proof.value]
-                    if candidates:
-                        guarded_obj = max(candidates, key=lambda candidate: repr(candidate.generation))
-                if guarded_obj is None:
+                                      if guard_stem(candidate.render()) == guard_stem(proof.value)]
+                if not candidates:
                     continue
+                guarded_obj = max(candidates, key=lambda candidate: repr(candidate.generation))
                 if proof.kind == "ISNULL":
+                    if guarded_obj in next_nonnull:
+                        # A path that has already established this value as
+                        # non-null cannot enter its null arm.
+                        contradictory_guard = True
+                        break
                     next_origins.discard(guarded_obj)
                     next_nulls.add(guarded_obj)
+                    next_nonnull.discard(guarded_obj)
                     next_nullable.discard(guarded_obj)
                 elif proof.kind == "NONNULL":
+                    if guarded_obj in next_nulls:
+                        # A known-null value cannot enter a non-null arm.
+                        contradictory_guard = True
+                        break
                     next_nulls.discard(guarded_obj)
+                    next_nonnull.add(guarded_obj)
                     next_nullable.discard(guarded_obj)
+            if contradictory_guard:
+                continue
             if edge.kind == "call":
                 if edge.return_to is None:
                     raise ValueError(f"call edge {state.node}->{edge.target} lacks return_to")
@@ -678,6 +722,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     next_escaped.discard(rebase(receiver))
             next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
+                                frozenset(next_nonnull),
                                 frozenset(next_escaped),
                                 tuple(sorted(sink_allocs.items())),
                                 frozenset(next_nullable),
@@ -687,6 +732,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             next_state = _State(
                 next_state.node, next_state.released, next_state.origins,
                 next_state.stack, next_state.bindings, next_state.nulls,
+                next_state.nonnull,
                 next_state.escaped, next_state.sink_allocs, next_state.nullable,
                 next_state.realloc_lost, frozenset(next_pointer_arithmetic),
                 next_state.abstract_bindings, next_state.abstract_released,

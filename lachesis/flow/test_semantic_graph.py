@@ -403,6 +403,60 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(hit["witness_edges"][0]["guards"],
                          [{"kind": "NONNULL", "value": "p#g0"}])
 
+    def test_guard_compatibility_survives_a_formal_to_field_seam(self):
+        actual = ObjRef("s", ("*", "request"), generation="g0")
+        formal = ObjRef("b", generation="g0")
+        g = SkeletonGraph()
+        for node, event in [
+                ("start", Event.origin(actual)),
+                ("enter", Event(EventKind.SEAM_ENTER)),
+                ("check", None),
+                ("free", Event.release(formal)),
+                ("exit", Event(EventKind.SEAM_EXIT)),
+                ("after", Event.read(actual)),
+        ]:
+            g.add_node(node, event, fragment="caller" if node in {"start", "after"}
+                       else "callee")
+        g.add_edge("start", "enter", kind="call", return_to="after",
+                   binding=((formal, actual),))
+        g.add_edge("enter", "check")
+        g.add_edge("check", "free", guard=(GuardProof("ISNULL", "b#g0"),))
+        g.add_edge("check", "free", guard=(GuardProof("NONNULL", "b#g0"),))
+        g.add_edge("free", "exit")
+        g.add_edge("exit", "after", kind="return")
+        g.add_fragment("caller", "start", ["after"])
+        g.add_fragment("callee", "enter", ["exit"])
+        hit = next(item for item in match_graph(g) if item["pattern"] == "uaf.deref")
+        self.assertEqual(hit["witness_edges"][2]["guards"],
+                         [{"kind": "NONNULL", "value": "b#g0"}])
+
+    def test_guard_state_does_not_cross_mutually_exclusive_cfg_arms(self):
+        obj = ObjRef("p", generation="g0")
+        g = SkeletonGraph()
+        g.add_node("start", Event.origin(obj), fragment="main")
+        g.add_node("first_check", Event(EventKind.BRANCH), fragment="main")
+        g.add_node("success", None, fragment="main")
+        g.add_node("failure", None, fragment="main")
+        g.add_node("merge", None, fragment="main")
+        g.add_node("second_check", Event(EventKind.BRANCH), fragment="main")
+        g.add_node("free", Event.release(obj), fragment="main")
+        g.add_node("use", Event.read(obj), fragment="main")
+        g.add_edge("start", "first_check")
+        g.add_edge("first_check", "success",
+                   guard=(GuardProof("NONNULL", "p#g0"),))
+        g.add_edge("first_check", "failure",
+                   guard=(GuardProof("ISNULL", "p#g0"),))
+        g.add_edge("success", "merge")
+        g.add_edge("failure", "merge")
+        # This resembles a real CFG join: the later null arm is only feasible
+        # on the earlier null path, never after the known-nonnull arm.
+        g.add_edge("merge", "second_check")
+        g.add_edge("second_check", "free",
+                   guard=(GuardProof("ISNULL", "p#g0"),))
+        g.add_edge("free", "use")
+        g.add_fragment("main", "start", ["use"])
+        self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_call_returns_only_to_pushed_continuation(self):
         o = ObjRef("O", generation="g0")
         g = SkeletonGraph()
