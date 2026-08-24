@@ -255,8 +255,18 @@ class FragmentStore:
                             "context_keys": entry.get("context_keys", ())}
                 self.put(functions, lang, graph, semantic, summaries, coverage,
                          reach_summaries)
-                self.mark_covered(coverage["state_keys"])
-                self.mark_contexts_covered(coverage["context_keys"])
+                # A matching semantic fingerprint proves only that the
+                # snapshot was built from the same inputs.  It does not prove
+                # that the serialized graph still contains every source-rooted
+                # path it claims to cover. Reuse the live materialization
+                # checks so a truncated or hand-edited sidecar cannot create a
+                # false convergence result.
+                materialized_states = Claus._materialized_states(
+                    semantic, coverage["state_keys"])
+                materialized_contexts = Claus._materialized_contexts(
+                    semantic, coverage["context_keys"])
+                self.mark_covered(materialized_states)
+                self.mark_contexts_covered(materialized_contexts)
             except (KeyError, TypeError, ValueError):
                 continue
             accepted += 1

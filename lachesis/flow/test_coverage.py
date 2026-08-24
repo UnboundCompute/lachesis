@@ -114,11 +114,13 @@ class CoverageSchedulerTests(unittest.TestCase):
         functions = {"source": {}, "worker": {}}
         graph_key = {"nodes": ["source", "worker"]}
         semantic = SkeletonGraph(language="c")
-        semantic.add_node("source:entry", fragment="source")
+        semantic.add_node("source:entry", fragment="source", source_site="site",
+                          source_reachable=True)
         semantic.add_node("worker:entry", fragment="worker")
         semantic.add_edge("source:entry", "worker:entry")
         semantic.add_fragment("source", "source:entry", ("source:entry",))
         semantic.add_fragment("worker", "worker:entry", ("worker:entry",))
+        semantic.source_reachable.add("source:entry")
 
         original = FragmentStore()
         original.put(functions, "c", graph_key, semantic,
@@ -165,6 +167,24 @@ class CoverageSchedulerTests(unittest.TestCase):
             self.assertIsNotNone(restored.get(
                 functions, "c", graph_key,
                 coverage={"state_keys": [["worker", "source"]]}))
+
+    def test_snapshot_does_not_restore_unmaterialized_state_as_covered(self):
+        functions = {"source": {}, "worker": {}}
+        graph_key = {"nodes": ["source", "worker"]}
+        semantic = SkeletonGraph(language="c")
+        semantic.add_node("source:entry", fragment="source")
+        semantic.add_node("worker:entry", fragment="worker")
+        semantic.add_fragment("source", "source:entry", ("source:entry",))
+        semantic.add_fragment("worker", "worker:entry", ("worker:entry",))
+        original = FragmentStore()
+        original.put(functions, "c", graph_key, semantic,
+                    coverage={"state_keys": [["worker", "source"]]})
+        original.mark_covered([("worker", "source")])
+
+        restored = FragmentStore()
+        self.assertEqual(restored.restore_snapshot(
+            original.snapshot(), functions, "c", graph_key), 1)
+        self.assertEqual(restored.covered_states, set())
 
     def test_fragment_cache_key_includes_coverage_states(self):
         store = FragmentStore()
