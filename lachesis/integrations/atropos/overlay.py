@@ -64,6 +64,9 @@ def stamps_from_report(report: Dict[str, Any],
                 "kind": model.get("kind"), "cwe": model.get("cwe", []),
                 "confidence": model.get("confidence", "medium"),
                 "access_path": model.get("access_path"),
+                # Allocation metadata is retained on the stamp so planners can
+                # recover element counts without maintaining a second catalog.
+                "element_count_arg": model.get("element_count_arg"),
             }
             edge = attachment.get("edge")
             if role == "summary" or edge:

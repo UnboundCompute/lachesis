@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from . import taxonomy
 from .sink_obligation import sink_constructor
 from .unbounded_copy import MemoryCopyCapacity
+from .index_capacity import MemoryIndexCapacity
 from .lifecycle_obligation import constructors as lifecycle_constructors
 from .temporal_obligation import temporal_constructor
 
@@ -16,6 +17,7 @@ from .temporal_obligation import temporal_constructor
 # -- that comes entirely from `taxonomy.family_specs()`.
 _SPECIALIZED: dict[str, type] = {
     MemoryCopyCapacity.metadata["id"]: MemoryCopyCapacity,
+    MemoryIndexCapacity.metadata["id"]: MemoryIndexCapacity,
     **lifecycle_constructors(),
 }
 
