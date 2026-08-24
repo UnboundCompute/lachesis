@@ -176,6 +176,26 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(kinds.count(EventKind.RELEASE), 1)
         self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(graph)})
 
+    def test_managed_language_lifecycle_roles_cover_javascript_and_typescript(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {"is_source": True, "source_reachable": True,
+                     "events": [], "calls": [
+                         {"callee": "fs.open", "assigned": "handle", "line": 1,
+                          "args": []},
+                         {"callee": "close", "receiver": "handle", "line": 2,
+                          "args": []},
+                     ]},
+        }
+        for language in ("javascript", "typescript"):
+            graph = build_semantic_graph(object(), functions, {"main": []},
+                                         lang=language, graph={})
+            kinds = [node.event.kind for node in graph.nodes.values()
+                     if node.event is not None]
+            self.assertEqual(kinds.count(EventKind.ORIGIN), 1, language)
+            self.assertEqual(kinds.count(EventKind.RELEASE), 1, language)
+
     def test_frontend_ir_source_calls_become_external_launch_nodes(self):
         from .emit import build_semantic_graph
 
