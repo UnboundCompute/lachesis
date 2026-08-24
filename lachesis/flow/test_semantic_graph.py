@@ -62,6 +62,14 @@ class SemanticGraphTests(unittest.TestCase):
             for entry in atropos.sink_catalog(language).values():
                 positions = entry.get("sink_args", ())
                 self.assertEqual(len(positions), len(set(positions)), language)
+            for entry in atropos.source_catalog(language).values():
+                positions = entry.get("args", ())
+                self.assertEqual(len(positions), len(set(positions)), language)
+            for entry in atropos.sanitizer_catalog(language).values():
+                positions = entry.get("ins", ())
+                self.assertEqual(len(positions), len(set(positions)), language)
+            for pairs in atropos.summary_catalog(language).values():
+                self.assertEqual(len(pairs), len(set(pairs)), language)
 
     def test_frontend_ir_fallback_preserves_pushdown_lifecycle_order(self):
         from .emit import build_semantic_graph

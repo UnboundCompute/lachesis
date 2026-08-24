@@ -104,10 +104,13 @@ def load(lang):
             src_id, dst_id = _decode_ap(lhs), _decode_ap(rhs)
             if role == "sanitizer":                       # value cleaned crossing the call
                 san = sanitizers.setdefault(method, {"ins": [], "out": "ret"})
-                san["ins"].append(src_id)
+                if src_id not in san["ins"]:
+                    san["ins"].append(src_id)
                 san["out"] = dst_id
             else:                                          # taint passthrough summary
-                summaries.setdefault(method, []).append((src_id, dst_id))
+                pair = (src_id, dst_id)
+                if pair not in summaries.setdefault(method, []):
+                    summaries[method].append(pair)
             continue
         arg = _decode_ap(ap)
         if role == "sink":
@@ -129,10 +132,12 @@ def load(lang):
                 s["family"] = e.get("kind")
         elif role == "source":
             src = sources.setdefault(method, {"args": [], "kind": e.get("kind")})
-            src["args"].append(arg)
+            if arg not in src["args"]:
+                src["args"].append(arg)
         elif role == "sanitizer":
             san = sanitizers.setdefault(method, {"ins": [], "out": "ret"})
-            san["ins"].append(arg)
+            if arg not in san["ins"]:
+                san["ins"].append(arg)
     _CACHE[lang] = (sinks, sources, sanitizers, summaries)
     return _CACHE[lang]
 
