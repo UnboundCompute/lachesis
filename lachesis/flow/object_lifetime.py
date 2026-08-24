@@ -259,6 +259,17 @@ def _receiver_path(sub, ap_builder, call_node):
     return _path(ap_builder, _peel(sub, receiver_node))
 
 
+def _aggregate_type_key(type_name):
+    """Normalize frontend spelling for aggregate-field catalogue lookup."""
+    if not type_name:
+        return "<unknown>"
+    text = " ".join(str(type_name).split()).lower()
+    for qualifier in ("const ", "volatile ", "restrict ", "struct ",
+                      "class ", "union ", "enum "):
+        text = text.replace(qualifier, "")
+    return text.replace("*", "").strip() or "<unknown>"
+
+
 def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, ...], ...]:
     """Collect field paths present in the program for bulk struct copies.
 
@@ -285,10 +296,13 @@ def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, .
             root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
             root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
             cache[root_type].add(path.selectors)
+            cache[_aggregate_type_key(root_type)].add(path.selectors)
     if type_key is None:
         paths = set().union(*cache.values()) if cache else set()
     else:
-        paths = cache.get(type_key) or cache.get("<unknown>", set())
+        paths = (cache.get(type_key)
+                 or cache.get(_aggregate_type_key(type_key))
+                 or cache.get("<unknown>", set()))
     return tuple(sorted(paths, key=repr))
 
 
