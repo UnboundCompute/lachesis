@@ -375,17 +375,29 @@ def _semantic_event(sub, operation, generations=None):
             return [Event(EventKind.COMPARE_VALUE, obj=obj, line=operation.line)]
         if operation.access == "return":
             return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line),
+                    Event.escape(obj, operation.line),
                     Event(EventKind.RETURN, obj=obj, line=operation.line)]
         if operation.access == "return-stack":
             return [Event(EventKind.RETURN_VALUE, obj=obj, line=operation.line,
                           facts={"stack_local": True}),
+                    Event.escape(obj, operation.line),
                     Event(EventKind.RETURN, obj=obj, line=operation.line)]
         if operation.access == "write":
             source_key = _semantic_key(sub, operation.source)
             value = (_semantic_obj(sub, operation.source,
                                    generations.get(source_key, "g0"), operation.node)
-                     if operation.source is not None else None)
-            return [Event.write(storage_obj, access_path, operation.line, value=value)]
+                      if operation.source is not None else None)
+            events = [Event.write(storage_obj, access_path, operation.line, value=value)]
+            # A declaration with no owning function is persistent program storage;
+            # storing a live object there is an explicit escape from the current
+            # activation.  Do not apply this shortcut to ordinary field stores:
+            # their lifetime still depends on the containing object's ownership.
+            target_root = operation.target.root
+            if (value is not None and target_root.startswith("decl:")
+                    and not (sub.props(target_root[len("decl:"):]).get("owner_function_id")
+                             or sub.props(target_root[len("decl:"):]).get("function_id"))):
+                events.append(Event.escape(value, operation.line))
+            return events
         return [Event.read(storage_obj, access_path, operation.line)]
     if operation.kind == OpKind.COPY and obj:
         source_key = _semantic_key(sub, operation.source)
