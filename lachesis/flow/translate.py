@@ -168,6 +168,15 @@ def _assigned_var(ix, call_id):
                 continue
             if tn.get("kind") == "variable":
                 return tn.get("label")
+            # Call results can be assigned directly into a field or indexed
+            # slot (`s->request = make_buffer(...)`). Preserve that expression
+            # instead of discarding the receiver at the variable-only boundary;
+            # Claus needs it to transfer return values and NULL facts across the
+            # seam with field-sensitive identity.
+            if tn.get("kind") == "expression":
+                label = tn.get("label") or ""
+                if any(marker in label for marker in _SUBOBJECT):
+                    return label
             frontier.append((e["target"], d + 1))
     return None
 

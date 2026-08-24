@@ -817,6 +817,27 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_edge("exit", "wrong", kind="return")
         self.assertEqual([h["node"] for h in match_graph(g) if h["pattern"] == "uaf.deref"], ["after"])
 
+    def test_null_return_cannot_cross_a_caller_nonnull_guard(self):
+        receiver = ObjRef("p", generation="g0")
+        returned = ObjRef("__return__", generation="g0")
+        g = SkeletonGraph()
+        g.add_node("caller", None, fragment="caller")
+        g.add_node("enter", None, fragment="callee")
+        g.add_node("null", Event(EventKind.RETURN_VALUE,
+                                  facts={"return_null": True}), fragment="callee")
+        g.add_node("exit", Event(EventKind.RETURN), fragment="callee")
+        g.add_node("check", Event(EventKind.BRANCH), fragment="caller")
+        g.add_node("use", Event.read(receiver, line=9), fragment="caller")
+        g.add_edge("caller", "enter", kind="call", return_to="check")
+        g.add_edge("enter", "null")
+        g.add_edge("null", "exit")
+        g.add_edge("exit", "check", kind="return",
+                   binding=((receiver, returned),))
+        g.add_edge("check", "use", guard=(GuardProof("NONNULL", "p#g0"),))
+        g.add_fragment("caller", "caller", ("use",))
+        g.add_fragment("callee", "enter", ("exit",))
+        self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_semantic_graph_dict_round_trip_preserves_identity_and_seams(self):
         obj = ObjRef("buf", ("*", "data", "&"), "g7")
         formal = ObjRef("formal", ("*",), "g0")

@@ -512,6 +512,15 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
                                       target=target, line=_line(sub, node), ordinal=30,
                                       access="return-stack" if stack_local else "return"))
+            elif _is_null(sub, _peel(sub, child)):
+                # Preserve a NULL return as a path-local value.  The seam
+                # composer rebases this marker onto the caller's receiver so
+                # a later NONNULL guard cannot admit the failure arm.
+                operations.append(_op(
+                    OpKind.CLOBBER, _place(sub, cfg_nodes, child, node),
+                    target=AccessPath("__return__"),
+                    line=_line(sub, node), ordinal=30, access="return-null"))
+            if target is not None or _is_null(sub, _peel(sub, child)):
                 break
 
     # The same semantic event can be visible via the assignment scan and the generic

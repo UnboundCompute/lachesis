@@ -51,7 +51,8 @@ from lachesis.nav.dataflow.substrate import Substrate
 from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
 from .patterns import evaluator_for
-from .object_lifetime import APBuilder, _argument_path, _path, extract_operations, _props
+from .object_lifetime import (APBuilder, _argument_path, _path,
+                               extract_operations, _props)
 from .object_state import AccessPath, OpKind
 from .pipeline import _lifetime_slice
 from .semantic_graph import Event, EventKind, GuardProof, ObjRef, SkeletonGraph
@@ -69,6 +70,8 @@ _OP_VERB = {
     OpKind.COPY: "copy",
     OpKind.CLOBBER: "reassign",
 }
+
+_SUBOBJECT = ("->", ".", "[", "*")
 
 
 def _readable_root(sub, root: str, scope=None) -> str:
@@ -332,6 +335,12 @@ def _semantic_event(sub, operation, generations=None):
     :func:`match_graph` derives those findings later.
     """
     generations = generations or {}
+    if (operation.kind == OpKind.CLOBBER
+            and operation.access == "return-null"):
+        return [Event(EventKind.RETURN_VALUE,
+                      line=operation.line, facts={"return_null": True}),
+                Event(EventKind.RETURN, line=operation.line,
+                      facts={"return_null": True})]
     target_key = _semantic_key(sub, operation.target)
     generation = generations.get(operation, generations.get(target_key, "g0"))
     obj = _semantic_obj(sub, operation.target, generation, operation.node)
@@ -1302,8 +1311,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     sub, call, functions.get(callee, {})))
                 receiver = call.get("assigned")
                 if receiver:
-                    receiver_ref = ObjRef(
-                        sub.label(str(receiver)) or str(receiver), generation="g0")
+                    receiver_name = sub.label(str(receiver)) or str(receiver)
+                    receiver_ref = (_expression_objref(receiver_name)
+                                    if any(marker in receiver_name for marker in _SUBOBJECT)
+                                    else ObjRef(receiver_name, generation="g0"))
                     # Return metadata may not carry an expression for a field
                     # return (for example `return buffer->data`). Recover the
                     # precise value from the emitted RETURN_VALUE event instead
@@ -1317,6 +1328,15 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         if event is not None and event.kind == EventKind.RETURN_VALUE \
                                 and event.obj is not None:
                             return_binding.append((receiver_ref, event.obj))
+                        elif (event is not None
+                              and event.kind == EventKind.RETURN_VALUE
+                              and event.facts.get("return_null")):
+                            # `__return__` is a path-local null marker. The
+                            # matcher transfers its null fact through this
+                            # formal-to-actual return binding.
+                            return_binding.append((
+                                receiver_ref,
+                                ObjRef("__return__", generation="g0")))
                     # A returned aggregate can carry aliases between its fields
                     # (for example `result->borrowed = result->meta->name`).
                     # Local DERIVE bindings otherwise disappear when the callee
@@ -1488,6 +1508,32 @@ def _call_bindings(sub, call, formals):
     return tuple(bindings)
 
 
+def _expression_objref(expression: str) -> ObjRef:
+    """Project a source-level receiver expression into an ObjRef path."""
+    expression = str(expression).strip().strip("() ").replace("->", " -> ")
+    tokens = re.findall(r"[A-Za-z_]\w*|->|\.|\*|&|\[[^]]*\]", expression)
+    base = tokens[0] if tokens and re.match(r"^[A-Za-z_]\w*$", tokens[0]) else expression
+    selectors = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "->" and index + 1 < len(tokens):
+            selectors.extend(("*", tokens[index + 1]))
+            index += 2
+        elif token == "." and index + 1 < len(tokens):
+            selectors.append(tokens[index + 1])
+            index += 2
+        elif token in {"*", "&"}:
+            selectors.append(token)
+            index += 1
+        elif token.startswith("["):
+            selectors.extend((token, "*"))
+            index += 1
+        else:
+            index += 1
+    return ObjRef(base, tuple(selectors), "g0")
+
+
 def _return_bindings(sub, call, callee):
     receiver = call.get("assigned")
     if not receiver:
@@ -1500,7 +1546,9 @@ def _return_bindings(sub, call, callee):
         if not local:
             continue
         local = sub.label(str(local)) or str(local)
-        receiver_ref = ObjRef(receiver, generation="g0")
+        receiver_ref = (_expression_objref(receiver)
+                        if any(marker in receiver for marker in _SUBOBJECT)
+                        else ObjRef(receiver, generation="g0"))
         # Canonical bindings point the caller's result at the callee's returned
         # value.  This direction lets a later caller-side use of `result` resolve
         # through the return seam to the actual object released through a formal.

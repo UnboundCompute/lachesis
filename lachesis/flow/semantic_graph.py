@@ -795,6 +795,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 obj = None
             if event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
+            if (event.kind == EventKind.RETURN_VALUE
+                    and event.facts.get("return_null")):
+                # `__return__` is a synthetic callee-local slot.  The return
+                # edge rebases its null fact onto the caller receiver.
+                nulls.add(ObjRef("__return__", generation="g0"))
             # Prefer declaration/object identities whenever the emitter provides
             # them.  The display ObjRef remains the compatibility fallback for
             # older frontends and hand-built graphs.
@@ -933,7 +938,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         for edge in graph.edges.get(state.node, ()):
             stack = state.stack
             next_bindings = dict(bindings)
-            next_bindings.update(edge.binding)
+            # A synthetic ``__return__`` binding is a value-state marker for a
+            # NULL return, not an object identity relation.  If it entered the
+            # canonical binding map, every caller receiver would be rewritten
+            # to ``__return__`` (including unrelated fields released before a
+            # later call), creating spurious cross-call lifecycle matches.
+            # Keep the pair available below for null/non-null transfer while
+            # keeping it out of identity canonicalization.
+            next_bindings.update(
+                (formal, actual) for formal, actual in edge.binding
+                if actual.base != "__return__"
+            )
             next_aliases = dict(aliases)
             next_slot_bindings = dict(slot_bindings)
             next_abstract_bindings = dict(abstract_bindings)
@@ -1035,6 +1050,14 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if edge.target != stack[-1]:
                     continue
                 stack = stack[:-1]
+                # Return bindings are stored in caller-receiver -> callee-value
+                # direction for identity canonicalization.  Null/non-null facts
+                # flow in the opposite direction when the callee returns.
+                for receiver, returned in edge.binding:
+                    if returned in next_nulls:
+                        next_nulls.add(receiver)
+                    if returned in next_nonnull:
+                        next_nonnull.add(receiver)
                 if abstract_contexts:
                     next_abstract_bindings = dict(abstract_contexts[-1])
                     next_abstract_contexts = abstract_contexts[:-1]
