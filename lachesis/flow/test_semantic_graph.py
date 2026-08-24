@@ -538,9 +538,21 @@ class SemanticGraphTests(unittest.TestCase):
         true_proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
         false_proofs = _cfg_guard_proofs(Sub(), "condition", 1, 2)
         self.assertEqual([(p.kind, p.value) for p in true_proofs],
-                         [("NONNULL", "buffer->data#g0")])
+                         [("NONNULL", "buffer->data#g0"),
+                          ("VALUE", "buffer->data!=0")])
         self.assertEqual([(p.kind, p.value) for p in false_proofs],
-                         [("ISNULL", "buffer->data#g0")])
+                         [("ISNULL", "buffer->data#g0"),
+                          ("VALUE", "buffer->data==0")])
+
+    def test_scalar_truthiness_also_emits_value_proofs(self):
+        class Sub:
+            @staticmethod
+            def label(_node):
+                return "mode"
+
+        proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
+        self.assertEqual([(p.kind, p.value) for p in proofs], [
+            ("NONNULL", "mode#g0"), ("VALUE", "mode!=0")])
 
     def test_compound_null_guards_preserve_only_provable_arm_facts(self):
         class Sub:
@@ -555,8 +567,11 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(true_proofs, ())
         self.assertEqual([(p.kind, p.value) for p in false_proofs], [
             ("NONNULL", "triple#g0"),
+            ("VALUE", "triple!=0"),
             ("NONNULL", "*triple#g0"),
+            ("VALUE", "*triple!=0"),
             ("NONNULL", "**triple#g0"),
+            ("VALUE", "**triple!=0"),
         ])
 
     def test_compound_nonnull_conjunction_proves_each_term(self):
@@ -569,8 +584,11 @@ class SemanticGraphTests(unittest.TestCase):
         false_proofs = _cfg_guard_proofs(Sub(), "condition", 1, 2)
         self.assertEqual([(p.kind, p.value) for p in true_proofs], [
             ("NONNULL", "triple#g0"),
+            ("VALUE", "triple!=0"),
             ("NONNULL", "*triple#g0"),
+            ("VALUE", "*triple!=0"),
             ("NONNULL", "**triple#g0"),
+            ("VALUE", "**triple!=0"),
         ])
         self.assertEqual(false_proofs, ())
 

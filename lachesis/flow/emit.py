@@ -1660,6 +1660,11 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
             kind = (true_kind if conjunction
                     else ("NONNULL" if true_kind == "ISNULL" else "ISNULL"))
             proofs.append(GuardProof(kind, f"{variable}#g0"))
+            # Keep a scalar-compatible proof alongside the pointer null proof.
+            # The matcher can use VALUE contradictions for integer/enum flags,
+            # while the null proof remains authoritative for pointer objects.
+            value_relation = "==0" if kind == "ISNULL" else "!=0"
+            proofs.append(GuardProof("VALUE", f"{variable}{value_relation}"))
         return tuple(proofs)
 
     compound = boolean_null_proofs(condition)
@@ -1683,7 +1688,9 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
     simple = condition.strip("()")
     if re.match(r"^[A-Za-z_]\w*(?:(?:->|\.)[A-Za-z_]\w*)*$", simple):
         kind = "NONNULL" if target_index == 0 else "ISNULL"
-        return (GuardProof(kind, f"{simple}#g0"),)
+        value_relation = "!=0" if kind == "NONNULL" else "==0"
+        return (GuardProof(kind, f"{simple}#g0"),
+                GuardProof("VALUE", f"{simple}{value_relation}"))
 
     # Preserve relational branch facts as typed VALUE proofs.  The matcher does
     # not treat these as lifetime verdicts, but downstream properties can consume
