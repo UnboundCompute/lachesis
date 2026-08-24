@@ -9,6 +9,51 @@ than left for you to discover.
 
 ## Unreleased
 
+## [0.2.0]
+
+This release introduces a source-rooted semantic flow analysis and a lifetime/typestate
+candidate layer on top of the existing sink-reachability model. Pre-1.0: the graph schema
+and candidate surface grow here; older candidate output remains readable.
+
+### Added
+
+- **Semantic flow graph (Pass 3).** A new source-rooted pass builds a frontend-neutral
+  semantic flow graph for every supported language: per-function fragments joined at
+  call/return seams, carrying object identities, symbolic generations, guard proofs, and
+  source provenance. It replaces the legacy per-function skeletons as the object-mode
+  production path and is scheduled from a source-rooted coverage worklist.
+- **Lifetime and typestate candidate families.** The candidate census now surfaces
+  temporal leads alongside sink reachability: cross-seam double-free, use-after-free and
+  unchecked use, uninitialized-pointer use, realloc-invalidated (dangling) pointers,
+  returned stack-local escapes, unchecked nullable-return dereference, allocation/copy
+  size mismatch, loop-bounded unbounded copy, and multiplicative allocation overflow.
+- **Catalog-driven detection.** Lifecycle allocation/release/use nodes, sink facts, and
+  the default matcher registry are derived from the Atropos catalog, so detection coverage
+  tracks the catalog rather than hard-coded rules. Lifecycle transitions are routed through
+  catalog evaluators.
+- **Interprocedural cross-seam matching.** The matcher advances loose ordered patterns
+  along branch-compatible paths across call seams — rebasing pointer slots, stitching
+  callback seams, and preserving field aliases and object identity across returns — so
+  free-here / use-there patterns are matchable.
+- **Adjudicable evidence.** Pass 3 lifecycle evidence and structured semantic witness
+  traces are exposed through the navigation and MCP surface, and the taint witness path is
+  surfaced so each lead can be traced source-to-sink. MCP tool descriptions now document
+  read-only status, parameters, and usage.
+
+### Changed
+
+- Object mode produces the semantic flow graph as its production path; legacy skeletons are
+  retired from object mode.
+- Coverage accounting is call/return aware and source-rooted, and reusable semantic
+  fragments are cached with deterministic fingerprints across pass runs.
+
+### Fixed
+
+- Deterministic fragment cache fingerprints and fail-safe unions on incompatible caches.
+- A size guard must compare magnitude, not merely name a variable.
+- The C frontend slices AST snippets by byte offset rather than code point.
+- Tolerate unreadable legacy graph properties instead of failing the load.
+
 ## [0.1.7]
 
 ### Added
