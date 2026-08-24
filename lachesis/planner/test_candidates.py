@@ -1251,6 +1251,24 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertNotIn("verdict", row)
         self.assertEqual(row["inferences"]["same_object"], "not-queried")
 
+    def test_temporal_census_reports_uncovered_semantic_states(self):
+        graph = {
+            "nodes": [], "edges": [],
+            "semantic_graph": {
+                "coverage": {"converged": False,
+                              "uncovered_states": [["worker", "source"]],
+                              "uncovered_contexts": [["worker", "source", "site"]]},
+                "nodes": {
+                    "release": {"event": {"kind": "RELEASE", "obj": "O#g0"},
+                                 "fragment": "worker"},
+                },
+            },
+        }
+        result = default_candidate_registry(graph).census(
+            "mem.lifetime.double-free")["constructors"][0]
+        self.assertFalse(result["complete_for_observable_graph"])
+        self.assertEqual(result["frontiers"]["unresolved_calls"], 2)
+
     def test_temporal_registry_consumes_serialized_semantic_skeleton(self):
         graph = {
             "nodes": [], "edges": [],

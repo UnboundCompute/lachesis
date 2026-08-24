@@ -53,13 +53,24 @@ def main(argv: list[str] | None = None) -> int:
         from lachesis.flow.pipeline import run_pass
         from lachesis.planner.temporal_obligation import merge_semantic_nodes
         semantic_nodes = {}
+        semantic_coverages = []
         for language in summary.get("languages") or ("c",):
             flow = run_pass(store, lang=language, lifetime_engine="object")
             semantic = flow.get("semantic_graph")
             if semantic is not None:
                 merge_semantic_nodes(semantic_nodes, semantic, language)
+                semantic_coverages.append(dict(semantic.coverage or {}))
         if semantic_nodes:
             stamped["semantic_graph"] = {"nodes": semantic_nodes}
+            if semantic_coverages:
+                stamped["semantic_graph"]["coverage"] = {
+                    "converged": all(item.get("converged", True)
+                                      for item in semantic_coverages),
+                    "uncovered_states": [state for item in semantic_coverages
+                                         for state in item.get("uncovered_states", ())],
+                    "uncovered_contexts": [context for item in semantic_coverages
+                                           for context in item.get("uncovered_contexts", ())],
+                }
 
     registry = default_candidate_registry(stamped, summary)
     if args.candidate_id:

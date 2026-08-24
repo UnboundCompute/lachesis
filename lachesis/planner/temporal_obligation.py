@@ -73,8 +73,10 @@ class TemporalLifecycle:
         # publication without coupling it to the C frontend.
         semantic = graph.get("semantic_graph") or {}
         self.language = graph.get("language")
+        self.coverage = {}
         if isinstance(semantic, dict):
             self.language = self.language or semantic.get("language")
+            self.coverage = dict(semantic.get("coverage") or {})
             semantic_nodes = semantic.get("nodes", ())
             if isinstance(semantic_nodes, dict):
                 self.nodes.extend([{"id": node_id, **(node or {})}
@@ -138,6 +140,8 @@ class TemporalLifecycle:
         rows.sort(key=lambda row: (row["observations"].get("file") or "",
                                    row["observations"].get("line") or 0,
                                    row["handles"]["site_node_id"]))
+        uncovered = (len(self.coverage.get("uncovered_states", ()))
+                     + len(self.coverage.get("uncovered_contexts", ())))
         return {
             "constructor": self.metadata["id"],
             "domain": "lifecycle",
@@ -145,11 +149,11 @@ class TemporalLifecycle:
             "candidates": rows,
             "census": {"enumerated": len(rows),
                        "by_status": {"not-queried": len(rows)}},
-            "frontiers": {"unresolved_calls": 0, "unbound_models": 0,
+            "frontiers": {"unresolved_calls": uncovered, "unbound_models": 0,
                            "unbound_sinks": [], "truncated_walks": 0,
                            "missing_optional_capabilities": [],
                            "unselected_configs": []},
-            "complete_for_observable_graph": True,
+            "complete_for_observable_graph": bool(self.coverage.get("converged", True)),
         }
 
 
