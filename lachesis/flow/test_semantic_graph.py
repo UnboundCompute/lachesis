@@ -691,6 +691,17 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(hit["witness_complete"])
         self.assertEqual(hit["witness_edges"][0]["guards"][0]["kind"], "NONNULL")
 
+    def test_escape_is_first_class_and_keeps_the_object_live_for_leak_matching(self):
+        obj = ObjRef("p", generation="g0")
+        g = SkeletonGraph()
+        g.add_node("origin", Event.origin(obj), fragment="main")
+        g.add_node("escape", Event(EventKind.ESCAPE, obj=obj), fragment="main")
+        g.add_node("exit", None, fragment="main")
+        g.add_edge("origin", "escape")
+        g.add_edge("escape", "exit")
+        g.add_fragment("main", "origin", ("exit",))
+        self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(g)})
+
     def test_witness_keeps_the_edge_taken_when_parallel_guards_share_nodes(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

@@ -23,6 +23,7 @@ class EventKind(str, Enum):
     READ_STORAGE = "READ_STORAGE"
     WRITE_STORAGE = "WRITE_STORAGE"
     PASS_VALUE = "PASS_VALUE"
+    ESCAPE = "ESCAPE"
     COMPARE_VALUE = "COMPARE_VALUE"
     RETURN_VALUE = "RETURN_VALUE"
     DERIVE = "DERIVE"
@@ -132,6 +133,10 @@ class Event:
     @classmethod
     def pass_value(cls, obj: ObjRef, line: int | None = None) -> "Event":
         return cls(EventKind.PASS_VALUE, obj=obj, line=line)
+
+    @classmethod
+    def escape(cls, obj: ObjRef, line: int | None = None) -> "Event":
+        return cls(EventKind.ESCAPE, obj=obj, line=line)
 
     @classmethod
     def release(cls, obj: ObjRef, line: int | None = None) -> "Event":
@@ -841,7 +846,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     _record(hits, "null-deref", base, node, witness())
                 if "unchecked-return-deref" in wanted and base in nullable:
                     _record(hits, "unchecked-return-deref", base, node, witness())
-            elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
+            elif event.kind in (EventKind.PASS_VALUE, EventKind.ESCAPE,
+                                EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
                 abstract_freed = any(
                     abstract_key(value, obj) in {
                         released_value for released_value, _ in abstract_released}
@@ -850,15 +856,15 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 abstract_available = any(stable_abstract(value)
                                          for value, _ in abstract_released)
                 alias_supported = explicit_alias(obj)
-                if "use.dangling" in wanted and (
+                if (event.kind != EventKind.ESCAPE and "use.dangling" in wanted and (
                         abstract_freed if identity_abstract and abstract_available and not alias_supported
-                        else obj_freed):
+                        else obj_freed)):
                     _record(hits, "use.dangling", obj, node, witness())
                 if (event.kind == EventKind.RETURN_VALUE
                         and event.facts.get("stack_local")
                         and "use-after-return" in wanted):
                     _record(hits, "use-after-return", obj, node, witness())
-                if event.kind == EventKind.RETURN_VALUE:
+                if event.kind in (EventKind.RETURN_VALUE, EventKind.ESCAPE):
                     escaped.add(obj)
             elif event.kind == EventKind.ORIGIN and obj:
                 # Re-originating a slot creates a new lifetime incarnation.

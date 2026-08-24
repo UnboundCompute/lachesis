@@ -456,7 +456,7 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
         if kind == "use":
             return Event.read(obj, "*", line)
         if kind == "escape":
-            return Event.pass_value(obj, line)
+            return Event(EventKind.ESCAPE, obj=obj, line=line)
         return None
 
     for fn in sorted(functions):
@@ -657,7 +657,7 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
         elif kind == "use" and obj:
             event = Event.read(obj, "*", line)
         elif kind == "escape" and obj:
-            event = Event.pass_value(obj, line)
+            event = Event(EventKind.ESCAPE, obj=obj, line=line)
         else:
             return previous
         node_id = f"{fn}:ir:event:{index}"
