@@ -33,6 +33,22 @@ class CoverageSchedulerTests(unittest.TestCase):
         plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()
         self.assertEqual(plan.for_target("deep").sources, ("entry",))
 
+    def test_callback_argument_is_a_forward_coverage_edge(self):
+        functions = {
+            "entry": {"callers": [], "calls": [
+                {"callee": "dispatch", "args": [{"pos": 0, "root": "handler"}]},
+            ]},
+            "dispatch": {"params": ["callback"], "callers": ["entry"]},
+            "handler": {"callers": []},
+            "deep": {"callers": ["handler"]},
+        }
+        plan = CoverageScheduler(functions, {
+            "entry": ["dispatch"], "dispatch": [], "handler": ["deep"], "deep": [],
+        }).plan(["deep"])
+        region = plan.for_target("deep")
+        self.assertEqual(region.sources, ("entry",))
+        self.assertIn(("deep", "entry"), region.state_keys)
+
     def test_successor_graph_is_authoritative_when_callers_metadata_is_absent(self):
         functions = {"entry": {}, "deep": {}}
         plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()

@@ -85,9 +85,32 @@ class CoverageScheduler:
 
     def __init__(self, functions: Mapping[str, Mapping], successors: Mapping[str, Iterable[str]]):
         self.functions = functions
-        self.successors = {name: tuple(sorted(callee for callee in successors.get(name, ())
-                                             if callee in functions))
-                           for name in functions}
+        normalized = {
+            name: set(callee for callee in successors.get(name, ())
+                      if callee in functions)
+            for name in functions
+        }
+        # A callback target is a real source-rooted edge even when the
+        # frontend's direct call graph records only the callback formal. Keep
+        # this normalization at the scheduler boundary so every frontend and
+        # every direct CoverageScheduler caller gets the same reachability
+        # semantics as the semantic emitter.
+        for caller, record in functions.items():
+            for call in record.get("calls", ()):
+                callee = call.get("callee")
+                callee_record = functions.get(callee)
+                if callee_record is None:
+                    continue
+                formals = tuple(callee_record.get("params", ()))
+                for argument in call.get("args", ()):
+                    position = argument.get("pos")
+                    actual = argument.get("root")
+                    if (isinstance(position, int) and position < len(formals)
+                            and actual in functions and actual != callee):
+                        normalized[caller].add(actual)
+        self.successors = {
+            name: tuple(sorted(callees)) for name, callees in normalized.items()
+        }
         reverse: dict[str, set[str]] = defaultdict(set)
         for caller, callees in self.successors.items():
             for callee in callees:
