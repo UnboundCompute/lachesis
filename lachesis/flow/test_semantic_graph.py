@@ -931,6 +931,24 @@ class SemanticGraphTests(unittest.TestCase):
         hit = next(hit for hit in match_graph(g) if hit["pattern"] == "uaf.deref")
         self.assertEqual(hit["object"], "p#g0")
 
+    def test_repeated_loop_origins_reset_the_current_incarnation(self):
+        slot = ObjRef("p", generation="g0")
+        events = [
+            ("first", Event.origin(slot)),
+            ("loop1", Event(EventKind.LOOP)),
+            ("second", Event.origin(slot, facts={"loop_widening": True})),
+            ("release1", Event.release(slot)),
+            ("loop2", Event(EventKind.LOOP)),
+            ("third", Event.origin(slot, facts={"loop_widening": True})),
+            ("release2", Event.release(slot)),
+        ]
+        g = self._graph(events, [
+            (events[index][0], events[index + 1][0])
+            for index in range(len(events) - 1)
+        ])
+        self.assertNotIn("double-free",
+                         {hit["pattern"] for hit in match_graph(g)})
+
     def test_branch_reorigin_rebinds_slot_but_not_captured_alias(self):
         slot0 = ObjRef("p", generation="g0")
         slot1 = ObjRef("p", generation="g1")
