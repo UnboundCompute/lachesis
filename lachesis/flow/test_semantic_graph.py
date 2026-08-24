@@ -124,6 +124,26 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(kinds.count(EventKind.RELEASE), 1)
         self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(graph)})
 
+    def test_frontend_ir_lifecycle_receiver_release_uses_atropos_roles(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {"is_source": True, "source_reachable": True,
+                     "events": [], "calls": [
+                         {"callee": "open", "assigned": "handle", "line": 1,
+                          "args": []},
+                         {"callee": "close", "receiver": "handle", "line": 2,
+                          "args": []},
+                     ]},
+        }
+        graph = build_semantic_graph(object(), functions, {"main": []},
+                                     lang="python", graph={})
+        kinds = [node.event.kind for node in graph.nodes.values()
+                 if node.event is not None]
+        self.assertEqual(kinds.count(EventKind.ORIGIN), 1)
+        self.assertEqual(kinds.count(EventKind.RELEASE), 1)
+        self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(graph)})
+
     def test_frontend_ir_fallback_routes_sink_facts_through_atropos(self):
         from unittest.mock import patch
         from .emit import build_semantic_graph

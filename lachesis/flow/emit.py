@@ -588,7 +588,13 @@ def _ir_lifecycle_events(call, norm, ref):
     if norm.is_release(callee):
         released = argument()
         if released is None:
-            released = ref(call.get("receiver"))
+            # Managed-language lifecycle methods carry ownership on the
+            # receiver rather than a positional argument (resource.close(),
+            # stream.destroy(), ...).  Frontends use slightly different names
+            # for that neutral field; accept the normalized aliases here.
+            receiver = (call.get("receiver") or call.get("receiver_root")
+                        or call.get("receiver_value"))
+            released = ref(receiver)
         return [Event(EventKind.RELEASE, obj=released, line=line,
                       facts={"frontend_ir": True, "callee": callee})] if released else []
     if norm.is_acquire(callee):

@@ -335,6 +335,11 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                "is_sink": cat is not None,
                "assigned": assigned,
+               # Managed-language lifecycle methods place the resource on the
+               # receiver, not in an argument slot. Preserve that neutral
+               # identity for the semantic graph; C-style calls leave it absent.
+               "receiver": (cp.get("receiver") or cp.get("receiver_root")
+                            or cp.get("receiver_value")),
                "node": c["id"],                             # graph node = CFG anchor for events
                "control": nest.enclosing(c["id"])}          # loop/branch nesting, outer->inner
         if cat is not None:
