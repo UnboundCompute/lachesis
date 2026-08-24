@@ -235,6 +235,32 @@ def _arg_records(ix, call):
     return out
 
 
+def _expanded_macro_size(call, args, macro_defs, callee):
+    """Recover an allocator's size expression when Clang lowered a macro call.
+
+    The frontend graph preserves the macro definition and the call's argument
+    values, but the lowered ``malloc`` node otherwise exposes only the final
+    parameter (for example ``count``).  Expanding the recorded declarative macro
+    body here keeps the fact language-neutral and avoids matching macro names or
+    fixture text in the detector.
+    """
+    name = str(call.get("label") or "").strip()
+    definition = macro_defs.get(name)
+    if not definition or callee not in str(definition.get("body") or ""):
+        return None
+    body = str(definition.get("body") or "")
+    parameters = tuple(definition.get("parameters") or ())
+    substitutions = {
+        parameter: str(args[index].get("expr") or args[index].get("value") or "")
+        for index, parameter in enumerate(parameters)
+        if index < len(args)
+    }
+    for parameter, replacement in substitutions.items():
+        body = re.sub(rf"\b{re.escape(parameter)}\b", replacement, body)
+    match = re.search(rf"\b{re.escape(callee)}\s*\((.*)\)", body)
+    return match.group(1).strip() if match else None
+
+
 def _guards_for(regions, fid, idents, span):
     """Guards active at a call site: {var, canon} for each arg-root a dominating
     size-testing branch names. Uses the same sound region-containment the reader's
@@ -311,6 +337,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     params = [p.get("label") for p in _by_offset(ix.nodes_owned_by(fid, "parameter"))]
     param_set = set(params)
     calls, callees, events, assigns = [], [], [], []
+    macro_defs = {node.get("label"): _props(node)
+                  for node in ix.nodes_of_kind("macro") if node.get("label")}
 
     for c in _by_offset(ix.nodes_owned_by(fid, "call", "construct")):
         callee = norm.canon_callee(_callee_name(c))
@@ -349,6 +377,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             # compare an alloc's size against a copy's size on the same path
             sa = next((a for a in args if a.get("pos") == size_arg), None) if size_arg is not None else None
             rec["size_expr"] = sa.get("value") if sa else None
+            if norm.is_alloc(callee):
+                expanded = _expanded_macro_size(c, args, macro_defs, callee)
+                if expanded:
+                    rec["size_expr"] = expanded
             # the destination the sink writes/allocates -- the identity a two-node shape joins on
             # (alloc: the pointer the result is assigned to; copy/write: the first argument)
             rec["dst"] = alloc_dst if norm.is_alloc(callee) else (args[0].get("value") if args else None)
