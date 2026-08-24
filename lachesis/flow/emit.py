@@ -583,6 +583,11 @@ def _ir_event(record):
         if record.get("null"):
             return Event(EventKind.RETURN_VALUE, line=line,
                          facts={"return_null": True})
+    if kind in {"return_stack", "stack_escape"} and obj:
+        return Event(EventKind.RETURN_VALUE, obj=obj, line=line,
+                     facts={**dict(record.get("facts") or {}),
+                            "stack_local": True,
+                            "escape_store": kind == "stack_escape"})
     if kind == "realloc_attempt" and obj:
         return Event.realloc_attempt(obj, line)
     if kind == "realloc_failed" and obj:

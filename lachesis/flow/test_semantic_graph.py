@@ -1184,6 +1184,17 @@ class SemanticGraphTests(unittest.TestCase):
         ], [("store", "exit")])
         self.assertIn("use-after-return", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_generic_ir_preserves_stack_escape_event(self):
+        from .emit import build_semantic_graph
+
+        graph = build_semantic_graph(
+            object(),
+            {"main": {"is_source": True, "source_reachable": True,
+                      "events": [{"kind": "stack_escape", "var": "local", "line": 3}],
+                      "calls": []}},
+            {"main": []}, lang="python", graph={})
+        self.assertIn("use-after-return", {hit["pattern"] for hit in match_graph(graph)})
+
     def test_pointer_slot_value_propagates_to_release_and_read(self):
         item = ObjRef("item", generation="g0")
         slot = ObjRef("items", ("[i]",), generation="g0")
