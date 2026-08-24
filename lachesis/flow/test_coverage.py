@@ -31,6 +31,23 @@ class CoverageSchedulerTests(unittest.TestCase):
         plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()
         self.assertEqual(plan.for_target("deep").sources, ("entry",))
 
+    def test_catalogued_sources_do_not_hide_other_external_roots(self):
+        functions = {
+            "catalog_entry": {
+                "source_sites": [{"node": "read_site", "callee": "read"}],
+                "callers": [],
+            },
+            "plain_entry": {"callers": []},
+            "catalog_deep": {"callers": ["catalog_entry"]},
+            "plain_deep": {"callers": ["plain_entry"]},
+        }
+        plan = CoverageScheduler(functions, {
+            "catalog_entry": ["catalog_deep"], "catalog_deep": [],
+            "plain_entry": ["plain_deep"], "plain_deep": [],
+        }).plan()
+        self.assertEqual(plan.for_target("plain_deep").sources, ("plain_entry",))
+        self.assertEqual(plan.for_target("catalog_deep").sources, ("catalog_entry",))
+
     def test_multiple_sources_do_not_cross_product_forward_cones(self):
         functions = {
             "source_a": {"source_sites": [{"callee": "read_a"}], "callers": []},

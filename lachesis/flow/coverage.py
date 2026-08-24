@@ -95,12 +95,21 @@ class CoverageScheduler:
         self.reverse = {name: tuple(sorted(reverse.get(name, ()))) for name in functions}
 
     def _source_functions(self) -> tuple[str, ...]:
-        sources = [name for name, record in self.functions.items()
-                   if record.get("source_sites") or record.get("source_calls")]
-        if sources:
-            return tuple(sorted(sources))
-        return tuple(sorted(name for name, record in self.functions.items()
-                            if not record.get("callers")))
+        # Catalogued source sites and structural roots are both external launch
+        # candidates.  A project can legitimately contain both: for example,
+        # one entry point may read through a known library source while another
+        # public entry has no catalogued source call at all.  Returning only the
+        # catalogued set would silently make the second entry unreachable to
+        # Pass 3 whenever the catalog is non-empty.
+        sources = {
+            name for name, record in self.functions.items()
+            if record.get("source_sites") or record.get("source_calls")
+        }
+        sources.update(
+            name for name, record in self.functions.items()
+            if not record.get("callers")
+        )
+        return tuple(sorted(sources))
 
     def _backward_cone(self, target: str) -> set[str]:
         seen = {target}
