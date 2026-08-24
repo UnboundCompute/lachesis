@@ -64,6 +64,12 @@ FROZEN_PATTERNS = {
     "pointer-arithmetic-before-validation": PatternSpec(
         "pointer-arithmetic-before-validation", (EventKind.POINTER_ARITHMETIC,
                                                    EventKind.READ_STORAGE)),
+    # Sink-context relationships are accumulated by the graph walk, so these
+    # must be included in the default graph pattern set too.
+    "mem.copy.in-loop-unbounded": PatternSpec(
+        "mem.copy.in-loop-unbounded", (EventKind.SINK,)),
+    "mem.alloc-copy.size-mismatch": PatternSpec(
+        "mem.alloc-copy.size-mismatch", (EventKind.SINK,)),
 }
 
 

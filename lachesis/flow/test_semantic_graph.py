@@ -6,6 +6,18 @@ from .semantic_graph import Edge, Event, EventKind, GuardProof, ObjRef, Skeleton
 
 
 class SemanticGraphTests(unittest.TestCase):
+    def test_default_pattern_registry_covers_every_atropos_matcher(self):
+        from lachesis.flow.patterns import EVALUATORS
+        from lachesis.flow.semantic_graph import FROZEN_PATTERNS
+
+        for entry in atropos.pattern_catalog():
+            matcher = entry.get("matcher") or {}
+            pattern = matcher.get("pattern")
+            self.assertTrue(
+                pattern in FROZEN_PATTERNS or pattern in EVALUATORS,
+                entry.get("id"),
+            )
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:
