@@ -400,6 +400,115 @@ def _semantic_event(sub, operation, generations=None):
     return []
 
 
+def _native_object_substrate(graph):
+    """Probe for the declaration/AST roles required by the rich emitter.
+
+    This is a substrate capability check, not a language dispatch.  Frontends without
+    these roles still use the frontend-neutral F-IR graph builder below.
+    """
+    if not isinstance(graph, dict):
+        return False
+    syntax = {
+        (_props(node).get("syntax_kind"))
+        for node in graph.get("nodes", ())
+    }
+    return "DeclRefExpr" in syntax and "CallExpr" in syntax
+
+
+def _build_ir_semantic_graph(functions, successors, *, lang):
+    """Build a conservative semantic graph from translated frontend-neutral IR.
+
+    The F-IR path preserves lifecycle order, source roots, and pushdown call/return
+    seams for frontends that do not yet expose declaration-rooted heap identities.
+    It intentionally does not invent aliases or branch proofs that the frontend did
+    not emit; richer frontend overlays can be added without changing the matcher.
+    """
+    result = SkeletonGraph(language=lang)
+    entries, exits = {}, {}
+    pending_calls = []
+
+    def ref(value):
+        return ObjRef(str(value), generation="g0") if value else None
+
+    def emit_event(fn, index, record, previous, reachable):
+        kind = record.get("kind")
+        obj = ref(record.get("var"))
+        line = record.get("line")
+        if kind == "alloc" and obj:
+            event = Event.origin(obj, line, facts={"frontend_ir": True})
+        elif kind == "free" and obj:
+            event = Event.release(obj, line)
+        elif kind == "use" and obj:
+            event = Event.read(obj, "*", line)
+        elif kind == "escape" and obj:
+            event = Event.pass_value(obj, line)
+        else:
+            return previous
+        node_id = f"{fn}:ir:event:{index}"
+        result.add_node(node_id, event, fragment=fn, source_reachable=reachable)
+        result.add_edge(previous, node_id)
+        return node_id
+
+    for fn in sorted(functions):
+        record = functions[fn]
+        reachable = bool(record.get("source_reachable") or record.get("is_source"))
+        entry = f"{fn}:ir:entry"
+        result.add_node(entry, None, fragment=fn, source_reachable=reachable)
+        entries[fn] = entry
+        if reachable:
+            result.source_reachable.add(entry)
+        items = [("event", item) for item in record.get("events", ())]
+        items.extend(("call", item) for item in record.get("calls", ()))
+        items.sort(key=lambda item: (
+            item[1].get("line") if item[1].get("line") is not None else 10**12,
+            str(item[1].get("node") or item[1].get("callee") or ""),
+            0 if item[0] == "event" else 1,
+        ))
+        previous = entry
+        index = 0
+        for kind, item in items:
+            if kind == "event":
+                previous = emit_event(fn, index, item, previous, reachable)
+                index += 1
+                continue
+            callee = item.get("callee")
+            if callee not in functions:
+                continue
+            enter = f"{fn}:ir:call:{index}:enter"
+            continuation = f"{fn}:ir:call:{index}:return"
+            result.add_node(enter, Event(EventKind.SEAM_ENTER, line=item.get("line")),
+                            fragment=fn, source_reachable=reachable)
+            result.add_node(continuation,
+                            Event(EventKind.SEAM_EXIT, line=item.get("line")),
+                            fragment=fn, source_reachable=reachable)
+            result.add_edge(previous, enter)
+            formals = tuple(functions[callee].get("params", ()))
+            bindings = []
+            for argument in item.get("args", ()):
+                position = argument.get("pos")
+                if isinstance(position, int) and position < len(formals):
+                    actual = ref(argument.get("root") or argument.get("var"))
+                    formal = ref(formals[position])
+                    if actual is not None and formal is not None:
+                        bindings.append((formal, actual))
+            pending_calls.append((enter, callee, continuation, tuple(bindings)))
+            previous = continuation
+            index += 1
+        exit_node = f"{fn}:ir:exit"
+        result.add_node(exit_node, None, fragment=fn, source_reachable=reachable)
+        result.add_edge(previous, exit_node)
+        exits[fn] = {exit_node}
+        result.add_fragment(fn, entry, exits[fn], params=record.get("params", ()))
+
+    for enter, callee, continuation, bindings in pending_calls:
+        result.add_edge(enter, entries[callee], kind="call", return_to=continuation,
+                        binding=bindings)
+        for callee_exit in exits[callee]:
+            result.add_edge(callee_exit, continuation, kind="return")
+    result.validate()
+    return result
+
+
 def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None,
                          reach_summaries=None, state_artifacts=None):
     """Build the production frozen-v1 graph from the enriched third-pass substrate.
@@ -409,6 +518,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     ``semantic_graph.match_graph``.  Calls are represented by seam nodes and return-site
     continuations, so a shared callee cannot return into another caller's path.
     """
+    if not _native_object_substrate(graph):
+        return _build_ir_semantic_graph(F, succ, lang=lang)
     functions = _lifetime_slice(F, succ, lang=lang)
     if not functions:
         return SkeletonGraph(language=lang)

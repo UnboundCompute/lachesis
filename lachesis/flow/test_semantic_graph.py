@@ -55,6 +55,35 @@ class SemanticGraphTests(unittest.TestCase):
         declared.discard(None)
         self.assertTrue(declared <= _requested_patterns(None))
 
+    def test_frontend_ir_fallback_preserves_pushdown_lifecycle_order(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "is_source": True,
+                "source_reachable": True,
+                "events": [
+                    {"kind": "alloc", "var": "p", "line": 1},
+                    {"kind": "use", "var": "p", "line": 3},
+                ],
+                "calls": [{"callee": "release_helper", "line": 2,
+                           "args": [{"pos": 0, "root": "p"}]}],
+                "params": [],
+            },
+            "release_helper": {
+                "events": [{"kind": "free", "var": "p", "line": 2}],
+                "calls": [],
+                "params": ["p"],
+            },
+        }
+        graph = build_semantic_graph(object(), functions,
+                                     {"main": ["release_helper"],
+                                      "release_helper": []},
+                                     lang="python", graph={})
+        hits = match_graph(graph)
+        self.assertTrue(any(hit["pattern"] == "uaf.deref" for hit in hits))
+        self.assertTrue(all(hit["witness_complete"] for hit in hits))
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:

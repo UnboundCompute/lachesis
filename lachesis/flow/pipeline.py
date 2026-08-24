@@ -12,7 +12,7 @@ from .translate import build_F
 from .skeleton import build_skeletons, _summaries_for
 from .match import match_all, match_leak, match_reach, match_typestate
 from .cfg import cfg_bundle
-from .object_lifetime import analyze_object_lifetimes
+from .object_lifetime import ObjectLifetimeResult, analyze_object_lifetimes
 from .semantic_graph import match_graph
 from .fragment_store import Claus
 from .coverage import CoverageScheduler
@@ -194,8 +194,30 @@ def run_pass(store, lang="c", lifetime_engine=None):
             name: [callee for callee in succ.get(name, ()) if callee in object_functions]
             for name in object_functions
         }
-        object_result = analyze_object_lifetimes(
-            store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+        from .emit import _native_object_substrate
+        if _native_object_substrate(analysis_graph):
+            object_result = analyze_object_lifetimes(
+                store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+        else:
+            # Frontends without declaration-rooted heap roles still participate in
+            # Pass 3 through the generic F-IR semantic graph.  Do not route them
+            # through the C-shaped object analyzer and call its substrate failure a
+            # coverage result; the graph/matcher remains useful at the facts the
+            # frontend actually emitted.
+            object_result = ObjectLifetimeResult(
+                (), {}, {
+                    "backend": "frontend-ir",
+                    "analyzed": 0,
+                    "unsafe_functions": [],
+                    "seed_unsafe_functions": [],
+                    "unsafe_object_flow": {},
+                    "unplaced": 0,
+                    "unplaced_functions": {},
+                    "capped": [],
+                    "widenings": 0,
+                    "transfers": 0,
+                    "total_seconds": 0.0,
+                }, {})
         # The semantic skeleton is deliberately built over the lifecycle/sink slice,
         # not over every translated function.  Give Claus the matching coverage plan;
         # passing the whole-program plan here would mark functions absent from the
