@@ -113,7 +113,12 @@ def load(lang):
         if role == "sink":
             s = sinks.setdefault(method, {"size_arg": None, "sink_args": [],
                                           "family": e.get("kind"), "cwe": [], "kinds": {}})
-            s["sink_args"].append(arg)
+            # Multiple catalog rows may describe the same sink argument (for
+            # example a generic role plus its language-specific refinement).
+            # Preserve the merged kind/CWE information, but expose each
+            # argument position once to graph builders and other consumers.
+            if arg not in s["sink_args"]:
+                s["sink_args"].append(arg)
             s["kinds"][arg] = e.get("kind")
             for c in e.get("cwe", []):
                 if c not in s["cwe"]:

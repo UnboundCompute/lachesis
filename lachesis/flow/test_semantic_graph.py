@@ -55,6 +55,14 @@ class SemanticGraphTests(unittest.TestCase):
         declared.discard(None)
         self.assertTrue(declared <= _requested_patterns(None))
 
+    def test_atropos_sink_catalog_exposes_unique_argument_positions(self):
+        from . import atropos
+
+        for language in ("c", "python", "typescript"):
+            for entry in atropos.sink_catalog(language).values():
+                positions = entry.get("sink_args", ())
+                self.assertEqual(len(positions), len(set(positions)), language)
+
     def test_frontend_ir_fallback_preserves_pushdown_lifecycle_order(self):
         from .emit import build_semantic_graph
 
