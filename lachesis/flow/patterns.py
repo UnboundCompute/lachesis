@@ -91,6 +91,25 @@ def _arithmetic_overflow_guard(fact):
                for predicate in fact.get("guard_predicates", ()))
 
 
+def _allocation_overflow_size(fact):
+    """Detect a tainted multiplicative allocation size.
+
+    This is deliberately an expression-shape evaluator, not a C parser: frontends
+    provide the normalized size expression and the catalog identifies the
+    ``alloc-size`` family.  A non-constant factor multiplied into the allocation
+    size can wrap before the allocator sees it; proving the exact numeric range is
+    a separate analysis capability.
+    """
+    if fact.get("kind") != "alloc-size" or not fact.get("tainted"):
+        return False
+    expression = str(fact.get("size_expr") or "")
+    if "*" not in expression:
+        return False
+    factors = [part.strip() for part in expression.split("*")]
+    return len(factors) >= 2 and any(
+        re.search(r"[A-Za-z_]", factor) for factor in factors)
+
+
 def _typestate(fact):
     """Mark a semantic lifecycle fact for the temporal graph evaluator.
 
@@ -108,6 +127,7 @@ EVALUATORS = {
     "missing-guard": _missing_guard,
     "inverted-capacity-guard": _inverted_capacity_guard,
     "arithmetic-overflow-guard": _arithmetic_overflow_guard,
+    "allocation-overflow-size": _allocation_overflow_size,
     "typestate": _typestate,
 }
 
@@ -134,7 +154,7 @@ KIND_EVALUATOR = {
     "xpath-injection":    "reachability",
     "redos":              "reachability",
     # size / memory -> relational (taint AND unbounded length vs capacity)
-    "alloc-size":         "relational",
+    "alloc-size":         ["relational", "missing-guard", "allocation-overflow-size"],
     "buffer-size":        "relational",
     "buffer-write":       ["relational", "missing-guard"],
     # configuration -> presence (taint-independent; the call is the bug)

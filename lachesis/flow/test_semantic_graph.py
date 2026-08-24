@@ -725,6 +725,17 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(hit["pattern_id"],
                          "mem.arithmetic.overflow-before-bound")
 
+    def test_multiplicative_allocation_overflow_is_catalogued(self):
+        event = Event(EventKind.SINK, obj=ObjRef("packets"), facts={
+            "family": "alloc-size", "callee": "malloc", "arg": 0,
+            "tainted": True, "guarded": False,
+            "size_expr": "sizeof(uint64_t) * count",
+        })
+        g = self._graph([("sink", event)], [])
+        hit = next(hit for hit in match_graph(g)
+                   if hit["pattern"] == "allocation-overflow-size")
+        self.assertEqual(hit["pattern_id"], "mem.alloc.arithmetic-overflow")
+
     def test_pointer_arithmetic_before_validation_has_public_id(self):
         self.assertEqual(atropos.event_evaluator("pointer_arithmetic"), "typestate")
         self.assertEqual(atropos.event_evaluator("derive"), "typestate")
