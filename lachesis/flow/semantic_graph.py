@@ -37,6 +37,7 @@ class EventKind(str, Enum):
     RETURN = "return"
     SINK = "sink"
     POINTER_ARITHMETIC = "pointer_arithmetic"
+    UNINITIALIZED = "UNINITIALIZED"
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,9 @@ FROZEN_PATTERNS = {
         "mem.alloc-copy.size-mismatch", (EventKind.SINK,)),
     "aggregate-copy-alias": PatternSpec(
         "aggregate-copy-alias", (EventKind.DERIVE,)),
+    "uninitialized-use": PatternSpec(
+        "uninitialized-use", (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE,
+                               EventKind.PASS_VALUE, EventKind.COMPARE_VALUE)),
 }
 
 
@@ -436,6 +440,7 @@ class _State:
     # Keep externally rooted launches distinct even when their abstract facts
     # happen to be equal at a shared node.
     launch_context: str | None = None
+    uninitialized: frozenset[ObjRef] = frozenset()
 
 
 class _WitnessPath(tuple):
@@ -501,6 +506,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             left.abstract_released | right.abstract_released,
             left.abstract_contexts,
             left.launch_context,
+            left.uninitialized | right.uninitialized,
         )
 
     def widen_loop_ref(value: ObjRef) -> ObjRef:
@@ -550,6 +556,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             state.abstract_released,
             state.abstract_contexts,
             state.launch_context,
+            frozenset(ref(value) for value in state.uninitialized),
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -593,6 +600,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         abstract_bindings = dict(state.abstract_bindings)
         abstract_released = set(state.abstract_released)
         abstract_contexts = state.abstract_contexts
+        uninitialized = set(state.uninitialized)
 
         # A LOOP node is the widening boundary for path predicates.  Values
         # controlling one iteration are not stable facts for the next; keeping
@@ -821,6 +829,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 bound = canonical(event.value) or event.value
                 bindings[event.obj] = bound
                 aliases[event.obj] = bound
+                uninitialized.discard(event.obj)
                 if (event.facts.get("aggregate_copy")
                         and "aggregate-copy-alias" in wanted):
                     _record(hits, "aggregate-copy-alias", event.obj, node, witness())
@@ -845,6 +854,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                         slot_bindings.pop(slot, None)
                     elif event.value is not None:
                         slot_bindings[slot] = canonical(event.value)
+                        uninitialized.discard(raw_obj)
             if temporal_event and is_null_write and raw_obj:
                 # NULL is a value in this storage slot, not a property of the
                 # heap object reached through another alias.
@@ -855,6 +865,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 obj = None
             if temporal_event and event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
+            if temporal_event and event.kind == EventKind.UNINITIALIZED and obj:
+                uninitialized.add(obj)
             if (temporal_event and event.kind == EventKind.RETURN_VALUE
                     and event.facts.get("return_null")):
                 # `__return__` is a synthetic callee-local slot.  The return
@@ -937,6 +949,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                         and not alias_supported
                         else obj_freed):
                     _record(hits, "uaf.deref", base, node, witness())
+                if ("uninitialized-use" in wanted
+                        and any(equivalent(base, candidate)
+                                for candidate in uninitialized)):
+                    _record(hits, "uninitialized-use", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
                     _record(hits, "null-deref", base, node, witness())
                 if "unchecked-return-deref" in wanted and base in nullable:
@@ -959,6 +975,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                         and not alias_supported
                         else obj_freed)):
                     _record(hits, "use.dangling", obj, node, witness())
+                if (event.kind != EventKind.ESCAPE and "uninitialized-use" in wanted
+                        and any(equivalent(obj, candidate)
+                                for candidate in uninitialized)):
+                    _record(hits, "uninitialized-use", obj, node, witness())
                 if (event.kind == EventKind.RETURN_VALUE
                         and event.facts.get("stack_local")
                         and "use-after-return" in wanted):
@@ -991,6 +1011,13 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                              generation="g0")] = obj
                         aliases.pop(raw_obj, None)
                 origins.add(obj)
+                uninitialized.discard(raw_obj)
+                uninitialized.discard(obj)
+                if raw_obj is not None:
+                    uninitialized = {
+                        value for value in uninitialized
+                        if (value.base, value.path) != (raw_obj.base, raw_obj.path)
+                    }
                 if raw_obj is not None and obj.generation != "g0":
                     # Rebinding the source slot is distinct from rebinding an
                     # alias captured before this origin. A later event may still
@@ -1227,7 +1254,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 frozenset(next_realloc_lost), frozenset(next_pointer_arithmetic),
                                 tuple(sorted(next_abstract_bindings.items())),
                                 frozenset(abstract_released), next_abstract_contexts,
-                                state.launch_context)
+                                state.launch_context,
+                                frozenset(uninitialized))
             next_state = _State(
                 next_state.node, next_state.released, next_state.origins,
                 next_state.stack, next_state.bindings, next_state.aliases,
@@ -1238,7 +1266,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 next_state.escaped, next_state.sink_allocs, next_state.nullable,
                 next_state.realloc_lost, frozenset(next_pointer_arithmetic),
                 next_state.abstract_bindings, next_state.abstract_released,
-                next_state.abstract_contexts, next_state.launch_context)
+                next_state.abstract_contexts, next_state.launch_context,
+                next_state.uninitialized)
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 # Loop-entry markers reset path predicates for a newly

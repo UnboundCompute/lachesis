@@ -368,6 +368,15 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         elif sub.kind(node) == "VarDecl" and _is_pointer(sub, node):
             initializer = _initializer(sub, node)
             if initializer is None:
+                # Preserve an uninitialized pointer declaration as a semantic
+                # fact.  It is not an allocation or a NULL origin: the
+                # matcher must keep the indeterminate state until a
+                # path-compatible assignment initializes the slot.
+                target = AccessPath("decl:" + str(node))
+                operations.append(_op(
+                    OpKind.CLOBBER, _place(sub, cfg_nodes, node, node),
+                    target=target, line=_line(sub, node), ordinal=1,
+                    access="uninitialized"))
                 continue
             target = AccessPath("decl:" + str(node))
             kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, initializer)

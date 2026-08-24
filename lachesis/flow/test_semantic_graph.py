@@ -58,6 +58,24 @@ class SemanticGraphTests(unittest.TestCase):
         hits = match_graph(graph)
         self.assertIn("aggregate-copy-alias", {hit["pattern"] for hit in hits})
 
+    def test_uninitialized_value_use_is_path_sensitive(self):
+        obj = ObjRef("ptr", generation="g0")
+        graph = SkeletonGraph()
+        graph.add_node("decl", Event(EventKind.UNINITIALIZED, obj=obj))
+        graph.add_node("use", Event.pass_value(obj, 2))
+        graph.add_node("init", Event.origin(obj, 3))
+        graph.add_node("safe_use", Event.pass_value(obj, 4))
+        graph.add_fragment("f", "decl", ["safe_use"])
+        graph.source_reachable = {"decl"}
+        graph.add_edge("decl", "use")
+        graph.add_edge("use", "init")
+        graph.add_edge("init", "safe_use")
+        hits = match_graph(graph)
+        self.assertEqual(
+            [hit["node"] for hit in hits if hit["pattern"] == "uninitialized-use"],
+            ["use"],
+        )
+
     def test_default_matcher_registry_imports_atropos_matcher_names(self):
         declared = {
             (entry.get("matcher") or {}).get("pattern")

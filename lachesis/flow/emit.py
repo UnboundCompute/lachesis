@@ -395,6 +395,9 @@ def _semantic_event(sub, operation, generations=None):
     target_key = _semantic_key(sub, operation.target)
     generation = generations.get(operation, generations.get(target_key, "g0"))
     obj = _semantic_obj(sub, operation.target, generation, operation.node)
+    if operation.kind == OpKind.CLOBBER and operation.access == "uninitialized":
+        return [Event(EventKind.UNINITIALIZED, obj=obj, line=operation.line,
+                      facts={"indeterminate": True})] if obj else []
     if operation.kind == OpKind.ALLOC:
         if not obj:
             return []
