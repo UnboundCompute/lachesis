@@ -356,11 +356,13 @@ def _semantic_event(sub, operation, generations=None):
             return [Event(EventKind.POINTER_ARITHMETIC, obj=obj, base=source,
                           line=operation.line,
                           facts={"validated": False})]
-        # A storage access is anchored at the owning object.  Its selectors belong
-        # to the event path, not to the identity used for lifetime matching.  This
-        # is what lets ``free(p); p->field`` match the same generation of ``p``.
+        # The operation target is already the dereference base selected by Claus:
+        # ``p->field`` targets ``p``, while ``b->data[i]`` targets the field-pointee
+        # ``b->data``.  Preserve that distinction.  Stripping selectors here makes
+        # ``free(b->data); b->data[i]`` compare a field-pointee release against the
+        # containing aggregate and silently loses the cross-function field fact.
         access_path = "".join(operation.target.selectors) or "*"
-        storage_obj = ObjRef(obj.base, generation=obj.generation)
+        storage_obj = obj
         if operation.access == "pass":
             return [Event.pass_value(obj, operation.line)]
         if operation.access == "compare":

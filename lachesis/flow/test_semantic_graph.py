@@ -167,6 +167,19 @@ class SemanticGraphTests(unittest.TestCase):
         g = self._graph(events, [("start", "capture"), ("capture", "free"), ("free", "saved_use")])
         self.assertEqual(match_graph(g), [])
 
+    def test_field_pointee_release_matches_field_pointee_dereference(self):
+        aggregate = ObjRef("b", generation="g0")
+        payload = aggregate.child("*data")
+        events = [
+            ("start", None),
+            ("free", Event.release(payload, 2)),
+            ("use", Event.read(payload, "[*]", 3)),
+        ]
+        g = self._graph(events, [("start", "free"), ("free", "use")])
+        hits = match_graph(g)
+        self.assertEqual([hit["pattern"] for hit in hits], ["uaf.deref"])
+        self.assertEqual(hits[0]["object"], payload.render())
+
     def test_derive_preserves_alias_identity(self):
         original = ObjRef("O", generation="g0")
         alias = ObjRef("saved", generation="g0")
