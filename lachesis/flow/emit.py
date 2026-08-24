@@ -426,6 +426,7 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     result = SkeletonGraph(language=lang)
     entries, exits = {}, {}
     pending_calls = []
+    sink_catalog = atropos.sink_catalog(lang)
 
     def ref(value):
         return ObjRef(str(value), generation="g0") if value else None
@@ -472,6 +473,37 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                 index += 1
                 continue
             callee = item.get("callee")
+            catalog_entry = sink_catalog.get(callee) or {}
+            for arg_pos in catalog_entry.get("sink_args", ()):
+                argument = next((arg for arg in item.get("args", ())
+                                 if arg.get("pos") == arg_pos), None)
+                if argument is None:
+                    continue
+                family = (catalog_entry.get("kinds") or {}).get(arg_pos)
+                family = family or catalog_entry.get("family")
+                if not family:
+                    continue
+                sink_id = f"{fn}:ir:sink:{index}:{arg_pos}"
+                sink_obj = ref(argument.get("root") or argument.get("var")
+                               or callee)
+                facts = {
+                    "family": family,
+                    "callee": callee,
+                    "arg": arg_pos,
+                    "tainted": argument.get("provenance") != "const",
+                    "guarded": bool(item.get("guards")),
+                    "guard_status": item.get("guard_status"),
+                    "guard_predicates": item.get("guard_predicates") or (),
+                    "size_expr": item.get("size_expr"),
+                    "dst": item.get("dst"),
+                    "control": item.get("control") or (),
+                }
+                result.add_node(sink_id, Event(EventKind.SINK, obj=sink_obj,
+                                               line=item.get("line"), facts=facts),
+                                fragment=fn, source_reachable=reachable,
+                                source_influenced=bool(facts["tainted"]))
+                result.add_edge(previous, sink_id)
+                previous = sink_id
             if callee not in functions:
                 continue
             enter = f"{fn}:ir:call:{index}:enter"
