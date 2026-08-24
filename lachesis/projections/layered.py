@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from ..core.capabilities import ALL_CAPABILITIES
 from ..core.query import GraphIndex
-from .security import derive_roles, detect_guards
+from .security import derive_roles, detect_guards, detect_path_guards
 
 
 SCHEMA_VERSION = 2
@@ -338,9 +338,12 @@ def build_security_query_projection(
         for node_id, node in index.nodes.items()
     }
     reaches = sorted(index.nodes_of_kind("taint-reach"), key=lambda item: item["id"])
+    path_guards = detect_path_guards(graph, index)
     return {
         "manifest": {
             "security": {
+                "path_guard_count": len(path_guards),
+                "path_guards": path_guards,
                 "path_queries": [
                     {"id": reach["id"], "label": reach["label"],
                      "query": {"operation": "security-path", "node_id": reach["id"]}}
@@ -546,6 +549,7 @@ def build_layered_graph(
     owners = _ownership(graph, index, tier_of, project_id)
     role_of, sinks = derive_roles(graph, index)
     verdicts = detect_guards(graph, sinks, index)
+    path_guards = detect_path_guards(graph, index)
     for verdict in verdicts:
         if verdict["status"] == "GUARDED":
             for witness in verdict["witnesses"]:
@@ -728,6 +732,11 @@ def build_layered_graph(
             ),
             "guard_differential_count": len(differentials),
             "differentials": differentials,
+            # Path guards are evidence, not automatic suppression.  In particular
+            # `startswith` is surfaced as weak so the Django traversal remains a
+            # candidate until component containment is proven.
+            "path_guard_count": len(path_guards),
+            "path_guards": path_guards,
             "path_queries": [
                 {"id": reach["id"], "label": reach["label"],
                  "query": {"operation": "security-path", "node_id": reach["id"]}}
