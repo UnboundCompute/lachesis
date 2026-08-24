@@ -480,15 +480,23 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                 target = edge.get("target")
                 if target not in heads:
                     continue
+                guard = ()
+                if edge.get("kind") in {"TRUE_BRANCH", "FALSE_BRANCH"}:
+                    predicate = str(edge.get("predicate") or cfg_node)
+                    predicate = predicate.removeprefix("condition:").strip()
+                    proof_value = (f"{predicate}==TRUE"
+                                   if edge.get("kind") == "TRUE_BRANCH"
+                                   else f"{predicate}!=TRUE")
+                    guard = (GuardProof("VALUE", proof_value),)
                 if edge.get("kind") == "LOOP_BACK":
                     loop_id = f"{fn}:ir:loop:{cfg_node}:{edge_index}"
                     result.add_node(loop_id, Event(EventKind.LOOP,
                                                     facts={"frontend_ir": True}),
                                     fragment=fn, source_reachable=reachable)
                     result.add_edge(source, loop_id)
-                    result.add_edge(loop_id, heads[target])
+                    result.add_edge(loop_id, heads[target], guard=guard)
                 else:
-                    result.add_edge(source, heads[target])
+                    result.add_edge(source, heads[target], guard=guard)
         entry = cfg.get("entry") or cfg_nodes[0]
         entry = heads.get(entry, heads[cfg_nodes[0]])
         if reachable:

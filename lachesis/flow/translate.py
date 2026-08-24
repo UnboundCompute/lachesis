@@ -480,6 +480,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             cfg_successors[source].append({
                 "target": target,
                 "kind": kind,
+                "predicate": ix.nodes.get(source, {}).get("label"),
                 "properties": edge.get("properties") or {},
             })
             cfg_nodes.update((source, target))
