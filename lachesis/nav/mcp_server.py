@@ -55,7 +55,6 @@ _PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
 # "text" = compact LLM-facing rendering (Spec 1); "json" = the full result dict.
 # Set from LACHESIS_FORMAT in main(); defaults to text.
 _DEFAULT_FORMAT = "text"
-_REVIEWS = {}
 
 # Hunting-only tools are excluded from the opt-in comprehension surface. The default
 # remains additive/backward-compatible; a caller has to request the narrower profile.
@@ -124,7 +123,6 @@ TOOL_ORDER = (
     "candidates", "candidate_detail", "candidate_census", "skeleton",
     "flow_pass", "flow_skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
-    "review",
 )
 
 
@@ -552,15 +550,6 @@ TOOLS = [
          "limit": {"type": "integer", "default": 20},
          "include_suppressions": {"type": "boolean", "default": False}},
          "required": []}},
-    {"name": "review",
-     "description": "Record a developer review decision for a candidate in this server session. "
-                    "This is a workflow note, not a safety verdict; decisions are returned by "
-                    "later calls in the same session and are not written into the graph.",
-     "inputSchema": {"type": "object", "properties": {
-         "candidate_id": {"type": "string"},
-         "decision": {"type": "string", "enum": ["open", "killed", "confirmed"]},
-         "note": {"type": "string"}},
-         "required": ["candidate_id", "decision"]}},
     {"name": "wrapper_model",
      "description": "Infer wrapper semantics from graph evidence: allocator, deallocator, "
                     "I/O, validator, and forwarding call roles. This is evidence with "
@@ -1078,15 +1067,6 @@ def call_tool(name, args, format=None):
         return _load_graph(args)
     if name == "build_graph":
         return _build_graph(args)
-    if name == "review":
-        candidate_id = str(args.get("candidate_id", "")).strip()
-        decision = str(args.get("decision", "")).strip()
-        if not candidate_id or decision not in {"open", "killed", "confirmed"}:
-            return _emit(name, {"error": "candidate_id and decision (open|killed|confirmed) are required"}, fmt)
-        _REVIEWS[candidate_id] = {"candidate_id": candidate_id, "decision": decision,
-                                  "note": str(args.get("note", ""))}
-        return _emit(name, {"move": "review", "review": _REVIEWS[candidate_id],
-                            "persistence": "session"}, fmt)
     if name in DISABLED_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is disabled: it requires a "
                                      "whole-graph guard scan (removed for now)"}, fmt)
