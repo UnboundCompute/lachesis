@@ -74,8 +74,12 @@ _OP_VERB = {
 def _readable_root(sub, root: str, scope=None) -> str:
     """Render an AccessPath root (``decl:<id>`` / ``param``) as a stable, readable base.
 
-    Identity is per-skeleton (one function), so a variable's own name is a stable key here;
-    the raw decl id is opaque and collides across nothing within a single function."""
+    Local names remain readable, but ownerless declarations are program-scope storage
+    identities.  Qualifying those roots with their declaration id keeps two same-named
+    globals/statics from collapsing while preserving one identity across every function
+    that refers to the same declaration.  This is the same declaration-vs-call-context
+    distinction used by the object-state layer; a bare spelling is not a sufficient whole-
+    program identity for persistent storage."""
     if root.startswith("decl:"):
         node_id = root[len("decl:"):]
         label = sub.label(node_id) or node_id
@@ -97,6 +101,8 @@ def _readable_root(sub, root: str, scope=None) -> str:
                         if counts[(owner, name)] > 1}
             sub._shadowed_roots = shadowed
         owner = sub.props(node_id).get("owner_function_id") or sub.props(node_id).get("function_id")
+        if owner is None:
+            return f"{label}@{node_id}"
         if (owner, label) in shadowed:
             return f"{label}@{node_id}"
         return label
