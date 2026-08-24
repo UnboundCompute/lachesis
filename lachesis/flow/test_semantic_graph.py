@@ -478,6 +478,23 @@ class SemanticGraphTests(unittest.TestCase):
         g.nodes["callee"].event.facts["abstract_object_ids"] = ["('clobber', 'recent', 'caller', 'p')"]
         self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_parameter_identity_is_scoped_between_unrelated_fragments(self):
+        identity = "('param', 0, ('*', 'data'))"
+        g = SkeletonGraph()
+        g.add_node("release", Event(EventKind.RELEASE,
+                                     obj=ObjRef("p", ("*", "data")),
+                                     facts={"abstract_object_ids": [identity]}),
+                   fragment="owner")
+        g.add_node("use", Event(EventKind.READ_STORAGE,
+                                 obj=ObjRef("q", ("*", "data")),
+                                 base=ObjRef("q", ("*", "data")),
+                                 facts={"abstract_object_ids": [identity]}),
+                   fragment="unrelated")
+        g.add_fragment("owner", "release", ["release"])
+        g.add_fragment("unrelated", "use", ["use"])
+        g.add_edge("release", "use")
+        self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_new_origin_clears_prior_abstract_release_at_same_site(self):
         obj = ObjRef("p", generation="g0")
         identity = ["('alloc', 'site', 'helper', 'p')"]

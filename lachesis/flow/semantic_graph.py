@@ -588,7 +588,17 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             # versus a stale cursor), so the matcher must retain both.
             values = (tuple(event.facts.get("abstract_object_ids") or ()) +
                       tuple(event.facts.get("abstract_source_ids") or ()))
-            return tuple(dict.fromkeys(str(value) for value in values))
+            scoped = []
+            for value in values:
+                text = str(value)
+                # Parameter identities are local to the fragment that emitted
+                # them.  Concrete ObjRef seam bindings remain the authority for
+                # interprocedural continuity; without this scope, unrelated
+                # ``param 0`` values in different functions can collide.
+                if text.startswith("('param',"):
+                    text = f"{text}|scope={node.fragment}"
+                scoped.append(text)
+            return tuple(dict.fromkeys(scoped))
 
         def abstract_canonical(value: str) -> str:
             visited = set()
