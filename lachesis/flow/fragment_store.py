@@ -70,29 +70,35 @@ class FragmentStore:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def key(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
-            summaries: Any = None, coverage=None, reach_summaries: Any = None) -> tuple[Any, ...]:
-        return self._base_key(functions, lang, graph, summaries, reach_summaries) + (
+            summaries: Any = None, coverage=None, reach_summaries: Any = None,
+            state_artifacts: Any = None) -> tuple[Any, ...]:
+        return self._base_key(functions, lang, graph, summaries, reach_summaries,
+                              state_artifacts) + (
             self._coverage_key(coverage), self._context_key(coverage))
 
     @staticmethod
     def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
-                  summaries: Any, reach_summaries: Any) -> tuple[Any, ...]:
+                  summaries: Any, reach_summaries: Any,
+                  state_artifacts: Any = None) -> tuple[Any, ...]:
         graph_key = (FragmentStore._fingerprint(graph)
                      if isinstance(graph, (dict, list, tuple)) else id(graph))
         return (lang, graph_key, FragmentStore._fingerprint(functions),
                 FragmentStore._fingerprint(summaries),
-                FragmentStore._fingerprint(reach_summaries))
+                FragmentStore._fingerprint(reach_summaries),
+                FragmentStore._fingerprint(state_artifacts))
 
     def get(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
-            summaries: Any = None, coverage=None, reach_summaries: Any = None):
+            summaries: Any = None, coverage=None, reach_summaries: Any = None,
+            state_artifacts: Any = None):
         exact = self._graphs.get(self.key(functions, lang, graph, summaries, coverage,
-                                           reach_summaries))
+                                           reach_summaries, state_artifacts))
         if exact is not None:
             return exact
         requested = self._coverage_signature(coverage)
         if not requested:
             return None
-        base = self._base_key(functions, lang, graph, summaries, reach_summaries)
+        base = self._base_key(functions, lang, graph, summaries, reach_summaries,
+                              state_artifacts)
         # Reuse only a true source/state superset under identical semantic inputs.
         candidates = self._coverage_graphs.get(base, ())
         supersets = [(len(states), value) for states, value in candidates
@@ -176,10 +182,12 @@ class FragmentStore:
 
     def put(self, functions: Mapping[str, Mapping], lang: str, graph: Any,
             semantic_graph: SkeletonGraph, summaries: Any = None,
-            coverage=None, reach_summaries: Any = None) -> SkeletonGraph:
+            coverage=None, reach_summaries: Any = None,
+            state_artifacts: Any = None) -> SkeletonGraph:
         self._graphs[self.key(functions, lang, graph, summaries, coverage,
-                              reach_summaries)] = semantic_graph
-        base = self._base_key(functions, lang, graph, summaries, reach_summaries)
+                              reach_summaries, state_artifacts)] = semantic_graph
+        base = self._base_key(functions, lang, graph, summaries, reach_summaries,
+                              state_artifacts)
         states = self._coverage_signature(coverage)
         entries = self._coverage_graphs.setdefault(base, [])
         entries[:] = [(known, value) for known, value in entries
@@ -232,7 +240,7 @@ class FragmentStore:
 
     def restore_snapshot(self, payload: Mapping[str, Any], functions: Mapping[str, Mapping],
                          lang: str, graph: Any = None, summaries: Any = None,
-                         reach_summaries: Any = None) -> int:
+                         reach_summaries: Any = None, state_artifacts: Any = None) -> int:
         """Restore only fragments matching the supplied semantic input identity.
 
         Returns the number of accepted fragments.  Invalid or incompatible
@@ -242,7 +250,7 @@ class FragmentStore:
         """
         accepted = 0
         expected_base = self._base_key(functions, lang, graph, summaries,
-                                       reach_summaries)
+                                       reach_summaries, state_artifacts)
         for entry in payload.get("fragments", ()) or ():
             # A persisted graph is useful only when its semantic-input identity
             # matches this restore session.  Never re-key an arbitrary stale
@@ -254,7 +262,7 @@ class FragmentStore:
                 coverage = {"state_keys": entry.get("state_keys", ()),
                             "context_keys": entry.get("context_keys", ())}
                 self.put(functions, lang, graph, semantic, summaries, coverage,
-                         reach_summaries)
+                         reach_summaries, state_artifacts)
                 # A matching semantic fingerprint proves only that the
                 # snapshot was built from the same inputs.  It does not prove
                 # that the serialized graph still contains every source-rooted
@@ -293,7 +301,7 @@ class FragmentStore:
 
     def load_snapshot(self, path: str | os.PathLike[str], functions: Mapping[str, Mapping],
                       lang: str, graph: Any = None, summaries: Any = None,
-                      reach_summaries: Any = None) -> int:
+                      reach_summaries: Any = None, state_artifacts: Any = None) -> int:
         """Load a sidecar snapshot, returning zero for absent/invalid data."""
         try:
             with Path(path).open(encoding="utf-8") as handle:
@@ -301,7 +309,7 @@ class FragmentStore:
             if payload.get("version") != 1:
                 return 0
             return self.restore_snapshot(payload, functions, lang, graph,
-                                         summaries, reach_summaries)
+                                         summaries, reach_summaries, state_artifacts)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return 0
 
@@ -485,7 +493,7 @@ class Claus:
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
               coverage=None, reach_summaries=None, state_artifacts=None):
         cached = self.fragments.get(functions, lang, graph, summaries, coverage,
-                                    reach_summaries)
+                                    reach_summaries, state_artifacts)
         if cached is not None:
             return self._record_coverage(cached, coverage)
         # A complete cache miss must rebuild the full semantic input.  When a
@@ -514,4 +522,4 @@ class Claus:
                                      work_functions=work_functions)
         self._record_coverage(built, coverage)
         return self.fragments.put(functions, lang, graph, built, summaries, coverage,
-                                  reach_summaries)
+                                  reach_summaries, state_artifacts)

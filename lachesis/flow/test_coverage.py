@@ -242,6 +242,17 @@ class CoverageSchedulerTests(unittest.TestCase):
         })
         self.assertNotEqual(first, second)
 
+    def test_fragment_cache_key_includes_heap_state_artifacts(self):
+        store = FragmentStore()
+        functions = {"worker": {}}
+        first = store.key(functions, "c", state_artifacts={
+            "worker": {"point_states": {"n1": ["heap-a"]}},
+        })
+        second = store.key(functions, "c", state_artifacts={
+            "worker": {"point_states": {"n1": ["heap-b"]}},
+        })
+        self.assertNotEqual(first, second)
+
     def test_fragment_cache_reuses_a_coverage_superset(self):
         store = FragmentStore()
         functions = {"worker": {}}

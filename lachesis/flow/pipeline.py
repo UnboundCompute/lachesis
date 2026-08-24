@@ -240,7 +240,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
         if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
             claus.fragments.load_snapshot(
                 snapshot_path, F, lang, analysis_graph,
-                object_result.summaries, summaries)
+                object_result.summaries, summaries, object_result.artifacts)
             store._pass3_snapshot_loaded = True
         semantic_graph = claus.build(
             store, F, succ, lang=lang, graph=analysis_graph,
