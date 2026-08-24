@@ -728,14 +728,21 @@ TOOLS = [
          "src": {"type": "string"}, "sink": {"type": "string"}},
          "required": ["src", "sink"]}},
     {"name": "sources_of",
-     "description": "Reverse value-flow cone: which values can feed this sink. path_shape.",
+     "description": "Read-only reverse value-flow cone for a sink. Use this after a candidate "
+                    "or sink is selected to find values that may feed it; it returns labeled "
+                    "nodes and edges plus explicit truncation/frontier metadata. A missing path "
+                    "is not proof that no flow exists.",
      "inputSchema": {"type": "object", "properties": {
-         "sink": {"type": "string"}, "limit": {"type": "integer", "default": 200}},
+         "sink": {"type": "string", "description": "sink name or graph node id"},
+         "limit": {"type": "integer", "default": 200, "description": "maximum rows returned"}},
          "required": ["sink"]}},
     {"name": "points_to",
-     "description": "Heap objects a value points to (POINTS_TO). path_shape.",
+     "description": "Read-only heap alias query: return the objects a value may point to "
+                    "through POINTS_TO edges. Use this for pointer/alias follow-up, not for "
+                    "callers or value-flow; the response includes path evidence and unknowns.",
      "inputSchema": {"type": "object", "properties": {
-         "value": {"type": "string"}}, "required": ["value"]}},
+         "value": {"type": "string", "description": "value name or graph node id"}},
+         "required": ["value"]}},
     {"name": "aliases",
      "description": "Values that alias this one (share a heap-object via POINTS_TO) — the "
                     "destructuring/alias set. path_shape.",
