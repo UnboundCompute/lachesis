@@ -488,11 +488,30 @@ class Claus:
                                     reach_summaries)
         if cached is not None:
             return self._record_coverage(cached, coverage)
+        # A complete cache miss must rebuild the full semantic input.  When a
+        # source-rooted plan is only partially materialized, however, hand the
+        # emitter the deterministic pending cones so Claus can grow the cache
+        # incrementally instead of rewalking every function.  The full
+        # ``functions`` mapping remains part of the cache identity; only the
+        # current materialization work item is narrowed.
+        work_functions = None
+        if coverage is not None and hasattr(coverage, "pending_regions"):
+            pending = coverage.pending_regions(
+                self.fragments.covered_states,
+                self.fragments.covered_contexts,
+            )
+            if pending:
+                work_functions = {
+                    name
+                    for region in pending
+                    for name in (*region.sources, *region.functions)
+                }
         from .emit import build_semantic_graph
         built = build_semantic_graph(store, functions, successors, lang=lang,
                                      graph=graph, summaries=summaries,
                                      reach_summaries=reach_summaries,
-                                     state_artifacts=state_artifacts)
+                                     state_artifacts=state_artifacts,
+                                     work_functions=work_functions)
         self._record_coverage(built, coverage)
         return self.fragments.put(functions, lang, graph, built, summaries, coverage,
                                   reach_summaries)

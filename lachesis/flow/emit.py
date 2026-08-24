@@ -977,7 +977,8 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
 
 
 def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None,
-                         reach_summaries=None, state_artifacts=None):
+                         reach_summaries=None, state_artifacts=None,
+                         work_functions=None):
     """Build the production frozen-v1 graph from the enriched third-pass substrate.
 
     The existing object interpreter supplies identity-bearing operations and a real structured
@@ -986,9 +987,18 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     continuations, so a shared callee cannot return into another caller's path.
     """
     available_graph = graph if graph is not None else getattr(store, "graph", None)
+    selected = None if work_functions is None else set(work_functions)
     if not _native_object_substrate(available_graph):
+        if selected is not None:
+            selected &= set(F)
+            F = {name: F[name] for name in sorted(selected)}
+            succ = {name: [callee for callee in succ.get(name, ()) if callee in F]
+                    for name in F}
         return _build_ir_semantic_graph(F, succ, lang=lang)
     functions = _lifetime_slice(F, succ, lang=lang)
+    if selected is not None:
+        functions = {name: functions[name] for name in sorted(selected)
+                     if name in functions}
     if not functions:
         return SkeletonGraph(language=lang)
     analysis_graph = graph if graph is not None else store.graph

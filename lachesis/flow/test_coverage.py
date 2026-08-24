@@ -219,6 +219,38 @@ class CoverageSchedulerTests(unittest.TestCase):
             semantic,
         )
 
+    def test_claus_emits_only_pending_source_cones(self):
+        functions = {
+            "source_a": {"callers": []},
+            "worker_a": {"callers": ["source_a"]},
+            "source_b": {"callers": []},
+            "worker_b": {"callers": ["source_b"]},
+        }
+        successors = {
+            "source_a": ["worker_a"], "worker_a": [],
+            "source_b": ["worker_b"], "worker_b": [],
+        }
+        plan = CoverageScheduler(functions, successors).plan(
+            ["worker_a", "worker_b"])
+        fragment_store = FragmentStore()
+        fragment_store.mark_covered([("source_a", "source_a"),
+                                     ("worker_a", "source_a")])
+        fragment_store.mark_contexts_covered([
+            ("source_a", "source_a", "__entry__"),
+            ("worker_a", "source_a", "__entry__"),
+        ])
+        captured = {}
+
+        def build(_store, _functions, _successors, **kwargs):
+            captured["work_functions"] = kwargs["work_functions"]
+            return SkeletonGraph()
+
+        with patch("lachesis.flow.emit.build_semantic_graph", side_effect=build):
+            Claus(fragment_store).build(
+                object(), functions, successors, coverage=plan)
+
+        self.assertEqual(captured["work_functions"], {"source_b", "worker_b"})
+
     def test_fragment_cache_composes_disjoint_source_regions(self):
         store = FragmentStore()
         functions = {"worker": {}}
