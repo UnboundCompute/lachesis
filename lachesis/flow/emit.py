@@ -415,6 +415,90 @@ def _native_object_substrate(graph):
     return "DeclRefExpr" in syntax and "CallExpr" in syntax
 
 
+def _build_cfg_ir_semantic_graph(functions, *, lang):
+    """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
+    result = SkeletonGraph(language=lang)
+
+    def event_for(record):
+        obj = ObjRef(str(record.get("var")), generation="g0") \
+            if record.get("var") else None
+        if obj is None:
+            return None
+        line = record.get("line")
+        kind = record.get("kind")
+        if kind == "alloc":
+            return Event.origin(obj, line, facts={"frontend_ir": True})
+        if kind == "free":
+            return Event.release(obj, line)
+        if kind == "use":
+            return Event.read(obj, "*", line)
+        if kind == "escape":
+            return Event.pass_value(obj, line)
+        return None
+
+    for fn in sorted(functions):
+        record = functions[fn]
+        cfg = record.get("cfg") or {}
+        cfg_nodes = tuple(cfg.get("nodes") or ())
+        if not cfg_nodes:
+            continue
+        reachable = bool(record.get("source_reachable") or record.get("is_source"))
+        successor_map = cfg.get("succ") or {}
+        event_by_anchor = defaultdict(list)
+        for index, event_record in enumerate(record.get("events", ())):
+            event_node = event_record.get("node")
+            if event_node in cfg_nodes:
+                event_by_anchor[event_node].append((index, event_record))
+        tails = {}
+        heads = {}
+        for cfg_node in cfg_nodes:
+            outgoing = successor_map.get(cfg_node, ())
+            graph_node = f"{fn}:ir:cfg:{cfg_node}"
+            if len(outgoing) > 1:
+                structural = Event(EventKind.BRANCH, facts={"frontend_ir": True})
+            elif any(edge.get("kind") == "LOOP_BACK" for edge in outgoing):
+                structural = Event(EventKind.LOOP, facts={"frontend_ir": True})
+            else:
+                structural = None
+            result.add_node(graph_node, structural, fragment=fn,
+                            source_reachable=reachable)
+            heads[cfg_node] = graph_node
+            tail = graph_node
+            for index, event_record in event_by_anchor.get(cfg_node, ()):
+                event = event_for(event_record)
+                if event is None:
+                    continue
+                event_id = f"{fn}:ir:event:{index}"
+                result.add_node(event_id, event, fragment=fn,
+                                source_reachable=reachable)
+                result.add_edge(tail, event_id)
+                tail = event_id
+            tails[cfg_node] = tail
+        for cfg_node in cfg_nodes:
+            source = tails[cfg_node]
+            for edge_index, edge in enumerate(successor_map.get(cfg_node, ())):
+                target = edge.get("target")
+                if target not in heads:
+                    continue
+                if edge.get("kind") == "LOOP_BACK":
+                    loop_id = f"{fn}:ir:loop:{cfg_node}:{edge_index}"
+                    result.add_node(loop_id, Event(EventKind.LOOP,
+                                                    facts={"frontend_ir": True}),
+                                    fragment=fn, source_reachable=reachable)
+                    result.add_edge(source, loop_id)
+                    result.add_edge(loop_id, heads[target])
+                else:
+                    result.add_edge(source, heads[target])
+        entry = cfg.get("entry") or cfg_nodes[0]
+        entry = heads.get(entry, heads[cfg_nodes[0]])
+        if reachable:
+            result.source_reachable.add(entry)
+        exits = {tails[node] for node in cfg_nodes if not successor_map.get(node)}
+        result.add_fragment(fn, entry, exits, params=record.get("params", ()))
+    result.validate()
+    return result
+
+
 def _build_ir_semantic_graph(functions, successors, *, lang):
     """Build a conservative semantic graph from translated frontend-neutral IR.
 
@@ -423,6 +507,18 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     It intentionally does not invent aliases or branch proofs that the frontend did
     not emit; richer frontend overlays can be added without changing the matcher.
     """
+    can_use_cfg = bool(functions) and all(
+        (record.get("cfg") and
+         not any(call.get("callee") in functions
+                 for call in record.get("calls", ())) and
+         all(not event.get("node") or
+             event.get("node") in set(record["cfg"].get("nodes") or ())
+             for event in record.get("events", ())))
+        for record in functions.values()
+    )
+    if can_use_cfg:
+        return _build_cfg_ir_semantic_graph(functions, lang=lang)
+
     result = SkeletonGraph(language=lang)
     entries, exits = {}, {}
     pending_calls = []

@@ -139,6 +139,39 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["pattern"] == "uaf.deref"
                             for hit in match_graph(graph)))
 
+    def test_frontend_ir_fallback_keeps_sibling_cfg_arms_separate(self):
+        from .emit import build_semantic_graph
+
+        cfg = {
+            "nodes": ("entry", "condition", "free_arm", "live_arm", "merge", "exit"),
+            "entry": "entry",
+            "succ": {
+                "entry": ({"target": "condition", "kind": "CFG_NEXT"},),
+                "condition": ({"target": "free_arm", "kind": "TRUE_BRANCH"},
+                              {"target": "live_arm", "kind": "FALSE_BRANCH"}),
+                "free_arm": ({"target": "merge", "kind": "CFG_NEXT"},),
+                "live_arm": ({"target": "merge", "kind": "CFG_NEXT"},),
+                "merge": ({"target": "exit", "kind": "CFG_NEXT"},),
+            },
+        }
+        functions = {
+            "entry_fn": {
+                "is_source": True, "source_reachable": True, "params": [],
+                "calls": [], "cfg": cfg,
+                "events": [
+                    {"kind": "alloc", "var": "p", "node": "entry", "line": 1},
+                    {"kind": "free", "var": "p", "node": "free_arm", "line": 2},
+                    {"kind": "use", "var": "p", "node": "live_arm", "line": 3},
+                    {"kind": "use", "var": "p", "node": "merge", "line": 4},
+                ],
+            },
+        }
+        graph = build_semantic_graph(object(), functions, {"entry_fn": []},
+                                     lang="python", graph={})
+        hits = [hit for hit in match_graph(graph) if hit["pattern"] == "uaf.deref"]
+        self.assertTrue(any(hit["line"] == 4 for hit in hits))
+        self.assertFalse(any(hit["line"] == 3 for hit in hits))
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:

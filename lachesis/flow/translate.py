@@ -463,11 +463,43 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         if r.get("kind") == "var" and r.get("prov") == "alloc":
             events.append({"kind": "escape", "var": r["var"], "line": r.get("line")})
 
+    # Preserve the neutral control-flow overlay for consumers that do not have
+    # the C declaration-rooted object substrate.  The semantic graph can use
+    # these typed sibling edges without re-reading frontend-specific AST facts.
+    cfg_edge_kinds = ("CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK",
+                      "EXCEPTION_BRANCH", "SWITCH_CASE")
+    owned_ids = {node.get("id") for node in owned_nodes}
+    cfg_successors = defaultdict(list)
+    cfg_nodes = set()
+    for source in owned_ids:
+        for edge in ix.outgoing_of_kind(source, *cfg_edge_kinds):
+            target = edge.get("target")
+            if target not in owned_ids:
+                continue
+            kind = ix.semantic_edge_kind(edge) or edge.get("kind")
+            cfg_successors[source].append({
+                "target": target,
+                "kind": kind,
+                "properties": edge.get("properties") or {},
+            })
+            cfg_nodes.update((source, target))
+    cfg = None
+    if cfg_nodes:
+        entries = [node.get("id") for node in owned_nodes
+                   if node.get("id") in cfg_nodes and node.get("kind") == "cfg-entry"]
+        cfg = {
+            "nodes": tuple(sorted(cfg_nodes)),
+            "entry": entries[0] if entries else None,
+            "succ": {source: tuple(sorted(edges, key=lambda item: (
+                item.get("kind") or "", item.get("target") or "")))
+                      for source, edges in cfg_successors.items()},
+        }
+
     return {"name": fnode.get("label"),
             "file": _props(fnode).get("file"), "line": _props(fnode).get("start_line"),
             "params": params, "calls": calls, "events": events,
             "assigns": assigns, "returns": returns, "callees": callees,
-            "body_node_count": body_node_count}
+            "body_node_count": body_node_count, "cfg": cfg}
 
 
 def build_F(store, lang="c", *, return_graph=False):
