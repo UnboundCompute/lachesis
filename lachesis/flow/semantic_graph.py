@@ -1330,6 +1330,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         hit["source_function"] = launch_node.fragment if launch_node else None
         hit["source_site"] = (launch_node.metadata.get("source_site")
                                if launch_node else None)
+        hit["source_provenance"] = (launch_node.metadata.get("source_provenance", "unknown")
+                                     if launch_node else "unknown")
         hit["witness_complete"] = len(edge_trace) == max(0, len(witness) - 1)
         first = trace[0] if trace else {}
         hit["source_node"] = first.get("node")

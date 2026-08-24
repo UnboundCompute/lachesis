@@ -1243,7 +1243,7 @@ class SemanticGraphTests(unittest.TestCase):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()
         g.add_node("launch", Event.origin(obj, 17), fragment="main",
-                   source_site="read@17")
+                   source_site="read@17", source_provenance="catalog")
         g.add_node("free", Event.release(obj), fragment="main")
         g.add_node("use", Event.read(obj), fragment="main")
         g.add_edge("launch", "free", guard=(GuardProof("NONNULL", "p#g0"),))
@@ -1254,6 +1254,7 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(hit["source_context"], "launch")
         self.assertEqual(hit["source_function"], "main")
         self.assertEqual(hit["source_site"], "read@17")
+        self.assertEqual(hit["source_provenance"], "catalog")
         self.assertEqual(hit["source_line"], 17)
         self.assertTrue(hit["witness_complete"])
         self.assertEqual(hit["witness_edges"][0]["guards"][0]["kind"], "NONNULL")
