@@ -456,7 +456,12 @@ def _semantic_event(sub, operation, generations=None):
             if (value is not None and target_root.startswith("decl:")
                     and not (sub.props(target_root[len("decl:"):]).get("owner_function_id")
                              or sub.props(target_root[len("decl:"):]).get("function_id"))):
-                events.append(Event.escape(value, operation.line))
+                events.extend((
+                    Event(EventKind.DERIVE, obj=storage_obj, value=value,
+                          line=operation.line,
+                          facts={"persistent_slot": True}),
+                    Event.escape(value, operation.line),
+                ))
             return events
         return [Event.read(storage_obj, access_path, operation.line)]
     if operation.kind == OpKind.COPY and obj:
@@ -544,7 +549,12 @@ def _ir_event(record):
         return Event.pass_value(obj, line)
     if kind in {"compare", "compare_value"} and obj:
         return Event(EventKind.COMPARE_VALUE, obj=obj, line=line)
-    if kind in {"escape", "global_store"} and obj:
+    if kind == "global_store" and obj:
+        # Persistent slots retain an alias across function boundaries; encode
+        # that relation explicitly instead of reducing the store to escape.
+        return Event(EventKind.DERIVE, obj=obj, value=value, line=line,
+                     facts={"persistent_slot": True})
+    if kind == "escape" and obj:
         return Event.escape(obj, line)
     if kind in {"return", "return_value"}:
         if obj:

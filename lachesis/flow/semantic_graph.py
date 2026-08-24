@@ -819,6 +819,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 bound = canonical(event.value) or event.value
                 bindings[event.obj] = bound
                 aliases[event.obj] = bound
+                if event.facts.get("persistent_slot"):
+                    # A persistent slot is both an alias and an ownership
+                    # escape. Reads through it must observe releases made via
+                    # another alias on the same source-rooted execution.
+                    escaped.add(bound)
                 obj = canonical(event.obj)
             if event is not None and event.kind == EventKind.POINTER_ARITHMETIC and obj:
                 pointer_arithmetic.add((obj, canonical(event.base)))

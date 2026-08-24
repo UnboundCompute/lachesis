@@ -1069,6 +1069,20 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_fragment("main", "origin", ("exit",))
         self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_persistent_slot_alias_observes_release_through_another_alias(self):
+        obj = ObjRef("node", generation="g0")
+        slot = ObjRef("cached", generation="g0")
+        g = self._graph([
+            ("origin", Event.origin(obj)),
+            ("store", Event(EventKind.DERIVE, obj=slot, value=obj,
+                             facts={"persistent_slot": True})),
+            ("release", Event.release(obj)),
+            ("read", Event.read(slot)),
+        ], [("origin", "store"), ("store", "release"), ("release", "read")])
+        patterns = {hit["pattern"] for hit in match_graph(g)}
+        self.assertIn("uaf.deref", patterns)
+        self.assertNotIn("leak", patterns)
+
     def test_witness_keeps_the_edge_taken_when_parallel_guards_share_nodes(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()
