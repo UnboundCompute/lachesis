@@ -402,6 +402,24 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual({hit["source_context"] for hit in hits},
                          {"source_a", "source_b"})
 
+    def test_neutral_seam_parser_preserves_prefix_pointer_algebra(self):
+        from lachesis.flow.emit import _call_bindings, _expression_objref
+
+        self.assertEqual(_expression_objref("&node").path, ("&",))
+        self.assertEqual(_expression_objref("**triple").path, ("*", "*"))
+        self.assertEqual(_expression_objref("&node->field").path,
+                         ("&", "*", "field"))
+
+        class Sub:
+            @staticmethod
+            def label(value):
+                return value
+
+        bindings = _call_bindings(
+            Sub(), {"args": [{"pos": 0, "root": "node", "expr": "&node"}]},
+            ("formal",))
+        self.assertEqual(bindings[0][1], ObjRef("node", ("&",), "g0"))
+
     def test_public_atropos_pattern_id_selects_the_internal_matcher(self):
         obj = ObjRef("object", generation="g0")
         g = self._graph(

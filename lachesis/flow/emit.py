@@ -1664,11 +1664,19 @@ def _call_bindings(sub, call, formals):
         tokens = re.findall(r"[A-Za-z_]\w*|->|\.|\*|&|\[[^]]*\]", expression)
         if not tokens:
             return ObjRef(str(root), generation="g0")
-        base = tokens[0]
-        if not re.match(r"^[A-Za-z_]\w*$", base):
+        # Preserve prefix address/dereference operators instead of falling
+        # back to the bare root.  ``&node`` and ``**triple`` are precisely the
+        # multi-level seam identities the semantic matcher must normalize.
+        prefix = []
+        index = 0
+        while index < len(tokens) and tokens[index] in {"*", "&"}:
+            prefix.append(tokens[index])
+            index += 1
+        if index >= len(tokens) or not re.match(r"^[A-Za-z_]\w*$", tokens[index]):
             return ObjRef(str(root), generation="g0")
-        selectors = []
-        index = 1
+        base = tokens[index]
+        selectors = prefix
+        index += 1
         while index < len(tokens):
             token = tokens[index]
             if token == "->" and index + 1 < len(tokens):
@@ -1705,9 +1713,15 @@ def _expression_objref(expression: str) -> ObjRef:
     """Project a source-level receiver expression into an ObjRef path."""
     expression = str(expression).strip().strip("() ").replace("->", " -> ")
     tokens = re.findall(r"[A-Za-z_]\w*|->|\.|\*|&|\[[^]]*\]", expression)
-    base = tokens[0] if tokens and re.match(r"^[A-Za-z_]\w*$", tokens[0]) else expression
-    selectors = []
-    index = 1
+    prefix = []
+    index = 0
+    while index < len(tokens) and tokens[index] in {"*", "&"}:
+        prefix.append(tokens[index])
+        index += 1
+    base = (tokens[index] if index < len(tokens)
+            and re.match(r"^[A-Za-z_]\w*$", tokens[index]) else expression)
+    selectors = prefix
+    index += 1
     while index < len(tokens):
         token = tokens[index]
         if token == "->" and index + 1 < len(tokens):
