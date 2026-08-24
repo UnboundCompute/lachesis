@@ -288,6 +288,24 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual({hit["pattern"] for hit in match_graph(g)},
                          {"leak", "mem.lifetime.realloc-failure-leak"})
 
+    def test_loop_reorigin_does_not_rebind_an_old_alias(self):
+        slot = ObjRef("p", generation="g0")
+        alias = ObjRef("saved", generation="g0")
+        events = [
+            ("first_origin", Event.origin(slot)),
+            ("save", Event(EventKind.DERIVE, obj=alias, value=slot)),
+            ("loop", Event(EventKind.LOOP)),
+            ("release_old", Event.release(slot)),
+            # The source-level slot spelling is unchanged; the matcher must
+            # widen this into a new incarnation at the loop boundary.
+            ("next_origin", Event.origin(slot, facts={"loop_widening": True})),
+            ("use_old_alias", Event.read(alias)),
+        ]
+        g = self._graph(events, [(events[i][0], events[i + 1][0])
+                                 for i in range(len(events) - 1)])
+        hit = next(hit for hit in match_graph(g) if hit["pattern"] == "uaf.deref")
+        self.assertEqual(hit["object"], "p#g0")
+
     def test_returning_an_owner_keeps_its_field_allocation_reachable(self):
         owner = ObjRef("b", generation="g0")
         field = ObjRef("b", ("*", "data"), generation="g0")

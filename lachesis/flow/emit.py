@@ -276,6 +276,49 @@ def _operation_generations(sub, operations):
     return generations, fresh
 
 
+def _loop_nodes(cfg):
+    """Return CFG nodes belonging to a real back-edge cycle.
+
+    ReachingDef preserves the frontend CFG, but does not annotate loop bodies
+    as a separate semantic region.  For generation widening we identify the
+    cycle structurally: nodes reachable from a back-edge target that can also
+    reach the back-edge source.  This is language-neutral and avoids relying
+    on source spelling or loop keywords.
+    """
+    nodes = set(cfg.get("nodes", ()))
+    successors = {
+        node: tuple(target for target in cfg.get("succ", {}).get(node, ())
+                    if target in nodes)
+        for node in nodes
+    }
+    reverse = defaultdict(set)
+    for source, targets in successors.items():
+        for target in targets:
+            reverse[target].add(source)
+
+    def walk(start, adjacency):
+        seen, pending = set(), [start]
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(adjacency.get(current, ()))
+        return seen
+
+    result = set()
+    for source, targets in successors.items():
+        for target in targets:
+            # Any edge whose target can reach its source is a back edge in the
+            # structural sense, independent of frontend node ordering.
+            if target not in nodes or source not in nodes:
+                continue
+            if source not in walk(target, successors):
+                continue
+            result.update(walk(target, successors) & walk(source, reverse))
+    return result
+
+
 def _semantic_event(sub, operation, generations=None):
     """Translate one object-engine fact to a frozen-schema event.
 
@@ -449,6 +492,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         operations = extract_operations(
             sub, norm, fid, functions[name], functions, obj_summaries, cfg)
         operation_generations, realloc_generations = _operation_generations(sub, operations)
+        loop_nodes = _loop_nodes(cfg)
         artifact = (state_artifacts or {}).get(name)
 
         def abstract_facts(operation, *, post=False):
@@ -522,7 +566,9 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     result.add_node(success_id, annotate_event(Event.origin(
                         obj, op.line,
                         facts={"allocation_site": str(op.site or op.node),
-                               "generation": obj.generation}), op, post=True), fragment=name,
+                               "generation": obj.generation,
+                               "loop_widening": op.node in loop_nodes}),
+                                     op, post=True), fragment=name,
                                      source_reachable=source_reachable)
                     result.add_node(failure_id, Event(EventKind.WRITE_STORAGE, obj=obj, base=obj,
                                                      slot=obj, facts={"null": True,
@@ -620,8 +666,13 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                         result.add_edge(failure_lost, merge_id)
                     previous = merge_id
                     continue
-                for event_index, event in enumerate(
-                        annotate(_semantic_event(sub, op, operation_generations), op)):
+                semantic_events = annotate(
+                    _semantic_event(sub, op, operation_generations), op)
+                if op.kind == OpKind.ALLOC and op.node in loop_nodes:
+                    for event in semantic_events:
+                        if event.kind == EventKind.ORIGIN:
+                            event.facts["loop_widening"] = True
+                for event_index, event in enumerate(semantic_events):
                     event_id = f"{anchor}:event:{index}:{event_index}"
                     metadata = {
                         "source_reachable": source_reachable,

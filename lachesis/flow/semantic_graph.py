@@ -297,6 +297,11 @@ class _State:
     origins: frozenset[ObjRef] = frozenset()
     stack: tuple[str, ...] = ()
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
+    # Stable value aliases and current slot rebindings are kept separately from
+    # seam/derived ``bindings``.  This prevents ``alias = p`` from following a
+    # later reallocation of the owning slot ``p``.
+    aliases: tuple[tuple[ObjRef, ObjRef], ...] = ()
+    slot_bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
     nonnull: frozenset[ObjRef] = frozenset()
     guard_values: frozenset[str] = frozenset()
@@ -342,12 +347,22 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         merged_bindings = dict(left_bindings)
         for key, value in right_bindings.items():
             merged_bindings.setdefault(key, value)
+        left_aliases, right_aliases = dict(left.aliases), dict(right.aliases)
+        merged_aliases = dict(left_aliases)
+        for key, value in right_aliases.items():
+            merged_aliases.setdefault(key, value)
+        left_slots, right_slots = dict(left.slot_bindings), dict(right.slot_bindings)
+        merged_slots = dict(left_slots)
+        for key, value in right_slots.items():
+            merged_slots.setdefault(key, value)
         return _State(
             right.node,
             left.released | right.released,
             left.origins | right.origins,
             right.stack,
             tuple(sorted(merged_bindings.items(), key=repr)),
+            tuple(sorted(merged_aliases.items(), key=repr)),
+            tuple(sorted(merged_slots.items(), key=repr)),
             left.nulls | right.nulls,
             left.nonnull | right.nonnull,
             left.guard_values & right.guard_values,
@@ -381,6 +396,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             return widen_loop_ref(value)
         bindings = tuple(sorted(
             ((ref(left), ref(right)) for left, right in state.bindings), key=repr))
+        aliases = tuple(sorted(
+            ((ref(left), ref(right)) for left, right in state.aliases), key=repr))
+        slots = tuple(sorted(
+            ((ref(left), ref(right)) for left, right in state.slot_bindings), key=repr))
         pointer_arithmetic = frozenset(
             (ref(pointer), ref(base) if base is not None else None)
             for pointer, base in state.pointer_arithmetic)
@@ -390,6 +409,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             frozenset(ref(value) for value in state.origins),
             state.stack,
             bindings,
+            aliases,
+            slots,
             frozenset(ref(value) for value in state.nulls),
             frozenset(ref(value) for value in state.nonnull),
             state.guard_values,
@@ -421,6 +442,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         nonnull = set(state.nonnull)
         guard_values = set(state.guard_values)
         bindings = dict(state.bindings)
+        aliases = dict(state.aliases)
+        slot_bindings = dict(state.slot_bindings)
         escaped = set(state.escaped)
         sink_allocs = dict(state.sink_allocs)
         nullable = set(state.nullable)
@@ -465,11 +488,15 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 return None
             return canonical(ObjRef(parts[0], parts[1:], generation))
 
-        def canonical(value: ObjRef | None) -> ObjRef | None:
+        def canonical(value: ObjRef | None, *, follow_slots: bool = True) -> ObjRef | None:
             seen = set()
             used_bindings = set()
             while value is not None and value not in seen:
                 seen.add(value)
+                stable = aliases.get(value)
+                if stable is not None:
+                    value = stable
+                    break
                 direct = bindings.get(value)
                 if direct is not None and value not in used_bindings:
                     used_bindings.add(value)
@@ -478,6 +505,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     if direct.base == old_base:
                         break
                     continue
+                if follow_slots:
+                    slotted = slot_bindings.get(value)
+                    if slotted is not None:
+                        value = slotted
+                        break
                 # A binding for p also binds p&, p**, and field paths rooted at
                 # p. Compose the suffix instead of treating those as unrelated
                 # storage names. This is the address-of/multi-deref algebra used
@@ -612,7 +644,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # remaining lifecycle branches below intentionally do not match
                 # EventKind.SINK.
             if event is not None and event.kind == EventKind.DERIVE and event.obj and event.value:
-                bindings[event.obj] = canonical(event.value) or event.value
+                bound = canonical(event.value) or event.value
+                bindings[event.obj] = bound
+                aliases[event.obj] = bound
                 obj = canonical(event.obj)
             if event is not None and event.kind == EventKind.POINTER_ARITHMETIC and obj:
                 pointer_arithmetic.add((obj, canonical(event.base)))
@@ -679,6 +713,20 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if event.kind == EventKind.RETURN_VALUE:
                     escaped.add(obj)
             elif event.kind == EventKind.ORIGIN and obj:
+                # Re-originating a slot creates a new lifetime incarnation.
+                # Keep aliases captured before this event pinned to the old
+                # object while direct references to the slot move forward.
+                if (event.facts.get("loop_widening") or
+                        event.facts.get("incarnation")) and (
+                            obj in origins or
+                            any(released_obj == obj for released_obj, _ in released)):
+                    generation = obj.generation
+                    if "@loop:" not in str(generation):
+                        generation = f"{generation}@loop:{node.id}"
+                    obj = ObjRef(obj.base, obj.path, generation)
+                    if raw_obj is not None:
+                        slot_bindings[raw_obj] = obj
+                        aliases.pop(raw_obj, None)
                 origins.add(obj)
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
@@ -722,10 +770,15 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             stack = state.stack
             next_bindings = dict(bindings)
             next_bindings.update(edge.binding)
+            next_aliases = dict(aliases)
+            next_slot_bindings = dict(slot_bindings)
             next_abstract_bindings = dict(abstract_bindings)
             next_abstract_bindings.update(edge.provenance)
             next_abstract_contexts = abstract_contexts
             def rebase(value):
+                stable = next_aliases.get(value)
+                if stable is not None:
+                    return stable
                 seen_bindings = set()
                 while value in next_bindings and value not in seen_bindings:
                     seen_bindings.add(value)
@@ -826,7 +879,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 for _formal, receiver in edge.binding:
                     next_escaped.discard(rebase(receiver))
             next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
-                                tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
+                                tuple(sorted(next_bindings.items(), key=repr)),
+                                tuple(sorted(next_aliases.items(), key=repr)),
+                                tuple(sorted(next_slot_bindings.items(), key=repr)),
+                                frozenset(next_nulls),
                                 frozenset(next_nonnull),
                                 frozenset(next_guard_values),
                                 frozenset(next_escaped),
@@ -837,7 +893,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 frozenset(abstract_released), next_abstract_contexts)
             next_state = _State(
                 next_state.node, next_state.released, next_state.origins,
-                next_state.stack, next_state.bindings, next_state.nulls,
+                next_state.stack, next_state.bindings, next_state.aliases,
+                next_state.slot_bindings,
+                next_state.nulls,
                 next_state.nonnull,
                 next_state.guard_values,
                 next_state.escaped, next_state.sink_allocs, next_state.nullable,
