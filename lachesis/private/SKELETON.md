@@ -462,10 +462,18 @@ findings), `flow/pipeline.py` (rewire entry from lifecycle-slice to source-roote
 
 ---
 
-## 11. Still open (decide explicitly, do not silently assume)
+## 11. Resolved policy decisions
 
-- GC / managed-language mapping: what `RELEASE` / `SOURCE` mean with no explicit `free`.
-- How much heap a cached fragment transformation reads/writes.
+- **GC / managed-language mapping:** GC-managed objects do not receive synthetic
+  `ORIGIN`/`RELEASE` ownership events and are not reported as C-style leaks. Only
+  explicit resource roles declared by Atropos (for example `open`/`close`, stream
+  destruction, or URL revocation) enter typestate. This keeps the skeleton
+  language-neutral without pretending that collector reachability is an ownership
+  proof.
+- **Cached heap dependencies:** object-state artifacts are semantic inputs to
+  fragment construction and are included in the fragment/snapshot cache identity.
+  A changed heap artifact set therefore rebuilds the affected semantic graph
+  rather than reusing stale object identities.
 
 The v1 implementation has explicit decisions for the former loop and cache questions:
 
