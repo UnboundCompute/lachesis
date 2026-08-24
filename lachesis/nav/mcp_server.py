@@ -111,7 +111,7 @@ OVERLAY_SEED_ARGS = {
 # a name missing here (or a future tool) still shows, appended in definition order.
 TOOL_ORDER = (
     "load_graph", "build_graph",
-    "hubs", "communities", "search", "callers", "callees", "read_body", "read_file", "open_file", "open_folder",
+    "hubs", "communities", "search", "callers", "callees", "read_body", "open_file", "open_folder",
     "unknowns", "coverage_map", "field_history", "sibling_compare",
     "type_explain", "component_boundary", "indirect_targets",
     "architecture_map", "execution_story",
@@ -706,14 +706,6 @@ TOOLS = [
          "name": {"type": "string"},
          "node_id": {"type": "string"},
          "max_chars": {"type": "integer", "default": 4000}}}},
-    {"name": "read_file",
-     "description": "Read a complete source file from the graph's recorded source tree. "
-                    "This is a read-only fallback for files that are larger than a function "
-                    "body; paths are repository-relative and the response reports truncation.",
-     "inputSchema": {"type": "object", "properties": {
-         "file": {"type": "string", "description": "repository-relative source path"},
-         "max_chars": {"type": "integer", "default": 100000}},
-         "required": ["file"]}},
     {"name": "open_file",
      "description": "L1 file graph: imports, declarations, intra-file calls, cross-file jump-stubs "
                     "for one file (repo-relative path). Returns a {nodes,edges,manifest} graph.",
@@ -1116,24 +1108,6 @@ def call_tool(name, args, format=None):
             component_depth=int(args.get("component_depth", 1)),
             limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))
         return _emit(name, result, fmt, offset, limit)
-    if name == "read_file":
-        root = c.comprehension._source_root()
-        requested = str(args.get("file", ""))
-        if root is None or not requested:
-            return _emit(name, {"error": "source tree is unavailable for this graph"}, fmt)
-        candidate = os.path.realpath(os.path.join(str(root), requested))
-        root_real = os.path.realpath(str(root))
-        if candidate != root_real and not candidate.startswith(root_real + os.sep):
-            return _emit(name, {"error": "file must stay inside the recorded source tree"}, fmt)
-        try:
-            with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
-                source = handle.read(max(1, int(args.get("max_chars", 100000))) + 1)
-        except OSError as exc:
-            return _emit(name, {"error": str(exc)}, fmt)
-        max_chars = max(1, int(args.get("max_chars", 100000)))
-        return _emit(name, {"move": "read_file", "file": requested,
-                            "source": source[:max_chars],
-                            "truncated": len(source) > max_chars}, fmt)
     if name == "field_history":
         result = c.comprehension.field_history(
             args["field"], args.get("owner_type"), limit=int(args.get("limit", 100)),
