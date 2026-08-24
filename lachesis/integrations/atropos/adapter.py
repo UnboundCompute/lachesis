@@ -95,6 +95,20 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
         raw = arg_nodes_by_call.get(node["id"]) or has_arg_by_call.get(node["id"], [])
         ordered = [target for _, target in sorted(raw, key=lambda t: t[0])]
         receiver_expression = props.get("receiver")
+        # Some frontends (e.g. the TypeScript compiler frontend) spell a member
+        # call in the ``callee`` field as a dotted ``receiver.method`` string and
+        # leave ``receiver`` unset, whereas Python records ``method`` + a separate
+        # ``receiver``.  When that happens, decompose the dotted callee so a
+        # package-qualified Atropos model (method=readFile, package=fs) can bind
+        # the same way it does for Python's ``os.makedirs``.  Only a bare
+        # identifier prefix is treated as a module root; ``a.b.c`` / ``obj.method``
+        # object receivers keep the leaf method name with no module (unchanged
+        # behaviour for those).
+        if receiver_expression is None and name and "." in name:
+            prefix, _, leaf = name.rpartition(".")
+            if leaf and re.fullmatch(r"[A-Za-z_]\w*", prefix):
+                name = leaf
+                receiver_expression = prefix
         receiver_name = None
         if receiver_expression:
             receiver_name = re.search(r"([A-Za-z_]\w*)\s*$",
