@@ -453,6 +453,65 @@ def _ir_guard_proofs(call):
     return tuple(proofs)
 
 
+def _ir_ref(value):
+    return ObjRef(str(value), generation="g0") if value else None
+
+
+def _ir_event(record):
+    """Decode frontend-neutral lifecycle/value facts into frozen events.
+
+    F-IR deliberately carries semantic roles rather than C syntax.  Keeping this
+    adapter expressive means a non-C frontend can preserve aliases and storage
+    accesses for the same graph matcher without opting into the C declaration
+    substrate.
+    """
+    kind = str(record.get("kind") or "").lower().replace("-", "_")
+    line = record.get("line")
+    obj = _ir_ref(record.get("var") or record.get("obj") or record.get("target"))
+    base = _ir_ref(record.get("base") or record.get("var") or record.get("obj"))
+    value = _ir_ref(record.get("value") or record.get("source"))
+    path = record.get("path") or "*"
+    if isinstance(path, (tuple, list)):
+        path = "".join(str(part) for part in path)
+    if kind in {"alloc", "origin"} and obj:
+        return Event.origin(obj, line, facts={"frontend_ir": True})
+    if kind in {"free", "release", "invalidate"} and obj:
+        return Event(EventKind.INVALIDATE if kind == "invalidate" else EventKind.RELEASE,
+                     obj=obj, line=line)
+    if kind in {"use", "read", "deref"} and base:
+        return Event.read(base, str(path), line)
+    if kind in {"write", "store"} and base:
+        raw_value = record.get("value")
+        if (record.get("null") or
+                ("value" in record and raw_value is None) or
+                str(raw_value).lower() == "null"):
+            return Event.write_null(base, line)
+        return Event.write(base, str(path), line, value=value)
+    if kind in {"derive", "copy", "alias"} and obj:
+        return Event(EventKind.DERIVE, obj=obj, value=value, line=line)
+    if kind in {"pass", "pass_value"} and obj:
+        return Event.pass_value(obj, line)
+    if kind in {"compare", "compare_value"} and obj:
+        return Event(EventKind.COMPARE_VALUE, obj=obj, line=line)
+    if kind in {"escape", "global_store"} and obj:
+        return Event.escape(obj, line)
+    if kind in {"return", "return_value"}:
+        if obj:
+            return Event(EventKind.RETURN_VALUE, obj=obj, line=line,
+                         facts=dict(record.get("facts") or {}))
+        if record.get("null"):
+            return Event(EventKind.RETURN_VALUE, line=line,
+                         facts={"return_null": True})
+    if kind == "realloc_attempt" and obj:
+        return Event.realloc_attempt(obj, line)
+    if kind == "realloc_failed" and obj:
+        return Event.realloc_failed(obj, record.get("slot") and _ir_ref(record["slot"]), line)
+    if kind == "lost_from_slot" and obj:
+        return Event(EventKind.LOST_FROM_SLOT, obj=obj,
+                     slot=_ir_ref(record.get("slot")), line=line)
+    return None
+
+
 def _build_cfg_ir_semantic_graph(functions, *, lang):
     """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
     result = SkeletonGraph(language=lang)
@@ -464,21 +523,7 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
         return ObjRef(str(value), generation="g0") if value else None
 
     def event_for(record):
-        obj = ObjRef(str(record.get("var")), generation="g0") \
-            if record.get("var") else None
-        if obj is None:
-            return None
-        line = record.get("line")
-        kind = record.get("kind")
-        if kind == "alloc":
-            return Event.origin(obj, line, facts={"frontend_ir": True})
-        if kind == "free":
-            return Event.release(obj, line)
-        if kind == "use":
-            return Event.read(obj, "*", line)
-        if kind == "escape":
-            return Event(EventKind.ESCAPE, obj=obj, line=line)
-        return None
+        return _ir_event(record)
 
     for fn in sorted(functions):
         record = functions[fn]
@@ -668,18 +713,8 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
         return ObjRef(str(value), generation="g0") if value else None
 
     def emit_event(fn, index, record, previous, reachable):
-        kind = record.get("kind")
-        obj = ref(record.get("var"))
-        line = record.get("line")
-        if kind == "alloc" and obj:
-            event = Event.origin(obj, line, facts={"frontend_ir": True})
-        elif kind == "free" and obj:
-            event = Event.release(obj, line)
-        elif kind == "use" and obj:
-            event = Event.read(obj, "*", line)
-        elif kind == "escape" and obj:
-            event = Event(EventKind.ESCAPE, obj=obj, line=line)
-        else:
+        event = _ir_event(record)
+        if event is None:
             return previous
         node_id = f"{fn}:ir:event:{index}"
         result.add_node(node_id, event, fragment=fn, source_reachable=reachable)

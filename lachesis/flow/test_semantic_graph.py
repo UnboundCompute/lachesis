@@ -139,6 +139,42 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["pattern"] == "uaf.deref"
                             for hit in match_graph(graph)))
 
+    def test_frontend_ir_preserves_persistent_alias_across_helper_seams(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "is_source": True, "source_reachable": True, "params": [],
+                "events": [
+                    {"kind": "alloc", "var": "p", "line": 1},
+                    {"kind": "use", "var": "cached", "line": 4},
+                ],
+                "calls": [
+                    {"callee": "cache", "line": 2,
+                     "args": [{"pos": 0, "root": "p"}]},
+                    {"callee": "destroy", "line": 3,
+                     "args": [{"pos": 0, "root": "p"}]},
+                ],
+            },
+            "cache": {
+                "params": ["value"],
+                "events": [{"kind": "derive", "var": "cached",
+                            "value": "value", "line": 2}],
+                "calls": [],
+            },
+            "destroy": {
+                "params": ["value"],
+                "events": [{"kind": "free", "var": "value", "line": 3}],
+                "calls": [],
+            },
+        }
+        graph = build_semantic_graph(
+            object(), functions, {"main": ["cache", "destroy"],
+                                  "cache": [], "destroy": []},
+            lang="python", graph={})
+        hits = [hit for hit in match_graph(graph) if hit["pattern"] == "uaf.deref"]
+        self.assertTrue(any(hit["line"] == 4 for hit in hits))
+
     def test_frontend_ir_fallback_keeps_sibling_cfg_arms_separate(self):
         from .emit import build_semantic_graph
 
