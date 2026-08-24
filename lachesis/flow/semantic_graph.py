@@ -431,6 +431,9 @@ class _State:
     abstract_bindings: tuple[tuple[str, str], ...] = ()
     abstract_released: frozenset[tuple[str, str]] = frozenset()
     abstract_contexts: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # Keep externally rooted launches distinct even when their abstract facts
+    # happen to be equal at a shared node.
+    launch_context: str | None = None
 
 
 class _WitnessPath(tuple):
@@ -452,13 +455,13 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
     wanted = _requested_patterns(patterns)
     starts = sorted(graph.source_reachable) if graph.source_reachable else [f.entry for f in graph.fragments.values()]
     starts = starts or list(graph.nodes)
-    queue = deque(_State(s) for s in starts)
+    queue = deque(_State(s, launch_context=s) for s in starts)
     predecessors: dict[_State, _State | None] = {
-        _State(s): None for s in starts
+        _State(s, launch_context=s): None for s in starts
     }
     predecessor_edges: dict[_State, Edge] = {}
     superseded: set[_State] = set()
-    loop_buckets: dict[tuple[str, tuple[str, ...]], list[_State]] = {}
+    loop_buckets: dict[tuple[str, tuple[str, ...], str | None], list[_State]] = {}
 
     def join_loop_states(left: _State, right: _State) -> _State:
         left_bindings, right_bindings = dict(left.bindings), dict(right.bindings)
@@ -492,6 +495,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             tuple(sorted(set(left.abstract_bindings) | set(right.abstract_bindings))),
             left.abstract_released | right.abstract_released,
             left.abstract_contexts,
+            left.launch_context,
         )
 
     def widen_loop_ref(value: ObjRef) -> ObjRef:
@@ -540,6 +544,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             state.abstract_bindings,
             state.abstract_released,
             state.abstract_contexts,
+            state.launch_context,
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -1145,7 +1150,8 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 frozenset(next_nullable),
                                 frozenset(next_realloc_lost), frozenset(next_pointer_arithmetic),
                                 tuple(sorted(next_abstract_bindings.items())),
-                                frozenset(abstract_released), next_abstract_contexts)
+                                frozenset(abstract_released), next_abstract_contexts,
+                                state.launch_context)
             next_state = _State(
                 next_state.node, next_state.released, next_state.origins,
                 next_state.stack, next_state.bindings, next_state.aliases,
@@ -1156,11 +1162,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 next_state.escaped, next_state.sink_allocs, next_state.nullable,
                 next_state.realloc_lost, frozenset(next_pointer_arithmetic),
                 next_state.abstract_bindings, next_state.abstract_released,
-                next_state.abstract_contexts)
+                next_state.abstract_contexts, next_state.launch_context)
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
                 next_state = widen_loop_state(next_state)
-                bucket_key = (edge.target, stack)
+                bucket_key = (edge.target, stack, next_state.launch_context)
                 bucket = loop_buckets.setdefault(bucket_key, [])
                 if len(bucket) >= _LOOP_WIDEN_LIMIT:
                     prior = bucket.pop(0)
@@ -1236,8 +1242,9 @@ def _record(hits: dict, pattern: str, obj: ObjRef, node: GraphNode,
     # thousands of equivalent leads; seam identities are the stable source-root
     # distinction that matters for shared callees.
     seam_context = tuple(sorted({step for step in witness if ":seam_enter:" in step}))
+    launch_context = witness[0] if witness else None
     key = (pattern, obj.render(), node.id, node.event.line if node.event else None,
-           seam_context)
+           seam_context, launch_context)
     reachable = bool(node.metadata.get("source_reachable", False))
     influenced = bool(node.metadata.get("source_influenced", False))
     object_name = obj.render()

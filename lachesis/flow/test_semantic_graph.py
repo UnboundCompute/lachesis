@@ -384,6 +384,24 @@ class SemanticGraphTests(unittest.TestCase):
                    side_effect=route):
             self.assertEqual(match_graph(graph), [])
 
+    def test_matcher_preserves_distinct_external_launch_witnesses(self):
+        obj = ObjRef("p", generation="g0")
+        graph = SkeletonGraph()
+        graph.add_node("source_a", None, fragment="main")
+        graph.add_node("source_b", None, fragment="main")
+        graph.add_node("release", Event.release(obj), fragment="main")
+        graph.add_node("use", Event.read(obj), fragment="main")
+        graph.add_edge("source_a", "release")
+        graph.add_edge("source_b", "release")
+        graph.add_edge("release", "use")
+        graph.add_fragment("main", "source_a", ("use",))
+        graph.source_reachable.update({"source_a", "source_b"})
+
+        hits = [hit for hit in match_graph(graph) if hit["pattern"] == "uaf.deref"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual({hit["source_context"] for hit in hits},
+                         {"source_a", "source_b"})
+
     def test_public_atropos_pattern_id_selects_the_internal_matcher(self):
         obj = ObjRef("object", generation="g0")
         g = self._graph(
