@@ -57,6 +57,34 @@ _PROFILE = "all"  # tool-surface profile: "all" (default) | "comprehension"
 _DEFAULT_FORMAT = "text"
 _REVIEWS = {}
 
+def _reviews_file():
+    if not _GRAPH_PATH:
+        return None
+    target = _GRAPH_PATH if os.path.isdir(_GRAPH_PATH) else os.path.dirname(_GRAPH_PATH)
+    return os.path.join(target, ".lachesis-reviews.json")
+
+def _load_reviews():
+    path = _reviews_file()
+    if not path or _REVIEWS:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            _REVIEWS.update(data)
+    except (OSError, ValueError, TypeError):
+        return
+
+def _save_reviews():
+    path = _reviews_file()
+    if not path:
+        return
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(_REVIEWS, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+    os.replace(temporary, path)
+
 # Hunting-only tools are excluded from the opt-in comprehension surface. The default
 # remains additive/backward-compatible; a caller has to request the narrower profile.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
@@ -553,9 +581,9 @@ TOOLS = [
          "include_suppressions": {"type": "boolean", "default": False}},
          "required": []}},
     {"name": "review",
-     "description": "Record a developer review decision for a candidate in this server session. "
-                    "This is a workflow note, not a safety verdict; decisions are returned by "
-                    "later calls in the same session and are not written into the graph.",
+     "description": "Record a developer review decision for a candidate in a graph-scoped sidecar. "
+                    "This is a workflow note, not a safety verdict; it is kept outside the graph "
+                    "and keyed by candidate id so later sessions can retrieve the decision.",
      "inputSchema": {"type": "object", "properties": {
          "candidate_id": {"type": "string"},
          "decision": {"type": "string", "enum": ["open", "killed", "confirmed"]},
@@ -1087,14 +1115,19 @@ def call_tool(name, args, format=None):
     if name == "build_graph":
         return _build_graph(args)
     if name == "review":
+        _load_reviews()
         candidate_id = str(args.get("candidate_id", "")).strip()
         decision = str(args.get("decision", "")).strip()
         if not candidate_id or decision not in {"open", "killed", "confirmed"}:
             return _emit(name, {"error": "candidate_id and decision (open|killed|confirmed) are required"}, fmt)
         _REVIEWS[candidate_id] = {"candidate_id": candidate_id, "decision": decision,
                                   "note": str(args.get("note", ""))}
+        try:
+            _save_reviews()
+        except OSError as exc:
+            return _emit(name, {"error": f"review could not be saved: {exc}"}, fmt)
         return _emit(name, {"move": "review", "review": _REVIEWS[candidate_id],
-                            "persistence": "session"}, fmt)
+                            "persistence": "graph-sidecar"}, fmt)
     if name in DISABLED_TOOLS:
         return _emit(name, {"error": f"tool {name!r} is disabled: it requires a "
                                      "whole-graph guard scan (removed for now)"}, fmt)
