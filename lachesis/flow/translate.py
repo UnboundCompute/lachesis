@@ -241,6 +241,25 @@ def _expression_root(label):
     return match.group(1) if match else None
 
 
+def _catalog_sink(sinks, callee, call_props):
+    """Look up a sink by canonical name, then by a simple module receiver.
+
+    Python's AST frontend keeps ``os.makedirs`` as method ``makedirs`` plus
+    receiver ``os``.  Atropos models the qualified library symbol, while
+    receiver methods such as ``cursor.execute`` intentionally use the bare
+    method key.  This neutral lookup preserves both forms without embedding a
+    library-specific list in the flow layer.
+    """
+    direct = sinks.get(callee)
+    if direct is not None:
+        return direct, callee
+    receiver = (call_props.get("receiver") or call_props.get("receiver_root")
+                or call_props.get("receiver_value"))
+    module = _expression_root(receiver)
+    qualified = f"{module}.{callee}" if module and module != callee else None
+    return (sinks.get(qualified), qualified) if qualified else (None, None)
+
+
 def _dynamic_property_writes(ix, regions, nest, fid):
     """Project computed member writes into the common sink vocabulary.
 
@@ -432,7 +451,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
         guard_status = _guard_status_for(regions, fid, idents, _span(c))
-        cat = sinks.get(callee)
+        cat, catalog_name = _catalog_sink(sinks, callee, cp)
         # the variable this call's result is assigned to (any callee, not just allocators), so
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
         # wrapper's `returns=alloc` seeds an alloc, a freed-return's `returns_dangling` seeds a
@@ -443,6 +462,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                "guard_status": guard_status,
                "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                "is_sink": cat is not None,
+               "sink_name": catalog_name,
                "assigned": assigned,
                # Managed-language lifecycle methods place the resource on the
                # receiver, not in an argument slot. Preserve that neutral

@@ -106,11 +106,18 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
         elif receiver_expression and re.search(r"\.cursor\s*\(\s*\)\s*$",
                                                 str(receiver_expression)):
             receiver_provenance = "cursor-factory"
+        # Python records ``os.makedirs`` as method=makedirs, receiver=os.
+        # Preserve that module spelling for package-qualified Atropos models;
+        # object receivers such as self.connection intentionally remain null.
+        receiver_root = re.fullmatch(r"[A-Za-z_]\w*", str(receiver_expression or ""))
+        module = props.get("module")
+        if module is None and receiver_root:
+            module = receiver_root.group(0)
         callsites.append({
             "id": node["id"],
             "callee": {
                 "name": name,
-                "module": props.get("module"),
+                "module": module,
                 "receiver_type": props.get("receiver_type"),
                 "arity": len(ordered),
                 "static": props.get("receiver_value_id") is None,
