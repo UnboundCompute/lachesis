@@ -47,6 +47,17 @@ class SemanticGraphTests(unittest.TestCase):
                 entry.get("id"),
             )
 
+    def test_aggregate_copy_alias_is_a_declared_semantic_pattern(self):
+        obj = ObjRef("clone", path=("*", "meta"), generation="g0")
+        value = ObjRef("src", path=("*", "meta"), generation="g0")
+        graph = SkeletonGraph()
+        graph.add_node("start", Event(EventKind.DERIVE, obj=obj, value=value,
+                                       facts={"aggregate_copy": True}))
+        graph.add_fragment("f", "start", ["start"])
+        graph.source_reachable = {"start"}
+        hits = match_graph(graph)
+        self.assertIn("aggregate-copy-alias", {hit["pattern"] for hit in hits})
+
     def test_default_matcher_registry_imports_atropos_matcher_names(self):
         declared = {
             (entry.get("matcher") or {}).get("pattern")

@@ -71,6 +71,8 @@ FROZEN_PATTERNS = {
         "mem.copy.in-loop-unbounded", (EventKind.SINK,)),
     "mem.alloc-copy.size-mismatch": PatternSpec(
         "mem.alloc-copy.size-mismatch", (EventKind.SINK,)),
+    "aggregate-copy-alias": PatternSpec(
+        "aggregate-copy-alias", (EventKind.DERIVE,)),
 }
 
 
@@ -819,6 +821,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 bound = canonical(event.value) or event.value
                 bindings[event.obj] = bound
                 aliases[event.obj] = bound
+                if (event.facts.get("aggregate_copy")
+                        and "aggregate-copy-alias" in wanted):
+                    _record(hits, "aggregate-copy-alias", event.obj, node, witness())
                 if event.facts.get("persistent_slot"):
                     # A persistent slot is both an alias and an ownership
                     # escape. Reads through it must observe releases made via

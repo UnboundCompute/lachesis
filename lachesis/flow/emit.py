@@ -487,7 +487,9 @@ def _semantic_event(sub, operation, generations=None):
     if operation.kind == OpKind.COPY and obj:
         source_key = _semantic_key(sub, operation.source)
         source = _semantic_obj(sub, operation.source, generations.get(source_key, "g0"), operation.node)
-        return [Event(EventKind.DERIVE, obj=obj, value=source, line=operation.line)]
+        facts = {"aggregate_copy": True} if operation.access == "aggregate-copy" else {}
+        return [Event(EventKind.DERIVE, obj=obj, value=source,
+                      line=operation.line, facts=facts)]
     if operation.kind == OpKind.CLOBBER and obj:
         if operation.access == "source":
             return [Event.origin(obj, operation.line)]
