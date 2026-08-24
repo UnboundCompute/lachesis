@@ -1009,6 +1009,14 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
         kind = true_kind if target_index == 0 else ("NONNULL" if true_kind == "ISNULL" else "ISNULL")
         return (GuardProof(kind, f"{variable}#g0"),)
 
+    # A bare pointer/resource condition is the same nullability split as
+    # ``p != NULL``.  Keep this deliberately limited to a single source-level
+    # value path; compound predicates remain opaque rather than being guessed.
+    simple = condition.strip("()")
+    if re.match(r"^[A-Za-z_]\w*(?:(?:->|\.)[A-Za-z_]\w*)*$", simple):
+        kind = "NONNULL" if target_index == 0 else "ISNULL"
+        return (GuardProof(kind, f"{simple}#g0"),)
+
     # Preserve relational branch facts as typed VALUE proofs.  The matcher does
     # not treat these as lifetime verdicts, but downstream properties can consume
     # them without having to reinterpret a raw predicate string.

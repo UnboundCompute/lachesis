@@ -59,6 +59,19 @@ class SemanticGraphTests(unittest.TestCase):
         proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
         self.assertEqual([proof.kind for proof in proofs], ["VALUE", "BOUNDED"])
 
+    def test_truthiness_guards_produce_compatible_nullability_proofs(self):
+        class Sub:
+            @staticmethod
+            def label(_node):
+                return "buffer->data"
+
+        true_proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
+        false_proofs = _cfg_guard_proofs(Sub(), "condition", 1, 2)
+        self.assertEqual([(p.kind, p.value) for p in true_proofs],
+                         [("NONNULL", "buffer->data#g0")])
+        self.assertEqual([(p.kind, p.value) for p in false_proofs],
+                         [("ISNULL", "buffer->data#g0")])
+
     def test_atropos_sink_history_matches_size_mismatch(self):
         events = [
             ("alloc", Event(EventKind.SINK, obj=ObjRef("buf"), facts={
