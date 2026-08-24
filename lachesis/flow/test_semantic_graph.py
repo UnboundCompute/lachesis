@@ -172,6 +172,42 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["line"] == 4 for hit in hits))
         self.assertFalse(any(hit["line"] == 3 for hit in hits))
 
+    def test_frontend_ir_cfg_keeps_call_seam_inside_branch(self):
+        from .emit import build_semantic_graph
+
+        main_cfg = {
+            "nodes": ("entry", "condition", "free_arm", "live_arm", "merge", "exit"),
+            "entry": "entry",
+            "succ": {
+                "entry": ({"target": "condition", "kind": "CFG_NEXT"},),
+                "condition": ({"target": "free_arm", "kind": "TRUE_BRANCH"},
+                              {"target": "live_arm", "kind": "FALSE_BRANCH"}),
+                "free_arm": ({"target": "merge", "kind": "CFG_NEXT"},),
+                "live_arm": ({"target": "merge", "kind": "CFG_NEXT"},),
+                "merge": ({"target": "exit", "kind": "CFG_NEXT"},),
+            },
+        }
+        helper_cfg = {"nodes": ("hentry", "hexit"), "entry": "hentry",
+                      "succ": {"hentry": ({"target": "hexit", "kind": "CFG_NEXT"},)}}
+        functions = {
+            "main": {"is_source": True, "source_reachable": True, "params": [],
+                     "cfg": main_cfg,
+                     "events": [{"kind": "alloc", "var": "p", "node": "entry", "line": 1},
+                                {"kind": "use", "var": "p", "node": "live_arm", "line": 3},
+                                {"kind": "use", "var": "p", "node": "merge", "line": 4}],
+                     "calls": [{"callee": "release_helper", "node": "free_arm", "line": 2,
+                                "args": [{"pos": 0, "root": "p"}]}]},
+            "release_helper": {"params": ["p"], "cfg": helper_cfg,
+                               "events": [{"kind": "free", "var": "p", "node": "hentry", "line": 2}],
+                               "calls": [], "returns": []},
+        }
+        graph = build_semantic_graph(object(), functions,
+                                     {"main": ["release_helper"], "release_helper": []},
+                                     lang="python", graph={})
+        hits = [hit for hit in match_graph(graph) if hit["pattern"] == "uaf.deref"]
+        self.assertTrue(any(hit["line"] == 4 for hit in hits))
+        self.assertFalse(any(hit["line"] == 3 for hit in hits))
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:

@@ -418,6 +418,12 @@ def _native_object_substrate(graph):
 def _build_cfg_ir_semantic_graph(functions, *, lang):
     """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
     result = SkeletonGraph(language=lang)
+    entries, exits = {}, {}
+    pending_calls = []
+    sink_catalog = atropos.sink_catalog(lang)
+
+    def ref(value):
+        return ObjRef(str(value), generation="g0") if value else None
 
     def event_for(record):
         obj = ObjRef(str(record.get("var")), generation="g0") \
@@ -445,10 +451,15 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
         reachable = bool(record.get("source_reachable") or record.get("is_source"))
         successor_map = cfg.get("succ") or {}
         event_by_anchor = defaultdict(list)
+        call_by_anchor = defaultdict(list)
         for index, event_record in enumerate(record.get("events", ())):
             event_node = event_record.get("node")
             if event_node in cfg_nodes:
                 event_by_anchor[event_node].append((index, event_record))
+        for index, call in enumerate(record.get("calls", ())):
+            call_node = call.get("node")
+            if call_node in cfg_nodes:
+                call_by_anchor[call_node].append((index, call))
         tails = {}
         heads = {}
         for cfg_node in cfg_nodes:
@@ -464,15 +475,87 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                             source_reachable=reachable)
             heads[cfg_node] = graph_node
             tail = graph_node
-            for index, event_record in event_by_anchor.get(cfg_node, ()):
-                event = event_for(event_record)
-                if event is None:
+            items = [("event", index, item)
+                     for index, item in event_by_anchor.get(cfg_node, ())]
+            items.extend(("call", index, item)
+                         for index, item in call_by_anchor.get(cfg_node, ()))
+            items.sort(key=lambda item: (
+                item[2].get("line") if item[2].get("line") is not None else 10**12,
+                item[1], 0 if item[0] == "event" else 1))
+            for item_kind, index, item in items:
+                if item_kind == "event":
+                    event = event_for(item)
+                    if event is None:
+                        continue
+                    event_id = f"{fn}:ir:event:{index}"
+                    result.add_node(event_id, event, fragment=fn,
+                                    source_reachable=reachable)
+                    result.add_edge(tail, event_id)
+                    tail = event_id
                     continue
-                event_id = f"{fn}:ir:event:{index}"
-                result.add_node(event_id, event, fragment=fn,
+                callee = item.get("callee")
+                catalog_entry = sink_catalog.get(callee) or {}
+                for arg_pos in catalog_entry.get("sink_args", ()):
+                    argument = next((arg for arg in item.get("args", ())
+                                     if arg.get("pos") == arg_pos), None)
+                    if argument is None:
+                        continue
+                    family = (catalog_entry.get("kinds") or {}).get(arg_pos)
+                    family = family or catalog_entry.get("family")
+                    if not family:
+                        continue
+                    guarded = bool(item.get("guards"))
+                    recipe = evaluator_for(family)
+                    relational = (recipe == "relational" or
+                                  isinstance(recipe, (list, tuple))
+                                  and "relational" in recipe)
+                    sink_obj = ref(argument.get("root") or argument.get("var") or callee)
+                    sink_id = f"{fn}:ir:cfg-sink:{index}:{arg_pos}"
+                    result.add_node(sink_id, Event(
+                        EventKind.SINK, obj=sink_obj, line=item.get("line"), facts={
+                            "family": family, "callee": callee, "arg": arg_pos,
+                            "tainted": argument.get("provenance") != "const",
+                            "guarded": guarded,
+                            "guard_status": item.get("guard_status"),
+                            "guard_predicates": item.get("guard_predicates") or (),
+                            "bound": ("bounded" if guarded else "unbounded")
+                                     if relational else None,
+                            "size_expr": item.get("size_expr"),
+                            "dst": item.get("dst"),
+                            "control": item.get("control") or (),
+                        }), fragment=fn, source_reachable=reachable)
+                    result.add_edge(tail, sink_id)
+                    tail = sink_id
+                if callee not in functions:
+                    continue
+                enter = f"{fn}:ir:call:{index}:enter"
+                continuation = f"{fn}:ir:call:{index}:return"
+                result.add_node(enter, Event(EventKind.SEAM_ENTER,
+                                             line=item.get("line")), fragment=fn,
                                 source_reachable=reachable)
-                result.add_edge(tail, event_id)
-                tail = event_id
+                result.add_node(continuation, Event(EventKind.SEAM_EXIT,
+                                                    line=item.get("line")), fragment=fn,
+                                source_reachable=reachable)
+                result.add_edge(tail, enter)
+                formals = tuple(functions[callee].get("params", ()))
+                bindings = []
+                for argument in item.get("args", ()):
+                    position = argument.get("pos")
+                    if isinstance(position, int) and position < len(formals):
+                        actual = ref(argument.get("root") or argument.get("var"))
+                        formal = ref(formals[position])
+                        if actual is not None and formal is not None:
+                            bindings.append((formal, actual))
+                return_bindings = []
+                receiver = ref(item.get("assigned"))
+                if receiver is not None:
+                    for returned in functions[callee].get("returns", ()):
+                        returned_ref = ref(returned.get("var"))
+                        if returned_ref is not None and returned.get("kind") in {"var", "call"}:
+                            return_bindings.append((receiver, returned_ref))
+                pending_calls.append((enter, callee, continuation, tuple(bindings),
+                                      tuple(return_bindings)))
+                tail = continuation
             tails[cfg_node] = tail
         for cfg_node in cfg_nodes:
             source = tails[cfg_node]
@@ -499,10 +582,20 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                     result.add_edge(source, heads[target], guard=guard)
         entry = cfg.get("entry") or cfg_nodes[0]
         entry = heads.get(entry, heads[cfg_nodes[0]])
+        entries[fn] = entry
         if reachable:
             result.source_reachable.add(entry)
-        exits = {tails[node] for node in cfg_nodes if not successor_map.get(node)}
-        result.add_fragment(fn, entry, exits, params=record.get("params", ()))
+        function_exits = {tails[node] for node in cfg_nodes
+                          if not successor_map.get(node)}
+        exits[fn] = function_exits
+        result.add_fragment(fn, entry, function_exits,
+                            params=record.get("params", ()))
+    for enter, callee, continuation, bindings, return_bindings in pending_calls:
+        result.add_edge(enter, entries[callee], kind="call", return_to=continuation,
+                        binding=bindings)
+        for callee_exit in exits[callee]:
+            result.add_edge(callee_exit, continuation, kind="return",
+                            binding=return_bindings)
     result.validate()
     return result
 
@@ -517,11 +610,12 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     """
     can_use_cfg = bool(functions) and all(
         (record.get("cfg") and
-         not any(call.get("callee") in functions
-                 for call in record.get("calls", ())) and
          all(not event.get("node") or
              event.get("node") in set(record["cfg"].get("nodes") or ())
-             for event in record.get("events", ())))
+             for event in record.get("events", ())) and
+         all(not call.get("node") or
+             call.get("node") in set(record["cfg"].get("nodes") or ())
+             for call in record.get("calls", ())))
         for record in functions.values()
     )
     if can_use_cfg:
