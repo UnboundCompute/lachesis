@@ -160,7 +160,14 @@ class CoverageScheduler:
         return seen
 
     def _source_contexts(self, source: str) -> tuple[str, ...]:
-        sites = self.functions.get(source, {}).get("source_sites", ())
+        record = self.functions.get(source, {})
+        # Both projected source_sites and frontend source_calls identify an
+        # externally rooted launch.  Keeping only source_sites collapses
+        # multiple source-call contexts to __entry__, which makes coverage and
+        # fragment caching lose the very source distinction Pass 3 is meant to
+        # preserve.
+        sites = tuple(record.get("source_sites", ()) or ()) + tuple(
+            record.get("source_calls", ()) or ())
         contexts = []
         for site in sites:
             token = site.get("node") or (

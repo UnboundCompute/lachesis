@@ -112,6 +112,26 @@ class CoverageSchedulerTests(unittest.TestCase):
             ("source", "source", "site_b"),
         ))
 
+    def test_source_calls_create_distinct_context_keys(self):
+        functions = {
+            "source": {
+                "source_calls": [
+                    {"node": "call_b", "callee": "read_b"},
+                    {"node": "call_a", "callee": "read_a"},
+                ],
+            },
+            "deep": {},
+        }
+        plan = CoverageScheduler(functions, {
+            "source": ["deep"], "deep": [],
+        }).plan(["deep"])
+        self.assertEqual(plan.context_keys, (
+            ("deep", "source", "call_a"),
+            ("deep", "source", "call_b"),
+            ("source", "source", "call_a"),
+            ("source", "source", "call_b"),
+        ))
+
     def test_fragment_store_tracks_source_state_keys(self):
         store = FragmentStore()
         store.mark_covered([("worker", "source")])
