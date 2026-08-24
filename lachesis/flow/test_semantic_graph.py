@@ -2,7 +2,8 @@ import unittest
 
 from .emit import _cfg_guard_proofs
 from . import atropos
-from .semantic_graph import Edge, Event, EventKind, GuardProof, ObjRef, SkeletonGraph, match_graph
+from .semantic_graph import (Edge, Event, EventKind, GuardProof, ObjRef,
+                              SkeletonGraph, _requested_patterns, match_graph)
 
 
 class SemanticGraphTests(unittest.TestCase):
@@ -17,6 +18,14 @@ class SemanticGraphTests(unittest.TestCase):
                 pattern in FROZEN_PATTERNS or pattern in EVALUATORS,
                 entry.get("id"),
             )
+
+    def test_default_matcher_registry_imports_atropos_matcher_names(self):
+        declared = {
+            (entry.get("matcher") or {}).get("pattern")
+            for entry in atropos.pattern_catalog()
+        }
+        declared.discard(None)
+        self.assertTrue(declared <= _requested_patterns(None))
 
     def _graph(self, events, edges):
         g = SkeletonGraph()

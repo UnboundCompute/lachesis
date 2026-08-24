@@ -279,16 +279,25 @@ def _normalized_path(path: tuple[str, ...]) -> tuple[str, ...]:
 
 def _requested_patterns(patterns: Iterable[str] | None) -> set[str]:
     """Normalize internal evaluator names and Atropos public pattern IDs."""
-    if patterns is None:
-        return set(FROZEN_PATTERNS)
-    requested = set(patterns)
+    # FROZEN_PATTERNS is the compatibility floor for installations where the
+    # sibling catalog is unavailable.  When Atropos is present, its matcher
+    # declarations are also part of the default executable registry.  Keeping
+    # this discovery here prevents a newly catalogued pattern from becoming
+    # inert merely because this module's compatibility table was not edited in
+    # the same change.
+    requested = set(FROZEN_PATTERNS)
+    explicit = patterns is not None
+    if explicit:
+        requested = set(patterns)
     try:
         from . import atropos
         for entry in atropos.pattern_catalog():
             public_id = entry.get("id")
             matcher = entry.get("matcher") or {}
             internal_name = matcher.get("pattern")
-            if public_id in requested and internal_name:
+            if internal_name and not explicit:
+                requested.add(internal_name)
+            elif public_id in requested and internal_name:
                 requested.add(internal_name)
     except (ImportError, OSError, ValueError, AttributeError):
         # The semantic matcher remains usable without the optional sibling catalog.
