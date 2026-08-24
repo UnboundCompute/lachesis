@@ -68,6 +68,7 @@ FROZEN_PATTERNS = {
 
 
 _LOOP_WIDEN_LIMIT = 32
+_LOOP_PATH_LIMIT = 4
 
 
 @dataclass(frozen=True, order=True)
@@ -358,6 +359,48 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             tuple(sorted(set(left.abstract_bindings) | set(right.abstract_bindings))),
             left.abstract_released | right.abstract_released,
             left.abstract_contexts,
+        )
+
+    def widen_loop_ref(value: ObjRef) -> ObjRef:
+        """Bound loop-carried access paths without inventing a lifetime event.
+
+        Linked-list traversal is represented as repeated field selectors.  A
+        raw path such as ``head->next->next...`` would otherwise create a new
+        matcher identity on every iteration and prevent the worklist from
+        converging.  Preserve the first two selectors (the concrete field
+        context) and replace only the unbounded suffix with an abstract loop
+        segment.  The same abstraction is applied to bindings and lifecycle
+        sets, so it cannot manufacture a release/use link by itself.
+        """
+        if len(value.path) <= _LOOP_PATH_LIMIT:
+            return value
+        return ObjRef(value.base, value.path[:2] + ("<loop>",), value.generation)
+
+    def widen_loop_state(state: _State) -> _State:
+        def ref(value):
+            return widen_loop_ref(value)
+        bindings = tuple(sorted(
+            ((ref(left), ref(right)) for left, right in state.bindings), key=repr))
+        pointer_arithmetic = frozenset(
+            (ref(pointer), ref(base) if base is not None else None)
+            for pointer, base in state.pointer_arithmetic)
+        return _State(
+            state.node,
+            frozenset((ref(value), site) for value, site in state.released),
+            frozenset(ref(value) for value in state.origins),
+            state.stack,
+            bindings,
+            frozenset(ref(value) for value in state.nulls),
+            frozenset(ref(value) for value in state.nonnull),
+            state.guard_values,
+            frozenset(ref(value) for value in state.escaped),
+            state.sink_allocs,
+            frozenset(ref(value) for value in state.nullable),
+            frozenset(ref(value) for value in state.realloc_lost),
+            pointer_arithmetic,
+            state.abstract_bindings,
+            state.abstract_released,
+            state.abstract_contexts,
         )
     seen: set[_State] = set()
     hits: dict[tuple[str, str, str | None, int | None], dict[str, Any]] = {}
@@ -803,6 +846,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 next_state.abstract_contexts)
             target_event = graph.nodes[edge.target].event
             if target_event is not None and target_event.kind == EventKind.LOOP:
+                next_state = widen_loop_state(next_state)
                 bucket_key = (edge.target, stack)
                 bucket = loop_buckets.setdefault(bucket_key, [])
                 if len(bucket) >= _LOOP_WIDEN_LIMIT:
