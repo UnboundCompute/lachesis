@@ -530,7 +530,15 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                     formal = ref(formals[position])
                     if actual is not None and formal is not None:
                         bindings.append((formal, actual))
-            pending_calls.append((enter, callee, continuation, tuple(bindings)))
+            return_bindings = []
+            receiver = ref(item.get("assigned"))
+            if receiver is not None:
+                for returned in functions[callee].get("returns", ()):
+                    returned_ref = ref(returned.get("var"))
+                    if returned_ref is not None and returned.get("kind") in {"var", "call"}:
+                        return_bindings.append((receiver, returned_ref))
+            pending_calls.append((enter, callee, continuation, tuple(bindings),
+                                  tuple(return_bindings)))
             previous = continuation
             index += 1
         exit_node = f"{fn}:ir:exit"
@@ -539,11 +547,12 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
         exits[fn] = {exit_node}
         result.add_fragment(fn, entry, exits[fn], params=record.get("params", ()))
 
-    for enter, callee, continuation, bindings in pending_calls:
+    for enter, callee, continuation, bindings, return_bindings in pending_calls:
         result.add_edge(enter, entries[callee], kind="call", return_to=continuation,
                         binding=bindings)
         for callee_exit in exits[callee]:
-            result.add_edge(callee_exit, continuation, kind="return")
+            result.add_edge(callee_exit, continuation, kind="return",
+                            binding=return_bindings)
     result.validate()
     return result
 

@@ -112,6 +112,33 @@ class SemanticGraphTests(unittest.TestCase):
         hits = match_graph(graph)
         self.assertTrue(any(hit["pattern"] == "relational" for hit in hits))
 
+    def test_frontend_ir_fallback_binds_returned_allocations(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "is_source": True,
+                "source_reachable": True,
+                "events": [
+                    {"kind": "free", "var": "q", "line": 3},
+                    {"kind": "use", "var": "q", "line": 4},
+                ],
+                "calls": [{"callee": "make", "line": 2, "assigned": "q",
+                           "args": []}],
+                "returns": [], "params": [],
+            },
+            "make": {
+                "events": [{"kind": "alloc", "var": "tmp", "line": 1}],
+                "calls": [], "returns": [{"kind": "var", "var": "tmp"}],
+                "params": [],
+            },
+        }
+        graph = build_semantic_graph(object(), functions,
+                                     {"main": ["make"], "make": []},
+                                     lang="python", graph={})
+        self.assertTrue(any(hit["pattern"] == "uaf.deref"
+                            for hit in match_graph(graph)))
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:
