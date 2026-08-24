@@ -410,6 +410,21 @@ class SemanticGraphTests(unittest.TestCase):
         g.nodes["callee"].event.facts["abstract_object_ids"] = ["('clobber', 'recent', 'caller', 'p')"]
         self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_new_origin_clears_prior_abstract_release_at_same_site(self):
+        obj = ObjRef("p", generation="g0")
+        identity = ["('alloc', 'site', 'helper', 'p')"]
+        events = [
+            ("first", Event.origin(obj, facts={"abstract_object_ids": identity})),
+            ("free", Event(EventKind.RELEASE, obj=obj,
+                            facts={"abstract_object_ids": identity})),
+            ("second", Event.origin(obj, facts={"abstract_object_ids": identity})),
+            ("use", Event(EventKind.READ_STORAGE, obj=obj, base=obj,
+                           facts={"abstract_object_ids": identity})),
+        ]
+        g = self._graph(events, [(events[i][0], events[i + 1][0])
+                                 for i in range(len(events) - 1)])
+        self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_derive_preserves_alias_identity(self):
         original = ObjRef("O", generation="g0")
         alias = ObjRef("saved", generation="g0")

@@ -780,6 +780,16 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 origins.add(obj)
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
+                if identity_abstract:
+                    # An allocation site may be invoked repeatedly (or revisited
+                    # after a loop generation).  A fresh ORIGIN replaces the old
+                    # abstract lifetime; retaining its release marker makes the
+                    # next invocation look like a use-after-free even though it
+                    # received a new object incarnation.
+                    abstract_released = {
+                        (value, site) for value, site in abstract_released
+                        if value.split("@", 1)[0] not in identity_abstract
+                    }
                 nulls.discard(raw_obj)
                 if event.facts.get("return_may_null"):
                     nullable.add(obj)
