@@ -1044,7 +1044,14 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # before entering the seam.  Nested callbacks otherwise form
                 # cycles such as ``handler.p -> dispatch.value -> caller.p``
                 # and lose the concrete object at the callee event.
-                next_bindings[formal] = canonical(actual) or actual
+                composed = (canonical(actual)
+                            if edge.kind == "call" and formal.base != actual.base
+                            else actual)
+                # Preserve the raw seam for an already-canonical actual.  This
+                # avoids rewriting ordinary native return/field paths while
+                # still collapsing nested callback formals whose actual is a
+                # caller-local formal bound to a different object.
+                next_bindings[formal] = composed if composed != actual else actual
             next_aliases = dict(aliases)
             next_slot_bindings = dict(slot_bindings)
             next_abstract_bindings = dict(abstract_bindings)
