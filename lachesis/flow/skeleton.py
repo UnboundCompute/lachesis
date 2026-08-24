@@ -23,11 +23,12 @@ Token vocabulary (each token is a dict; ``depth`` = call-seam nesting level):
   {t:sink,  family, callee, arg, var, tainted, bound, guarded, depth}
   {t:alloc|use|free|escape, var, line, fn, depth}   lifecycle (object identity across seams)
 
-Known gaps (honest, inherited from the substrate):
+Known compatibility limits (honest, and specific to this legacy renderer):
   * ``tainted`` is a coarse proxy (provenance != const), not a full source-catalog reach --
     the reach substrate tracks "a value reaches the sink", not yet "an attacker value reaches it".
-  * standalone post-free deref uses are absent (the memory.deref tier-2 blocker), so a
-    use-after-free whose use is a bare ``buf[0]`` will not render; call-uses do.
+  * the legacy linear renderer does not preserve standalone post-free deref identity;
+    production object mode uses the semantic graph emitter for those facts. This module
+    remains available for compatibility and differential diagnostics.
 """
 import argparse
 import json

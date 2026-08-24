@@ -26,13 +26,13 @@ Contract reproduced (the record ``order.load`` used to return, one per defined U
 
 Drop-in: ``load_graph(path)`` mirrors ``order.load`` and returns ``(F, succ)``.
 
-Known gaps vs the old clang parser (honest, not silent):
-  * memory.deref use-events for a standalone dereference (``return buf[0]`` after a
-    free) are NOT emitted -- the reader does not stamp deref lifecycle nodes yet
-    (the tier-2 blocker). Uses that pass through a call ARE recovered by summarize.
-  * arg provenance is shallow: parameter / field / local / const, not the full
-    origin walk (n <- r.count <- param r). Guard presence -- the differential's
-    signal -- does not depend on it.
+Known limitations vs a full object-state analysis (honest, not silent):
+  * the compact F projection carries shallow provenance (parameter / field / local /
+    const), not the full origin walk (n <- r.count <- param r); the native semantic
+    graph receives richer declaration-rooted facts from the object substrate.
+  * the generic non-native backend preserves the lifecycle and sink facts available in
+    F, but does not invent frontend branch histories or heap aliases that were not
+    emitted by that frontend.
 """
 import argparse
 from collections import defaultdict
