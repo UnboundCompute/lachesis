@@ -235,6 +235,87 @@ def _arg_records(ix, call):
     return out
 
 
+def _expression_root(label):
+    """Return the lexical root of a neutral expression, when one is visible."""
+    match = re.match(r"\s*(?:[*&]\s*)*([A-Za-z_]\w*)", str(label or ""))
+    return match.group(1) if match else None
+
+
+def _dynamic_property_writes(ix, regions, nest, fid):
+    """Project computed member writes into the common sink vocabulary.
+
+    Library sinks are represented by call-model rows, but a computed write such as
+    ``target[key] = value`` has no callee to model.  Frontends already preserve this
+    fact either as a T3 ``computed-property-write`` behavior (JS/TS) or as a write
+    whose property path contains a dynamic segment (Python/C).  Keep the rule here,
+    at the language-neutral boundary, so every frontend gets the same sink family.
+
+    Literal member writes deliberately do not enter this projection: ``target.foo``
+    is a named field, not an attacker-selected prototype key.
+    """
+    records, seen = [], set()
+
+    def add(node, props, target, key_expression, key_node=None):
+        target_props = _props(target)
+        if not target or not target_props.get("dynamic"):
+            return
+        anchor = props.get("site_id") or props.get("evidenced_by") or node.get("id")
+        dedupe = (anchor, props.get("target_id"), key_expression)
+        if dedupe in seen:
+            return
+        seen.add(dedupe)
+        key_label = (key_node or {}).get("label") if key_node else key_expression
+        key_root = _expression_root(key_label)
+        key_provenance = _prov((key_node or {}).get("kind")) if key_node else "local"
+        span = _span(node)
+        idents = {key_root} if key_root else set()
+        guards = _guards_for(regions, fid, idents, span)
+        record = {
+            "callee": "__computed_property_write__",
+            "line": _stmt_line(node),
+            "args": [{"pos": 0, "var": key_root, "value": key_root or key_expression,
+                      "expr": key_expression, "root": key_root,
+                      "provenance": key_provenance}],
+            "guards": guards,
+            "guard_status": _guard_status_for(regions, fid, idents, span),
+            "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
+            "is_sink": True,
+            "sink_family": "prototype-pollution",
+            "sink_arg": 0,
+            "dynamic_property_write": True,
+            "target_id": props.get("target_id"),
+            "key_expression": key_expression,
+            "dst": target.get("label"),
+            "node": anchor,
+            "control": nest.enclosing(anchor),
+        }
+        records.append(record)
+
+    # TypeScript/JavaScript emits the key's value node and target path directly.
+    for node in _by_offset(ix.nodes_owned_by(fid, "dynamic-behavior")):
+        props = _props(node)
+        if props.get("behavior_kind") != "computed-property-write":
+            continue
+        target = ix.nodes.get(props.get("target_id"))
+        key_node = ix.nodes.get(props.get("key_value_id"))
+        add(node, props, target, props.get("key_expression"), key_node)
+
+    # Python, C, and any future frontend can use the shared write/property-path
+    # contract without needing a frontend-specific behavior marker.
+    for node in _by_offset(ix.nodes_owned_by(fid, "write")):
+        props = _props(node)
+        target = ix.nodes.get(props.get("target_id"))
+        target_props = _props(target)
+        segments = target_props.get("path_segments") or ()
+        dynamic = [segment for segment in segments
+                   if isinstance(segment, dict) and segment.get("dynamic")]
+        if not dynamic:
+            continue
+        key_expression = dynamic[-1].get("key")
+        add(node, props, target, key_expression)
+    return records
+
+
 def _expanded_macro_size(call, args, macro_defs, callee):
     """Recover an allocator's size expression when Clang lowered a macro call.
 
@@ -442,6 +523,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                            "var": _freed_identity(release_arg), "line": line,
                            "node": c["id"], "callee": callee})
 
+    dynamic_writes = _dynamic_property_writes(ix, regions, nest, fid)
+    calls.extend(dynamic_writes)
+    callees.extend(record["callee"] for record in dynamic_writes)
+
     alloc_vars = {a["var"] for a in assigns}
     tracked_vars = set()
     tracked_vars.update(a["var"] for a in assigns
@@ -605,8 +690,9 @@ def build_F(store, lang="c", *, return_graph=False):
     reverse_callers = defaultdict(set)
     sink_reachable = set()
     for name, record in recs.items():
-        for callee in record["callees"]:
-            if is_lifecycle_or_sink(callee):
+        for call in record["calls"]:
+            callee = call.get("callee")
+            if call.get("sink_family") or is_lifecycle_or_sink(callee):
                 sink_reachable.add(name)
             elif callee in recs:
                 reverse_callers[callee].add(name)

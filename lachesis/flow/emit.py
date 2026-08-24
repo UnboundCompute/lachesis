@@ -663,6 +663,21 @@ def _ir_lifecycle_events(call, norm, ref):
     return []
 
 
+def _sink_specs(record, sink_catalog):
+    """Return ``(argument, family)`` pairs for catalogued and native sinks."""
+    explicit = record.get("sink_family")
+    if explicit:
+        return ((record.get("sink_arg", 0), explicit),)
+    catalog_entry = sink_catalog.get(record.get("callee")) or {}
+    return tuple(
+        (arg_pos, (catalog_entry.get("kinds") or {}).get(arg_pos)
+         or catalog_entry.get("family"))
+        for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ()))
+        if ((catalog_entry.get("kinds") or {}).get(arg_pos)
+            or catalog_entry.get("family"))
+    )
+
+
 def _source_call_tokens(record):
     """Return stable source-site tokens for a frontend-neutral function record."""
     tokens = set()
@@ -785,14 +800,11 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                                     fragment=fn, source_reachable=reachable)
                     result.add_edge(tail, lifecycle_id)
                     tail = lifecycle_id
-                catalog_entry = sink_catalog.get(callee) or {}
-                for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
+                for arg_pos, family in _sink_specs(item, sink_catalog):
                     argument = next((arg for arg in item.get("args", ())
                                      if arg.get("pos") == arg_pos), None)
                     if argument is None:
                         continue
-                    family = (catalog_entry.get("kinds") or {}).get(arg_pos)
-                    family = family or catalog_entry.get("family")
                     if not family:
                         continue
                     guarded = bool(item.get("guards"))
@@ -975,14 +987,11 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                                 fragment=fn, source_reachable=reachable)
                 result.add_edge(previous, lifecycle_id)
                 previous = lifecycle_id
-            catalog_entry = sink_catalog.get(callee) or {}
-            for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
+            for arg_pos, family in _sink_specs(item, sink_catalog):
                 argument = next((arg for arg in item.get("args", ())
                                  if arg.get("pos") == arg_pos), None)
                 if argument is None:
                     continue
-                family = (catalog_entry.get("kinds") or {}).get(arg_pos)
-                family = family or catalog_entry.get("family")
                 if not family:
                     continue
                 sink_id = f"{fn}:ir:sink:{index}:{arg_pos}"
@@ -1387,15 +1396,11 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             for call_index, call in enumerate(functions[name].get("calls", ())):
                 if call.get("node") != n:
                     continue
-                catalog_entry = sink_catalog.get(call.get("callee")) or {}
-                for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
+                for arg_pos, family in _sink_specs(call, sink_catalog):
                     argument = next((arg for arg in call.get("args", ())
                                      if arg.get("pos") == arg_pos), None)
                     if argument is None:
                         continue
-                    family = (catalog_entry.get("kinds") or {}).get(arg_pos)
-                    if not family:
-                        family = catalog_entry.get("family")
                     if not family:
                         continue
                     recipe = evaluator_for(family)
