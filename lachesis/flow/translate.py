@@ -463,6 +463,11 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                "is_sink": cat is not None,
                "sink_name": catalog_name,
+               # Keep the catalog's semantic kind on the F record.  `is_sink`
+               # alone is not enough for the language-neutral matcher/security
+               # projections: it used to make every non-prototype Python sink
+               # visible only as an untyped call.
+               "sink_family": cat.get("family") if cat is not None else None,
                "assigned": assigned,
                # Managed-language lifecycle methods place the resource on the
                # receiver, not in an argument slot. Preserve that neutral
@@ -506,7 +511,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             hrec = {"callee": hcallee, "line": line, "args": args, "guards": guards,
                     "guard_status": guard_status,
                     "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
-                    "is_sink": hcat is not None, "node": c["id"],
+                    "is_sink": hcat is not None,
+                    "sink_name": hcallee if hcat is not None else None,
+                    "sink_family": hcat.get("family") if hcat is not None else None,
+                    "node": c["id"],
                     "control": rec["control"], "dispatch": "may-invoke"}
             if hcat is not None:
                 hsize = hcat.get("size_arg")
@@ -689,14 +697,33 @@ def build_F(store, lang="c", *, return_graph=False):
     fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
     defined = {f.get("label") for f in fnodes if not _props(f).get("declaration_only")}
 
+    # Python permits many methods with the same surface name (`extract`, `close`,
+    # `execute`, ...).  The old name-keyed projection silently discarded every
+    # definition after the first one, which could erase the only source/sink body
+    # in a class hierarchy.  Preserve a stable qualified identity when the frontend
+    # gives us a class owner; retain the old spelling for unique functions and for
+    # non-class callables so existing language-neutral consumers remain compatible.
+    def function_key(fnode):
+        name = fnode.get("label")
+        props = _props(fnode)
+        owner = ix.nodes.get(props.get("owner_id")) if props.get("owner_id") else None
+        if owner and owner.get("kind") == "class" and owner.get("label"):
+            return f"{owner['label']}.{name}"
+        if sum(1 for candidate in fnodes
+               if candidate.get("label") == name
+               and not _props(candidate).get("declaration_only")) > 1:
+            return f"{name}@{props.get('absolute_file') or props.get('file')}:{props.get('start_line')}"
+        return name
+
     recs = {}
     for f in fnodes:
         if _props(f).get("declaration_only"):
             continue
-        name = f.get("label")
-        if not name or name in recs:              # first defined record wins (static dupes)
+        name = function_key(f)
+        if not name or name in recs:
             continue
         recs[name] = _walk_function(ix, regions, nest, sinks, norm, f)
+        recs[name]["name"] = name
 
     def is_lifecycle_or_sink(c):
         return c in sink_names or norm.is_acquire(c) or norm.is_release(c) or norm.is_realloc(c)
