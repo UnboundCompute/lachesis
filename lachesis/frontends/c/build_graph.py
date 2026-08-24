@@ -54,20 +54,18 @@ VALUE_KINDS = {
     "EnumConstantDecl": "constant",
 }
 
-# Calls that create an object. Without an `allocation` node the heap-identity
-# overlay never runs (core/overlays/heap.py:31-32), so points_to/aliases answer
-# nothing on C. Covers libc and the common kernel allocators; the family name is
-# recorded verbatim so a zeroing allocator stays distinguishable downstream.
-ALLOCATOR_NAMES = frozenset({
-    "malloc", "calloc", "realloc", "reallocarray", "valloc", "aligned_alloc",
-    "memalign", "posix_memalign", "strdup", "strndup",
-    "kmalloc", "kzalloc", "kcalloc", "kmalloc_array", "krealloc", "krealloc_array",
-    "kvmalloc", "kvzalloc", "kvcalloc", "vmalloc", "vzalloc", "vcalloc",
-    "kmemdup", "kstrdup", "kmem_cache_alloc", "kmem_cache_zalloc",
-    "devm_kzalloc", "devm_kmalloc", "devm_kcalloc",
-    "dma_alloc_coherent", "dmam_alloc_coherent",
-    "kmalloc_node", "kzalloc_node", "vmalloc_node",
-})
+# Allocation roles are catalog data, not a frontend-maintained name list.  The
+# sink catalog supplies sized allocators (including kernel families); the
+# lifecycle catalog adds size-less allocators such as strdup variants.
+from lachesis.flow import atropos as _atropos
+
+_LIFECYCLE_ROLES = _atropos.detection("lifecycle-roles")
+_ALLOC_KINDS = set(_LIFECYCLE_ROLES.get("alloc_kinds") or ())
+ALLOCATOR_NAMES = frozenset(
+    {name for name, entry in _atropos.sink_catalog("c").items()
+     if entry.get("family") in _ALLOC_KINDS}
+    | set((_LIFECYCLE_ROLES.get("alloc") or {}).get("c") or ())
+)
 CONTENT_HASHES: Dict[Path, str] = {}
 
 # Memoize the (resolved path, content hash) of each distinct ``absolute_file``
@@ -435,6 +433,27 @@ def source_text(path: Path, cache: Dict[Path, str]) -> str:
     return cache[path]
 
 
+def source_bytes(path: Path, cache: Dict[Path, bytes]) -> bytes:
+    """Raw file bytes, for slicing spans by Clang's BYTE offsets.
+
+    Clang reports ``offset``/``tokLen`` as byte positions into the file, but
+    ``source_text`` returns a ``str`` of Unicode code points. Indexing that ``str``
+    with a byte offset drifts by one position per extra UTF-8 byte seen so far, so a
+    single multi-byte character anywhere in a file corrupts the snippet of every span
+    after it (and the drift grows downstream). Slice the bytes, then decode."""
+    if path not in cache:
+        try:
+            cache[path] = path.read_bytes()
+        except OSError:
+            cache[path] = b""
+    return cache[path]
+
+
+def source_span(raw: bytes, start: int, finish: int) -> str:
+    """Decode a byte span [start, finish) as the source snippet it spells."""
+    return raw[start:finish].decode("utf-8", "replace")
+
+
 def display_path(target: Path, source_dir: Path) -> str:
     """Canonical `properties.file` key for a file node.
 
@@ -516,8 +535,28 @@ def position_from_ast(
     begin = ast_node.get("range", {}).get("begin", {})
     end = ast_node.get("range", {}).get("end", {})
     loc = ast_node.get("loc", {})
-    start = begin.get("offset", loc.get("offset", 0))
-    finish = end.get("offset", start) + end.get("tokLen", loc.get("tokLen", 0))
+
+    # Macro-expanded operations are spelled in a header but executed at a
+    # source call site.  Clang puts the useful source coordinates in
+    # ``expansionLoc`` and leaves the header coordinates in ``spellingLoc``.
+    # Prefer the expansion for graph identity and source witnesses whenever it
+    # is available; ordinary AST nodes retain their existing range behaviour.
+    begin_source = begin.get("expansionLoc", begin)
+    end_source = end.get("expansionLoc", end)
+    loc_source = loc.get("expansionLoc", loc)
+    # Macro arguments all share the invocation's expansion offset. Their
+    # spelling locations, however, retain the distinct source expressions
+    # needed for argument/value identity (e.g. memcpy(dst, src, ...)).
+    if begin_source.get("isMacroArgExpansion"):
+        begin_source = begin.get("spellingLoc", begin_source)
+    if end_source.get("isMacroArgExpansion"):
+        end_source = end.get("spellingLoc", end_source)
+    if loc_source.get("isMacroArgExpansion"):
+        loc_source = loc.get("spellingLoc", loc_source)
+    start = begin_source.get("offset", loc_source.get("offset", 0))
+    finish = end_source.get("offset", start) + end_source.get(
+        "tokLen", loc_source.get("tokLen", 0)
+    )
     text = source_text(path, texts)
     starts = line_starts(path, text, line_starts_cache)
 
@@ -536,10 +575,10 @@ def position_from_ast(
     return {
         "file": str(path), "absolute_file": str(path),
         "start_offset": start, "end_offset": finish,
-        "start_line": loc.get("line", begin.get("line", start_line)),
-        "start_column": loc.get("col", begin.get("col", start_column)),
-        "end_line": end.get("line", end_line),
-        "end_column": end.get("col", end_column),
+        "start_line": loc_source.get("line", begin_source.get("line", start_line)),
+        "start_column": loc_source.get("col", begin_source.get("col", start_column)),
+        "end_line": end_source.get("line", end_line),
+        "end_column": end_source.get("col", end_column),
     }
 
 
@@ -818,6 +857,13 @@ def _has_include_origin(node: dict) -> bool:
     """
     loc = node.get("loc", {})
     begin = node.get("range", {}).get("begin", {})
+    # A macro expansion rooted in the current source file is source-visible,
+    # even when its spelling location is in an included header.  This keeps
+    # fortified libc/compiler builtins in the semantic graph without admitting
+    # the header implementation itself.
+    expansion = loc.get("expansionLoc") or begin.get("expansionLoc")
+    if isinstance(expansion, dict) and expansion.get("file"):
+        return False
     return bool(loc.get("includedFrom") or begin.get("includedFrom"))
 
 
@@ -903,6 +949,7 @@ def main() -> int:
 
     graph = Graph()
     texts: Dict[Path, str] = {}
+    raw_texts: Dict[Path, bytes] = {}
     line_starts_cache: Dict[Path, List[int]] = {}
     file_ids: Dict[Path, str] = {}
     declarations_by_raw_id: Dict[str, str] = {}
@@ -1391,12 +1438,38 @@ def main() -> int:
             "BinaryOperator", "UnaryOperator", "ConditionalOperator",
             "IntegerLiteral", "StringLiteral", "CharacterLiteral",
         }
-        if not node.get("isImplicit") and not is_included and is_body:
+        # Some source-visible library/builtin calls (notably fortified or macro
+        # lowered calls) are marked implicit by Clang but still carry the only
+        # semantic operation at their source span. Retain those CallExpr nodes;
+        # expression-only compiler scaffolding remains filtered out.
+        expansion = (
+            node.get("range", {}).get("begin", {}).get("expansionLoc")
+            or node.get("loc", {}).get("expansionLoc")
+        )
+        source_call = kind == "CallExpr" and isinstance(expansion, dict) and bool(
+            expansion.get("file")
+        )
+        call_reference = (
+            referenced_decl(node.get("inner", [{}])[0])
+            if kind == "CallExpr" and node.get("inner") else None
+        )
+        if (not node.get("isImplicit") or source_call) and not is_included and is_body:
             position = position_from_ast(node, path, texts, line_starts_cache)
-            text = source_text(path, texts)
-            snippet = compact(text[position["start_offset"]:position["end_offset"]])
+            # Clang offsets are BYTE positions; slice the raw bytes so a multi-byte
+            # character upstream does not shift the snippet (see source_bytes).
+            snippet = compact(source_span(source_bytes(path, raw_texts),
+                                          position["start_offset"], position["end_offset"]))
             node_kind = "call" if kind == "CallExpr" else "statement" if kind.endswith("Stmt") else "expression"
-            body_id = stable_id("body", path, position["start_offset"], position["end_offset"], kind)
+            # Fortified/macro-lowered calls can contain multiple CallExpr nodes
+            # at one source span (the wrapper and its builtin helpers). Include
+            # the resolved callee in the identity so those semantic operations
+            # do not overwrite one another in the graph.
+            identity_parts = [
+                "body", path, position["start_offset"], position["end_offset"], kind,
+            ]
+            if kind == "CallExpr" and expansion:
+                identity_parts.append((call_reference or {}).get("name", ""))
+            body_id = stable_id(*identity_parts)
             graph.node(
                 "T3", body_id, node_kind, snippet or kind, **position,
                 syntax_kind=kind, type=node.get("type", {}).get("qualType"),
@@ -1415,7 +1488,7 @@ def main() -> int:
             if kind == "CallExpr":
                 # Clang stores the callee as the first CallExpr child. Looking
                 # through the whole call can incorrectly select an argument.
-                reference = referenced_decl(node.get("inner", [{}])[0])
+                reference = call_reference
                 target = declarations_by_raw_id.get((reference or {}).get("id", ""))
                 if not target and reference:
                     candidates = declarations_by_name.get((reference.get("kind", "FunctionDecl"), reference.get("name", "")), [])

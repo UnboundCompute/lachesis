@@ -12,19 +12,55 @@ from .translate import build_F
 from .skeleton import build_skeletons, _summaries_for
 from .match import match_all, match_leak, match_reach, match_typestate
 from .cfg import cfg_bundle
-from .object_lifetime import analyze_object_lifetimes
+from .object_lifetime import ObjectLifetimeResult, analyze_object_lifetimes
+from .semantic_graph import match_graph
+from .fragment_store import Claus
+from .coverage import CoverageScheduler
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
 _DEFAULT_LIFETIME_ENGINE = "object"
 
 
-def _lifetime_slice(F, succ):
-    """Restrict object analysis to the call-graph region carrying lifecycle events."""
+def _lifetime_slice(F, succ, lang="c"):
+    """Select the semantic call-graph region carrying lifecycle or sink facts.
+
+    The name is retained for API compatibility.  The production skeleton must
+    also include sink-only functions (for example a standalone bounded-copy
+    helper) and realloc-only functions, otherwise Atropos reach patterns would
+    remain stranded in the retired renderer.
+    """
+    from . import atropos
+
+    sink_names = set(atropos.sink_catalog(lang))
+    def carries_semantic_work(function):
+        # A frontend may expose an inline/compiler artifact as a nominal source
+        # function with no body, calls, lifecycle facts, or sink observations.
+        # Such a node cannot contribute an object state and should not create a
+        # permanently unresolved Pass 3 region. Real source wrappers remain
+        # seeds because they carry calls/source sites even when their lifecycle
+        # effect is entirely in a callee.
+        return bool(function.get("events") or function.get("calls")
+                    or function.get("source_calls") or function.get("source_sites"))
+
+    def materializable(function):
+        return (carries_semantic_work(function) or function.get("params") or
+                function.get("returns") or function.get("body_node_count", 0) > 0)
+
     seeds = {
         name for name, function in F.items()
-        if any(event.get("kind") in {"alloc", "free", "escape"}
+        # Source-rooted Pass 3 must not require a sink-shaped fact before it
+        # explores a function.  A pointer-arithmetic or language-specific
+        # semantic operation can be invisible to the generic operation census
+        # and still be the only route to a matcher pattern.  The source
+        # discovery result is the authoritative reachability gate; Claus and
+        # the matcher decide later whether the region contains useful facts.
+        if (function.get("source_reachable") and
+            materializable(function))
+        or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
+        or any(call.get("is_sink") or call.get("callee") in sink_names
+               for call in function.get("calls", ()))
     }
     if not seeds:
         return {}
@@ -37,7 +73,8 @@ def _lifetime_slice(F, succ):
     while queue:
         name = queue.popleft()
         for neighbour in set(succ.get(name, ())) | set(reverse.get(name, ())):
-            if neighbour in F and neighbour not in region:
+            if (neighbour in F and neighbour not in region and
+                (materializable(F[neighbour]) or succ.get(neighbour))):
                 region.add(neighbour)
                 queue.append(neighbour)
     return {name: F[name] for name in region}
@@ -127,29 +164,91 @@ def run_pass(store, lang="c", lifetime_engine=None):
     if requested not in {"legacy", "shadow", "object"}:
         raise ValueError(
             "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")
-    object_requested = lang.lower() == "c" and requested != "legacy"
+    # Pass 3 is a language-neutral semantic pipeline.  Frontends select the
+    # appropriate catalog/normalizer and contribute their own graph facts; the
+    # scheduler, Claus graph, and matcher must not make C the dispatch gate.
+    object_requested = requested != "legacy"
     if object_requested:
         F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
+    coverage = CoverageScheduler(F, succ).plan()
     projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
-    skeletons = build_skeletons(F, summaries, lang=lang)
+    # The semantic graph is the production lifetime substrate.  Keep the old
+    # typestate renderer for legacy/shadow operation and for an explicit
+    # fallback only; object mode still uses its reach skeletons for Atropos's
+    # non-lifetime evaluators.
+    skeletons = ([] if object_requested else
+                 build_skeletons(F, summaries, lang=lang, include_typestate=True))
     skeletons_done = perf_counter()
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
     legacy_leads = None
     leads = []
     if object_requested:
-        object_functions = _lifetime_slice(F, succ)
+        object_functions = _lifetime_slice(F, succ, lang=lang)
         object_succ = {
             name: [callee for callee in succ.get(name, ()) if callee in object_functions]
             for name in object_functions
         }
-        object_result = analyze_object_lifetimes(
-            store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+        from .emit import _native_object_substrate
+        if _native_object_substrate(analysis_graph):
+            object_result = analyze_object_lifetimes(
+                store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+        else:
+            # Frontends without declaration-rooted heap roles still participate in
+            # Pass 3 through the generic F-IR semantic graph.  Do not route them
+            # through the C-shaped object analyzer and call its substrate failure a
+            # coverage result; the graph/matcher remains useful at the facts the
+            # frontend actually emitted.
+            object_result = ObjectLifetimeResult(
+                (), {}, {
+                    "backend": "frontend-ir",
+                    "analyzed": 0,
+                    "unsafe_functions": [],
+                    "seed_unsafe_functions": [],
+                    "unsafe_object_flow": {},
+                    "unplaced": 0,
+                    "unplaced_functions": {},
+                    "capped": [],
+                    "widenings": 0,
+                    "transfers": 0,
+                    "total_seconds": 0.0,
+                }, {})
+        # The semantic skeleton is deliberately built over the lifecycle/sink slice,
+        # not over every translated function.  Give Claus the matching coverage plan;
+        # passing the whole-program plan here would mark functions absent from the
+        # skeleton as covered and make Pass 3's convergence claim unsound.
+        semantic_coverage = CoverageScheduler(object_functions, object_succ).plan()
+        # Keep the fragment store on the loaded graph session so repeated Pass 3
+        # requests can reuse covered semantic regions.  The store key fingerprints
+        # rebuilt summaries, so this is safe across fresh F dictionaries as long as
+        # the underlying graph and semantic inputs remain unchanged.
+        claus = getattr(store, "_pass3_claus", None)
+        if claus is None:
+            claus = Claus()
+            store._pass3_claus = claus
+        # A graph-backed session gets a reusable semantic-fragment sidecar.  The
+        # FragmentStore still validates semantic fingerprints before accepting
+        # anything, so an older graph or changed translator input is a miss rather
+        # than a false coverage claim. In-memory stores remain purely in-memory.
+        snapshot_path = (f"{store.graph_path}.pass3.json"
+                         if getattr(store, "graph_path", None) else None)
+        if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
+            claus.fragments.load_snapshot(
+                snapshot_path, F, lang, analysis_graph,
+                object_result.summaries, summaries, object_result.artifacts)
+            store._pass3_snapshot_loaded = True
+        semantic_graph = claus.build(
+            store, F, succ, lang=lang, graph=analysis_graph,
+            summaries=object_result.summaries, coverage=semantic_coverage,
+            reach_summaries=summaries, state_artifacts=object_result.artifacts)
+        if snapshot_path:
+            claus.fragments.save_snapshot(snapshot_path)
+        semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.
@@ -164,6 +263,25 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
         # filtered per-object by the object-flow map. Legacy fallback covers seed-unsafe.
         seed_unsafe = set(diagnostics.get("seed_unsafe_functions", unsafe))
+        if requested == "shadow":
+            # Shadow mode is an explicit differential, so it must materialize
+            # the legacy stream even when object analysis has no fallback
+            # functions.  Otherwise the comparison silently becomes
+            # legacy-empty versus semantic and cannot audit recall.  Restrict
+            # the diagnostic to the same source-rooted lifecycle slice as the
+            # production semantic graph; unrelated sink-only functions do not
+            # contribute lifetime recall and can make the old renderer explode
+            # in size on mature graphs.
+            legacy_functions = {name: F[name] for name in object_functions}
+            legacy_summaries = {name: summaries.get(name, ())
+                                for name in object_functions}
+            skeletons = build_skeletons(legacy_functions, legacy_summaries, lang=lang,
+                                        include_typestate=True)
+        if seed_unsafe and requested == "object":
+            # Re-enable the compatibility typestate stream only for functions
+            # whose semantic object analysis could not produce a trustworthy
+            # graph. Healthy object-mode paths never depend on the old flow.
+            skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
         object_flow = diagnostics.get("unsafe_object_flow", {})
         covered = set(F) - seed_unsafe
         if requested == "shadow":
@@ -173,10 +291,23 @@ def run_pass(store, lang="c", lifetime_engine=None):
                 object_flow=object_flow)
         else:
             fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
+            if seed_unsafe and not skeletons:
+                skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
             legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
-            leads, _ = _select_lifetime_leads(
-                legacy_leads, object_result.leads, requested, covered_entries=covered,
-                object_flow=object_flow)
+            # The frozen graph/matcher is now the production lifetime path.  Keep the old
+            # matcher only for non-lifetime reach leads and as a diagnostic fallback for
+            # functions whose object projection could not be emitted.
+            # Atropos sink observations now live in the semantic graph.  The
+            # compatibility matcher contributes only lifetime fallback leads
+            # for functions whose object analysis failed.
+            reach_leads = []
+            fallback_lifetime = [lead for lead in legacy_leads
+                                 if lead.get("pattern") in _LIFETIME_PATTERNS
+                                 and lead.get("entry") in seed_unsafe]
+            # Object mode is source-rooted semantic-graph production.  A failed
+            # object projection is reported in diagnostics, not silently converted
+            # back into the legacy name-keyed lifetime verdicts.
+            leads = fallback_lifetime + semantic_leads
             differential = {
                 "computed": False,
                 "reason": "set LACHESIS_LIFETIME_ENGINE=shadow for a full differential",
@@ -192,6 +323,10 @@ def run_pass(store, lang="c", lifetime_engine=None):
             "diagnostics": diagnostics,
             "fallback_functions": sorted(seed_unsafe),
             "candidate_functions": len(object_functions),
+            "semantic_graph_nodes": len(semantic_graph.nodes),
+            "semantic_graph_edges": sum(len(edges) for edges in semantic_graph.edges.values()),
+            "semantic_leads": len(semantic_leads),
+            "coverage": semantic_graph.coverage,
         })
     else:
         legacy_leads = match_all(skeletons, cfg=cfg_bundle(store))
@@ -206,5 +341,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
         "total_seconds": round(finished - started, 6),
     }
     return {"F": F, "succ": succ, "summaries": summaries,
-            "skeletons": skeletons, "leads": leads, "lifetime": lifetime,
+            "skeletons": skeletons, "semantic_graph": locals().get("semantic_graph"),
+            "coverage": locals().get("coverage"),
+            "leads": leads, "lifetime": lifetime,
             "timings": timings}

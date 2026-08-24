@@ -1178,6 +1178,190 @@ class AllFamilyRegistryTest(unittest.TestCase):
         self.assertEqual(query[0]["observations"]["atropos_model_id"],
                          "c.db.mysql_query.a1")
 
+    def test_temporal_flow_patterns_are_candidate_families(self):
+        graph = {
+            "nodes": [
+                _node("free:1", "release", "free(p)", object_id="obj:p",
+                      owner_function_id="fn:destroy", file="destroy.c", start_line=8),
+                _node("read:1", "read", "p->field", object_id="obj:p",
+                      owner_function_id="fn:use", file="use.c", start_line=19),
+            ],
+            "edges": [],
+        }
+        registry = default_candidate_registry(graph)
+        uaf = registry.census("mem.lifetime.use-after-free")["constructors"][0]
+        double_free = registry.census("mem.lifetime.double-free")["constructors"][0]
+        self.assertEqual(uaf["census"]["enumerated"], 1)
+        self.assertEqual(double_free["census"]["enumerated"], 1)
+        self.assertEqual(uaf["metadata"]["matcher_pattern"], "uaf.deref")
+        self.assertEqual(double_free["metadata"]["matcher_pattern"], "double-free")
+
+    def test_unchecked_return_deref_is_discoverable_as_a_temporal_candidate(self):
+        graph = {
+            "nodes": [
+                _node("read:1", "read_storage", "result->field", object_id="obj:result",
+                      owner_function_id="fn:caller", file="caller.c", start_line=14),
+            ],
+            "edges": [],
+        }
+        registry = default_candidate_registry(graph)
+        result = registry.census("ctrl.unchecked-return-deref")["constructors"][0]
+        self.assertEqual(result["metadata"]["matcher_pattern"],
+                         "unchecked-return-deref")
+        self.assertEqual(result["census"]["enumerated"], 1)
+
+    def test_temporal_candidates_are_language_neutral(self):
+        graph = {
+            "nodes": [
+                _node("free:py", "release", "release(buf)", object_id="obj:buf",
+                      owner_function_id="fn:destroy", file="destroy.py", start_line=8),
+                _node("read:py", "read_storage", "buf.data", object_id="obj:buf",
+                      owner_function_id="fn:use", file="use.py", start_line=19),
+            ],
+            "edges": [],
+        }
+        registry = default_candidate_registry(graph)
+        rows = registry.candidates(constructor="mem.lifetime.use-after-free")["candidates"]
+        self.assertEqual(rows[0]["language"], "python")
+        self.assertEqual(rows[0]["observations"]["event_kind"], "read_storage")
+
+    def test_every_catalogued_lifecycle_pattern_has_observation_routing(self):
+        from lachesis.flow import atropos
+        from lachesis.planner import taxonomy
+        from lachesis.planner.temporal_obligation import temporal_constructor
+
+        lifecycle = [entry for entry in atropos.pattern_catalog()
+                     if (entry.get("candidate") or {}).get("domain") == "lifecycle"]
+        registry = default_candidate_registry({"nodes": [], "edges": []})
+        registered = {spec["id"] for spec in registry.constructors}
+        self.assertTrue(lifecycle)
+        for entry in lifecycle:
+            candidate = entry["candidate"]
+            self.assertIn(entry["id"], registered)
+            spec = next(spec for spec in taxonomy.family_specs()
+                        if spec["id"] == entry["id"])
+            implementation = temporal_constructor(spec)
+            self.assertTrue(implementation.trigger, entry["id"])
+
+    def test_temporal_candidate_rows_are_not_verdicts(self):
+        graph = {"nodes": [_node("free:1", "release", "free(p)" )], "edges": []}
+        registry = default_candidate_registry(graph)
+        row = registry.candidates(constructor="mem.lifetime.double-free",
+                                  detail="full")["candidates"][0]
+        self.assertNotIn("verdict", row)
+        self.assertEqual(row["inferences"]["same_object"], "not-queried")
+
+    def test_temporal_census_reports_uncovered_semantic_states(self):
+        graph = {
+            "nodes": [], "edges": [],
+            "semantic_graph": {
+                "coverage": {"converged": False,
+                              "uncovered_states": [["worker", "source"]],
+                              "uncovered_contexts": [["worker", "source", "site"]]},
+                "nodes": {
+                    "release": {"event": {"kind": "RELEASE", "obj": "O#g0"},
+                                 "fragment": "worker"},
+                },
+            },
+        }
+        result = default_candidate_registry(graph).census(
+            "mem.lifetime.double-free")["constructors"][0]
+        self.assertFalse(result["complete_for_observable_graph"])
+        self.assertEqual(result["frontiers"]["unresolved_calls"], 2)
+
+    def test_temporal_registry_consumes_serialized_semantic_skeleton(self):
+        graph = {
+            "nodes": [], "edges": [],
+            "semantic_graph": {
+                "nodes": {
+                    "origin": {"event": {"kind": "ORIGIN", "obj": "O#g0",
+                                           "line": 10},
+                               "fragment": "make", "metadata": {}},
+                    "release": {"event": {"kind": "RELEASE", "obj": "O#g0",
+                                            "line": 20},
+                                 "fragment": "destroy", "metadata": {}},
+                },
+                "edges": {}, "fragments": {},
+            },
+        }
+        registry = default_candidate_registry(graph)
+        leak = registry.candidates(constructor="mem.lifetime.leak")
+        double_free = registry.candidates(constructor="mem.lifetime.double-free")
+        self.assertEqual(leak["total"], 1)
+        self.assertEqual(double_free["total"], 1)
+        self.assertEqual(leak["candidates"][0]["handles"]["enclosing_function_id"], "make")
+        self.assertNotIn("verdict", leak["candidates"][0])
+
+    def test_serialized_semantic_language_survives_without_file_metadata(self):
+        graph = {
+            "language": "python",
+            "nodes": [], "edges": [],
+            "semantic_graph": {
+                "language": "python",
+                "nodes": {
+                    "read": {"event": {"kind": "READ_STORAGE", "obj": "buf#g0"},
+                             "fragment": "use", "metadata": {}},
+                },
+                "edges": {}, "fragments": {},
+            },
+        }
+        row = default_candidate_registry(graph).candidates(
+            constructor="mem.lifetime.use-after-free")["candidates"][0]
+        self.assertEqual(row["language"], "python")
+
+    def test_multilanguage_semantic_nodes_keep_language_and_collisions(self):
+        from lachesis.planner.temporal_obligation import merge_semantic_nodes
+
+        class Semantic:
+            def __init__(self, node):
+                self.node = node
+
+            def to_dict(self):
+                return {"nodes": {"shared": self.node}}
+
+        merged = {}
+        merge_semantic_nodes(merged, Semantic({"event": {"kind": "ORIGIN"},
+                                               "metadata": {}}), "c")
+        merge_semantic_nodes(merged, Semantic({"event": {"kind": "ORIGIN"},
+                                               "metadata": {}}), "python")
+        self.assertEqual(merged["shared"]["metadata"]["language"], "c")
+        self.assertEqual(merged["python:shared"]["metadata"]["language"], "python")
+
+
+class GuardRelationTest(unittest.TestCase):
+    """A branch guards a size only when it COMPARES the variable's magnitude.
+
+    The region classifier used to flag any branch that merely NAMED a size variable,
+    so `if (p && ...)` read as a size guard and suppressed a real overflow/lifetime
+    bug. A guard must carry a magnitude relation (`< <= > >=`), not a nullness or
+    presence test."""
+
+    def _named(self, head, *idents):
+        import re as _re
+
+        from lachesis.planner.unbounded_copy import _relation_named
+        patterns = {i: _re.compile(r"\b" + _re.escape(i) + r"\b") for i in idents}
+        return _relation_named(head, patterns)
+
+    def test_magnitude_comparison_is_a_guard(self):
+        self.assertEqual(["cap", "len"], self._named("if (len < cap)", "len", "cap"))
+        self.assertEqual(["x"], self._named("if (x >= 0)", "x"))
+        self.assertEqual(["count", "i"], self._named("while (i < count)", "i", "count"))
+
+    def test_nullness_or_presence_is_not_a_guard(self):
+        self.assertEqual([], self._named("if (z && a && b)", "z", "a", "b"))
+        self.assertEqual([], self._named("if (p != NULL)", "p"))
+        self.assertEqual([], self._named("if (buf)", "buf"))
+
+    def test_bit_shift_is_not_a_relation(self):
+        self.assertEqual([], self._named("if (flags << 2)", "flags"))
+        self.assertEqual([], self._named("if (a >> b)", "a", "b"))
+
+    def test_only_the_operands_of_the_relation_clause_count(self):
+        # `ready` shares the head but sits in its own presence clause, not the bound.
+        self.assertEqual(["n", "size"],
+                         self._named("if (n <= size && ready)", "n", "size", "ready"))
+
 
 if __name__ == "__main__":
     unittest.main()

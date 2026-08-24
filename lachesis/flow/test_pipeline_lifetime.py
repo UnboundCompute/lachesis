@@ -59,6 +59,40 @@ class PipelineLifetimeTests(unittest.TestCase):
         successors = {"caller": ["alloc"], "alloc": [], "unrelated": []}
         self.assertEqual(set(_lifetime_slice(functions, successors)), {"alloc", "caller"})
 
+    def test_empty_source_artifacts_do_not_seed_lifetime_slice(self):
+        functions = {
+            "empty": {"source_reachable": True},
+            "wrapper": {"source_reachable": True, "calls": [{"callee": "alloc"}]},
+            "alloc": {"events": [{"kind": "alloc"}]},
+        }
+        successors = {"empty": [], "wrapper": ["alloc"], "alloc": []}
+        self.assertEqual(set(_lifetime_slice(functions, successors)), {"wrapper", "alloc"})
+
+    def test_source_reachable_parameter_function_is_not_dropped_before_semantic_pass(self):
+        functions = {
+            "pointer_only": {"source_reachable": True, "params": ["buffer"],
+                              "file": "fixture.c", "line": 10},
+        }
+        self.assertEqual(set(_lifetime_slice(functions, {"pointer_only": []})),
+                         {"pointer_only"})
+
+    def test_empty_compiler_artifact_cannot_keep_region_unconverged(self):
+        functions = {
+            "wrapper": {"source_reachable": True,
+                        "calls": [{"callee": "alloc"}], "file": "fixture.c"},
+            "artifact": {"source_reachable": True, "file": "builtin.c"},
+            "alloc": {"events": [{"kind": "alloc"}], "file": "fixture.c"},
+        }
+        successors = {"wrapper": ["alloc", "artifact"], "alloc": [], "artifact": []}
+        self.assertEqual(set(_lifetime_slice(functions, successors)), {"wrapper", "alloc"})
+
+    def test_body_only_function_is_materialized_for_non_sink_semantics(self):
+        functions = {
+            "global_reader": {"source_reachable": True, "body_node_count": 4},
+        }
+        self.assertEqual(set(_lifetime_slice(functions, {"global_reader": []})),
+                         {"global_reader"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -76,7 +76,20 @@ class Normalizer:
         lc = atropos.detection("lifecycle-roles")
         alloc_kinds = set(lc.get("alloc_kinds") or [])
         alloc_extra = set((lc.get("alloc") or {}).get(lang) or [])
+        self.acquire_method_names = set((lc.get("acquire_methods") or {}).get(lang) or [])
         self.dealloc_names = set((lc.get("dealloc") or {}).get(lang) or [])
+        # Managed-language destructors are method names in the source graph rather
+        # than C-style free symbols.  Keep this vocabulary in the lifecycle catalog;
+        # the reader only asks the catalog whether a call is a release operation.
+        self.release_method_names = set((lc.get("release_methods") or {}).get(lang) or [])
+        self.release_qualified_names = set((lc.get("release_qualified") or {}).get(lang) or [])
+        # realloc-family is BOTH a free (of its first argument's old block) and an alloc
+        # (of the returned block). It keeps its `alloc-size` sink identity below (its size
+        # argument is a spatial sink); this set adds only the lifetime fact -- that the old
+        # generation may be freed -- so an un-rebased interior pointer reads as a dangling
+        # use-after-free. DATA-DRIVEN from the same catalog; no name is hard-coded here.
+        self.realloc_names = set((lc.get("realloc") or {}).get(lang) or [])
+        self.aggregate_copy_specs = dict((lc.get("aggregate_copy") or {}).get(lang) or {})
         cat = atropos.sink_catalog(lang)
         self.alloc_names = {m for m, c in cat.items()
                             if c.get("family") in alloc_kinds} | alloc_extra
@@ -85,9 +98,41 @@ class Normalizer:
         """True if `callee` allocates an owned object (a lifecycle alloc event source)."""
         return self.canon_callee(callee) in self.alloc_names
 
+    def is_acquire(self, callee):
+        """True for a catalogue-managed acquisition returning a tracked resource."""
+        name = self.canon_callee(callee)
+        return name in self.alloc_names or name in self.acquire_method_names
+
     def is_dealloc(self, callee):
         """True if `callee` frees its pointer argument (a lifecycle free event source)."""
         return self.canon_callee(callee) in self.dealloc_names
+
+    def is_release(self, callee):
+        """True for a catalogue release, including managed receiver methods."""
+        name = self.canon_callee(callee)
+        return (name in self.dealloc_names or name in self.release_qualified_names
+                or name.rsplit(".", 1)[-1] in self.release_method_names)
+
+    def is_realloc(self, callee):
+        """True if `callee` reallocates its first pointer argument -- freeing the old block
+        (it may move) and returning a fresh one. Checked before is_alloc by the lifetime
+        emitter so realloc carries its free-of-old-generation semantics, not a plain alloc."""
+        return self.canon_callee(callee) in self.realloc_names
+
+    def is_aggregate_copy(self, callee, expression=""):
+        """Whether a call carries a catalogued aggregate-copy semantic role."""
+        name = self.canon_callee(callee)
+        requirement = self.aggregate_copy_specs.get(name)
+        if requirement is None:
+            return False
+        if isinstance(requirement, str):
+            # A string value is the catalogued size-argument convention (for
+            # example ``sizeof``), not a requirement that the frontend preserve
+            # the complete source spelling.  Macro-expanded calls may expose
+            # only their callee label after graph normalization; the declarative
+            # role is still authoritative in that case.
+            return True
+        return bool(requirement)
 
     def canon_callee(self, name):
         """The canonical callee/sink name for a surface name (identity if unmapped).
@@ -106,7 +151,9 @@ class Normalizer:
         """Small dict describing what this normalizer will apply -- for a coverage line."""
         return {"lang": self.lang, "alias_sections": sorted(self.alias_sections),
                 "callee_rewrites": len(self.callee_rewrites), "opaque_kinds": len(self.opaque),
-                "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names)}
+                "alloc_names": len(self.alloc_names), "dealloc_names": len(self.dealloc_names),
+                "realloc_names": len(self.realloc_names),
+                "aggregate_copy_names": len(self.aggregate_copy_specs)}
 
 
 _CACHE = {}

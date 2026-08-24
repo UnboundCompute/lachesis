@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from . import taxonomy
 from .sink_obligation import sink_constructor
 from .unbounded_copy import MemoryCopyCapacity
+from .lifecycle_obligation import constructors as lifecycle_constructors
+from .temporal_obligation import temporal_constructor
 
 # The one family whose obligation is richer than a single argument (it pairs a
 # copy size with a write destination) earns a specialized enumerator. Every other
@@ -14,6 +16,7 @@ from .unbounded_copy import MemoryCopyCapacity
 # -- that comes entirely from `taxonomy.family_specs()`.
 _SPECIALIZED: dict[str, type] = {
     MemoryCopyCapacity.metadata["id"]: MemoryCopyCapacity,
+    **lifecycle_constructors(),
 }
 
 
@@ -162,6 +165,8 @@ def default_candidate_registry(graph: dict, bind_summary: dict | None = None) ->
     they deliberately want to test that one family."""
     registry = CandidateRegistry(graph, bind_summary)
     for spec in taxonomy.family_specs():
-        implementation = _SPECIALIZED.get(spec["id"]) or sink_constructor(spec)
+        implementation = (_SPECIALIZED.get(spec["id"]) or
+                          (temporal_constructor(spec) if spec.get("temporal") else
+                           sink_constructor(spec)))
         registry.register(implementation)
     return registry

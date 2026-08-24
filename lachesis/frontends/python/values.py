@@ -346,6 +346,29 @@ class ValueWalk:
         self.write_count += 1
         return node_id
 
+    def release_target(self, node: ast.AST, target: ast.expr, frame, method: str) -> None:
+        """Emit one catalogue release for a target (``del`` or context exit)."""
+        target_id = self.target_of(target, frame)
+        if target_id is None:
+            return
+        position = self.source.position(node)
+        release_line = position.get("end_line") if method == "__exit__" else position.get("start_line")
+        node_id = stable_id("release", self.source.display,
+                            position["start_offset"], position["end_offset"], target_id,
+                            method)
+        self.graph.node(node_id, "release", compact(self.source.excerpt(target)),
+                        **position, release_method=method, target_id=target_id,
+                        release_line=release_line,
+                        owner_function_id=frame.owner_function_id)
+        body_id = self.bodies.get(id(node))
+        if body_id:
+            self.graph.edge("EVIDENCED_BY", node_id, body_id)
+
+    def release(self, node: ast.Delete, frame) -> None:
+        """Emit ``del`` as a structural release of its tracked target."""
+        for target in node.targets:
+            self.release_target(node, target, frame, "del")
+
     # -- allocations ---------------------------------------------------------
 
     def allocation(
@@ -406,7 +429,9 @@ class ValueWalk:
 
     def visit(self, node: ast.AST, frame) -> None:
         """Called once per AST node, in the traversal BodyWalk already performs."""
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+        if isinstance(node, ast.Delete):
+            self.release(node, frame)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
                              ast.NamedExpr)):
             self._assignment(node, frame)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
@@ -418,6 +443,8 @@ class ValueWalk:
                     # claim about the context manager and not about the object.
                     self._bind(item.optional_vars, item.context_expr, frame,
                                "context-manager", "conservative")
+                if item.optional_vars is not None:
+                    self.release_target(node, item.optional_vars, frame, "__exit__")
         elif isinstance(node, ast.comprehension):
             self._bind(node.target, node.iter, frame, "iteration", "conservative")
         elif isinstance(node, ast.ExceptHandler) and node.name:

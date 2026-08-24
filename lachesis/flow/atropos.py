@@ -33,7 +33,11 @@ _DEFAULT_ATROPOS_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "atropos"))
 ATROPOS_ROOT = os.environ.get("ATROPOS_ROOT", _DEFAULT_ATROPOS_ROOT)
 
-_EXT_LANG = {".c": "c", ".h": "c", ".py": "python", ".js": "javascript", ".ts": "typescript"}
+_EXT_LANG = {
+    ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".cxx": "c", ".hpp": "c",
+    ".py": "python", ".js": "javascript", ".jsx": "javascript",
+    ".mjs": "javascript", ".ts": "typescript", ".tsx": "typescript",
+}
 
 
 def lang_of(path):
@@ -59,7 +63,8 @@ def _entries(lang):
     d = os.path.join(ATROPOS_ROOT, "models", lang)
     for path in sorted(glob.glob(os.path.join(d, "*.json"))):
         try:
-            doc = json.load(open(path))
+            with open(path, encoding="utf-8") as stream:
+                doc = json.load(stream)
         except (OSError, ValueError):
             continue
         for e in doc.get("entries", []):
@@ -99,16 +104,24 @@ def load(lang):
             src_id, dst_id = _decode_ap(lhs), _decode_ap(rhs)
             if role == "sanitizer":                       # value cleaned crossing the call
                 san = sanitizers.setdefault(method, {"ins": [], "out": "ret"})
-                san["ins"].append(src_id)
+                if src_id not in san["ins"]:
+                    san["ins"].append(src_id)
                 san["out"] = dst_id
             else:                                          # taint passthrough summary
-                summaries.setdefault(method, []).append((src_id, dst_id))
+                pair = (src_id, dst_id)
+                if pair not in summaries.setdefault(method, []):
+                    summaries[method].append(pair)
             continue
         arg = _decode_ap(ap)
         if role == "sink":
             s = sinks.setdefault(method, {"size_arg": None, "sink_args": [],
                                           "family": e.get("kind"), "cwe": [], "kinds": {}})
-            s["sink_args"].append(arg)
+            # Multiple catalog rows may describe the same sink argument (for
+            # example a generic role plus its language-specific refinement).
+            # Preserve the merged kind/CWE information, but expose each
+            # argument position once to graph builders and other consumers.
+            if arg not in s["sink_args"]:
+                s["sink_args"].append(arg)
             s["kinds"][arg] = e.get("kind")
             for c in e.get("cwe", []):
                 if c not in s["cwe"]:
@@ -119,10 +132,12 @@ def load(lang):
                 s["family"] = e.get("kind")
         elif role == "source":
             src = sources.setdefault(method, {"args": [], "kind": e.get("kind")})
-            src["args"].append(arg)
+            if arg not in src["args"]:
+                src["args"].append(arg)
         elif role == "sanitizer":
             san = sanitizers.setdefault(method, {"ins": [], "out": "ret"})
-            san["ins"].append(arg)
+            if arg not in san["ins"]:
+                san["ins"].append(arg)
     _CACHE[lang] = (sinks, sources, sanitizers, summaries)
     return _CACHE[lang]
 
@@ -133,7 +148,8 @@ def _load_profile(lang, layer):
     so every form it uses lands in the 'unnormalized' ledger (honest, not a crash)."""
     path = os.path.join(ATROPOS_ROOT, "profiles", lang, f"{layer}.json")
     try:
-        return json.load(open(path))
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
     except (OSError, ValueError):
         return {}
 
@@ -167,10 +183,70 @@ def detection(name):
     if name not in _DETECTION_CACHE:
         path = os.path.join(ATROPOS_ROOT, "detection", f"{name}.json")
         try:
-            _DETECTION_CACHE[name] = json.load(open(path))
+            with open(path, encoding="utf-8") as stream:
+                _DETECTION_CACHE[name] = json.load(stream)
         except (OSError, ValueError):
             _DETECTION_CACHE[name] = {}
     return _DETECTION_CACHE[name]
+
+
+def pattern_catalog():
+    """Return the language-neutral declarative flow-pattern library.
+
+    Pattern definitions belong to Atropos alongside evaluator recipes and lifecycle
+    roles.  A missing catalog remains a valid empty result for older installations;
+    callers can then use their compatibility defaults.
+    """
+    return detection("flow-patterns").get("patterns", [])
+
+
+def flow_pattern_id(matcher_pattern, family=None):
+    """Resolve an engine finding to Atropos's public flow-pattern identifier.
+
+    The engine keeps its compact evaluator/lifetime names for compatibility, while
+    Atropos owns the user-facing taxonomy.  Family constraints prevent a generic
+    evaluator such as ``relational`` from being mislabelled across sink classes.
+    """
+    for entry in pattern_catalog():
+        matcher = entry.get("matcher") or {}
+        if matcher.get("pattern") != matcher_pattern:
+            continue
+        families = matcher.get("families") or []
+        if families and family not in families:
+            continue
+        return entry.get("id")
+    return None
+
+
+def flow_pattern_evaluator(matcher_pattern, family=None):
+    """Resolve the executable evaluator class for a graph-pattern finding."""
+    for entry in pattern_catalog():
+        matcher = entry.get("matcher") or {}
+        if matcher.get("pattern") != matcher_pattern:
+            continue
+        families = matcher.get("families") or []
+        if families and family not in families:
+            continue
+        return entry.get("evaluator")
+    return None
+
+
+def evaluator_catalog():
+    """Return the Atropos evaluator vocabulary and kind routing table."""
+    return detection("evaluators")
+
+
+def event_evaluator(event_kind):
+    """Return the evaluator recipe for a semantic skeleton event.
+
+    Sink ``kind_evaluator`` routing remains for single-node observations.  Lifecycle
+    events are a separate axis: their meaning depends on ordering, identity, guards,
+    call/return context, and allocation generation, so the temporal graph matcher owns
+    the evaluation.  Atropos still owns the vocabulary and declares which events enter
+    that evaluator.
+    """
+    catalog = evaluator_catalog()
+    return (catalog.get("event_evaluator") or {}).get(event_kind)
 
 
 def sink_catalog(lang):

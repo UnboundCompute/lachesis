@@ -227,9 +227,10 @@ class _Ctx:
     def candidate_bundle(self):
         """The catalog-stamped graph and its cached obligation registry.
 
-        Candidate enumeration binds catalog facts against the core symbol index. It
-        deliberately does not build value flow or judge the resulting sites; the AI
-        chooses follow-up graph tools for candidates it wants to investigate.
+        Candidate enumeration binds catalog facts against the core symbol index and
+        also publishes the cached semantic skeleton to temporal constructors.  The
+        constructors still emit observations, never verdicts; the graph matcher
+        remains the authority for proving a lifecycle relation.
         """
         def build():
             from lachesis.integrations.atropos.enrich import atropos_enrich
@@ -238,6 +239,33 @@ class _Ctx:
 
             graph = materialize_graph(self.store.index)
             stamped, summary = atropos_enrich(graph, complete_dataflow=False)
+            # Temporal candidate families observe semantic operations (release,
+            # origin, dereference, and so on), which do not exist as catalog role
+            # nodes in the base CPG.  Reuse the same cached Pass 3 graph exposed
+            # by flow_pass instead of creating a second traversal or teaching the
+            # candidate registry a language-specific lifecycle extractor.
+            from lachesis.flow.pipeline import run_pass
+            from lachesis.planner.temporal_obligation import merge_semantic_nodes
+            semantic_nodes = {}
+            semantic_coverages = []
+            for language in summary.get("languages") or ("c",):
+                flow = (self.flow_bundle if language == "c" else
+                        run_pass(self.store, lang=language, lifetime_engine="object"))
+                semantic = flow.get("semantic_graph")
+                if semantic is not None:
+                    merge_semantic_nodes(semantic_nodes, semantic, language)
+                    semantic_coverages.append(dict(semantic.coverage or {}))
+            if semantic_nodes:
+                stamped["semantic_graph"] = {"nodes": semantic_nodes}
+                if semantic_coverages:
+                    stamped["semantic_graph"]["coverage"] = {
+                        "converged": all(item.get("converged", True)
+                                          for item in semantic_coverages),
+                        "uncovered_states": [state for item in semantic_coverages
+                                             for state in item.get("uncovered_states", ())],
+                        "uncovered_contexts": [context for item in semantic_coverages
+                                               for context in item.get("uncovered_contexts", ())],
+                    }
             return {
                 "registry": default_candidate_registry(stamped, summary),
                 "stamped": stamped,
@@ -407,21 +435,28 @@ TOOLS = [
                              "description": "per-build compile timeout; raise for large trees"}},
          "required": ["source"]}},
     {"name": "unknowns",
-     "description": "Explicit comprehension frontiers: unresolved calls, dynamic runtime "
-                    "behavior, and parser/compiler diagnostics. Distinguishes proven-absent "
-                    "from couldn't-cross instead of silently treating missing graph facts as none.",
+     "description": "Read-only. List the graph's explicit comprehension frontiers: unresolved calls, "
+                    "dynamic/reflective runtime behavior, and parser/compiler diagnostics. It "
+                    "separates proven-absent from couldn't-cross, so you never read a missing fact as "
+                    "'none'. Call it to gauge how much of an answer is trustworthy; scope to one "
+                    "`function` or survey the whole graph.",
      "inputSchema": {"type": "object", "properties": {
-         "function": {"type": "string", "description": "optional function name or node id"},
-         "limit": {"type": "integer", "default": 100},
-         "offset": {"type": "integer", "default": 0}}}},
+         "function": {"type": "string",
+                      "description": "optional function name or node id to scope frontiers to"},
+         "limit": {"type": "integer", "default": 100, "description": "maximum rows returned"},
+         "offset": {"type": "integer", "default": 0, "description": "row offset for paging"}}}},
     {"name": "coverage_map",
-     "description": "Deterministic indexed-graph coverage by component: files, callable bodies, "
-                    "diagnostics, and unmodeled frontiers. This reports graph coverage, not mutable "
-                    "per-client session activity.",
+     "description": "Read-only. Report deterministic graph coverage by component: how many files and "
+                    "callable bodies are indexed, plus diagnostics and unmodeled frontiers. It "
+                    "measures what the graph contains, not per-client session activity — use it to "
+                    "decide whether an empty result means 'clean' or 'not analyzed'. All params "
+                    "optional.",
      "inputSchema": {"type": "object", "properties": {
-         "component_depth": {"type": "integer", "default": 1},
-         "limit": {"type": "integer", "default": 100},
-         "offset": {"type": "integer", "default": 0}}}},
+         "component_depth": {"type": "integer", "default": 1,
+                             "description": "path-prefix depth used to group files into components"},
+         "limit": {"type": "integer", "default": 100,
+                   "description": "maximum component rows returned"},
+         "offset": {"type": "integer", "default": 0, "description": "row offset for paging"}}}},
     {"name": "field_history",
      "description": "For a field/property, list graph-evidenced initialization, modification, "
                     "reads, checks, and value-flow events with owning functions.",
@@ -440,20 +475,30 @@ TOOLS = [
          "call_offset": {"type": "integer", "default": 0}},
          "required": ["symbol"]}},
     {"name": "type_explain",
-     "description": "Explain a type from graph facts: fields and constructor, mutator, consumer, "
-                    "and destructor method roles.",
+     "description": "Read-only. Explain a type from graph facts: its fields plus the methods that "
+                    "construct, mutate, consume, or destroy it, each role graph-derived. Use it to "
+                    "learn a struct/class's shape and how it is handled before reading call sites. "
+                    "Paginate fields with offset and methods with member_offset.",
      "inputSchema": {"type": "object", "properties": {
-         "type": {"type": "string"}, "limit": {"type": "integer", "default": 100},
-         "offset": {"type": "integer", "default": 0},
-         "member_offset": {"type": "integer", "default": 0}},
+         "type": {"type": "string", "description": "type name or graph node id"},
+         "limit": {"type": "integer", "default": 100, "description": "maximum rows returned"},
+         "offset": {"type": "integer", "default": 0, "description": "field offset for paging"},
+         "member_offset": {"type": "integer", "default": 0,
+                           "description": "method/member offset for paging"}},
          "required": ["type"]}},
     {"name": "component_boundary",
-     "description": "Show calls, callbacks, and type references crossing between two path "
-                    "components, in both directions, with confidence and source locations.",
+     "description": "Read-only. Show every call, callback, and type reference crossing between two "
+                    "path components, in both directions, with confidence and file:line. Use it to "
+                    "audit the contract between two modules/dirs; `cross_boundary_paths` adds rarity "
+                    "ranking over the same crossings. Components are path prefixes (e.g. src/net vs "
+                    "src/crypto).",
      "inputSchema": {"type": "object", "properties": {
-         "from_component": {"type": "string"}, "to_component": {"type": "string"},
-         "limit": {"type": "integer", "default": 100},
-         "offset": {"type": "integer", "default": 0}},
+         "from_component": {"type": "string",
+                            "description": "source component: a path prefix (e.g. src/net)"},
+         "to_component": {"type": "string",
+                          "description": "destination component: a path prefix (e.g. src/crypto)"},
+         "limit": {"type": "integer", "default": 100, "description": "maximum crossing rows returned"},
+         "offset": {"type": "integer", "default": 0, "description": "row offset for paging"}},
          "required": ["from_component", "to_component"]}},
     {"name": "indirect_targets",
      "description": "Resolve function-pointer, callback, ops-table, and runtime dispatch sites "
@@ -464,31 +509,49 @@ TOOLS = [
          "target_offset": {"type": "integer", "default": 0}},
          "required": ["function"]}},
     {"name": "architecture_map",
-     "description": "Deterministic file communities over the call + dependency graph, with "
-                    "internal/boundary edge counts and call-graph hubs. Returns no generated labels.",
+     "description": "Read-only. Map the codebase's architecture: deterministic file communities over "
+                    "the call + dependency graph, each with internal/boundary edge counts and its "
+                    "call-graph hubs (labels are graph-derived member names, never generated prose). "
+                    "A directory-independent 'what are the big pieces' view — use `communities` for "
+                    "function-level subsystems and `hubs` for the central functions. All params "
+                    "optional; paginate communities with offset and files with file_offset.",
      "inputSchema": {"type": "object", "properties": {
-         "component_depth": {"type": "integer", "default": 2},
-         "max_communities": {"type": "integer", "default": 30},
-         "max_files_per_community": {"type": "integer", "default": 50},
-         "offset": {"type": "integer", "default": 0},
-         "file_offset": {"type": "integer", "default": 0}}}},
+         "component_depth": {"type": "integer", "default": 2,
+                             "description": "path-prefix depth used to group files into components"},
+         "max_communities": {"type": "integer", "default": 30,
+                             "description": "maximum communities returned"},
+         "max_files_per_community": {"type": "integer", "default": 50,
+                                     "description": "maximum files listed per community"},
+         "offset": {"type": "integer", "default": 0, "description": "community offset for paging"},
+         "file_offset": {"type": "integer", "default": 0,
+                         "description": "file offset within each community for paging"}}}},
     {"name": "execution_story",
-     "description": "Bounded forward call-and-branch trace from an entry point, including resolved "
-                    "indirect dispatch. Returns graph structure, not generated narrative prose.",
+     "description": "Read-only. Bounded forward call-and-branch trace from an entry point, following "
+                    "resolved indirect dispatch — the ordered structure of what runs, not generated "
+                    "narrative prose. Use it to see the control skeleton reachable from an entry; "
+                    "bound cost with max_depth/max_steps and page the branches/frontier. For pure "
+                    "centrality use `hubs` instead.",
      "inputSchema": {"type": "object", "properties": {
-         "entry": {"type": "string"}, "max_depth": {"type": "integer", "default": 5},
-         "max_steps": {"type": "integer", "default": 100},
-         "offset": {"type": "integer", "default": 0},
-         "branch_limit": {"type": "integer", "default": 20},
-         "branch_offset": {"type": "integer", "default": 0},
-         "frontier_offset": {"type": "integer", "default": 0}},
+         "entry": {"type": "string", "description": "entry-point function name or node id"},
+         "max_depth": {"type": "integer", "default": 5, "description": "maximum call depth to trace"},
+         "max_steps": {"type": "integer", "default": 100,
+                       "description": "maximum total steps before truncating"},
+         "offset": {"type": "integer", "default": 0, "description": "step offset for paging"},
+         "branch_limit": {"type": "integer", "default": 20,
+                          "description": "maximum branches recorded per node"},
+         "branch_offset": {"type": "integer", "default": 0, "description": "branch offset for paging"},
+         "frontier_offset": {"type": "integer", "default": 0,
+                             "description": "offset into the unresolved-frontier list for paging"}},
          "required": ["entry"]}},
     {"name": "change_context",
-     "description": "Join a symbol to its Git history: exact commits, authors, dates, and subjects. "
-                    "Returns history facts and does not generate a why narrative.",
+     "description": "Read-only. Join a symbol to its Git history: the exact commits that touched it "
+                    "with author, date, and subject. Returns history facts only — no generated 'why' "
+                    "narrative. Use it to date a change or find who last touched a function; newest "
+                    "first, paged with limit/offset.",
      "inputSchema": {"type": "object", "properties": {
-         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 12},
-         "offset": {"type": "integer", "default": 0}},
+         "symbol": {"type": "string", "description": "symbol name or graph node id"},
+         "limit": {"type": "integer", "default": 12, "description": "maximum commits returned"},
+         "offset": {"type": "integer", "default": 0, "description": "commit offset for paging"}},
          "required": ["symbol"]}},
     {"name": "tests_for",
      "description": "Find exact references to a symbol in test/spec files, including nearby "
@@ -499,11 +562,15 @@ TOOLS = [
          "offset": {"type": "integer", "default": 0}},
          "required": ["symbol"]}},
     {"name": "spec_links",
-     "description": "Link a symbol to documentation and source comments, preserving any standards "
-                    "URLs and exact file:line evidence.",
+     "description": "Read-only. Link a symbol to its documentation and source comments, preserving "
+                    "any standards URLs (RFCs, CVEs) and exact file:line evidence. Use it to recover "
+                    "the spec/standard a function implements; returns comment/doc references paged "
+                    "with limit/offset. Reads recorded source, so it works even where comments are "
+                    "outside the production graph.",
      "inputSchema": {"type": "object", "properties": {
-         "symbol": {"type": "string"}, "limit": {"type": "integer", "default": 50},
-         "offset": {"type": "integer", "default": 0}},
+         "symbol": {"type": "string", "description": "symbol name or graph node id"},
+         "limit": {"type": "integer", "default": 50, "description": "maximum reference rows returned"},
+         "offset": {"type": "integer", "default": 0, "description": "row offset for paging"}},
          "required": ["symbol"]}},
     {"name": "context_pack",
      "description": "Return a minimal coherent factual set for a code question: relevant symbols, "
@@ -559,16 +626,26 @@ TOOLS = [
          "limit": {"type": "integer", "default": 20}},
          "required": ["src", "sink", "validator"]}},
     {"name": "invariant_trace",
-     "description": "Trace graph-evidenced producers, mutators, checkers, and consumers "
-                    "of a value or field over a bounded local flow cone.",
+     "description": "Read-only. Trace the producers, mutators, checkers, and consumers of a value or "
+                    "field over a bounded local flow cone — who sets it, who guards it, who reads it. "
+                    "Use it to reconstruct an invariant around one value; returns role-tagged nodes "
+                    "with file:line, bounded by `depth`. Local, not interprocedural — use `flow` / "
+                    "`sources_of` to cross call seams.",
      "inputSchema": {"type": "object", "properties": {
-         "value": {"type": "string"}, "limit": {"type": "integer", "default": 100},
-         "depth": {"type": "integer", "default": 4}}, "required": ["value"]}},
+         "value": {"type": "string", "description": "value or field name / graph node id to trace"},
+         "limit": {"type": "integer", "default": 100, "description": "maximum event rows returned"},
+         "depth": {"type": "integer", "default": 4,
+                   "description": "how many flow hops out from the value to walk"}},
+         "required": ["value"]}},
     {"name": "representation_roundtrip",
-     "description": "Compare two named paths/functions for graph-visible calls, controls, "
-                    "conversions, and side-effect differences. No semantic verdict is inferred.",
+     "description": "Read-only. Compare two functions/paths side by side for graph-visible calls, "
+                    "control structure, conversions, and side-effect differences — e.g. an "
+                    "encode/decode or serialize/parse pair. Returns the differences as facts only, "
+                    "inferring no semantic verdict. Use `sibling_compare` for auto-discovered "
+                    "structural peers, this for a deliberate two-sided pairing.",
      "inputSchema": {"type": "object", "properties": {
-         "left": {"type": "string"}, "right": {"type": "string"}},
+         "left": {"type": "string", "description": "first function/path name or node id"},
+         "right": {"type": "string", "description": "second function/path name or node id"}},
          "required": ["left", "right"]}},
     {"name": "cross_boundary_paths",
      "description": "List crossings between two components with boundary tags and rarity "
@@ -579,24 +656,38 @@ TOOLS = [
          "offset": {"type": "integer", "default": 0}},
          "required": ["from_component", "to_component"]}},
     {"name": "range_analysis",
-     "description": "Return lightweight numeric evidence when graph guards expose it. "
-                    "Full value-range analysis is explicitly unavailable until the numeric "
-                    "model is present; the response reports that frontier honestly.",
+     "description": "Read-only. Return the lightweight numeric evidence graph guards expose for a "
+                    "value (comparisons, bounds checks) — not a full interval solve: real "
+                    "value-range analysis stays unavailable until the numeric model ships, and the "
+                    "response names that frontier honestly. Scope with `value` and/or `function`; "
+                    "omit both for the capability report.",
      "inputSchema": {"type": "object", "properties": {
-         "value": {"type": "string"}, "function": {"type": "string"},
-         "limit": {"type": "integer", "default": 50}}}},
+         "value": {"type": "string", "description": "value name or graph node id to bound"},
+         "function": {"type": "string", "description": "function name/id to scope the search to"},
+         "limit": {"type": "integer", "default": 50,
+                   "description": "maximum evidence rows returned"}}}},
     {"name": "object_lifecycle",
-     "description": "Report lifecycle analysis capability and graph constructors. Full "
-                    "created-to-released state machines remain blocked until free/deref "
-                    "constructors are emitted.",
+     "description": "Read-only. Report what lifecycle evidence the graph holds for a value or "
+                    "function — Pass 3 alloc/release/deref/alias/generation events and its "
+                    "source-rooted coverage — plus the matcher leads that relate them. "
+                    "Give `value` or `function` to scope it; omit both for the capability report. "
+                    "Prefer `field_history` for one field's events and `flow_pass` for the composed "
+                    "interprocedural summary.",
      "inputSchema": {"type": "object", "properties": {
-         "value": {"type": "string"}, "function": {"type": "string"}}}},
+         "value": {"type": "string",
+                   "description": "value name or graph node id to scope lifecycle evidence to"},
+         "function": {"type": "string",
+                      "description": "function name or node id to scope lifecycle evidence to"}}}},
     {"name": "error_path_summary",
-     "description": "Report exit-path evidence and lifecycle-analysis frontiers. Complete "
-                    "transfer/release summaries remain blocked until free/deref constructors "
-                    "are emitted.",
+     "description": "Read-only. For one function, report its exit paths (returns / error branches) "
+                    "and the resource-handling evidence on them, plus the honest frontier: complete "
+                    "transfer summaries remain a separate frontier from the lifecycle graph. Use "
+                    "it to see how a function leaves on its error paths; pair with `guards` and "
+                    "`flow_pass` for the interprocedural picture.",
      "inputSchema": {"type": "object", "properties": {
-         "function": {"type": "string"}, "limit": {"type": "integer", "default": 100}},
+         "function": {"type": "string", "description": "function name or node id to summarize"},
+         "limit": {"type": "integer", "default": 100,
+                   "description": "maximum exit-path rows returned"}},
          "required": ["function"]}},
     {"name": "concept_search",
      "description": "Search code by behavior rather than spelling using an optional local "
@@ -685,35 +776,63 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "file": {"type": "string"}}, "required": ["file"]}},
     {"name": "open_folder",
-     "description": "L0 folder graph rooted at a path prefix: folder->file->declarations.",
+     "description": "Read-only. L0 folder graph rooted at a path prefix: folder -> file -> "
+                    "declarations. The coarsest orientation move — use it to see what lives under a "
+                    "directory before drilling in with `open_file` (one file's graph) or `read_body` "
+                    "(one function's source). Returns a {nodes, edges, manifest} graph.",
      "inputSchema": {"type": "object", "properties": {
-         "root": {"type": "string"}}, "required": ["root"]}},
+         "root": {"type": "string",
+                  "description": "repo-relative path prefix to root the folder graph at"}},
+         "required": ["root"]}},
     {"name": "flow",
-     "description": "Forward value-flow cone from a value/symbol: everything it reaches over "
-                    "VALUE_FLOWS_TO + POINTS_TO (with alias-via-heap bridging). path_shape.",
+     "description": "Read-only. Forward value-flow cone from a value/symbol: everything it can reach "
+                    "over VALUE_FLOWS_TO + POINTS_TO, bridging aliases through the heap. Use it to "
+                    "answer 'where does this value go?'; for the reverse (what feeds a sink) use "
+                    "`sources_of`, and for a yes/no witness between two points use `reaches`. Returns "
+                    "labeled nodes/edges; a missing path is over-approximation-safe, not proof of "
+                    "none.",
      "inputSchema": {"type": "object", "properties": {
-         "seed": {"type": "string"}, "limit": {"type": "integer", "default": 200}},
+         "seed": {"type": "string", "description": "value/symbol name or graph node id to flow from"},
+         "limit": {"type": "integer", "default": 200, "description": "maximum nodes returned"}},
          "required": ["seed"]}},
     {"name": "reaches",
-     "description": "Does src reach sink through value flow? Returns the labeled witness path or a "
-                    "negative answer. src/sink may be node ids or names.",
+     "description": "Read-only. Does src reach sink through value flow? Returns the labeled witness "
+                    "path when it does, or an honest negative when it doesn't (a negative under "
+                    "truncation is not proof of no path). Use it to confirm one specific "
+                    "source->sink pair; use `flow`/`sources_of` to explore a whole cone. NOTE: it "
+                    "follows VALUE_FLOWS_TO/POINTS_TO, a different edge set than `taint`, so "
+                    "adjudicate taint witnesses from their own `path`.",
      "inputSchema": {"type": "object", "properties": {
-         "src": {"type": "string"}, "sink": {"type": "string"}},
+         "src": {"type": "string", "description": "source value name or graph node id"},
+         "sink": {"type": "string", "description": "sink value name or graph node id"}},
          "required": ["src", "sink"]}},
     {"name": "sources_of",
-     "description": "Reverse value-flow cone: which values can feed this sink. path_shape.",
+     "description": "Read-only reverse value-flow cone for a sink. Use this after a candidate "
+                    "or sink is selected to find values that may feed it; it returns labeled "
+                    "nodes and edges plus explicit truncation/frontier metadata. A missing path "
+                    "is not proof that no flow exists.",
      "inputSchema": {"type": "object", "properties": {
-         "sink": {"type": "string"}, "limit": {"type": "integer", "default": 200}},
+         "sink": {"type": "string", "description": "sink name or graph node id"},
+         "limit": {"type": "integer", "default": 200, "description": "maximum rows returned"}},
          "required": ["sink"]}},
     {"name": "points_to",
-     "description": "Heap objects a value points to (POINTS_TO). path_shape.",
+     "description": "Read-only. Return the heap objects a value may point to through POINTS_TO "
+                    "edges — the alias set behind a pointer. Use it for pointer/alias follow-up, not "
+                    "for callers (`callers`) or value-flow (`flow`/`reaches`). Returns the "
+                    "pointed-to objects with path evidence plus explicit unknowns; a missing edge is "
+                    "over-approximation-safe, not proof the pointer is null.",
      "inputSchema": {"type": "object", "properties": {
-         "value": {"type": "string"}}, "required": ["value"]}},
+         "value": {"type": "string", "description": "value name or graph node id"}},
+         "required": ["value"]}},
     {"name": "aliases",
-     "description": "Values that alias this one (share a heap-object via POINTS_TO) — the "
-                    "destructuring/alias set. path_shape.",
+     "description": "Read-only. Return the values that alias this one — those sharing a heap object "
+                    "through POINTS_TO (the destructuring / alias set). Use it to find every name for "
+                    "the same object before reasoning about a mutation; complements `points_to` "
+                    "(objects a value points to) and `flow` (where a value goes). Response carries "
+                    "the alias set with path evidence.",
      "inputSchema": {"type": "object", "properties": {
-         "value": {"type": "string"}}, "required": ["value"]}},
+         "value": {"type": "string", "description": "value name or graph node id"}},
+         "required": ["value"]}},
     {"name": "guards",
      "description": "Derived guard profile of a function (Fix 2): score, class "
                     "(guard|validate|passthrough), and the raw CONDITION/short-circuit/throw counts.",
@@ -877,6 +996,44 @@ def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
 def _capability_blocked(name, reason, prerequisite):
     return {"move": name, "supported": False, "status": "blocked",
             "reason": reason, "prerequisite": prerequisite}
+
+
+def _semantic_lifecycle_report(c, args):
+    """Expose Pass 3 lifecycle evidence without introducing a second matcher."""
+    bundle = c.flow_bundle
+    semantic = bundle.get("semantic_graph")
+    if semantic is None:
+        return _capability_blocked("object_lifecycle", "no semantic graph was produced",
+                                   "Pass 3 semantic graph")
+    payload = semantic.to_dict()
+    raw_nodes = payload.get("nodes") or {}
+    nodes = ([{"id": node_id, **(node or {})} for node_id, node in raw_nodes.items()]
+             if isinstance(raw_nodes, dict) else list(raw_nodes))
+    value, function = args.get("value"), args.get("function")
+    lifecycle = {"alloc_attempt", "origin", "release", "invalidate", "read_storage",
+                 "write_storage", "write_storage_null", "use", "escape", "derive",
+                 "uninitialized", "realloc_attempt", "realloc_failed", "lost_from_slot"}
+    events = []
+    for node in nodes:
+        props, event = node.get("properties") or {}, node.get("event") or {}
+        kind = str(props.get("event_kind") or event.get("kind") or "").lower()
+        kind = kind.removeprefix("eventkind.")
+        obj = props.get("object_id") or props.get("target_id") or props.get("obj") or event.get("obj")
+        owner = props.get("owner_function_id") or node.get("fragment") or props.get("function")
+        if kind not in lifecycle:
+            continue
+        if value and value not in {str(obj), str(node.get("label")), str(node.get("id"))}:
+            continue
+        if function and function not in {str(owner), str(props.get("owner_function")), str(node.get("fragment"))}:
+            continue
+        events.append({"node": node.get("id"), "kind": kind, "object": obj,
+                       "function": owner, "line": props.get("line") or event.get("line"),
+                       "label": node.get("label")})
+    events.sort(key=lambda item: (item.get("function") or "", item.get("line") or 0,
+                                  item["node"] or ""))
+    return {"move": "object_lifecycle", "supported": True, "status": "available",
+            "events": events, "count": len(events), "coverage": bundle.get("coverage"),
+            "lifetime": bundle.get("lifetime", {})}
 
 
 def _wrapper_model(store, token, limit=50):
@@ -1190,9 +1347,7 @@ def call_tool(name, args, format=None):
             name, "numeric range constraints are not emitted by the current graph",
             "local numeric model"), fmt, offset, limit)
     if name == "object_lifecycle":
-        return _emit(name, _capability_blocked(
-            name, "lifecycle constructors are not yet emitted",
-            "memory.free and memory.deref constructors"), fmt, offset, limit)
+        return _emit(name, _semantic_lifecycle_report(c, args), fmt, offset, limit)
     if name == "error_path_summary":
         return _emit(name, _capability_blocked(
             name, "release/transfer events are not yet emitted on exits",

@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from time import perf_counter
 from typing import Iterable
@@ -29,6 +29,7 @@ from .object_state import (
     OpKind,
     Operation,
     ParamEffect,
+    ReturnEffect,
 )
 from .order import build_order
 
@@ -132,13 +133,52 @@ def _rhs_kind(sub, ap_builder, norm, rhs):
     rhs = _peel(sub, rhs)
     if rhs is None:
         return OpKind.CLOBBER, None, False
+    if sub.kind(rhs) == "ConditionalOperator":
+        # A common ownership idiom stores a field or alias on the non-null arm
+        # and NULL on the other arm.  Preserve the value-producing arm as a
+        # COPY fact; treating the whole conditional as an opaque clobber loses
+        # the alias relation before any interprocedural matcher can use it.
+        # Do not infer the arm from child position: Clang's child ordering puts
+        # the condition between the true and false expressions for some
+        # conditional forms.  The typed TRUE_VALUE role is the stable semantic
+        # boundary and preserves nested field paths such as `n->meta->name`.
+        candidates = tuple(_roles(sub, rhs).get("TRUE_VALUE", ()))
+        if not candidates:
+            children = sub.ast_children.get(rhs, ())
+            candidates = tuple(children[1:])
+        for candidate in candidates:
+            source = _path(ap_builder, candidate)
+            if source is not None:
+                return OpKind.COPY, source, False
+        children = sub.ast_children.get(rhs, ())
+        return OpKind.CLOBBER, None, any(_is_null(sub, child) for child in children[1:])
     if sub.is_call(rhs):
-        return ((OpKind.ALLOC, None, False) if norm.is_alloc(_callee(sub, rhs))
+        callee = _callee(sub, rhs)
+        # realloc BEFORE alloc: it frees the old block its first argument names (source)
+        # and returns a fresh one bound to the target. The engine's REALLOC op carries
+        # both halves, so an interior pointer not rebased to the result dangles.
+        if norm.is_realloc(callee):
+            return OpKind.REALLOC, _argument_path(sub, ap_builder, rhs, 0), False
+        return ((OpKind.ALLOC, None, False) if norm.is_alloc(callee)
                 else (OpKind.CLOBBER, None, False))
     source = _path(ap_builder, rhs)
     if source is not None:
         return OpKind.COPY, source, False
     return OpKind.CLOBBER, None, _is_null(sub, rhs)
+
+
+def _pointer_arithmetic_source(sub, ap_builder, rhs):
+    """Return the pointer base of a declaration initialized by pointer arithmetic."""
+    expression = _peel(sub, rhs)
+    if expression is None or sub.kind(expression) != "BinaryOperator":
+        return None
+    if (sub.operator(expression) or "") not in {"+", "-"}:
+        return None
+    for child in sub.ast_children.get(expression, ()):
+        path = _path(ap_builder, child)
+        if path is not None:
+            return path
+    return None
 
 
 def _initializer(sub, declaration):
@@ -187,9 +227,83 @@ def _is_unevaluated(sub, node):
     return False
 
 
+def _is_pointer_comparison(sub, node):
+    """Whether a binary expression observes pointer values without dereferencing."""
+    if sub.kind(node) != "BinaryOperator":
+        return False
+    operator = sub.operator(node) or ""
+    return operator in {"==", "!=", "<", "<=", ">", ">="}
+
+
 def _argument_path(sub, ap_builder, call_node, position):
     argument = sub.role_child_at(call_node, "ARGUMENT", position)
     return _path(ap_builder, argument)
+
+
+def _receiver_path(sub, ap_builder, call_node):
+    """Resolve a method receiver as an object access path.
+
+    C-style deallocators take the object in argument zero, but managed and
+    C++-style release operations can put ownership on the receiver
+    (``handle.close()`` / ``owner.reset()``). The graph overlay records that
+    receiver independently of positional arguments.
+    """
+    props = sub.props(call_node)
+    receiver = (props.get("receiver_value_id") or props.get("receiver_symbol_id")
+                or props.get("receiver_id"))
+    if receiver is not None:
+        path = _path(ap_builder, _peel(sub, receiver))
+        if path is not None:
+            return path
+    receiver_node = sub.role_child_at(call_node, "RECEIVER", 0)
+    return _path(ap_builder, _peel(sub, receiver_node))
+
+
+def _aggregate_type_key(type_name):
+    """Normalize frontend spelling for aggregate-field catalogue lookup."""
+    if not type_name:
+        return "<unknown>"
+    text = " ".join(str(type_name).split()).lower()
+    for qualifier in ("const ", "volatile ", "restrict ", "struct ",
+                      "class ", "union ", "enum "):
+        text = text.replace(qualifier, "")
+    return text.replace("*", "").strip() or "<unknown>"
+
+
+def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, ...], ...]:
+    """Collect field paths present in the program for bulk struct copies.
+
+    ``memcpy(dst, src, sizeof(T))`` has no field AST children of its own.  The
+    surrounding CPG still contains the member accesses used by constructors and
+    destructors, which gives us the field layout needed to materialize the
+    field-wise alias facts without teaching the matcher about memcpy.
+    """
+    cache = getattr(sub, "_aggregate_field_paths_cache", None)
+    if cache is None:
+        cache = defaultdict(set)
+        sub._aggregate_field_paths_cache = cache
+    for item in sub.idx.nodes_of_kind("expression"):
+        node = item.get("id") if isinstance(item, dict) else item
+        item_props = item.get("properties", {}) if isinstance(item, dict) else {}
+        item_kind = item_props.get("syntax_kind") or (item.get("kind") if isinstance(item, dict) else None)
+        if node is None or item_kind != "MemberExpr":
+            continue
+        path = _path(ap_builder, node)
+        # A bulk copy aliases the destination's direct fields.  Nested paths are
+        # recovered by following those field objects later; emitting every nested
+        # combination here causes avoidable state multiplication in summaries.
+        if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
+            root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
+            root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
+            cache[root_type].add(path.selectors)
+            cache[_aggregate_type_key(root_type)].add(path.selectors)
+    if type_key is None:
+        paths = set().union(*cache.values()) if cache else set()
+    else:
+        paths = (cache.get(type_key)
+                 or cache.get(_aggregate_type_key(type_key))
+                 or cache.get("<unknown>", set()))
+    return tuple(sorted(paths, key=repr))
 
 
 def _place(sub, cfg_nodes, anchor, fallback=None):
@@ -215,9 +329,10 @@ def _place(sub, cfg_nodes, anchor, fallback=None):
 
 
 def _op(kind, node, *, target=None, source=None, line=None, ordinal=0,
-        is_null=False, alternatives=()):
+        is_null=False, alternatives=(), access="deref"):
     return Operation(kind, node, target=target, source=source, site=node, line=line,
-                     ordinal=ordinal, is_null=is_null, alternatives=alternatives)
+                     ordinal=ordinal, is_null=is_null, alternatives=alternatives,
+                     access=access)
 
 
 def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
@@ -235,8 +350,10 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             line = _line(sub, node)
             base = _deref_base(sub, ap_builder, lhs)
             if base is not None and not _is_unevaluated(sub, lhs):
+                rhs_source = _path(ap_builder, rhs)
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
-                                      target=base, line=line, ordinal=0))
+                                      target=base, source=rhs_source, line=line, ordinal=0,
+                                      access="write"))
             # Only pointer-valued stores alter this lifetime environment. Scalar
             # ``*p = 0`` is a use of p, not a rebinding of p.
             if not _is_pointer(sub, lhs):
@@ -251,15 +368,50 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         elif sub.kind(node) == "VarDecl" and _is_pointer(sub, node):
             initializer = _initializer(sub, node)
             if initializer is None:
+                # Preserve an uninitialized pointer declaration as a semantic
+                # fact.  It is not an allocation or a NULL origin: the
+                # matcher must keep the indeterminate state until a
+                # path-compatible assignment initializes the slot.
+                target = AccessPath("decl:" + str(node))
+                operations.append(_op(
+                    OpKind.CLOBBER, _place(sub, cfg_nodes, node, node),
+                    target=target, line=_line(sub, node), ordinal=1,
+                    access="uninitialized"))
                 continue
             target = AccessPath("decl:" + str(node))
             kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, initializer)
             anchor = _place(sub, cfg_nodes, _peel(sub, initializer), node)
             operations.append(_op(kind, anchor, target=target, source=payload,
                                   line=_line(sub, node), ordinal=1, is_null=is_null))
+            arithmetic_source = _pointer_arithmetic_source(sub, ap_builder, initializer)
+            if arithmetic_source is not None:
+                # Preserve the derived pointer and its source object as a
+                # semantic fact. The lifetime engine may ignore this USE, but
+                # the reusable skeleton can match a later dereference against
+                # the derived pointer without reparsing the expression.
+                operations.append(_op(
+                    OpKind.USE, anchor, target=target, source=arithmetic_source,
+                    line=_line(sub, node), ordinal=2,
+                    access="pointer-arithmetic"))
 
     # A real memory read/write through an access expression uses its base object.
     for node in owned:
+        if _is_pointer_comparison(sub, node):
+            for child in sub.ast_children.get(node, ()):
+                path = _path(ap_builder, child)
+                if path is not None and _is_pointer(sub, child):
+                    operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
+                                          target=path, line=_line(sub, node), ordinal=1,
+                                          access="compare"))
+            continue
+        parent = sub.ast_parent.get(node)
+        if parent is not None and sub.is_plain_assign(parent):
+            lhs, _rhs = _assignment_operands(sub, parent)
+            if lhs is not None and _peel(sub, lhs) == _peel(sub, node):
+                # The assignment scan above emits the LHS as WRITE_STORAGE.  Do not
+                # duplicate it as a READ_STORAGE merely because the same access
+                # expression is also visited by the generic dereference scan.
+                continue
         base = _deref_base(sub, ap_builder, node)
         if base is not None and not _is_unevaluated(sub, node):
             operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, node), target=base,
@@ -272,11 +424,44 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         anchor = _place(sub, cfg_nodes, call_node)
         callee = call.get("callee")
         line = call.get("line")
-        if norm.is_dealloc(callee):
-            target = _argument_path(sub, ap_builder, call_node, 0)
+        # `is_release` is the language-neutral lifecycle predicate.  It includes
+        # C deallocators and the Atropos-managed method vocabulary (close,
+        # dispose, release, ...), so the object engine consumes the same
+        # catalogue-backed fact that the translator emits.
+        if norm.is_release(callee):
+            target = (_argument_path(sub, ap_builder, call_node, 0)
+                      or _receiver_path(sub, ap_builder, call_node))
             if target is not None:
                 operations.append(_op(OpKind.FREE, anchor, target=target,
                                       line=line, ordinal=20))
+            continue
+
+        if norm.is_aggregate_copy(callee, sub.label(call_node) or ""):
+            destination = _argument_path(sub, ap_builder, call_node, 0)
+            source = _argument_path(sub, ap_builder, call_node, 1)
+            if destination is not None and source is not None:
+                source_id = source.root[len("decl:"):] if source.root.startswith("decl:") else None
+                source_type = sub.props(source_id).get("type") if source_id else None
+                if source_type is None:
+                    # Access paths may retain the source-level declaration name
+                    # rather than its T2 id (notably parameters crossing a
+                    # frontend/macro boundary). Resolve that name within the
+                    # current function before falling back to the all-field
+                    # catalogue.
+                    source_type = next((
+                        sub.props(item.get("id")).get("type")
+                        for kind in ("parameter", "variable")
+                        for item in sub.idx.nodes_of_kind(kind)
+                        if item.get("label") == source.root
+                        and sub.props(item.get("id")).get("owner_function_id") == function_id
+                    ), None)
+                for selectors in _aggregate_field_paths(sub, ap_builder, source_type):
+                    operations.append(_op(
+                        OpKind.COPY, anchor,
+                        target=AccessPath(destination.root,
+                                          destination.selectors + selectors),
+                        source=AccessPath(source.root, source.selectors + selectors),
+                        line=line, ordinal=15 + len(operations), access="aggregate-copy"))
             continue
 
         callee_summary = summaries.get(callee)
@@ -285,6 +470,24 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
             for alternative in callee_summary:
                 effects = []
                 for effect in alternative:
+                    if isinstance(effect, ReturnEffect):
+                        assigned = call.get("assigned")
+                        if not assigned:
+                            continue
+                        destination = next((candidate for candidate in owned
+                                            if sub.kind(candidate) == "variable"
+                                            and sub.label(candidate) == assigned), None)
+                        receiver = (_path(ap_builder, destination)
+                                    if destination is not None else AccessPath(str(assigned)))
+                        actual = _argument_path(
+                            sub, ap_builder, call_node, effect.position)
+                        if receiver is None or actual is None:
+                            continue
+                        effects.append(_op(
+                            OpKind.COPY, anchor, target=receiver,
+                            source=_compose(actual, effect.selectors), line=line,
+                            ordinal=20 + len(effects), access="return-alias"))
+                        continue
                     actual = _argument_path(sub, ap_builder, call_node, effect.position)
                     if actual is None:
                         continue
@@ -297,6 +500,23 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                                       alternatives=tuple(alternatives)))
             continue
 
+        # External sources create a fresh value at their assigned destination.
+        # Keep this as an ORIGIN fact in the frozen graph; it is not an allocator
+        # attempt and must remain distinct from allocation failure semantics.
+        source_callees = {item.get("callee") for item in function_ir.get("source_calls", ())}
+        if callee in source_callees and call.get("assigned"):
+            assigned = call["assigned"]
+            destination = next((candidate for candidate in owned
+                                if sub.kind(candidate) == "variable" and
+                                sub.label(candidate) == assigned), None)
+            # `_assigned_var` is already the canonical display root.  Some
+            # frontends do not retain a variable node for a call-result edge,
+            # so do not require a declaration-node lookup here.
+            target = _path(ap_builder, destination) if destination is not None else AccessPath(str(assigned))
+            if target is not None:
+                operations.append(_op(OpKind.CLOBBER, anchor, target=target, line=line,
+                                      ordinal=5, access="source"))
+
         # Unknown callees may dereference pointer arguments. Lifecycle primitives are
         # modeled by their contracts above and allocator arguments are not pointee uses.
         if not norm.is_alloc(callee):
@@ -304,7 +524,8 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                 target = _argument_path(sub, ap_builder, call_node, argument.get("pos"))
                 if target is not None:
                     operations.append(_op(OpKind.USE, anchor, target=target, line=line,
-                                          ordinal=10 + int(argument.get("pos") or 0)))
+                                          ordinal=10 + int(argument.get("pos") or 0),
+                                          access="pass"))
 
     # Returning a freed pointer is the escape form of this family. Preserve the
     # existing public pattern name by representing the observation as USE for now.
@@ -312,10 +533,37 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
         if sub.kind(node) != "ReturnStmt":
             continue
         for child in sub.ast_children.get(node, ()):
-            target = _path(ap_builder, child)
+            # Return expressions are commonly wrapped in an implicit cast or
+            # parenthesized expression.  Resolve the value after peeling those
+            # transparent nodes, otherwise a returned heap object is omitted
+            # from the semantic RETURN_VALUE fact and is incorrectly reported
+            # as a leak at the fragment exit.
+            target = _path(ap_builder, _peel(sub, child))
             if target is not None:
+                root_id = target.root.removeprefix("decl:")
+                root_props = sub.props(root_id)
+                root_kind = sub.kind(root_id)
+                # A returned array decays to a pointer to its automatic
+                # storage.  Explicit address-of paths cover scalar/struct
+                # locals; heap-returning locals are deliberately excluded.
+                stack_local = (
+                    root_kind in {"variable", "VarDecl"}
+                    and root_props.get("owner_function_id") == function_id
+                    and ("[" in (root_props.get("type") or "")
+                         or "&" in target.selectors)
+                )
                 operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, child, node),
-                                      target=target, line=_line(sub, node), ordinal=30))
+                                      target=target, line=_line(sub, node), ordinal=30,
+                                      access="return-stack" if stack_local else "return"))
+            elif _is_null(sub, _peel(sub, child)):
+                # Preserve a NULL return as a path-local value.  The seam
+                # composer rebases this marker onto the caller's receiver so
+                # a later NONNULL guard cannot admit the failure arm.
+                operations.append(_op(
+                    OpKind.CLOBBER, _place(sub, cfg_nodes, child, node),
+                    target=AccessPath("__return__"),
+                    line=_line(sub, node), ordinal=30, access="return-null"))
+            if target is not None or _is_null(sub, _peel(sub, child)):
                 break
 
     # The same semantic event can be visible via the assignment scan and the generic
@@ -323,7 +571,7 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
     unique = {}
     for operation in operations:
         key = (operation.kind, operation.node, operation.target, operation.source,
-               operation.is_null, operation.alternatives)
+               operation.is_null, operation.alternatives, operation.access)
         unique[key] = operation
     return tuple(sorted(unique.values(), key=lambda item: (
         sub.offset(item.node) if item.node in owned else 0, item.ordinal, item.kind.value,
@@ -372,7 +620,7 @@ def _analyze_prepared(prepared):
     # Widening sooner makes them converge within budget; the join is an over-
     # approximation, so recall (uncapped functions) rises at a marginal precision cost,
     # which is the right trade for a finder (capping is a guaranteed false negative).
-    result = ObjectStateAnalyzer(max_disjuncts=32).analyze(
+    result = ObjectStateAnalyzer(max_disjuncts=32, collect_findings=False).analyze(
         nodes, successors, operations, initial=initial)
     alternatives = {state.trace for state in result.exit_states}
     return tuple(sorted(alternatives, key=repr)), result
@@ -436,6 +684,9 @@ class ObjectLifetimeResult:
     leads: tuple[dict, ...]
     summaries: dict[str, tuple[tuple[ParamEffect, ...], ...]]
     diagnostics: dict
+    # Per-function abstract-state snapshots are retained for semantic consumers;
+    # the summary API remains unchanged for callers that only need effects.
+    artifacts: dict[str, object] = field(default_factory=dict)
 
 
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None):
@@ -661,4 +912,4 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     diagnostics["unsafe_object_flow"] = unsafe_object_flow
     diagnostics["total_seconds"] = round(perf_counter() - started, 6)
 
-    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics)
+    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics, artifacts)

@@ -26,13 +26,13 @@ Contract reproduced (the record ``order.load`` used to return, one per defined U
 
 Drop-in: ``load_graph(path)`` mirrors ``order.load`` and returns ``(F, succ)``.
 
-Known gaps vs the old clang parser (honest, not silent):
-  * memory.deref use-events for a standalone dereference (``return buf[0]`` after a
-    free) are NOT emitted -- the reader does not stamp deref lifecycle nodes yet
-    (the tier-2 blocker). Uses that pass through a call ARE recovered by summarize.
-  * arg provenance is shallow: parameter / field / local / const, not the full
-    origin walk (n <- r.count <- param r). Guard presence -- the differential's
-    signal -- does not depend on it.
+Known limitations vs a full object-state analysis (honest, not silent):
+  * the compact F projection carries shallow provenance (parameter / field / local /
+    const), not the full origin walk (n <- r.count <- param r); the native semantic
+    graph receives richer declaration-rooted facts from the object substrate.
+  * the generic non-native backend preserves the lifecycle and sink facts available in
+    F, but does not invent frontend branch histories or heap aliases that were not
+    emitted by that frontend.
 """
 import argparse
 from collections import defaultdict
@@ -46,11 +46,20 @@ from lachesis.planner.unbounded_copy import BranchRegions
 
 from . import atropos
 from .normalize import normalizer
+from .source_discovery import discover_sources
+from .coverage import CoverageScheduler
 
 
 # --- small helpers ---------------------------------------------------------------
 def _props(node):
     return (node or {}).get("properties") or {}
+
+
+def _callee_name(node):
+    """Frontend-neutral call spelling, including receiver methods."""
+    p = _props(node)
+    return (p.get("callee") or p.get("callee_name") or p.get("method_name")
+            or node.get("label"))
 
 
 def _span(node):
@@ -159,6 +168,15 @@ def _assigned_var(ix, call_id):
                 continue
             if tn.get("kind") == "variable":
                 return tn.get("label")
+            # Call results can be assigned directly into a field or indexed
+            # slot (`s->request = make_buffer(...)`). Preserve that expression
+            # instead of discarding the receiver at the variable-only boundary;
+            # Claus needs it to transfer return values and NULL facts across the
+            # seam with field-sensitive identity.
+            if tn.get("kind") == "expression":
+                label = tn.get("label") or ""
+                if any(marker in label for marker in _SUBOBJECT):
+                    return label
             frontier.append((e["target"], d + 1))
     return None
 
@@ -181,6 +199,15 @@ def _freed_identity(arg):
     if expr and expr != root and root in expr and any(s in expr for s in _SUBOBJECT):
         return expr
     return root
+
+
+def _read_root(label, tracked):
+    """Recover the base object from a frontend read spelling."""
+    if not label:
+        return None
+    match = re.match(r"\s*(?:\*\s*)?([A-Za-z_]\w*)", str(label))
+    root = match.group(1) if match else None
+    return root if root in tracked else None
 
 
 def _arg_records(ix, call):
@@ -208,6 +235,32 @@ def _arg_records(ix, call):
     return out
 
 
+def _expanded_macro_size(call, args, macro_defs, callee):
+    """Recover an allocator's size expression when Clang lowered a macro call.
+
+    The frontend graph preserves the macro definition and the call's argument
+    values, but the lowered ``malloc`` node otherwise exposes only the final
+    parameter (for example ``count``).  Expanding the recorded declarative macro
+    body here keeps the fact language-neutral and avoids matching macro names or
+    fixture text in the detector.
+    """
+    name = str(call.get("label") or "").strip()
+    definition = macro_defs.get(name)
+    if not definition or callee not in str(definition.get("body") or ""):
+        return None
+    body = str(definition.get("body") or "")
+    parameters = tuple(definition.get("parameters") or ())
+    substitutions = {
+        parameter: str(args[index].get("expr") or args[index].get("value") or "")
+        for index, parameter in enumerate(parameters)
+        if index < len(args)
+    }
+    for parameter, replacement in substitutions.items():
+        body = re.sub(rf"\b{re.escape(parameter)}\b", replacement, body)
+    match = re.search(rf"\b{re.escape(callee)}\s*\((.*)\)", body)
+    return match.group(1).strip() if match else None
+
+
 def _guards_for(regions, fid, idents, span):
     """Guards active at a call site: {var, canon} for each arg-root a dominating
     size-testing branch names. Uses the same sound region-containment the reader's
@@ -226,6 +279,19 @@ def _guards_for(regions, fid, idents, span):
             seen.add((name, canon))
             out.append({"var": name, "canon": canon})
     return out
+
+
+def _guard_status_for(regions, fid, idents, span):
+    """Return the Atropos guard-dimension status without collapsing it to a bool.
+
+    ``guarded-region`` and ``fall-through`` are distinct semantic observations;
+    the latter is the missing-bounds shape.  Keeping the status beside the typed
+    guard list lets sink evaluators consume it without weakening lifetime/null
+    guard handling.
+    """
+    if not idents or span is None:
+        return "not-computed"
+    return regions.classify(fid, idents, span).get("status", "not-computed")
 
 
 def _returns(ix, fid, alloc_vars, params, norm):
@@ -263,28 +329,45 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     graph, so every downstream fact -- sink lookup, alloc/free events, summaries, skeletons --
     speaks one vocabulary. The graph node keeps its surface name; only this IR is rewritten."""
     fid = fnode["id"]
+    owned_nodes = ix.nodes_owned_by(fid)
+    body_node_count = sum(
+        1 for node in owned_nodes
+        if node.get("kind") not in {"cfg-entry", "cfg-exit", "cfg-merge", "cfg-condition"}
+    )
     params = [p.get("label") for p in _by_offset(ix.nodes_owned_by(fid, "parameter"))]
     param_set = set(params)
     calls, callees, events, assigns = [], [], [], []
+    macro_defs = {node.get("label"): _props(node)
+                  for node in ix.nodes_of_kind("macro") if node.get("label")}
 
-    for c in _by_offset(ix.nodes_owned_by(fid, "call")):
-        callee = norm.canon_callee(_props(c).get("callee"))
+    for c in _by_offset(ix.nodes_owned_by(fid, "call", "construct")):
+        callee = norm.canon_callee(_callee_name(c))
         if not callee:
             continue
         line = _stmt_line(c)
         callees.append(callee)
         args = _arg_records(ix, c)
+        cp = _props(c)
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
+        guard_status = _guard_status_for(regions, fid, idents, _span(c))
         cat = sinks.get(callee)
         # the variable this call's result is assigned to (any callee, not just allocators), so
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
         # wrapper's `returns=alloc` seeds an alloc, a freed-return's `returns_dangling` seeds a
         # free. `alloc_dst` is the is_alloc-gated subset used for the alloc event and sink dst.
         assigned = _assigned_var(ix, c["id"])
-        alloc_dst = assigned if norm.is_alloc(callee) else None
+        alloc_dst = assigned if norm.is_acquire(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
+               "guard_status": guard_status,
+               "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                "is_sink": cat is not None,
+               "assigned": assigned,
+               # Managed-language lifecycle methods place the resource on the
+               # receiver, not in an argument slot. Preserve that neutral
+               # identity for the semantic graph; C-style calls leave it absent.
+               "receiver": (cp.get("receiver") or cp.get("receiver_root")
+                            or cp.get("receiver_value")),
                "node": c["id"],                             # graph node = CFG anchor for events
                "control": nest.enclosing(c["id"])}          # loop/branch nesting, outer->inner
         if cat is not None:
@@ -294,6 +377,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             # compare an alloc's size against a copy's size on the same path
             sa = next((a for a in args if a.get("pos") == size_arg), None) if size_arg is not None else None
             rec["size_expr"] = sa.get("value") if sa else None
+            if norm.is_alloc(callee):
+                expanded = _expanded_macro_size(c, args, macro_defs, callee)
+                if expanded:
+                    rec["size_expr"] = expanded
             # the destination the sink writes/allocates -- the identity a two-node shape joins on
             # (alloc: the pointer the result is assigned to; copy/write: the first argument)
             rec["dst"] = alloc_dst if norm.is_alloc(callee) else (args[0].get("value") if args else None)
@@ -316,6 +403,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             callees.append(hcallee)
             hcat = sinks.get(hcallee)
             hrec = {"callee": hcallee, "line": line, "args": args, "guards": guards,
+                    "guard_status": guard_status,
+                    "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                     "is_sink": hcat is not None, "node": c["id"],
                     "control": rec["control"], "dispatch": "may-invoke"}
             if hcat is not None:
@@ -331,21 +420,138 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         if assigned:
             assigns.append({"var": assigned, "callee": callee, "line": line, "node": c["id"]})
         if alloc_dst:
-            events.append({"kind": "alloc", "var": alloc_dst, "line": line, "node": c["id"]})
-        if norm.is_dealloc(callee) and args and args[0]["root"]:
-            events.append({"kind": "free", "var": _freed_identity(args[0]), "line": line,
-                           "node": c["id"]})
+            events.append({"kind": "alloc", "family": ("memory.alloc" if norm.lang == "c"
+                           else "lifecycle.acquire"),
+                           "var": alloc_dst, "line": line, "node": c["id"]})
+        # realloc is a release of the old generation and an acquire of the returned
+        # generation.  Keep both facts in the structural stream; the matcher remains
+        # completely unaware of the concrete allocator spelling.
+        release_arg = args[0] if args and args[0].get("root") else None
+        if norm.is_release(callee) or norm.is_realloc(callee):
+            receiver_id = cp.get("receiver_value_id") or cp.get("receiver_symbol_id")
+            if release_arg is None and receiver_id:
+                receiver = ix.nodes.get(receiver_id) or {}
+                receiver_label = receiver.get("label") or cp.get("receiver")
+                if receiver_label:
+                    release_arg = {"root": receiver_label, "expr": receiver_label}
+            if release_arg is None or not release_arg.get("root"):
+                release_arg = None
+        if release_arg:
+            events.append({"kind": "free", "family": ("memory.free" if norm.lang == "c"
+                           else "lifecycle.release"),
+                           "var": _freed_identity(release_arg), "line": line,
+                           "node": c["id"], "callee": callee})
 
     alloc_vars = {a["var"] for a in assigns}
+    tracked_vars = set()
+    tracked_vars.update(a["var"] for a in assigns
+                        if norm.is_acquire(a.get("callee"))
+                        or a.get("callee") in atropos.source_catalog(norm.lang))
+    tracked_vars.update(e["var"] for e in events if e["kind"] in ("alloc", "free"))
+    # Explicit frontend release nodes (Python `del`/context exit) are also
+    # evidence that their target is a tracked resource.  Collect them before
+    # scanning reads so a subsequent member/index access is in scope.
+    for n in ix.nodes_owned_by(fid, "release"):
+        target = ix.nodes.get((_props(n)).get("target_id")) or {}
+        root = _read_root(target.get("label") or n.get("label"), set(params))
+        if root:
+            tracked_vars.add(root)
+    if norm.lang == "c":
+        for n in ix.nodes_owned_by(fid):
+            p = _props(n)
+            syntax = p.get("syntax_kind") or n.get("kind")
+            label = n.get("label") or ""
+            if syntax == "CXXDeleteExpr" or str(label).lstrip().startswith("delete"):
+                root = _read_root(label, set(params))
+                if root:
+                    tracked_vars.add(root)
+    # Expression-level reads are the structural use alphabet for all frontends.
+    # They are emitted only when the base is already tracked by an acquisition,
+    # release, or source; ordinary object/property reads never enter the stream.
+    for n in ix.nodes_owned_by(fid, "read", "body", "expression"):
+        p = _props(n)
+        syntax = p.get("syntax_kind") or n.get("kind")
+        label = n.get("label") or p.get("expression")
+        if syntax not in {"MemberExpr", "ArraySubscriptExpr", "UnaryOperator",
+                          "property-path", "read", "index", "member"}:
+            continue
+        root = _read_root(label, tracked_vars)
+        if root and any(mark in str(label) for mark in ("->", ".", "[", "*")):
+            events.append({"kind": "use", "family": ("memory.deref" if norm.lang == "c"
+                           else "lifecycle.use"), "var": root,
+                           "line": p.get("start_line"), "node": n.get("id")})
+    for n in ix.nodes_owned_by(fid, "release"):
+        p = _props(n)
+        target = ix.nodes.get(p.get("target_id")) or {}
+        root = _read_root(target.get("label") or n.get("label"), tracked_vars)
+        if root:
+            events.append({"kind": "free", "family": ("memory.free" if norm.lang == "c"
+                           else "lifecycle.release"), "var": root,
+                           "line": p.get("release_line") or p.get("start_line"),
+                           "node": n.get("id"),
+                           "callee": p.get("release_method")})
+    # Clang represents delete/delete[] as an expression rather than a call.
+    # It is still a catalogue release and must enter the same structural stream.
+    if norm.lang == "c":
+        for n in ix.nodes_owned_by(fid):
+            p = _props(n)
+            syntax = p.get("syntax_kind") or n.get("kind")
+            label = n.get("label") or ""
+            if syntax != "CXXDeleteExpr" and not str(label).lstrip().startswith("delete"):
+                continue
+            root = _read_root(label, tracked_vars)
+            if root:
+                events.append({"kind": "free", "family": "memory.free", "var": root,
+                               "line": p.get("start_line"), "node": n.get("id"),
+                               "callee": "delete"})
     returns = _returns(ix, fid, alloc_vars, param_set, norm)
     for r in returns:                             # a returned alloc'd local escapes
         if r.get("kind") == "var" and r.get("prov") == "alloc":
             events.append({"kind": "escape", "var": r["var"], "line": r.get("line")})
 
+    # Preserve the neutral control-flow overlay for consumers that do not have
+    # the C declaration-rooted object substrate.  The semantic graph can use
+    # these typed sibling edges without re-reading frontend-specific AST facts.
+    cfg_edge_kinds = ("CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK",
+                      "EXCEPTION_BRANCH", "SWITCH_CASE")
+    owned_ids = {node.get("id") for node in owned_nodes}
+    cfg_successors = defaultdict(list)
+    cfg_nodes = set()
+    for source in owned_ids:
+        for edge in ix.outgoing_of_kind(source, *cfg_edge_kinds):
+            target = edge.get("target")
+            if target not in owned_ids:
+                continue
+            kind = ix.semantic_edge_kind(edge) or edge.get("kind")
+            cfg_successors[source].append({
+                "target": target,
+                "kind": kind,
+                "predicate": ix.nodes.get(source, {}).get("label"),
+                "properties": edge.get("properties") or {},
+            })
+            cfg_nodes.update((source, target))
+    cfg = None
+    if cfg_nodes:
+        entries = [node.get("id") for node in owned_nodes
+                   if node.get("id") in cfg_nodes and node.get("kind") == "cfg-entry"]
+        cfg = {
+            "nodes": tuple(sorted(cfg_nodes)),
+            "entry": entries[0] if entries else None,
+            "succ": {source: tuple(sorted(edges, key=lambda item: (
+                item.get("kind") or "", item.get("target") or "")))
+                      for source, edges in cfg_successors.items()},
+        }
+
     return {"name": fnode.get("label"),
             "file": _props(fnode).get("file"), "line": _props(fnode).get("start_line"),
+            # Frontends with linkage metadata can distinguish an exported
+            # declaration from a file-local helper.  Missing metadata is treated
+            # as externally visible for non-C frontends, whose module/export
+            # rules are represented elsewhere in the graph.
+            "externally_visible": (_props(fnode).get("storage_class") != "static"),
             "params": params, "calls": calls, "events": events,
-            "assigns": assigns, "returns": returns, "callees": callees}
+            "assigns": assigns, "returns": returns, "callees": callees,
+            "body_node_count": body_node_count, "cfg": cfg}
 
 
 def build_F(store, lang="c", *, return_graph=False):
@@ -373,6 +579,7 @@ def build_F(store, lang="c", *, return_graph=False):
     sinks = atropos.sink_catalog(lang)
     sink_names = set(sinks)
     norm = normalizer(lang)                        # form oracle: canonicalize callee names
+    source_methods = set(atropos.source_catalog(lang))
 
     fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
     defined = {f.get("label") for f in fnodes if not _props(f).get("declaration_only")}
@@ -387,7 +594,7 @@ def build_F(store, lang="c", *, return_graph=False):
         recs[name] = _walk_function(ix, regions, nest, sinks, norm, f)
 
     def is_lifecycle_or_sink(c):
-        return c in sink_names or norm.is_alloc(c) or norm.is_dealloc(c)
+        return c in sink_names or norm.is_acquire(c) or norm.is_release(c) or norm.is_realloc(c)
 
     # Compute the transitive caller closure once.  The old implementation launched a
     # depth-first walk from every function, allocating a fresh ``seen`` set each time;
@@ -433,15 +640,78 @@ def build_F(store, lang="c", *, return_graph=False):
             taxo = "UDF"
         F[n] = {
             "name": n, "file": r["file"], "line": r["line"],
+            "externally_visible": r.get("externally_visible", True),
             "taxonomy": taxo, "is_source": len(callers[n]) == 0,
             "params": r["params"],
             "udf_callees": udf_callees, "ldf_callees": ldf_callees,
             "sink_ldf_callees": sink_ldf, "callers": sorted(callers[n]),
             "calls": r["calls"], "events": r["events"],
             "assigns": r["assigns"], "returns": r["returns"],
+            "body_node_count": r.get("body_node_count", 0),
+            # Pass-2 source facts are retained separately from reachability.  A
+            # callerless function is only a structural entry; an actual source call
+            # is the operation from which Claus should launch.
+            "source_calls": [
+                {"callee": call["callee"], "line": call.get("line"), "node": call.get("node"),
+                 "assigned": call.get("assigned"),
+                 "args": [arg.get("pos") for arg in call.get("args", ())]}
+                for call in r["calls"] if call.get("callee") in source_methods
+            ],
+            "source_reachable": bool(len(callers[n]) == 0 or
+                                      any(call.get("callee") in source_methods
+                                          for call in r["calls"])),
         }
 
     succ = {n: [c for c in F[n]["udf_callees"] if c in F] for n in F}
+    # A function-valued argument is an indirect call-graph edge even when the
+    # immediate callee is a callback formal (``callback(value)``). Preserve it
+    # in the generic successor relation so source discovery, coverage cones,
+    # object slicing, and Claus all include the eventual target. This relies on
+    # canonical function identities already present in F; no callback names or
+    # language-specific conventions are embedded here.
+    for caller, record in F.items():
+        for call in record.get("calls", ()):
+            callee = call.get("callee")
+            callee_record = F.get(callee)
+            if callee_record is None:
+                continue
+            formals = tuple(callee_record.get("params", ()))
+            for argument in call.get("args", ()):
+                position = argument.get("pos")
+                actual = argument.get("root")
+                if (isinstance(position, int) and position < len(formals)
+                        and actual in F and actual != callee):
+                    succ[caller].append(actual)
+        succ[caller] = sorted(set(succ[caller]))
+    discovery = discover_sources(F, succ, atropos.source_catalog(lang))
+    coverage = CoverageScheduler(F, succ).plan()
+    coverage_by_target = {region.target: region for region in coverage.regions}
+    by_function_bindings = {}
+    for binding in discovery.bindings:
+        by_function_bindings.setdefault(binding.caller, []).append({
+            "callee": binding.callee, "call_node": binding.call_node,
+            "formal_to_actual": list(binding.formal_to_actual),
+            "return_to": binding.return_to,
+        })
+    for name, record in F.items():
+        record["source_sites"] = [
+            {"node": site.node, "callee": site.callee, "line": site.line,
+             "arguments": list(site.arguments), "influenced_roots": list(site.influenced_roots),
+             "kind": site.kind}
+            for site in discovery.sites_for(name)
+        ]
+        record["seam_bindings"] = by_function_bindings.get(name, [])
+        record["source_reachable"] = name in discovery.reachable_functions
+        root_provenance = discovery.provenance_by_function.get(name, ())
+        record["source_provenance"] = (
+            root_provenance[0] if len(root_provenance) == 1 else
+            "mixed" if root_provenance else "unreachable")
+        record["source_influenced_roots"] = discovery.influenced_roots.get(name, ())
+        region = coverage_by_target.get(name)
+        record["coverage_sources"] = region.sources if region else ()
+        record["coverage_functions"] = region.functions if region else ()
+        record["coverage_state_keys"] = region.state_keys if region else ()
+        record["coverage_unresolved"] = name in coverage.uncovered_functions
     return (F, succ, graph) if return_graph else (F, succ)
 
 

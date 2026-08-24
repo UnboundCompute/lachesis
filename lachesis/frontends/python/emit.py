@@ -41,7 +41,7 @@ TIER_OF_KIND = {
     "scope": "T2", "symbol": "T2", "parameter": "T2", "variable": "T2",
     "binding": "T2", "property": "T2", "constant": "T2", "value": "T2",
     "decorator": "T2", "type-parameter": "T2",
-    "definition": "T2", "read": "T2", "write": "T2", "literal": "T2",
+    "definition": "T2", "read": "T2", "write": "T2", "release": "T2", "literal": "T2",
     "property-path": "T2", "allocation": "T2", "type-refinement": "T2",
     "generic-substitution": "T2",
     "argument": "T2", "call-value": "T2", "return": "T2", "return-value": "T2",

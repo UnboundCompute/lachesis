@@ -43,7 +43,7 @@ EXECUTABLE_NODE_KINDS = frozenset({
     "call-value", "argument", "return", "return-value", "throw",
 })
 VALUE_NODE_KINDS = frozenset({
-    "definition", "read", "write", "literal", "property-path", "allocation",
+    "definition", "read", "write", "release", "literal", "property-path", "allocation",
     "heap-object", "heap-location", "type-refinement", "generic-substitution",
     "call-context", "context-parameter", "context-return",
 })
@@ -161,7 +161,7 @@ FRONTEND_FORBIDDEN_EDGE_KINDS = frozenset({
 SOURCE_DERIVED_NODE_KINDS = frozenset().union(
     DECLARATION_NODE_KINDS,
     EXECUTABLE_NODE_KINDS,
-    {"definition", "read", "write", "literal", "property-path", "allocation",
+    {"definition", "read", "write", "release", "literal", "property-path", "allocation",
      "type-refinement", "generic-substitution",
      "dynamic-behavior", "module-initializer", "static-initializer",
      "source-span", "token"},

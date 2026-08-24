@@ -23,17 +23,18 @@ Token vocabulary (each token is a dict; ``depth`` = call-seam nesting level):
   {t:sink,  family, callee, arg, var, tainted, bound, guarded, depth}
   {t:alloc|use|free|escape, var, line, fn, depth}   lifecycle (object identity across seams)
 
-Known gaps (honest, inherited from the substrate):
+Known compatibility limits (honest, and specific to this legacy renderer):
   * ``tainted`` is a coarse proxy (provenance != const), not a full source-catalog reach --
     the reach substrate tracks "a value reaches the sink", not yet "an attacker value reaches it".
-  * standalone post-free deref uses are absent (the memory.deref tier-2 blocker), so a
-    use-after-free whose use is a bare ``buf[0]`` will not render; call-uses do.
+  * the legacy linear renderer does not preserve standalone post-free deref identity;
+    production object mode uses the semantic graph emitter for those facts. This module
+    remains available for compatibility and differential diagnostics.
 """
 import argparse
 import json
 
 from . import atropos
-from .patterns import KIND_EVALUATOR
+from .patterns import evaluator_for
 from .translate import load_graph
 from .traverse import traverse_all
 from .order import tarjan_scc, is_cyclic
@@ -108,7 +109,10 @@ def _expand_reach(fn, flow, F, summaries, catalog, depth, guarded_acc, chain):
         guarded = bool(site_guards) or guarded_acc
         kind = _kind_of(callee, pos, catalog)
         bound = None
-        if KIND_EVALUATOR.get(kind) == "relational":       # size sink: the guard IS the bound
+        recipe = evaluator_for(kind)
+        relational = (recipe == "relational" or
+                      isinstance(recipe, (list, tuple)) and "relational" in recipe)
+        if relational:                                      # size sink: the guard IS the bound
             bound = "bounded" if guarded else "unbounded"
         tok = {"t": "sink", "family": kind, "callee": callee, "arg": pos,
                "var": flow.get("value"), "tainted": flow.get("provenance") != "const",
@@ -152,17 +156,34 @@ def _expand_reach(fn, flow, F, summaries, catalog, depth, guarded_acc, chain):
 
 
 # --- typestate skeleton (already ordered; re-serialise into tokens) ---------------
-def _typestate_skel(fn, var, events, depth):
+def _lifecycle_family(kind, lang):
+    """Map the legacy event verb to the public structural family.
+
+    C already exposes memory.alloc/free/deref and those names are part of its
+    compatibility surface. Managed frontends use the language-neutral lifecycle
+    alphabet; the event verb remains available for rendering/debugging.
+    """
+    if lang == "c":
+        return {"alloc": "memory.alloc", "free": "memory.free", "use": "memory.deref",
+                "escape": "lifecycle.escape"}.get(kind, "lifecycle." + kind)
+    return {"alloc": "lifecycle.acquire", "free": "lifecycle.release",
+            "use": "lifecycle.use", "escape": "lifecycle.escape"}.get(
+                kind, "lifecycle." + kind)
+
+
+def _typestate_skel(fn, var, events, depth, lang="c"):
     toks = [{"t": "enter", "fn": fn, "depth": depth}]
     for e in events:
-        toks.append({"t": e["kind"], "var": var, "line": e.get("line"),
-                     "node": e.get("node"), "fn": fn, "depth": depth + 1})
+        toks.append({"t": e["kind"], "family": e.get("family") or
+                     _lifecycle_family(e["kind"], lang), "var": var,
+                     "line": e.get("line"), "node": e.get("node"), "fn": fn,
+                     "depth": depth + 1})
     toks.append({"t": "exit", "fn": fn, "depth": depth})
     return toks
 
 
 # --- driver ----------------------------------------------------------------------
-def build_skeletons(F, summaries, lang="c"):
+def build_skeletons(F, summaries, lang="c", *, include_typestate=True):
     """Every sink-bearing flow in the graph, rendered as an ordered token skeleton.
 
     A reach skeleton is emitted from EVERY function that carries the flow, so both the
@@ -181,13 +202,14 @@ def build_skeletons(F, summaries, lang="c"):
             skels.append({"kind": "reach", "entry": fn, "is_source": is_src,
                           "sink": flow["sink"], "value": flow.get("value"),
                           "complete": ok, "tokens": toks})
-        for var, events in s.get("typestate", {}).items():
-            skels.append({"kind": "typestate", "entry": fn, "is_source": is_src, "var": var,
-                          "complete": True, "tokens": _typestate_skel(fn, var, events, 0)})
-        for var, events in s.get("param_typestate", {}).items():
-            skels.append({"kind": "typestate", "entry": fn, "is_source": is_src,
-                          "var": "param:" + var, "complete": True,
-                          "tokens": _typestate_skel(fn, "param:" + var, events, 0)})
+        if include_typestate:
+            for var, events in s.get("typestate", {}).items():
+                skels.append({"kind": "typestate", "entry": fn, "is_source": is_src, "var": var,
+                              "complete": True, "tokens": _typestate_skel(fn, var, events, 0, lang)})
+            for var, events in s.get("param_typestate", {}).items():
+                skels.append({"kind": "typestate", "entry": fn, "is_source": is_src,
+                              "var": "param:" + var, "complete": True,
+                              "tokens": _typestate_skel(fn, "param:" + var, events, 0, lang)})
     return skels
 
 
@@ -218,7 +240,8 @@ def render_text(skel):
                          f"var={t['var']}{tt}{b} {g}{ctrl}{sz}{dst}{trunc}")
         else:                                            # lifecycle
             ln = f"@{t['line']}" if t.get("line") is not None else ""
-            lines.append(f"{pad}{t['t']} {t['var']}{ln}")
+            fam = f" {t['family']}" if t.get("family") else ""
+            lines.append(f"{pad}{t['t']}{fam} {t['var']}{ln}")
     return "\n".join(lines)
 
 

@@ -19,9 +19,12 @@ Three layers, kept separable so each graduates to its destination:
                        these dimensions (op/effect, object reachability, value, control).
 """
 
+import re
+
 
 # ---- (c) SUBSTRATE -------------------------------------------------------------------------
-def substrate(sink_kind, tainted, value_bound, guarded):
+def substrate(sink_kind, tainted, value_bound, guarded, guard_status=None,
+              size_expr=None, guard_predicates=()):
     """The dimensions every pattern predicates over, built once per sink occurrence:
       kind        -- the op / effect identity (atropos sink-arg kind)
       tainted     -- does an attacker-controlled value reach this arg (reach substrate)
@@ -29,7 +32,9 @@ def substrate(sink_kind, tainted, value_bound, guarded):
       guarded     -- is there a control guard on the value at the sink
     """
     return {"kind": sink_kind, "tainted": bool(tainted),
-            "value_bound": value_bound, "guarded": bool(guarded)}
+            "value_bound": value_bound, "guarded": guarded,
+            "guard_status": guard_status, "size_expr": size_expr,
+            "guard_predicates": tuple(guard_predicates or ())}
 
 
 # ---- (b) EVALUATORS (closed set) -----------------------------------------------------------
@@ -52,10 +57,78 @@ def _presence(fact):
     return True
 
 
+def _missing_guard(fact):
+    """Fire only when a validation exists but the sink is on its fall-through arm."""
+    return fact.get("guard_status") == "fall-through"
+
+
+def _inverted_capacity_guard(fact):
+    """Detect a size guard that permits the copy when length is at/over capacity.
+
+    This is intentionally expression-shape based, not C-name based: the translator
+    supplies normalized predicates and the evaluator only recognizes the generic
+    ordering relation between the sink's size expression and a capacity expression.
+    """
+    size = str(fact.get("size_expr") or "").replace(" ", "")
+    if not size or not fact.get("tainted"):
+        return False
+    escaped = re.escape(size)
+    return any(re.search(rf"(?:^|[(&|!]){escaped}(?:>=|>)", str(predicate).replace(" ", ""))
+               for predicate in fact.get("guard_predicates", ()))
+
+
+def _arithmetic_overflow_guard(fact):
+    """Detect a tainted additive expression used as a pre-write bound check.
+
+    The predicate is intentionally language-neutral at this layer: translators
+    provide normalized guard text, while the evaluator only recognizes the
+    generic ``addition followed by an upper-bound comparison`` shape.
+    """
+    if not fact.get("tainted") or not fact.get("guarded"):
+        return False
+    return any("+" in str(predicate)
+               and re.search(r"(?:<=|<)", str(predicate))
+               for predicate in fact.get("guard_predicates", ()))
+
+
+def _allocation_overflow_size(fact):
+    """Detect a tainted multiplicative allocation size.
+
+    This is deliberately an expression-shape evaluator, not a C parser: frontends
+    provide the normalized size expression and the catalog identifies the
+    ``alloc-size`` family.  A non-constant factor multiplied into the allocation
+    size can wrap before the allocator sees it; proving the exact numeric range is
+    a separate analysis capability.
+    """
+    if fact.get("kind") != "alloc-size" or not fact.get("tainted"):
+        return False
+    expression = str(fact.get("size_expr") or "")
+    if "*" not in expression:
+        return False
+    factors = [part.strip() for part in expression.split("*")]
+    return len(factors) >= 2 and any(
+        re.search(r"[A-Za-z_]", factor) for factor in factors)
+
+
+def _typestate(fact):
+    """Mark a semantic lifecycle fact for the temporal graph evaluator.
+
+    The ordering decision is intentionally not made from one sink fact.  This predicate
+    is the routing primitive used by Atropos's event vocabulary; ``semantic_graph`` then
+    evaluates the actual compatible path, object identity, call stack, and generation.
+    """
+    return bool(fact.get("event_kind") or fact.get("temporal_event"))
+
+
 EVALUATORS = {
     "reachability": _reachability,
     "relational":   _relational,
     "presence":     _presence,
+    "missing-guard": _missing_guard,
+    "inverted-capacity-guard": _inverted_capacity_guard,
+    "arithmetic-overflow-guard": _arithmetic_overflow_guard,
+    "allocation-overflow-size": _allocation_overflow_size,
+    "typestate": _typestate,
 }
 
 
@@ -81,9 +154,9 @@ KIND_EVALUATOR = {
     "xpath-injection":    "reachability",
     "redos":              "reachability",
     # size / memory -> relational (taint AND unbounded length vs capacity)
-    "alloc-size":         "relational",
+    "alloc-size":         ["relational", "missing-guard", "allocation-overflow-size"],
     "buffer-size":        "relational",
-    "buffer-write":       "relational",
+    "buffer-write":       ["relational", "missing-guard"],
     # configuration -> presence (taint-independent; the call is the bug)
     "weak-crypto":        "presence",
     "insecure-tls":       "presence",
@@ -91,13 +164,78 @@ KIND_EVALUATOR = {
 }
 
 
+def pattern_catalog():
+    """Expose Atropos's declarative structural library to matcher clients."""
+    try:
+        from .atropos import pattern_catalog as _catalog
+        return _catalog()
+    except (ImportError, OSError, ValueError):
+        return []
+
+
+def evaluator_catalog():
+    """Use Atropos routing when installed, retaining the compatibility table otherwise."""
+    try:
+        from .atropos import evaluator_catalog as _catalog
+        return _catalog()
+    except (ImportError, OSError, ValueError):
+        return {"evaluators": EVALUATORS, "kind_evaluator": KIND_EVALUATOR}
+
+
+def evaluator_for(sink_kind):
+    """Return the catalogued evaluator recipe for a sink kind.
+
+    Recipes may be a single evaluator or a list; keeping this lookup in the
+    Atropos adapter prevents renderers from silently falling back to the old
+    compatibility table when the catalog adds a second evaluator to a kind.
+    """
+    catalog = evaluator_catalog()
+    return catalog.get("kind_evaluator", {}).get(sink_kind,
+                                                   KIND_EVALUATOR.get(sink_kind))
+
+
 def evaluate(sink_kind, fact):
     """Route a substrate fact through the evaluator its kind selects. Returns the evaluator
     name if the pattern fires, else None (unknown kind, or predicate not satisfied)."""
-    ev = KIND_EVALUATOR.get(sink_kind)
+    catalog = evaluator_catalog()
+    ev = catalog.get("kind_evaluator", {}).get(sink_kind, KIND_EVALUATOR.get(sink_kind))
     if ev is None:
         return None
-    return ev if EVALUATORS[ev](fact) else None
+    names = [ev] if isinstance(ev, str) else ev
+    matches = [name for name in names
+               if name in EVALUATORS and EVALUATORS[name](fact)]
+    return matches[0] if matches else None
+
+
+def evaluate_all(sink_kind, fact):
+    """Return every catalogued evaluator that fires for one substrate fact."""
+    catalog = evaluator_catalog()
+    ev = catalog.get("kind_evaluator", {}).get(sink_kind, KIND_EVALUATOR.get(sink_kind))
+    if ev is None:
+        return []
+    names = [ev] if isinstance(ev, str) else ev
+    matches = [name for name in names
+               if name in EVALUATORS and EVALUATORS[name](fact)]
+    # Atropos may publish a structural matcher whose evaluator is not the
+    # primary kind recipe. Discover those family bindings from the pattern
+    # catalog so adding a new pattern remains declarative.
+    for entry in pattern_catalog():
+        matcher = entry.get("matcher") or {}
+        pattern = matcher.get("pattern")
+        families = matcher.get("families") or []
+        if (sink_kind in families and pattern not in matches
+                and pattern in EVALUATORS and EVALUATORS[pattern](fact)):
+            matches.append(pattern)
+    return matches
+
+
+def evaluator_for_event(event_kind):
+    """Return the Atropos-declared evaluator for a semantic event kind."""
+    try:
+        from .atropos import event_evaluator
+        return event_evaluator(event_kind)
+    except (ImportError, OSError, ValueError, AttributeError):
+        return None
 
 
 def is_call_level(sink_kind):
@@ -106,4 +244,6 @@ def is_call_level(sink_kind):
     fires even with constant arguments. Every other class is ARG-level: the occurrence is a
     (call, argument) pair carrying a value the taint/bound predicates read. Adding a new
     presence KIND needs no code; only a new occurrence granularity would."""
-    return KIND_EVALUATOR.get(sink_kind) == "presence"
+    catalog = evaluator_catalog()
+    ev = catalog.get("kind_evaluator", {}).get(sink_kind, KIND_EVALUATOR.get(sink_kind))
+    return ev == "presence" or (isinstance(ev, list) and "presence" in ev)

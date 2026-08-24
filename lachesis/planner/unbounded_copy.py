@@ -32,6 +32,35 @@ _STRLIT = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 def _strip_string_literals(text: str) -> str:
     return _STRLIT.sub("", text)
 
+# A magnitude comparison: `<`, `<=`, `>`, `>=` -- but NOT a bit shift (`<<`, `>>`)
+# and NOT an equality/nullness test (`==`, `!=`). A branch imposes a *size bound* on
+# a variable only when it compares that variable's magnitude; a pure presence test
+# (`if (p)`, `if (p != NULL)`, `if (a && b)`) names the variable but bounds nothing.
+_REL = re.compile(r"<=|>=|(?<!<)<(?![<=])|(?<!>)>(?![>=])")
+
+
+def _relation_named(head: str, patterns: dict) -> list:
+    """Idents that participate in a magnitude RELATION in a condition, not merely
+    appear by name.
+
+    The branch head is split into its logical clauses (on ``&&``/``||``/``,``); an
+    ident counts only inside a clause that also carries a magnitude operator. So
+    ``if (len < cap && ready)`` yields ``len``/``cap`` (bounded) but ``ready`` and
+    every ident of ``if (z && a && b)`` are rejected -- a nullness/presence test must
+    not read as a size guard, or it silently suppresses a real bug. Undecidable
+    guards (a helper call like ``if (fits(n)))``) carry no operator here and read as
+    unguarded: the safe direction for a recall-oriented finder is not to suppress."""
+    if not head:
+        return []
+    named = set()
+    for clause in re.split(r"&&|\|\||,", head):
+        if not _REL.search(clause):
+            continue
+        for ident, pattern in patterns.items():
+            if pattern.search(clause):
+                named.add(ident)
+    return sorted(named)
+
 _ARG_INDEX = re.compile(r"Argument\[(\d+)\]")
 # A leaked value-node label: either a copied-through source comment (the file's
 # leading copyright banner is a frequent offender) or a bare clang AST kind name
@@ -179,12 +208,14 @@ class BranchRegions:
         patterns = {i: re.compile(r"\b" + re.escape(i) + r"\b") for i in idents}
         testing = []  # (head, named idents, [region spans])
         for cond_id, head in self._conditions_of.get(function_id or "", ()):
-            named = sorted(i for i, p in patterns.items() if head and p.search(head))
+            named = _relation_named(head, patterns)
             if named:
                 testing.append((head, named, self._regions_of.get(cond_id, ())))
         if not testing:
             return {"status": "none-observed",
-                    "basis": "no branch in the enclosing function tests a size variable"}
+                    "basis": "no branch in the enclosing function compares a size "
+                             "variable's magnitude (a nullness/presence test is not "
+                             "a size guard)"}
         if callsite_span is None:
             return {"status": "undecided",
                     "reason": "the copy call site carries no source span to place "
@@ -196,12 +227,13 @@ class BranchRegions:
         if containing:
             return {"status": "guarded-region",
                     "basis": "the copy call site lies inside a conditional region "
-                             "whose controlling branch tests a size variable; the "
-                             "copy runs only when that branch is taken",
+                             "whose controlling branch compares a size variable's "
+                             "magnitude; the copy runs only when that branch is taken",
                     "regions": containing}
         return {"status": "fall-through",
-                "basis": "a branch in this function tests a size variable, but the "
-                         "copy call site lies outside that branch's region; the copy "
+                "basis": "a branch in this function compares a size variable's "
+                         "magnitude, but the copy call site lies outside that "
+                         "branch's region; the copy "
                          "is reached without entering it -- a missing-guard shape "
                          "worth reading, not proof of a bug",
                 "branches": [{"condition": head, "names": named}

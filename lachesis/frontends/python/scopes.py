@@ -34,6 +34,8 @@ from .emit import Graph, SourceFile, stable_id
 BLOCK_TYPES = frozenset({"module", "function", "class"})
 
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+MATCH_AS_NODE = getattr(ast, "MatchAs", None)
+MATCH_STAR_NODE = getattr(ast, "MatchStar", None)
 COMPREHENSION_NAMES = {
     ast.ListComp: "listcomp", ast.SetComp: "setcomp",
     ast.DictComp: "dictcomp", ast.GeneratorExp: "genexpr",
@@ -235,7 +237,8 @@ def bound_occurrences(regions: Sequence[ast.AST]) -> Dict[str, ast.AST]:
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 record(name, node)
-        elif isinstance(node, ast.MatchAs) or isinstance(node, ast.MatchStar):
+        elif ((MATCH_AS_NODE is not None and isinstance(node, MATCH_AS_NODE))
+              or (MATCH_STAR_NODE is not None and isinstance(node, MATCH_STAR_NODE))):
             record(node.name, node)
         for child in ast.iter_child_nodes(node):
             visit(child)

@@ -11,7 +11,7 @@ variable's spelling.
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Hashable, Iterable, Mapping, Sequence
 
@@ -28,6 +28,7 @@ class OpKind(str, Enum):
     CLOBBER = "clobber"
     COPY = "copy"
     FREE = "free"
+    REALLOC = "realloc"
     USE = "use"
     SUMMARY = "summary"
 
@@ -55,6 +56,8 @@ class Operation:
     ordinal: int = 0
     # Each alternative is an ordered sequence of already-instantiated FREE/USE ops.
     alternatives: tuple[tuple["Operation", ...], ...] = ()
+    # Access form for the frozen skeleton split: dereference, pointer-value pass, or return.
+    access: str = "deref"
 
 
 @dataclass(frozen=True, order=True)
@@ -68,6 +71,14 @@ class Finding:
 @dataclass(frozen=True, order=True)
 class ParamEffect:
     kind: OpKind
+    position: int
+    selectors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, order=True)
+class ReturnEffect:
+    """A return value borrowed from one formal parameter access path."""
+
     position: int
     selectors: tuple[str, ...] = ()
 
@@ -115,7 +126,7 @@ class AbstractState:
         env: Mapping[str, ObjectId] | None = None,
         facts: Mapping[ObjectId, frozenset[ObjectFact]] | None = None,
         slots: Mapping[tuple[ObjectId, str], ObjectId] | None = None,
-        trace: Sequence[ParamEffect] = (),
+        trace: Sequence[ParamEffect | ReturnEffect] = (),
         freed_paths: Mapping[AccessPath, ObjectId] | None = None,
     ):
         self.env = dict(env or {})
@@ -192,6 +203,13 @@ class AbstractState:
         if self.trace.count(effect) < 2 and len(self.trace) < self.TRACE_LIMIT:
             self.trace += (effect,)
 
+    def _record_return_effect(self, oid: ObjectId) -> None:
+        if not (isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
+            return
+        effect = ReturnEffect(oid[1], oid[2])
+        if self.trace.count(effect) < 2 and len(self.trace) < AbstractState.TRACE_LIMIT:
+            self.trace += (effect,)
+
     def _merge_object(self, destination: ObjectId, source: ObjectId) -> None:
         self.facts[destination] = frozenset(
             self.facts.get(destination, frozenset())
@@ -248,6 +266,39 @@ class AbstractState:
         if freed_param is not None:
             self._record_param_effect(OpKind.ALLOC, freed_param)
 
+    def _free_object(
+        self,
+        oid: ObjectId | None,
+        path: AccessPath | None,
+        node: Hashable,
+        line: int | None,
+        findings: set[Finding],
+    ) -> None:
+        # Mark the object `oid` (named via `path`) freed, raising double-free if it was
+        # already freed.  Shared verbatim by FREE and the free-half of REALLOC: realloc
+        # may relocate its block, so the object its first argument names is (may-be) freed
+        # exactly as free() frees its argument -- no bug-specific logic, both callers get
+        # identical typestate, and any surviving alias is caught by the USE-on-FREED path.
+        if oid is None:
+            return
+        self._record_param_effect(OpKind.FREE, oid)
+        if (path is not None and path.selectors
+                and isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
+            # Remember the freed pointer-field so a later reassignment through it
+            # (see _compensate_reassignment) can net the summary back to live.
+            self.freed_paths[path] = oid
+        facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
+        # A summary object (identity formed through a variable subscript) may-be-freed
+        # abstracts distinct concrete cells; a repeat free of it is not a proven
+        # violation of the same object, so it does not raise a strong finding.
+        weak = _is_summary_object(oid)
+        if ObjectFact.FREED in facts and not weak:
+            findings.add(Finding("double-free", line, path, node))
+        if facts != frozenset({ObjectFact.NULL}):
+            freed = frozenset({ObjectFact.FREED})
+            is_summary = len(oid) > 1 and oid[1] == "summary"
+            self.facts[oid] = (facts | freed) if is_summary else freed
+
     def apply(self, op: Operation, findings: set[Finding]) -> None:
         if op.kind == OpKind.ALLOC:
             self._compensate_reassignment(op)
@@ -262,6 +313,22 @@ class AbstractState:
             self._compensate_reassignment(op)
             self.bind(op.target, self.resolve(op.source, create=True))
             return
+        if op.kind == OpKind.REALLOC:
+            # realloc(source): the block `source` names may move, so its object is
+            # (may-be) freed exactly as free() would -- an interior pointer or alias still
+            # bound to it now dangles, and the existing USE-on-FREED check raises the
+            # use-after-free with no per-bug rule.  The call also returns a fresh (possibly
+            # relocated) object, bound to target like an allocation.  Order matters: the
+            # source object is resolved and freed BEFORE target is rebound, so an in-place
+            # `p = realloc(p, ...)` still frees the old generation the aliases hold.
+            if op.source is not None:
+                self._free_object(
+                    self.resolve(op.source, create=True),
+                    op.source, op.node, op.line, findings,
+                )
+            self._compensate_reassignment(op)
+            self._fresh(op, ObjectFact.ALLOCATED)
+            return
         if op.kind not in (OpKind.FREE, OpKind.USE):
             raise ValueError(f"cannot directly apply {op.kind}")
 
@@ -269,28 +336,18 @@ class AbstractState:
         oid = self.resolve(op.target, create=(op.kind == OpKind.FREE))
         if oid is None:
             return
-        self._record_param_effect(op.kind, oid)
-        if (op.kind == OpKind.FREE and op.target is not None and op.target.selectors
-                and isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
-            # Remember the freed pointer-field so a later reassignment through it
-            # (see _compensate_reassignment) can net the summary back to live.
-            self.freed_paths[op.target] = oid
-        facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
-        # A summary object (identity formed through a variable subscript) may-be-freed
-        # abstracts distinct concrete cells; a repeat free/use of it is not a proven
-        # violation of the same object, so it does not raise a strong finding.
-        weak = _is_summary_object(oid)
         if op.kind == OpKind.USE:
-            if ObjectFact.FREED in facts and not weak:
+            self._record_param_effect(OpKind.USE, oid)
+            if op.access == "return":
+                self._record_return_effect(oid)
+            facts = self.facts.get(oid, frozenset({ObjectFact.UNKNOWN}))
+            # A summary object may-be-freed abstracts distinct concrete cells; a use of it
+            # is not a proven violation of the same object, so it stays a weak (no-finding).
+            if ObjectFact.FREED in facts and not _is_summary_object(oid):
                 findings.add(Finding("use-after-free", op.line, op.target, op.node))
             return
 
-        if ObjectFact.FREED in facts and not weak:
-            findings.add(Finding("double-free", op.line, op.target, op.node))
-        if facts != frozenset({ObjectFact.NULL}):
-            freed = frozenset({ObjectFact.FREED})
-            is_summary = len(oid) > 1 and oid[1] == "summary"
-            self.facts[oid] = (facts | freed) if is_summary else freed
+        self._free_object(oid, op.target, op.node, op.line, findings)
 
 
 def join_states(states: Iterable[AbstractState], node: Hashable) -> AbstractState:
@@ -367,14 +424,41 @@ class AnalysisResult:
     transfers: int
     widenings: int
     capped: bool
+    # Abstract states immediately before each CFG node's operations.  Consumers
+    # such as the semantic skeleton builder can reuse the field-sensitive,
+    # loop-widened identity domain instead of reconstructing it from a flat op
+    # stream.  States are snapshots, not mutable analyzer internals.
+    point_states: Mapping[Hashable, tuple[AbstractState, ...]] = field(default_factory=dict)
+    # States immediately after the operations anchored at each CFG point.  These
+    # are retained separately because an ALLOC/REALLOC success has a new identity
+    # that cannot be recovered from its incoming state.
+    post_states: Mapping[Hashable, tuple[AbstractState, ...]] = field(default_factory=dict)
+
+
+class _DiscardFindings:
+    """Sink used by the production summary interpreter.
+
+    Abstract-state transfer still computes lifecycle facts; vulnerability conclusions belong to
+    the semantic graph matcher and are therefore not accumulated here.
+    """
+    def add(self, _finding):
+        return None
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
 
 
 class ObjectStateAnalyzer:
-    def __init__(self, *, max_disjuncts: int = 64, transfer_cap: int | None = None):
+    def __init__(self, *, max_disjuncts: int = 64, transfer_cap: int | None = None,
+                 collect_findings: bool = True):
         if max_disjuncts < 1:
             raise ValueError("max_disjuncts must be positive")
         self.max_disjuncts = max_disjuncts
         self.transfer_cap = transfer_cap
+        self.collect_findings = collect_findings
 
     @staticmethod
     def _transfer(
@@ -425,7 +509,10 @@ class ObjectStateAnalyzer:
         work = deque([nodes[0]])
         queued = {nodes[0]}
         widened: set[Hashable] = set()
-        findings: set[Finding] = set()
+        post_snapshots: dict[Hashable, dict[tuple, AbstractState]] = {
+            node: {} for node in nodes
+        }
+        findings = set() if self.collect_findings else _DiscardFindings()
         transfers = widenings = 0
         cap = self.transfer_cap or max(10000, len(nodes) * 500)
 
@@ -433,6 +520,8 @@ class ObjectStateAnalyzer:
             node = work.popleft()
             queued.discard(node)
             outgoing = self._transfer(incoming[node].values(), at.get(node, ()), findings)
+            post_snapshots[node].update(
+                (key, state.clone()) for key, state in outgoing.items())
             transfers += len(outgoing)
             for successor in successors.get(node, ()):
                 if successor not in incoming:
@@ -463,6 +552,13 @@ class ObjectStateAnalyzer:
         for node in nodes:
             if not successors.get(node):
                 exits.extend(self._transfer(incoming[node].values(), at.get(node, ()), findings).values())
+        point_states = {
+            node: tuple(state.clone() for state in states.values())
+            for node, states in incoming.items()
+        }
+        post_states = {
+            node: tuple(states.values()) for node, states in post_snapshots.items()
+        }
         return AnalysisResult(
             findings=findings,
             exit_states=tuple(exits),
@@ -470,4 +566,6 @@ class ObjectStateAnalyzer:
             transfers=transfers,
             widenings=widenings,
             capped=bool(work),
+            point_states=point_states,
+            post_states=post_states,
         )
