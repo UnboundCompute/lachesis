@@ -420,6 +420,17 @@ class SemanticGraphTests(unittest.TestCase):
             ("formal",))
         self.assertEqual(bindings[0][1], ObjRef("node", ("&",), "g0"))
 
+    def test_matcher_falls_back_when_serialized_launch_id_is_stale(self):
+        obj = ObjRef("p", generation="g0")
+        graph = self._graph([
+            ("origin", Event.origin(obj)),
+            ("release", Event.release(obj)),
+            ("use", Event.read(obj)),
+        ], [("origin", "release"), ("release", "use")])
+        graph.source_reachable.add("removed-after-serialization")
+        self.assertTrue(any(hit["pattern"] == "uaf.deref"
+                            for hit in match_graph(graph)))
+
     def test_public_atropos_pattern_id_selects_the_internal_matcher(self):
         obj = ObjRef("object", generation="g0")
         g = self._graph(

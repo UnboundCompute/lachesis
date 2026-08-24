@@ -453,7 +453,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
     the exact object and generation, so freeing a storage object never frees its pointee.
     """
     wanted = _requested_patterns(patterns)
-    starts = sorted(graph.source_reachable) if graph.source_reachable else [f.entry for f in graph.fragments.values()]
+    starts = ([node_id for node_id in sorted(graph.source_reachable)
+               if node_id in graph.nodes]
+              if graph.source_reachable else
+              [f.entry for f in graph.fragments.values()])
     starts = starts or list(graph.nodes)
     queue = deque(_State(s, launch_context=s) for s in starts)
     predecessors: dict[_State, _State | None] = {
