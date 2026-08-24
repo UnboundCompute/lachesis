@@ -604,6 +604,18 @@ def _ir_lifecycle_events(call, norm, ref):
     return []
 
 
+def _source_call_tokens(record):
+    """Return stable source-site tokens for a frontend-neutral function record."""
+    tokens = set()
+    for site in (record.get("source_sites", ()) or ()):
+        tokens.add(str(site.get("node") or
+                       f"{site.get('callee') or 'source'}@{site.get('line') or 0}"))
+    for site in (record.get("source_calls", ()) or ()):
+        tokens.add(str(site.get("node") or
+                       f"{site.get('callee') or 'source'}@{site.get('line') or 0}"))
+    return tokens
+
+
 def _build_cfg_ir_semantic_graph(functions, *, lang):
     """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
     result = SkeletonGraph(language=lang)
@@ -625,6 +637,7 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
         if not cfg_nodes:
             continue
         reachable = bool(record.get("source_reachable") or record.get("is_source"))
+        source_tokens = _source_call_tokens(record)
         successor_map = cfg.get("succ") or {}
         event_by_anchor = defaultdict(list)
         call_by_anchor = defaultdict(list)
@@ -670,6 +683,15 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                     tail = event_id
                     continue
                 callee = item.get("callee")
+                call_token = str(item.get("node") or
+                                 f"{callee or 'source'}@{item.get('line') or 0}")
+                if call_token in source_tokens:
+                    launch_id = f"{fn}:ir:source:{index}"
+                    result.add_node(launch_id, None, fragment=fn,
+                                    source_reachable=True, source_site=call_token)
+                    result.add_edge(tail, launch_id)
+                    result.source_reachable.add(launch_id)
+                    tail = launch_id
                 for lifecycle_index, lifecycle_event in enumerate(
                         _ir_lifecycle_events(item, norm, ref)):
                     lifecycle_id = f"{fn}:ir:lifecycle:{index}:{lifecycle_index}"
@@ -766,7 +788,11 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
         entry = cfg.get("entry") or cfg_nodes[0]
         entry = heads.get(entry, heads[cfg_nodes[0]])
         entries[fn] = entry
-        if reachable:
+        if reachable and not any(
+                result.nodes[node_id].metadata.get("source_site")
+                for node_id in result.source_reachable
+                if node_id in result.nodes
+                and result.nodes[node_id].fragment == fn):
             result.source_reachable.add(entry)
         function_exits = {tails[node] for node in cfg_nodes
                           if not successor_map.get(node)}
@@ -825,10 +851,11 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     for fn in sorted(functions):
         record = functions[fn]
         reachable = bool(record.get("source_reachable") or record.get("is_source"))
+        source_tokens = _source_call_tokens(record)
         entry = f"{fn}:ir:entry"
         result.add_node(entry, None, fragment=fn, source_reachable=reachable)
         entries[fn] = entry
-        if reachable:
+        if reachable and not source_tokens:
             result.source_reachable.add(entry)
         items = [("event", item) for item in record.get("events", ())]
         items.extend(("call", item) for item in record.get("calls", ()))
@@ -843,6 +870,15 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                 previous = emit_event(fn, index, item, previous, reachable)
                 continue
             callee = item.get("callee")
+            call_token = str(item.get("node") or
+                             f"{callee or 'source'}@{item.get('line') or 0}")
+            if call_token in source_tokens:
+                launch_id = f"{fn}:ir:source:{index}"
+                result.add_node(launch_id, None, fragment=fn,
+                                source_reachable=True, source_site=call_token)
+                result.add_edge(previous, launch_id)
+                result.source_reachable.add(launch_id)
+                previous = launch_id
             for lifecycle_index, lifecycle_event in enumerate(
                     _ir_lifecycle_events(item, norm, ref)):
                 lifecycle_id = f"{fn}:ir:lifecycle:{index}:{lifecycle_index}"
@@ -918,6 +954,12 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                                   tuple(return_bindings), _ir_guard_proofs(item)))
             previous = continuation
             index += 1
+        if reachable and not any(
+                result.nodes[node_id].metadata.get("source_site")
+                for node_id in result.source_reachable
+                if node_id in result.nodes
+                and result.nodes[node_id].fragment == fn):
+            result.source_reachable.add(entry)
         exit_node = f"{fn}:ir:exit"
         result.add_node(exit_node, None, fragment=fn, source_reachable=reachable)
         result.add_edge(previous, exit_node)

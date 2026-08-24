@@ -144,6 +144,25 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(kinds.count(EventKind.RELEASE), 1)
         self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(graph)})
 
+    def test_frontend_ir_source_calls_become_external_launch_nodes(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "source_reachable": True,
+                "source_calls": [{"node": "read_site", "callee": "read",
+                                  "line": 4}],
+                "calls": [{"node": "read_site", "callee": "read", "line": 4,
+                           "assigned": "value", "args": []}],
+                "events": [{"kind": "use", "var": "value", "line": 5}],
+            },
+        }
+        graph = build_semantic_graph(object(), functions, {"main": []},
+                                     lang="python", graph={})
+        launches = [graph.nodes[node_id] for node_id in graph.source_reachable]
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0].metadata["source_site"], "read_site")
+
     def test_frontend_ir_fallback_routes_sink_facts_through_atropos(self):
         from unittest.mock import patch
         from .emit import build_semantic_graph
