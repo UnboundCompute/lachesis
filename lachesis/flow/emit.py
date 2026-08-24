@@ -563,12 +563,48 @@ def _ir_event(record):
     return None
 
 
+def _ir_lifecycle_events(call, norm, ref):
+    """Lift catalogued lifecycle calls into neutral events.
+
+    Frontends that do not expose the C object substrate still provide normalized
+    calls.  Alloc/acquire and release roles are unambiguous at this boundary;
+    realloc is deliberately represented only as an attempt unless the frontend
+    also supplies explicit success/failure facts.
+    """
+    callee = call.get("callee")
+    line = call.get("line")
+
+    def argument(position=0):
+        item = next((arg for arg in call.get("args", ())
+                     if arg.get("pos") == position), None)
+        if item is None:
+            return None
+        return ref(item.get("root") or item.get("var") or item.get("value"))
+
+    if norm.is_realloc(callee):
+        old = argument()
+        return [Event(EventKind.REALLOC_ATTEMPT, obj=old, line=line,
+                      facts={"frontend_ir": True, "callee": callee})] if old else []
+    if norm.is_release(callee):
+        released = argument()
+        if released is None:
+            released = ref(call.get("receiver"))
+        return [Event(EventKind.RELEASE, obj=released, line=line,
+                      facts={"frontend_ir": True, "callee": callee})] if released else []
+    if norm.is_acquire(callee):
+        acquired = ref(call.get("assigned"))
+        return [Event(EventKind.ORIGIN, obj=acquired, line=line,
+                      facts={"frontend_ir": True, "callee": callee})] if acquired else []
+    return []
+
+
 def _build_cfg_ir_semantic_graph(functions, *, lang):
     """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
     result = SkeletonGraph(language=lang)
     entries, exits = {}, {}
     pending_calls = []
     sink_catalog = atropos.sink_catalog(lang)
+    norm = normalizer(lang)
 
     def ref(value):
         return ObjRef(str(value), generation="g0") if value else None
@@ -628,6 +664,13 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                     tail = event_id
                     continue
                 callee = item.get("callee")
+                for lifecycle_index, lifecycle_event in enumerate(
+                        _ir_lifecycle_events(item, norm, ref)):
+                    lifecycle_id = f"{fn}:ir:lifecycle:{index}:{lifecycle_index}"
+                    result.add_node(lifecycle_id, lifecycle_event,
+                                    fragment=fn, source_reachable=reachable)
+                    result.add_edge(tail, lifecycle_id)
+                    tail = lifecycle_id
                 catalog_entry = sink_catalog.get(callee) or {}
                 for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
                     argument = next((arg for arg in item.get("args", ())
@@ -759,6 +802,7 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     entries, exits = {}, {}
     pending_calls = []
     sink_catalog = atropos.sink_catalog(lang)
+    norm = normalizer(lang)
 
     def ref(value):
         return ObjRef(str(value), generation="g0") if value else None
@@ -793,6 +837,13 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                 previous = emit_event(fn, index, item, previous, reachable)
                 continue
             callee = item.get("callee")
+            for lifecycle_index, lifecycle_event in enumerate(
+                    _ir_lifecycle_events(item, norm, ref)):
+                lifecycle_id = f"{fn}:ir:lifecycle:{index}:{lifecycle_index}"
+                result.add_node(lifecycle_id, lifecycle_event,
+                                fragment=fn, source_reachable=reachable)
+                result.add_edge(previous, lifecycle_id)
+                previous = lifecycle_id
             catalog_entry = sink_catalog.get(callee) or {}
             for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
                 argument = next((arg for arg in item.get("args", ())
