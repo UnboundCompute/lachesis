@@ -443,22 +443,29 @@ Patterns are atropos data; the engine only supplies the substrate the matcher wa
 
 ```
 Phase 0  this doc (schema) — DONE
-Phase 1  CORE: Claus fragment builder emitting a GRAPH
+Phase 1  CORE: Claus fragment builder emitting a GRAPH — IMPLEMENTED v1
            - reuse object_state.py env/heap/generation machinery
            - emit graph (branches/merges/loops/seams), NOT a linear stream
            - NO baked-in detection (move UAF/double-free out of AbstractState.apply)
            - split events per §2.2; ALLOC_ATTEMPT/REALLOC_ATTEMPT outcomes per §2.1
-Phase 2  fragment store + seam stitching (symbolic bind at seams, §5)
+Phase 2  fragment store + seam stitching (symbolic bind at seams, §5) — IMPLEMENTED v1
 Phase 3  source-rooted driver (pass 3): SOURCE_REACHABLE scheduling + backward source
-           discovery (formal->actual/return/influence) + launch Claus forward
-Phase 4  continuation-aware reachability matcher (§7) — replaces match_universal
-Phase 5  wire pipeline.py to this path + validate on the 35-bug fixture
+           discovery (formal->actual/return/influence) + launch Claus forward — IMPLEMENTED v1
+Phase 4  continuation-aware reachability matcher (§7) — replaces match_universal — IMPLEMENTED v1
+Phase 5  wire pipeline.py to this path + validate on the 35-bug fixture — IMPLEMENTED v1
 ```
 
-Current code to refactor, not reuse blindly: `flow/emit.py` (linearizes — replace with graph
-emitter), `flow/skeleton_ir.py::match_universal` (linear scan — replace with §7),
-`flow/object_state.py` (keep the heap/generation/disjunct machinery; remove baked-in
-findings), `flow/pipeline.py` (rewire entry from lifecycle-slice to source-rooted).
+The v1 path is now `flow/emit.py`'s native graph emitter, `flow/fragment_store.py`'s Claus
+driver/store, `flow/coverage.py`'s source-rooted scheduler, and
+`flow/semantic_graph.py::match_graph`. The older linear renderer and its matcher remain as
+compatibility code for non-object/shadow operation; they are not the production matcher path.
+`flow/object_state.py` continues to provide heap/generation/disjunct facts, while production
+object analysis collects no vulnerability verdicts there.
+
+The remaining boundary is evidence quality, not graph shape: frontends must emit sufficiently
+rich aliases/guards, and callerless file-local helpers are retained as explicitly tagged
+`structural` coverage roots when export metadata is unavailable. Such roots are never mislabeled
+as `export` in the semantic graph or matcher witness.
 
 ---
 
