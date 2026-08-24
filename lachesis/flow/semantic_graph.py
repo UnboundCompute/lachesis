@@ -864,12 +864,26 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                                            for value in event_abstract)
                                  else ())
             if temporal_event and event.kind == EventKind.RELEASE and obj:
-                prior_sites = {site for released_obj, site in released if released_obj == obj}
+                def is_release_site(site):
+                    site_node = graph.nodes.get(site)
+                    site_event = site_node.event if site_node is not None else None
+                    return site_event is not None and site_event.kind == EventKind.RELEASE
+
+                prior_sites = {
+                    site for released_obj, site in released
+                    if released_obj == obj and is_release_site(site)
+                }
                 abstract_prior = {
                     site for value, site in abstract_released
                     if value in {abstract_key(item, obj) for item in identity_abstract}
+                    and is_release_site(site)
                 }
-                prior = abstract_prior if identity_abstract else prior_sites
+                # Parameter abstract IDs are deliberately scoped per fragment,
+                # so ``param 0.data`` in invalidate_buffer and buffer_destroy
+                # is not textually equal.  When the concrete canonical object
+                # is the same across that seam, retain the exact-object proof
+                # instead of letting scoped metadata hide a real double free.
+                prior = (abstract_prior or prior_sites) if identity_abstract else prior_sites
                 if "double-free" in wanted and any(site != node.id for site in prior):
                     _record(hits, "double-free", obj, node, witness())
                 released = {(released_obj, site) for released_obj, site in released
