@@ -24,6 +24,8 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(atropos.flow_pattern_evaluator("double-free"), "typestate")
         self.assertEqual(atropos.flow_pattern_id("relational", "buffer-write"),
                          "mem.write.tainted-unbounded")
+        self.assertEqual(atropos.flow_pattern_id("missing-guard", "alloc-size"),
+                         "mem.alloc.missing-guard")
 
     def test_public_atropos_pattern_id_selects_the_internal_matcher(self):
         obj = ObjRef("object", generation="g0")
