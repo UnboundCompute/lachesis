@@ -448,6 +448,26 @@ def _semantic_event(sub, operation, generations=None):
                                    generations.get(source_key, "g0"), operation.node)
                       if operation.source is not None else None)
             events = [Event.write(storage_obj, access_path, operation.line, value=value)]
+            # An address-of a function-local stored into an out-parameter or
+            # persistent slot escapes the activation even though the source
+            # operation is a write rather than a return statement.  Keep this
+            # as a semantic RETURN_VALUE fact so the typestate matcher can
+            # report use-after-return without baking the sink shape into it.
+            source_root = operation.source.root if operation.source is not None else ""
+            source_id = source_root[len("decl:"):] if source_root.startswith("decl:") else None
+            source_props = sub.props(source_id) if source_id else {}
+            stack_address = bool(
+                value is not None
+                and operation.source is not None
+                and "&" in operation.source.selectors
+                and source_id
+                and (source_props.get("owner_function_id")
+                     or source_props.get("function_id")))
+            if stack_address:
+                events.append(Event(EventKind.RETURN_VALUE, obj=value,
+                                    line=operation.line,
+                                    facts={"stack_local": True,
+                                           "escape_store": True}))
             # A declaration with no owning function is persistent program storage;
             # storing a live object there is an explicit escape from the current
             # activation.  Do not apply this shortcut to ordinary field stores:

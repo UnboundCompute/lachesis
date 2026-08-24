@@ -1175,6 +1175,15 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertIn("uaf.deref", patterns)
         self.assertNotIn("leak", patterns)
 
+    def test_stack_address_store_is_use_after_return(self):
+        local = ObjRef("local", ("&",), generation="g0")
+        g = self._graph([
+            ("store", Event(EventKind.RETURN_VALUE, obj=local,
+                             facts={"stack_local": True, "escape_store": True})),
+            ("exit", None),
+        ], [("store", "exit")])
+        self.assertIn("use-after-return", {hit["pattern"] for hit in match_graph(g)})
+
     def test_pointer_slot_value_propagates_to_release_and_read(self):
         item = ObjRef("item", generation="g0")
         slot = ObjRef("items", ("[i]",), generation="g0")
