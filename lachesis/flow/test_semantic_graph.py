@@ -163,6 +163,33 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0].metadata["source_site"], "read_site")
 
+    def test_cfg_ir_source_calls_replace_entry_launch(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "source_reachable": True,
+                "source_calls": [{"node": "source", "callee": "read",
+                                  "line": 2}],
+                "calls": [{"node": "source", "callee": "read", "line": 2,
+                           "args": []}],
+                "cfg": {
+                    "nodes": ("entry", "source", "exit"),
+                    "entry": "entry",
+                    "succ": {
+                        "entry": ({"target": "source"},),
+                        "source": ({"target": "exit"},),
+                        "exit": (),
+                    },
+                },
+            },
+        }
+        graph = build_semantic_graph(object(), functions, {"main": []},
+                                     lang="python", graph={})
+        launches = [graph.nodes[node_id] for node_id in graph.source_reachable]
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0].metadata["source_site"], "source")
+
     def test_frontend_ir_fallback_routes_sink_facts_through_atropos(self):
         from unittest.mock import patch
         from .emit import build_semantic_graph
