@@ -132,6 +132,40 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["pattern"] == "uaf.deref"
                             for hit in match_graph(graph)))
 
+    def test_frontend_ir_callback_formal_is_stitched_to_function_target(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "is_source": True, "source_reachable": True,
+                "events": [{"kind": "alloc", "var": "p", "line": 1},
+                           {"kind": "use", "var": "p", "line": 4}],
+                "calls": [{"callee": "dispatch", "line": 2,
+                           "args": [{"pos": 0, "root": "handler"},
+                                    {"pos": 1, "root": "p"}]}],
+            },
+            "dispatch": {
+                "params": ["callback", "value"],
+                "events": [],
+                "calls": [{"callee": "callback", "line": 3,
+                           "args": [{"pos": 0, "root": "value"}]}],
+            },
+            "handler": {
+                "params": ["p"],
+                "events": [{"kind": "free", "var": "p", "line": 3}],
+                "calls": [],
+            },
+        }
+        graph = build_semantic_graph(
+            object(), functions,
+            {"main": ["dispatch"], "dispatch": [], "handler": []},
+            lang="python", graph={},
+        )
+        self.assertTrue(any(edge.kind == "call" and edge.target.startswith("handler:")
+                            for edges in graph.edges.values() for edge in edges))
+        self.assertTrue(any(hit["pattern"] == "uaf.deref"
+                            for hit in match_graph(graph)))
+
     def test_frontend_ir_lifecycle_calls_use_atropos_roles(self):
         from .emit import build_semantic_graph
 

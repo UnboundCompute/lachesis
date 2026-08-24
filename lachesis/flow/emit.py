@@ -626,6 +626,32 @@ def _source_call_tokens(record):
     return tokens
 
 
+def _callback_dispatch_targets(functions):
+    """Map callback formals to function-valued actuals in the projected IR."""
+    targets = defaultdict(set)
+    for caller_ir in functions.values():
+        for call in caller_ir.get("calls", ()):
+            callee = call.get("callee")
+            callee_ir = functions.get(callee)
+            if callee_ir is None:
+                continue
+            formals = tuple(callee_ir.get("params", ()))
+            for argument in call.get("args", ()):
+                position = argument.get("pos")
+                actual = argument.get("root")
+                if (isinstance(position, int) and position < len(formals)
+                        and actual in functions and actual != callee):
+                    targets[(callee, formals[position])].add(actual)
+    return targets
+
+
+def _dispatch_targets(functions, callback_targets, caller, call):
+    callee = call.get("callee")
+    if callee in functions:
+        return (callee,)
+    return tuple(sorted(callback_targets.get((caller, callee), ())))
+
+
 def _build_cfg_ir_semantic_graph(functions, *, lang):
     """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
     result = SkeletonGraph(language=lang)
@@ -633,6 +659,7 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
     pending_calls = []
     sink_catalog = atropos.sink_catalog(lang)
     norm = normalizer(lang)
+    callback_targets = _callback_dispatch_targets(functions)
 
     def ref(value):
         return ObjRef(str(value), generation="g0") if value else None
@@ -741,7 +768,8 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                         }), fragment=fn, source_reachable=reachable)
                     result.add_edge(tail, sink_id)
                     tail = sink_id
-                if callee not in functions:
+                targets = _dispatch_targets(functions, callback_targets, fn, item)
+                if not targets:
                     continue
                 enter = f"{fn}:ir:call:{index}:enter"
                 continuation = f"{fn}:ir:call:{index}:return"
@@ -752,24 +780,25 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                                                     line=item.get("line")), fragment=fn,
                                 source_reachable=reachable)
                 result.add_edge(tail, enter)
-                formals = tuple(functions[callee].get("params", ()))
-                bindings = []
-                for argument in item.get("args", ()):
-                    position = argument.get("pos")
-                    if isinstance(position, int) and position < len(formals):
-                        actual = ref(argument.get("root") or argument.get("var"))
-                        formal = ref(formals[position])
-                        if actual is not None and formal is not None:
-                            bindings.append((formal, actual))
-                return_bindings = []
-                receiver = ref(item.get("assigned"))
-                if receiver is not None:
-                    for returned in functions[callee].get("returns", ()):
-                        returned_ref = ref(returned.get("var"))
-                        if returned_ref is not None and returned.get("kind") in {"var", "call"}:
-                            return_bindings.append((receiver, returned_ref))
-                pending_calls.append((enter, callee, continuation, tuple(bindings),
-                                      tuple(return_bindings), _ir_guard_proofs(item)))
+                for target in targets:
+                    formals = tuple(functions[target].get("params", ()))
+                    bindings = []
+                    for argument in item.get("args", ()):
+                        position = argument.get("pos")
+                        if isinstance(position, int) and position < len(formals):
+                            actual = ref(argument.get("root") or argument.get("var"))
+                            formal = ref(formals[position])
+                            if actual is not None and formal is not None:
+                                bindings.append((formal, actual))
+                    return_bindings = []
+                    receiver = ref(item.get("assigned"))
+                    if receiver is not None:
+                        for returned in functions[target].get("returns", ()):
+                            returned_ref = ref(returned.get("var"))
+                            if returned_ref is not None and returned.get("kind") in {"var", "call"}:
+                                return_bindings.append((receiver, returned_ref))
+                    pending_calls.append((enter, target, continuation, tuple(bindings),
+                                          tuple(return_bindings), _ir_guard_proofs(item)))
                 tail = continuation
             tails[cfg_node] = tail
         for cfg_node in cfg_nodes:
@@ -845,6 +874,7 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     pending_calls = []
     sink_catalog = atropos.sink_catalog(lang)
     norm = normalizer(lang)
+    callback_targets = _callback_dispatch_targets(functions)
 
     def ref(value):
         return ObjRef(str(value), generation="g0") if value else None
@@ -934,7 +964,8 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                                 source_influenced=bool(facts["tainted"]))
                 result.add_edge(previous, sink_id)
                 previous = sink_id
-            if callee not in functions:
+            targets = _dispatch_targets(functions, callback_targets, fn, item)
+            if not targets:
                 continue
             enter = f"{fn}:ir:call:{index}:enter"
             continuation = f"{fn}:ir:call:{index}:return"
@@ -944,24 +975,25 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                             Event(EventKind.SEAM_EXIT, line=item.get("line")),
                             fragment=fn, source_reachable=reachable)
             result.add_edge(previous, enter)
-            formals = tuple(functions[callee].get("params", ()))
-            bindings = []
-            for argument in item.get("args", ()):
-                position = argument.get("pos")
-                if isinstance(position, int) and position < len(formals):
-                    actual = ref(argument.get("root") or argument.get("var"))
-                    formal = ref(formals[position])
-                    if actual is not None and formal is not None:
-                        bindings.append((formal, actual))
-            return_bindings = []
-            receiver = ref(item.get("assigned"))
-            if receiver is not None:
-                for returned in functions[callee].get("returns", ()):
-                    returned_ref = ref(returned.get("var"))
-                    if returned_ref is not None and returned.get("kind") in {"var", "call"}:
-                        return_bindings.append((receiver, returned_ref))
-            pending_calls.append((enter, callee, continuation, tuple(bindings),
-                                  tuple(return_bindings), _ir_guard_proofs(item)))
+            for target in targets:
+                formals = tuple(functions[target].get("params", ()))
+                bindings = []
+                for argument in item.get("args", ()):
+                    position = argument.get("pos")
+                    if isinstance(position, int) and position < len(formals):
+                        actual = ref(argument.get("root") or argument.get("var"))
+                        formal = ref(formals[position])
+                        if actual is not None and formal is not None:
+                            bindings.append((formal, actual))
+                return_bindings = []
+                receiver = ref(item.get("assigned"))
+                if receiver is not None:
+                    for returned in functions[target].get("returns", ()):
+                        returned_ref = ref(returned.get("var"))
+                        if returned_ref is not None and returned.get("kind") in {"var", "call"}:
+                            return_bindings.append((receiver, returned_ref))
+                pending_calls.append((enter, target, continuation, tuple(bindings),
+                                      tuple(return_bindings), _ir_guard_proofs(item)))
             previous = continuation
             index += 1
         if reachable and not any(

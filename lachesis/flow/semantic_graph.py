@@ -1037,10 +1037,14 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             # later call), creating spurious cross-call lifecycle matches.
             # Keep the pair available below for null/non-null transfer while
             # keeping it out of identity canonicalization.
-            next_bindings.update(
-                (formal, actual) for formal, actual in edge.binding
-                if actual.base != "__return__"
-            )
+            for formal, actual in edge.binding:
+                if actual.base == "__return__":
+                    continue
+                # Compose a callee formal with the caller's current identity
+                # before entering the seam.  Nested callbacks otherwise form
+                # cycles such as ``handler.p -> dispatch.value -> caller.p``
+                # and lose the concrete object at the callee event.
+                next_bindings[formal] = canonical(actual) or actual
             next_aliases = dict(aliases)
             next_slot_bindings = dict(slot_bindings)
             next_abstract_bindings = dict(abstract_bindings)
