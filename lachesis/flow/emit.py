@@ -1410,6 +1410,57 @@ def _cfg_guard_proofs(sub, node, target_index, target_count):
     if target_count != 2:
         return ()
     condition = (sub.label(node) or "").replace(" ", "")
+
+    def split_boolean(value, operator):
+        """Split one top-level boolean operator without parsing expressions."""
+        depth = 0
+        terms = []
+        start = 0
+        index = 0
+        while index < len(value) - 1:
+            char = value[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+            if depth == 0 and value[index:index + 2] == operator:
+                terms.append(value[start:index])
+                start = index + 2
+                index += 2
+                continue
+            index += 1
+        if terms:
+            terms.append(value[start:])
+        return tuple(term.strip("()") for term in terms)
+
+    def boolean_null_proofs(value):
+        # For A && B, the true arm proves both terms. For A || B, only the
+        # false arm proves both terms false. The other arm is a disjunction
+        # and cannot be represented as a conjunction of GuardProof values.
+        conjunction = split_boolean(value, "&&")
+        disjunction = split_boolean(value, "||")
+        if conjunction:
+            terms, constrained = conjunction, target_index == 0
+        elif disjunction:
+            terms, constrained = disjunction, target_index == 1
+        else:
+            return None
+        if not constrained:
+            return ()
+        proofs = []
+        for term in terms:
+            true_kind = "ISNULL" if term.startswith("!") else "NONNULL"
+            variable = term[1:] if term.startswith("!") else term
+            if not re.match(r"^\**[A-Za-z_]\w*(?:(?:->|\.)[A-Za-z_]\w*)*$", variable):
+                return ()
+            kind = (true_kind if conjunction
+                    else ("NONNULL" if true_kind == "ISNULL" else "ISNULL"))
+            proofs.append(GuardProof(kind, f"{variable}#g0"))
+        return tuple(proofs)
+
+    compound = boolean_null_proofs(condition)
+    if compound is not None:
+        return compound
     variable = None
     true_kind = None
     if condition.startswith("!"):

@@ -272,6 +272,38 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual([(p.kind, p.value) for p in false_proofs],
                          [("ISNULL", "buffer->data#g0")])
 
+    def test_compound_null_guards_preserve_only_provable_arm_facts(self):
+        class Sub:
+            @staticmethod
+            def label(_node):
+                return "!triple || !*triple || !**triple"
+
+        true_proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
+        false_proofs = _cfg_guard_proofs(Sub(), "condition", 1, 2)
+        # The true arm means "at least one is NULL" and cannot be represented
+        # as a conjunction. The false arm proves every pointer level non-null.
+        self.assertEqual(true_proofs, ())
+        self.assertEqual([(p.kind, p.value) for p in false_proofs], [
+            ("NONNULL", "triple#g0"),
+            ("NONNULL", "*triple#g0"),
+            ("NONNULL", "**triple#g0"),
+        ])
+
+    def test_compound_nonnull_conjunction_proves_each_term(self):
+        class Sub:
+            @staticmethod
+            def label(_node):
+                return "triple && *triple && **triple"
+
+        true_proofs = _cfg_guard_proofs(Sub(), "condition", 0, 2)
+        false_proofs = _cfg_guard_proofs(Sub(), "condition", 1, 2)
+        self.assertEqual([(p.kind, p.value) for p in true_proofs], [
+            ("NONNULL", "triple#g0"),
+            ("NONNULL", "*triple#g0"),
+            ("NONNULL", "**triple#g0"),
+        ])
+        self.assertEqual(false_proofs, ())
+
     def test_atropos_sink_history_matches_size_mismatch(self):
         events = [
             ("alloc", Event(EventKind.SINK, obj=ObjRef("buf"), facts={
