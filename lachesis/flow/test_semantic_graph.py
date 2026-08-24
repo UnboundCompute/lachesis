@@ -697,6 +697,7 @@ class SemanticGraphTests(unittest.TestCase):
                          "mem.arithmetic.overflow-before-bound")
 
     def test_pointer_arithmetic_before_validation_has_public_id(self):
+        self.assertEqual(atropos.event_evaluator("pointer_arithmetic"), "typestate")
         base = ObjRef("buffer")
         derived = ObjRef("location")
         events = [
