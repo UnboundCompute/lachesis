@@ -1071,10 +1071,20 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 # writes made inside a callee survive at the caller.
                 candidates = [source for source in next_bindings
                               if source.base == value.base
+                              and source not in seen_bindings
                               and value.path[:len(source.path)] == source.path]
                 if candidates:
                     source = max(candidates, key=lambda item: len(item.path))
                     target = next_bindings[source]
+                    # A same-base root binding such as ``m -> m->name`` is
+                    # already a complete local identity at this boundary.
+                    # Prefixing the unmatched suffix would turn every seam
+                    # rebase into ``m->name->name`` (and repeat indefinitely
+                    # through shared callees).  Cross-base and field-rooted
+                    # bindings still compose normally.
+                    if (source.path == () and target.base == value.base
+                            and target.path):
+                        return value
                     value = ObjRef(target.base,
                                    target.path + value.path[len(source.path):],
                                    target.generation)

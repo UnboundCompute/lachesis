@@ -769,6 +769,31 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual([hit["pattern"] for hit in hits], ["uaf.deref"])
         self.assertEqual(hits[0]["object"], payload.render())
 
+    def test_seam_rebase_does_not_repeat_same_base_field_suffix(self):
+        caller_obj = ObjRef("n", generation="g0")
+        alias = caller_obj.child("*borrowed_name")
+        owned = caller_obj.child("*meta").child("*name")
+        callee_obj = ObjRef("m", generation="g0")
+        graph = SkeletonGraph()
+        graph.add_node("start", Event(EventKind.DERIVE, obj=alias, value=owned),
+                       fragment="caller")
+        graph.add_node("enter", Event(EventKind.SEAM_ENTER), fragment="caller")
+        graph.add_node("free", Event.release(callee_obj.child("*name")),
+                       fragment="callee")
+        graph.add_node("exit", Event(EventKind.SEAM_EXIT), fragment="caller")
+        graph.add_node("use", Event.pass_value(alias), fragment="caller")
+        graph.add_fragment("caller", "start", ["use"])
+        graph.add_fragment("callee", "free", ["free"])
+        graph.source_reachable = {"start"}
+        graph.add_edge("start", "enter")
+        graph.add_edge("enter", "free", kind="call", return_to="exit",
+                       binding=((callee_obj, caller_obj.child("*meta")),))
+        graph.add_edge("free", "exit", kind="return")
+        graph.add_edge("exit", "use")
+
+        hits = match_graph(graph)
+        self.assertIn("use.dangling", {hit["pattern"] for hit in hits})
+
     def test_abstract_identity_prevents_same_named_local_false_uaf(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()
