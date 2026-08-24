@@ -415,6 +415,23 @@ def _native_object_substrate(graph):
     return "DeclRefExpr" in syntax and "CallExpr" in syntax
 
 
+def _ir_guard_proofs(call):
+    """Translate neutral call-site guard facts into matcher-compatible proofs."""
+    proofs = []
+    for guard in call.get("guards", ()):
+        canon = str(guard.get("canon") or "")
+        var = str(guard.get("var") or "")
+        compact = canon.replace(" ", "").lower()
+        value = f"{var}#g0" if var else canon
+        if any(token in compact for token in ("!=null", "null!=", "isnotnone", "isnotnull")):
+            proofs.append(GuardProof("NONNULL", value))
+        elif any(token in compact for token in ("==null", "null==", "isnone", "isnull")):
+            proofs.append(GuardProof("ISNULL", value))
+        elif canon:
+            proofs.append(GuardProof("VALUE", canon))
+    return tuple(proofs)
+
+
 def _build_cfg_ir_semantic_graph(functions, *, lang):
     """Build the F-IR graph over neutral CFG edges when no interprocedural seam is needed."""
     result = SkeletonGraph(language=lang)
@@ -554,7 +571,7 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                         if returned_ref is not None and returned.get("kind") in {"var", "call"}:
                             return_bindings.append((receiver, returned_ref))
                 pending_calls.append((enter, callee, continuation, tuple(bindings),
-                                      tuple(return_bindings)))
+                                      tuple(return_bindings), _ir_guard_proofs(item)))
                 tail = continuation
             tails[cfg_node] = tail
         for cfg_node in cfg_nodes:
@@ -590,9 +607,9 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
         exits[fn] = function_exits
         result.add_fragment(fn, entry, function_exits,
                             params=record.get("params", ()))
-    for enter, callee, continuation, bindings, return_bindings in pending_calls:
+    for enter, callee, continuation, bindings, return_bindings, guards in pending_calls:
         result.add_edge(enter, entries[callee], kind="call", return_to=continuation,
-                        binding=bindings)
+                        binding=bindings, guard=guards)
         for callee_exit in exits[callee]:
             result.add_edge(callee_exit, continuation, kind="return",
                             binding=return_bindings)
@@ -736,7 +753,7 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
                     if returned_ref is not None and returned.get("kind") in {"var", "call"}:
                         return_bindings.append((receiver, returned_ref))
             pending_calls.append((enter, callee, continuation, tuple(bindings),
-                                  tuple(return_bindings)))
+                                  tuple(return_bindings), _ir_guard_proofs(item)))
             previous = continuation
             index += 1
         exit_node = f"{fn}:ir:exit"
@@ -745,9 +762,9 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
         exits[fn] = {exit_node}
         result.add_fragment(fn, entry, exits[fn], params=record.get("params", ()))
 
-    for enter, callee, continuation, bindings, return_bindings in pending_calls:
+    for enter, callee, continuation, bindings, return_bindings, guards in pending_calls:
         result.add_edge(enter, entries[callee], kind="call", return_to=continuation,
-                        binding=bindings)
+                        binding=bindings, guard=guards)
         for callee_exit in exits[callee]:
             result.add_edge(callee_exit, continuation, kind="return",
                             binding=return_bindings)

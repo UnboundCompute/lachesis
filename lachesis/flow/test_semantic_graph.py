@@ -208,6 +208,16 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["line"] == 4 for hit in hits))
         self.assertFalse(any(hit["line"] == 3 for hit in hits))
 
+    def test_frontend_ir_call_guards_use_typed_null_proofs(self):
+        from .emit import _ir_guard_proofs
+
+        proofs = _ir_guard_proofs({"guards": [
+            {"var": "p", "canon": "p != NULL"},
+            {"var": "q", "canon": "q == NULL"},
+        ]})
+        self.assertEqual([(proof.kind, proof.value) for proof in proofs], [
+            ("NONNULL", "p#g0"), ("ISNULL", "q#g0")])
+
     def _graph(self, events, edges):
         g = SkeletonGraph()
         for node, event in events:
