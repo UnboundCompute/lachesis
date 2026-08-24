@@ -8,7 +8,8 @@ changing the pipeline contract.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 import hashlib
 import json
 import os
@@ -62,8 +63,43 @@ class FragmentStore:
     @staticmethod
     def _fingerprint(value: Any) -> str:
         """Stable content identity for semantic inputs rebuilt by each pass."""
+        def normalize(item):
+            # State artifacts contain AbstractState/AnalysisResult instances whose
+            # default repr includes insertion-ordered dicts and unordered sets.  The
+            # same semantic analysis can therefore produce a different cache key
+            # when summaries are rebuilt in another process.  Normalize the small
+            # value protocol used by the analysis instead of falling back to repr.
+            if item is None or isinstance(item, (str, int, float, bool)):
+                return item
+            if isinstance(item, Enum):
+                return {"__enum__": f"{type(item).__qualname__}:{item.value}"}
+            if isinstance(item, Mapping):
+                pairs = [(normalize(key), normalize(val))
+                         for key, val in item.items()]
+                pairs.sort(key=lambda pair: json.dumps(pair[0], sort_keys=True,
+                                                        separators=(",", ":"),
+                                                        default=str))
+                return {"__mapping__": pairs}
+            if isinstance(item, (set, frozenset)):
+                values = [normalize(val) for val in item]
+                values.sort(key=lambda val: json.dumps(val, sort_keys=True,
+                                                        separators=(",", ":"),
+                                                        default=str))
+                return {"__set__": values}
+            if isinstance(item, (list, tuple)):
+                return {"__tuple__": [normalize(val) for val in item]}
+            if is_dataclass(item):
+                return {"__type__": type(item).__qualname__,
+                        "fields": {field.name: normalize(getattr(item, field.name))
+                                   for field in fields(item)}}
+            attrs = getattr(item, "__dict__", None)
+            if attrs is not None:
+                return {"__type__": type(item).__qualname__,
+                        "attrs": normalize(attrs)}
+            return {"__type__": type(item).__qualname__, "value": repr(item)}
+
         try:
-            encoded = json.dumps(value, sort_keys=True, default=repr,
+            encoded = json.dumps(normalize(value), sort_keys=True,
                                  separators=(",", ":"))
         except (TypeError, ValueError):
             encoded = repr(value)

@@ -253,6 +253,16 @@ class CoverageSchedulerTests(unittest.TestCase):
         })
         self.assertNotEqual(first, second)
 
+    def test_fragment_cache_fingerprint_is_order_independent_for_state_shapes(self):
+        store = FragmentStore()
+        first = store._fingerprint({
+            "point_states": {"n1": {"facts": {"b", "a"}, "env": {"x": 1, "y": 2}}},
+        })
+        second = store._fingerprint({
+            "point_states": {"n1": {"env": {"y": 2, "x": 1}, "facts": {"a", "b"}}},
+        })
+        self.assertEqual(first, second)
+
     def test_fragment_cache_reuses_a_coverage_superset(self):
         store = FragmentStore()
         functions = {"worker": {}}
