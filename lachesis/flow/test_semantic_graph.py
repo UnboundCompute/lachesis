@@ -1095,6 +1095,42 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertIn("uaf.deref",
                       {hit["pattern"] for hit in match_graph(g)})
 
+    def test_pointer_slot_binding_rebases_across_call_return_seam(self):
+        value = ObjRef("new", generation="g0")
+        formal = ObjRef("out", generation="g0")
+        actual = ObjRef("holder", generation="g0")
+        g = SkeletonGraph()
+        nodes = [
+            ("launch", None, "main"),
+            ("enter", Event(EventKind.SEAM_ENTER), "main"),
+            ("hentry", None, "helper"),
+            ("origin", Event.origin(value), "helper"),
+            ("store", Event.write(formal.child("*"), value=value), "helper"),
+            ("hexit", None, "helper"),
+            ("cont", Event(EventKind.SEAM_EXIT), "main"),
+            ("release", Event.release(actual.child("*")), "main"),
+            ("read", Event.read(actual.child("*")), "main"),
+            ("exit", None, "main"),
+        ]
+        for node, event, fragment in nodes:
+            g.add_node(node, event, fragment=fragment)
+        g.add_edge("launch", "enter")
+        g.add_edge("enter", "hentry", kind="call", return_to="cont",
+                   binding=((formal, actual),))
+        g.add_edge("hentry", "origin")
+        g.add_edge("origin", "store")
+        g.add_edge("store", "hexit")
+        g.add_edge("hexit", "cont", kind="return")
+        g.add_edge("cont", "release")
+        g.add_edge("release", "read")
+        g.add_edge("read", "exit")
+        g.add_fragment("main", "launch", ("exit",))
+        g.add_fragment("helper", "hentry", ("hexit",), params=("out",))
+        g.source_reachable.add("launch")
+        g.validate()
+        self.assertIn("uaf.deref",
+                      {hit["pattern"] for hit in match_graph(g)})
+
     def test_witness_keeps_the_edge_taken_when_parallel_guards_share_nodes(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()

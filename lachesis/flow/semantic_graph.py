@@ -1054,7 +1054,24 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 while value in next_bindings and value not in seen_bindings:
                     seen_bindings.add(value)
                     value = next_bindings[value]
+                # Seam bindings can target a field/deref access path (for
+                # example ``out->data`` to ``buffer->data``), not only a bare
+                # formal root. Compose the unmatched suffix so pointer-slot
+                # writes made inside a callee survive at the caller.
+                candidates = [source for source in next_bindings
+                              if source.base == value.base
+                              and value.path[:len(source.path)] == source.path]
+                if candidates:
+                    source = max(candidates, key=lambda item: len(item.path))
+                    target = next_bindings[source]
+                    value = ObjRef(target.base,
+                                   target.path + value.path[len(source.path):],
+                                   target.generation)
                 return value
+            next_slot_bindings = {
+                rebase(slot): rebase(value)
+                for slot, value in next_slot_bindings.items()
+            }
             next_origins = {rebased for origin in origins
                             if (rebased := rebase(origin)) is not None}
             next_released = {(rebased, site) for released_obj, site in released
