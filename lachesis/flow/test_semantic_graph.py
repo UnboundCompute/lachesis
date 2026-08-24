@@ -1270,6 +1270,19 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_fragment("main", "origin", ("exit",))
         self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_aggregate_escape_keeps_owned_field_allocation_live(self):
+        aggregate = ObjRef("b", generation="g0")
+        field = aggregate.child("*data")
+        g = self._graph([
+            ("aggregate", Event.origin(aggregate)),
+            ("field", Event.origin(field)),
+            ("return", Event(EventKind.RETURN_VALUE, obj=aggregate)),
+            ("escape", Event.escape(aggregate)),
+            ("exit", None),
+        ], [("aggregate", "field"), ("field", "return"),
+            ("return", "escape"), ("escape", "exit")])
+        self.assertNotIn("leak", {hit["pattern"] for hit in match_graph(g)})
+
     def test_persistent_slot_alias_observes_release_through_another_alias(self):
         obj = ObjRef("node", generation="g0")
         slot = ObjRef("cached", generation="g0")

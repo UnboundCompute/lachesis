@@ -471,11 +471,30 @@ def _semantic_event(sub, operation, generations=None):
                                     line=operation.line,
                                     facts={"stack_local": True,
                                            "escape_store": True}))
+            # A value written through a formal parameter escapes the current
+            # activation when the parameter denotes caller-owned storage.  This
+            # is the common out-parameter shape (``*out = value``), but the
+            # same fact applies to a field write through a parameter.  The
+            # object substrate normalizes the storage target of ``*out``
+            # to the formal's declaration root (the dereference is retained
+            # in its derived slot fact), so the formal-root check is the stable
+            # cross-frontend signal here.  Plain reassignment of a by-value
+            # pointer parameter is represented as CLOBBER, not this write form.
+            target_root = operation.target.root
+            target_id = (target_root[len("decl:"):]
+                         if target_root.startswith("decl:") else None)
+            target_is_formal = bool(
+                target_id
+                and target_id in {
+                    candidate.get("id")
+                    for candidate in sub.idx.nodes_of_kind("parameter")
+                })
+            if value is not None and target_is_formal:
+                events.append(Event.escape(value, operation.line))
             # A declaration with no owning function is persistent program storage;
             # storing a live object there is an explicit escape from the current
             # activation.  Do not apply this shortcut to ordinary field stores:
             # their lifetime still depends on the containing object's ownership.
-            target_root = operation.target.root
             if (value is not None and target_root.startswith("decl:")
                     and not (sub.props(target_root[len("decl:"):]).get("owner_function_id")
                              or sub.props(target_root[len("decl:"):]).get("function_id"))):
