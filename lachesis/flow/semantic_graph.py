@@ -581,8 +581,14 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         def abstract_ids(event: Event | None) -> tuple[str, ...]:
             if event is None:
                 return ()
-            values = event.facts.get("abstract_object_ids") or ()
-            return tuple(str(value) for value in values)
+            # Emitters use ``abstract_object_ids`` for the value currently
+            # carried by an operation and ``abstract_source_ids`` for the
+            # storage identity that operation came from.  Both describe the
+            # same lifetime relation at a seam (notably realloc's old object
+            # versus a stale cursor), so the matcher must retain both.
+            values = (tuple(event.facts.get("abstract_object_ids") or ()) +
+                      tuple(event.facts.get("abstract_source_ids") or ()))
+            return tuple(dict.fromkeys(str(value) for value in values))
 
         def abstract_canonical(value: str) -> str:
             visited = set()
@@ -596,7 +602,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             # and clobber recency IDs are stable enough to disambiguate local
             # declarations within one source-rooted exploration.
             text = str(value)
-            return text.startswith("('alloc',") or text.startswith("('clobber',")
+            return (text.startswith("('alloc',")
+                    or text.startswith("('clobber',")
+                    or text.startswith("('param',"))
 
         def abstract_key(value: str, obj: ObjRef | None) -> str:
             return f"{value}@{obj.generation}" if obj is not None else str(value)
@@ -829,6 +837,18 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             elif event.kind == EventKind.INVALIDATE and obj:
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
+                # Reallocation invalidates the previous incarnation just like
+                # an explicit release.  Preserve its abstract identities too,
+                # otherwise aliases whose concrete spelling differs (for
+                # example a loop-local cursor) cannot observe the stale use.
+                if event_abstract:
+                    abstract_released = {
+                        (value, site) for value, site in abstract_released
+                        if value.split("@", 1)[0] not in event_abstract
+                    }
+                    abstract_released.update(
+                        (abstract_key(value, obj), node.id)
+                        for value in event_abstract)
             elif event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE) and base and not is_null_write:
                 if ("pointer-arithmetic-before-validation" in wanted
                         and any(equivalent(pointer, base)

@@ -503,6 +503,24 @@ class SemanticGraphTests(unittest.TestCase):
         g = self._graph(events, [("start", "derive"), ("derive", "free"), ("free", "use")])
         self.assertTrue(any(h["pattern"] == "uaf.deref" for h in match_graph(g)))
 
+    def test_realloc_invalidation_matches_stale_alias_across_abstract_fields(self):
+        """A stale loop-local alias must observe realloc's old incarnation."""
+        old = ObjRef("b", ("*", "data"), "g0")
+        cursor = ObjRef("cursor", generation="g0")
+        identity = "('param', 0, ('*', 'data'))"
+        events = [
+            ("origin", Event.origin(old)),
+            ("invalidate", Event(EventKind.INVALIDATE, obj=old,
+                                  facts={"abstract_source_ids": [identity]})),
+            ("use", Event(EventKind.WRITE_STORAGE, obj=cursor, base=cursor,
+                           path="*", facts={"abstract_object_ids": [identity]})),
+        ]
+        g = self._graph(events, [("origin", "invalidate"),
+                                 ("invalidate", "use")])
+        self.assertTrue(any(hit["pattern"] == "uaf.deref"
+                            and hit["node"] == "use"
+                            for hit in match_graph(g)))
+
     def test_address_and_deref_algebra_survives_a_call_seam(self):
         """A multi-level address chain must identify the released pointee.
 
