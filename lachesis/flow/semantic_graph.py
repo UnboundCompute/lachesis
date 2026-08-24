@@ -554,6 +554,19 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         seen.add(state)
         node = graph.nodes[state.node]
         event = node.event
+        # Atropos owns the event-to-evaluator vocabulary.  Keep the old
+        # compatibility behavior when a legacy catalog has no row, but do not
+        # silently interpret an event routed to another evaluator as a
+        # lifecycle transition.  This is the seam that lets future evaluators
+        # coexist with typestate without adding another engine-side whitelist.
+        if event is not None:
+            from .patterns import evaluator_for_event
+            event_name = (event.kind.value if isinstance(event.kind, EventKind)
+                          else str(event.kind)).lower()
+            declared_evaluator = evaluator_for_event(event_name)
+            temporal_event = declared_evaluator in (None, "typestate")
+        else:
+            temporal_event = False
         released = set(state.released)
         origins = set(state.origins)
         nulls = set(state.nulls)
@@ -803,7 +816,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 pointer_arithmetic.add((obj, canonical(event.base)))
             is_null_write = (event.kind == EventKind.WRITE_STORAGE_NULL or
                              (event.kind == EventKind.WRITE_STORAGE and event.facts.get("null")))
-            if is_null_write and raw_obj:
+            if temporal_event and is_null_write and raw_obj:
                 # NULL is a value in this storage slot, not a property of the
                 # heap object reached through another alias.
                 nulls.add(raw_obj)
@@ -811,9 +824,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if obj is not None:
                     nonnull.discard(obj)
                 obj = None
-            if event.kind == EventKind.RELEASE and raw_obj in nulls:
+            if temporal_event and event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
-            if (event.kind == EventKind.RETURN_VALUE
+            if (temporal_event and event.kind == EventKind.RETURN_VALUE
                     and event.facts.get("return_null")):
                 # `__return__` is a synthetic callee-local slot.  The return
                 # edge rebases its null fact onto the caller receiver.
@@ -826,7 +839,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                  if event_abstract and all(stable_abstract(value)
                                                            for value in event_abstract)
                                  else ())
-            if event.kind == EventKind.RELEASE and obj:
+            if temporal_event and event.kind == EventKind.RELEASE and obj:
                 prior_sites = {site for released_obj, site in released if released_obj == obj}
                 abstract_prior = {
                     site for value, site in abstract_released
@@ -844,7 +857,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     }
                     abstract_released.update(
                         (abstract_key(value, obj), node.id) for value in event_abstract)
-            elif event.kind == EventKind.INVALIDATE and obj:
+            elif temporal_event and event.kind == EventKind.INVALIDATE and obj:
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
                 # Reallocation invalidates the previous incarnation just like
@@ -859,7 +872,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     abstract_released.update(
                         (abstract_key(value, obj), node.id)
                         for value in event_abstract)
-            elif event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE) and base and not is_null_write:
+            elif (temporal_event
+                  and event.kind in (EventKind.READ_STORAGE, EventKind.WRITE_STORAGE)
+                  and base and not is_null_write):
                 if ("pointer-arithmetic-before-validation" in wanted
                         and any(equivalent(pointer, base)
                                 for pointer, _source in pointer_arithmetic)):
@@ -883,8 +898,10 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     _record(hits, "null-deref", base, node, witness())
                 if "unchecked-return-deref" in wanted and base in nullable:
                     _record(hits, "unchecked-return-deref", base, node, witness())
-            elif event.kind in (EventKind.PASS_VALUE, EventKind.ESCAPE,
-                                EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
+            elif (temporal_event
+                  and event.kind in (EventKind.PASS_VALUE, EventKind.ESCAPE,
+                                     EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE)
+                  and obj):
                 abstract_freed = any(
                     abstract_key(value, obj) in {
                         released_value for released_value, _ in abstract_released}
@@ -905,7 +922,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                     _record(hits, "use-after-return", obj, node, witness())
                 if event.kind in (EventKind.RETURN_VALUE, EventKind.ESCAPE):
                     escaped.add(obj)
-            elif event.kind == EventKind.ORIGIN and obj:
+            elif temporal_event and event.kind == EventKind.ORIGIN and obj:
                 # Re-originating a slot creates a new lifetime incarnation.
                 # Keep aliases captured before this event pinned to the old
                 # object while direct references to the slot move forward.
@@ -957,7 +974,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 else:
                     nullable.discard(obj)
                     nonnull.add(obj)
-            elif event.kind == EventKind.LOST_FROM_SLOT and raw_obj:
+            elif temporal_event and event.kind == EventKind.LOST_FROM_SLOT and raw_obj:
                 # Losing the owning slot does not free the object.  A DERIVE
                 # alias remains a live root; without one, the origin is leaked.
                 nulls.add(raw_obj)

@@ -366,6 +366,24 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual(atropos.flow_pattern_id("missing-guard", "alloc-size"),
                          "mem.alloc.missing-guard")
 
+    def test_matcher_honors_atropos_event_evaluator_routing(self):
+        from unittest.mock import patch
+
+        obj = ObjRef("p", generation="g0")
+        graph = self._graph([
+            ("origin", Event.origin(obj)),
+            ("release", Event.release(obj)),
+            ("read", Event.read(obj)),
+        ], [("origin", "release"), ("release", "read")])
+
+        def route(event_kind):
+            return "presence" if event_kind in {
+                "origin", "release", "read_storage"} else None
+
+        with patch("lachesis.flow.patterns.evaluator_for_event",
+                   side_effect=route):
+            self.assertEqual(match_graph(graph), [])
+
     def test_public_atropos_pattern_id_selects_the_internal_matcher(self):
         obj = ObjRef("object", generation="g0")
         g = self._graph(
