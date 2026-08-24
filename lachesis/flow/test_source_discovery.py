@@ -24,10 +24,17 @@ class SourceDiscoveryTests(unittest.TestCase):
         self.assertIn("value", result.influenced_roots["worker"])
 
     def test_empty_catalog_keeps_structural_entry_fallback(self):
-        result = discover_sources({"main": {"callers": [], "params": (), "calls": []}},
+        result = discover_sources({"main": {"callers": [], "params": (), "calls": [],
+                                             "externally_visible": False}},
                                   {"main": []})
         self.assertEqual(result.launch_nodes, {"main": ("__entry__",)})
         self.assertEqual(result.launch_provenance, {"main": "structural"})
+
+    def test_exported_callerless_entry_is_distinguished_from_structural_fallback(self):
+        result = discover_sources({"api": {"callers": [], "params": (), "calls": [],
+                                             "externally_visible": True}},
+                                  {"api": []})
+        self.assertEqual(result.launch_provenance, {"api": "export"})
         self.assertEqual(result.sites, ())
 
 

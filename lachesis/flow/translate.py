@@ -544,6 +544,11 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
 
     return {"name": fnode.get("label"),
             "file": _props(fnode).get("file"), "line": _props(fnode).get("start_line"),
+            # Frontends with linkage metadata can distinguish an exported
+            # declaration from a file-local helper.  Missing metadata is treated
+            # as externally visible for non-C frontends, whose module/export
+            # rules are represented elsewhere in the graph.
+            "externally_visible": (_props(fnode).get("storage_class") != "static"),
             "params": params, "calls": calls, "events": events,
             "assigns": assigns, "returns": returns, "callees": callees,
             "body_node_count": body_node_count, "cfg": cfg}
@@ -635,6 +640,7 @@ def build_F(store, lang="c", *, return_graph=False):
             taxo = "UDF"
         F[n] = {
             "name": n, "file": r["file"], "line": r["line"],
+            "externally_visible": r.get("externally_visible", True),
             "taxonomy": taxo, "is_source": len(callers[n]) == 0,
             "params": r["params"],
             "udf_callees": udf_callees, "ldf_callees": ldf_callees,

@@ -101,7 +101,8 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
             continue
         if not record.get("callers"):
             launches[function] = ["__entry__"]
-            launch_provenance[function] = "structural"
+            launch_provenance[function] = (
+                "export" if record.get("externally_visible") else "structural")
 
     reachable = set(launches)
     work = list(reachable)
