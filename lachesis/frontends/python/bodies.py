@@ -40,6 +40,7 @@ from .values import ValueWalk
 
 # 3.11 added ``except*``; on 3.10 there is no such node and the tuple is empty.
 TRY_NODES = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
+MATCH_NODE = getattr(ast, "Match", None)
 
 # lachesis/core/overlays/control_flow.py switches on these strings
 # (control_flow.py:11-14), so the vocabulary is theirs and not ours.
@@ -49,13 +50,14 @@ CONTROL_KIND = {
     # three-clause loop, so it is "for-each" and never "for".
     ast.For: "for-each", ast.AsyncFor: "for-each",
     ast.While: "while",
-    ast.Match: "switch",
     ast.Return: "return", ast.Raise: "throw",
     ast.Break: "break", ast.Continue: "continue",
     ast.Assign: "declaration", ast.AnnAssign: "declaration",
     ast.AugAssign: "declaration",
     ast.Expr: "expression",
 }
+if MATCH_NODE is not None:
+    CONTROL_KIND[MATCH_NODE] = "switch"
 CONTROL_KIND.update({node: "try" for node in TRY_NODES})
 
 
@@ -366,7 +368,7 @@ class BodyWalk:
             self._else(node.orelse, frame, node_id)
         elif isinstance(node, TRY_NODES):
             self._try(node, node_id, frame)
-        elif isinstance(node, ast.Match):
+        elif MATCH_NODE is not None and isinstance(node, MATCH_NODE):
             self._match(node, node_id, frame)
         elif isinstance(node, ast.Return):
             self._return(node, node_id, frame, "return", node.value)

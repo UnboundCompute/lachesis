@@ -629,7 +629,7 @@ def _build_cfg_ir_semantic_graph(functions, *, lang):
                     continue
                 callee = item.get("callee")
                 catalog_entry = sink_catalog.get(callee) or {}
-                for arg_pos in catalog_entry.get("sink_args", ()):
+                for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
                     argument = next((arg for arg in item.get("args", ())
                                      if arg.get("pos") == arg_pos), None)
                     if argument is None:
@@ -788,15 +788,13 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
             0 if item[0] == "event" else 1,
         ))
         previous = entry
-        index = 0
-        for kind, item in items:
+        for index, (kind, item) in enumerate(items):
             if kind == "event":
                 previous = emit_event(fn, index, item, previous, reachable)
-                index += 1
                 continue
             callee = item.get("callee")
             catalog_entry = sink_catalog.get(callee) or {}
-            for arg_pos in catalog_entry.get("sink_args", ()):
+            for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
                 argument = next((arg for arg in item.get("args", ())
                                  if arg.get("pos") == arg_pos), None)
                 if argument is None:
@@ -1188,7 +1186,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                 if call.get("node") != n:
                     continue
                 catalog_entry = sink_catalog.get(call.get("callee")) or {}
-                for arg_pos in catalog_entry.get("sink_args", ()):
+                for arg_pos in dict.fromkeys(catalog_entry.get("sink_args", ())):
                     argument = next((arg for arg in call.get("args", ())
                                      if arg.get("pos") == arg_pos), None)
                     if argument is None:

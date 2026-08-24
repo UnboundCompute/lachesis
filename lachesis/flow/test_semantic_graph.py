@@ -112,6 +112,37 @@ class SemanticGraphTests(unittest.TestCase):
         hits = match_graph(graph)
         self.assertTrue(any(hit["pattern"] == "relational" for hit in hits))
 
+    def test_frontend_ir_deduplicates_catalog_sink_arguments_and_call_ordinals(self):
+        from unittest.mock import patch
+        from .emit import build_semantic_graph
+
+        functions = {
+            "entry": {
+                "is_source": True,
+                "source_reachable": True,
+                "events": [],
+                "calls": [
+                    {"callee": "execute", "line": 1,
+                     "args": [{"pos": 0, "root": "cursor"}]},
+                    {"callee": "execute", "line": 2,
+                     "args": [{"pos": 0, "root": "cursor"}]},
+                ],
+            },
+        }
+        # A catalog merger may contribute the same argument position through
+        # multiple declarations.  The graph must still contain one event per
+        # call, with distinct stable node IDs.
+        catalog = {"execute": {"sink_args": (0, 0),
+                                "kinds": {0: "sql-injection"}}}
+        with patch("lachesis.flow.emit.atropos.sink_catalog",
+                   return_value=catalog):
+            graph = build_semantic_graph(object(), functions, {"entry": []},
+                                         lang="python", graph={})
+        sinks = [node_id for node_id, node in graph.nodes.items()
+                 if node.event is not None and node.event.kind == EventKind.SINK]
+        self.assertEqual(len(sinks), 2)
+        self.assertEqual(len(set(sinks)), 2)
+
     def test_frontend_ir_fallback_binds_returned_allocations(self):
         from .emit import build_semantic_graph
 
