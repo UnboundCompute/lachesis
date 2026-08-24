@@ -1110,12 +1110,21 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         hit["witness_edges"] = edge_trace
         launch_contexts = [node_id for node_id in witness
                            if node_id in graph.source_reachable]
-        hit["source_context"] = launch_contexts[0] if launch_contexts else None
+        launch_id = launch_contexts[0] if launch_contexts else None
+        launch_node = graph.nodes.get(launch_id) if launch_id else None
+        launch_event = launch_node.event if launch_node else None
+        hit["source_context"] = launch_id
+        hit["source_function"] = launch_node.fragment if launch_node else None
+        hit["source_site"] = (launch_node.metadata.get("source_site")
+                               if launch_node else None)
         hit["witness_complete"] = len(edge_trace) == max(0, len(witness) - 1)
         first = trace[0] if trace else {}
         hit["source_node"] = first.get("node")
         hit["source_entry"] = first.get("fragment")
-        hit["source_line"] = first.get("line")
+        hit["source_line"] = (
+            launch_event.line if launch_event and launch_event.line is not None
+            else (launch_node.metadata.get("source_line") if launch_node else None)
+            if launch_node else first.get("line"))
     return sorted(hits.values(), key=lambda x: (x["pattern"], x.get("line") or -1))
 
 
