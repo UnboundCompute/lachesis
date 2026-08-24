@@ -668,9 +668,8 @@ TOOLS = [
                    "description": "maximum evidence rows returned"}}}},
     {"name": "object_lifecycle",
      "description": "Read-only. Report what lifecycle evidence the graph holds for a value or "
-                    "function — the alloc/init/use constructors currently emitted — and name the "
-                    "frontier honestly: full created-to-released state machines stay blocked until "
-                    "free/deref constructors ship, so this does not yet detect leak / use-after-free. "
+                    "function — Pass 3 alloc/release/deref/alias/generation events and its "
+                    "source-rooted coverage — plus the matcher leads that relate them. "
                     "Give `value` or `function` to scope it; omit both for the capability report. "
                     "Prefer `field_history` for one field's events and `flow_pass` for the composed "
                     "interprocedural summary.",
@@ -682,7 +681,7 @@ TOOLS = [
     {"name": "error_path_summary",
      "description": "Read-only. For one function, report its exit paths (returns / error branches) "
                     "and the resource-handling evidence on them, plus the honest frontier: complete "
-                    "transfer/release summaries stay blocked until free/deref constructors ship. Use "
+                    "transfer summaries remain a separate frontier from the lifecycle graph. Use "
                     "it to see how a function leaves on its error paths; pair with `guards` and "
                     "`flow_pass` for the interprocedural picture.",
      "inputSchema": {"type": "object", "properties": {
@@ -999,6 +998,44 @@ def _capability_blocked(name, reason, prerequisite):
             "reason": reason, "prerequisite": prerequisite}
 
 
+def _semantic_lifecycle_report(c, args):
+    """Expose Pass 3 lifecycle evidence without introducing a second matcher."""
+    bundle = c.flow_bundle
+    semantic = bundle.get("semantic_graph")
+    if semantic is None:
+        return _capability_blocked("object_lifecycle", "no semantic graph was produced",
+                                   "Pass 3 semantic graph")
+    payload = semantic.to_dict()
+    raw_nodes = payload.get("nodes") or {}
+    nodes = ([{"id": node_id, **(node or {})} for node_id, node in raw_nodes.items()]
+             if isinstance(raw_nodes, dict) else list(raw_nodes))
+    value, function = args.get("value"), args.get("function")
+    lifecycle = {"alloc_attempt", "origin", "release", "invalidate", "read_storage",
+                 "write_storage", "write_storage_null", "use", "escape", "derive",
+                 "uninitialized", "realloc_attempt", "realloc_failed", "lost_from_slot"}
+    events = []
+    for node in nodes:
+        props, event = node.get("properties") or {}, node.get("event") or {}
+        kind = str(props.get("event_kind") or event.get("kind") or "").lower()
+        kind = kind.removeprefix("eventkind.")
+        obj = props.get("object_id") or props.get("target_id") or props.get("obj") or event.get("obj")
+        owner = props.get("owner_function_id") or node.get("fragment") or props.get("function")
+        if kind not in lifecycle:
+            continue
+        if value and value not in {str(obj), str(node.get("label")), str(node.get("id"))}:
+            continue
+        if function and function not in {str(owner), str(props.get("owner_function")), str(node.get("fragment"))}:
+            continue
+        events.append({"node": node.get("id"), "kind": kind, "object": obj,
+                       "function": owner, "line": props.get("line") or event.get("line"),
+                       "label": node.get("label")})
+    events.sort(key=lambda item: (item.get("function") or "", item.get("line") or 0,
+                                  item["node"] or ""))
+    return {"move": "object_lifecycle", "supported": True, "status": "available",
+            "events": events, "count": len(events), "coverage": bundle.get("coverage"),
+            "lifetime": bundle.get("lifetime", {})}
+
+
 def _wrapper_model(store, token, limit=50):
     """Infer wrapper roles from nearby callee names and graph effects."""
     seeds = _seeds(store, token)
@@ -1310,9 +1347,7 @@ def call_tool(name, args, format=None):
             name, "numeric range constraints are not emitted by the current graph",
             "local numeric model"), fmt, offset, limit)
     if name == "object_lifecycle":
-        return _emit(name, _capability_blocked(
-            name, "lifecycle constructors are not yet emitted",
-            "memory.free and memory.deref constructors"), fmt, offset, limit)
+        return _emit(name, _semantic_lifecycle_report(c, args), fmt, offset, limit)
     if name == "error_path_summary":
         return _emit(name, _capability_blocked(
             name, "release/transfer events are not yet emitted on exits",
