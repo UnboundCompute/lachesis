@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any, Iterable
 
 
@@ -297,6 +298,7 @@ class _State:
     bindings: tuple[tuple[ObjRef, ObjRef], ...] = ()
     nulls: frozenset[ObjRef] = frozenset()
     nonnull: frozenset[ObjRef] = frozenset()
+    guard_values: frozenset[str] = frozenset()
     escaped: frozenset[ObjRef] = frozenset()
     sink_allocs: tuple[tuple[str, str], ...] = ()
     nullable: frozenset[ObjRef] = frozenset()
@@ -347,6 +349,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             tuple(sorted(merged_bindings.items(), key=repr)),
             left.nulls | right.nulls,
             left.nonnull | right.nonnull,
+            left.guard_values & right.guard_values,
             left.escaped | right.escaped,
             tuple(sorted(set(left.sink_allocs) | set(right.sink_allocs))),
             left.nullable | right.nullable,
@@ -373,6 +376,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         origins = set(state.origins)
         nulls = set(state.nulls)
         nonnull = set(state.nonnull)
+        guard_values = set(state.guard_values)
         bindings = dict(state.bindings)
         escaped = set(state.escaped)
         sink_allocs = dict(state.sink_allocs)
@@ -382,6 +386,13 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         abstract_bindings = dict(state.abstract_bindings)
         abstract_released = set(state.abstract_released)
         abstract_contexts = state.abstract_contexts
+
+        # A LOOP node is the widening boundary for path predicates.  Values
+        # controlling one iteration are not stable facts for the next; keeping
+        # every accumulated relational predicate here would split the worklist
+        # once per iteration and defeat the graph's finite loop abstraction.
+        if event is not None and event.kind == EventKind.LOOP:
+            guard_values.clear()
 
         def abstract_ids(event: Event | None) -> tuple[str, ...]:
             if event is None:
@@ -471,6 +482,30 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 and value.path[:len(root.path)] == root.path
                 for root in escaped
             )
+
+        def value_constraint(value: str):
+            match = re.match(r"^(.+?)(<=|>=|==|!=|<|>)(.+)$", str(value))
+            return match.groups() if match else None
+
+        def contradictory_value(left: str, right: str) -> bool:
+            """Recognize the exact opposite/equality conflicts we can prove.
+
+            VALUE proofs remain opaque to lifecycle semantics except for these
+            local contradictions.  Keeping the relation parser this small is
+            intentional: an unknown expression remains feasible rather than
+            being guessed away.
+            """
+            a = value_constraint(left)
+            b = value_constraint(right)
+            if not a or not b or a[0] != b[0]:
+                return False
+            if a[1] == "==" and b[1] == "==":
+                return a[2] != b[2]
+            if {a[1], b[1]} == {"==", "!="}:
+                return a[2] == b[2]
+            opposites = {("<", ">="), (">=", "<"),
+                         (">", "<="), ("<=", ">")}
+            return (a[1], b[1]) in opposites
 
         def witness() -> _WitnessPath:
             path = []
@@ -663,6 +698,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             next_nulls = set(nulls)
             next_nonnull = {rebased for nonnull_obj in nonnull
                             if (rebased := rebase(nonnull_obj)) is not None}
+            next_guard_values = set(guard_values)
             next_nullable = {rebased for nullable_obj in nullable
                              if (rebased := rebase(nullable_obj)) is not None}
             next_realloc_lost = {rebased for lost_obj in realloc_lost
@@ -684,6 +720,13 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             contradictory_guard = False
             for proof in edge.guard:
                 candidates = []
+                if proof.kind == "VALUE":
+                    if any(contradictory_value(existing, proof.value)
+                           for existing in next_guard_values):
+                        contradictory_guard = True
+                        break
+                    next_guard_values.add(proof.value)
+                    continue
                 if "#" in proof.value:
                     reference = guard_reference(proof.value)
                     # Null tests constrain the current variable binding, not a stale
@@ -742,6 +785,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
             next_state = _State(edge.target, frozenset(next_released), frozenset(next_origins), stack,
                                 tuple(sorted(next_bindings.items(), key=repr)), frozenset(next_nulls),
                                 frozenset(next_nonnull),
+                                frozenset(next_guard_values),
                                 frozenset(next_escaped),
                                 tuple(sorted(sink_allocs.items())),
                                 frozenset(next_nullable),
@@ -752,6 +796,7 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 next_state.node, next_state.released, next_state.origins,
                 next_state.stack, next_state.bindings, next_state.nulls,
                 next_state.nonnull,
+                next_state.guard_values,
                 next_state.escaped, next_state.sink_allocs, next_state.nullable,
                 next_state.realloc_lost, frozenset(next_pointer_arithmetic),
                 next_state.abstract_bindings, next_state.abstract_released,

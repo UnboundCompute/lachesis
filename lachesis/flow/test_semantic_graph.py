@@ -470,6 +470,30 @@ class SemanticGraphTests(unittest.TestCase):
         g.add_fragment("main", "start", ["use"])
         self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
 
+    def test_value_guards_do_not_create_an_impossible_temporal_path(self):
+        obj = ObjRef("p", generation="g0")
+        g = SkeletonGraph()
+        for node, event in [
+                ("start", Event.origin(obj)),
+                ("first_check", Event(EventKind.BRANCH)),
+                ("free", Event.release(obj)),
+                ("merge", None),
+                ("use", Event.read(obj)),
+        ]:
+            g.add_node(node, event, fragment="main")
+        g.add_edge("start", "first_check")
+        g.add_edge("first_check", "free",
+                   guard=(GuardProof("VALUE", "mode==1"),))
+        g.add_edge("first_check", "merge",
+                   guard=(GuardProof("VALUE", "mode!=1"),))
+        g.add_edge("free", "merge")
+        # The only edge to the use requires mode != 1.  A release on the
+        # mode == 1 arm must not be carried through the join into this use.
+        g.add_edge("merge", "use",
+                   guard=(GuardProof("VALUE", "mode!=1"),))
+        g.add_fragment("main", "start", ["use"])
+        self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_call_returns_only_to_pushed_continuation(self):
         o = ObjRef("O", generation="g0")
         g = SkeletonGraph()
