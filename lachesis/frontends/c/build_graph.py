@@ -54,20 +54,18 @@ VALUE_KINDS = {
     "EnumConstantDecl": "constant",
 }
 
-# Calls that create an object. Without an `allocation` node the heap-identity
-# overlay never runs (core/overlays/heap.py:31-32), so points_to/aliases answer
-# nothing on C. Covers libc and the common kernel allocators; the family name is
-# recorded verbatim so a zeroing allocator stays distinguishable downstream.
-ALLOCATOR_NAMES = frozenset({
-    "malloc", "calloc", "realloc", "reallocarray", "valloc", "aligned_alloc",
-    "memalign", "posix_memalign", "strdup", "strndup",
-    "kmalloc", "kzalloc", "kcalloc", "kmalloc_array", "krealloc", "krealloc_array",
-    "kvmalloc", "kvzalloc", "kvcalloc", "vmalloc", "vzalloc", "vcalloc",
-    "kmemdup", "kstrdup", "kmem_cache_alloc", "kmem_cache_zalloc",
-    "devm_kzalloc", "devm_kmalloc", "devm_kcalloc",
-    "dma_alloc_coherent", "dmam_alloc_coherent",
-    "kmalloc_node", "kzalloc_node", "vmalloc_node",
-})
+# Allocation roles are catalog data, not a frontend-maintained name list.  The
+# sink catalog supplies sized allocators (including kernel families); the
+# lifecycle catalog adds size-less allocators such as strdup variants.
+from lachesis.flow import atropos as _atropos
+
+_LIFECYCLE_ROLES = _atropos.detection("lifecycle-roles")
+_ALLOC_KINDS = set(_LIFECYCLE_ROLES.get("alloc_kinds") or ())
+ALLOCATOR_NAMES = frozenset(
+    {name for name, entry in _atropos.sink_catalog("c").items()
+     if entry.get("family") in _ALLOC_KINDS}
+    | set((_LIFECYCLE_ROLES.get("alloc") or {}).get("c") or ())
+)
 CONTENT_HASHES: Dict[Path, str] = {}
 
 # Memoize the (resolved path, content hash) of each distinct ``absolute_file``
