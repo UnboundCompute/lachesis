@@ -193,6 +193,23 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertEqual([hit["pattern"] for hit in hits], ["uaf.deref"])
         self.assertEqual(hits[0]["object"], payload.render())
 
+    def test_abstract_identity_prevents_same_named_local_false_uaf(self):
+        obj = ObjRef("p", generation="g0")
+        g = SkeletonGraph()
+        g.add_node("caller", Event(EventKind.RELEASE, obj=obj, facts={
+            "abstract_object_ids": ["('clobber', 'recent', 'caller', 'p')"],
+        }), fragment="caller")
+        g.add_node("callee", Event(EventKind.READ_STORAGE, base=obj, obj=obj,
+                                     facts={"abstract_object_ids": ["('clobber', 'recent', 'callee', 'p')"]}),
+                    fragment="callee")
+        g.add_fragment("caller", "caller", ["caller"])
+        g.add_fragment("callee", "callee", ["callee"])
+        g.add_edge("caller", "callee")
+        self.assertNotIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
+        g.nodes["callee"].event.facts["abstract_object_ids"] = ["('clobber', 'recent', 'caller', 'p')"]
+        self.assertIn("uaf.deref", {hit["pattern"] for hit in match_graph(g)})
+
     def test_derive_preserves_alias_identity(self):
         original = ObjRef("O", generation="g0")
         alias = ObjRef("saved", generation="g0")

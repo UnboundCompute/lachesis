@@ -479,6 +479,16 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 value = abstract_bindings[value]
             return value
 
+        def stable_abstract(value: str) -> bool:
+            # Parameter and unknown-slot IDs are context-relative. Allocation
+            # and clobber recency IDs are stable enough to disambiguate local
+            # declarations within one source-rooted exploration.
+            text = str(value)
+            return text.startswith("('alloc',") or text.startswith("('clobber',")
+
+        def abstract_key(value: str, obj: ObjRef | None) -> str:
+            return f"{value}@{obj.generation}" if obj is not None else str(value)
+
         def guard_stem(value: str) -> str:
             """Normalize source-level member spelling to ObjRef path spelling."""
             return str(value).replace("->", "*").replace(".", "*")
@@ -543,6 +553,11 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
         def equivalent(left: ObjRef | None, right: ObjRef | None) -> bool:
             """Compare canonical representatives after seam/derive composition."""
             return canonical(left) == canonical(right)
+
+        def explicit_alias(value: ObjRef | None) -> bool:
+            """Whether the current state proves a non-name-based alias relation."""
+            return any(key != value and equivalent(key, value)
+                       for key in (*aliases.keys(), *bindings.keys()))
 
         def escaped_reaches(value: ObjRef | None) -> bool:
             """Whether an escaped object keeps this object/path reachable.
@@ -668,28 +683,32 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 obj = None
             if event.kind == EventKind.RELEASE and raw_obj in nulls:
                 obj = None
-            # Local abstract IDs are intentionally ignored until a seam has
-            # supplied a formal->actual translation.  Otherwise loop joins could
-            # turn two generations in one fragment into a false lifecycle hit.
-            event_abstract = (tuple(abstract_canonical(value) for value in abstract_ids(event))
-                              if abstract_bindings else ())
+            # Prefer declaration/object identities whenever the emitter provides
+            # them.  The display ObjRef remains the compatibility fallback for
+            # older frontends and hand-built graphs.
+            event_abstract = tuple(abstract_canonical(value) for value in abstract_ids(event))
+            identity_abstract = (event_abstract
+                                 if event_abstract and all(stable_abstract(value)
+                                                           for value in event_abstract)
+                                 else ())
             if event.kind == EventKind.RELEASE and obj:
                 prior_sites = {site for released_obj, site in released if released_obj == obj}
-                if "double-free" in wanted and any(site != node.id for site in prior_sites):
+                abstract_prior = {
+                    site for value, site in abstract_released
+                    if value in {abstract_key(item, obj) for item in identity_abstract}
+                }
+                prior = abstract_prior if identity_abstract else prior_sites
+                if "double-free" in wanted and any(site != node.id for site in prior):
                     _record(hits, "double-free", obj, node, witness())
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
                 if event_abstract:
-                    if "double-free" in wanted and any(
-                            prior_value != node.id
-                            for prior_value in (site for value, site in abstract_released
-                                                 if value in event_abstract)):
-                        _record(hits, "double-free", obj, node, witness())
                     abstract_released = {
                         (value, site) for value, site in abstract_released
-                        if value not in event_abstract
+                        if value.split("@", 1)[0] not in event_abstract
                     }
-                    abstract_released.update((value, node.id) for value in event_abstract)
+                    abstract_released.update(
+                        (abstract_key(value, obj), node.id) for value in event_abstract)
             elif event.kind == EventKind.INVALIDATE and obj:
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj} | {(obj, node.id)}
@@ -699,18 +718,34 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                 for pointer, _source in pointer_arithmetic)):
                     _record(hits, "pointer-arithmetic-before-validation", base,
                             node, witness())
-                if "uaf.deref" in wanted and any(released_obj == base for released_obj, _ in released):
-                    _record(hits, "uaf.deref", base, node, witness())
-                if "uaf.deref" in wanted and any(
-                        value in {released_value for released_value, _ in abstract_released}
-                        for value in event_abstract):
+                abstract_freed = any(
+                    abstract_key(value, base) in {
+                        released_value for released_value, _ in abstract_released}
+                    for value in identity_abstract)
+                obj_freed = any(released_obj == base for released_obj, _ in released)
+                abstract_available = any(stable_abstract(value)
+                                         for value, _ in abstract_released)
+                alias_supported = explicit_alias(base)
+                if "uaf.deref" in wanted and (
+                        abstract_freed if identity_abstract and abstract_available and not alias_supported
+                        else obj_freed):
                     _record(hits, "uaf.deref", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
                     _record(hits, "null-deref", base, node, witness())
                 if "unchecked-return-deref" in wanted and base in nullable:
                     _record(hits, "unchecked-return-deref", base, node, witness())
             elif event.kind in (EventKind.PASS_VALUE, EventKind.COMPARE_VALUE, EventKind.RETURN_VALUE) and obj:
-                if "use.dangling" in wanted and any(released_obj == obj for released_obj, _ in released):
+                abstract_freed = any(
+                    abstract_key(value, obj) in {
+                        released_value for released_value, _ in abstract_released}
+                    for value in identity_abstract)
+                obj_freed = any(released_obj == obj for released_obj, _ in released)
+                abstract_available = any(stable_abstract(value)
+                                         for value, _ in abstract_released)
+                alias_supported = explicit_alias(obj)
+                if "use.dangling" in wanted and (
+                        abstract_freed if identity_abstract and abstract_available and not alias_supported
+                        else obj_freed):
                     _record(hits, "use.dangling", obj, node, witness())
                 if (event.kind == EventKind.RETURN_VALUE
                         and event.facts.get("stack_local")
