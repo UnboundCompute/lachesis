@@ -12,6 +12,32 @@ import hashlib
 from ..flow import atropos
 
 
+def merge_semantic_nodes(target, semantic_graph, language):
+    """Merge one language's semantic nodes without losing language identity.
+
+    Semantic node IDs are generated from function names and can collide when a
+    multi-language project contains equally named functions.  Candidate census
+    consumes nodes, not graph edges, so namespace only collisions while keeping
+    the original ID in the node metadata.  Stamp language on each node because
+    the graph-level language is lost when several graphs are combined.
+    """
+    payload = semantic_graph.to_dict()
+    for raw_id, raw_node in (payload.get("nodes") or {}).items():
+        node_id = str(raw_id)
+        if node_id in target:
+            node_id = f"{language}:{node_id}"
+            suffix = 2
+            while node_id in target:
+                node_id = f"{language}:{raw_id}:{suffix}"
+                suffix += 1
+        node = dict(raw_node)
+        metadata = dict(node.get("metadata") or {})
+        metadata.setdefault("language", language)
+        node["metadata"] = metadata
+        target[node_id] = node
+    return target
+
+
 def _event_kind(node):
     props = node.get("properties") or {}
     event = node.get("event") or {}
@@ -59,7 +85,10 @@ class TemporalLifecycle:
     def _language(self, node):
         props = node.get("properties") or {}
         path = props.get("absolute_file") or props.get("file") or node.get("file") or ""
-        return atropos.lang_of(path) if path else (self.language or "c")
+        metadata = node.get("metadata") or {}
+        return (atropos.lang_of(path) if path else
+                node.get("language") or metadata.get("language") or
+                self.language or "c")
 
     def _candidate(self, node):
         props = node.get("properties") or {}

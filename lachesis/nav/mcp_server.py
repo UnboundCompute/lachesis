@@ -245,13 +245,14 @@ class _Ctx:
             # by flow_pass instead of creating a second traversal or teaching the
             # candidate registry a language-specific lifecycle extractor.
             from lachesis.flow.pipeline import run_pass
+            from lachesis.planner.temporal_obligation import merge_semantic_nodes
             semantic_nodes = {}
             for language in summary.get("languages") or ("c",):
                 flow = (self.flow_bundle if language == "c" else
                         run_pass(self.store, lang=language, lifetime_engine="object"))
                 semantic = flow.get("semantic_graph")
                 if semantic is not None:
-                    semantic_nodes.update(semantic.to_dict().get("nodes", {}))
+                    merge_semantic_nodes(semantic_nodes, semantic, language)
             if semantic_nodes:
                 stamped["semantic_graph"] = {"nodes": semantic_nodes}
             return {

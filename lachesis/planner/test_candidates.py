@@ -1291,6 +1291,24 @@ class AllFamilyRegistryTest(unittest.TestCase):
             constructor="mem.lifetime.use-after-free")["candidates"][0]
         self.assertEqual(row["language"], "python")
 
+    def test_multilanguage_semantic_nodes_keep_language_and_collisions(self):
+        from lachesis.planner.temporal_obligation import merge_semantic_nodes
+
+        class Semantic:
+            def __init__(self, node):
+                self.node = node
+
+            def to_dict(self):
+                return {"nodes": {"shared": self.node}}
+
+        merged = {}
+        merge_semantic_nodes(merged, Semantic({"event": {"kind": "ORIGIN"},
+                                               "metadata": {}}), "c")
+        merge_semantic_nodes(merged, Semantic({"event": {"kind": "ORIGIN"},
+                                               "metadata": {}}), "python")
+        self.assertEqual(merged["shared"]["metadata"]["language"], "c")
+        self.assertEqual(merged["python:shared"]["metadata"]["language"], "python")
+
 
 class GuardRelationTest(unittest.TestCase):
     """A branch guards a size only when it COMPARES the variable's magnitude.

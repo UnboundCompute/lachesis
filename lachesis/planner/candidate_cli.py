@@ -51,12 +51,13 @@ def main(argv: list[str] | None = None) -> int:
     temporal_ids = {spec["id"] for spec in family_specs() if spec.get("temporal")}
     if args.constructor in temporal_ids:
         from lachesis.flow.pipeline import run_pass
+        from lachesis.planner.temporal_obligation import merge_semantic_nodes
         semantic_nodes = {}
         for language in summary.get("languages") or ("c",):
             flow = run_pass(store, lang=language, lifetime_engine="object")
             semantic = flow.get("semantic_graph")
             if semantic is not None:
-                semantic_nodes.update(semantic.to_dict().get("nodes", {}))
+                merge_semantic_nodes(semantic_nodes, semantic, language)
         if semantic_nodes:
             stamped["semantic_graph"] = {"nodes": semantic_nodes}
 
