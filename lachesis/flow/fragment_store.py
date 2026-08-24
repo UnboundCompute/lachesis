@@ -212,13 +212,14 @@ class FragmentStore:
         different source revision or language from being treated as covered.
         """
         entries = []
-        for candidates in self._coverage_graphs.values():
+        for base, candidates in self._coverage_graphs.items():
             for states, graph in candidates:
                 if not isinstance(graph, SkeletonGraph):
                     continue
                 state_keys = [list(key[1:]) for key in states if key and key[0] == "state"]
                 context_keys = [list(key[1:]) for key in states if key and key[0] == "context"]
                 entries.append({
+                    "base_key": list(base),
                     "state_keys": state_keys,
                     "context_keys": context_keys,
                     "graph": graph.to_dict(),
@@ -237,17 +238,25 @@ class FragmentStore:
         never a source of fabricated coverage.
         """
         accepted = 0
+        expected_base = self._base_key(functions, lang, graph, summaries,
+                                       reach_summaries)
         for entry in payload.get("fragments", ()) or ():
+            # A persisted graph is useful only when its semantic-input identity
+            # matches this restore session.  Never re-key an arbitrary stale
+            # graph under the current program merely because its shape loads.
+            if tuple(entry.get("base_key", ())) != expected_base:
+                continue
             try:
                 semantic = SkeletonGraph.from_dict(entry["graph"])
                 coverage = {"state_keys": entry.get("state_keys", ()),
                             "context_keys": entry.get("context_keys", ())}
                 self.put(functions, lang, graph, semantic, summaries, coverage,
                          reach_summaries)
+                self.mark_covered(coverage["state_keys"])
+                self.mark_contexts_covered(coverage["context_keys"])
             except (KeyError, TypeError, ValueError):
                 continue
             accepted += 1
-        self.restore_coverage(payload.get("coverage", {}) or {})
         return accepted
 
     def restore_coverage(self, snapshot: Mapping[str, Any]) -> None:

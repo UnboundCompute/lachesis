@@ -99,7 +99,6 @@ class CoverageSchedulerTests(unittest.TestCase):
         store = FragmentStore()
         store.mark_covered([("worker", "source")])
         store.mark_contexts_covered([("worker", "source", "site_a")])
-        json.dumps(original.snapshot())
         restored = FragmentStore()
         restored.restore_coverage(store.coverage_snapshot())
         self.assertEqual(restored.coverage_snapshot(), store.coverage_snapshot())
@@ -120,6 +119,7 @@ class CoverageSchedulerTests(unittest.TestCase):
                               "context_keys": [["worker", "source", "site"]]})
         original.mark_covered([("worker", "source")])
         original.mark_contexts_covered([("worker", "source", "site")])
+        json.dumps(original.snapshot())
 
         restored = FragmentStore()
         self.assertEqual(restored.restore_snapshot(
@@ -130,6 +130,12 @@ class CoverageSchedulerTests(unittest.TestCase):
             coverage={"state_keys": [["worker", "source"]],
                       "context_keys": [["worker", "source", "site"]]})
         self.assertEqual(set(cached.nodes), set(semantic.nodes))
+
+        stale = FragmentStore()
+        changed_functions = {"source": {}, "worker": {"changed": True}}
+        self.assertEqual(stale.restore_snapshot(
+            original.snapshot(), changed_functions, "c", graph_key), 0)
+        self.assertEqual(stale.covered_states, set())
 
     def test_fragment_cache_key_includes_coverage_states(self):
         store = FragmentStore()
