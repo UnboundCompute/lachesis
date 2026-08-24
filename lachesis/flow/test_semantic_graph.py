@@ -100,6 +100,38 @@ class SemanticGraphTests(unittest.TestCase):
         self.assertTrue(any(hit["pattern"] == "uaf.deref" for hit in hits))
         self.assertTrue(all(hit["witness_complete"] for hit in hits))
 
+    def test_frontend_ir_pending_cone_preserves_selected_call_return_seam(self):
+        from .emit import build_semantic_graph
+
+        functions = {
+            "main": {
+                "is_source": True, "source_reachable": True,
+                "events": [{"kind": "alloc", "var": "p", "line": 1},
+                           {"kind": "use", "var": "p", "line": 3}],
+                "calls": [{"callee": "release_helper", "line": 2,
+                           "args": [{"pos": 0, "root": "p"}]}],
+            },
+            "release_helper": {
+                "events": [{"kind": "free", "var": "p", "line": 2}],
+                "calls": [], "params": ["p"],
+            },
+            "unselected": {
+                "events": [{"kind": "alloc", "var": "other", "line": 9}],
+                "calls": [],
+            },
+        }
+        graph = build_semantic_graph(
+            object(), functions,
+            {"main": ["release_helper"], "release_helper": [], "unselected": []},
+            lang="python", graph={},
+            work_functions={"main", "release_helper"},
+        )
+        self.assertNotIn("unselected", graph.fragments)
+        self.assertTrue(any(edge.kind == "call"
+                            for edges in graph.edges.values() for edge in edges))
+        self.assertTrue(any(hit["pattern"] == "uaf.deref"
+                            for hit in match_graph(graph)))
+
     def test_frontend_ir_lifecycle_calls_use_atropos_roles(self):
         from .emit import build_semantic_graph
 
