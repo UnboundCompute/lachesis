@@ -812,6 +812,31 @@ class SemanticGraphTests(unittest.TestCase):
         hits = match_graph(graph)
         self.assertIn("double-free", {hit["pattern"] for hit in hits})
 
+    def test_scoped_parameter_ids_do_not_hide_cross_seam_double_free(self):
+        caller = ObjRef("b", path=("*", "data"), generation="g0")
+        formal = ObjRef("b", path=("*", "data"), generation="g0")
+        graph = SkeletonGraph()
+        graph.add_node("start", Event(EventKind.SEAM_ENTER), fragment="caller")
+        graph.add_node("free_in_helper", Event(
+            EventKind.RELEASE, obj=formal,
+            facts={"abstract_object_ids": ["('param', 0, ('*', 'data'))"]}),
+                       fragment="helper")
+        graph.add_node("return", Event(EventKind.SEAM_EXIT), fragment="caller")
+        graph.add_node("free_again", Event(
+            EventKind.RELEASE, obj=caller,
+            facts={"abstract_object_ids": ["('param', 0, ('*', 'data'))"]}),
+                       fragment="caller")
+        graph.add_fragment("caller", "start", ["free_again"])
+        graph.add_fragment("helper", "free_in_helper", ["free_in_helper"])
+        graph.source_reachable = {"start"}
+        graph.add_edge("start", "free_in_helper", kind="call", return_to="return",
+                       binding=((ObjRef("b"), ObjRef("b")),))
+        graph.add_edge("free_in_helper", "return", kind="return")
+        graph.add_edge("return", "free_again")
+
+        hits = match_graph(graph)
+        self.assertIn("double-free", {hit["pattern"] for hit in hits})
+
     def test_abstract_identity_prevents_same_named_local_false_uaf(self):
         obj = ObjRef("p", generation="g0")
         g = SkeletonGraph()
