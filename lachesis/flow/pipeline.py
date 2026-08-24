@@ -231,10 +231,23 @@ def run_pass(store, lang="c", lifetime_engine=None):
         if claus is None:
             claus = Claus()
             store._pass3_claus = claus
+        # A graph-backed session gets a reusable semantic-fragment sidecar.  The
+        # FragmentStore still validates semantic fingerprints before accepting
+        # anything, so an older graph or changed translator input is a miss rather
+        # than a false coverage claim. In-memory stores remain purely in-memory.
+        snapshot_path = (f"{store.graph_path}.pass3.json"
+                         if getattr(store, "graph_path", None) else None)
+        if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
+            claus.fragments.load_snapshot(
+                snapshot_path, F, lang, analysis_graph,
+                object_result.summaries, summaries)
+            store._pass3_snapshot_loaded = True
         semantic_graph = claus.build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries, coverage=semantic_coverage,
             reach_summaries=summaries, state_artifacts=object_result.artifacts)
+        if snapshot_path:
+            claus.fragments.save_snapshot(snapshot_path)
         semantic_leads = match_graph(semantic_graph)
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another

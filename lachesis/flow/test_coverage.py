@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -136,6 +137,28 @@ class CoverageSchedulerTests(unittest.TestCase):
         self.assertEqual(stale.restore_snapshot(
             original.snapshot(), changed_functions, "c", graph_key), 0)
         self.assertEqual(stale.covered_states, set())
+
+    def test_snapshot_sidecar_is_atomic_and_loadable(self):
+        functions = {"source": {}, "worker": {}}
+        graph_key = {"nodes": ["source", "worker"]}
+        semantic = SkeletonGraph(language="c")
+        semantic.add_node("source:entry", fragment="source")
+        semantic.add_node("worker:entry", fragment="worker")
+        semantic.add_edge("source:entry", "worker:entry")
+        semantic.add_fragment("source", "source:entry", ("source:entry",))
+        semantic.add_fragment("worker", "worker:entry", ("worker:entry",))
+        original = FragmentStore()
+        original.put(functions, "c", graph_key, semantic,
+                    coverage={"state_keys": [["worker", "source"]]})
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/semantic.pass3.json"
+            original.save_snapshot(path)
+            restored = FragmentStore()
+            self.assertEqual(restored.load_snapshot(
+                path, functions, "c", graph_key), 1)
+            self.assertIsNotNone(restored.get(
+                functions, "c", graph_key,
+                coverage={"state_keys": [["worker", "source"]]}))
 
     def test_fragment_cache_key_includes_coverage_states(self):
         store = FragmentStore()

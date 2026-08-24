@@ -11,6 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
+from pathlib import Path
+import tempfile
 from typing import Any, Mapping
 
 from .semantic_graph import SkeletonGraph
@@ -258,6 +261,39 @@ class FragmentStore:
                 continue
             accepted += 1
         return accepted
+
+    def save_snapshot(self, path: str | os.PathLike[str]) -> None:
+        """Atomically write the reusable fragment snapshot to ``path``."""
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=destination.parent,
+            prefix=f".{destination.name}.", suffix=".tmp", delete=False)
+        temporary = Path(handle.name)
+        try:
+            with handle:
+                json.dump(self.snapshot(), handle, sort_keys=True,
+                          separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def load_snapshot(self, path: str | os.PathLike[str], functions: Mapping[str, Mapping],
+                      lang: str, graph: Any = None, summaries: Any = None,
+                      reach_summaries: Any = None) -> int:
+        """Load a sidecar snapshot, returning zero for absent/invalid data."""
+        try:
+            with Path(path).open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if payload.get("version") != 1:
+                return 0
+            return self.restore_snapshot(payload, functions, lang, graph,
+                                         summaries, reach_summaries)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return 0
 
     def restore_coverage(self, snapshot: Mapping[str, Any]) -> None:
         """Restore only coverage facts; graph materialization remains independently verified."""
