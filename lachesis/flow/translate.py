@@ -702,7 +702,10 @@ def build_F(store, lang="c", *, return_graph=False):
         ]
         record["seam_bindings"] = by_function_bindings.get(name, [])
         record["source_reachable"] = name in discovery.reachable_functions
-        record["source_provenance"] = discovery.launch_provenance.get(name, "unreachable")
+        root_provenance = discovery.provenance_by_function.get(name, ())
+        record["source_provenance"] = (
+            root_provenance[0] if len(root_provenance) == 1 else
+            "mixed" if root_provenance else "unreachable")
         record["source_influenced_roots"] = discovery.influenced_roots.get(name, ())
         region = coverage_by_target.get(name)
         record["coverage_sources"] = region.sources if region else ()

@@ -35,6 +35,14 @@ class SourceDiscoveryTests(unittest.TestCase):
                                              "externally_visible": True}},
                                   {"api": []})
         self.assertEqual(result.launch_provenance, {"api": "export"})
+
+    def test_reachable_callee_inherits_launch_provenance(self):
+        result = discover_sources(
+            {"api": {"callers": [], "externally_visible": True, "calls": [
+                {"callee": "worker", "node": "call", "args": []}]},
+             "worker": {"callers": ["api"], "calls": []}},
+            {"api": ["worker"], "worker": []})
+        self.assertEqual(result.provenance_by_function["worker"], ("export",))
         self.assertEqual(result.sites, ())
 
 

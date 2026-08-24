@@ -41,6 +41,10 @@ class SourceDiscovery:
     # metadata; it is coverage-rooted, but must not be reported as proof of an
     # externally exported entry point.
     launch_provenance: dict[str, str] = field(default_factory=dict)
+    # Provenance of every function reachable from one or more launches.  A
+    # function may legitimately have multiple root classes, so callers can
+    # distinguish a single class from a mixed source cone.
+    provenance_by_function: dict[str, tuple[str, ...]] = field(default_factory=dict)
     reachable_functions: set[str] = field(default_factory=set)
     influenced_roots: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -105,12 +109,23 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
                 "export" if record.get("externally_visible") else "structural")
 
     reachable = set(launches)
+    provenance_sets: dict[str, set[str]] = {
+        function: {launch_provenance.get(function, "unknown")}
+        for function in launches
+    }
     work = list(reachable)
     while work:
         function = work.pop()
         for callee in succ.get(function, ()):
-            if callee in F and callee not in reachable:
+            if callee not in F:
+                continue
+            before = set(provenance_sets.get(callee, ()))
+            provenance_sets.setdefault(callee, set()).update(
+                provenance_sets.get(function, {"unknown"}))
+            if callee not in reachable:
                 reachable.add(callee)
+                work.append(callee)
+            elif provenance_sets[callee] != before:
                 work.append(callee)
 
     # Propagate source influence through actual/formal seams and returned values.
@@ -141,5 +156,8 @@ def discover_sources(F: Mapping[str, Mapping], succ: Mapping[str, Iterable[str]]
 
     return SourceDiscovery(tuple(sites), tuple(bindings),
                            {name: tuple(nodes) for name, nodes in launches.items()},
-                           launch_provenance, reachable,
+                           launch_provenance,
+                           {name: tuple(sorted(values))
+                            for name, values in provenance_sets.items()},
+                           reachable,
                            {name: tuple(sorted(roots)) for name, roots in influenced.items()})
