@@ -33,6 +33,12 @@ class CoverageSchedulerTests(unittest.TestCase):
         plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()
         self.assertEqual(plan.for_target("deep").sources, ("entry",))
 
+    def test_successor_graph_is_authoritative_when_callers_metadata_is_absent(self):
+        functions = {"entry": {}, "deep": {}}
+        plan = CoverageScheduler(functions, {"entry": ["deep"], "deep": []}).plan()
+        self.assertEqual(plan.for_target("deep").sources, ("entry",))
+        self.assertNotIn(("deep", "deep"), plan.state_keys)
+
     def test_catalogued_sources_do_not_hide_other_external_roots(self):
         functions = {
             "catalog_entry": {

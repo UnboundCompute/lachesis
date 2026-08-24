@@ -105,10 +105,13 @@ class CoverageScheduler:
             name for name, record in self.functions.items()
             if record.get("source_sites") or record.get("source_calls")
         }
-        sources.update(
-            name for name, record in self.functions.items()
-            if not record.get("callers")
-        )
+        # The successor relation is the scheduler's normalized whole-program
+        # graph. Do not infer roots from an optional frontend ``callers`` field:
+        # frontends are allowed to omit it, and treating every such function as
+        # external would invent source states for callees that are reachable only
+        # through another function.
+        sources.update(name for name in self.functions
+                       if not self.reverse.get(name))
         return tuple(sorted(sources))
 
     def _backward_cone(self, target: str) -> set[str]:
