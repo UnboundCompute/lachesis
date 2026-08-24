@@ -158,7 +158,15 @@ def _restore(
     """Inflate a stored ``props`` blob back into a properties dict.
 
     The blob is deflated protobuf metadata (see ``kuzu_store.PropsCodec``)."""
-    props = decode_document(_inflate(props_blob, zdict)) if props_blob else {}
+    if props_blob:
+        try:
+            props = decode_document(_inflate(props_blob, zdict))
+        except (zlib.error, ValueError, TypeError) as exc:
+            # A legacy/corrupt property tail must not prevent navigation over the
+            # rest of a readable graph. Preserve the failure as an explicit unknown.
+            props = {"_decode_error": str(exc)}
+    else:
+        props = {}
     if not restore_defaults:
         return _LazyDefaultProps(props)
     for key, default in CONSTANT_PROP_DEFAULTS.items():
