@@ -259,29 +259,80 @@ def _next_generation(current):
     return "g1"
 
 
-def _operation_generations(sub, operations):
-    """Assign incarnation generations in source order, independent of CFG layout."""
-    current = {}
+def _operation_generations(sub, operations, cfg=None):
+    """Assign incarnations only when a prior rebind dominates the operation.
+
+    Source order is not execution order: allocations in sibling CFG arms must
+    share the same abstract generation at their join, while ``p = alloc(); free(p);
+    p = alloc()`` must advance it.  Dominance captures exactly that distinction
+    without inventing a path-sensitive generation set in the frozen graph.
+    Loop re-entry remains an explicit matcher widening event.
+    """
     generations = {}
     fresh = {}
-    ordered = sorted(operations, key=lambda op: (sub.offset(op.node), op.line or 0,
-                                                  op.ordinal, op.kind.value))
-    for operation in ordered:
+    ordered = sorted(
+        enumerate(operations),
+        key=lambda item: (sub.offset(item[1].node), item[1].line or 0,
+                          item[1].ordinal, item[1].kind.value, item[0]))
+
+    nodes = tuple((cfg or {}).get("nodes", ()))
+    successors = {node: tuple((cfg or {}).get("succ", {}).get(node, ()))
+                  for node in nodes}
+    predecessors = defaultdict(set)
+    for source, targets in successors.items():
+        for target in targets:
+            if target in successors:
+                predecessors[target].add(source)
+    entry = (cfg or {}).get("entry") or (nodes[0] if nodes else None)
+    dominators = {}
+    if entry is not None and nodes:
+        all_nodes = set(nodes)
+        dominators = {node: ({node} if node == entry else set(all_nodes))
+                      for node in nodes}
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                if node == entry:
+                    continue
+                incoming = predecessors.get(node, set())
+                candidate = ({node} | set.intersection(
+                    *(dominators[parent] for parent in incoming))) if incoming else {node}
+                if candidate != dominators[node]:
+                    dominators[node] = candidate
+                    changed = True
+
+    def dominates(left, right):
+        if left == right:
+            return True
+        return left in dominators.get(right, {right})
+
+    history = defaultdict(list)
+    for position, (_original_index, operation) in enumerate(ordered):
         key = _semantic_key(sub, operation.target)
         if key is None:
             continue
-        generation = current.get(key, "g0")
+        prior = [item for item in history[key]
+                 if (item[0] < position and
+                     dominates(item[1].node, operation.node))]
+        generation = max(
+            (item[2] for item in prior),
+            key=lambda value: int(value[1:]) if isinstance(value, str)
+            and value.startswith("g") and value[1:].isdigit() else -1,
+            default="g0")
         if operation.kind == OpKind.ALLOC:
-            if key in current:
-                generation = _next_generation(generation)
-            current[key] = generation
+            generation = _next_generation(generation) if prior else "g0"
+            generations[operation] = generation
+            history[key].append((position, operation, generation))
         elif operation.kind == OpKind.REALLOC:
             generations[operation] = generation
             fresh_generation = _next_generation(generation)
             fresh[operation] = fresh_generation
-            current[key] = fresh_generation
-            continue
-        generations[operation] = generation
+            history[key].append((position, operation, fresh_generation))
+        else:
+            generations[operation] = generation
+            if operation.kind == OpKind.CLOBBER:
+                history[key].append((position, operation, generation))
     return generations, fresh
 
 
@@ -930,7 +981,8 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         # that would manufacture double-frees when the callee fragment is also traversed.
         operations = extract_operations(
             sub, norm, fid, functions[name], functions, obj_summaries, cfg)
-        operation_generations, realloc_generations = _operation_generations(sub, operations)
+        operation_generations, realloc_generations = _operation_generations(
+            sub, operations, cfg)
         loop_nodes = _loop_nodes(cfg)
         artifact = (state_artifacts or {}).get(name)
 

@@ -844,7 +844,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                          for value, _ in abstract_released)
                 alias_supported = explicit_alias(base)
                 if "uaf.deref" in wanted and (
-                        abstract_freed if identity_abstract and abstract_available and not alias_supported
+                        abstract_freed if identity_abstract and abstract_available
+                        and "@loop:" not in str(base.generation)
+                        and not alias_supported
                         else obj_freed):
                     _record(hits, "uaf.deref", base, node, witness())
                 if "null-deref" in wanted and raw_base in nulls:
@@ -862,7 +864,9 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                                          for value, _ in abstract_released)
                 alias_supported = explicit_alias(obj)
                 if (event.kind != EventKind.ESCAPE and "use.dangling" in wanted and (
-                        abstract_freed if identity_abstract and abstract_available and not alias_supported
+                        abstract_freed if identity_abstract and abstract_available
+                        and "@loop:" not in str(obj.generation)
+                        and not alias_supported
                         else obj_freed)):
                     _record(hits, "use.dangling", obj, node, witness())
                 if (event.kind == EventKind.RETURN_VALUE
@@ -878,15 +882,32 @@ def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) 
                 if (event.facts.get("loop_widening") or
                         event.facts.get("incarnation")) and (
                             obj in origins or
-                            any(released_obj == obj for released_obj, _ in released)):
+                            any(released_obj.base == obj.base
+                                and released_obj.path == obj.path
+                                for released_obj, _ in released)):
                     generation = obj.generation
                     if "@loop:" not in str(generation):
                         generation = f"{generation}@loop:{node.id}"
                     obj = ObjRef(obj.base, obj.path, generation)
                     if raw_obj is not None:
                         slot_bindings[raw_obj] = obj
+                        # Events after a loop are emitted from the source slot
+                        # spelling and may still carry its baseline generation
+                        # (for example `item#g0`). Rebind that direct slot key,
+                        # but do not touch aliases captured under their own
+                        # names/generations; those must continue to identify the
+                        # pre-loop object.
+                        slot_bindings[ObjRef(raw_obj.base, raw_obj.path,
+                                             generation="g0")] = obj
                         aliases.pop(raw_obj, None)
                 origins.add(obj)
+                if raw_obj is not None and obj.generation != "g0":
+                    # Rebinding the source slot is distinct from rebinding an
+                    # alias captured before this origin. A later event may still
+                    # carry the baseline slot generation after a branch or loop
+                    # join; select the active incarnation for the slot only.
+                    slot_bindings[ObjRef(raw_obj.base, raw_obj.path,
+                                         generation="g0")] = obj
                 released = {(released_obj, site) for released_obj, site in released
                             if released_obj != obj}
                 if identity_abstract:

@@ -644,6 +644,36 @@ class SemanticGraphTests(unittest.TestCase):
         hit = next(hit for hit in match_graph(g) if hit["pattern"] == "uaf.deref")
         self.assertEqual(hit["object"], "p#g0")
 
+    def test_branch_reorigin_rebinds_slot_but_not_captured_alias(self):
+        slot0 = ObjRef("p", generation="g0")
+        slot1 = ObjRef("p", generation="g1")
+        alias = ObjRef("saved", generation="g0")
+        g = SkeletonGraph()
+        for node, event in [
+                ("start", Event.origin(slot0)),
+                ("save", Event(EventKind.DERIVE, obj=alias, value=slot0)),
+                ("branch", Event(EventKind.BRANCH)),
+                ("reorigin", Event.origin(slot1)),
+                ("free", Event.release(slot1)),
+                ("other", None),
+                ("merge", Event(EventKind.MERGE)),
+                ("use", Event.read(slot0, line=8)),
+                ("exit", None)]:
+            g.add_node(node, event, fragment="main")
+        g.add_edge("start", "save")
+        g.add_edge("save", "branch")
+        g.add_edge("branch", "reorigin")
+        g.add_edge("branch", "other")
+        g.add_edge("reorigin", "free")
+        g.add_edge("free", "merge")
+        g.add_edge("other", "merge")
+        g.add_edge("merge", "use")
+        g.add_edge("use", "exit")
+        g.add_fragment("main", "start", ["exit"])
+        hits = [hit for hit in match_graph(g) if hit["pattern"] == "uaf.deref"]
+        self.assertEqual([hit["node"] for hit in hits], ["use"])
+        self.assertEqual(hits[0]["object"], "p#g1")
+
     def test_returning_an_owner_keeps_its_field_allocation_reachable(self):
         owner = ObjRef("b", generation="g0")
         field = ObjRef("b", ("*", "data"), generation="g0")
