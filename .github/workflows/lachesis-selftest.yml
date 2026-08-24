@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: UnboundCompute/lachesis-action@v1.0.4
+      - uses: UnboundCompute/lachesis-action@v1.1.0
         with:
           # Scan the whole repo (Python + TypeScript + C), not just a fixture:
           # the real dogfood is Lachesis analyzing its own source.
