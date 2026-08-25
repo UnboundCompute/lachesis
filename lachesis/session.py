@@ -225,7 +225,10 @@ class Analysis:
             # observable to downstream bind/flow iteration.  Match that canonical
             # order on the one-shot retained view before handing it to the binder.
             _sort_materialized_edges(graph["edges"])
-        return atropos_enrich(graph, complete_dataflow=False)
+        return atropos_enrich(
+            graph, complete_dataflow=False,
+            symbol_index_source=getattr(self.store, "index", None),
+        )
 
     def _enrich_and_merge(self, *, deadline: Deadline | None = None) -> tuple[dict, dict, bool]:
         """The structural bind plus the Pass 3 semantic skeleton the temporal families read.

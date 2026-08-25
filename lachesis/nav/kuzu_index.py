@@ -1097,6 +1097,56 @@ class KuzuGraphIndex:
         return self._argument_edges_cache
 
     @timeit
+    def atropos_projection(self) -> dict:
+        """Return only the records needed to build Atropos's neutral symbol index.
+
+        Catalog binding needs call/construct/write/argument records, not the full CPG.
+        Export that narrow projection directly from Kùzu so a disk-backed Pass 2 can
+        avoid scanning the million-node materialized graph just to discover callsites.
+        The returned shape is intentionally an ordinary graph fragment: the existing
+        canonical adapter remains the compatibility and parity oracle.
+        """
+        kinds = ["argument", "call", "construct", "write"]
+        nodes = {}
+        res = self._conn.execute(
+            f"MATCH (n:Node) WHERE n.kind IN $kinds "
+            f"RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props",
+            {"kinds": kinds},
+        )
+        while res.has_next():
+            row = res.get_next()
+            nid = decode_id(row[0], self._id_prefixes)
+            nodes[nid] = {
+                "id": nid, "kind": row[1], "label": row[2],
+                "properties": _restore_node_props(
+                    row[3:-1], row[-1], self._props_dict, self._id_prefixes),
+            }
+
+        edges = []
+        for group in self.argument_edges_by_source().values():
+            edges.extend(group)
+
+        # The cursor-factory fallback needs only labels of write targets. Fetch
+        # those targets in one bounded IN query rather than broadening the scan.
+        target_ids = {
+            (node.get("properties") or {}).get("target_id")
+            for node in nodes.values() if node.get("kind") == "write"
+        }
+        target_ids.discard(None)
+        if target_ids:
+            coded = [encode_id(nid, self._id_codes) for nid in target_ids]
+            res = self._conn.execute(
+                "MATCH (n:Node) WHERE n.id IN $ids RETURN n.id, n.kind, n.label",
+                {"ids": coded},
+            )
+            while res.has_next():
+                coded_id, kind, label = res.get_next()
+                nid = decode_id(coded_id, self._id_prefixes)
+                nodes.setdefault(nid, {"id": nid, "kind": kind, "label": label,
+                                       "properties": {}})
+        return {"nodes": tuple(nodes.values()), "edges": tuple(edges)}
+
+    @timeit
     def value_targets_by_source(self) -> dict[str, tuple[str, ...]]:
         """Compactly index the hot VALUE_FLOWS_TO relation by source id.
 

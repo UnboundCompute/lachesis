@@ -85,7 +85,7 @@ def _languages_present(graph: Dict[str, Any]) -> List[str]:
 
 def atropos_enrich(
     graph: Dict[str, Any], *, atropos_root: Optional[str] = None,
-    complete_dataflow: bool = True,
+    complete_dataflow: bool = True, symbol_index_source: Any = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return ``(taint_aware_graph, summary)``; graph unchanged if Atropos absent.
 
@@ -113,11 +113,19 @@ def atropos_enrich(
 
     stamps: List[dict] = []
     per_language: Dict[str, Any] = {}
+    projection = None
+    if symbol_index_source is not None:
+        projection_fn = getattr(symbol_index_source, "atropos_projection", None)
+        if projection_fn is not None:
+            projection = projection_fn()
     for language in languages:
         lang_models = [m for m in models if m.get("language") == language]
         if not lang_models:
             continue
-        index = canonical_index(graph, language=language, source="lachesis")
+        index = canonical_index(
+            projection if projection is not None else graph,
+            language=language, source="lachesis",
+        )
         report = binder.bind_all(lang_models, index)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
