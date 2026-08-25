@@ -995,6 +995,10 @@ def write_kuzu_graph(
     # reduced stores, whose body records are intentionally incomplete.
     from lachesis.nav.dataflow.substrate import write_pass2_owner_cache
     write_pass2_owner_cache({"nodes": nodes}, target_db_dir, manifest=payload)
+    if enriched and not carry_unresolved_edges:
+        from lachesis.nav.dataflow.substrate import write_pass2_cfg_cache
+        write_pass2_cfg_cache({"nodes": nodes, "edges": edges}, target_db_dir,
+                              manifest=payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)
