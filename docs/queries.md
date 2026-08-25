@@ -1,10 +1,12 @@
 # Querying the graph
 
-Once a graph is built there are three ways to ask it questions: `lachesis-query`,
-the verdict-free `lachesis-candidates` worklist command, and the `lachesis-mcp`
-server that exposes both kinds of reasoning to an LLM agent. This page is the
-reference for them. For a hands-on run of the most
-important ones, follow [`examples/README.md`](../examples/README.md).
+Once a graph is built there are three ways to ask it questions: `lachesis query`,
+the verdict-free `lachesis candidates` worklist command, and the `lachesis mcp`
+server that exposes both kinds of reasoning to an LLM agent. All three are now
+subcommands of the one `lachesis` entrypoint; the old standalone `lachesis-query`
+/ `lachesis-candidates` / `lachesis-mcp` scripts still work and print a one-line
+hint to the new verb. This page is the reference for them. For a hands-on run of
+the most important ones, follow [`examples/README.md`](../examples/README.md).
 
 Both surfaces read the same canonical graph and speak in terms of the
 [graph model](./graph-model.md): node kinds, edge kinds, and tiers.
@@ -12,10 +14,10 @@ Both surfaces read the same canonical graph and speak in terms of the
 ## The `lachesis-query` command line
 
 ```
-lachesis-query [--budget-tokens N] [--format json|text] <graph> <command> [args]
+lachesis query [--budget-tokens N] [--format json|text] <graph> <command> [args]
 ```
 
-`<graph>` is a store directory built by `lachesis-analyze`. Two global flags apply
+`<graph>` is a store directory built by `lachesis build`. Two global flags apply
 to every command:
 
 - `--format json` (default) emits the full result dict. `--format text` emits a
@@ -211,9 +213,9 @@ evidence, and ranks. The LLM remains the judge.
 The same registry is available for batch use:
 
 ```bash
-lachesis-candidates graph.kuzu --constructor memory.copy.capacity --limit 40
-lachesis-candidates graph.kuzu --constructor memory.copy.capacity --census
-lachesis-candidates graph.kuzu --candidate-id obl_...
+lachesis candidates graph.kuzu --constructor memory.copy.capacity --limit 40
+lachesis candidates graph.kuzu --constructor memory.copy.capacity --census
+lachesis explain graph.kuzu obl_...        # the one-shot capsule for a single candidate
 ```
 
 This batch command emits JSON and binds against the core symbol index. It does not

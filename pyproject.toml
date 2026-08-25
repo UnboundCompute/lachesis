@@ -48,11 +48,14 @@ concept-search = ["fastembed>=0.8,<0.9"]
 # The product surface. Everything below it is the engine, kept because a
 # graph you hold yourself is a legitimate thing to want.
 lachesis = "lachesis.cli.main:main"
-lachesis-analyze = "lachesis.cli.analyze:main"
-lachesis-query = "lachesis.cli.query:main"
-lachesis-mcp = "lachesis.nav.mcp_server:main"
-lachesis-plan = "lachesis.planner.cli:main"
-lachesis-candidates = "lachesis.planner.candidate_cli:main"
+# Deprecated aliases: the reader is one `lachesis` with subcommands now. Each old
+# script still runs its exact prior behaviour and prints a stderr hint to the new
+# verb (lachesis-analyze -> `lachesis build`, it is pass 1 the builder).
+lachesis-analyze = "lachesis.cli.deprecated:analyze"
+lachesis-query = "lachesis.cli.deprecated:query"
+lachesis-mcp = "lachesis.cli.deprecated:mcp"
+lachesis-plan = "lachesis.cli.deprecated:plan"
+lachesis-candidates = "lachesis.cli.deprecated:candidates"
 
 [project.urls]
 Homepage = "https://github.com/UnboundCompute/lachesis"
