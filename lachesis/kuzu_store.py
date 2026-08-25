@@ -988,13 +988,6 @@ def write_kuzu_graph(
     from lachesis.nav.dataflow.substrate import write_substrate_cache
     write_substrate_cache({"nodes": nodes, "edges": edges}, target_db_dir,
                           manifest=payload)
-    # Pass 2 object analysis consumes whole owner bodies in dependency waves.  The
-    # build already has those node records resident, so publish an ordered protobuf
-    # stream beside the structural substrate and let Pass 2 avoid repeating the large
-    # Kùzu owner scan.  It is independently content/version keyed and harmless for
-    # reduced stores, whose body records are intentionally incomplete.
-    from lachesis.nav.dataflow.substrate import write_pass2_owner_cache
-    write_pass2_owner_cache({"nodes": nodes}, target_db_dir, manifest=payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)
