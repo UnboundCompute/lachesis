@@ -37,8 +37,18 @@ _LITERALS = {"IntegerLiteral", "FloatingLiteral", "StringLiteral", "CharacterLit
 _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOperator",
             "UnaryOperator", "CompoundAssignOperator", "ConditionalOperator"}
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _CACHE_SUFFIX = ".pass3.substrate.pb"
+_SUBSTRATE_NODE_KINDS = frozenset({
+    "ArraySubscriptExpr", "BinaryOperator", "BreakStmt", "CallExpr", "CaseStmt",
+    "CompoundAssignOperator", "CompoundStmt", "ConditionalOperator", "ContinueStmt",
+    "CXXMemberCallExpr", "CXXNullPtrLiteralExpr", "CXXOperatorCallExpr", "DeclRefExpr",
+    "DeclStmt", "DefaultStmt", "DoStmt", "ForStmt", "GNUNullExpr", "GotoStmt",
+    "IfStmt", "ImplicitCastExpr", "ImplicitValueInitExpr", "IntegerLiteral", "LabelStmt",
+    "MemberExpr", "ParenExpr", "ParmVarDecl", "ReturnStmt", "StringLiteral", "SwitchStmt",
+    "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
+    "cfg-exit", "cfg-merge", "cfg-condition",
+})
 
 
 def substrate_cache_path(graph_path):
@@ -49,7 +59,7 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     """Write the structural Pass-3 substrate produced by Pass 1.
 
     The file is framed protobuf, not pickle/JSON. It contains only immutable
-    relations and member-expression records consumed by the object substrate;
+    relations and scalar expression records consumed by the object substrate;
     Kuzu remains the fallback for anything outside this contract.
     """
     nodes = graph.get("nodes", ())
@@ -60,14 +70,18 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     # retains the stronger validation used by the normal Pass-1 writer.
     node_ids = ({node.get("id") for node in nodes}
                 if "nodes" in graph else None)
-    records, member_nodes = [], []
+    records, cached_nodes, member_nodes = [], [], []
     for node in nodes:
         props = node.get("properties") or {}
-        if props.get("syntax_kind") == "MemberExpr":
-            member_nodes.append({
+        syntax_kind = props.get("syntax_kind") or node.get("kind")
+        if syntax_kind in _SUBSTRATE_NODE_KINDS:
+            cached = {
                 "id": node.get("id"), "kind": node.get("kind"),
                 "label": node.get("label"), "properties": props,
-            })
+            }
+            cached_nodes.append(cached)
+            if syntax_kind == "MemberExpr":
+                member_nodes.append(cached)
     for edge in graph.get("edges", ()):
         source, target = edge.get("source"), edge.get("target")
         if node_ids is not None and (source not in node_ids or target not in node_ids):
@@ -89,8 +103,8 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     header = {
         "format": "lachesis-pass3-substrate",
         "version": _CACHE_VERSION,
-        "node_count": graph.get("node_count", len(node_ids) if node_ids is not None else 0),
         "edge_count": len(records),
+        "node_count": len(cached_nodes),
         "member_count": len(member_nodes),
         "store_version": manifest.get("version"),
         "core_content_hash": manifest.get("core_content_hash"),
@@ -103,7 +117,7 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     try:
         with os.fdopen(fd, "wb") as handle:
             write_frame(handle, encode_document({"type": "header", **header}))
-            for node in member_nodes:
+            for node in cached_nodes:
                 write_frame(handle, b"N" + encode_node(node))
             for edge in records:
                 write_frame(handle, b"E" + encode_edge(edge))
@@ -144,14 +158,16 @@ def read_substrate_cache(index):
             if header.get(header_key) != expected.get(manifest_key):
                 return None
         result = {"ast": [], "refers": [], "cfg": [],
-                  "initializers": [], "members": []}
+                  "initializers": [], "members": [], "nodes": []}
         for frame in frames:
             if not frame:
                 continue
             is_node = frame[:1] == b"N"
             record = decode_node(frame[1:]) if is_node else decode_edge(frame[1:])
             if is_node:
-                result["members"].append(record)
+                result["nodes"].append(record)
+                if (record.get("properties") or {}).get("syntax_kind") == "MemberExpr":
+                    result["members"].append(record)
             elif record.get("kind") == "AST_CHILD":
                 result["ast"].append(record)
             elif record.get("kind") == "REFERS_TO":
@@ -193,6 +209,8 @@ class Substrate:
             return self
         cached = read_substrate_cache(self.idx)
         if cached is not None:
+            for node in cached.get("nodes", ()):
+                self._node[node["id"]] = node
             for e in cached["ast"]:
                 self.ast_children[e["source"]].append(e["target"])
                 self.ast_parent[e["target"]] = e["source"]
