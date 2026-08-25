@@ -329,4 +329,19 @@ mod tests {
         let p = state.resolve(&mut Path::root("p"), false).unwrap();
         assert_eq!(p, q);
     }
+
+    #[test]
+    fn linear_batch_keeps_pre_and_post_snapshots() {
+        let nodes = vec!["alloc".to_string(), "free".to_string()];
+        let target = Path::root("p");
+        let operations = vec![
+            op(Kind::Alloc, target.clone(), "alloc"),
+            op(Kind::Free, target, "free"),
+        ];
+        let result = solve_linear(&nodes, &operations, State::default());
+        assert_eq!(result.point_states.len(), 2);
+        assert_eq!(result.post_states.len(), 2);
+        assert_eq!(result.transfers, 2);
+        assert!(result.findings.double_free.is_empty());
+    }
 }
