@@ -959,14 +959,14 @@ class SinkTaxonomyTest(unittest.TestCase):
         # sink kind it models must be placed in the tree. Skipped when the
         # catalog is not checked out beside us (unit runs stay hermetic).
         try:
-            from lachesis.integrations.atropos.enrich import locate_atropos, _load_binder
+            from lachesis.integrations.atropos.enrich import locate_atropos
+            from lachesis.integrations.atropos.models import load_models
         except Exception:  # pragma: no cover - integration module optional
             self.skipTest("atropos integration unavailable")
         root = locate_atropos(None)
         if root is None:
             self.skipTest("atropos catalog not checked out")
-        binder = _load_binder(root)
-        models = binder.load_models(root / "models")
+        models = load_models(root / "models")
         from lachesis.planner import taxonomy
 
         # load_models returns a flat list of role entries; each sink entry

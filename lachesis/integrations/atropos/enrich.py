@@ -20,7 +20,6 @@ is an additive :class:`GraphDelta` folded over a graph the caller already holds.
 """
 from __future__ import annotations
 
-import importlib.util
 import os
 import sys
 from time import perf_counter
@@ -53,17 +52,9 @@ def locate_atropos(explicit: Optional[str] = None) -> Optional[Path]:
     candidates.append(Path(__file__).resolve().parents[3].parent / "atropos")
     candidates.append(Path.home() / "project" / "unboundcompute" / "atropos")
     for candidate in candidates:
-        if (candidate / "tools" / "bind.py").exists():
+        if (candidate / "models").is_dir():
             return candidate
     return None
-
-
-def _load_binder(atropos_root: Path):
-    spec = importlib.util.spec_from_file_location(
-        "atropos_bind", str(atropos_root / "tools" / "bind.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _languages_present(graph: Dict[str, Any]) -> List[str]:
@@ -119,8 +110,9 @@ def atropos_enrich(
                        "atropos_root": str(root)}
 
     started = perf_counter()
-    binder = _load_binder(root)
-    models = list(binder.load_models(root / "models"))
+    from lachesis.integrations.atropos.models import load_models
+
+    models = load_models(root / "models")
     models_by_id = {model["id"]: model for model in models}
     _phase_timing("catalog load", started)
 

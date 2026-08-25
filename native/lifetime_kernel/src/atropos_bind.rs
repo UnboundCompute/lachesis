@@ -6,7 +6,7 @@
 //! values.  The output is the existing `atropos-binding-report` contract.
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::{c_char, CStr, CString};
+use prost::Message;
 
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 
@@ -318,16 +318,100 @@ fn bind_all(models: &[Model], index: &Index) -> Report {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Input { models: Vec<Model>, index: Index }
+fn optional_string(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn from_proto(request: crate::atropos_proto::Request) -> (Vec<Model>, Index) {
+    let models = request.models.into_iter().map(|model| Model {
+        id: optional_string(model.id), language: optional_string(model.language),
+        method: optional_string(model.method), package: optional_string(model.package),
+        receiver_type: optional_string(model.receiver_type),
+        arity: model.has_arity.then_some(model.arity),
+        access_path: optional_string(model.access_path), role: optional_string(model.role),
+    }).collect();
+    let index = request.index.unwrap_or_default();
+    let callsites = index.callsites.into_iter().map(|callsite| {
+        let callee = callsite.callee.unwrap_or_default();
+        Callsite {
+            id: callsite.id,
+            callee: Callee {
+                name: callee.name, module: optional_string(callee.module),
+                receiver_type: optional_string(callee.receiver_type),
+                arity: callee.has_arity.then_some(callee.arity),
+            },
+            call_value_id: optional_string(callsite.call_value_id),
+            receiver_value_id: optional_string(callsite.receiver_value_id),
+            arg_value_ids: callsite.arg_value_ids,
+        }
+    }).collect();
+    (models, Index { language: optional_string(index.language), source: optional_string(index.source), callsites })
+}
+
+fn to_proto(report: Report) -> crate::atropos_proto::Report {
+    let rows = report.results.into_iter().map(|row| crate::atropos_proto::ResultRow {
+        model_id: row.model_id.unwrap_or_default(), method: row.method.unwrap_or_default(),
+        access_path: row.access_path.unwrap_or_default(), role: row.role.unwrap_or_default(),
+        status: row.status,
+        candidates: row.candidates.unwrap_or_default().into_iter().map(|candidate| crate::atropos_proto::Candidate {
+            module: candidate.module.unwrap_or_default(), receiver_type: candidate.receiver_type.unwrap_or_default(),
+            arity: candidate.arity.unwrap_or_default(), has_arity: candidate.arity.is_some(),
+        }).collect(),
+        attachments: row.attachments.unwrap_or_default().into_iter().map(|attachment| {
+            let target = if let Some(node) = attachment.node {
+                crate::atropos_proto::attachment::Target::Node(crate::atropos_proto::NodeAttachment {
+                    node, kind: attachment.kind.unwrap_or_default(), index: attachment.index.unwrap_or_default() as i64,
+                    has_index: attachment.index.is_some(),
+                })
+            } else {
+                let edge = attachment.edge.unwrap();
+                crate::atropos_proto::attachment::Target::Edge(crate::atropos_proto::Edge {
+                    from: edge.from, to: edge.to,
+                })
+            };
+            crate::atropos_proto::Attachment {
+                callsite: attachment.callsite, target: Some(target),
+                from_kind: attachment.from_kind.unwrap_or_default(),
+                to_kind: attachment.to_kind.unwrap_or_default(),
+            }
+        }).collect(),
+        skipped: row.skipped.unwrap_or_default().into_iter().map(|item| crate::atropos_proto::Skipped {
+            callsite: item.callsite, detail: item.detail,
+        }).collect(),
+        detail: row.detail.unwrap_or_default(),
+    }).collect();
+    crate::atropos_proto::Report {
+        format: report.format.into(), version: report.version,
+        index: report.index.unwrap_or_default(),
+        summary: Some(crate::atropos_proto::Summary {
+            symbol_not_found: report.summary.symbol_not_found as u64,
+            ambiguous: report.summary.ambiguous as u64,
+            arity_mismatch: report.summary.arity_mismatch as u64,
+            unsupported_path: report.summary.unsupported_path as u64,
+            bound: report.summary.bound as u64,
+            attempted: report.summary.attempted as u64,
+        }),
+        results: rows,
+    }
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn lachesis_atropos_bind_json(input: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn lachesis_atropos_bind_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
     let result = (|| {
-        let input = CStr::from_ptr(input).to_str().map_err(|error| error.to_string())?;
-        let input: Input = serde_json::from_str(input).map_err(|error| error.to_string())?;
-        serde_json::to_string(&bind_all(&input.models, &input.index)).map_err(|error| error.to_string())
+        let bytes = std::slice::from_raw_parts(input, length);
+        let request = crate::atropos_proto::Request::decode(bytes)
+            .map_err(|error| error.to_string())?;
+        let (models, index) = from_proto(request);
+        let mut output = Vec::new();
+        to_proto(bind_all(&models, &index)).encode(&mut output)
+            .map_err(|error| error.to_string())?;
+        Ok::<Vec<u8>, String>(output)
     })();
-    let payload = result.unwrap_or_else(|error| serde_json::json!({"error": error}).to_string());
-    CString::new(payload).expect("JSON cannot contain NUL").into_raw()
+    let mut payload = result.unwrap_or_default();
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
 }

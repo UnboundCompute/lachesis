@@ -17,6 +17,10 @@ mod lifetime_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.lifetime.rs"));
 }
 
+mod atropos_proto {
+    include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Path {
     pub root: String,

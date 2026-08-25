@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package lachesis.atropos;
+
+message Model {
+  string id = 1;
+  string language = 2;
+  string method = 3;
+  string package = 4;
+  string receiver_type = 5;
+  int64 arity = 6;
+  bool has_arity = 7;
+  string access_path = 8;
+  string role = 9;
+}
+message Callee {
+  string name = 1;
+  string module = 2;
+  string receiver_type = 3;
+  int64 arity = 4;
+  bool has_arity = 5;
+}
+message Callsite {
+  string id = 1;
+  Callee callee = 2;
+  string call_value_id = 3;
+  string receiver_value_id = 4;
+  repeated string arg_value_ids = 5;
+}
+message Index {
+  string language = 1;
+  string source = 2;
+  repeated Callsite callsites = 3;
+}
+message Request {
+  repeated Model models = 1;
+  Index index = 2;
+}
+message Candidate {
+  string module = 1;
+  string receiver_type = 2;
+  int64 arity = 3;
+  bool has_arity = 4;
+}
+message Edge { string from = 1; string to = 2; }
+message Attachment {
+  string callsite = 1;
+  oneof target {
+    NodeAttachment node = 2;
+    Edge edge = 3;
+  }
+  string from_kind = 4;
+  string to_kind = 5;
+}
+message NodeAttachment {
+  string node = 1;
+  string kind = 2;
+  int64 index = 3;
+  bool has_index = 4;
+}
+message Skipped { string callsite = 1; string detail = 2; }
+message ResultRow {
+  string model_id = 1;
+  string method = 2;
+  string access_path = 3;
+  string role = 4;
+  string status = 5;
+  repeated Candidate candidates = 6;
+  repeated Attachment attachments = 7;
+  repeated Skipped skipped = 8;
+  string detail = 9;
+}
+message Summary {
+  uint64 symbol_not_found = 1;
+  uint64 ambiguous = 2;
+  uint64 arity_mismatch = 3;
+  uint64 unsupported_path = 4;
+  uint64 bound = 5;
+  uint64 attempted = 6;
+}
+message Report {
+  string format = 1;
+  uint32 version = 2;
+  string index = 3;
+  Summary summary = 4;
+  repeated ResultRow results = 5;
+}

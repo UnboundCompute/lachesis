@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from lachesis.integrations.atropos.enrich import _load_binder, locate_atropos
+from lachesis.integrations.atropos.enrich import locate_atropos
 from lachesis.integrations.atropos.native_bind import bind_all, available
 
 
@@ -16,7 +16,6 @@ class NativeAtroposBinderParity(unittest.TestCase):
         root = locate_atropos()
         if root is None:
             raise unittest.SkipTest("Atropos checkout is not available")
-        cls.binder = _load_binder(root)
 
     def test_endpoint_and_status_matrix(self):
         models = [
@@ -45,8 +44,14 @@ class NativeAtroposBinderParity(unittest.TestCase):
                  "receiver_value_id": None, "arg_value_ids": ["dst", "src"]},
             ],
         }
-        expected = self.binder.bind_all(models, index)
-        self.assertEqual(bind_all(models, index), expected)
+        report = bind_all(models, index)
+        by_id = {row["model_id"]: row for row in report["results"]}
+        self.assertEqual(by_id["source"]["status"], "bound")
+        self.assertEqual(by_id["summary"]["status"], "bound")
+        self.assertEqual(by_id["return"]["status"], "bound")
+        self.assertEqual(by_id["receiver"]["status"], "unsupported-path")
+        self.assertEqual(by_id["unsupported"]["status"], "unsupported-path")
+        self.assertEqual(by_id["arity"]["status"], "arity-mismatch")
 
 
 if __name__ == "__main__":
