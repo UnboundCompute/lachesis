@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::slice;
+use std::sync::Arc;
 use prost::Message;
 
 use serde::{Deserialize, Serialize};
@@ -787,10 +788,12 @@ impl Operation {
     fn access_is_return(&self) -> bool { self.access == "return" }
 }
 
-fn deduplicate(states: Vec<State>) -> Vec<State> {
+fn deduplicate_shared(states: Vec<Arc<State>>) -> Vec<Arc<State>> {
     let mut unique = Vec::with_capacity(states.len());
     'candidate: for state in states {
-        if unique.iter().any(|existing: &State| existing.semantically_equal(&state)) {
+        if unique.iter().any(|existing: &Arc<State>| {
+            existing.as_ref().semantically_equal(state.as_ref())
+        }) {
             continue 'candidate;
         }
         unique.push(state);
@@ -920,11 +923,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     tracked_nodes.extend(nodes.iter().filter(|node| {
         successors.get(*node).is_some_and(Vec::is_empty)
     }).cloned());
-    let mut incoming: HashMap<String, Vec<State>> = nodes.iter()
+    let mut incoming: HashMap<String, Vec<Arc<State>>> = nodes.iter()
         .map(|node| (node.clone(), Vec::new()))
         .collect();
     if let Some(first) = nodes.first() {
-        incoming.insert(first.clone(), vec![initial]);
+        incoming.insert(first.clone(), vec![Arc::new(initial)]);
     }
     let mut point_snapshots: HashMap<String, Vec<Snapshot>> = HashMap::new();
     let mut post_snapshots: HashMap<String, Vec<Snapshot>> = HashMap::new();
@@ -947,18 +950,21 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             // then release the full mutable state after propagation.  Keeping
             // full State clones in `incoming` for every operation node causes
             // branch-heavy functions to retain thousands of historical heaps.
-            point_snapshots.insert(node.clone(), current.iter().map(State::snapshot).collect());
+            point_snapshots.insert(node.clone(), current.iter().map(|state| state.snapshot()).collect());
         }
         for operation in at.get(&node).into_iter().flatten() {
             let mut next = Vec::with_capacity(current.len());
-            for state in current {
-                next.extend(state.apply_variants(operation, &mut findings));
+            for shared in current {
+                let state = Arc::try_unwrap(shared)
+                    .unwrap_or_else(|shared| (*shared).clone());
+                next.extend(state.apply_variants(operation, &mut findings)
+                    .into_iter().map(Arc::new));
             }
-            current = deduplicate(next);
+            current = deduplicate_shared(next);
         }
         transfers += current.len() as u64;
         if tracked_nodes.contains(&node) {
-            post_snapshots.insert(node.clone(), current.iter().map(State::snapshot).collect());
+            post_snapshots.insert(node.clone(), current.iter().map(|state| state.snapshot()).collect());
         }
         let outgoing = successors.get(&node).map(Vec::as_slice).unwrap_or(&[]);
         if outgoing.len() == 1 {
@@ -970,7 +976,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             }
             let mut target = incoming.get_mut(successor).map(std::mem::take).unwrap_or_default();
             let mut new_items = current.into_iter().filter(|state| {
-                !target.iter().any(|existing| existing.semantically_equal(state))
+                !target.iter().any(|existing| existing.as_ref().semantically_equal(state.as_ref()))
             }).collect::<Vec<_>>();
             if new_items.is_empty() {
                 incoming.insert(successor.clone(), target);
@@ -980,12 +986,13 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
                 || widened.contains(successor);
             let (replacement, changed) = if should_widen {
                 target.append(&mut new_items);
-                let merged = join_states(&target, successor);
+                let candidates = target.iter().map(|state| (**state).clone()).collect::<Vec<_>>();
+                let merged = join_states(&candidates, successor);
                 let changed = target.len() != 1
-                    || !target.first().is_some_and(|old| old.semantically_equal(&merged));
+                    || !target.first().is_some_and(|old| old.as_ref().semantically_equal(&merged));
                 widened.insert(successor.clone());
                 widenings += 1;
-                (vec![merged], changed)
+                (vec![Arc::new(merged)], changed)
             } else {
                 target.append(&mut new_items);
                 (target, true)
@@ -1002,7 +1009,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             }
             let target = incoming.get(successor).cloned().unwrap_or_default();
             let mut new_items = current.iter().filter(|state| {
-                !target.iter().any(|existing| existing.semantically_equal(state))
+                !target.iter().any(|existing| existing.as_ref().semantically_equal(state.as_ref()))
             }).cloned().collect::<Vec<_>>();
             if new_items.is_empty() {
                 continue;
@@ -1010,14 +1017,14 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             let should_widen = target.len() + new_items.len() > cap
                 || widened.contains(successor);
             let (replacement, changed) = if should_widen {
-                let mut candidates = target.clone();
-                candidates.append(&mut new_items);
+                let mut candidates = target.iter().map(|state| (**state).clone()).collect::<Vec<_>>();
+                candidates.extend(new_items.iter().map(|state| (**state).clone()));
                 let merged = join_states(&candidates, successor);
                 let changed = target.len() != 1
-                    || !target.first().is_some_and(|old| old.semantically_equal(&merged));
+                    || !target.first().is_some_and(|old| old.as_ref().semantically_equal(&merged));
                 widened.insert(successor.clone());
                 widenings += 1;
-                (vec![merged], changed)
+                (vec![Arc::new(merged)], changed)
             } else {
                 let mut replacement = target;
                 replacement.append(&mut new_items);
