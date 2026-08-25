@@ -366,25 +366,23 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
     for node in owned:
         if sub.is_plain_assign(node):
             lhs, rhs = _assignment_operands(sub, node)
-            if lhs is None or rhs is None:
-                continue
-            line = _line(sub, node)
-            base = _deref_base(sub, ap_builder, lhs)
-            if base is not None and not _is_unevaluated(sub, lhs):
-                rhs_source = _path(ap_builder, rhs)
-                operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
-                                      target=base, source=rhs_source, line=line, ordinal=0,
-                                      access="write"))
-            # Only pointer-valued stores alter this lifetime environment. Scalar
-            # ``*p = 0`` is a use of p, not a rebinding of p.
-            if not _is_pointer(sub, lhs):
-                continue
-            target = _path(ap_builder, lhs)
-            if target is None:
-                continue
-            kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, rhs)
-            operations.append(_op(kind, _place(sub, cfg_nodes, node), target=target,
-                                  source=payload, line=line, ordinal=1, is_null=is_null))
+            if lhs is not None and rhs is not None:
+                line = _line(sub, node)
+                base = _deref_base(sub, ap_builder, lhs)
+                if base is not None and not _is_unevaluated(sub, lhs):
+                    rhs_source = _path(ap_builder, rhs)
+                    operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
+                                          target=base, source=rhs_source, line=line, ordinal=0,
+                                          access="write"))
+                # Only pointer-valued stores alter this lifetime environment. Scalar
+                # ``*p = 0`` is a use of p, not a rebinding of p.
+                if _is_pointer(sub, lhs):
+                    target = _path(ap_builder, lhs)
+                    if target is not None:
+                        kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, rhs)
+                        operations.append(_op(
+                            kind, _place(sub, cfg_nodes, node), target=target,
+                            source=payload, line=line, ordinal=1, is_null=is_null))
 
         elif sub.kind(node) == "VarDecl" and _is_pointer(sub, node):
             initializer = _initializer(sub, node)
@@ -398,25 +396,24 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                     OpKind.CLOBBER, _place(sub, cfg_nodes, node, node),
                     target=target, line=_line(sub, node), ordinal=1,
                     access="uninitialized"))
-                continue
-            target = AccessPath("decl:" + str(node))
-            kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, initializer)
-            anchor = _place(sub, cfg_nodes, _peel(sub, initializer), node)
-            operations.append(_op(kind, anchor, target=target, source=payload,
-                                  line=_line(sub, node), ordinal=1, is_null=is_null))
-            arithmetic_source = _pointer_arithmetic_source(sub, ap_builder, initializer)
-            if arithmetic_source is not None:
-                # Preserve the derived pointer and its source object as a
-                # semantic fact. The lifetime engine may ignore this USE, but
-                # the reusable skeleton can match a later dereference against
-                # the derived pointer without reparsing the expression.
-                operations.append(_op(
-                    OpKind.USE, anchor, target=target, source=arithmetic_source,
-                    line=_line(sub, node), ordinal=2,
-                    access="pointer-arithmetic"))
+            else:
+                target = AccessPath("decl:" + str(node))
+                kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, initializer)
+                anchor = _place(sub, cfg_nodes, _peel(sub, initializer), node)
+                operations.append(_op(kind, anchor, target=target, source=payload,
+                                      line=_line(sub, node), ordinal=1, is_null=is_null))
+                arithmetic_source = _pointer_arithmetic_source(sub, ap_builder, initializer)
+                if arithmetic_source is not None:
+                    # Preserve the derived pointer and its source object as a
+                    # semantic fact. The lifetime engine may ignore this USE, but
+                    # the reusable skeleton can match a later dereference against
+                    # the derived pointer without reparsing the expression.
+                    operations.append(_op(
+                        OpKind.USE, anchor, target=target, source=arithmetic_source,
+                        line=_line(sub, node), ordinal=2,
+                        access="pointer-arithmetic"))
 
-    # A real memory read/write through an access expression uses its base object.
-    for node in owned:
+        # A real memory read/write through an access expression uses its base object.
         if _is_pointer_comparison(sub, node):
             for child in sub.ast_children.get(node, ()):
                 path = _path(ap_builder, child)
