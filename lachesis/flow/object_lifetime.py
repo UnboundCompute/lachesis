@@ -636,7 +636,7 @@ def _analyze_prepared(prepared):
     return tuple(sorted(alternatives, key=repr)), result
 
 
-def _summary_worker_count(function_count):
+def _summary_worker_count(function_count, override=None):
     """Return the explicitly configured, bounded process count.
 
     Process execution is opt-in because ``run_pass`` is also a library API: Python's
@@ -644,12 +644,20 @@ def _summary_worker_count(function_count):
     The production CLI satisfies that contract, while silently spawning from an
     arbitrary caller would not.  CI can set LACHESIS_LIFETIME_WORKERS to its CPU/memory
     budget; 0 or 1 keeps deterministic in-process execution.
+
+    ``override`` (from the ``workers=`` keyword on ``run_pass``/``analyze_object_lifetimes``)
+    wins over the env var so a library caller configures parallelism explicitly instead of
+    mutating process-wide ``os.environ`` — which is not thread-safe and would leak into
+    spawned children. ``None`` falls back to the env var, preserving the default-1 contract.
     """
-    raw = os.environ.get("LACHESIS_LIFETIME_WORKERS", "1")
-    try:
-        requested = int(raw)
-    except ValueError as exc:
-        raise ValueError("LACHESIS_LIFETIME_WORKERS must be an integer") from exc
+    if override is not None:
+        requested = int(override)
+    else:
+        raw = os.environ.get("LACHESIS_LIFETIME_WORKERS", "1")
+        try:
+            requested = int(raw)
+        except ValueError as exc:
+            raise ValueError("LACHESIS_LIFETIME_WORKERS must be an integer") from exc
     return max(1, min(requested, function_count, os.cpu_count() or 1))
 
 
@@ -703,8 +711,17 @@ class ObjectLifetimeResult:
 
 
 @timeit
-def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None):
-    """Run object-identity lifetime analysis over all defined functions in ``functions``."""
+def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None,
+                             workers=None, deadline=None):
+    """Run object-identity lifetime analysis over all defined functions in ``functions``.
+
+    ``workers`` overrides ``LACHESIS_LIFETIME_WORKERS`` for this call (``None`` = env).
+    ``deadline`` is an optional cooperative budget: it is checked at each wave boundary
+    (the dominant cost) and, on expiry, stops scheduling further waves and reports
+    ``diagnostics["timed_out"]=True``. Functions already analyzed keep their summaries;
+    the rest fall through to the seed-unsafe path exactly as an un-analyzable function
+    does, so partial output stays sound. It never raises, and bounds scheduling rather
+    than a single in-flight function."""
     started = perf_counter()
     if graph is not None and hasattr(graph, "nodes_of_kind"):
         analysis_index = graph
@@ -749,11 +766,20 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     summary_runs = Counter()
     summary_transfers = 0
     schedule = build_order(functions, call_successors)
-    workers = _summary_worker_count(len(cfgs))
+    workers = _summary_worker_count(len(cfgs), override=workers)
     pool_context = (ProcessPoolExecutor(max_workers=workers)
                     if workers > 1 else nullcontext(None))
+    timed_out = False
     with pool_context as executor:
         for wave in _schedule_levels(schedule, call_successors):
+            # A wave boundary is the natural preemption point: the previous wave's futures
+            # are already drained here, so leaving now orphans nothing. Analyzed functions
+            # keep their summaries; unanalyzed ones fall through to the seed-unsafe path.
+            if deadline is not None and deadline.expired():
+                timed_out = True
+                if executor is not None:
+                    executor.shutdown(cancel_futures=True)
+                break
             # Prepare graph-derived operations in the parent. Workers receive only the
             # pure CFG/state problem, never a Kuzu connection or the materialized graph.
             pending = []
@@ -826,6 +852,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         "summary_recomputations": sum(max(0, count - 1) for count in summary_runs.values()),
         "summary_transfers": summary_transfers,
         "summary_workers": workers,
+        "timed_out": timed_out,
         "cfg_seconds": round(cfg_seconds, 6),
         "summary_seconds": round(summary_seconds, 6),
         "widenings": 0, "transfers": 0,

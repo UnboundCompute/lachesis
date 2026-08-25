@@ -28,6 +28,7 @@ hides the four security tools for a focused understanding run — nothing else c
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,6 +47,7 @@ from lachesis.nav import render as render_mod
 from lachesis.nav import skeleton as skeleton_mod
 from lachesis.nav.comprehension import Comprehension
 from lachesis.nav.concept import ConceptSearch, DEFAULT_MODEL
+from lachesis.session import Analysis, LeadSet
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
@@ -61,7 +63,7 @@ _DEFAULT_FORMAT = "text"
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 HUNTING_TOOLS = SECURITY_TOOLS + (
     "candidates", "candidate_detail", "candidate_census", "skeleton",
-    "flow_pass", "flow_skeleton", "taint", "scan", "guard_dominance",
+    "flow_pass", "leads", "flow_skeleton", "taint", "scan", "guard_dominance",
     "counterexample", "range_analysis", "object_lifecycle", "error_path_summary",
 )
 
@@ -121,7 +123,7 @@ TOOL_ORDER = (
     "object_lifecycle", "error_path_summary",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "skeleton",
-    "flow_pass", "flow_skeleton", "taint",
+    "flow_pass", "leads", "flow_skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -140,6 +142,22 @@ def log(*a):
     print("[lachesis-mcp]", *a, file=sys.stderr, flush=True)
 
 
+def _expand(path):
+    """Expand a leading ``~`` so a user-typed home path resolves instead of 404ing.
+
+    A path that exists on disk but is spelled ``~/.lachesis/graphs/x.kuzu`` used to come
+    back "path not found" because nothing called ``expanduser``. ``None``/empty passes
+    through untouched (an optional overlay or graph that was simply not supplied)."""
+    return os.path.expanduser(path) if path else path
+
+
+# One graph/ctx per process, mutated in place by load_graph. The stdin loop already
+# reads and dispatches requests serially, so there is no live race today; this lock makes
+# that serial contract explicit and keeps the shared _CTX swap atomic under any future
+# concurrent transport, so an overlapping call can never observe a half-attached store.
+_DISPATCH_LOCK = threading.Lock()
+
+
 # What this server calls itself when a client asks. It is the name the user sees in
 # their client's server list, so it is the product's name -- not `nav-reasoning`, which
 # is an internal overlay identifier that happens to be where this code grew up. The
@@ -156,8 +174,13 @@ except (ImportError, PackageNotFoundError):  # a source checkout that was never 
     SERVER_VERSION = "0+unknown"
 
 
-class _Ctx:
+class _Ctx(Analysis):
     """The loaded store plus the analysis objects, all built on first use.
+
+    Subclasses the public :class:`lachesis.session.Analysis`: the store-load, the memo
+    (``_analysis``/``_sync_tier``), and the two heavy builds (``_flow_bundle``/
+    ``_bind_bundle``) all live on the base, so the MCP server and the library share one
+    implementation. This class adds only the navigation properties the tool surface reads.
 
     Lazy for two reasons. A store built without ``--enrich`` grows its dataflow tier on
     demand, and that rebinds ``store.index``; every analysis object here caches the
@@ -166,28 +189,12 @@ class _Ctx:
     never touch dataflow, so they should never pay for it."""
 
     def __init__(self, graph_path, overlay_path):
-        self.store = GraphStore.load(graph_path, overlay_path=overlay_path)
-        self._built = {}
-        self._tier = (self.store.dataflow_ready,
-                      getattr(self.store, "cone_generation", 0))
+        store = GraphStore.load(graph_path, overlay_path=overlay_path)
+        super().__init__(store)
         log(f"loaded {len(self.store.gl.nodes)} nodes; "
             f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges; "
             f"dataflow tier: "
             f"{'present' if self.store.dataflow_ready else 'on demand, per cone'}")
-
-    def _analysis(self, key, build):
-        # Two ways the index can move: the whole tier arrives (`dataflow_ready` flips)
-        # or a cone graft adds edges to the index in place (`cone_generation` ticks).
-        # The second leaves `dataflow_ready` false forever -- the store still has no
-        # full tier -- so watching only the flag would serve a `Reachability` built
-        # before the graft, which is exactly the answer the graft existed to improve.
-        tier = (self.store.dataflow_ready, getattr(self.store, "cone_generation", 0))
-        if self._tier != tier:
-            self._built.clear()  # the index moved under them; every cache is stale
-            self._tier = tier
-        if key not in self._built:
-            self._built[key] = build()
-        return self._built[key]
 
     @property
     def reach(self):
@@ -227,66 +234,24 @@ class _Ctx:
     def candidate_bundle(self):
         """The catalog-stamped graph and its cached obligation registry.
 
-        Candidate enumeration binds catalog facts against the core symbol index and
-        also publishes the cached semantic skeleton to temporal constructors.  The
-        constructors still emit observations, never verdicts; the graph matcher
-        remains the authority for proving a lifecycle relation.
+        The build lives on :meth:`Analysis._bind_bundle` so the library and the MCP surface
+        share one implementation. Candidate enumeration binds catalog facts against the core
+        symbol index and publishes the cached semantic skeleton to the temporal constructors,
+        which emit observations, never verdicts; the graph matcher remains the authority for
+        proving a lifecycle relation.
         """
-        def build():
-            from lachesis.integrations.atropos.enrich import atropos_enrich
-            from lachesis.nav.kuzu_index import materialize_graph
-            from lachesis.planner.registry import default_candidate_registry
-
-            graph = materialize_graph(self.store.index)
-            stamped, summary = atropos_enrich(graph, complete_dataflow=False)
-            # Temporal candidate families observe semantic operations (release,
-            # origin, dereference, and so on), which do not exist as catalog role
-            # nodes in the base CPG.  Reuse the same cached Pass 3 graph exposed
-            # by flow_pass instead of creating a second traversal or teaching the
-            # candidate registry a language-specific lifecycle extractor.
-            from lachesis.flow.pipeline import run_pass
-            from lachesis.planner.temporal_obligation import merge_semantic_nodes
-            semantic_nodes = {}
-            semantic_coverages = []
-            for language in summary.get("languages") or ("c",):
-                flow = (self.flow_bundle if language == "c" else
-                        run_pass(self.store, lang=language, lifetime_engine="object"))
-                semantic = flow.get("semantic_graph")
-                if semantic is not None:
-                    merge_semantic_nodes(semantic_nodes, semantic, language)
-                    semantic_coverages.append(dict(semantic.coverage or {}))
-            if semantic_nodes:
-                stamped["semantic_graph"] = {"nodes": semantic_nodes}
-                if semantic_coverages:
-                    stamped["semantic_graph"]["coverage"] = {
-                        "converged": all(item.get("converged", True)
-                                          for item in semantic_coverages),
-                        "uncovered_states": [state for item in semantic_coverages
-                                             for state in item.get("uncovered_states", ())],
-                        "uncovered_contexts": [context for item in semantic_coverages
-                                               for context in item.get("uncovered_contexts", ())],
-                    }
-            return {
-                "registry": default_candidate_registry(stamped, summary),
-                "stamped": stamped,
-                "atropos": summary,
-            }
-
-        return self._analysis("candidate-registry", build)
+        return self._bind_bundle()
 
     @property
     def flow_bundle(self):
         """The interprocedural flow pass over the whole graph, computed once and cached.
 
-        Composes per-function summaries bottom-up, renders the stitched cross-function flow
-        skeletons, and matches shape patterns over them. Reads the enriched graph only to
-        project the IR; every later stage touches the IR, not the graph.
+        Delegates to :meth:`Analysis._flow_bundle` with ``engine=None`` so an operator who
+        runs this server with ``LACHESIS_LIFETIME_ENGINE=legacy`` is not silently forced into
+        object mode -- the env fallback inside ``run_pass`` still wins. The library's
+        ``analyze`` is opinionated (object by default); the server stays neutral.
         """
-        def build():
-            from lachesis.flow.pipeline import run_pass
-            return run_pass(self.store)
-
-        return self._analysis("flow-pass", build)
+        return self._flow_bundle(engine=None)
 
     @property
     def scan_bundle(self):
@@ -340,6 +305,25 @@ def _seeds(store, token):
 def _seed(store, token):
     seeds = _seeds(store, token)
     return seeds[0] if seeds else None
+
+
+def _parse_at(value):
+    """Parse a `leads` position arg: ``file`` | ``file:line`` | ``file:lo-hi``.
+
+    Returns ``(file, lines)`` where ``lines`` is an inclusive ``(lo, hi)`` tuple or ``None``.
+    Split from the right so a path that itself contains no line suffix is returned whole; a
+    trailing ``:N``/``:LO-HI`` is only consumed when it actually parses as numbers, so a bare
+    file with a colon in the name is not mistaken for a line spec.
+    """
+    head, sep, tail = value.rpartition(":")
+    if sep and head:
+        if "-" in tail:
+            lo, _, hi = tail.partition("-")
+            if lo.isdigit() and hi.isdigit():
+                return head, (int(lo), int(hi))
+        elif tail.isdigit():
+            return head, (int(tail), int(tail))
+    return value, None
 
 
 def _fold_cone(store, name, args):
@@ -928,6 +912,23 @@ TOOLS = [
                     "`function` to scope to one function; paginate with offset/limit.",
      "inputSchema": {"type": "object", "properties": {
          "function": {"type": "string", "description": "scope the census to one function"}}}},
+    {"name": "leads",
+     "description": "Query the flow pass's LEADS in memory -- the shape-matcher findings the "
+                    "3rd pass already computed and cached, not a fresh cold run. This is the "
+                    "warm counterpart to re-deriving leads by hand every question: the pass is "
+                    "materialized once (via `flow_pass`), then this filters the held result. No "
+                    "arg: a by-pattern summary plus the honesty fields (whether the run timed "
+                    "out, which functions were truncated) -- an empty result over a partial run "
+                    "is never 'clean'. `pattern` filters to one bug shape; `function` to one "
+                    "enclosing function; `at` locates by source position `file`, `file:line`, or "
+                    "`file:lo-hi` (a lead carries only its function + line, so the file is "
+                    "resolved through the symbol index; a basename or path suffix is enough). "
+                    "Leads are leads, not verdicts -- adjudicate with sources_of/reaches.",
+     "inputSchema": {"type": "object", "properties": {
+         "pattern": {"type": "string", "description": "keep only this bug-shape pattern"},
+         "function": {"type": "string", "description": "keep only leads in this function"},
+         "at": {"type": "string", "description": "locate by source position: file | file:line "
+                "| file:lo-hi"}}}},
     {"name": "flow_skeleton",
      "description": "Interprocedural flow skeletons: compose per-function summaries into "
                     "linear, nesting-aware {control|sink|lifecycle} streams STITCHED across "
@@ -1598,6 +1599,27 @@ def call_tool(name, args, format=None):
             "lifetime": bundle.get("lifetime", {}),
         }
         return _emit(name, result, fmt, offset, limit)
+    if name == "leads":
+        # The warm counterpart to a cold re-run: `flow_bundle` is already materialized and
+        # cached on the ctx, so this wraps it in a LeadSet and filters in memory. Same
+        # LeadSet the library returns -- one implementation, queried from both surfaces.
+        ls = LeadSet._from_bundle(c.flow_bundle, c.store, engine=None)
+        pattern, function, at = args.get("pattern"), args.get("function"), args.get("at")
+        if pattern:
+            ls = ls.by_pattern(pattern)
+        if function:
+            ls = ls.by_function(function)
+        if at:
+            file, lines = _parse_at(at)
+            ls = ls.near(file, lines)
+        # A bare call (or a summary-shaped one) returns the honest overview; a filtered call
+        # returns the matching rows plus that overview so a thin/empty result still carries
+        # whether the run was partial.
+        result = {"move": "leads", "summary": ls.summary()}
+        if pattern or function or at:
+            result["leads"] = list(ls.leads)
+            result["returned"] = len(ls)
+        return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
         bundle = c.flow_bundle
         all_skels, leads = bundle["skeletons"], bundle["leads"]
@@ -1754,7 +1776,7 @@ def _build_graph(args):
     build-or-reuse path the server's own startup uses — content-addressed, so a second
     build of an unchanged tree returns instantly from cache. On success the freshly built
     store is loaded exactly as `load_graph` would, so the next tool call hits it."""
-    source = args.get("source") or args.get("path")
+    source = _expand(args.get("source") or args.get("path"))
     if not source or not os.path.isdir(source):
         return json.dumps({"error": f"source must be an existing directory: {source!r}"})
     try:
@@ -1798,11 +1820,11 @@ def _load_graph(args):
     """Runtime target switch: repoint the server and drop the cached ctx so the next
     tool call rebuilds against the new graph (load-once still holds within a target)."""
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _CTX
-    path = args.get("path")
+    path = _expand(args.get("path"))
     if not path or not os.path.exists(path):
         return json.dumps({"error": f"graph path not found: {path!r}"})
     _GRAPH_PATH = path
-    _OVERLAY_PATH = args.get("overlay")
+    _OVERLAY_PATH = _expand(args.get("overlay"))
     prof = args.get("profile")
     if prof in ("all", "comprehension"):
         _PROFILE = prof
@@ -1817,6 +1839,44 @@ def send(obj):
     sys.stdout.flush()
 
 
+def _dispatch(msg):
+    """Handle one JSON-RPC message, replying via ``send``.
+
+    Split out of the read loop so that ``main`` can wrap a single request in one
+    try/except: a failure in *any* branch (tool call, tools/list, a serialization
+    error) becomes a JSON-RPC error for that one request, never a loop-killing
+    traceback that takes all tools with it. Tool dispatch is held under
+    ``_DISPATCH_LOCK`` so a load_graph swap stays atomic against an overlapping call."""
+    mid, method = msg.get("id"), msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": _visible_tools()}})
+    elif method == "tools/call":
+        p = msg.get("params") or {}
+        try:
+            a = p.get("arguments") or {}
+            with _DISPATCH_LOCK:
+                text = call_tool(p["name"], a, format=a.get("format"))
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"content": [{"type": "text", "text": text}]}})
+        except Exception as e:  # noqa: BLE001 - one tool's failure is that call's error
+            log("tool error:", e)
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"content": [{"type": "text", "text": f"error: {e}"}],
+                             "isError": True}})
+    elif method == "ping":
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif mid is not None:
+        send({"jsonrpc": "2.0", "id": mid,
+              "error": {"code": -32601, "message": f"method not found: {method}"}})
+
+
 def main():
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _DEFAULT_FORMAT
     if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
@@ -1828,7 +1888,7 @@ def main():
         return 0
     # Config precedence: explicit argv wins, else env. The graph path may come from
     # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
-    _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")
+    _GRAPH_PATH = _expand(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH"))
     # A graph only exists after a build somebody had to know to run, which made this
     # server unusable as the first thing anyone tries. So a directory is accepted in
     # the graph's place, and no argument at all means the working directory: the
@@ -1849,7 +1909,7 @@ def main():
             print(f"lachesis-mcp: {error}", file=sys.stderr)
             return 2
         _GRAPH_PATH = str(graph)
-    _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
+    _OVERLAY_PATH = _expand(sys.argv[2] if len(sys.argv) > 2 else None)
     # Profile: explicit 3rd argv wins, else env (LACHESIS_PROFILE, back-compat
     # LACHESIS_MCP_PROFILE), else the default "all". Only "comprehension" narrows the
     # surface; any other value falls back to "all".
@@ -1870,33 +1930,24 @@ def main():
         except Exception as e:  # noqa: BLE001
             log("bad json:", e)
             continue
-        mid, method = msg.get("id"), msg.get("method")
-        if method == "initialize":
-            send({"jsonrpc": "2.0", "id": mid, "result": {
-                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}}})
-        elif method == "notifications/initialized":
-            pass
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": _visible_tools()}})
-        elif method == "tools/call":
-            p = msg.get("params") or {}
-            try:
-                a = p.get("arguments") or {}
-                text = call_tool(p["name"], a, format=a.get("format"))
-                send({"jsonrpc": "2.0", "id": mid,
-                      "result": {"content": [{"type": "text", "text": text}]}})
-            except Exception as e:  # noqa: BLE001
-                log("tool error:", e)
-                send({"jsonrpc": "2.0", "id": mid,
-                      "result": {"content": [{"type": "text", "text": f"error: {e}"}],
-                                 "isError": True}})
-        elif method == "ping":
-            send({"jsonrpc": "2.0", "id": mid, "result": {}})
-        elif mid is not None:
-            send({"jsonrpc": "2.0", "id": mid,
-                  "error": {"code": -32601, "message": f"method not found: {method}"}})
+        try:
+            _dispatch(msg)
+        except (BrokenPipeError, KeyboardInterrupt):
+            # The client hung up (or Ctrl-C) mid-write; there is nothing left to send.
+            # Leave the loop cleanly instead of dumping a traceback that reads as a crash.
+            log("client disconnected; shutting down")
+            break
+        except Exception as e:  # noqa: BLE001 - one request must never kill the server
+            # A failure anywhere in dispatch (even initialize/tools/list) is reported as
+            # an error for that single request; the server keeps serving all 46 tools.
+            log("dispatch error:", e)
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            if mid is not None:
+                try:
+                    send({"jsonrpc": "2.0", "id": mid,
+                          "error": {"code": -32603, "message": f"internal error: {e}"}})
+                except Exception:  # noqa: BLE001 - client already gone
+                    break
 
 
 if __name__ == "__main__":

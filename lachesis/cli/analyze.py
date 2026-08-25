@@ -261,6 +261,14 @@ def _run() -> None:
 
 
 def main() -> int:
+    # stdout is block-buffered when piped to a file, so a long build that is killed (or a
+    # `| tee log` capture) loses every line it "printed". Line-buffer so progress reaches
+    # the file as it happens and a kill never swallows the tail. Guarded: some wrapped
+    # streams predate `.reconfigure`.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     try:
         _run()
     except KeyboardInterrupt:

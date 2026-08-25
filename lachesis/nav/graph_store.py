@@ -323,6 +323,13 @@ class GraphStore:
         opened directly here so the steady state costs nothing extra."""
         from lachesis.kuzu_store import (STORE_FORMAT_VERSION, is_kuzu_dir,
                                          read_store_manifest)
+        # Expand a leading ``~`` once, at the single load chokepoint, so a home-relative
+        # path resolves the same from the library, the CLI, and the MCP server instead of
+        # failing "not a graph store" for a directory that plainly exists.
+        import os as _os
+        graph_path = _os.path.expanduser(graph_path) if graph_path else graph_path
+        if overlay_path:
+            overlay_path = _os.path.expanduser(overlay_path)
         if not is_kuzu_dir(graph_path):
             raise ValueError(
                 f"{graph_path} is not a Lachesis graph store; build one with "
