@@ -212,6 +212,15 @@ class HeapIdentity:
                 if abstract:
                     context_parameter_objects[context_id][abstract] = caller_objects
 
+        contexts_by_abstract: dict[str, list[tuple[str, set[str], dict[str, set[str]]]]] = \
+            defaultdict(list)
+        for context_id, substitutions in context_parameter_objects.items():
+            for abstract_object, caller_objects in substitutions.items():
+                if caller_objects:
+                    contexts_by_abstract[abstract_object].append(
+                        (context_id, caller_objects, substitutions),
+                    )
+
         # Substitute parameter templates and clone callee-local return
         # allocations separately for every call context.
         for returned in index.nodes_of_kind("context-return"):
@@ -427,10 +436,8 @@ class HeapIdentity:
                                 "owner_function_id")
                             if not abstract_object or not function_id:
                                 continue
-                            for context_id, substitutions in context_parameter_objects.items():
-                                caller_objects = substitutions.get(abstract_object)
-                                if not caller_objects:
-                                    continue
+                            for context_id, caller_objects, substitutions \
+                                    in contexts_by_abstract.get(abstract_object, ()):
                                 contextual_values: set[str] = set()
                                 for value_object in points.get(value_id, ()):
                                     contextual_values.update(
@@ -512,10 +519,8 @@ class HeapIdentity:
                                 })
                                 add_edge("MUTATES", function_id, effect_id, effect_evidence)
                                 add_edge("EVIDENCED_BY", effect_id, write["id"], effect_evidence)
-                            for context_id, substitutions in context_parameter_objects.items():
-                                caller_objects = substitutions.get(abstract_object)
-                                if not caller_objects:
-                                    continue
+                            for context_id, caller_objects, substitutions \
+                                    in contexts_by_abstract.get(abstract_object, ()):
                                 contextual_values: set[str] = set()
                                 for value_object in value_objects:
                                     contextual_values.update(
