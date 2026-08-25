@@ -1,7 +1,7 @@
 """Language-neutral allocation-site and property heap identity."""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from ..composition import GraphDelta
 from ..identities import stable_id
@@ -158,11 +158,44 @@ class HeapIdentity:
             if target_id:
                 identity_edges.append((definition["id"], target_id))
 
-        changed = True
-        while changed:
+        identity_targets: dict[str, list[str]] = defaultdict(list)
+        for source, target in identity_edges:
+            identity_targets[source].append(target)
+
+        def propagate_identity(seeds=None) -> bool:
+            """Push newly discovered points through identity edges once.
+
+            The old fixed-point loop rescanned every identity edge once per
+            propagation wave. Large CPGs contain long chains of definitions and
+            value-preserving expressions, so a late point could make that loop walk
+            the whole edge list hundreds of times. A worklist visits an edge again
+            only when its source set actually grew; the resulting union is identical
+            because points-to facts are monotone.
+            """
+            if seeds is None:
+                queue = deque(value_id for value_id, object_ids in points.items()
+                              if object_ids)
+            else:
+                queue = deque(value_id for value_id in seeds if points.get(value_id))
+            queued = set(queue)
             changed = False
-            for source, target in identity_edges:
-                changed |= add_points(target, points.get(source, set()))
+            while queue:
+                source = queue.popleft()
+                queued.discard(source)
+                source_objects = points.get(source, ())
+                for target in identity_targets.get(source, ()):
+                    target_objects = points[target]
+                    before = len(target_objects)
+                    target_objects.update(source_objects)
+                    if len(target_objects) == before:
+                        continue
+                    changed = True
+                    if target not in queued:
+                        queued.add(target)
+                        queue.append(target)
+            return changed
+
+        propagate_identity()
 
         # Bind caller objects to the context parameter without contaminating a
         # shared callee parameter definition across unrelated call sites.
@@ -216,11 +249,7 @@ class HeapIdentity:
                         returned_objects.add(object_id)
             add_points(returned["id"], returned_objects)
 
-        changed = True
-        while changed:
-            changed = False
-            for source, target in identity_edges:
-                changed |= add_points(target, points.get(source, set()))
+        propagate_identity()
 
         property_paths = list(index.nodes_of_kind("property-path"))
         writes_by_target: dict[str, list[dict]] = defaultdict(list)
@@ -318,6 +347,7 @@ class HeapIdentity:
         # side effect of walking a prefix, which have to keep pace with the rounds.
         def propagate(emit: bool) -> bool:
             changed = False
+            changed_points: set[str] = set()
             for path in property_paths:
                 properties = path.get("properties", {})
                 base_id = properties.get("base_value_id")
@@ -398,17 +428,18 @@ class HeapIdentity:
                                             )
                     for read in reads_by_target.get(path["id"], []):
                         for location_id in target_ids:
-                            changed |= add_points(
+                            if add_points(
                                 read["id"], location_values.get(location_id, set()),
-                            )
+                            ):
+                                changed = True
+                                changed_points.add(read["id"])
                             if emit:
                                 add_edge(
                                     "READS_HEAP", location_id, read["id"],
                                     [read["id"], path["id"], location_id],
                                     property_path_id=path["id"],
                                 )
-            for source, target in identity_edges:
-                changed |= add_points(target, points.get(source, set()))
+            changed |= propagate_identity(changed_points)
             return changed
 
         while propagate(emit=False):
