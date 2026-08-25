@@ -879,42 +879,62 @@ pub(crate) fn solve_prepared(input: &[u8]) -> Result<Vec<u8>, String> {
 fn solve_prepared_functions(
     prepared: Vec<lifetime_proto::PreparedFunction>, include_prepared: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut results = prepared.into_par_iter().map(|function| -> Result<lifetime_proto::PreparedFunctionResult, String> {
-        let id = function.id.clone();
-        // A CFG with no lifetime operations cannot produce a finding or a
-        // state transition.  Avoid allocating its node/state worklists; keep
-        // the prepared CFG in the result so callers retain complete metadata.
-        let has_lifetime_transition = function.operations.iter().any(|operation| {
-            !matches!(operation.kind,
-                x if x == lifetime_proto::operation::Kind::Use as i32 ||
-                     x == lifetime_proto::operation::Kind::Clobber as i32)
-        });
-        if !has_lifetime_transition {
-            return Ok(lifetime_proto::PreparedFunctionResult {
-                id,
-                result: Some(lifetime_proto::Result {
-                    exit_state: Some(lifetime_proto::Snapshot::default()),
-                    ..Default::default()
-                }),
-                prepared: if include_prepared { Some(function) } else { None },
-            });
-        }
-        let operations = function.operations.iter().cloned().map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
-        let successors = function.successors.iter().map(|entry| (entry.node.clone(), entry.targets.clone())).collect::<HashMap<_, _>>();
-        let mut initial = crate::State::default();
-        for (position, root) in function.parameters.iter().enumerate() {
-            initial.seed_parameter(Path::root(format!("decl:{root}")), position as u32);
-        }
-        let solved = crate::solve_graph(&function.nodes, &successors, &operations, initial, 32);
-        Ok(lifetime_proto::PreparedFunctionResult {
-            id,
-            result: Some(crate::proto_result(solved)),
-            prepared: if include_prepared { Some(function) } else { None },
-        })
-    }).collect::<Result<Vec<_>, _>>()?;
+    // Small functions are independent and cheap enough to solve in parallel.
+    // Large CFGs can retain many state copies at branch joins; running all of
+    // them concurrently multiplies the peak and turns paging into the timer.
+    // Keep the large tail serialized while preserving parallel throughput for
+    // the common case.
+    const LARGE_FUNCTION_NODES: usize = 2_000;
+    let (large, small): (Vec<_>, Vec<_>) = prepared.into_iter()
+        .partition(|function| function.nodes.len() > LARGE_FUNCTION_NODES);
+    let mut results = small.into_par_iter()
+        .map(|function| solve_prepared_function(function, include_prepared))
+        .collect::<Result<Vec<_>, _>>()?;
+    for function in large {
+        results.push(solve_prepared_function(function, include_prepared)?);
+    }
     results.sort_by(|left, right| left.id.cmp(&right.id));
     let result = lifetime_proto::PrepareSolveResult { functions: results };
     let mut output = Vec::new();
     result.encode(&mut output).map_err(|error| error.to_string())?;
     Ok(output)
+}
+
+fn solve_prepared_function(
+    function: lifetime_proto::PreparedFunction, include_prepared: bool,
+) -> Result<lifetime_proto::PreparedFunctionResult, String> {
+    let id = function.id.clone();
+    // A CFG with no lifetime operations cannot produce a finding or a
+    // state transition. Avoid allocating its node/state worklists; keep
+    // the prepared CFG in the result so callers retain complete metadata.
+    let has_lifetime_transition = function.operations.iter().any(|operation| {
+        !matches!(operation.kind,
+            x if x == lifetime_proto::operation::Kind::Use as i32 ||
+                 x == lifetime_proto::operation::Kind::Clobber as i32)
+    });
+    if !has_lifetime_transition {
+        return Ok(lifetime_proto::PreparedFunctionResult {
+            id,
+            result: Some(lifetime_proto::Result {
+                exit_state: Some(lifetime_proto::Snapshot::default()),
+                ..Default::default()
+            }),
+            prepared: if include_prepared { Some(function) } else { None },
+        });
+    }
+    let operations = function.operations.iter().cloned()
+        .map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
+    let successors = function.successors.iter()
+        .map(|entry| (entry.node.clone(), entry.targets.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut initial = crate::State::default();
+    for (position, root) in function.parameters.iter().enumerate() {
+        initial.seed_parameter(Path::root(format!("decl:{root}")), position as u32);
+    }
+    let solved = crate::solve_graph(&function.nodes, &successors, &operations, initial, 32);
+    Ok(lifetime_proto::PreparedFunctionResult {
+        id,
+        result: Some(crate::proto_result(solved)),
+        prepared: if include_prepared { Some(function) } else { None },
+    })
 }

@@ -54,24 +54,6 @@ fn node(node: &graph_proto::NodeRecord) -> lifetime_proto::GraphNode {
     }
 }
 
-fn edge(edge: &graph_proto::EdgeRecord) -> lifetime_proto::GraphEdge {
-    let role = edge.properties.iter().find_map(|field| {
-        if field.key == "role" { scalar_edge_value(field) } else { None }
-    }).unwrap_or_default();
-    let position = edge.properties.iter().find_map(|field| {
-        if field.key != "position" { return None; }
-        scalar_edge_value(field)?.parse().ok()
-    });
-    lifetime_proto::GraphEdge {
-        kind: edge.kind.clone(),
-        source: edge.source.clone(),
-        target: edge.target.clone(),
-        role,
-        position: position.unwrap_or_default(),
-        has_position: position.is_some(),
-    }
-}
-
 fn scalar_edge_value(field: &graph_proto::Field) -> Option<String> {
     let value = field.value.as_ref()?.kind.as_ref()?;
     Some(match value {
@@ -79,12 +61,6 @@ fn scalar_edge_value(field: &graph_proto::Field) -> Option<String> {
         graph_proto::value::Kind::Integer(value) => value.to_string(),
         graph_proto::value::Kind::Boolean(value) => value.to_string(),
         _ => return None,
-    })
-}
-
-fn edge_scalar(edge: &graph_proto::EdgeRecord, key: &str) -> Option<String> {
-    edge.properties.iter().find_map(|field| {
-        if field.key == key { scalar_edge_value(field) } else { None }
     })
 }
 
@@ -132,120 +108,89 @@ fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
 pub(crate) fn sidecar_to_request(
     input: &[u8],
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    let mut offset = 0;
-    let header = frame(input, &mut offset)?;
-    let _: graph_proto::Document = graph_proto::Document::decode(header)
-        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    while offset < input.len() {
-        let payload = frame(input, &mut offset)?;
-        if payload.is_empty() { continue; }
-        match payload[0] {
-            b'N' => nodes.push(graph_proto::NodeRecord::decode(&payload[1..])
-                .map_err(|error| format!("invalid graph node frame: {error}"))?),
-            b'E' => edges.push(graph_proto::EdgeRecord::decode(&payload[1..])
-                .map_err(|error| format!("invalid graph edge frame: {error}"))?),
-            _ => return Err("unknown graph sidecar record prefix".to_owned()),
-        }
-    }
-
-    let owners: HashMap<String, String> = nodes.iter().filter_map(|item| {
-        owner(item).map(|function| (item.id.clone(), function))
-    }).collect();
-    let function_names: HashMap<String, String> = nodes.iter().filter_map(|item| {
-        let syntax = scalar(item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
-        if matches!(syntax.as_str(), "function" | "method" | "constructor"
-            | "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
-            Some((item.id.clone(), item.label.clone()))
-        } else {
-            None
-        }
-    }).collect();
-    let node_by_id: HashMap<String, &graph_proto::NodeRecord> = nodes.iter()
-        .map(|item| (item.id.clone(), item)).collect();
-    let mut parents = HashMap::new();
-    let mut edges_by_source: HashMap<String, Vec<usize>> = HashMap::new();
-    for (edge_index, item) in edges.iter().enumerate() {
-        edges_by_source.entry(item.source.clone()).or_default().push(edge_index);
-        if item.kind == "AST_CHILD" {
-            parents.entry(item.target.clone()).or_insert_with(|| item.source.clone());
-        }
-    }
+    let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(input)?;
+    let parents: HashMap<String, String> = edges_by_source.values().flatten()
+        .filter(|item| item.kind == "AST_CHILD" && call_ids.contains(&item.target))
+        .map(|item| (item.target.clone(), item.source.clone()))
+        .collect();
+    let parent_ids: HashSet<String> = parents.values().cloned().collect();
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
-    for item in &nodes {
-        let Some(function) = owner(item) else { continue };
-        let entry = functions.entry(function.clone()).or_insert_with(||
-            lifetime_proto::FunctionInput { id: function, ..Default::default() });
-        let syntax = scalar(item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
-        if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
-        entry.nodes.push(node(item));
-    }
-    for item in &edges {
-        let source_owner = owners.get(&item.source);
-        let target_owner = owners.get(&item.target);
-        let Some(function) = source_owner.or(target_owner) else { continue };
-        let Some(entry) = functions.get_mut(function) else { continue };
-        entry.edges.push(edge(item));
+    let mut call_nodes: Vec<(String, lifetime_proto::GraphNode)> = Vec::new();
+    let mut parent_nodes: HashMap<String, lifetime_proto::GraphNode> = HashMap::new();
+    scan_lifetime_nodes(input, |item| {
+        let item_id = item.id.clone();
+        if let Some(function) = owner(&item) {
+            let entry = functions.entry(function.clone()).or_insert_with(||
+                lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
+            let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+            if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
+            entry.nodes.push(node(&item));
+            if call_ids.contains(&item_id) {
+                call_nodes.push((function, node(&item)));
+            }
+        }
+        if parent_ids.contains(&item_id) {
+            parent_nodes.insert(item_id, node(&item));
+        }
+    })?;
+    for edges in edges_by_source.values() {
+        for item in edges {
+            let source_owner = owners.get(&item.source);
+            let target_owner = owners.get(&item.target);
+            let Some(function) = source_owner.or(target_owner) else { continue };
+            let Some(entry) = functions.get_mut(function) else { continue };
+            entry.edges.push(lifetime_edge(item));
+        }
     }
     // Calls are part of the graph contract, not a Python-side projection.  The
     // frontend has already persisted the canonical lifecycle classification;
     // Rust only links arguments and assignment destinations using AST edges.
-    for item in &nodes {
-        let syntax = scalar(item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
-        if syntax != "CallExpr" && syntax != "CXXMemberCallExpr" && syntax != "CXXOperatorCallExpr" {
-            continue;
-        }
-        let Some(function) = owner(item) else { continue };
+    for (function, item) in call_nodes {
         let Some(entry) = functions.get_mut(&function) else { continue };
         let mut call = lifetime_proto::FunctionCall {
             node: item.id.clone(),
-            callee: scalar(item, "primary_target_id")
+            callee: input_scalar(&item, "primary_target_id")
                 .and_then(|target| function_names.get(&target).cloned())
-                .or_else(|| scalar(item, "callee"))
+                .or_else(|| input_scalar(&item, "callee"))
                 .unwrap_or_else(|| item.label.clone()),
             assigned: String::new(),
-            receiver: scalar(item, "receiver").unwrap_or_default(),
-            line: scalar(item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
-            has_line: scalar(item, "start_line").is_some(),
-            is_alloc: scalar(item, "is_alloc").as_deref() == Some("true"),
-            is_release: scalar(item, "is_release").as_deref() == Some("true"),
-            is_realloc: scalar(item, "is_realloc").as_deref() == Some("true"),
+            receiver: input_scalar(&item, "receiver").unwrap_or_default(),
+            line: input_scalar(&item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
+            has_line: input_scalar(&item, "start_line").is_some(),
+            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true"),
+            is_release: input_scalar(&item, "is_release").as_deref() == Some("true"),
+            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true"),
             is_source: false,
-            is_aggregate_copy: scalar(item, "is_aggregate_copy").as_deref() == Some("true"),
+            is_aggregate_copy: input_scalar(&item, "is_aggregate_copy").as_deref() == Some("true"),
             arguments: Vec::new(),
             assigned_root: String::new(),
             assigned_selectors: Vec::new(),
         };
-        let parent = parents.get(&item.id).and_then(|id| node_by_id.get(id));
+        let parent = parents.get(&item.id).and_then(|id| parent_nodes.get(id));
         if let Some(parent) = parent {
-            let parent_kind = scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
-            if parent_kind == "BinaryOperator" && scalar(parent, "operator").as_deref() == Some("=") {
-                if let Some(left) = edges_by_source.get(&parent.id).into_iter().flatten()
-                    .map(|index| &edges[*index]).find(|edge| {
+            let parent_kind = input_scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
+            if parent_kind == "BinaryOperator" && input_scalar(parent, "operator").as_deref() == Some("=") {
+                if let Some(left) = edges_by_source.get(&parent.id).into_iter().flatten().find(|edge| {
                         edge.kind == "AST_CHILD"
-                            && edge_scalar(edge, "role").as_deref() == Some("LEFT_OPERAND")
+                            && edge.role == "LEFT_OPERAND"
                     }) {
                     call.assigned = left.target.clone();
                 }
             }
         }
         if call.assigned.is_empty() {
-            if let Some(initializer) = edges_by_source.get(&item.id).into_iter().flatten()
-                .map(|index| &edges[*index]).find(|edge| {
+            if let Some(initializer) = edges_by_source.get(&item.id).into_iter().flatten().find(|edge| {
                     edge.kind == "VALUE_FLOWS_TO"
-                        && edge_scalar(edge, "reason").as_deref() == Some("initializer")
+                        && edge.reason == "initializer"
                 }) {
                 call.assigned = initializer.target.clone();
             }
         }
-        let mut arguments = edges_by_source.get(&item.id).into_iter().flatten().filter_map(|index| {
-            let edge = &edges[*index];
+        let mut arguments = edges_by_source.get(&item.id).into_iter().flatten().filter_map(|edge| {
             if edge.kind != "AST_CHILD"
-                || edge_scalar(edge, "role").as_deref() != Some("ARGUMENT") { return None; }
+                || edge.role != "ARGUMENT" { return None; }
             Some(lifetime_proto::FunctionArgument {
-                position: edge_scalar(edge, "position").and_then(|value| value.parse().ok()).unwrap_or_default(),
+                position: edge.position.unwrap_or_default(),
                 node: edge.target.clone(),
                 root: String::new(),
                 selectors: Vec::new(),
@@ -384,6 +329,7 @@ struct CompactEdge {
     source: String,
     target: String,
     role: String,
+    reason: String,
     position: Option<u32>,
 }
 
@@ -417,8 +363,86 @@ fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
         if field.key != "position" { return None; }
         scalar_edge_value(field)?.parse().ok()
     });
+    let reason = record.properties.iter().find_map(|field| {
+        if field.key == "reason" { scalar_edge_value(field) } else { None }
+    }).unwrap_or_default();
     CompactEdge { kind: record.kind, source: record.source, target: record.target,
-                  role, position }
+                  role, reason, position }
+}
+
+fn lifetime_edge(edge: &CompactEdge) -> lifetime_proto::GraphEdge {
+    lifetime_proto::GraphEdge {
+        kind: edge.kind.clone(),
+        source: edge.source.clone(),
+        target: edge.target.clone(),
+        role: edge.role.clone(),
+        position: edge.position.unwrap_or_default() as i64,
+        has_position: edge.position.is_some(),
+    }
+}
+
+fn scan_lifetime_nodes<F>(input: &[u8], mut on_node: F) -> Result<(), String>
+where
+    F: FnMut(graph_proto::NodeRecord),
+{
+    let mut offset = 0;
+    let header = frame(input, &mut offset)?;
+    let _: graph_proto::Document = graph_proto::Document::decode(header)
+        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
+    while offset < input.len() {
+        let payload = frame(input, &mut offset)?;
+        if payload.first() == Some(&b'N') {
+            on_node(graph_proto::NodeRecord::decode(&payload[1..])
+                .map_err(|error| format!("invalid graph node frame: {error}"))?);
+        }
+    }
+    Ok(())
+}
+
+fn scan_lifetime_metadata(
+    input: &[u8],
+) -> Result<(
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashSet<String>,
+    HashMap<String, Vec<CompactEdge>>,
+), String> {
+    let mut owners = HashMap::new();
+    let mut function_names = HashMap::new();
+    let mut call_ids = HashSet::new();
+    let mut edges_by_source: HashMap<String, Vec<CompactEdge>> = HashMap::new();
+    let mut offset = 0;
+    let header = frame(input, &mut offset)?;
+    let _: graph_proto::Document = graph_proto::Document::decode(header)
+        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
+    while offset < input.len() {
+        let payload = frame(input, &mut offset)?;
+        if payload.is_empty() { continue; }
+        match payload[0] {
+            b'N' => {
+                let item = graph_proto::NodeRecord::decode(&payload[1..])
+                    .map_err(|error| format!("invalid graph node frame: {error}"))?;
+                if let Some(function) = owner(&item) {
+                    owners.insert(item.id.clone(), function);
+                }
+                let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+                if matches!(syntax.as_str(), "function" | "method" | "constructor"
+                    | "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
+                    function_names.insert(item.id.clone(), item.label.clone());
+                }
+                if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
+                    call_ids.insert(item.id);
+                }
+            }
+            b'E' => {
+                let item = graph_proto::EdgeRecord::decode(&payload[1..])
+                    .map_err(|error| format!("invalid graph edge frame: {error}"))?;
+                edges_by_source.entry(item.source.clone()).or_default().push(compact_edge(item));
+            }
+            _ => return Err("unknown graph sidecar record prefix".to_owned()),
+        }
+    }
+    Ok((owners, function_names, call_ids, edges_by_source))
 }
 
 fn compact_property<'a>(node: &'a CompactNode, key: &str) -> Option<&'a str> {
