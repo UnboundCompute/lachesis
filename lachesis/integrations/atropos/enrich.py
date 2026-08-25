@@ -118,14 +118,21 @@ def atropos_enrich(
         projection_fn = getattr(symbol_index_source, "atropos_projection", None)
         if projection_fn is not None:
             projection = projection_fn()
+    canonical_projection = None
     for language in languages:
         lang_models = [m for m in models if m.get("language") == language]
         if not lang_models:
             continue
-        index = canonical_index(
-            projection if projection is not None else graph,
-            language=language, source="lachesis",
-        )
+        # The graph projection is language-neutral: canonical_index's language argument
+        # only stamps the output envelope, while the calls/edges scan is identical for
+        # every catalog language. Build that million-node/two-million-edge projection
+        # once and share its immutable callsite lists across the per-language binders.
+        if canonical_projection is None:
+            canonical_projection = canonical_index(
+                projection if projection is not None else graph,
+                language=language, source="lachesis",
+            )
+        index = {**canonical_projection, "language": language}
         report = binder.bind_all(lang_models, index)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
