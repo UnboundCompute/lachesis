@@ -41,8 +41,6 @@ _CACHE_VERSION = 1
 _CACHE_SUFFIX = ".pass3.substrate.pb"
 _PASS2_OWNER_CACHE_VERSION = 1
 _PASS2_OWNER_CACHE_SUFFIX = ".pass2.owner.pb"
-_PASS2_CFG_CACHE_VERSION = 1
-_PASS2_CFG_CACHE_SUFFIX = ".pass2.cfg.pb"
 
 
 def substrate_cache_path(graph_path):
@@ -52,83 +50,6 @@ def substrate_cache_path(graph_path):
 def pass2_owner_cache_path(graph_path):
     """The Pass-1 owner stream consumed by Pass-2 object analysis."""
     return Path(str(graph_path).rstrip("/") + _PASS2_OWNER_CACHE_SUFFIX)
-
-
-def pass2_cfg_cache_path(graph_path):
-    return Path(str(graph_path).rstrip("/") + _PASS2_CFG_CACHE_SUFFIX)
-
-
-def write_pass2_cfg_cache(graph, graph_path, *, manifest=None):
-    """Persist the deterministic intraprocedural CFG prepared during Pass 1."""
-    from lachesis.core.query import GraphIndex
-    from lachesis.nav.dataflow.reaching_def import ReachingDef
-
-    index = GraphIndex(graph)
-    substrate = Substrate(index).load().load_initializers()
-    functions = [node["id"] for kind in ("function", "method", "constructor")
-                 for node in index.nodes_of_kind(kind)]
-    manifest = dict(manifest or {})
-    header = {
-        "type": "lachesis-pass2-cfg-cache",
-        "version": _PASS2_CFG_CACHE_VERSION,
-        "function_count": len(functions),
-        "store_version": manifest.get("version"),
-        "core_content_hash": manifest.get("core_content_hash"),
-        "source_content_hash": manifest.get("source_content_hash"),
-        "build_fingerprint": manifest.get("build_fingerprint"),
-    }
-    target = pass2_cfg_cache_path(graph_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=".pass2-cfg-", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            write_frame(handle, encode_document(header))
-            analyzer = ReachingDef(substrate)
-            for function_id in functions:
-                cfg = analyzer.analyze(function_id, reaching_defs=False)
-                write_frame(handle, b"C" + encode_document({
-                    "function_id": function_id, "cfg": cfg,
-                }))
-        os.replace(temp_name, target)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
-    return str(target)
-
-
-def read_pass2_cfg_cache(index):
-    """Return cached CFGs keyed by owner id, or None on any cache miss."""
-    path = pass2_cfg_cache_path(
-        getattr(index, "_pass3_cache_base", None) or getattr(index, "_db_dir", ""))
-    if not path.is_file():
-        return None
-    try:
-        frames = read_frames(path)
-        header = decode_document(next(frames))
-        expected = getattr(index, "_store_manifest", {})
-        if (header.get("type") != "lachesis-pass2-cfg-cache" or
-                header.get("version") != _PASS2_CFG_CACHE_VERSION):
-            return None
-        for header_key, manifest_key in {
-                "store_version": "version",
-                "core_content_hash": "core_content_hash",
-                "source_content_hash": "source_content_hash",
-                "build_fingerprint": "build_fingerprint",
-        }.items():
-            if header.get(header_key) != expected.get(manifest_key):
-                return None
-        result = {}
-        for frame in frames:
-            if not frame or frame[:1] != b"C":
-                continue
-            record = decode_document(frame[1:])
-            result[record["function_id"]] = record.get("cfg")
-        return result
-    except (OSError, StopIteration, ValueError, TypeError, KeyError):
-        return None
 
 
 def write_pass2_owner_cache(graph, graph_path, *, manifest=None):

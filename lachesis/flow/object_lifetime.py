@@ -738,10 +738,6 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                          for node_id in function_node_ids]
     sub = cached_substrate(analysis_index)
     sub.warm_nodes(function_node_ids)
-    cfg_cache = None
-    if getattr(sub, "idx", None) is analysis_index:
-        from lachesis.nav.dataflow.substrate import read_pass2_cfg_cache
-        cfg_cache = read_pass2_cfg_cache(analysis_index)
     by_name = {}
     for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
@@ -754,9 +750,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     cfgs = {}
     cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}
     def prepare_cfg(name, function_id):
-        cfg = (cfg_cache.get(function_id) if cfg_cache is not None and
-               function_id in cfg_cache else
-               ReachingDef(sub).analyze(function_id, reaching_defs=False))
+        cfg = ReachingDef(sub).analyze(function_id, reaching_defs=False)
         if cfg is None or cfg.get("bailed"):
             cfg_failures[name] = "too-large" if cfg and cfg.get("bailed") else "no-cfg"
         else:
