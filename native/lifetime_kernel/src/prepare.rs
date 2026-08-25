@@ -466,7 +466,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     }
 
     let mut operations = Vec::new();
-    let call_by_node = input.calls.iter().map(|call| (call.node.clone(), call)).collect::<HashMap<_, _>>();
+    let call_by_node = input.calls.iter().map(|call| (call.node.clone(), call.clone())).collect::<HashMap<_, _>>();
 
     // Assignment/declaration and dereference operations are prepared from the
     // raw AST here, before the request reaches the abstract-state solver.
@@ -618,6 +618,30 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         }
     }
+    let mut returns = Vec::new();
+    for (node_id, node) in &graph.nodes {
+        if graph.kind(node_id) != "ReturnStmt" { continue; }
+        let line = property(node, "start_line").and_then(|value| value.parse().ok());
+        let child = graph.children.get(node_id).into_iter().flatten()
+            .min_by_key(|child| graph.offset(child));
+        let Some(child) = child else { continue };
+        let peeled = graph.peel(child.clone());
+        if let Some(call) = call_by_node.get(&peeled) {
+            returns.push(lifetime_proto::FunctionReturn {
+                kind: "call".to_owned(), callee: call.callee.clone(),
+                root: String::new(), selectors: Vec::new(),
+                line: line.unwrap_or_default(), has_line: line.is_some(),
+            });
+        } else if let Some(path) = graph.access_path(&child, 0) {
+            returns.push(lifetime_proto::FunctionReturn {
+                kind: "var".to_owned(), callee: String::new(),
+                root: path.root, selectors: path.selectors,
+                line: line.unwrap_or_default(), has_line: line.is_some(),
+            });
+        }
+    }
+    returns.sort_by_key(|item| (if item.has_line { item.line } else { i64::MAX }, item.root.clone()));
+
     // Map expression anchors to the nearest CFG node. The solver consumes the
     // synthesized statement CFG, while operation extraction remains expression
     // precise above.
@@ -760,6 +784,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         operations: operations.into_iter().map(crate::proto_operation_message).collect(),
         parameters: input.parameters,
         calls,
+        returns,
     }
 }
 

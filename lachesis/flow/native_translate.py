@@ -134,12 +134,24 @@ def build_native_F(store, lang="c", *, return_graph=False):
                            "line": operation.line if operation.has_line else None,
                            "node": operation.node})
         params = tuple(_name(sub, value) for value in item.parameters)
+        returns = []
+        for returned in item.returns:
+            value = {
+                "kind": returned.kind,
+                "line": returned.line if returned.has_line else None,
+            }
+            if returned.kind == "call":
+                value["callee"] = returned.callee
+            elif returned.root:
+                value["var"] = _call_path(sub, returned.root, returned.selectors)
+                value["prov"] = "param" if value["var"] in params else "local"
+            returns.append(value)
         recs[name] = {
             "name": name, "file": _props(node).get("file"),
             "line": _props(node).get("start_line"),
             "externally_visible": _props(node).get("storage_class") != "static",
             "params": params, "calls": calls, "events": events,
-            "assigns": assigns, "returns": [], "callees": callees,
+            "assigns": assigns, "returns": returns, "callees": callees,
             "body_node_count": len(item.nodes),
             "cfg": {"nodes": tuple(item.nodes), "entry": item.nodes[0] if item.nodes else None,
                     "succ": {entry.node: tuple(entry.targets) for entry in item.successors}},

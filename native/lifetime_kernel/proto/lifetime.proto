@@ -161,6 +161,15 @@ message FunctionCall {
   repeated string assigned_selectors = 14;
 }
 
+message FunctionReturn {
+  string kind = 1;
+  string callee = 2;
+  string root = 3;
+  repeated string selectors = 4;
+  sint64 line = 5;
+  bool has_line = 6;
+}
+
 message FunctionSummaryEffect {
   Operation.Kind kind = 1;
   uint32 position = 2;
@@ -193,6 +202,7 @@ message PreparedFunction {
   // Native translation facts retained for the Rust-owned Pass-2 path.  Keeping
   // the calls beside the prepared CFG avoids a second Kùzu walk in Python.
   repeated FunctionCall calls = 6;
+  repeated FunctionReturn returns = 7;
 }
 message PrepareResult { repeated PreparedFunction functions = 1; }
 message PreparedFunctionResult {
