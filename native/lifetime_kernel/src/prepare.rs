@@ -877,7 +877,12 @@ fn solve_prepared_functions(
         // A CFG with no lifetime operations cannot produce a finding or a
         // state transition.  Avoid allocating its node/state worklists; keep
         // the prepared CFG in the result so callers retain complete metadata.
-        if function.operations.is_empty() {
+        let has_lifetime_transition = function.operations.iter().any(|operation| {
+            !matches!(operation.kind,
+                x if x == lifetime_proto::operation::Kind::Use as i32 ||
+                     x == lifetime_proto::operation::Kind::Clobber as i32)
+        });
+        if !has_lifetime_transition {
             return Ok(lifetime_proto::PreparedFunctionResult {
                 id: function.id,
                 result: Some(lifetime_proto::Result {
