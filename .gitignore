@@ -5,6 +5,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+target/
 .venv/
 venv/
 .mypy_cache/
