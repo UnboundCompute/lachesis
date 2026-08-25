@@ -6,8 +6,11 @@
 //! every transfer while preserving the existing analysis semantics.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{c_char, CStr, CString};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Path {
     pub root: String,
     pub selectors: Vec<String>,
@@ -19,7 +22,7 @@ impl Path {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Fact {
     Allocated,
     Freed,
@@ -27,7 +30,7 @@ pub enum Fact {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Kind {
     Alloc,
     Clobber,
@@ -37,7 +40,7 @@ pub enum Kind {
     Use,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Operation {
     pub kind: Kind,
     pub node: String,
@@ -52,7 +55,7 @@ pub struct Operation {
 /// Stable metadata for converting native IDs back to Python's tuple-shaped ObjectIds.
 /// The solver uses compact string handles internally; snapshots never expose those
 /// handles without this table.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ObjectMeta {
     Param { position: u32, selectors: Vec<String> },
     UnknownRoot { root: String },
@@ -60,7 +63,7 @@ pub enum ObjectMeta {
     Allocation { kind: Kind, site: String, target: Path },
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
     Param { kind: Kind, position: u32, selectors: Vec<String> },
     Return { position: u32, selectors: Vec<String> },
@@ -76,13 +79,13 @@ pub struct State {
     pub objects: HashMap<String, ObjectMeta>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Findings {
     pub double_free: Vec<(Option<i64>, Path, String)>,
     pub use_after_free: Vec<(Option<i64>, Path, String)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub env: Vec<(String, String)>,
     pub facts: Vec<(String, Vec<Fact>)>,
@@ -92,7 +95,7 @@ pub struct Snapshot {
     pub objects: Vec<(String, ObjectMeta)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LinearResult {
     pub point_states: Vec<(String, Snapshot)>,
     pub post_states: Vec<(String, Snapshot)>,
@@ -270,6 +273,54 @@ pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State
         post_states.push((node.clone(), state.snapshot()));
     }
     LinearResult { point_states, post_states, exit_state: state.snapshot(), findings, transfers }
+}
+
+#[derive(Debug, Deserialize)]
+struct WireBatch {
+    nodes: Vec<String>,
+    operations: Vec<Operation>,
+    parameters: Vec<(String, u32)>,
+}
+
+fn solve_wire(batch: WireBatch) -> LinearResult {
+    let mut state = State::default();
+    for (root, position) in batch.parameters {
+        state.seed_parameter(Path::root(root), position);
+    }
+    // The Python initializer materializes parameter-relative fields mentioned by the
+    // batch.  Resolve them once with creation enabled so the native state has the same
+    // stable parameter identities before the first transfer.
+    for operation in &batch.operations {
+        for path in [operation.target.as_ref(), operation.source.as_ref()].into_iter().flatten() {
+            let mut path = path.clone();
+            if state.env.contains_key(&path.root) && !path.selectors.is_empty() {
+                let _ = state.resolve(&mut path, true);
+            }
+        }
+    }
+    solve_linear(&batch.nodes, &batch.operations, state)
+}
+
+/// Solve one prepared linear function batch.  The ABI is intentionally tiny: Python
+/// passes one UTF-8 JSON document and receives one owned UTF-8 JSON document.  This is
+/// an opt-in bridge during development; the normal Python solver remains the fallback
+/// until parity is established.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_solve_json(input: *const c_char) -> *mut c_char {
+    let result = (|| {
+        let input = CStr::from_ptr(input).to_str().map_err(|error| error.to_string())?;
+        let batch: WireBatch = serde_json::from_str(input).map_err(|error| error.to_string())?;
+        serde_json::to_string(&solve_wire(batch)).map_err(|error| error.to_string())
+    })();
+    let payload = result.unwrap_or_else(|error| serde_json::json!({"error": error}).to_string());
+    CString::new(payload).expect("JSON cannot contain NUL").into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_free_json(value: *mut c_char) {
+    if !value.is_null() {
+        drop(CString::from_raw(value));
+    }
 }
 
 impl Operation {

@@ -624,6 +624,11 @@ def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summari
 def _analyze_prepared(prepared):
     """Pure, pickleable solver boundary used by process workers."""
     nodes, successors, operations, initial = prepared
+    if os.environ.get("LACHESIS_NATIVE_LIFETIME") == "1":
+        from .native_lifetime import solve_linear
+        native = solve_linear(nodes, successors, operations, initial)
+        if native is not None:
+            return native
     # 32 disjuncts/node (not 64): a fully-wired CFG closes every loop's def-use cycle,
     # so a looping function accumulates disjuncts across the back-edge until widening
     # fires. At 64 the widening fired so late that small pipeline-walk functions blew
