@@ -64,6 +64,7 @@ def summarize_one(name, F, summaries):
     norm = normalizer(atropos.lang_of(fn.get("file") or ""))
     params = set(fn["params"])
     sink_flows = []       # complete: [{sink, value, root, provenance, guards[], guarded, via}]
+    sink_flow_keys = set()
     sink_params = {}      # composition: param -> [{sink, guards[], guarded}]
     frees = {}            # param -> "direct" | "via:<callee>"
 
@@ -76,9 +77,9 @@ def summarize_one(name, F, summaries):
         # dedup on the security-relevant shape (a self-recursive call re-derives the same
         # value/sink/guards as the direct reach -> keep one, not two identical rows)
         key = (sink, oval, oroot, tuple(gsorted), len(site) > 0)
-        if any((f["sink"], f["value"], f["root"], tuple(f["guards"]),
-                f["site_guarded"]) == key for f in sink_flows):
+        if key in sink_flow_keys:
             return
+        sink_flow_keys.add(key)
         sink_flows.append({"sink": sink, "value": oval, "root": oroot,
                            "provenance": a.get("origin_prov", a.get("provenance")),
                            "guards": gsorted, "guarded": len(gsorted) > 0,
@@ -126,6 +127,19 @@ def summarize_one(name, F, summaries):
             frees[ev["var"]] = "direct"
 
     # ---- interprocedural typestate per pointer ------------------------------------
+    # lifetime_events_for is evaluated once per tracked variable.  Index the
+    # immutable F record once so each variable only visits calls/events that can
+    # mention it, rather than rescanning the complete function record.
+    calls_by_root = {}
+    for call in fn["calls"]:
+        for argument in call["args"]:
+            root = argument.get("root")
+            if root is not None:
+                calls_by_root.setdefault(root, []).append((call, argument))
+    events_by_var = {}
+    for event in fn["events"]:
+        events_by_var.setdefault(event["var"], []).append(event)
+
     alloc_line = {}
     for a in fn.get("assigns", []):
         cn = a.get("callee")
@@ -168,36 +182,33 @@ def summarize_one(name, F, summaries):
                   if alloc_seed is not None else [])
         if free_seed is not None:
             stream.append(("free", free_seed[0], free_seed[1]))
-        for call in fn["calls"]:
-            for a in call["args"]:
-                if a.get("root") != v:
-                    continue
-                # object AS WRITTEN, not the base pointer: passing `&v->field` (or `v->field`,
-                # `v[i]`, `*v`) to a callee that frees its formal frees the SUB-OBJECT, not `v`.
-                # The splice below keys the callee's lifetime effects onto `v`'s stream; without
-                # this guard a helper freeing `&data->meta_hash` lands a phantom free on `data`
-                # itself -- the interprocedural form of the C destructor-idiom double-free
-                # (free the members via helpers, then free the container). This is the same
-                # "object as written" rule the local free emission already applies; a sub-object
-                # of `v` belongs to its own lifetime, so it must not contribute to `v`'s stream.
-                if _freed_identity(a) != v:
-                    continue
-                sub = callee_param_stream(call, a)
-                if sub:                                    # splice the callee's effects
-                    for e in sub:                          # pinned to this caller's call site
-                        stream.append((e["kind"], call["line"], call.get("node")))
-                    continue
-                # a dealloc's free is emitted once from fn["events"], keyed on the object AS
-                # WRITTEN (free(p->field) frees the sub-object, not p). Re-emitting it here keyed
-                # on the base root a["root"] puts a field-free back on the base pointer's stream --
-                # a phantom double-free of the C destructor idiom (free the members, free the
-                # container). So skip the free here; fn["events"] is its single, correctly-keyed
-                # source. This loop emits only the pointer-as-arg USE.
-                if norm.is_dealloc(call["callee"]) and a["pos"] == 0:
-                    continue
-                stream.append(("use", call["line"], call.get("node")))
-        for ev in fn["events"]:
-            if ev["var"] == v and ev["kind"] in ("free", "use", "escape"):
+        for call, a in calls_by_root.get(v, ()):
+            # object AS WRITTEN, not the base pointer: passing `&v->field` (or `v->field`,
+            # `v[i]`, `*v`) to a callee that frees its formal frees the SUB-OBJECT, not `v`.
+            # The splice below keys the callee's lifetime effects onto `v`'s stream; without
+            # this guard a helper freeing `&data->meta_hash` lands a phantom free on `data`
+            # itself -- the interprocedural form of the C destructor-idiom double-free
+            # (free the members via helpers, then free the container). This is the same
+            # "object as written" rule the local free emission already applies; a sub-object
+            # of `v` belongs to its own lifetime, so it must not contribute to `v`'s stream.
+            if _freed_identity(a) != v:
+                continue
+            sub = callee_param_stream(call, a)
+            if sub:                                    # splice the callee's effects
+                for e in sub:                          # pinned to this caller's call site
+                    stream.append((e["kind"], call["line"], call.get("node")))
+                continue
+            # a dealloc's free is emitted once from fn["events"], keyed on the object AS
+            # WRITTEN (free(p->field) frees the sub-object, not p). Re-emitting it here keyed
+            # on the base root a["root"] puts a field-free back on the base pointer's stream --
+            # a phantom double-free of the C destructor idiom (free the members, free the
+            # container). So skip the free here; fn["events"] is its single, correctly-keyed
+            # source. This loop emits only the pointer-as-arg USE.
+            if norm.is_dealloc(call["callee"]) and a["pos"] == 0:
+                continue
+            stream.append(("use", call["line"], call.get("node")))
+        for ev in events_by_var.get(v, ()):
+            if ev["kind"] in ("free", "use", "escape"):
                 stream.append((ev["kind"], ev["line"], ev.get("node")))
         seen, ordered = set(), []
         for k, ln, nd in sorted(stream, key=lambda x: x[1] or 0):

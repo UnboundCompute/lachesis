@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Iterable, Mapping
+from lachesis.timeit import timeit
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,13 @@ class CoverageScheduler:
             for callee in callees:
                 reverse[callee].add(caller)
         self.reverse = {name: tuple(sorted(reverse.get(name, ()))) for name in functions}
+        # A source cone is independent of the target currently being planned.  The
+        # old planner rebuilt it once per (target, source) pair, turning a graph with
+        # many targets into repeated whole-graph traversals.  Keep the cache bounded
+        # to the scheduler lifetime: it is exactly the normalized graph already held
+        # by this plan and is released with the scheduler.
+        self._forward_cone_cache: dict[str, frozenset[str]] = {}
+        self._source_context_cache: dict[str, tuple[str, ...]] = {}
 
     def _source_functions(self) -> tuple[str, ...]:
         # Catalogued source sites and structural roots are both external launch
@@ -149,6 +157,9 @@ class CoverageScheduler:
         return seen
 
     def _forward_cone(self, source: str) -> set[str]:
+        cached = self._forward_cone_cache.get(source)
+        if cached is not None:
+            return set(cached)
         seen = {source}
         queue = deque([source])
         while queue:
@@ -157,9 +168,13 @@ class CoverageScheduler:
                 if callee not in seen:
                     seen.add(callee)
                     queue.append(callee)
+        self._forward_cone_cache[source] = frozenset(seen)
         return seen
 
     def _source_contexts(self, source: str) -> tuple[str, ...]:
+        cached = self._source_context_cache.get(source)
+        if cached is not None:
+            return cached
         record = self.functions.get(source, {})
         # Both projected source_sites and frontend source_calls identify an
         # externally rooted launch.  Keeping only source_sites collapses
@@ -173,8 +188,11 @@ class CoverageScheduler:
             token = site.get("node") or (
                 f"{site.get('callee') or 'source'}@{site.get('line') or 0}")
             contexts.append(str(token))
-        return tuple(sorted(set(contexts))) or ("__entry__",)
+        result = tuple(sorted(set(contexts))) or ("__entry__",)
+        self._source_context_cache[source] = result
+        return result
 
+    @timeit
     def plan(self, targets: Iterable[str] | None = None) -> CoveragePlan:
         selected = sorted(set(targets) if targets is not None else self.functions)
         source_functions = set(self._source_functions())
@@ -206,17 +224,25 @@ class CoverageScheduler:
                 # disappearing from the plan.
                 fallback_source = sources[0] if sources else target
                 forward_by_source.setdefault(fallback_source, set()).add(target)
-            forward = set().union(*forward_by_source.values()) if forward_by_source else set()
+            # Sort each source slice once.  The same ordered functions are used
+            # for both state and context keys; sorting independently caused the
+            # planner to repeat this work for every target/context expansion.
+            ordered_by_source = {
+                source: tuple(sorted(forward_by_source.get(source, ())))
+                for source in sources
+                if forward_by_source.get(source)
+            }
+            forward = set().union(*ordered_by_source.values()) if ordered_by_source else set()
             state_keys = tuple(
                 (function, source)
                 for source in sources
-                for function in sorted(forward_by_source.get(source, ()))
+                for function in ordered_by_source.get(source, ())
             )
             context_keys = tuple(
                 (function, source, context)
                 for source in sources
                 for context in self._source_contexts(source)
-                for function in sorted(forward_by_source.get(source, ()))
+                for function in ordered_by_source.get(source, ())
             )
             regions.append(CoverageRegion(target, sources, tuple(sorted(forward)),
                                           state_keys, context_keys))

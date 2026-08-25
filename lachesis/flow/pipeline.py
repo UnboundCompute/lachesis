@@ -16,6 +16,7 @@ from .object_lifetime import ObjectLifetimeResult, analyze_object_lifetimes
 from .semantic_graph import match_graph
 from .fragment_store import Claus
 from .coverage import CoverageScheduler
+from lachesis.timeit import timeit
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
@@ -130,6 +131,7 @@ def _select_lifetime_leads(legacy, object_identity, mode, covered_entries=None,
     return leads, differential
 
 
+@timeit(name="pipeline._match_object_mode_legacy")
 def _match_object_mode_legacy(skels, cfg, fallback_entries):
     """Retain reach + leak globally and legacy lifetime only for coverage fallbacks."""
     fallback_entries = set(fallback_entries)
@@ -144,6 +146,7 @@ def _match_object_mode_legacy(skels, cfg, fallback_entries):
     return leads
 
 
+@timeit
 def run_pass(store, lang="c", lifetime_engine=None):
     """Return {F, succ, summaries, skeletons, leads, lifetime} for an opened GraphStore.
 
@@ -173,7 +176,12 @@ def run_pass(store, lang="c", lifetime_engine=None):
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
-    coverage = CoverageScheduler(F, succ).plan()
+    cached_coverage = getattr(store, "_pass3_coverage_cache", None)
+    if (cached_coverage is not None and cached_coverage[0] is F
+            and cached_coverage[1] is succ):
+        coverage = cached_coverage[2]
+    else:
+        coverage = CoverageScheduler(F, succ).plan()
     projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
@@ -187,6 +195,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
     legacy_leads = None
+    legacy_fallback_skeletons = []
     leads = []
     if object_requested:
         object_functions = _lifetime_slice(F, succ, lang=lang)
@@ -235,24 +244,38 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # FragmentStore still validates semantic fingerprints before accepting
         # anything, so an older graph or changed translator input is a miss rather
         # than a false coverage claim. In-memory stores remain purely in-memory.
+        # The semantic snapshot is a large JSON serialization of the whole Claus
+        # graph.  On a cold full-graph pass it can exceed a gigabyte and take longer
+        # than the analysis itself, so it is an explicit opt-in cache rather than
+        # part of the timing-critical path.  The compact Pass-1 structural sidecar
+        # remains automatic and is what Pass 3 needs for cold substrate loading.
+        snapshot_enabled = os.environ.get("LACHESIS_PASS3_SNAPSHOT", "").lower() in {
+            "1", "true", "yes", "on"
+        }
         snapshot_path = (f"{store.graph_path}.pass3.json"
-                         if getattr(store, "graph_path", None) else None)
+                         if snapshot_enabled and getattr(store, "graph_path", None)
+                         else None)
         if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
             claus.fragments.load_snapshot(
                 snapshot_path, F, lang, analysis_graph,
                 object_result.summaries, summaries, object_result.artifacts)
             store._pass3_snapshot_loaded = True
+        semantic_build_started = perf_counter()
         semantic_graph = claus.build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries, coverage=semantic_coverage,
-            reach_summaries=summaries, state_artifacts=object_result.artifacts)
+            reach_summaries=summaries, state_artifacts=object_result.artifacts,
+            cfgs=object_result.cfgs)
+        semantic_build_done = perf_counter()
         if snapshot_path:
             claus.fragments.save_snapshot(snapshot_path)
+        semantic_match_started = perf_counter()
         semantic_leads = match_graph(semantic_graph)
+        semantic_match_done = perf_counter()
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.
-        if analysis_graph is not store.graph:
+        if analysis_graph is not store.graph and not hasattr(analysis_graph, "nodes_of_kind"):
             from lachesis.nav.graph_store import GraphStore
             fallback_store = GraphStore(analysis_graph)
         else:
@@ -281,7 +304,12 @@ def run_pass(store, lang="c", lifetime_engine=None):
             # Re-enable the compatibility typestate stream only for functions
             # whose semantic object analysis could not produce a trustworthy
             # graph. Healthy object-mode paths never depend on the old flow.
+            legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
+            legacy_summaries = {name: summaries.get(name, ())
+                                for name in legacy_functions}
             skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
+            legacy_fallback_skeletons = build_skeletons(
+                legacy_functions, legacy_summaries, lang=lang, include_typestate=True)
         object_flow = diagnostics.get("unsafe_object_flow", {})
         covered = set(F) - seed_unsafe
         if requested == "shadow":
@@ -290,10 +318,22 @@ def run_pass(store, lang="c", lifetime_engine=None):
                 legacy_leads, object_result.leads, requested, covered_entries=covered,
                 object_flow=object_flow)
         else:
-            fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
-            if seed_unsafe and not skeletons:
-                skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
-            legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
+            fallback_tokens = sum(len(skeleton.get("tokens", ()))
+                                 for skeleton in legacy_fallback_skeletons)
+            fallback_cfg = (cfg_bundle(fallback_store)
+                            if fallback_tokens <= 100_000 and seed_unsafe else None)
+            if seed_unsafe and not legacy_fallback_skeletons:
+                legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
+                legacy_summaries = {name: summaries.get(name, ())
+                                    for name in legacy_functions}
+                legacy_fallback_skeletons = build_skeletons(
+                    legacy_functions, legacy_summaries, lang=lang, include_typestate=True)
+            # These functions are already outside the trustworthy object-analysis
+            # set.  Use the legacy flat fallback rather than replaying the full CFG
+            # parent-resolution automaton over their potentially enormous streams;
+            # the flat may-analysis is conservative for this compatibility path.
+            legacy_leads = _match_object_mode_legacy(
+                legacy_fallback_skeletons, fallback_cfg, seed_unsafe)
             # The frozen graph/matcher is now the production lifetime path.  Keep the old
             # matcher only for non-lifetime reach leads and as a diagnostic fallback for
             # functions whose object projection could not be emitted.
@@ -340,6 +380,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
         "matching_seconds": round(finished - skeletons_done, 6),
         "total_seconds": round(finished - started, 6),
     }
+    if object_requested:
+        timings.update({
+            "semantic_build_seconds": round(
+                locals().get("semantic_build_done", finished)
+                - locals().get("semantic_build_started", finished), 6),
+            "semantic_match_seconds": round(
+                locals().get("semantic_match_done", finished)
+                - locals().get("semantic_match_started", finished), 6),
+        })
     return {"F": F, "succ": succ, "summaries": summaries,
             "skeletons": skeletons, "semantic_graph": locals().get("semantic_graph"),
             "coverage": locals().get("coverage"),

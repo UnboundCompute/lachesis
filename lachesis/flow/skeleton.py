@@ -32,6 +32,7 @@ Known compatibility limits (honest, and specific to this legacy renderer):
 """
 import argparse
 import json
+from lachesis.timeit import timeit
 
 from . import atropos
 from .patterns import evaluator_for
@@ -245,6 +246,7 @@ def render_text(skel):
     return "\n".join(lines)
 
 
+@timeit
 def _summaries_for(F, succ):
     """Run traverse + bottom-up summarise over the whole graph (same as walk.py)."""
     import random
@@ -264,10 +266,14 @@ def _summaries_for(F, succ):
                                 "param_typestate": {}, "frees_params": {}, "returns": "value",
                                 "returns_param": None}
             for _ in range(len(comp) + 3):
-                before = json.dumps({m: summaries[m] for m in comp}, sort_keys=True)
+                # Summary records are immutable from the caller's perspective;
+                # summarize_one returns fresh containers and only reads callee
+                # summaries.  Structural dict equality avoids serializing the
+                # entire recursive group on every fixpoint iteration.
+                before = {m: summaries[m] for m in comp}
                 for m in comp:
                     summaries[m] = summarize_one(m, F, summaries)
-                if json.dumps({m: summaries[m] for m in comp}, sort_keys=True) == before:
+                if {m: summaries[m] for m in comp} == before:
                     break
     return summaries
 

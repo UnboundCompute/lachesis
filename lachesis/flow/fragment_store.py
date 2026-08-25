@@ -116,6 +116,15 @@ class FragmentStore:
     def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
                   summaries: Any, reach_summaries: Any,
                   state_artifacts: Any = None) -> tuple[Any, ...]:
+        snapshot_enabled = os.environ.get("LACHESIS_PASS3_SNAPSHOT", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        if not snapshot_enabled:
+            # The default cache lives only for this in-process GraphStore session.
+            # Identity is both sufficient and conservative: rebuilt inputs miss,
+            # while the exact objects passed to get() are the ones passed to put().
+            return (lang, id(graph), id(functions), id(summaries),
+                    id(reach_summaries), id(state_artifacts))
         graph_key = (FragmentStore._fingerprint(graph)
                      if isinstance(graph, (dict, list, tuple)) else id(graph))
         return (lang, graph_key, FragmentStore._fingerprint(functions),
@@ -527,7 +536,7 @@ class Claus:
         return graph
 
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
-              coverage=None, reach_summaries=None, state_artifacts=None):
+              coverage=None, reach_summaries=None, state_artifacts=None, cfgs=None):
         cached = self.fragments.get(functions, lang, graph, summaries, coverage,
                                     reach_summaries, state_artifacts)
         if cached is not None:
@@ -555,7 +564,7 @@ class Claus:
                                      graph=graph, summaries=summaries,
                                      reach_summaries=reach_summaries,
                                      state_artifacts=state_artifacts,
-                                     work_functions=work_functions)
+                                     work_functions=work_functions, cfgs=cfgs)
         self._record_coverage(built, coverage)
         return self.fragments.put(functions, lang, graph, built, summaries, coverage,
                                   reach_summaries, state_artifacts)

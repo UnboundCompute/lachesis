@@ -18,7 +18,8 @@ from typing import Iterable
 
 from lachesis.nav.dataflow.ap_construct import APBuilder
 from lachesis.nav.dataflow.reaching_def import ReachingDef
-from lachesis.nav.dataflow.substrate import Substrate
+from lachesis.nav.dataflow.substrate import Substrate, cached_substrate
+from lachesis.timeit import timeit
 
 from .normalize import normalizer
 from .object_state import (
@@ -270,6 +271,7 @@ def _aggregate_type_key(type_name):
     return text.replace("*", "").strip() or "<unknown>"
 
 
+@timeit
 def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, ...], ...]:
     """Collect field paths present in the program for bulk struct copies.
 
@@ -282,21 +284,27 @@ def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, .
     if cache is None:
         cache = defaultdict(set)
         sub._aggregate_field_paths_cache = cache
-    for item in sub.idx.nodes_of_kind("expression"):
-        node = item.get("id") if isinstance(item, dict) else item
-        item_props = item.get("properties", {}) if isinstance(item, dict) else {}
-        item_kind = item_props.get("syntax_kind") or (item.get("kind") if isinstance(item, dict) else None)
-        if node is None or item_kind != "MemberExpr":
-            continue
-        path = _path(ap_builder, node)
-        # A bulk copy aliases the destination's direct fields.  Nested paths are
-        # recovered by following those field objects later; emitting every nested
-        # combination here causes avoidable state multiplication in summaries.
-        if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
-            root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
-            root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
-            cache[root_type].add(path.selectors)
-            cache[_aggregate_type_key(root_type)].add(path.selectors)
+    if not getattr(sub, "_aggregate_field_paths_loaded", False):
+        if hasattr(sub.idx, "member_expression_nodes"):
+            expression_items = sub.idx.member_expression_nodes()
+        else:
+            expression_items = sub.idx.nodes_of_kind("expression")
+        for item in expression_items:
+            node = item.get("id") if isinstance(item, dict) else item
+            item_props = item.get("properties", {}) if isinstance(item, dict) else {}
+            item_kind = item_props.get("syntax_kind") or (item.get("kind") if isinstance(item, dict) else None)
+            if node is None or item_kind != "MemberExpr":
+                continue
+            path = _path(ap_builder, node)
+            # A bulk copy aliases the destination's direct fields.  Nested paths are
+            # recovered by following those field objects later; emitting every nested
+            # combination here causes avoidable state multiplication in summaries.
+            if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
+                root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
+                root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
+                cache[root_type].add(path.selectors)
+                cache[_aggregate_type_key(root_type)].add(path.selectors)
+        sub._aggregate_field_paths_loaded = True
     if type_key is None:
         paths = set().union(*cache.values()) if cache else set()
     else:
@@ -335,6 +343,7 @@ def _op(kind, node, *, target=None, source=None, line=None, ordinal=0,
                      access=access)
 
 
+@timeit
 def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
     """Extract graph-derived operations for one function; no expected result enters here."""
     owned = set(sub._owned(function_id))
@@ -604,6 +613,7 @@ def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, 
     return _analyze_prepared(prepared)
 
 
+@timeit
 def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
     operations = extract_operations(
         sub, norm, function_id, function_ir, all_functions, summaries, cfg)
@@ -687,23 +697,31 @@ class ObjectLifetimeResult:
     # Per-function abstract-state snapshots are retained for semantic consumers;
     # the summary API remains unchanged for callers that only need effects.
     artifacts: dict[str, object] = field(default_factory=dict)
+    # Reaching-definition CFGs are also the emitter's structural input. Retain them
+    # so Pass 3 does not analyze every function a second time during emission.
+    cfgs: dict[str, dict] = field(default_factory=dict)
 
 
+@timeit
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None):
     """Run object-identity lifetime analysis over all defined functions in ``functions``."""
     started = perf_counter()
-    if graph is not None and graph is not store.graph:
+    if graph is not None and hasattr(graph, "nodes_of_kind"):
+        analysis_index = graph
+    elif graph is not None and graph is not store.graph:
         from lachesis.nav.graph_store import GraphStore
-        analysis_store = GraphStore(graph)
+        analysis_index = GraphStore(graph).index
     else:
-        analysis_store = store
-    sub = Substrate(analysis_store.index).load().load_initializers()
+        analysis_index = store.index
     norm = normalizer(lang)
     function_node_ids = [node_id for kind in ("function", "method", "constructor")
-                         for node_id in getattr(analysis_store.index, "by_kind", {}).get(kind, ())]
+                         for node_id in getattr(analysis_index, "by_kind", {}).get(kind, ())]
+    function_node_ids = [node_id.get("id") if isinstance(node_id, dict) else node_id
+                         for node_id in function_node_ids]
+    sub = cached_substrate(analysis_index)
     sub.warm_nodes(function_node_ids)
     by_name = {}
-    for node in analysis_store.index.nodes_of_kind("function", "method", "constructor"):
+    for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
             continue
         name = node.get("label")
@@ -912,4 +930,4 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     diagnostics["unsafe_object_flow"] = unsafe_object_flow
     diagnostics["total_seconds"] = round(perf_counter() - started, 6)
 
-    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics, artifacts)
+    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics, artifacts, cfgs)

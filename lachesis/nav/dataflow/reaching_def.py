@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .access_path import match_and_diff, EXACT
 from .ap_construct import APBuilder
+from lachesis.timeit import timeit
 
 _DEBUG = os.environ.get("RD_DEBUG") == "1"
 
@@ -517,6 +518,7 @@ class ReachingDef:
             return {"edges": [], "field_edges": [], "micro": st["micro"], "bailed": True}
         return self._emit_edges(st["nodes"], st["IN"], st["gen"])
 
+    @timeit
     def analyze(self, fn, *, reaching_defs=True) -> Optional[Dict]:
         """Intraprocedural CFG state for `fn`, the shared substrate the def->use edge
         emitter (and any def-site-keyed client such as a typestate pass) runs over:

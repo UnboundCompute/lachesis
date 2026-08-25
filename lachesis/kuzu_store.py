@@ -982,6 +982,12 @@ def write_kuzu_graph(
         else (None if enriched else graph_content_hash(nodes, edges))
     )
     _write_store_manifest(db_dir, payload)
+    # The writer still owns the exact resident graph and its final manifest.
+    # Persist the compact structural substrate beside the store so Pass 3 can
+    # reuse Pass-1 AST/CFG/reference work on the next process invocation.
+    from lachesis.nav.dataflow.substrate import write_substrate_cache
+    write_substrate_cache({"nodes": nodes, "edges": edges}, target_db_dir,
+                          manifest=payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)

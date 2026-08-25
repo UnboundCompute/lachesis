@@ -357,6 +357,10 @@ class GraphStore:
                     dataflow_path = candidate
         self = cls._open(open_path, overlay_path=overlay_path,
                          dataflow_path=dataflow_path, defer_maps=defer_maps)
+        # Structural Pass-3 artifacts are published beside the caller-facing
+        # core store even when this load transparently opened an enriched/rejoined
+        # implementation store.
+        self.index._pass3_cache_base = graph_path
         # The overlay sidecar and the caller-facing identity stay the *core* path even
         # when the derived cache is what is actually open: the cache is an
         # implementation detail, and its sidecar would be a second, divergent copy.
