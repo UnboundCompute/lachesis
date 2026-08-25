@@ -384,6 +384,13 @@ struct CompactEdge {
 
 fn compact_node(record: graph_proto::NodeRecord) -> CompactNode {
     let properties = record.properties.into_iter().filter_map(|field| {
+        if !matches!(field.key.as_str(),
+            "syntax_kind" | "owner_function_id" | "function_id" | "start_line" |
+            "start_offset" | "primary_target_id" | "callee" | "receiver" |
+            "is_alloc" | "is_release" | "is_realloc" | "is_aggregate_copy" |
+            "type" | "operator" | "storage_class") {
+            return None;
+        }
         let value = field.value?.kind?;
         let value = match value {
             graph_proto::value::Kind::Text(value) => value,
@@ -498,8 +505,13 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         match payload[0] {
             b'N' => { let node = compact_node(graph_proto::NodeRecord::decode(&payload[1..])
                 .map_err(|error| format!("invalid graph node frame: {error}"))?); nodes.insert(node.id.clone(), node); }
-            b'E' => edges.push(compact_edge(graph_proto::EdgeRecord::decode(&payload[1..])
-                .map_err(|error| format!("invalid graph edge frame: {error}"))?)),
+            b'E' => {
+                let record = graph_proto::EdgeRecord::decode(&payload[1..])
+                    .map_err(|error| format!("invalid graph edge frame: {error}"))?;
+                if matches!(record.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO") {
+                    edges.push(compact_edge(record));
+                }
+            }
             _ => return Err("unknown graph sidecar record prefix".to_owned()),
         }
     }
