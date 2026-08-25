@@ -182,6 +182,7 @@ class Substrate:
         self.cfg_prev = defaultdict(list)
         self.cfg_nodes = set()
         self.initializer_source = {}
+        self._warmed_owner_ids = set()
         self._initializers_loaded = False
         self._loaded = False
 
@@ -270,17 +271,25 @@ class Substrate:
     @timeit
     def warm_owned(self, function_ids, batch_size=5000):
         """Warm all bodies in bounded batches instead of one query per function."""
+        ordered = tuple(dict.fromkeys(function_ids))
+        pending = tuple(owner for owner in ordered
+                        if owner not in self._warmed_owner_ids)
+        if not pending:
+            return self
         owner_warmer = getattr(self.idx, "_warm_nodes_by_owner", None)
         if owner_warmer is not None:
-            owner_warmer(tuple(dict.fromkeys(function_ids)), None)
+            owner_warmer(pending, None)
+            self._warmed_owner_ids.update(pending)
             return self
         by_owner = getattr(self.idx, "by_owner", None)
         if by_owner is None:
             return self
         owned = []
-        for function_id in function_ids:
+        for function_id in pending:
             owned.extend(by_owner.get(function_id, ()))
-        return self.warm_nodes(owned, batch_size=batch_size)
+        result = self.warm_nodes(owned, batch_size=batch_size)
+        self._warmed_owner_ids.update(pending)
+        return result
 
     def role_children(self, node, role):
         return self.ast_by_role.get(node, {}).get(role, ())
