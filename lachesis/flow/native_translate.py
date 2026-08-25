@@ -14,6 +14,8 @@ from .coverage import CoverageScheduler
 from .normalize import normalizer
 from .source_discovery import discover_sources
 from .native_lifetime import prepare_graph_pb
+from .translate import _expression_root, _guard_info, _header_node, _span
+from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import cached_substrate, substrate_cache_path
 from lachesis.core import lifetime_pb2
 
@@ -62,6 +64,8 @@ def build_native_F(store, lang="c", *, return_graph=False):
     norm = normalizer(lang)
     sinks = atropos.sink_catalog(lang)
     source_names = set(atropos.source_catalog(lang))
+    graph = store.graph if store.graph is not None else index
+    regions = BranchRegions(graph)
     function_nodes = {}
     for node in index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
@@ -90,11 +94,21 @@ def build_native_F(store, lang="c", *, return_graph=False):
                     for arg in call.arguments]
             assigned = (_call_path(sub, call.assigned_root, call.assigned_selectors)
                         or (_name(sub, call.assigned) if call.assigned else None))
+            call_header = _header_node(index, call.node)
             catalog = sinks.get(callee)
+            guard_args = args
+            if catalog is not None and catalog.get("size_arg") is not None:
+                guard_args = [arg for arg in args
+                              if arg.get("pos") == catalog.get("size_arg")]
+            guard_roots = {_expression_root(arg["root"])
+                           for arg in guard_args if arg.get("root")}
+            guard_roots.discard(None)
+            guards, guard_status = _guard_info(
+                regions, function_id, guard_roots, _span(call_header))
             record = {
                 "callee": callee, "line": call.line if call.has_line else None,
-                "args": args, "guards": [], "guard_status": "not-computed",
-                "guard_predicates": (),
+                "args": args, "guards": guards, "guard_status": guard_status,
+                "guard_predicates": tuple(g.get("canon") for g in guards if g.get("canon")),
                 "is_sink": catalog is not None,
                 "sink_name": callee if catalog is not None else None,
                 "sink_family": catalog.get("family") if catalog else None,
@@ -225,5 +239,4 @@ def build_native_F(store, lang="c", *, return_graph=False):
         store._pass3_coverage_cache = (functions, succ, coverage)
     except AttributeError:
         pass
-    graph = store.graph if store.graph is not None else index
     return (functions, succ, graph) if return_graph else (functions, succ)
