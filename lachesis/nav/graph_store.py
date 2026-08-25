@@ -37,7 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lachesis.nav.graphlib import GraphLib
 from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
-from lachesis.core.graph_wire import decode_overlay, encode_overlay
+from lachesis.core.graph_wire import (
+    decode_overlay, is_dataflow_stream, read_dataflow_stream,
+    write_dataflow_stream_edge, write_dataflow_stream_header,
+    write_dataflow_stream_node,
+)
 
 
 def node_view(node: dict) -> dict:
@@ -88,7 +92,9 @@ def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
     if not core_hash or not os.path.isfile(path):
         return False
     try:
-        payload = decode_overlay(Path(path).read_bytes())
+        sidecar = Path(path)
+        payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
+                   else decode_overlay(sidecar.read_bytes()))
     except (OSError, ValueError, TypeError):
         return False
     return payload.get("version") == 1 and payload.get("core_content_hash") == core_hash
@@ -106,7 +112,10 @@ def _merge_overlays(primary: Overlay, secondary: Overlay) -> Overlay:
 
 def _load_dataflow_overlay(path: str) -> Overlay:
     """Load the internal protobuf dataflow sidecar."""
-    return Overlay.from_dict(decode_overlay(Path(path).read_bytes()))
+    sidecar = Path(path)
+    payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
+               else decode_overlay(sidecar.read_bytes()))
+    return Overlay.from_dict(payload)
 
 
 def joined_store_path(graph_path: str) -> str:
@@ -468,52 +477,41 @@ class GraphStore:
         )
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
-        # Every registered enrichment is represented by an additive GraphDelta.
-        # Capture only the records accepted by the fold; this lets the cold sidecar
-        # path release the 2.9M-record enriched view before protobuf encoding.
-        derived_nodes = []
-        derived_edges = []
-
-        def collect_delta(nodes, edges):
-            derived_nodes.extend(nodes)
-            derived_edges.extend(edges)
-
-        enriched = enrich_graph(
-            core, manifest_languages(manifest), manifest_capabilities(manifest),
-            delta_sink=collect_delta,
-        )
         cache = dataflow_overlay_path(core_path)
-        # GraphAccumulator returns fresh records in deterministic delta order.  Match
-        # the prior enriched-view ordering while sorting only the small additive tier,
-        # not the 919k-node/2M-edge core that is about to be released.
-        derived_nodes.sort(key=lambda node: node["id"])
-        derived_edges.sort(key=lambda edge: (
-            edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
-        ))
-        payload = {
-            "overlay_id": "dataflow",
-            "source": Path(core_path).name,
-            "version": 1,
-            "core_content_hash": core_hash,
-            "node_props": {}, "edge_props": {},
-            "derived_nodes": derived_nodes,
-            "derived_edges": derived_edges,
-        }
-        # The sidecar path is additive by construction: GraphAccumulator rejects
-        # conflicting replacements of an existing canonical node. Release both the
-        # core and final enriched containers before serializing the retained deltas.
-        del core, enriched
         fd, temporary = tempfile.mkstemp(
             prefix=".lachesis-dataflow-", suffix=".pb",
             dir=os.path.dirname(os.path.abspath(cache)),
         )
+        stream = os.fdopen(fd, "wb")
+        write_dataflow_stream_header(stream, {
+            "overlay_id": "dataflow",
+            "source": Path(core_path).name,
+            "version": 1,
+            "core_content_hash": core_hash,
+        })
+
+        def collect_delta(nodes, edges):
+            for node in nodes:
+                write_dataflow_stream_node(stream, node)
+            for edge in edges:
+                write_dataflow_stream_edge(stream, edge)
+
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(encode_overlay(payload))
+            enriched = enrich_graph(
+                core, manifest_languages(manifest), manifest_capabilities(manifest),
+                delta_sink=collect_delta,
+            )
+            # The sidecar path is additive by construction: GraphAccumulator rejects
+            # conflicting replacements of an existing canonical node. Release both
+            # graph-sized views before the stream is finalized/replaced.
+            del core, enriched
+            stream.close()
             os.replace(temporary, cache)
-        finally:
+        except BaseException:
+            stream.close()
             if os.path.exists(temporary):
                 os.unlink(temporary)
+            raise
         fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
                                  dataflow_path=cache)
         # The derived graph is now represented by the attached cache. The local
