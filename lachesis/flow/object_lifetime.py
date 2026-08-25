@@ -13,9 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import os
-import pickle
 import sys
-import tempfile
 from time import perf_counter
 from typing import Iterable
 
@@ -357,8 +355,20 @@ def _op(kind, node, *, target=None, source=None, line=None, ordinal=0,
                      access=access)
 
 
+@dataclass(frozen=True)
+class _DeferredSummaryCall:
+    """Graph-independent call facts used to compose a callee summary later."""
+
+    node: str
+    callee: str | None
+    line: int | None
+    destination: AccessPath | None
+    actuals: tuple[tuple[int, AccessPath], ...]
+
+
 @timeit
-def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
+def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg,
+                        deferred_summary_calls=None):
     """Extract graph-derived operations for one function; no expected result enters here."""
     owned = set(sub._owned(function_id))
     cfg_nodes = set(cfg["nodes"])
@@ -486,6 +496,26 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
 
         callee_summary = summaries.get(callee)
         if callee in all_functions and callee_summary is not None:
+            if deferred_summary_calls is not None:
+                assigned = call.get("assigned")
+                destination = next((candidate for candidate in owned
+                                    if sub.kind(candidate) == "variable"
+                                    and sub.label(candidate) == assigned), None)
+                receiver = (_path(ap_builder, destination)
+                            if destination is not None else
+                            (AccessPath(str(assigned)) if assigned else None))
+                actuals = tuple(
+                    (int(argument.get("pos")), actual)
+                    for argument in call.get("args", ())
+                    if isinstance(argument.get("pos"), int)
+                    for actual in (_argument_path(
+                        sub, ap_builder, call_node, argument.get("pos")),)
+                    if actual is not None
+                )
+                deferred_summary_calls.append(_DeferredSummaryCall(
+                    node=anchor, callee=callee, line=line,
+                    destination=receiver, actuals=actuals))
+                continue
             alternatives = []
             for alternative in callee_summary:
                 effects = []
@@ -618,9 +648,61 @@ def _initial_state(cfg, operations):
     return initial
 
 
-def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
-    prepared = _prepare_summary(
-        sub, norm, function_id, function_ir, all_functions, summaries, cfg)
+def _compose_deferred_operations(base_operations, deferred_calls, summaries):
+    """Add wave-ready interprocedural effects to compact local operations."""
+    operations = list(base_operations)
+    for call in deferred_calls:
+        actuals = dict(call.actuals)
+        callee_summary = summaries.get(call.callee)
+        if callee_summary is None:
+            operations.extend(
+                _op(OpKind.USE, call.node, target=path, line=call.line,
+                    ordinal=10 + position, access="pass")
+                for position, path in call.actuals)
+            continue
+        alternatives = []
+        for alternative in callee_summary:
+            effects = []
+            for effect in alternative:
+                if isinstance(effect, ReturnEffect):
+                    actual = actuals.get(effect.position)
+                    if call.destination is None or actual is None:
+                        continue
+                    effects.append(_op(
+                        OpKind.COPY, call.node, target=call.destination,
+                        source=_compose(actual, effect.selectors), line=call.line,
+                        ordinal=20 + len(effects), access="return-alias"))
+                    continue
+                actual = actuals.get(effect.position)
+                if actual is None:
+                    continue
+                effects.append(_op(
+                    effect.kind, call.node,
+                    target=_compose(actual, effect.selectors), line=call.line,
+                    ordinal=20 + len(effects)))
+            alternatives.append(tuple(effects))
+        if alternatives and any(alternatives):
+            operations.append(_op(
+                OpKind.SUMMARY, call.node, line=call.line, ordinal=20,
+                alternatives=tuple(alternatives)))
+    unique = {}
+    for operation in operations:
+        key = (operation.kind, operation.node, operation.target, operation.source,
+               operation.is_null, operation.alternatives, operation.access)
+        unique[key] = operation
+    return tuple(unique.values())
+
+
+def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, cfg,
+                 cached=None):
+    if cached is None:
+        prepared = _prepare_summary(
+            sub, norm, function_id, function_ir, all_functions, summaries, cfg)
+    else:
+        local_operations, deferred = cached
+        operations = _compose_deferred_operations(local_operations, deferred, summaries)
+        prepared = (cfg["nodes"], cfg["succ"], operations,
+                    _initial_state(cfg, operations))
     return _analyze_prepared(prepared)
 
 
@@ -821,31 +903,42 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         for group in schedule
         for name in group["members"]
     }
-    # A disk-backed index used to be queried once per dependency wave.  libxml2 has
-    # 36 waves, so the same owner scan was paid repeatedly even though each owner's
-    # graph records are consumed exactly once.  Spool each owner as compact binary
-    # Python records during one Kùzu scan, evict it immediately, then replay only the
-    # current wave.  The spool is temporary and never becomes a user-facing cache.
-    owner_spool = None
-    owner_offsets = {}
+    # Disk-backed callers are scanned once.  The graph records are converted immediately
+    # into compact local operations plus deferred call templates, then evicted; later
+    # dependency waves only compose summaries over those graph-independent values.
+    cached_operations = None
     if stream is not None:
-        owner_spool = tempfile.TemporaryFile(prefix="lachesis-lifetime-")
+        cached_operations = {}
+        deferred_empty = {name: () for name in functions}
         owner_ids = tuple(by_name.values())
         owner_set = set(owner_ids)
         query_started = perf_counter()
 
-        def spool_owner(owner_id, records):
+        def cache_owner(owner_id, records):
+            nonlocal streamed_owners, streamed_nodes, streamed_cfg_seconds
             if owner_id in owner_set:
-                offset = owner_spool.tell()
-                pickle.dump(records, owner_spool, protocol=pickle.HIGHEST_PROTOCOL)
-                owner_offsets[owner_id] = offset
+                name = name_by_owner.get(owner_id)
+                if name is not None:
+                    cfg_started = perf_counter()
+                    prepare_cfg(name, owner_id)
+                    cfg_elapsed = perf_counter() - cfg_started
+                    streamed_cfg_seconds += cfg_elapsed
+                    if name in cfgs:
+                        deferred = []
+                        operations = extract_operations(
+                            sub, norm, owner_id, functions[name], functions,
+                            deferred_empty, cfgs[name], deferred)
+                        cached_operations[name] = (operations, tuple(deferred))
+                    streamed_owners += 1
+                    streamed_nodes += len(records)
             for node in records:
                 node_id = node["id"]
                 getattr(sub.idx, "_node_cache", {}).pop(node_id, None)
                 sub._node.pop(node_id, None)
 
-        stream(owner_ids, spool_owner)
+        stream(owner_ids, cache_owner)
         streamed_query_seconds = perf_counter() - query_started
+        stream = None
     with pool_context as executor:
         for wave in _schedule_levels(schedule, call_successors):
             # A wave boundary is the natural preemption point: the previous wave's futures
@@ -859,69 +952,28 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
             pending = []
             retained_cyclic = defaultdict(list)
 
-            if stream is not None:
-                # Prepare graph-derived operations in the parent. Workers receive only the
-                # pure CFG/state problem, never a Kuzu connection or the materialized graph.
+            if cached_operations is not None:
+                # Compose graph-independent local operations with the summaries available
+                # at this dependency wave. Workers receive only the pure CFG/state problem.
                 owner_ids = [by_name[name]
                              for group in wave
                              for name in group["members"]
                              if name in by_name]
-
-                def evict(records):
-                    stream_idx = sub.idx
-                    for node in records:
-                        node_id = node["id"]
-                        stream_idx._node_cache.pop(node_id, None)
-                        sub._node.pop(node_id, None)
-
-                def consume(owner_id, records):
-                    nonlocal streamed_owners, streamed_nodes, streamed_cfg_seconds
-                    name = name_by_owner.get(owner_id)
-                    if name is None:
-                        return
-                    cfg_started = perf_counter()
-                    prepare_cfg(name, owner_id)
-                    cfg_elapsed = perf_counter() - cfg_started
-                    streamed_cfg_seconds += cfg_elapsed
-                    streamed_owners += 1
-                    streamed_nodes += len(records)
-                    if progress:
-                        slowest_cfgs.append((cfg_elapsed, name, len(records)))
-                        slowest_cfgs.sort(reverse=True)
-                        del slowest_cfgs[10:]
-                    group = group_by_name.get(name)
-                    if group is not None and group["cyclic"]:
-                        # SCC iterations need the same owner records repeatedly. Retain only
-                        # this wave's cyclic group(s), which are normally tiny, until its
-                        # local fixed point completes.
-                        retained_cyclic[id(group)].append((name, records))
-                    elif name in cfgs:
-                        prepared = _prepare_summary(
-                            sub, norm, owner_id, functions[name], functions,
-                            summaries, cfgs[name])
-                        future = (executor.submit(_analyze_prepared, prepared)
-                                  if executor is not None else None)
-                        pending.append((name, prepared, future))
-                        evict(records)
-                    else:
-                        evict(records)
-
-                if owner_spool is not None:
-                    for owner_id in owner_ids:
-                        offset = owner_offsets.get(owner_id)
-                        if offset is None:
-                            continue
-                        owner_spool.seek(offset)
-                        records = pickle.load(owner_spool)
-                        for node in records:
-                            node_id = node["id"]
-                            getattr(sub.idx, "_node_cache", {})[node_id] = node
-                            sub._node[node_id] = node
-                        consume(owner_id, records)
-                else:
-                    query_started = perf_counter()
-                    stream(owner_ids, consume)
-                    streamed_query_seconds += perf_counter() - query_started
+                for owner_id in owner_ids:
+                    name = name_by_owner[owner_id]
+                    if group_by_name[name]["cyclic"]:
+                        continue
+                    cached = cached_operations.get(name)
+                    if cached is None or name not in cfgs:
+                        continue
+                    local_operations, deferred = cached
+                    operations = _compose_deferred_operations(
+                        local_operations, deferred, summaries)
+                    prepared = (cfgs[name]["nodes"], cfgs[name]["succ"], operations,
+                                _initial_state(cfgs[name], operations))
+                    future = (executor.submit(_analyze_prepared, prepared)
+                              if executor is not None else None)
+                    pending.append((name, prepared, future))
                 if progress and streamed_owners and streamed_owners % progress_interval == 0:
                     print(
                         "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs "
@@ -976,7 +1028,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                         break
                     summary, result = _summary_for(
                         sub, norm, by_name[name], functions[name], functions,
-                        summaries, cfgs[name])
+                        summaries, cfgs[name],
+                        cached_operations.get(name) if cached_operations is not None else None)
                     summary_runs[name] += 1
                     summary_transfers += result.transfers
                     artifacts[name] = result
@@ -999,17 +1052,14 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 artifacts[name] = result
                 summary_runs[name] += 1
                 summary_transfers += result.transfers
-            if progress and stream is not None and retained_cyclic:
+            if progress and cached_operations is not None and retained_cyclic:
                 # Defensive cleanup if an unusual malformed schedule leaves a retained SCC
                 # without a normal iteration path.
                 for records in retained_cyclic.values():
                     for _name, owner_records in records:
                         evict(owner_records)
 
-    if owner_spool is not None:
-        owner_spool.close()
-
-    if progress and stream is not None:
+    if progress and cached_operations is not None:
         print(
             "pass2 object-cfg: complete owners=%d/%d nodes=%d query=%.1fs cfg=%.1fs slowest=%s"
             % (streamed_owners, len(by_name), streamed_nodes, streamed_query_seconds,
@@ -1017,7 +1067,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                [(name, round(seconds, 3), count)
                 for seconds, name, count in slowest_cfgs]),
             file=sys.stderr, flush=True)
-    if stream is not None:
+    if cached_operations is not None:
         cfg_seconds = streamed_query_seconds + streamed_cfg_seconds
 
     leads = []
