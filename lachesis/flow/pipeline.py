@@ -180,6 +180,32 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         if progress is not None:
             progress(label, perf_counter() - started)
 
+    def _expired():
+        return deadline is not None and deadline.expired()
+
+    def _timed_out_return(stopped_before, *, F=None, succ=None, coverage=None,
+                          summaries=None):
+        """Budget hit before object analysis could run: stop rather than start the next
+        heavy phase, and return empty-but-flagged leads. Each phase here (the dataflow
+        tier, the F projection, the summaries) is a single batch step the wave-level
+        deadline inside ``analyze_object_lifetimes`` cannot preempt, so the only place to
+        honour the budget across them is at their boundaries. An unfinished pass must read
+        as inconclusive -- callers key on ``lifetime['timed_out']`` and never treat an
+        empty result as clean."""
+        now = perf_counter()
+        return {
+            "F": F, "succ": succ, "summaries": summaries or {},
+            "skeletons": [], "semantic_graph": None, "coverage": coverage,
+            "leads": [],
+            "lifetime": {"requested": requested, "active": "legacy", "available": False,
+                         "timed_out": True,
+                         "diagnostics": {"timed_out": True,
+                                         "stopped_before": stopped_before}},
+            "timings": {"dataflow_tier_seconds": round(tier_done - started, 6),
+                        "total_seconds": round(now - started, 6),
+                        "stopped_before": stopped_before},
+        }
+
     store.ensure_dataflow_tier()
     tier_done = perf_counter()
     _emit("dataflow tier")
@@ -188,6 +214,11 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     if requested not in {"legacy", "shadow", "object"}:
         raise ValueError(
             "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")
+    # The tier is the single most expensive step and it runs before any other checkpoint,
+    # so a budget already spent here stops the pass now instead of paying for the whole
+    # projection + summaries + object analysis that follow.
+    if _expired():
+        return _timed_out_return("projection")
     # Pass 3 is a language-neutral semantic pipeline.  Frontends select the
     # appropriate catalog/normalizer and contribute their own graph facts; the
     # scheduler, Claus graph, and matcher must not make C the dispatch gate.
@@ -205,9 +236,14 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         coverage = CoverageScheduler(F, succ).plan()
     projection_done = perf_counter()
     _emit("projection")
+    if _expired():
+        return _timed_out_return("summaries", F=F, succ=succ, coverage=coverage)
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
     _emit("summaries")
+    if _expired():
+        return _timed_out_return("object-analysis", F=F, succ=succ,
+                                 coverage=coverage, summaries=summaries)
     # The semantic graph is the production lifetime substrate.  Keep the old
     # typestate renderer for legacy/shadow operation and for an explicit
     # fallback only; object mode still uses its reach skeletons for Atropos's
