@@ -130,6 +130,7 @@ class AbstractState:
     """One path-correlated environment and object-property state."""
 
     TRACE_LIMIT = 16
+    __slots__ = ("env", "facts", "slots", "trace", "freed_paths", "_key_cache")
 
     def __init__(
         self,
