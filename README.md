@@ -49,8 +49,10 @@ lachesis mcp ./my-project                    # hand the same codebase to your ag
 ```
 
 The lower-level artifact commands remain available when you need to name and move a graph
-explicitly: `lachesis-analyze` builds a store, `lachesis-query` reads it, and
-`lachesis-mcp` serves it.
+explicitly, now as subcommands of the one `lachesis` entrypoint: `lachesis build` builds a
+store, `lachesis query` reads it, and `lachesis mcp` serves it. (The old `lachesis-analyze`
+/ `lachesis-query` / `lachesis-mcp` scripts still work and print a one-line hint to the new
+verb — `lachesis-analyze` is `lachesis build`, the graph builder.)
 
 ## MCP
 
@@ -115,8 +117,8 @@ Source-checkout and interpreter troubleshooting examples are in
 Two sibling functions reach the same database call. One checks the caller's tenant first; the other doesn't. A symbol index sees both call `findById` and stops there — Lachesis tells them apart by following the value.
 
 ```bash
-lachesis-analyze lachesis/frontends/typescript/fixtures/project example.kuzu
-lachesis-query --format text example.kuzu handler-security getDocument
+lachesis build lachesis/frontends/typescript/fixtures/project example.kuzu
+lachesis query --format text example.kuzu handler-security getDocument
 ```
 
 ```
@@ -126,6 +128,42 @@ lachesis-query --format text example.kuzu handler-security getDocument
 ```
 
 `getDocument` reaches `findById` with no check — and the record names its guarded twin, `getInvoice`, directly. That finding lives in *how the value moves*, not *where the name appears*. Full walkthrough in [`examples/`](./examples/README.md).
+
+## See it work
+
+Two sibling functions reach the same database call. One checks the caller's tenant first; the other doesn't. A symbol index sees both call `findById` and stops there — Lachesis tells them apart by following the value.
+
+Build the bundled fixture and ask for an overview:
+
+```bash
+lachesis-analyze lachesis/frontends/typescript/fixtures/project example.kuzu
+lachesis-query --format text example.kuzu overview
+```
+
+```
+# overview
+Project: layered-project:de19e2325b09731683b9
+Languages: javascript, typescript
+Canonical graph: 3307 nodes / 6078 edges
+Security paths: 6
+Guard differentials: 1
+```
+
+One **guard differential**: a pair of siblings reaching the same sink where one authorizes and one does not. Ask about the unguarded one:
+
+```bash
+lachesis-query --format text example.kuzu handler-security getDocument
+```
+
+```
+"status": "UNGUARDED",
+"guard_signal": null,
+"differential_siblings": [ "getInvoice" ]
+```
+
+`getDocument` reaches `findById` with no check — and the record names its guarded twin, `getInvoice`, directly. That cross-reference is the finding: a fact that lives in *how the value moves*, not *where the name appears*. Full five-minute walkthrough in [`examples/`](./examples/README.md).
+
+---
 
 ## What you can ask
 
