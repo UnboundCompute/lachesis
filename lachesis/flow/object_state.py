@@ -41,9 +41,17 @@ class AccessPath:
 
     root: str
     selectors: tuple[str, ...] = ()
+    _hash_cache: int | None = field(default=None, init=False, repr=False, compare=False)
 
     def child(self, selector: str) -> "AccessPath":
         return AccessPath(self.root, self.selectors + (selector,))
+
+    def __hash__(self) -> int:
+        cached = self._hash_cache
+        if cached is None:
+            cached = hash((self.root, self.selectors))
+            object.__setattr__(self, "_hash_cache", cached)
+        return cached
 
 
 @dataclass(frozen=True)
@@ -140,8 +148,17 @@ class AbstractState:
         self.freed_paths = dict(freed_paths or {})
 
     def clone(self) -> "AbstractState":
-        return AbstractState(self.env, self.facts, self.slots, self.trace,
-                             self.freed_paths)
+        # This is an extremely hot path in the fixpoint solver. Bypass the generic
+        # constructor's Mapping normalization: all five fields are already in their
+        # canonical representation here, so direct copies preserve isolation while
+        # avoiding a second layer of argument/default handling for every state.
+        cloned = object.__new__(AbstractState)
+        cloned.env = self.env.copy()
+        cloned.facts = self.facts.copy()
+        cloned.slots = self.slots.copy()
+        cloned.trace = self.trace
+        cloned.freed_paths = self.freed_paths.copy()
+        return cloned
 
     @timeit(name="object_state.AbstractState.key")
     def key(self) -> tuple:
