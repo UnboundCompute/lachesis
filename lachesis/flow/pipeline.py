@@ -147,7 +147,8 @@ def _match_object_mode_legacy(skels, cfg, fallback_entries):
 
 
 @timeit
-def run_pass(store, lang="c", lifetime_engine=None):
+def run_pass(store, lang="c", lifetime_engine=None, *,
+             workers=None, snapshot=None, deadline=None, progress=None):
     """Return {F, succ, summaries, skeletons, leads, lifetime} for an opened GraphStore.
 
     The store's whole-graph value-flow tier is ensured once (cached to disk), then every
@@ -158,15 +159,66 @@ def run_pass(store, lang="c", lifetime_engine=None):
     C double-free/UAF leads use object identity by default. ``lifetime`` includes the
     bounded legacy differential and coverage diagnostics; functions with no complete
     object analysis retain legacy leads. Set ``LACHESIS_LIFETIME_ENGINE=shadow`` to run
-    both without changing output, or ``legacy`` for an operational rollback."""
+    both without changing output, or ``legacy`` for an operational rollback.
+
+    The keyword-only knobs make the pass configurable without process-wide env vars (which
+    are not thread-safe and leak into spawned workers), each falling back to its env var
+    when ``None``:
+      ``workers``  -> LACHESIS_LIFETIME_WORKERS (object-analysis process count)
+      ``snapshot`` -> LACHESIS_PASS3_SNAPSHOT   (opt-in semantic-graph disk cache; a footgun
+                                                 on large graphs, so it defaults off)
+      ``deadline`` -> a cooperative ``Deadline``; on expiry the pass returns the leads it has
+                      with ``lifetime["timed_out"]=True`` instead of running unbounded. There
+                      is no env fallback — an unset deadline means "no bound", preserving the
+                      historical unbounded behavior for the existing callers.
+      ``progress`` -> optional ``callable(label, elapsed_seconds)`` invoked at each phase
+                      boundary so a long pass is never silent.
+    """
     started = perf_counter()
+
+    def _emit(label):
+        if progress is not None:
+            progress(label, perf_counter() - started)
+
+    def _expired():
+        return deadline is not None and deadline.expired()
+
+    def _timed_out_return(stopped_before, *, F=None, succ=None, coverage=None,
+                          summaries=None):
+        """Budget hit before object analysis could run: stop rather than start the next
+        heavy phase, and return empty-but-flagged leads. Each phase here (the dataflow
+        tier, the F projection, the summaries) is a single batch step the wave-level
+        deadline inside ``analyze_object_lifetimes`` cannot preempt, so the only place to
+        honour the budget across them is at their boundaries. An unfinished pass must read
+        as inconclusive -- callers key on ``lifetime['timed_out']`` and never treat an
+        empty result as clean."""
+        now = perf_counter()
+        return {
+            "F": F, "succ": succ, "summaries": summaries or {},
+            "skeletons": [], "semantic_graph": None, "coverage": coverage,
+            "leads": [],
+            "lifetime": {"requested": requested, "active": "legacy", "available": False,
+                         "timed_out": True,
+                         "diagnostics": {"timed_out": True,
+                                         "stopped_before": stopped_before}},
+            "timings": {"dataflow_tier_seconds": round(tier_done - started, 6),
+                        "total_seconds": round(now - started, 6),
+                        "stopped_before": stopped_before},
+        }
+
     store.ensure_dataflow_tier()
     tier_done = perf_counter()
+    _emit("dataflow tier")
     requested = lifetime_engine or os.environ.get(
         "LACHESIS_LIFETIME_ENGINE", _DEFAULT_LIFETIME_ENGINE)
     if requested not in {"legacy", "shadow", "object"}:
         raise ValueError(
             "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")
+    # The tier is the single most expensive step and it runs before any other checkpoint,
+    # so a budget already spent here stops the pass now instead of paying for the whole
+    # projection + summaries + object analysis that follow.
+    if _expired():
+        return _timed_out_return("projection")
     # Pass 3 is a language-neutral semantic pipeline.  Frontends select the
     # appropriate catalog/normalizer and contribute their own graph facts; the
     # scheduler, Claus graph, and matcher must not make C the dispatch gate.
@@ -183,8 +235,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
     else:
         coverage = CoverageScheduler(F, succ).plan()
     projection_done = perf_counter()
+    _emit("projection")
+    if _expired():
+        return _timed_out_return("summaries", F=F, succ=succ, coverage=coverage)
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
+    _emit("summaries")
+    if _expired():
+        return _timed_out_return("object-analysis", F=F, succ=succ,
+                                 coverage=coverage, summaries=summaries)
     # The semantic graph is the production lifetime substrate.  Keep the old
     # typestate renderer for legacy/shadow operation and for an explicit
     # fallback only; object mode still uses its reach skeletons for Atropos's
@@ -206,7 +265,8 @@ def run_pass(store, lang="c", lifetime_engine=None):
         from .emit import _native_object_substrate
         if _native_object_substrate(analysis_graph):
             object_result = analyze_object_lifetimes(
-                store, object_functions, object_succ, lang=lang, graph=analysis_graph)
+                store, object_functions, object_succ, lang=lang, graph=analysis_graph,
+                workers=workers, deadline=deadline)
         else:
             # Frontends without declaration-rooted heap roles still participate in
             # Pass 3 through the generic F-IR semantic graph.  Do not route them
@@ -249,9 +309,12 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # than the analysis itself, so it is an explicit opt-in cache rather than
         # part of the timing-critical path.  The compact Pass-1 structural sidecar
         # remains automatic and is what Pass 3 needs for cold substrate loading.
-        snapshot_enabled = os.environ.get("LACHESIS_PASS3_SNAPSHOT", "").lower() in {
-            "1", "true", "yes", "on"
-        }
+        if snapshot is None:
+            snapshot_enabled = os.environ.get("LACHESIS_PASS3_SNAPSHOT", "").lower() in {
+                "1", "true", "yes", "on"
+            }
+        else:
+            snapshot_enabled = bool(snapshot)
         snapshot_path = (f"{store.graph_path}.pass3.json"
                          if snapshot_enabled and getattr(store, "graph_path", None)
                          else None)
@@ -267,11 +330,13 @@ def run_pass(store, lang="c", lifetime_engine=None):
             reach_summaries=summaries, state_artifacts=object_result.artifacts,
             cfgs=object_result.cfgs)
         semantic_build_done = perf_counter()
+        _emit("semantic graph")
         if snapshot_path:
             claus.fragments.save_snapshot(snapshot_path)
         semantic_match_started = perf_counter()
         semantic_leads = match_graph(semantic_graph)
         semantic_match_done = perf_counter()
+        _emit("matching")
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.
@@ -360,6 +425,10 @@ def run_pass(store, lang="c", lifetime_engine=None):
         lifetime.update({
             "active": "object" if requested == "object" else "legacy",
             "available": True, "differential": differential,
+            # A deadline that fired inside object analysis leaves this True and the
+            # leads partial; callers surface it so an empty/short result is never read
+            # as "clean". Absent deadline -> always False (the historical unbounded run).
+            "timed_out": bool(diagnostics.get("timed_out")),
             "diagnostics": diagnostics,
             "fallback_functions": sorted(seed_unsafe),
             "candidate_functions": len(object_functions),

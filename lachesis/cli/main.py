@@ -222,7 +222,7 @@ def command_mcp(args: argparse.Namespace) -> int:
     os.environ["LACHESIS_GRAPH"] = str(graph_path)
     if args.profile:
         os.environ["LACHESIS_PROFILE"] = args.profile
-    sys.argv = ["lachesis-mcp"]
+    sys.argv = ["lachesis mcp"]
     return mcp_server.main() or EXIT_OK
 
 
@@ -577,12 +577,19 @@ def build_parser() -> argparse.ArgumentParser:
     concept.set_defaults(handler=command_concept_model, model_action="status",
                          model="BAAI/bge-small-en-v1.5", json=False)
 
+    # The reader verbs, each a thin shell over one Analysis method: enrich (pass 2),
+    # analyze (pass 3 -> leads), candidates (the registry), explain (the one-shot capsule).
+    # These are parsed, not passed through -- they are the ergonomic front door.
+    from lachesis.cli.verbs import add_reader_verbs
+    add_reader_verbs(subcommands)
+
     # The engine's own programs, one word in. Their arguments are passed through
     # untouched, which is why these take REMAINDER rather than a parsed shape: they
     # are a different, lower-level surface and should behave exactly as documented
-    # for themselves.
+    # for themselves. `build` is pass 1 (the structural graph builder); the parsed
+    # `analyze` above is pass 3 (leads), so the two passes never share a word.
     for name, help_text in (
-        ("analyze", "engine: build a graph to a path you choose"),
+        ("build", "pass 1: build a structural graph to a path you choose"),
         ("query", "engine: query a graph directly"),
         ("plan", "engine: rank capsules from a graph you already have"),
     ):
@@ -595,7 +602,7 @@ def build_parser() -> argparse.ArgumentParser:
     return root
 
 
-ENGINE_COMMANDS = ("analyze", "query", "plan")
+ENGINE_COMMANDS = ("build", "query", "plan")
 
 
 def _run_engine(name: str, rest: list[str]) -> int:
@@ -607,9 +614,10 @@ def _run_engine(name: str, rest: list[str]) -> int:
     """
     from lachesis.cli import analyze, query
     from lachesis.planner import cli as planner_cli
-    sys.argv = [f"lachesis-{name}", *rest]
-    if name == "analyze":
+    if name == "build":
+        sys.argv = ["lachesis build", *rest]
         return analyze.main()
+    sys.argv = [f"lachesis {name}", *rest]
     return (query.main() if name == "query" else planner_cli.main()) or EXIT_OK
 
 

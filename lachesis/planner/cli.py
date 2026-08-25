@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """The planner command line: a graph in, a ranked investigation queue out.
 
-  lachesis-plan graph.kuzu
-  lachesis-plan graph.kuzu --limit 20
-  lachesis-plan graph.kuzu --json > queue.json
+  lachesis plan graph.kuzu
+  lachesis plan graph.kuzu --limit 20
+  lachesis plan graph.kuzu --json > queue.json
 
 The census line is printed to stderr on every run, including the JSON one, because
 the counts are how a reader tells a short queue from a truncated scan. A suppressed
@@ -74,7 +74,7 @@ def _render(capsule: dict, position: int) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="lachesis-plan",
+        prog="lachesis plan",
         description="rank investigation capsules from a Lachesis graph")
     p.add_argument("--version", action="version", version=_version())
     p.add_argument("graph", help="path to a .kuzu store")
@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001 - CLI converts store errors to one-line guidance
         if os.environ.get("LACHESIS_TRACEBACK"):
             raise
-        print(f"lachesis-plan: {error}", file=sys.stderr)
+        print(f"lachesis plan: {error}", file=sys.stderr)
         print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
         return 2
     result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)

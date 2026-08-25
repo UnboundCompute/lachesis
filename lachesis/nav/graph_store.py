@@ -213,7 +213,7 @@ def _rejoin(graph_path: str, manifest: dict) -> str:
             f"{graph_path} is a reduced store built from {source_dir}, which has "
             f"changed since (recorded {recorded[:12]}, now {current[:12]}). Its stored "
             f"semantics describe source that is no longer there; rebuild it with "
-            f"`lachesis-analyze {source_dir} {graph_path} --reduced`."
+            f"`lachesis build {source_dir} {graph_path} --reduced`."
         )
     cache = joined_store_path(graph_path)
     if _joined_cache_matches(cache, current):
@@ -263,6 +263,15 @@ def _copy_frontend_inventory(core_path: str, cache_path: str) -> None:
     with open(store_manifest_file(cache_path), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
+
+
+# The dataflow tier inflates the whole store back into Python objects and folds four
+# overlays over it, all in RAM. That peak is roughly linear in node count; measured on
+# full libxml2 it was ~7.5 GB for ~980k nodes, i.e. roughly 8 KB per node. Above this many
+# nodes we warn before starting, because on a memory-constrained machine the step drops
+# into swap and *looks* hung though it is still progressing. Advisory only, never a refusal.
+_ENRICH_HEAVY_NODES = 400_000
+_ENRICH_BYTES_PER_NODE = 8_000
 
 
 class GraphStore:
@@ -317,16 +326,23 @@ class GraphStore:
         accessor surface as the in-RAM one, so ``GraphLib`` and every nav tool are
         unchanged, and nothing loads the whole graph into memory.
 
-        A core-only store (the default `lachesis-analyze` output) opens as-is; the
+        A core-only store (the default `lachesis build` output) opens as-is; the
         overlay dataflow tier is materialized lazily by ``ensure_dataflow_tier`` on the
         first tool that needs it, and a previously built cache beside the store is
         opened directly here so the steady state costs nothing extra."""
         from lachesis.kuzu_store import (STORE_FORMAT_VERSION, is_kuzu_dir,
                                          read_store_manifest)
+        # Expand a leading ``~`` once, at the single load chokepoint, so a home-relative
+        # path resolves the same from the library, the CLI, and the MCP server instead of
+        # failing "not a graph store" for a directory that plainly exists.
+        import os as _os
+        graph_path = _os.path.expanduser(graph_path) if graph_path else graph_path
+        if overlay_path:
+            overlay_path = _os.path.expanduser(overlay_path)
         if not is_kuzu_dir(graph_path):
             raise ValueError(
                 f"{graph_path} is not a Lachesis graph store; build one with "
-                f"`lachesis-analyze <source_dir> {graph_path}`"
+                f"`lachesis build <source_dir> {graph_path}`"
             )
         core_manifest = read_store_manifest(graph_path)
         # Checked here rather than deeper down because the failure it replaces is a
@@ -337,7 +353,7 @@ class GraphStore:
             raise ValueError(
                 f"{graph_path} is a v{found} graph store and this build reads "
                 f"v{STORE_FORMAT_VERSION}; rebuild it with "
-                f"`lachesis-analyze <source_dir> {graph_path}`"
+                f"`lachesis build <source_dir> {graph_path}`"
             )
         open_path = graph_path
         dataflow_path = None
@@ -426,6 +442,21 @@ class GraphStore:
 
         core_path = self._core_path
         manifest = read_store_manifest(core_path)
+        # Say up front when this will be the heavy, unbounded, in-RAM step (see the class
+        # docstring). A slow first enrich on a large graph then reads as "big in-RAM step",
+        # not "frozen", and the message names the ways out. We never refuse the work.
+        node_count = self.index._node_count()
+        if node_count >= _ENRICH_HEAVY_NODES:
+            gb = node_count * _ENRICH_BYTES_PER_NODE / (1024 ** 3)
+            print(
+                f"[lachesis] enriching a large graph ({node_count:,} nodes): the dataflow "
+                f"tier is a whole-graph in-RAM step with a peak near ~{gb:.0f} GB and no "
+                f"time bound, so on a machine without that much free RAM it swaps and takes "
+                f"minutes. It is cached to a sidecar afterwards, so it is paid once per "
+                f"graph. To avoid the wait: free RAM, build with --reduced, or enrich a "
+                f"smaller subtree.",
+                file=sys.stderr, flush=True,
+            )
         core = materialize_graph(self.index)
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))

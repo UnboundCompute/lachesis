@@ -45,14 +45,9 @@ dev = ["pytest>=8"]
 concept-search = ["fastembed>=0.8,<0.9"]
 
 [project.scripts]
-# The product surface. Everything below it is the engine, kept because a
-# graph you hold yourself is a legitimate thing to want.
+# One entrypoint. The reader is a single `lachesis` with subcommands; every pass
+# and engine tool is a verb under it (build/enrich/analyze/query/plan/mcp/...).
 lachesis = "lachesis.cli.main:main"
-lachesis-analyze = "lachesis.cli.analyze:main"
-lachesis-query = "lachesis.cli.query:main"
-lachesis-mcp = "lachesis.nav.mcp_server:main"
-lachesis-plan = "lachesis.planner.cli:main"
-lachesis-candidates = "lachesis.planner.candidate_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/UnboundCompute/lachesis"

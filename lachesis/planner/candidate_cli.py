@@ -15,7 +15,7 @@ from lachesis.planner.registry import default_candidate_registry
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="lachesis-candidates",
+        prog="lachesis candidates",
         description="enumerate Atropos-backed obligations without judging safety")
     parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("graph", help="path to a Lachesis .kuzu store")
