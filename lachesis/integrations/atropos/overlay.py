@@ -106,6 +106,15 @@ class AtroposOverlay:
         }
         sources.update(stamp.get("from") for stamp in self._stamps
                        if stamp.get("from") is not None)
+        # A repeated fold may encounter the role edges emitted by an earlier
+        # fold. Include their deterministic role-node sources so the bounded
+        # seed lookup preserves the generic registry's deduplication behavior.
+        for stamp in self._stamps:
+            if stamp.get("role") in ("source", "sink") and stamp.get("value_id"):
+                sources.add(stable_id(
+                    _OWNER, self.overlay_id, stamp["role"],
+                    stamp["model_id"], stamp["value_id"],
+                ))
         return _MinimalOverlayIndex(graph, sources)
 
     def applies(self, graph: dict, index: Any = None) -> bool:
