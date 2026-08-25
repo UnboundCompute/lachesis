@@ -16,7 +16,9 @@ from .source_discovery import discover_sources
 from .native_lifetime import translate_graph_pb
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
-from lachesis.nav.dataflow.substrate import cached_substrate, substrate_cache_path
+from lachesis.nav.dataflow.substrate import (
+    cached_substrate, substrate_cache_path, translation_cache_path,
+)
 from lachesis.core import lifetime_pb2
 
 
@@ -51,7 +53,9 @@ def _native_prepared(index):
             or getattr(index, "_db_dir", None))
     if not base:
         return None
-    sidecar = substrate_cache_path(base)
+    sidecar = translation_cache_path(base)
+    if not sidecar.is_file():
+        sidecar = substrate_cache_path(base)
     if not sidecar.is_file():
         return None
     cached = getattr(index, "_native_translation", None)

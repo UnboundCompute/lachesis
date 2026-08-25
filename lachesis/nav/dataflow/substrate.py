@@ -39,6 +39,7 @@ _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOpera
 
 _CACHE_VERSION = 4
 _CACHE_SUFFIX = ".pass3.substrate.pb"
+_TRANSLATION_CACHE_SUFFIX = ".pass2.translation.pb"
 _SUBSTRATE_NODE_KINDS = frozenset({
     "ArraySubscriptExpr", "BinaryOperator", "BreakStmt", "CallExpr", "CaseStmt",
     "CompoundAssignOperator", "CompoundStmt", "ConditionalOperator", "ContinueStmt",
@@ -67,6 +68,73 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
 
 def substrate_cache_path(graph_path):
     return Path(str(graph_path).rstrip("/") + _CACHE_SUFFIX)
+
+
+def translation_cache_path(graph_path):
+    return Path(str(graph_path).rstrip("/") + _TRANSLATION_CACHE_SUFFIX)
+
+
+def _translation_records(nodes, records):
+    """Return the compact call/return projection used by native Pass 2.
+
+    Pass 1 already owns these filtered records while writing the substrate.  Keeping
+    this projection here avoids making Pass 2 decode the complete structural sidecar;
+    Rust still performs the actual translation and lifetime analysis.
+    """
+    def syntax(node):
+        props = node.get("properties") or {}
+        return props.get("syntax_kind") or node.get("kind")
+
+    seed_kinds = {
+        "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
+        "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
+        "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl",
+    }
+    seed_nodes = [node for node in nodes if syntax(node) in seed_kinds]
+    call_ids = {node["id"] for node in seed_nodes
+                if syntax(node) in {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}}
+    return_ids = {node["id"] for node in seed_nodes if syntax(node) == "ReturnStmt"}
+    relevant = call_ids | return_ids
+    for _ in range(2):
+        for edge in records:
+            kind = edge["kind"]
+            source, target = edge["source"], edge["target"]
+            if kind == "AST_CHILD" and (source in relevant or source in call_ids or
+                                         source in return_ids or target in call_ids):
+                relevant.add(source)
+                relevant.add(target)
+            elif kind == "REFERS_TO" and source in relevant:
+                relevant.add(target)
+            elif kind == "VALUE_FLOWS_TO" and source in call_ids:
+                relevant.add(target)
+    node_ids = {node["id"] for node in seed_nodes} | relevant
+    kept_nodes = [node for node in nodes if node["id"] in node_ids]
+    kept_edges = [edge for edge in records if (
+        (edge["kind"] == "AST_CHILD" and
+         (edge["source"] in relevant or edge["target"] in relevant)) or
+        (edge["kind"] == "REFERS_TO" and edge["source"] in relevant) or
+        (edge["kind"] == "VALUE_FLOWS_TO" and edge["source"] in call_ids)
+    )]
+    return kept_nodes, kept_edges
+
+
+def _write_framed_sidecar(target, prefix, header, nodes, edges):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=prefix, dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            write_frame(handle, encode_document({"type": "header", **header}))
+            for node in nodes:
+                write_frame(handle, b"N" + encode_node(node))
+            for edge in edges:
+                write_frame(handle, b"E" + encode_edge(edge))
+        os.replace(temp_name, target)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def write_substrate_cache(graph, graph_path, *, manifest=None):
@@ -131,22 +199,21 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
         "build_fingerprint": manifest.get("build_fingerprint"),
     }
     target = substrate_cache_path(graph_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=".pass3-substrate-", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            write_frame(handle, encode_document({"type": "header", **header}))
-            for node in cached_nodes:
-                write_frame(handle, b"N" + encode_node(node))
-            for edge in records:
-                write_frame(handle, b"E" + encode_edge(edge))
-        os.replace(temp_name, target)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+    _write_framed_sidecar(target, ".pass3-substrate-", header, cached_nodes, records)
+
+    translation_nodes, translation_edges = _translation_records(cached_nodes, records)
+    translation_header = {
+        "format": "lachesis-pass2-translation",
+        "version": _CACHE_VERSION,
+        "edge_count": len(translation_edges),
+        "node_count": len(translation_nodes),
+        "store_version": manifest.get("version"),
+        "core_content_hash": manifest.get("core_content_hash"),
+        "source_content_hash": manifest.get("source_content_hash"),
+        "build_fingerprint": manifest.get("build_fingerprint"),
+    }
+    _write_framed_sidecar(translation_cache_path(graph_path), ".pass2-translation-",
+                          translation_header, translation_nodes, translation_edges)
     return str(target)
 
 
