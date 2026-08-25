@@ -229,6 +229,45 @@ class FixtureIntegrationTests(unittest.TestCase):
         leads = analysis.analyze(hard_stop=0.0001)
         self.assertTrue(leads.timed_out)
 
+    def test_structural_fast_path_skips_the_flow_pass(self):
+        import os
+
+        # A complete cached bind would (correctly) satisfy a temporal=False request as a
+        # superset; clear it so this exercises the genuine structural-only fast path.
+        sidecar = self.GRAPH + ".bind.pb"
+        if os.path.isfile(sidecar):
+            os.remove(sidecar)
+        analysis = Analysis.open(self.GRAPH)
+        census = analysis.census(temporal=False)
+        # the fast path answers the structural families but does not evaluate the temporal
+        # ones, and must never force the dataflow-tier flow pass (no ("flow", ...) built) nor
+        # write a sidecar (the structural bind is a partial answer).
+        self.assertFalse(census["temporal_evaluated"])
+        self.assertTrue(census["constructors"])
+        self.assertNotIn(("flow", None, "c"), analysis._built)
+        self.assertIn(("bind", False), analysis._built)
+        self.assertFalse(os.path.isfile(sidecar))
+
+    def test_full_temporal_bind_evaluates_and_flags(self):
+        analysis = Analysis.open(self.GRAPH)
+        census = analysis.census()  # temporal on by default
+        self.assertTrue(census["temporal_evaluated"])
+
+    def test_bounded_temporal_degrades_not_hangs(self):
+        import os
+
+        # remove any sidecar so the sub-ms budget genuinely times out the merge rather than
+        # loading a complete cached bind.
+        sidecar = self.GRAPH + ".bind.pb"
+        if os.path.isfile(sidecar):
+            os.remove(sidecar)
+        analysis = Analysis.open(self.GRAPH)
+        census = analysis.census(hard_stop=0.0001)
+        # a timed-out temporal merge degrades to structural families, flagged, and is never
+        # cached to the sidecar (a partial answer must not poison a later patient run).
+        self.assertFalse(census["temporal_evaluated"])
+        self.assertFalse(os.path.isfile(sidecar))
+
 
 if __name__ == "__main__":
     unittest.main()

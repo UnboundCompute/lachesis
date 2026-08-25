@@ -389,6 +389,23 @@ def _ref(store, node_id):
             "at": f"{f}:{l}" if f and l else None}
 
 
+# Shared bounding args for the candidate tools. The temporal families (double-free,
+# use-after-free, ...) read the Pass 3 semantic skeleton, whose flow pass materializes the
+# whole dataflow tier -- the one candidate cost that can run long on a large graph. These give
+# a client the escape hatch: `temporal:false` answers the structural families immediately with
+# no tier at all, and `hard_stop` bounds the temporal path so a slow graph degrades to
+# structural (with `temporal_evaluated:false`) instead of hanging the server.
+_TEMPORAL_ARG = {"type": "boolean", "default": True,
+                 "description": "evaluate the temporal families (double-free/UAF/...). Default "
+                                "true. Set false for the guaranteed-bounded fast path: "
+                                "structural families only, no dataflow tier -- use it when a "
+                                "large graph makes the full bind run long. The result's "
+                                "`temporal_evaluated` flag reports whether they were evaluated."}
+_HARD_STOP_ARG = {"type": "number",
+                  "description": "wall-clock budget (seconds) for the temporal families; on "
+                                 "expiry the result degrades to the structural families with "
+                                 "`temporal_evaluated:false` rather than hang. 0 = unbounded."}
+
 TOOLS = [
     {"name": "load_graph",
      "description": "Switch/attach the active graph the whole server reasons over — point it at a "
@@ -874,17 +891,20 @@ TOOLS = [
          "detail": {"type": "string", "enum": ["brief", "compact", "full"], "default": "compact",
                     "description": "brief (one-line scan: id/rank/callee/at/size), "
                                    "compact (triage capsule, no inferences), "
-                                   "full (whole capsule incl. inferences)"}}}},
+                                   "full (whole capsule incl. inferences)"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
     {"name": "candidate_detail",
      "description": "Return the complete neutral evidence capsule for one candidate id. It "
                     "contains observations and bounded inferences, but no safe/unsafe verdict.",
      "inputSchema": {"type": "object", "properties": {
-         "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}},
+         "candidate_id": {"type": "string"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}, "required": ["candidate_id"]}},
     {"name": "candidate_census",
      "description": "Report constructor metadata, exhaustive counts, and explicit analysis "
                     "frontiers. Use this to distinguish an empty result from missing coverage.",
      "inputSchema": {"type": "object", "properties": {
-         "constructor_id": {"type": "string"}}}},
+         "constructor_id": {"type": "string"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
     {"name": "skeleton",
      "description": "Render a function's sink map as a pseudo-function: every catalogued sink "
                     "(all families -- memory, os, file, ...) shown in place, each annotated with "
@@ -1503,7 +1523,11 @@ def call_tool(name, args, format=None):
         return _emit(name, {**c.siblings.diff(hits[0]),
                             **_alts(store, args["sym"])}, fmt, offset, limit)
     if name in ("candidates", "candidate_detail", "candidate_census"):
-        bundle = c.candidate_bundle
+        # temporal:false is the guaranteed-bounded fast path (structural families, no dataflow
+        # tier); hard_stop bounds the temporal families so a slow graph degrades instead of
+        # hanging. Default matches the historical unbounded full bind.
+        bundle = c._bound_bind(temporal=args.get("temporal", True),
+                               hard_stop=args.get("hard_stop"), deadline=None)
         summary = bundle["atropos"]
         if not summary.get("applied"):
             return _emit(name, {
@@ -1522,6 +1546,8 @@ def call_tool(name, args, format=None):
         else:
             result = registry.census(args.get("constructor_id"))
         result["applied"] = True
+        # An absent temporal family means "not evaluated on this bounded run", never "clean".
+        result["temporal_evaluated"] = bool(bundle.get("temporal_evaluated"))
         # The per-language bind report carries the full `unbound` row lists
         # (hundreds of rows, ~90KB on a large catalog). That is coverage data:
         # it belongs on `candidate_census`, the move whose job is to distinguish
