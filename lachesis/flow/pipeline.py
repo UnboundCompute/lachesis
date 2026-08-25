@@ -242,8 +242,17 @@ def run_pass(store, lang="c", lifetime_engine=None):
         # FragmentStore still validates semantic fingerprints before accepting
         # anything, so an older graph or changed translator input is a miss rather
         # than a false coverage claim. In-memory stores remain purely in-memory.
+        # The semantic snapshot is a large JSON serialization of the whole Claus
+        # graph.  On a cold full-graph pass it can exceed a gigabyte and take longer
+        # than the analysis itself, so it is an explicit opt-in cache rather than
+        # part of the timing-critical path.  The compact Pass-1 structural sidecar
+        # remains automatic and is what Pass 3 needs for cold substrate loading.
+        snapshot_enabled = os.environ.get("LACHESIS_PASS3_SNAPSHOT", "").lower() in {
+            "1", "true", "yes", "on"
+        }
         snapshot_path = (f"{store.graph_path}.pass3.json"
-                         if getattr(store, "graph_path", None) else None)
+                         if snapshot_enabled and getattr(store, "graph_path", None)
+                         else None)
         if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
             claus.fragments.load_snapshot(
                 snapshot_path, F, lang, analysis_graph,
