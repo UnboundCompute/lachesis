@@ -492,29 +492,117 @@ fn compact_owner(node: &CompactNode) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
+fn scan_compact_records<FN, FE>(input: &[u8], on_node: FN, on_edge: FE) -> Result<(), String>
+where
+    FN: FnMut(CompactNode),
+    FE: FnMut(CompactEdge),
+{
     let mut offset = 0;
     let header = frame(input, &mut offset)?;
     let _: graph_proto::Document = graph_proto::Document::decode(header)
         .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    let mut nodes = HashMap::new();
-    let mut edges = Vec::new();
+    scan_compact_records_at(input, offset, on_node, on_edge)
+}
+
+fn scan_compact_records_at<FN, FE>(input: &[u8], mut offset: usize,
+                                   mut on_node: FN, mut on_edge: FE) -> Result<(), String>
+where
+    FN: FnMut(CompactNode),
+    FE: FnMut(CompactEdge),
+{
     while offset < input.len() {
         let payload = frame(input, &mut offset)?;
         if payload.is_empty() { continue; }
         match payload[0] {
-            b'N' => { let node = compact_node(graph_proto::NodeRecord::decode(&payload[1..])
-                .map_err(|error| format!("invalid graph node frame: {error}"))?); nodes.insert(node.id.clone(), node); }
+            b'N' => on_node(compact_node(graph_proto::NodeRecord::decode(&payload[1..])
+                .map_err(|error| format!("invalid graph node frame: {error}"))?)),
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph edge frame: {error}"))?;
                 if matches!(record.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO") {
-                    edges.push(compact_edge(record));
+                    on_edge(compact_edge(record));
                 }
             }
             _ => return Err("unknown graph sidecar record prefix".to_owned()),
         }
     }
+    Ok(())
+}
+
+// The substrate writer emits one contiguous node section followed by one
+// contiguous edge section.  Find that boundary without decoding protobufs so
+// later edge-only passes do not repeatedly walk the million-node prefix.
+fn compact_edge_offset(input: &[u8]) -> Result<usize, String> {
+    let mut offset = 0;
+    let header = frame(input, &mut offset)?;
+    let _: graph_proto::Document = graph_proto::Document::decode(header)
+        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
+    while offset < input.len() {
+        let record_offset = offset;
+        let payload = frame(input, &mut offset)?;
+        if payload.first() == Some(&b'E') { return Ok(record_offset); }
+    }
+    Ok(input.len())
+}
+
+pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
+    // Keep only the records needed to seed relevance.  The previous version
+    // retained every compact node before filtering edges, which defeated the
+    // purpose of the compact ABI on million-node graphs.
+    let mut seed_nodes = HashMap::new();
+    scan_compact_records(input, |node| {
+        if matches!(compact_kind(&node),
+            "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr" |
+            "ReturnStmt" | "function" | "method" | "constructor" |
+            "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
+            "CXXDestructorDecl" | "ParmVarDecl") {
+            seed_nodes.insert(node.id.clone(), node);
+        }
+    }, |_| {})?;
+    let edge_offset = compact_edge_offset(input)?;
+    let call_ids: HashSet<String> = seed_nodes.values().filter(|node| matches!(compact_kind(node),
+        "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr")).map(|node| node.id.clone()).collect();
+    let return_ids: HashSet<String> = seed_nodes.values().filter(|node| compact_kind(node) == "ReturnStmt")
+        .map(|node| node.id.clone()).collect();
+    let mut relevant = call_ids.union(&return_ids).cloned().collect::<HashSet<_>>();
+    for _ in 0..2 {
+        scan_compact_records_at(input, edge_offset, |_| {}, |edge| {
+            match edge.kind.as_str() {
+                "AST_CHILD" => {
+                    if call_ids.contains(&edge.source) || return_ids.contains(&edge.source)
+                        || relevant.contains(&edge.source) || call_ids.contains(&edge.target) {
+                        relevant.insert(edge.source);
+                        relevant.insert(edge.target);
+                    }
+                }
+                "REFERS_TO" if relevant.contains(&edge.source) => {
+                    relevant.insert(edge.target);
+                }
+                "VALUE_FLOWS_TO" if call_ids.contains(&edge.source) => {
+                    relevant.insert(edge.target);
+                }
+                _ => {}
+            }
+        })?;
+    }
+    let mut nodes = seed_nodes;
+    let mut edges = Vec::new();
+    // Re-read only the node section to add relevant intermediates; the edge
+    // section is scanned independently from its known boundary below.
+    scan_compact_records(input, |node| {
+        if relevant.contains(&node.id) {
+            nodes.insert(node.id.clone(), node);
+        }
+    }, |_| {})?;
+    scan_compact_records_at(input, edge_offset, |_| {}, |edge| {
+        let keep = match edge.kind.as_str() {
+            "AST_CHILD" => relevant.contains(&edge.source) || relevant.contains(&edge.target),
+            "REFERS_TO" => relevant.contains(&edge.source),
+            "VALUE_FLOWS_TO" => call_ids.contains(&edge.source),
+            _ => false,
+        };
+        if keep { edges.push(edge); }
+    })?;
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     let mut parents = HashMap::new();
     let mut refers = HashMap::new();
@@ -602,7 +690,14 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             let line = nodes.get(&node_id).and_then(|node| compact_property(node, "start_line"))
                 .and_then(|value| value.parse::<i64>().ok());
             let Some(child) = children.get(&node_id).and_then(|items| items.first()) else { continue };
-            if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
+            if call_ids.contains(child) {
+                let callee = nodes.get(child)
+                    .and_then(|node| compact_property(node, "primary_target_id"))
+                    .and_then(|id| function_names.get(id).cloned())
+                    .or_else(|| nodes.get(child).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
+                    .unwrap_or_else(|| nodes.get(child).map(|node| node.label.clone()).unwrap_or_default());
+                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some() });
+            } else if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
                 entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some() });
             }
         }
