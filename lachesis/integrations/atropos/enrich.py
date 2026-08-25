@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -83,6 +85,12 @@ def _languages_present(graph: Dict[str, Any]) -> List[str]:
     return langs
 
 
+def _phase_timing(label: str, started: float) -> None:
+    if os.environ.get("LACHESIS_ATROPOS_TIMINGS") == "1":
+        print(f"[lachesis atropos] {label}: {perf_counter() - started:.3f}s",
+              file=sys.stderr, flush=True)
+
+
 def atropos_enrich(
     graph: Dict[str, Any], *, atropos_root: Optional[str] = None,
     complete_dataflow: bool = True, symbol_index_source: Any = None,
@@ -103,14 +111,18 @@ def atropos_enrich(
     if root is None:
         return graph, {"applied": False, "reason": "atropos-not-found"}
 
+    started = perf_counter()
     languages = _languages_present(graph)
+    _phase_timing("language detection", started)
     if not languages:
         return graph, {"applied": False, "reason": "no-recognized-frontend",
                        "atropos_root": str(root)}
 
+    started = perf_counter()
     binder = _load_binder(root)
     models = list(binder.load_models(root / "models"))
     models_by_id = {model["id"]: model for model in models}
+    _phase_timing("catalog load", started)
 
     stamps: List[dict] = []
     per_language: Dict[str, Any] = {}
@@ -118,7 +130,9 @@ def atropos_enrich(
     if symbol_index_source is not None:
         projection_fn = getattr(symbol_index_source, "atropos_projection", None)
         if projection_fn is not None:
+            started = perf_counter()
             projection = projection_fn()
+            _phase_timing("Kuzu projection", started)
     canonical_projection = None
     for language in languages:
         lang_models = [m for m in models if m.get("language") == language]
@@ -129,17 +143,23 @@ def atropos_enrich(
         # every catalog language. Build that million-node/two-million-edge projection
         # once and share its immutable callsite lists across the per-language binders.
         if canonical_projection is None:
+            started = perf_counter()
             canonical_projection = canonical_index(
                 projection if projection is not None else graph,
                 language=language, source="lachesis",
             )
+            _phase_timing("canonical projection", started)
         index = {**canonical_projection, "language": language}
         report = None
         if os.environ.get("LACHESIS_NATIVE_ATROPOS") == "1":
             from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
+            started = perf_counter()
             report = native_bind_all(lang_models, index)
+            _phase_timing(f"native bind {language}", started)
         if report is None:
+            started = perf_counter()
             report = binder.bind_all(lang_models, index)
+            _phase_timing(f"Python bind {language}", started)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
         unbound: List[dict] = []
