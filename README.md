@@ -62,9 +62,8 @@ lachesis explain graph.kuzu tree.c:1487       # one call: the whole evidence cha
 
 Everything a verb does is a method on the `lachesis.Analysis` library class, and every
 verb has a matching MCP tool — the [three front doors](#three-ways-in-cli-library-mcp) run
-the same code. The old standalone `lachesis-analyze` / `lachesis-query` / `lachesis-mcp`
-scripts still work and print a one-line hint to the new verb (`lachesis-analyze` is now
-`lachesis build`, the graph builder).
+the same code. The supported command surface is the single `lachesis` entrypoint; the
+deprecated standalone scripts have been removed.
 
 ## Three ways in: CLI, library, MCP
 
@@ -293,7 +292,7 @@ Example full cold run against libxml2:
 ```bash
 SOURCE=/Users/riyandhiman/project/unboundcompute/cve-proof/src/libxml2
 GRAPH=/tmp/libxml2-pass2.kuzu
-lachesis-analyze "$SOURCE" "$GRAPH"
+lachesis build "$SOURCE" "$GRAPH"
 lachesis enrich "$GRAPH"
 ```
 
