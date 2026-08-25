@@ -194,6 +194,10 @@ def solve_prepared_pb(prepared) -> dict[str, lifetime_pb2.PreparedFunctionResult
     solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                       ctypes.POINTER(ctypes.c_size_t)]
     solve.restype = ctypes.c_void_p
+    if isinstance(prepared, dict):
+        message = lifetime_pb2.PrepareResult()
+        message.functions.extend(prepared.values())
+        prepared = message
     payload = (prepared.SerializeToString()
                if hasattr(prepared, "SerializeToString") else bytes(prepared))
     output_length = ctypes.c_size_t()

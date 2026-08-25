@@ -23,7 +23,7 @@ _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
 _DEFAULT_LIFETIME_ENGINE = "object"
 
 
-def _lifetime_slice(F, succ, lang="c"):
+def _lifetime_slice(F, succ, lang="c", *, include_source_roots=True):
     """Select the semantic call-graph region carrying lifecycle or sink facts.
 
     The name is retained for API compatibility.  The production skeleton must
@@ -56,7 +56,7 @@ def _lifetime_slice(F, succ, lang="c"):
         # and still be the only route to a matcher pattern.  The source
         # discovery result is the authoritative reachability gate; Claus and
         # the matcher decide later whether the region contains useful facts.
-        if (function.get("source_reachable") and
+        if (include_source_roots and function.get("source_reachable") and
             materializable(function))
         or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
@@ -231,7 +231,14 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     # appropriate catalog/normalizer and contribute their own graph facts; the
     # scheduler, Claus graph, and matcher must not make C the dispatch gate.
     object_requested = requested != "legacy"
-    if object_requested:
+    if object_requested and os.environ.get("LACHESIS_NATIVE_TRANSLATION") == "1":
+        from .native_translate import build_native_F
+        native_translation = build_native_F(store, lang=lang, return_graph=True)
+        if native_translation is None:
+            F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
+        else:
+            F, succ, analysis_graph = native_translation
+    elif object_requested:
         F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
     else:
         F, succ = build_F(store, lang=lang)

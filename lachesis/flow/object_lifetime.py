@@ -926,7 +926,9 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
     does not rebuild graph nodes, CFGs, calls, or operations in Python.
     """
     from lachesis.nav.dataflow.substrate import substrate_cache_path
-    from .native_lifetime import decode_prepared_result, prepare_graph_solve_details_pb
+    from .native_lifetime import (decode_prepared_result,
+                                  prepare_graph_solve_details_pb,
+                                  solve_prepared_pb)
 
     base = (getattr(analysis_index, "_pass3_cache_base", None)
             or getattr(analysis_index, "_db_dir", None))
@@ -942,7 +944,9 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
         name = node.get("label")
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
-    native = prepare_graph_solve_details_pb(sidecar)
+    prepared = getattr(analysis_index, "_native_prepared", None)
+    native = (solve_prepared_pb(prepared) if prepared is not None
+              else prepare_graph_solve_details_pb(sidecar))
     sub = cached_substrate(analysis_index).load()
     summaries = {}
     artifacts = {}
