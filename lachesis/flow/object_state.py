@@ -509,6 +509,26 @@ class ObjectStateAnalyzer:
         seed = initial or AbstractState()
         findings = set() if self.collect_findings else _DiscardFindings()
 
+        # A translated function can have a large control-flow skeleton but no placed
+        # object operation (for example a pure wrapper or declaration-only body). Its
+        # abstract state is identical on every path, so a fixpoint would only spend time
+        # hashing and rejoining the same value. Preserve snapshots for consumers while
+        # skipping the solver entirely.
+        if not any(at.values()):
+            state = seed.clone()
+            point_states = {node: (state.clone(),) for node in nodes}
+            post_states = {node: (state.clone(),) for node in nodes}
+            return AnalysisResult(
+                findings=findings,
+                exit_states=(state.clone(),),
+                unplaced=tuple(unplaced),
+                transfers=0,
+                widenings=0,
+                capped=False,
+                point_states=point_states,
+                post_states=post_states,
+            )
+
         # Most small helpers have a single straight-line CFG. There is exactly one
         # abstract state on that shape: no join, loop, or summary alternative can create
         # a second state. Carry it directly instead of allocating a keyed state map and
