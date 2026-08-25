@@ -424,6 +424,17 @@ fn compact_kind(node: &CompactNode) -> &str {
     compact_property(node, "syntax_kind").unwrap_or(node.kind.as_str())
 }
 
+fn record_kind(node: &graph_proto::NodeRecord) -> &str {
+    for field in &node.properties {
+        if field.key != "syntax_kind" { continue; }
+        if let Some(graph_proto::value::Kind::Text(value)) =
+            field.value.as_ref().and_then(|value| value.kind.as_ref()) {
+            return value.as_str();
+        }
+    }
+    node.kind.as_str()
+}
+
 fn compact_peel(nodes: &HashMap<String, CompactNode>, children: &HashMap<String, Vec<String>>, mut id: String) -> String {
     for _ in 0..12 {
         if matches!(nodes.get(&id).map(|node| compact_kind(node)).unwrap_or(""),
@@ -494,7 +505,7 @@ fn compact_owner(node: &CompactNode) -> Option<String> {
 
 fn scan_compact_records<FN, FE>(input: &[u8], on_node: FN, on_edge: FE) -> Result<(), String>
 where
-    FN: FnMut(CompactNode),
+    FN: FnMut(graph_proto::NodeRecord),
     FE: FnMut(CompactEdge),
 {
     let mut offset = 0;
@@ -507,15 +518,15 @@ where
 fn scan_compact_records_at<FN, FE>(input: &[u8], mut offset: usize,
                                    mut on_node: FN, mut on_edge: FE) -> Result<(), String>
 where
-    FN: FnMut(CompactNode),
+    FN: FnMut(graph_proto::NodeRecord),
     FE: FnMut(CompactEdge),
 {
     while offset < input.len() {
         let payload = frame(input, &mut offset)?;
         if payload.is_empty() { continue; }
         match payload[0] {
-            b'N' => on_node(compact_node(graph_proto::NodeRecord::decode(&payload[1..])
-                .map_err(|error| format!("invalid graph node frame: {error}"))?)),
+            b'N' => on_node(graph_proto::NodeRecord::decode(&payload[1..])
+                .map_err(|error| format!("invalid graph node frame: {error}"))?),
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph edge frame: {error}"))?;
@@ -550,12 +561,13 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     // retained every compact node before filtering edges, which defeated the
     // purpose of the compact ABI on million-node graphs.
     let mut seed_nodes = HashMap::new();
-    scan_compact_records(input, |node| {
-        if matches!(compact_kind(&node),
+    scan_compact_records(input, |record| {
+        if matches!(record_kind(&record),
             "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr" |
             "ReturnStmt" | "function" | "method" | "constructor" |
             "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
             "CXXDestructorDecl" | "ParmVarDecl") {
+            let node = compact_node(record);
             seed_nodes.insert(node.id.clone(), node);
         }
     }, |_| {})?;
@@ -589,8 +601,9 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut edges = Vec::new();
     // Re-read only the node section to add relevant intermediates; the edge
     // section is scanned independently from its known boundary below.
-    scan_compact_records(input, |node| {
-        if relevant.contains(&node.id) {
+    scan_compact_records(input, |record| {
+        if relevant.contains(&record.id) {
+            let node = compact_node(record);
             nodes.insert(node.id.clone(), node);
         }
     }, |_| {})?;
