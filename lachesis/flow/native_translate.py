@@ -18,6 +18,7 @@ from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import (
     cached_substrate, substrate_cache_path, translation_cache_path,
+    translation_facts_path,
 )
 from lachesis.core import lifetime_pb2
 
@@ -53,6 +54,21 @@ def _native_prepared(index):
             or getattr(index, "_db_dir", None))
     if not base:
         return None
+    facts_path = translation_facts_path(base)
+    if facts_path.is_file():
+        cached = getattr(index, "_native_translation", None)
+        if cached is not None:
+            return cached
+        result = lifetime_pb2.TranslationResult()
+        try:
+            result.ParseFromString(facts_path.read_bytes())
+        except Exception:
+            result = None
+        if result is not None and result.functions:
+            prepared = {function.id: function for function in result.functions}
+            index._native_translation = prepared
+            return prepared
+
     sidecar = translation_cache_path(base)
     if not sidecar.is_file():
         sidecar = substrate_cache_path(base)

@@ -23,6 +23,7 @@ from lachesis.core.graph_wire import (
     encode_document, encode_edge, encode_node,
     read_frames, write_frame,
 )
+from lachesis.core import lifetime_pb2
 
 from lachesis.timeit import timeit
 
@@ -40,6 +41,7 @@ _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOpera
 _CACHE_VERSION = 4
 _CACHE_SUFFIX = ".pass3.substrate.pb"
 _TRANSLATION_CACHE_SUFFIX = ".pass2.translation.pb"
+_TRANSLATION_FACTS_SUFFIX = ".pass2.facts.pb"
 _SUBSTRATE_NODE_KINDS = frozenset({
     "ArraySubscriptExpr", "BinaryOperator", "BreakStmt", "CallExpr", "CaseStmt",
     "CompoundAssignOperator", "CompoundStmt", "ConditionalOperator", "ContinueStmt",
@@ -72,6 +74,185 @@ def substrate_cache_path(graph_path):
 
 def translation_cache_path(graph_path):
     return Path(str(graph_path).rstrip("/") + _TRANSLATION_CACHE_SUFFIX)
+
+
+def translation_facts_path(graph_path):
+    return Path(str(graph_path).rstrip("/") + _TRANSLATION_FACTS_SUFFIX)
+
+
+_PATH_CASTS = {
+    "ImplicitCastExpr", "CStyleCastExpr", "ParenExpr", "CXXConstCastExpr",
+    "CXXStaticCastExpr", "CXXReinterpretCastExpr", "CXXFunctionalCastExpr",
+}
+
+
+def _translation_facts(nodes, records):
+    """Project the Pass-1 records into the compact native translation ABI."""
+    by_id = {node["id"]: node for node in nodes}
+    children = defaultdict(list)
+    parents = {}
+    refers = {}
+    source_edges = defaultdict(list)
+    for edge in records:
+        source, target = edge["source"], edge["target"]
+        source_edges[source].append(edge)
+        if edge["kind"] == "AST_CHILD":
+            children[source].append((target, (edge.get("properties") or {}).get("role", "")))
+            parents.setdefault(target, source)
+        elif edge["kind"] == "REFERS_TO":
+            refers[source] = target
+
+    def props(node):
+        return node.get("properties") or {}
+
+    def syntax(node_id):
+        node = by_id.get(node_id)
+        return (props(node).get("syntax_kind") or node.get("kind")) if node else ""
+
+    def peel(node_id):
+        for _ in range(12):
+            if syntax(node_id) not in _PATH_CASTS:
+                break
+            items = children.get(node_id, ())
+            if not items:
+                break
+            node_id = items[0][0]
+        return node_id
+
+    def path(node_id, depth=0):
+        if not node_id or depth > 40:
+            return None
+        node_id = peel(node_id)
+        node = by_id.get(node_id)
+        if node is None:
+            return None
+        kind = syntax(node_id)
+        if kind == "DeclRefExpr":
+            return path(refers.get(node_id), depth + 1)
+        if kind in {"ParmVarDecl", "VarDecl"}:
+            return (f"decl:{node_id}", [])
+        if kind == "MemberExpr":
+            items = children.get(node_id, ())
+            base = path(items[0][0], depth + 1) if items else None
+            if base is None:
+                return None
+            label = node.get("label") or ""
+            if "->" in label:
+                index, width, arrow = label.rfind("->"), 2, True
+            elif "." in label:
+                index, width, arrow = label.rfind("."), 1, False
+            else:
+                return base
+            field = label[index + width:].split("[", 1)[0].split("(", 1)[0].split(" ", 1)[0]
+            if not field:
+                return base
+            selectors = (["*"] if arrow else []) + [field] + list(base[1])
+            return base[0], selectors
+        if kind == "ArraySubscriptExpr":
+            items = children.get(node_id, ())
+            base = path(items[0][0], depth + 1) if items else None
+            return None if base is None else (base[0], list(base[1]) + ["<?>", "*"])
+        if kind == "UnaryOperator":
+            items = children.get(node_id, ())
+            base = path(items[0][0], depth + 1) if items else None
+            if base is None:
+                return None
+            operator = props(node).get("operator", "")
+            selectors = list(base[1])
+            if operator in {"*", "&"}:
+                selectors.append(operator)
+            return base[0], selectors
+        return None
+
+    function_kinds = {"function", "method", "constructor", "FunctionDecl",
+                      "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl"}
+    function_names = {node["id"]: node.get("label", "") for node in nodes
+                      if syntax(node["id"]) in function_kinds}
+    function_ids = set(function_names)
+    functions = {}
+    return_nodes = defaultdict(list)
+    for node in nodes:
+        owner = props(node).get("owner_function_id") or props(node).get("function_id")
+        if not owner:
+            continue
+        item = functions.setdefault(owner, lifetime_pb2.TranslationFunction(id=owner))
+        if syntax(node["id"]) == "ParmVarDecl":
+            item.parameters.append(node["id"])
+        if syntax(node["id"]) == "ReturnStmt":
+            return_nodes[owner].append(node)
+    for item in functions.values():
+        item.parameters.sort(key=lambda node_id: int(props(by_id[node_id]).get("start_offset") or 2**63 - 1))
+
+    call_kinds = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}
+    for node in nodes:
+        node_id = node["id"]
+        if syntax(node_id) not in call_kinds:
+            continue
+        node_props = props(node)
+        owner = node_props.get("owner_function_id") or node_props.get("function_id")
+        item = functions.get(owner)
+        if item is None:
+            continue
+        target = node_props.get("primary_target_id")
+        callee = function_names.get(target) or node_props.get("callee") or node.get("label", "")
+        call = lifetime_pb2.FunctionCall(
+            node=node_id, callee=callee, receiver=node_props.get("receiver", ""),
+            line=int(node_props.get("start_line") or 0), has_line="start_line" in node_props,
+            is_alloc=node_props.get("is_alloc") is True,
+            is_release=node_props.get("is_release") is True,
+            is_realloc=node_props.get("is_realloc") is True,
+            is_aggregate_copy=node_props.get("is_aggregate_copy") is True,
+        )
+        parent_id = parents.get(node_id)
+        if parent_id and syntax(parent_id) == "BinaryOperator" and props(by_id[parent_id]).get("operator") == "=":
+            call.assigned = next((target for target, role in children.get(parent_id, ())
+                                  if role == "LEFT_OPERAND"), "")
+        if not call.assigned:
+            call.assigned = next((edge["target"] for edge in source_edges[node_id]
+                                  if edge["kind"] == "VALUE_FLOWS_TO" and
+                                  (edge.get("properties") or {}).get("reason") == "initializer"), "")
+        assigned = path(call.assigned)
+        if assigned:
+            call.assigned_root = assigned[0]
+            call.assigned_selectors.extend(assigned[1])
+        args = [(edge["target"], edge.get("properties", {}).get("position", 0))
+                for edge in source_edges[node_id] if edge["kind"] == "AST_CHILD" and
+                (edge.get("properties") or {}).get("role") == "ARGUMENT"]
+        for arg_id, position in sorted(args, key=lambda pair: pair[1] or 0):
+            arg_path = path(arg_id)
+            argument = lifetime_pb2.FunctionArgument(
+                position=int(position or 0), node=arg_id,
+                expression=by_id.get(arg_id, {}).get("label", ""),
+            )
+            if arg_path:
+                argument.root = arg_path[0]
+                argument.selectors.extend(arg_path[1])
+            call.arguments.append(argument)
+        item.calls.append(call)
+
+    for item in functions.values():
+        for node in return_nodes.get(item.id, ()):
+            node_id = node["id"]
+            if not children.get(node_id):
+                continue
+            child = children[node_id][0][0]
+            peeled = peel(child)
+            line_props = props(node)
+            if syntax(peeled) in call_kinds:
+                call_node = by_id[peeled]
+                call_props = props(call_node)
+                target = call_props.get("primary_target_id")
+                item.returns.append(lifetime_pb2.FunctionReturn(
+                    kind="call", callee=function_names.get(target) or
+                    call_props.get("callee") or call_node.get("label", ""),
+                    line=int(line_props.get("start_line") or 0), has_line="start_line" in line_props))
+            else:
+                return_path = path(child)
+                if return_path:
+                    item.returns.append(lifetime_pb2.FunctionReturn(
+                        kind="var", root=return_path[0], selectors=return_path[1],
+                        line=int(line_props.get("start_line") or 0), has_line="start_line" in line_props))
+    return lifetime_pb2.TranslationResult(functions=[functions[key] for key in sorted(functions)])
 
 
 def _translation_records(nodes, records):
@@ -128,6 +309,20 @@ def _write_framed_sidecar(target, prefix, header, nodes, edges):
                 write_frame(handle, b"N" + encode_node(node))
             for edge in edges:
                 write_frame(handle, b"E" + encode_edge(edge))
+        os.replace(temp_name, target)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_translation_facts(target, result):
+    fd, temp_name = tempfile.mkstemp(prefix=".pass2-facts-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(result.SerializeToString())
         os.replace(temp_name, target)
     except BaseException:
         try:
@@ -214,6 +409,8 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     }
     _write_framed_sidecar(translation_cache_path(graph_path), ".pass2-translation-",
                           translation_header, translation_nodes, translation_edges)
+    facts = _translation_facts(translation_nodes, translation_edges)
+    _write_translation_facts(translation_facts_path(graph_path), facts)
     return str(target)
 
 
