@@ -756,58 +756,16 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         else:
             cfgs[name] = cfg
 
-        # Streaming callers retain only the current owner's records. The substrate and
-        # index caches are deliberately evicted after CFG preparation so a million-node
-        # graph cannot become a second whole-graph Python object graph.
+    # Disk-backed callers stream records in the dependency waves below. This keeps one
+    # owner's records resident through both CFG preparation and summary preparation, then
+    # evicts them; doing CFG first and evicting would make the summary phase decode every
+    # owner a second time. In-memory callers retain the original whole-substrate path.
     stream = getattr(getattr(sub, "idx", None), "stream_nodes_by_owner", None)
-    if stream is not None:
-        progress = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
-        streamed_owners = 0
-        streamed_nodes = 0
-        streamed_cfg_seconds = 0.0
-        slowest_cfgs = []
-
-        def consume(owner_id, records):
-            nonlocal streamed_owners, streamed_nodes, streamed_cfg_seconds
-            stream_ids = {node["id"] for node in records}
-            stream_idx = sub.idx
-            for node in records:
-                stream_idx._node_cache[node["id"]] = node
-            name = name_by_owner.get(owner_id)
-            if name is not None:
-                cfg_started = perf_counter()
-                prepare_cfg(name, owner_id)
-                cfg_elapsed = perf_counter() - cfg_started
-                streamed_cfg_seconds += cfg_elapsed
-                if progress:
-                    slowest_cfgs.append((cfg_elapsed, name, len(records)))
-                    slowest_cfgs.sort(reverse=True)
-                    del slowest_cfgs[10:]
-            for node_id in stream_ids:
-                stream_idx._node_cache.pop(node_id, None)
-                sub._node.pop(node_id, None)
-            streamed_owners += 1
-            streamed_nodes += len(records)
-            if progress and streamed_owners % 500 == 0:
-                print(
-                    "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs cfg=%.1fs"
-                    % (streamed_owners, len(by_name), streamed_nodes,
-                       perf_counter() - started, streamed_cfg_seconds),
-                    file=sys.stderr, flush=True)
-        stream(by_name.values(), consume)
-        if progress:
-            print(
-                "pass2 object-cfg: complete owners=%d nodes=%d elapsed=%.1fs cfg=%.1fs slowest=%s"
-                % (streamed_owners, streamed_nodes, perf_counter() - started,
-                   streamed_cfg_seconds,
-                   [(name, round(seconds, 3), count)
-                    for seconds, name, count in slowest_cfgs]),
-                file=sys.stderr, flush=True)
-    else:
+    if stream is None:
         sub.warm_owned(by_name.values())
         for name, function_id in by_name.items():
             prepare_cfg(name, function_id)
-    cfg_seconds = perf_counter() - started
+    cfg_seconds = perf_counter() - started if stream is None else 0.0
 
     # Absence means "no analyzable summary", not "proven to have no effects". That
     # distinction makes callers of a CFG failure take the conservative external-call
@@ -822,6 +780,17 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     pool_context = (ProcessPoolExecutor(max_workers=workers)
                     if workers > 1 else nullcontext(None))
     timed_out = False
+    progress = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
+    streamed_owners = 0
+    streamed_nodes = 0
+    streamed_cfg_seconds = 0.0
+    streamed_query_seconds = 0.0
+    slowest_cfgs = []
+    group_by_name = {
+        name: group
+        for group in schedule
+        for name in group["members"]
+    }
     with pool_context as executor:
         for wave in _schedule_levels(schedule, call_successors):
             # A wave boundary is the natural preemption point: the previous wave's futures
@@ -832,21 +801,86 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 if executor is not None:
                     executor.shutdown(cancel_futures=True)
                 break
-            # Prepare graph-derived operations in the parent. Workers receive only the
-            # pure CFG/state problem, never a Kuzu connection or the materialized graph.
             pending = []
+            retained_cyclic = defaultdict(list)
+
+            if stream is not None:
+                # Prepare graph-derived operations in the parent. Workers receive only the
+                # pure CFG/state problem, never a Kuzu connection or the materialized graph.
+                owner_ids = [by_name[name]
+                             for group in wave
+                             for name in group["members"]
+                             if name in by_name]
+
+                def evict(records):
+                    stream_idx = sub.idx
+                    for node in records:
+                        node_id = node["id"]
+                        stream_idx._node_cache.pop(node_id, None)
+                        sub._node.pop(node_id, None)
+
+                def consume(owner_id, records):
+                    nonlocal streamed_owners, streamed_nodes, streamed_cfg_seconds
+                    name = name_by_owner.get(owner_id)
+                    if name is None:
+                        return
+                    cfg_started = perf_counter()
+                    prepare_cfg(name, owner_id)
+                    cfg_elapsed = perf_counter() - cfg_started
+                    streamed_cfg_seconds += cfg_elapsed
+                    streamed_owners += 1
+                    streamed_nodes += len(records)
+                    if progress:
+                        slowest_cfgs.append((cfg_elapsed, name, len(records)))
+                        slowest_cfgs.sort(reverse=True)
+                        del slowest_cfgs[10:]
+                    group = group_by_name.get(name)
+                    if group is not None and group["cyclic"]:
+                        # SCC iterations need the same owner records repeatedly. Retain only
+                        # this wave's cyclic group(s), which are normally tiny, until its
+                        # local fixed point completes.
+                        retained_cyclic[id(group)].append((name, records))
+                    elif name in cfgs:
+                        prepared = _prepare_summary(
+                            sub, norm, owner_id, functions[name], functions,
+                            summaries, cfgs[name])
+                        future = (executor.submit(_analyze_prepared, prepared)
+                                  if executor is not None else None)
+                        pending.append((name, prepared, future))
+                        evict(records)
+                    else:
+                        evict(records)
+
+                query_started = perf_counter()
+                stream(owner_ids, consume)
+                streamed_query_seconds += perf_counter() - query_started
+                if progress and streamed_owners and streamed_owners % 500 == 0:
+                    print(
+                        "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs "
+                        "query=%.1fs cfg=%.1fs"
+                        % (streamed_owners, len(by_name), streamed_nodes,
+                           perf_counter() - started, streamed_query_seconds,
+                           streamed_cfg_seconds),
+                        file=sys.stderr, flush=True)
+            else:
+                # Prepare graph-derived operations in the parent. Workers receive only the
+                # pure CFG/state problem, never a Kuzu connection or the materialized graph.
+                for group in wave:
+                    if group["cyclic"]:
+                        continue
+                    analysable = [name for name in group["members"] if name in cfgs]
+                    if not analysable:
+                        continue
+                    name = analysable[0]
+                    prepared = _prepare_summary(
+                        sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
+                    future = (executor.submit(_analyze_prepared, prepared)
+                              if executor is not None else None)
+                    pending.append((name, prepared, future))
+
             for group in wave:
                 if group["cyclic"]:
                     continue
-                analysable = [name for name in group["members"] if name in cfgs]
-                if not analysable:
-                    continue
-                name = analysable[0]
-                prepared = _prepare_summary(
-                    sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
-                future = (executor.submit(_analyze_prepared, prepared)
-                          if executor is not None else None)
-                pending.append((name, prepared, future))
 
             # Recursive SCCs retain their dependency-driven local worklist. They are
             # few and require newly changed member summaries immediately; meanwhile,
@@ -886,6 +920,10 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                             queue.append(caller)
                             queued.add(caller)
 
+                if stream is not None:
+                    for _name, records in retained_cyclic.pop(id(group), ()):
+                        evict(records)
+
             for name, prepared, future in pending:
                 summary, result = (future.result() if future is not None
                                    else _analyze_prepared(prepared))
@@ -893,6 +931,23 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 artifacts[name] = result
                 summary_runs[name] += 1
                 summary_transfers += result.transfers
+            if progress and stream is not None and retained_cyclic:
+                # Defensive cleanup if an unusual malformed schedule leaves a retained SCC
+                # without a normal iteration path.
+                for records in retained_cyclic.values():
+                    for _name, owner_records in records:
+                        evict(owner_records)
+
+    if progress and stream is not None:
+        print(
+            "pass2 object-cfg: complete owners=%d/%d nodes=%d query=%.1fs cfg=%.1fs slowest=%s"
+            % (streamed_owners, len(by_name), streamed_nodes, streamed_query_seconds,
+               streamed_cfg_seconds,
+               [(name, round(seconds, 3), count)
+                for seconds, name, count in slowest_cfgs]),
+            file=sys.stderr, flush=True)
+    if stream is not None:
+        cfg_seconds = streamed_query_seconds + streamed_cfg_seconds
 
     leads = []
     summary_seconds = perf_counter() - started - cfg_seconds
