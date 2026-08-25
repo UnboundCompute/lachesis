@@ -414,7 +414,7 @@ def _native_function_item(sub, norm, function_id, function_ir, summaries, record
         calls.append({
             "node": call_node, "callee": callee, "line": call.get("line"),
             "assigned": call.get("assigned"), "receiver": call.get("receiver"),
-            "is_alloc": bool(norm.is_acquire(callee)),
+            "is_alloc": bool(norm.is_acquire(callee) and not norm.is_realloc(callee)),
             "is_release": bool(norm.is_release(callee)),
             "is_realloc": bool(norm.is_realloc(callee)),
             "is_source": call_node in source_nodes,

@@ -485,10 +485,18 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         }
 
-        if let Some(base) = graph.deref_base(node_id) {
-            operations.push(raw_operation(Kind::Use, node_id, Some(base), None,
-                graph.node(node_id).and_then(|node| property(node, "start_line")).and_then(|value| value.parse().ok()),
-                false, "deref"));
+        let assignment_lhs = graph.parent.get(node_id).is_some_and(|parent| {
+            graph.kind(parent) == "BinaryOperator" && graph.operator(parent) == "=" &&
+            graph.children.get(parent).into_iter().flatten()
+                .min_by_key(|child| graph.offset(child))
+                .is_some_and(|child| graph.peel(child.clone()) == graph.peel(node_id.clone()))
+        });
+        if !assignment_lhs {
+            if let Some(base) = graph.deref_base(node_id) {
+                operations.push(raw_operation(Kind::Use, node_id, Some(base), None,
+                    graph.node(node_id).and_then(|node| property(node, "start_line")).and_then(|value| value.parse().ok()),
+                    false, "deref"));
+            }
         }
     }
     let summary_by_callee = input.summaries.iter().map(|summary| (summary.callee.as_str(), summary)).collect::<HashMap<_, _>>();
@@ -504,9 +512,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 operations.push(operation(Kind::Free, &call.node, Some(target), None, call));
             }
         } else if call.is_realloc {
-            if let Some(target) = target {
-                operations.push(operation(Kind::Realloc, &call.node, Some(target), source, call));
-            }
+            // Assignment/VarDecl preparation above owns realloc's destination.
+            continue;
         } else if call.is_alloc || call.is_source {
             if let Some(target) = target {
                 operations.push(operation(
@@ -566,6 +573,12 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         while !cfg_node_set.contains(&anchor) && seen.insert(anchor.clone()) {
             let Some(parent) = graph.parent.get(&anchor) else { break };
             anchor = parent.clone();
+        }
+        if !cfg_node_set.contains(&anchor) {
+            if let Some(initializer) = graph.initializers.get(&item.node) {
+                let initializer = graph.peel(initializer.clone());
+                if cfg_node_set.contains(&initializer) { anchor = initializer; }
+            }
         }
         if cfg_node_set.contains(&anchor) { item.node = anchor; }
     }
