@@ -203,7 +203,7 @@ impl State {
             return;
         }
         let mut parent = Path { root: path.root.clone(), selectors: path.selectors[..path.selectors.len() - 1].to_vec() };
-        let parent_id = self.resolve(&mut parent, true).expect("created path parent");
+        let Some(parent_id) = self.resolve(&mut parent, true) else { return };
         self.slots.insert((parent_id, path.selectors.last().unwrap().clone()), oid);
     }
 
@@ -262,7 +262,7 @@ impl State {
     }
 
     fn fresh(&mut self, op: &Operation, fact: Fact) {
-        let target = op.target.as_ref().expect("fresh operation target");
+        let Some(target) = op.target.as_ref() else { return };
         let recent = format!("{}|recent|{}|{}", kind_name(op.kind), op.site, path_name(target));
         let summary = format!("{}|summary|{}|{}", kind_name(op.kind), op.site, path_name(target));
         self.objects.entry(recent.clone()).or_insert_with(|| ObjectMeta::Allocation {
@@ -281,7 +281,7 @@ impl State {
     }
 
     fn free(&mut self, op: &Operation, findings: &mut Findings) {
-        let target = op.target.as_ref().expect("free operation target");
+        let Some(target) = op.target.as_ref() else { return };
         let Some(oid) = self.resolve(target, true) else { return };
         self.record_param(Kind::Free, &oid);
         if target.selectors.len() > 0 && parse_param(&oid).is_some() {
@@ -309,10 +309,12 @@ impl State {
                 self.fresh(op, if op.is_null { Fact::Null } else { Fact::Unknown })
             }
             Kind::Copy => {
-                let mut source = op.source.as_ref().expect("copy source").clone();
-                let oid = self.resolve(&mut source, true).expect("copy source resolves");
-                self.compensate_reassignment(op.target.as_ref());
-                self.bind(op.target.as_ref().expect("copy target"), oid);
+                let Some(source) = op.source.as_ref().cloned() else { return };
+                let mut source = source;
+                let Some(oid) = self.resolve(&mut source, true) else { return };
+                let Some(target) = op.target.as_ref() else { return };
+                self.compensate_reassignment(Some(target));
+                self.bind(target, oid);
             }
             Kind::Free => self.free(op, findings),
             Kind::Realloc => {
@@ -326,7 +328,7 @@ impl State {
                 self.fresh(op, Fact::Allocated);
             }
             Kind::Use => {
-                let target = op.target.as_ref().expect("use target");
+                let Some(target) = op.target.as_ref() else { return };
                 let mut target_path = target.clone();
                 let Some(oid) = self.resolve(&mut target_path, false) else { return };
                 self.record_param(Kind::Use, &oid);
