@@ -49,6 +49,17 @@ pub struct Operation {
     pub access: String,
 }
 
+/// Stable metadata for converting native IDs back to Python's tuple-shaped ObjectIds.
+/// The solver uses compact string handles internally; snapshots never expose those
+/// handles without this table.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ObjectMeta {
+    Param { position: u32, selectors: Vec<String> },
+    UnknownRoot { root: String },
+    UnknownSlot { base: String, selector: String },
+    Allocation { kind: Kind, site: String, target: Path },
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Effect {
     Param { kind: Kind, position: u32, selectors: Vec<String> },
@@ -62,6 +73,7 @@ pub struct State {
     pub slots: HashMap<(String, String), String>,
     pub trace: Vec<Effect>,
     pub freed_paths: HashMap<Path, String>,
+    pub objects: HashMap<String, ObjectMeta>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,9 +82,43 @@ pub struct Findings {
     pub use_after_free: Vec<(Option<i64>, Path, String)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub env: Vec<(String, String)>,
+    pub facts: Vec<(String, Vec<Fact>)>,
+    pub slots: Vec<((String, String), String)>,
+    pub trace: Vec<Effect>,
+    pub freed_paths: Vec<(Path, String)>,
+    pub objects: Vec<(String, ObjectMeta)>,
+}
+
 impl State {
+    pub fn snapshot(&self) -> Snapshot {
+        let mut env: Vec<_> = self.env.iter().map(|(root, oid)| (root.clone(), oid.clone())).collect();
+        env.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut facts: Vec<_> = self.facts.iter().map(|(oid, values)| {
+            let mut values: Vec<_> = values.iter().copied().collect();
+            values.sort_by_key(|value| *value as u8);
+            (oid.clone(), values)
+        }).collect();
+        facts.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut slots: Vec<_> = self.slots.iter().map(|((base, selector), oid)| {
+            ((base.clone(), selector.clone()), oid.clone())
+        }).collect();
+        slots.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut freed_paths: Vec<_> = self.freed_paths.iter().map(|(path, oid)| (path.clone(), oid.clone())).collect();
+        freed_paths.sort_by(|left, right| path_name(&left.0).cmp(&path_name(&right.0)));
+        let mut objects: Vec<_> = self.objects.iter().map(|(oid, meta)| (oid.clone(), meta.clone())).collect();
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        Snapshot { env, facts, slots, trace: self.trace.clone(), freed_paths, objects }
+    }
+
     pub fn seed_parameter(&mut self, path: Path, position: u32) {
         let oid = param_id(position, &path.selectors);
+        self.objects.entry(oid.clone()).or_insert_with(|| ObjectMeta::Param {
+            position,
+            selectors: path.selectors.clone(),
+        });
         self.env.insert(path.root, oid.clone());
         self.facts.entry(oid).or_default().insert(Fact::Unknown);
     }
@@ -81,6 +127,9 @@ impl State {
         let mut oid = self.env.get(&path.root).cloned();
         if oid.is_none() && create {
             let fresh = format!("unknown-root:{}", path.root);
+            self.objects.entry(fresh.clone()).or_insert_with(|| ObjectMeta::UnknownRoot {
+                root: path.root.clone(),
+            });
             self.env.insert(path.root.clone(), fresh.clone());
             self.facts.entry(fresh.clone()).or_default().insert(Fact::Unknown);
             oid = Some(fresh);
@@ -98,6 +147,9 @@ impl State {
                 } else {
                     format!("unknown-slot:{}:{}", base, selector)
                 };
+                self.objects.entry(fresh.clone()).or_insert_with(|| {
+                    ObjectMeta::UnknownSlot { base: base.clone(), selector: selector.clone() }
+                });
                 self.slots.insert(key, fresh.clone());
                 self.facts.entry(fresh.clone()).or_default().insert(Fact::Unknown);
                 fresh
@@ -138,6 +190,11 @@ impl State {
     fn fresh(&mut self, op: &Operation, fact: Fact) {
         let target = op.target.as_ref().expect("fresh operation target");
         let recent = format!("{}|recent|{}|{}", kind_name(op.kind), op.site, path_name(target));
+        self.objects.entry(recent.clone()).or_insert_with(|| ObjectMeta::Allocation {
+            kind: op.kind,
+            site: op.site.clone(),
+            target: target.clone(),
+        });
         self.facts.insert(recent.clone(), [fact].into_iter().collect());
         self.bind(target, recent);
     }
