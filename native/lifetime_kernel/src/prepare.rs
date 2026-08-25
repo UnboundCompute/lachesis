@@ -32,6 +32,7 @@ fn path(node: Option<&str>) -> Option<Path> {
 struct GraphView {
     nodes: HashMap<String, lifetime_proto::GraphNode>,
     children: HashMap<String, Vec<String>>,
+    roles: HashMap<(String, String), Vec<String>>,
     parent: HashMap<String, String>,
     refers: HashMap<String, String>,
     initializers: HashMap<String, String>,
@@ -42,6 +43,7 @@ impl GraphView {
         let nodes = input.nodes.iter().cloned().map(|node| (node.id.clone(), node)).collect();
         let mut children = HashMap::new();
         let mut parent = HashMap::new();
+        let mut roles = HashMap::new();
         let mut refers = HashMap::new();
         let mut initializers = HashMap::new();
         for edge in &input.edges {
@@ -49,13 +51,14 @@ impl GraphView {
                 "AST_CHILD" => {
                     children.entry(edge.source.clone()).or_insert_with(Vec::new).push(edge.target.clone());
                     parent.entry(edge.target.clone()).or_insert_with(|| edge.source.clone());
+                    roles.entry((edge.source.clone(), edge.role.clone())).or_insert_with(Vec::new).push(edge.target.clone());
                 }
                 "REFERS_TO" => { refers.insert(edge.source.clone(), edge.target.clone()); }
                 "VALUE_FLOWS_TO" => { initializers.insert(edge.target.clone(), edge.source.clone()); }
                 _ => {}
             }
         }
-        Self { nodes, children, parent, refers, initializers }
+        Self { nodes, children, roles, parent, refers, initializers }
     }
 
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> { self.nodes.get(id) }
@@ -155,6 +158,218 @@ impl GraphView {
             _ => None,
         }
     }
+
+    fn is_descendant(&self, node: &str, root: &str) -> bool {
+        let mut current = node;
+        let mut seen = HashSet::new();
+        while seen.insert(current.to_owned()) {
+            if current == root { return true; }
+            let Some(parent) = self.parent.get(current) else { return false };
+            current = parent;
+        }
+        false
+    }
+}
+
+fn is_statement(kind: &str) -> bool {
+    kind.ends_with("Stmt") || matches!(kind, "cfg-entry" | "cfg-exit" | "cfg-merge" | "cfg-condition")
+}
+
+fn expression_stream(graph: &GraphView, id: &str, owned: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>, depth: usize) {
+    if depth > 60 || !owned.contains(id) || !seen.insert(id.to_owned()) { return; }
+    let peeled = graph.peel(id.to_owned());
+    if peeled != id {
+        if owned.contains(&peeled) {
+            expression_stream(graph, &peeled, owned, out, seen, depth + 1);
+        } else {
+            out.push(id.to_owned());
+        }
+        return;
+    }
+    let mut children = graph.children.get(id).cloned().unwrap_or_default()
+        .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
+    children.sort_by_key(|child| graph.offset(child));
+    if graph.kind(id) == "BinaryOperator" && graph.operator(id) == "=" && children.len() >= 2 {
+        children.swap(0, 1);
+    }
+    for child in children { expression_stream(graph, &child, owned, out, seen, depth + 1); }
+    out.push(id.to_owned());
+}
+
+fn append_chain(successors: &mut HashMap<String, Vec<String>>, nodes: &[String]) {
+    for pair in nodes.windows(2) {
+        successors.entry(pair[0].clone()).or_default().push(pair[1].clone());
+    }
+}
+
+fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<String>, HashMap<String, Vec<String>>)> {
+    let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
+        graph.parent.get(*node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
+    if roots.is_empty() { roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt").cloned().collect(); }
+    let root = roots.into_iter().min_by_key(|node| graph.offset(node))?;
+    let mut successors: HashMap<String, Vec<String>> = HashMap::new();
+    let mut memo: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
+    let mut in_progress = HashSet::new();
+
+    fn emit(
+        graph: &GraphView, owned: &HashSet<String>, id: &str,
+        successors: &mut HashMap<String, Vec<String>>,
+        memo: &mut HashMap<String, (Option<String>, Vec<String>)>,
+        in_progress: &mut HashSet<String>, depth: usize,
+    ) -> (Option<String>, Vec<String>) {
+        if depth > 200 { return (None, Vec::new()); }
+        if let Some(value) = memo.get(id) { return value.clone(); }
+        if !in_progress.insert(id.to_owned()) { return (None, Vec::new()); }
+        let kind = graph.kind(id);
+        let children = graph.children.get(id).cloned().unwrap_or_default()
+            .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
+        let result = if kind == "CompoundStmt" {
+            let mut items = children;
+            items.sort_by_key(|child| graph.offset(child));
+            let mut first = None;
+            let mut exits: Vec<String> = Vec::new();
+            for child in items {
+                let (entry, next_exits) = {
+                if is_statement(graph.kind(&child).as_str()) {
+                    emit(graph, owned, &child, successors, memo, in_progress, depth + 1)
+                } else {
+                    let mut stream = Vec::new();
+                    expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0);
+                    let exits = stream.last().cloned().into_iter().collect();
+                    append_chain(successors, &stream);
+                    (stream.first().cloned(), exits)
+                }
+                };
+                let Some(entry) = entry else { continue };
+                if first.is_none() { first = Some(entry.clone()); }
+                for previous in &exits { successors.entry(previous.clone()).or_default().push(entry.clone()); }
+                exits = next_exits;
+            }
+            (first, exits)
+        } else if kind == "IfStmt" {
+            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned()
+                .or_else(|| children.iter().min_by_key(|child| graph.offset(child)).cloned());
+            let mut condition_stream = Vec::new();
+            if let Some(condition) = condition {
+                expression_stream(graph, &condition, owned, &mut condition_stream, &mut HashSet::new(), 0);
+                append_chain(successors, &condition_stream);
+            }
+            let mut branches = Vec::new();
+            for role in ["TRUE_BRANCH", "FALSE_BRANCH"] {
+                if let Some(branch) = graph.roles.get(&(id.to_owned(), role.to_owned())).and_then(|items| items.first()) {
+                    branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
+                }
+            }
+            let mut exits = Vec::new();
+            for (entry, branch_exits) in branches {
+                if let Some(entry) = entry {
+                    for condition_exit in condition_stream.iter().rev().take(1) {
+                        successors.entry(condition_exit.clone()).or_default().push(entry.clone());
+                    }
+                    exits.extend(branch_exits);
+                }
+            }
+            if exits.is_empty() { exits = condition_stream.last().cloned().into_iter().collect(); }
+            (condition_stream.first().cloned().or_else(|| exits.first().cloned()), exits)
+        } else if kind == "ForStmt" {
+            let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned();
+            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned();
+            let mut others = children;
+            others.retain(|child| Some(child) != body.as_ref() && Some(child) != condition.as_ref());
+            others.sort_by_key(|child| graph.offset(child));
+            let condition_offset = condition.as_ref().map(|node| graph.offset(node)).unwrap_or(i64::MAX);
+            let init = others.iter().find(|node| graph.offset(node) < condition_offset).cloned();
+            let increment = others.iter().rev().find(|node| graph.offset(node) > condition_offset).cloned();
+            let emit_expr = |node: Option<String>, successors: &mut HashMap<String, Vec<String>>| -> (Option<String>, Vec<String>) {
+                let Some(node) = node else { return (None, Vec::new()) };
+                let mut stream = Vec::new();
+                expression_stream(graph, &node, owned, &mut stream, &mut HashSet::new(), 0);
+                append_chain(successors, &stream);
+                (stream.first().cloned(), stream.last().cloned().into_iter().collect())
+            };
+            let init_result = emit_expr(init, successors);
+            let condition_result = emit_expr(condition, successors);
+            let body_result = body.map(|node| emit(graph, owned, &node, successors, memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
+            let increment_result = emit_expr(increment, successors);
+            if let Some(condition_entry) = condition_result.0.clone() {
+                for exit in &init_result.1 { successors.entry(exit.clone()).or_default().push(condition_entry.clone()); }
+                if let Some(body_entry) = body_result.0.clone() {
+                    if let Some(condition_exit) = condition_result.1.first() { successors.entry(condition_exit.clone()).or_default().push(body_entry); }
+                }
+                let back = increment_result.0.clone().or(condition_result.0.clone());
+                for exit in &body_result.1 { if let Some(back) = back.clone() { successors.entry(exit.clone()).or_default().push(back); } }
+                if let Some(increment_entry) = increment_result.0.clone() {
+                    for exit in &increment_result.1 { successors.entry(exit.clone()).or_default().push(condition_entry.clone()); }
+                    let _ = increment_entry;
+                }
+            }
+            let entry = init_result.0.or(condition_result.0).or(body_result.0);
+            (entry, condition_result.1.into_iter().chain(body_result.1).collect())
+        } else if matches!(kind.as_str(), "WhileStmt" | "DoStmt") {
+            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned();
+            let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned();
+            let mut condition_stream = Vec::new();
+            if let Some(condition) = condition.as_ref() { expression_stream(graph, condition, owned, &mut condition_stream, &mut HashSet::new(), 0); append_chain(successors, &condition_stream); }
+            let body_result = body.as_ref().map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
+            if kind == "WhileStmt" {
+                if let Some(body_entry) = body_result.0.clone() {
+                    for condition_exit in condition_stream.iter().rev().take(1) { successors.entry(condition_exit.clone()).or_default().push(body_entry.clone()); }
+                }
+                for body_exit in body_result.1 { if let Some(condition_entry) = condition_stream.first() { successors.entry(body_exit).or_default().push(condition_entry.clone()); } }
+                (condition_stream.first().cloned().or(body_result.0), condition_stream.last().cloned().into_iter().collect())
+            } else {
+                for body_exit in body_result.1 { if let Some(condition_entry) = condition_stream.first() { successors.entry(body_exit).or_default().push(condition_entry.clone()); } }
+                (body_result.0.or_else(|| condition_stream.first().cloned()), condition_stream.last().cloned().into_iter().collect())
+            }
+        } else if kind == "ReturnStmt" {
+            let mut stream = Vec::new();
+            for child in children { expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0); }
+            append_chain(successors, &stream);
+            if let Some(last) = stream.last() { successors.entry(last.clone()).or_default(); }
+            (stream.first().cloned().or_else(|| Some(id.to_owned())), Vec::new())
+        } else if is_statement(kind.as_str()) {
+            let mut stream = Vec::new();
+            let mut sorted = children;
+            sorted.sort_by_key(|child| graph.offset(child));
+            for child in sorted { expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0); }
+            append_chain(successors, &stream);
+            (stream.first().cloned(), stream.last().cloned().into_iter().collect())
+        } else {
+            let mut stream = Vec::new();
+            expression_stream(graph, id, owned, &mut stream, &mut HashSet::new(), 0);
+            append_chain(successors, &stream);
+            (stream.first().cloned(), stream.last().cloned().into_iter().collect())
+        };
+        in_progress.remove(id);
+        memo.insert(id.to_owned(), result.clone());
+        result
+    }
+
+    let (entry, exits) = emit(graph, owned, &root, &mut successors, &mut memo, &mut in_progress, 0);
+    let entry = entry?;
+    let cfg_entry = owned.iter().find(|node| graph.kind(node) == "cfg-entry").cloned();
+    let cfg_exit = owned.iter().find(|node| graph.kind(node) == "cfg-exit").cloned();
+    let mut params = owned.iter().filter(|node| graph.kind(node) == "ParmVarDecl").cloned().collect::<Vec<_>>();
+    params.sort_by_key(|node| graph.offset(node));
+    if let Some(exit) = cfg_exit.clone() {
+        successors.entry(exit).or_default();
+        for item in exits { successors.entry(item).or_default().push(cfg_exit.clone().unwrap()); }
+    }
+    let mut chain = Vec::new();
+    if let Some(entry_node) = cfg_entry { chain.push(entry_node); }
+    chain.extend(params);
+    chain.push(entry);
+    append_chain(&mut successors, &chain);
+    let start = chain.first()?.clone();
+    let mut nodes = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = vec![start];
+    while let Some(node) = queue.pop() {
+        if !seen.insert(node.clone()) { continue; }
+        nodes.push(node.clone());
+        for successor in successors.get(&node).into_iter().flatten().rev() { queue.push(successor.clone()); }
+    }
+    Some((nodes, successors))
 }
 
 fn operation(kind: Kind, node: &str, target: Option<Path>, source: Option<Path>, call: &lifetime_proto::FunctionCall) -> Operation {
@@ -198,21 +413,15 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             successor_map.entry(edge.source.clone()).or_default().push(edge.target.clone());
         }
     }
-    // Some frontend fragments have no statement CFG edge. Preserve a useful
-    // deterministic local stream until the full AST CFG synthesizer is selected.
+    let mut prepared_from_cfg = None;
     if successor_map.is_empty() {
-        for pair in node_ids.windows(2) {
-            successor_map.entry(pair[0].clone()).or_default().push(pair[1].clone());
+        if let Some((nodes, successors)) = synthesize_cfg(&graph, &node_set) {
+            prepared_from_cfg = Some(nodes);
+            successor_map = successors;
         }
     }
     let cfg_node_set = successor_map.keys().cloned()
         .chain(successor_map.values().flatten().cloned()).collect::<HashSet<_>>();
-    let mut successors = successor_map.into_iter().map(|(node, mut targets)| {
-        targets.sort();
-        targets.dedup();
-        lifetime_proto::Successors { node, targets }
-    }).collect::<Vec<_>>();
-    successors.sort_by(|left, right| left.node.cmp(&right.node));
 
     let mut operations = Vec::new();
     let call_by_node = input.calls.iter().map(|call| (call.node.clone(), call)).collect::<HashMap<_, _>>();
@@ -361,9 +570,21 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         if cfg_node_set.contains(&anchor) { item.node = anchor; }
     }
     operations.retain(|item| node_set.contains(&item.node));
-    let prepared_nodes = if cfg_node_set.is_empty() {
-        let mut values = operations.iter().map(|item| item.node.clone()).collect::<Vec<_>>();
+    let prepared_nodes = if let Some(nodes) = prepared_from_cfg {
+        nodes
+    } else if cfg_node_set.is_empty() {
+        let operation_nodes = operations.iter().map(|item| item.node.as_str()).collect::<HashSet<_>>();
+        let mut values = node_ids.iter().filter(|node| {
+            operation_nodes.contains(node.as_str()) || matches!(graph.kind(node).as_str(),
+                "DeclRefExpr" | "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr" |
+                "BinaryOperator" | "CompoundAssignOperator" | "UnaryOperator" |
+                "ConditionalOperator" | "MemberExpr" | "ArraySubscriptExpr" |
+                "IntegerLiteral" | "FloatingLiteral" | "StringLiteral" |
+                "CharacterLiteral" | "CXXBoolLiteralExpr" | "ImplicitValueInitExpr" |
+                "GNUNullExpr" | "CXXNullPtrLiteralExpr" | "VarDecl" | "ParmVarDecl")
+        }).cloned().collect::<Vec<_>>();
         values.sort();
+        values.sort_by_key(|node| graph.offset(node));
         values.dedup();
         values
     } else {
@@ -373,6 +594,89 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     };
     let prepared_set = prepared_nodes.iter().cloned().collect::<HashSet<_>>();
     operations.retain(|item| prepared_set.contains(&item.node));
+
+    // A few frontend snapshots contain only AST/CFG marker nodes and no
+    // CFG_NEXT edges. In that case chain the compact operation anchors, not
+    // every raw graph record; this keeps the fallback bounded and preserves
+    // source order until structured AST CFG synthesis handles branches.
+    if successor_map.is_empty() {
+        for pair in prepared_nodes.windows(2) {
+            successor_map.entry(pair[0].clone()).or_default().push(pair[1].clone());
+        }
+        // Recover the common if/else shape from AST role edges. This keeps
+        // path correlation for the native solver even when the persisted graph
+        // has statement CFG markers but no CFG_NEXT relation.
+            let mut if_nodes = graph.nodes.keys().filter(|node| graph.kind(node) == "IfStmt").cloned().collect::<Vec<_>>();
+        if_nodes.sort_by_key(|node| graph.offset(node));
+        for if_node in if_nodes {
+            let true_roots = graph.roles.get(&(if_node.clone(), "TRUE_BRANCH".to_owned())).cloned().unwrap_or_default();
+            let false_roots = graph.roles.get(&(if_node.clone(), "FALSE_BRANCH".to_owned())).cloned().unwrap_or_default();
+            if true_roots.is_empty() { continue; }
+            let branch_nodes = |roots: &[String]| prepared_nodes.iter().filter(|node| {
+                roots.iter().any(|root| graph.is_descendant(node, root))
+            }).cloned().collect::<Vec<_>>();
+            let true_nodes = branch_nodes(&true_roots);
+            let false_nodes = branch_nodes(&false_roots);
+            if true_nodes.is_empty() { continue; }
+            let first_branch_offset = true_nodes.iter().chain(false_nodes.iter()).map(|node| graph.offset(node)).min().unwrap_or(i64::MAX);
+            let last_branch_offset = true_nodes.iter().chain(false_nodes.iter()).map(|node| graph.offset(node)).max().unwrap_or(i64::MIN);
+            let before = prepared_nodes.iter().filter(|node| graph.offset(node) < first_branch_offset).cloned().collect::<Vec<_>>();
+            let after = prepared_nodes.iter().filter(|node| graph.offset(node) > last_branch_offset).cloned().collect::<Vec<_>>();
+            let continuation = after.first().cloned();
+            let entry = before.last().cloned().or_else(|| prepared_nodes.first().cloned());
+            if let Some(entry) = entry {
+                successor_map.remove(&entry);
+                let mut targets = vec![true_nodes[0].clone()];
+                if let Some(false_entry) = false_nodes.first() {
+                    targets.push(false_entry.clone());
+                } else if let Some(next) = continuation.clone() {
+                    targets.push(next);
+                }
+                targets.sort();
+                targets.dedup();
+                successor_map.insert(entry, targets);
+            }
+            for branch in [&true_nodes, &false_nodes] {
+                if let Some(last) = branch.last() {
+                    successor_map.remove(last);
+                    if let Some(next) = continuation.clone() {
+                        successor_map.insert(last.clone(), vec![next]);
+                    }
+                }
+            }
+        }
+        // Malformed or macro-expanded ASTs can make a role-derived branch
+        // boundary point back into an earlier source interval. Never hand a
+        // cyclic approximation to the native worklist: use a conservative
+        // source-order chain until structured CFG synthesis can resolve it.
+        let mut color: HashMap<String, u8> = HashMap::new();
+        fn visit(node: &str, successors: &HashMap<String, Vec<String>>, color: &mut HashMap<String, u8>) -> bool {
+            match color.get(node).copied().unwrap_or(0) {
+                1 => return true,
+                2 => return false,
+                _ => {}
+            }
+            color.insert(node.to_owned(), 1);
+            for successor in successors.get(node).into_iter().flatten() {
+                if visit(successor, successors, color) { return true; }
+            }
+            color.insert(node.to_owned(), 2);
+            false
+        }
+        let cyclic = prepared_nodes.iter().any(|node| visit(node, &successor_map, &mut color));
+        if cyclic {
+            successor_map.clear();
+            for pair in prepared_nodes.windows(2) {
+                successor_map.entry(pair[0].clone()).or_default().push(pair[1].clone());
+            }
+        }
+    }
+    let mut successors = successor_map.into_iter().map(|(node, mut targets)| {
+        targets.sort();
+        targets.dedup();
+        lifetime_proto::Successors { node, targets }
+    }).collect::<Vec<_>>();
+    successors.sort_by(|left, right| left.node.cmp(&right.node));
     operations.sort_by_key(|item| (item.line.unwrap_or(i64::MAX), item.node.clone(), item.kind as u8));
 
     lifetime_proto::PreparedFunction {
@@ -401,6 +705,7 @@ pub(crate) fn prepare_and_solve(input: &[u8]) -> Result<Vec<u8>, String> {
     let prepared = request.functions.into_iter().map(prepare_function).collect::<Vec<_>>();
     let mut results = Vec::with_capacity(prepared.len());
     for function in prepared {
+        let prepared_for_output = function.clone();
         let operations = function.operations.into_iter().map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
         let successors = function.successors.into_iter().map(|entry| (entry.node, entry.targets)).collect::<HashMap<_, _>>();
         let mut initial = crate::State::default();
@@ -411,6 +716,7 @@ pub(crate) fn prepare_and_solve(input: &[u8]) -> Result<Vec<u8>, String> {
         results.push(lifetime_proto::PreparedFunctionResult {
             id: function.id,
             result: Some(crate::proto_result(solved)),
+            prepared: Some(prepared_for_output),
         });
     }
     let result = lifetime_proto::PrepareSolveResult { functions: results };

@@ -177,5 +177,9 @@ message PreparedFunction {
   repeated string parameters = 5;
 }
 message PrepareResult { repeated PreparedFunction functions = 1; }
-message PreparedFunctionResult { string id = 1; Result result = 2; }
+message PreparedFunctionResult {
+  string id = 1;
+  Result result = 2;
+  PreparedFunction prepared = 3;
+}
 message PrepareSolveResult { repeated PreparedFunctionResult functions = 1; }

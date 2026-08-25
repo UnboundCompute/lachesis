@@ -771,7 +771,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         queue.push_back(first.clone());
         queued.insert(first.clone());
     }
-    let mut findings = Findings::default();
+    let findings = Findings::default();
     let mut transfers = 0u64;
     let mut widenings = 0u64;
     let cap = max_disjuncts.max(1);

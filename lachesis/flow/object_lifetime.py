@@ -355,6 +355,102 @@ def _op(kind, node, *, target=None, source=None, line=None, ordinal=0,
                      access=access)
 
 
+def _native_function_item(sub, norm, function_id, function_ir, summaries, records=None):
+    """Marshal one raw function graph into the native preparation ABI.
+
+    This is intentionally a record marshaler, not a second lifetime implementation:
+    Rust receives the AST/CFG/reference facts and performs CFG placement, access-path
+    extraction, call effects, and solving. Keeping this seam small makes it possible
+    to compare the native result with the existing Python implementation function by
+    function before changing the production scheduler.
+    """
+    if records is None:
+        records = [sub.node(node) for node in sub._owned(function_id)]
+    node_ids = {record.get("id") for record in records if record.get("id") is not None}
+    edges = []
+    for source in node_ids:
+        for target in sub.ast_children.get(source, ()):
+            if target not in node_ids:
+                continue
+            role = ""
+            position = None
+            for candidate_role, children in sub.ast_by_role.get(source, {}).items():
+                if target not in children:
+                    continue
+                role = candidate_role
+                position = next((index for index, value in
+                                 sub.ast_by_position.get(source, {}).get(candidate_role, {}).items()
+                                 if value == target), None)
+                break
+            edge = {"kind": "AST_CHILD", "source": source, "target": target,
+                    "role": role}
+            if position is not None:
+                edge["position"] = position
+            edges.append(edge)
+        referent = sub.refers.get(source)
+        if referent in node_ids:
+            edges.append({"kind": "REFERS_TO", "source": source, "target": referent})
+        initializer = sub.initializer_source.get(source)
+        if initializer in node_ids:
+            edges.append({"kind": "VALUE_FLOWS_TO", "source": initializer, "target": source})
+        for target in sub.cfg_next.get(source, ()):
+            if target in node_ids:
+                edges.append({"kind": "CFG_NEXT", "source": source, "target": target})
+
+    source_nodes = {item.get("node") for item in function_ir.get("source_calls", ())}
+    calls = []
+    for call in function_ir.get("calls", ()):
+        call_node = call.get("node")
+        if call_node not in node_ids:
+            continue
+        callee = call.get("callee")
+        args = []
+        for argument in call.get("args", ()):
+            position = argument.get("pos")
+            if not isinstance(position, int):
+                continue
+            argument_node = sub.role_child_at(call_node, "ARGUMENT", position)
+            args.append({"pos": position, "node": argument_node or argument.get("root") or ""})
+        calls.append({
+            "node": call_node, "callee": callee, "line": call.get("line"),
+            "assigned": call.get("assigned"), "receiver": call.get("receiver"),
+            "is_alloc": bool(norm.is_acquire(callee)),
+            "is_release": bool(norm.is_release(callee)),
+            "is_realloc": bool(norm.is_realloc(callee)),
+            "is_source": call_node in source_nodes,
+            "is_aggregate_copy": bool(norm.is_aggregate_copy(callee, sub.label(call_node) or "")),
+            "args": args,
+        })
+
+    params = [record["id"] for record in records
+              if (sub.kind(record.get("id")) == "ParmVarDecl"
+                  and sub.label(record.get("id")) in set(function_ir.get("params", ())))]
+    encoded_summaries = []
+    for callee, alternatives in summaries.items():
+        encoded_alternatives = []
+        for alternative in alternatives:
+            effects = []
+            for effect in alternative:
+                if isinstance(effect, ReturnEffect):
+                    effects.append({"is_return": True, "position": effect.position,
+                                    "selectors": effect.selectors, "kind": "copy"})
+                else:
+                    effects.append({"is_return": False, "position": effect.position,
+                                    "selectors": effect.selectors, "kind": effect.kind.value})
+            encoded_alternatives.append(effects)
+        encoded_summaries.append({"callee": callee, "alternatives": encoded_alternatives})
+
+    item = {"id": function_id, "nodes": records, "edges": edges, "parameters": params,
+            "calls": calls, "summaries": encoded_summaries}
+    return item
+
+
+def _native_function_input(sub, norm, function_id, function_ir, summaries, records=None):
+    from .native_lifetime import prepare_and_solve_pb
+    item = _native_function_item(sub, norm, function_id, function_ir, summaries, records)
+    return prepare_and_solve_pb([item])[function_id]
+
+
 @dataclass(frozen=True)
 class _DeferredSummaryCall:
     """Graph-independent call facts used to compose a callee summary later."""
