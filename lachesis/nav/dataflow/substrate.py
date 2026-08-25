@@ -37,7 +37,7 @@ _LITERALS = {"IntegerLiteral", "FloatingLiteral", "StringLiteral", "CharacterLit
 _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOperator",
             "UnaryOperator", "CompoundAssignOperator", "ConditionalOperator"}
 
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 _CACHE_SUFFIX = ".pass3.substrate.pb"
 _SUBSTRATE_NODE_KINDS = frozenset({
     "ArraySubscriptExpr", "BinaryOperator", "BreakStmt", "CallExpr", "CaseStmt",
@@ -48,6 +48,12 @@ _SUBSTRATE_NODE_KINDS = frozenset({
     "MemberExpr", "ParenExpr", "ParmVarDecl", "ReturnStmt", "StringLiteral", "SwitchStmt",
     "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
     "cfg-exit", "cfg-merge", "cfg-condition",
+})
+_SUBSTRATE_PROPERTY_KEYS = frozenset({
+    "absolute_file", "end_line", "end_offset", "file", "function_id",
+    "operator", "owner_function_id", "receiver", "receiver_id",
+    "receiver_symbol_id", "receiver_value", "receiver_value_id",
+    "start_line", "start_offset", "syntax_kind", "type",
 })
 
 
@@ -75,9 +81,14 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
         props = node.get("properties") or {}
         syntax_kind = props.get("syntax_kind") or node.get("kind")
         if syntax_kind in _SUBSTRATE_NODE_KINDS:
+            cached_properties = {
+                key: value for key, value in props.items()
+                if key in _SUBSTRATE_PROPERTY_KEYS
+                and isinstance(value, (str, int, float, bool, type(None)))
+            }
             cached = {
                 "id": node.get("id"), "kind": node.get("kind"),
-                "label": node.get("label"), "properties": props,
+                "label": node.get("label"), "properties": cached_properties,
             }
             cached_nodes.append(cached)
             if syntax_kind == "MemberExpr":
