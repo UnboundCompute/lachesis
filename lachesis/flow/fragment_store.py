@@ -116,22 +116,21 @@ class FragmentStore:
     def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
                   summaries: Any, reach_summaries: Any,
                   state_artifacts: Any = None) -> tuple[Any, ...]:
-        graph_key = (FragmentStore._fingerprint(graph)
-                     if isinstance(graph, (dict, list, tuple)) else id(graph))
-        # State artifacts contain every abstract snapshot at every CFG point. Their
-        # stable JSON fingerprint can be larger than the semantic graph itself and is
-        # unnecessary for the default in-process cache: a new artifact object must
-        # conservatively miss, while the same object is exactly the one used by this
-        # build. Snapshot mode opts back into content identity across processes.
         snapshot_enabled = os.environ.get("LACHESIS_PASS3_SNAPSHOT", "").lower() in {
             "1", "true", "yes", "on"
         }
-        state_key = (FragmentStore._fingerprint(state_artifacts)
-                     if snapshot_enabled else id(state_artifacts))
+        if not snapshot_enabled:
+            # The default cache lives only for this in-process GraphStore session.
+            # Identity is both sufficient and conservative: rebuilt inputs miss,
+            # while the exact objects passed to get() are the ones passed to put().
+            return (lang, id(graph), id(functions), id(summaries),
+                    id(reach_summaries), id(state_artifacts))
+        graph_key = (FragmentStore._fingerprint(graph)
+                     if isinstance(graph, (dict, list, tuple)) else id(graph))
         return (lang, graph_key, FragmentStore._fingerprint(functions),
                 FragmentStore._fingerprint(summaries),
                 FragmentStore._fingerprint(reach_summaries),
-                state_key)
+                FragmentStore._fingerprint(state_artifacts))
 
     def get(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None,
