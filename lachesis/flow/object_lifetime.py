@@ -13,7 +13,9 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import os
+import pickle
 import sys
+import tempfile
 from time import perf_counter
 from typing import Iterable
 
@@ -819,6 +821,31 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         for group in schedule
         for name in group["members"]
     }
+    # A disk-backed index used to be queried once per dependency wave.  libxml2 has
+    # 36 waves, so the same owner scan was paid repeatedly even though each owner's
+    # graph records are consumed exactly once.  Spool each owner as compact binary
+    # Python records during one Kùzu scan, evict it immediately, then replay only the
+    # current wave.  The spool is temporary and never becomes a user-facing cache.
+    owner_spool = None
+    owner_offsets = {}
+    if stream is not None:
+        owner_spool = tempfile.TemporaryFile(prefix="lachesis-lifetime-")
+        owner_ids = tuple(by_name.values())
+        owner_set = set(owner_ids)
+        query_started = perf_counter()
+
+        def spool_owner(owner_id, records):
+            if owner_id in owner_set:
+                offset = owner_spool.tell()
+                pickle.dump(records, owner_spool, protocol=pickle.HIGHEST_PROTOCOL)
+                owner_offsets[owner_id] = offset
+            for node in records:
+                node_id = node["id"]
+                getattr(sub.idx, "_node_cache", {}).pop(node_id, None)
+                sub._node.pop(node_id, None)
+
+        stream(owner_ids, spool_owner)
+        streamed_query_seconds = perf_counter() - query_started
     with pool_context as executor:
         for wave in _schedule_levels(schedule, call_successors):
             # A wave boundary is the natural preemption point: the previous wave's futures
@@ -879,9 +906,22 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                     else:
                         evict(records)
 
-                query_started = perf_counter()
-                stream(owner_ids, consume)
-                streamed_query_seconds += perf_counter() - query_started
+                if owner_spool is not None:
+                    for owner_id in owner_ids:
+                        offset = owner_offsets.get(owner_id)
+                        if offset is None:
+                            continue
+                        owner_spool.seek(offset)
+                        records = pickle.load(owner_spool)
+                        for node in records:
+                            node_id = node["id"]
+                            getattr(sub.idx, "_node_cache", {})[node_id] = node
+                            sub._node[node_id] = node
+                        consume(owner_id, records)
+                else:
+                    query_started = perf_counter()
+                    stream(owner_ids, consume)
+                    streamed_query_seconds += perf_counter() - query_started
                 if progress and streamed_owners and streamed_owners % progress_interval == 0:
                     print(
                         "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs "
@@ -965,6 +1005,9 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 for records in retained_cyclic.values():
                     for _name, owner_records in records:
                         evict(owner_records)
+
+    if owner_spool is not None:
+        owner_spool.close()
 
     if progress and stream is not None:
         print(
