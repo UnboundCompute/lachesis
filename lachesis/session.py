@@ -382,7 +382,11 @@ class Analysis:
         from lachesis import bind_cache
         from lachesis.nav.graph_store import dataflow_overlay_path
 
-        self.store.ensure_dataflow_tier(retain_materialized=True)
+        # Do not retain the whole enriched Python graph for the catalog bind.  The retained
+        # path requires sorting roughly two million edge dictionaries before binding, which
+        # can dominate Pass 2 and keep the graph-sized object peak alive.  The indexed
+        # materializer below is bounded and was already the measured ~46s path on libxml2.
+        self.store.ensure_dataflow_tier()
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
                                    deadline=self._resolve_deadline(hard_stop, deadline),
