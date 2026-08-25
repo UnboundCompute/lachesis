@@ -131,6 +131,7 @@ def _select_lifetime_leads(legacy, object_identity, mode, covered_entries=None,
     return leads, differential
 
 
+@timeit(name="pipeline._match_object_mode_legacy")
 def _match_object_mode_legacy(skels, cfg, fallback_entries):
     """Retain reach + leak globally and legacy lifetime only for coverage fallbacks."""
     fallback_entries = set(fallback_entries)
