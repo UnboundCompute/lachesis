@@ -214,9 +214,17 @@ class Analysis:
         """The catalog bind alone: fast, and forces no dataflow tier. This is the fast path's
         whole cost, and the base the temporal merge builds on."""
         from lachesis.integrations.atropos.enrich import atropos_enrich
-        from lachesis.nav.kuzu_index import materialize_graph
+        from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
-        graph = materialize_graph(self.store.index)
+        graph = self.store.take_retained_enriched_graph()
+        if graph is None:
+            graph = materialize_graph(self.store.index)
+        else:
+            # enrich_graph sorts by the public three-field edge key.  The Kùzu
+            # materializer also orders equal triples by properties, which is
+            # observable to downstream bind/flow iteration.  Match that canonical
+            # order on the one-shot retained view before handing it to the binder.
+            _sort_materialized_edges(graph["edges"])
         return atropos_enrich(graph, complete_dataflow=False)
 
     def _enrich_and_merge(self, *, deadline: Deadline | None = None) -> tuple[dict, dict, bool]:
@@ -336,7 +344,7 @@ class Analysis:
         from lachesis import bind_cache
         from lachesis.nav.graph_store import dataflow_overlay_path
 
-        self.store.ensure_dataflow_tier()
+        self.store.ensure_dataflow_tier(retain_materialized=True)
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
                                    deadline=self._resolve_deadline(hard_stop, deadline))

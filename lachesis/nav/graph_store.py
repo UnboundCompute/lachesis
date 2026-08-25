@@ -308,6 +308,7 @@ class GraphStore:
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
+        self._retained_enriched_graph = None
 
     @classmethod
     def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None,
@@ -327,6 +328,7 @@ class GraphStore:
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
+        self._retained_enriched_graph = None
         return self
 
     @classmethod
@@ -419,7 +421,7 @@ class GraphStore:
         cache ``store.index`` can watch this to tell when they have gone stale."""
         return bool(getattr(self, "_enriched", True))
 
-    def ensure_dataflow_tier(self) -> "GraphStore":
+    def ensure_dataflow_tier(self, *, retain_materialized: bool = False) -> "GraphStore":
         """Guarantee the overlay dataflow tier is present, building it if needed.
 
         Idempotent, and a no-op for a store that was built with ``--enrich`` or for an
@@ -474,7 +476,14 @@ class GraphStore:
         # of dictionaries/lists that are discarded as soon as the derived sidecar is
         # written.
         core = materialize_graph(
-            self.index, restore_defaults=False, sort_output=False,
+            self.index,
+            # The retained graph is consumed by the structural catalog binder,
+            # whose public input is the canonical materialized representation.
+            # Keep the low-allocation lazy form for the ordinary sidecar-only path,
+            # but restore constants when this one-shot view will replace the second
+            # materialization that the binder would otherwise perform.
+            restore_defaults=retain_materialized,
+            sort_output=False,
         )
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
@@ -505,6 +514,14 @@ class GraphStore:
             # The sidecar path is additive by construction: GraphAccumulator rejects
             # conflicting replacements of an existing canonical node. Release both
             # graph-sized views before the stream is finalized/replaced.
+            if retain_materialized:
+                # The CLI bind immediately needs a canonical graph view. Keeping this
+                # result avoids a second full Kùzu materialization after the dataflow
+                # sidecar is written; ordinary callers leave it false to minimize
+                # retained memory.
+                retained = enriched
+            else:
+                retained = None
             del core, enriched
             stream.close()
             os.replace(temporary, cache)
@@ -522,9 +539,16 @@ class GraphStore:
         self.graph = fresh.graph
         self.gl = fresh.gl
         self.index = fresh.index
+        self._retained_enriched_graph = retained
         self._entries = None
         self._enriched = True
         return self
+
+    def take_retained_enriched_graph(self):
+        """Return the one-shot graph retained for the immediately following bind."""
+        graph = getattr(self, "_retained_enriched_graph", None)
+        self._retained_enriched_graph = None
+        return graph
 
     def ensure_dataflow_cone(self, seed_id: str, budget: int = None) -> dict:
         """Fold the overlay dataflow tier over the neighbourhood of ``seed_id`` only.
