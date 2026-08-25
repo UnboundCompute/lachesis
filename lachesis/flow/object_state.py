@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Hashable, Iterable, Mapping, Sequence
 
+from lachesis.timeit import timeit
+
 
 class ObjectFact(str, Enum):
     ALLOCATED = "ALLOCATED"
@@ -141,6 +143,7 @@ class AbstractState:
         return AbstractState(self.env, self.facts, self.slots, self.trace,
                              self.freed_paths)
 
+    @timeit(name="object_state.AbstractState.key")
     def key(self) -> tuple:
         # These mappings are mathematical sets for state-equivalence purposes.
         # Sorting them used ``repr(object_id)`` because recursively constructed phi
@@ -461,6 +464,7 @@ class ObjectStateAnalyzer:
         self.collect_findings = collect_findings
 
     @staticmethod
+    @timeit(name="object_state.ObjectStateAnalyzer._transfer")
     def _transfer(
         states: Iterable[AbstractState],
         operations: Sequence[Operation],
