@@ -13,6 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import os
+import sys
 from time import perf_counter
 from typing import Iterable
 
@@ -759,18 +760,48 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         # graph cannot become a second whole-graph Python object graph.
     stream = getattr(getattr(sub, "idx", None), "stream_nodes_by_owner", None)
     if stream is not None:
+        progress = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
+        streamed_owners = 0
+        streamed_nodes = 0
+        streamed_cfg_seconds = 0.0
+        slowest_cfgs = []
+
         def consume(owner_id, records):
+            nonlocal streamed_owners, streamed_nodes, streamed_cfg_seconds
             stream_ids = {node["id"] for node in records}
             stream_idx = sub.idx
             for node in records:
                 stream_idx._node_cache[node["id"]] = node
             name = by_name.get(owner_id)
             if name is not None:
+                cfg_started = perf_counter()
                 prepare_cfg(name, owner_id)
+                cfg_elapsed = perf_counter() - cfg_started
+                streamed_cfg_seconds += cfg_elapsed
+                if progress:
+                    slowest_cfgs.append((cfg_elapsed, name, len(records)))
+                    slowest_cfgs.sort(reverse=True)
+                    del slowest_cfgs[10:]
             for node_id in stream_ids:
                 stream_idx._node_cache.pop(node_id, None)
                 sub._node.pop(node_id, None)
+            streamed_owners += 1
+            streamed_nodes += len(records)
+            if progress and streamed_owners % 500 == 0:
+                print(
+                    "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs cfg=%.1fs"
+                    % (streamed_owners, len(by_name), streamed_nodes,
+                       perf_counter() - started, streamed_cfg_seconds),
+                    file=sys.stderr, flush=True)
         stream(by_name.values(), consume)
+        if progress:
+            print(
+                "pass2 object-cfg: complete owners=%d nodes=%d elapsed=%.1fs cfg=%.1fs slowest=%s"
+                % (streamed_owners, streamed_nodes, perf_counter() - started,
+                   streamed_cfg_seconds,
+                   [(name, round(seconds, 3), count)
+                    for seconds, name, count in slowest_cfgs]),
+                file=sys.stderr, flush=True)
     else:
         sub.warm_owned(by_name.values())
         for name, function_id in by_name.items():
