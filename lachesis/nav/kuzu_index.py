@@ -497,6 +497,7 @@ class KuzuGraphIndex:
         self._overlay = None
         self._derived_out: dict = {}
         self._derived_in: dict = {}
+        self._overlay_argument_edges: dict = {}
         self._ids = []
         self._kind_by_id = {}
         self._label_by_id = {}
@@ -604,9 +605,13 @@ class KuzuGraphIndex:
         self._kind_ids.clear()
         self._derived_out = defaultdict(list)
         self._derived_in = defaultdict(list)
+        overlay_argument_edges = defaultdict(list)
         for edge in overlay.derived_edges:
             self._derived_out[edge["source"]].append(edge)
             self._derived_in[edge["target"]].append(edge)
+            if edge.get("kind") == "HAS_ARGUMENT":
+                overlay_argument_edges[edge["source"]].append(edge)
+        self._overlay_argument_edges = overlay_argument_edges
         for node in overlay.derived_nodes:
             nid = node["id"]
             if nid in self._node_cache:
@@ -1178,10 +1183,8 @@ class KuzuGraphIndex:
                 "kind": semantic_kind or kind or "HAS_ARGUMENT",
                 "properties": _restore(props, self._props_dict),
             })
-        if self._overlay is not None:
-            for edge in self._overlay.derived_edges:
-                if edge.get("kind") == "HAS_ARGUMENT":
-                    indexed[edge["source"]].append(dict(edge))
+        for source, edges in self._overlay_argument_edges.items():
+            indexed[source].extend(dict(edge) for edge in edges)
         for edges in indexed.values():
             _sort_materialized_edges(edges)
         self._argument_edges_cache = {
