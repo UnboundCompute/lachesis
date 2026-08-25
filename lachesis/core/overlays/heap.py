@@ -162,7 +162,7 @@ class HeapIdentity:
         for source, target in identity_edges:
             identity_targets[source].append(target)
 
-        def propagate_identity(seeds=None) -> bool:
+        def propagate_identity(seeds=None) -> set[str]:
             """Push newly discovered points through identity edges once.
 
             The old fixed-point loop rescanned every identity edge once per
@@ -178,7 +178,7 @@ class HeapIdentity:
             else:
                 queue = deque(value_id for value_id in seeds if points.get(value_id))
             queued = set(queue)
-            changed = False
+            changed_values: set[str] = set()
             while queue:
                 source = queue.popleft()
                 queued.discard(source)
@@ -189,11 +189,11 @@ class HeapIdentity:
                     target_objects.update(source_objects)
                     if len(target_objects) == before:
                         continue
-                    changed = True
+                    changed_values.add(target)
                     if target not in queued:
                         queued.add(target)
                         queue.append(target)
-            return changed
+            return changed_values
 
         propagate_identity()
 
@@ -267,6 +267,20 @@ class HeapIdentity:
         location_values: dict[str, set[str]] = defaultdict(set)
         effects: set[str] = set()
 
+        # A property path only needs to be revisited when one of its base/value
+        # points-to sets grows. Index those dependencies once so the fixed point
+        # below schedules affected paths instead of rescanning every property path
+        # on every round.
+        paths_by_dependency: dict[str, list[dict]] = defaultdict(list)
+        for path in property_paths:
+            base_id = path.get("properties", {}).get("base_value_id")
+            if base_id:
+                paths_by_dependency[base_id].append(path)
+            for write in writes_by_target.get(path["id"], ()):
+                value_id = write.get("properties", {}).get("value_id")
+                if value_id:
+                    paths_by_dependency[value_id].append(path)
+
         def normalized_segments(path: dict) -> tuple[str, ...]:
             structured = path.get("properties", {}).get("path_segments") or []
             if structured:
@@ -337,6 +351,92 @@ class HeapIdentity:
                 for current_object in current_objects
             }
 
+        def propagate_worklist() -> bool:
+            """Reach the property/points-to fixed point without global rescans."""
+            pending = deque(property_paths)
+            queued = {path["id"] for path in property_paths}
+            readers: dict[str, dict[str, dict]] = defaultdict(dict)
+            changed_any = False
+
+            def enqueue(value_ids) -> None:
+                for value_id in value_ids:
+                    for path in paths_by_dependency.get(value_id, ()):
+                        if path["id"] not in queued:
+                            queued.add(path["id"])
+                            pending.append(path)
+
+            def register_reader(location_id: str, read: dict) -> set[str]:
+                readers[location_id][read["id"]] = read
+                value_ids = location_values.get(location_id, ())
+                before = len(points[read["id"]])
+                points[read["id"]].update(value_ids)
+                return {read["id"]} if len(points[read["id"]]) != before else set()
+
+            def update_location(location_id: str, value_ids) -> set[str]:
+                values = location_values[location_id]
+                before = len(values)
+                values.update(value_ids)
+                changed = set()
+                if len(values) == before:
+                    return changed
+                for read in readers.get(location_id, {}).values():
+                    read_before = len(points[read["id"]])
+                    points[read["id"]].update(values)
+                    if len(points[read["id"]]) != read_before:
+                        changed.add(read["id"])
+                return changed
+
+            while pending:
+                path = pending.popleft()
+                queued.discard(path["id"])
+                properties = path.get("properties", {})
+                base_id = properties.get("base_value_id")
+                segments = normalized_segments(path)
+                if not base_id or not segments:
+                    continue
+                changed_points: set[str] = set()
+                for object_id in list(points.get(base_id, ())):
+                    target_ids = target_locations(
+                        object_id, segments, [path["id"], base_id, object_id],
+                    )
+                    reads = reads_by_target.get(path["id"], ())
+                    for location_id in target_ids:
+                        for read in reads:
+                            changed_points.update(register_reader(location_id, read))
+                        for write in writes_by_target.get(path["id"], ()):
+                            value_id = write.get("properties", {}).get("value_id")
+                            changed_points.update(update_location(
+                                location_id, points.get(value_id, ()),
+                            ))
+                            abstract_object = parameter_objects.get(base_id)
+                            function_id = write.get("properties", {}).get(
+                                "owner_function_id")
+                            if not abstract_object or not function_id:
+                                continue
+                            for context_id, substitutions in context_parameter_objects.items():
+                                caller_objects = substitutions.get(abstract_object)
+                                if not caller_objects:
+                                    continue
+                                contextual_values: set[str] = set()
+                                for value_object in points.get(value_id, ()):
+                                    contextual_values.update(
+                                        substitutions.get(value_object, {value_object})
+                                    )
+                                for caller_object in caller_objects:
+                                    caller_locations = target_locations(
+                                        caller_object, segments,
+                                        [path["id"], context_id, caller_object],
+                                    )
+                                    for caller_location in caller_locations:
+                                        changed_points.update(update_location(
+                                            caller_location, contextual_values,
+                                        ))
+                identity_changed = propagate_identity(changed_points)
+                if changed_points or identity_changed:
+                    changed_any = True
+                    enqueue((*changed_points, *identity_changed))
+            return changed_any
+
         # Property reads and writes can reveal new aliases. Iterate location
         # contents and identity propagation to a fixed point, then emit once over
         # the converged state. Every edge below is a function of that state and of
@@ -346,6 +446,8 @@ class HeapIdentity:
         # so are the nodes and POINTS_TO edges that target_locations creates as a
         # side effect of walking a prefix, which have to keep pace with the rounds.
         def propagate(emit: bool) -> bool:
+            if not emit:
+                return propagate_worklist()
             changed = False
             changed_points: set[str] = set()
             for path in property_paths:
@@ -439,7 +541,7 @@ class HeapIdentity:
                                     [read["id"], path["id"], location_id],
                                     property_path_id=path["id"],
                                 )
-            changed |= propagate_identity(changed_points)
+            changed |= bool(propagate_identity(changed_points))
             return changed
 
         while propagate(emit=False):
