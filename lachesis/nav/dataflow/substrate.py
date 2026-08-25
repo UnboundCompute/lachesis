@@ -53,7 +53,13 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     Kuzu remains the fallback for anything outside this contract.
     """
     nodes = graph.get("nodes", ())
-    node_ids = {node.get("id") for node in nodes}
+    # A disk-backed graph can publish this sidecar without materializing its full
+    # node table: callers may provide just the required structural edges and the
+    # MemberExpr rows.  ``None`` means endpoint validation is intentionally deferred
+    # to the graph store's own referential integrity, while an explicit node list
+    # retains the stronger validation used by the normal Pass-1 writer.
+    node_ids = ({node.get("id") for node in nodes}
+                if "nodes" in graph else None)
     records, member_nodes = [], []
     for node in nodes:
         props = node.get("properties") or {}
@@ -64,7 +70,7 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
             })
     for edge in graph.get("edges", ()):
         source, target = edge.get("source"), edge.get("target")
-        if source not in node_ids or target not in node_ids:
+        if node_ids is not None and (source not in node_ids or target not in node_ids):
             continue
         props = edge.get("properties") or {}
         kind = (props.get("semantic_kind") or edge.get("semantic_kind")
@@ -83,7 +89,7 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     header = {
         "format": "lachesis-pass3-substrate",
         "version": _CACHE_VERSION,
-        "node_count": len(node_ids),
+        "node_count": graph.get("node_count", len(node_ids) if node_ids is not None else 0),
         "edge_count": len(records),
         "member_count": len(member_nodes),
         "store_version": manifest.get("version"),
