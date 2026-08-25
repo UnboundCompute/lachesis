@@ -477,12 +477,12 @@ class GraphStore:
         # written.
         core = materialize_graph(
             self.index,
-            # The retained graph is consumed by the structural catalog binder,
-            # whose public input is the canonical materialized representation.
-            # Keep the low-allocation lazy form for the ordinary sidecar-only path,
-            # but restore constants when this one-shot view will replace the second
-            # materialization that the binder would otherwise perform.
-            restore_defaults=retain_materialized,
+            # The retained graph is consumed by the binder and candidate registry,
+            # both of which use property lookup (`get`/`[]`) and therefore work with
+            # lazy compiler constants.  Do not expand three constant properties onto
+            # every node merely because this view is retained for the bind; the new
+            # Kùzu symbol projection no longer requires canonical dict equality here.
+            restore_defaults=False,
             sort_output=False,
         )
         core_hash = (manifest.get("core_content_hash")
