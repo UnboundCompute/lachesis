@@ -894,7 +894,8 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     if let Some(first) = nodes.first() {
         incoming.insert(first.clone(), vec![initial]);
     }
-    let mut post: HashMap<String, Vec<State>> = HashMap::new();
+    let mut point_snapshots: HashMap<String, Vec<Snapshot>> = HashMap::new();
+    let mut post_snapshots: HashMap<String, Vec<Snapshot>> = HashMap::new();
     let mut queue = VecDeque::new();
     let mut queued = HashSet::new();
     let mut widened = HashSet::new();
@@ -911,9 +912,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         queued.remove(&node);
         let mut current = incoming.get_mut(&node).map(std::mem::take).unwrap_or_default();
         if tracked_nodes.contains(&node) {
-            // Keep the point state available for the semantic emitter, while
-            // allowing unobserved CFG nodes to transfer ownership directly.
-            incoming.insert(node.clone(), current.clone());
+            // Snapshot the point state once this worklist version is selected,
+            // then release the full mutable state after propagation.  Keeping
+            // full State clones in `incoming` for every operation node causes
+            // branch-heavy functions to retain thousands of historical heaps.
+            point_snapshots.insert(node.clone(), current.iter().map(State::snapshot).collect());
         }
         for operation in at.get(&node).into_iter().flatten() {
             let mut next = Vec::with_capacity(current.len());
@@ -924,7 +927,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         }
         transfers += current.len() as u64;
         if tracked_nodes.contains(&node) {
-            post.insert(node.clone(), current.clone());
+            post_snapshots.insert(node.clone(), current.iter().map(State::snapshot).collect());
         }
         let outgoing = successors.get(&node).map(Vec::as_slice).unwrap_or(&[]);
         if outgoing.len() == 1 {
@@ -996,19 +999,15 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         }
     }
 
-    let point_states = nodes.iter().filter(|node| tracked_nodes.contains(*node)).filter_map(|node| {
-        incoming.get(node).map(|states| (
-            node.clone(), states.iter().map(State::snapshot).collect(),
-        ))
+    let point_states = nodes.iter().filter_map(|node| {
+        point_snapshots.get(node).map(|states| (node.clone(), states.clone()))
     }).collect();
-    let post_states = nodes.iter().filter(|node| tracked_nodes.contains(*node)).filter_map(|node| {
-        post.get(node).map(|states| (
-            node.clone(), states.iter().map(State::snapshot).collect(),
-        ))
+    let post_states = nodes.iter().filter_map(|node| {
+        post_snapshots.get(node).map(|states| (node.clone(), states.clone()))
     }).collect();
     let exit_states: Vec<_> = nodes.iter()
         .filter(|node| successors.get(*node).is_none_or(Vec::is_empty))
-        .flat_map(|node| post.get(node).into_iter().flatten().map(State::snapshot))
+        .flat_map(|node| post_snapshots.get(node).into_iter().flatten().cloned())
         .collect();
     let exit_state = exit_states.first().cloned()
         .unwrap_or_else(|| State::default().snapshot());
