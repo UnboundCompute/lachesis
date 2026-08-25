@@ -94,7 +94,8 @@ def build_native_F(store, lang="c", *, return_graph=False):
             record = {
                 "callee": callee, "line": call.line if call.has_line else None,
                 "args": args, "guards": [], "guard_status": "not-computed",
-                "guard_predicates": (), "is_sink": catalog is not None,
+                "guard_predicates": (),
+                "is_sink": catalog is not None,
                 "sink_name": callee if catalog is not None else None,
                 "sink_family": catalog.get("family") if catalog else None,
                 "assigned": assigned, "receiver": call.receiver or None,
@@ -115,7 +116,15 @@ def build_native_F(store, lang="c", *, return_graph=False):
         events = []
         for operation in item.operations:
             kind = lifetime_pb2.Operation.Kind.Name(operation.kind)
-            if kind not in {"ALLOC", "FREE", "USE"} or operation.target is None:
+            # Native preparation also records assignment-side writes as USE
+            # operations. They are state transitions, not dereference events in
+            # the F projection; exposing them here creates spurious UAF leads.
+            if (kind not in {"ALLOC", "FREE", "USE"} or
+                    operation.target is None or
+                    (kind == "USE" and operation.access == "write")):
+                continue
+            target_root = operation.target.root.removeprefix("decl:")
+            if sub.kind(target_root) not in {"VarDecl", "ParmVarDecl", "parameter", "variable"}:
                 continue
             event_kind = {"ALLOC": "alloc", "FREE": "free", "USE": "use"}[kind]
             events.append({"kind": event_kind,
