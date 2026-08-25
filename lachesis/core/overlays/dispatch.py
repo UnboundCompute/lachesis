@@ -1,7 +1,7 @@
 """Candidate expansion for canonical callable and type relationships."""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from ...indices import last_name as _last_name
 from ..composition import GraphDelta
@@ -38,6 +38,7 @@ class DynamicDispatch:
         implementations: dict[str, set[str]] = defaultdict(set)
         callable_targets: dict[str, set[str]] = defaultdict(set)
         identity_edges: list[tuple[str, str]] = []
+        identity_out: dict[str, list[str]] = defaultdict(list)
         ast_children: dict[str, list[tuple[str, dict]]] = defaultdict(list)
         references: dict[str, set[str]] = defaultdict(set)
         read_by_evidence: dict[str, list[str]] = defaultdict(list)
@@ -86,13 +87,26 @@ class DynamicDispatch:
             elif kind == "READ_EVIDENCED_BY":
                 read_by_evidence[edge["target"]].append(edge["source"])
 
-        changed = True
-        while changed:
-            changed = False
-            for source, target in identity_edges:
+        # Propagate callable targets through the identity graph with a worklist.
+        # The previous fixed-point loop rescanned every identity edge once per
+        # graph-wide convergence round; a node is requeued only when its target
+        # set actually grows.
+        for source, target in identity_edges:
+            identity_out[source].append(target)
+        pending = deque(callable_targets)
+        queued = set(callable_targets)
+        while pending:
+            source = pending.popleft()
+            queued.discard(source)
+            targets = callable_targets.get(source)
+            if not targets:
+                continue
+            for target in identity_out.get(source, ()):
                 before = len(callable_targets[target])
-                callable_targets[target].update(callable_targets.get(source, set()))
-                changed |= len(callable_targets[target]) != before
+                callable_targets[target].update(targets)
+                if len(callable_targets[target]) != before and target not in queued:
+                    pending.append(target)
+                    queued.add(target)
 
         # Override and implementation relationships are transitively closed so
         # a call resolved to an interface/base declaration keeps every concrete
@@ -108,7 +122,12 @@ class DynamicDispatch:
                 implementations[base].update(expanded)
                 changed |= len(implementations[base]) != before
 
+        descendant_cache: dict[str, set[str]] = {}
+
         def descendant_references(root_id: str) -> set[str]:
+            cached = descendant_cache.get(root_id)
+            if cached is not None:
+                return cached
             result: set[str] = set()
             queue = [root_id]
             seen = set(queue)
@@ -121,6 +140,7 @@ class DynamicDispatch:
                     if child not in seen:
                         seen.add(child)
                         queue.append(child)
+            descendant_cache[root_id] = result
             return result
 
         bindings_by_parameter: dict[str, list[str]] = defaultdict(list)
