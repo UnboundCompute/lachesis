@@ -90,6 +90,13 @@ message Snapshot {
   repeated Object objects = 6;
 }
 message StateAt { string node = 1; repeated Snapshot states = 2; }
+message Finding {
+  string pattern = 1;
+  Path path = 2;
+  sint64 line = 3;
+  bool has_line = 4;
+  string node = 5;
+}
 message Result {
   repeated StateAt point_states = 1;
   repeated StateAt post_states = 2;
@@ -98,6 +105,7 @@ message Result {
   uint64 transfers = 5;
   uint64 widenings = 6;
   bool capped = 7;
+  repeated Finding findings = 8;
 }
 
 // Raw, function-scoped graph input for the native preparation path. Python only

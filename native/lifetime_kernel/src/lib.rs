@@ -550,6 +550,20 @@ pub(crate) fn proto_result(result: LinearResult) -> lifetime_proto::Result {
     let states = |items: Vec<(String, Vec<Snapshot>)>| items.into_iter().map(|(node, snapshots)| {
         lifetime_proto::StateAt { node, states: snapshots.into_iter().map(proto_snapshot).collect() }
     }).collect();
+    let mut findings = result.findings.double_free.into_iter().map(|(line, path, node)| {
+        lifetime_proto::Finding {
+            pattern: "double-free".into(),
+            path: Some(lifetime_proto::Path { root: path.root, selectors: path.selectors }),
+            line: line.unwrap_or_default(), has_line: line.is_some(), node,
+        }
+    }).collect::<Vec<_>>();
+    findings.extend(result.findings.use_after_free.into_iter().map(|(line, path, node)| {
+        lifetime_proto::Finding {
+            pattern: "use-after-free".into(),
+            path: Some(lifetime_proto::Path { root: path.root, selectors: path.selectors }),
+            line: line.unwrap_or_default(), has_line: line.is_some(), node,
+        }
+    }));
     lifetime_proto::Result {
         point_states: states(result.point_states),
         post_states: states(result.post_states),
@@ -558,6 +572,7 @@ pub(crate) fn proto_result(result: LinearResult) -> lifetime_proto::Result {
         transfers: result.transfers,
         widenings: result.widenings,
         capped: result.capped,
+        findings,
     }
 }
 

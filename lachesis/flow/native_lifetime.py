@@ -195,6 +195,62 @@ def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
     return {function.id: function for function in result.functions}
 
 
+def prepare_graph_solve_details_pb(sidecar_path: str | os.PathLike[str]):
+    """Return native prepared CFGs and results without rebuilding them in Python."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    solve = library.lachesis_lifetime_prepare_graph_solve_pb
+    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    solve.restype = ctypes.c_void_p
+    payload = Path(sidecar_path).read_bytes()
+    output_length = ctypes.c_size_t()
+    request_buffer = ctypes.create_string_buffer(payload)
+    pointer = solve(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
+                    ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native whole-graph preparation/solve returned no result")
+    try:
+        result = lifetime_pb2.PrepareSolveResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return {function.id: function for function in result.functions}
+
+
+def _path_message(message):
+    if not message or not message.root:
+        return None
+    return AccessPath(message.root, tuple(message.selectors))
+
+
+def _operation_message(message, ordinal=0):
+    kind = OpKind(lifetime_pb2.Operation.Kind.Name(message.kind).lower())
+    alternatives = tuple(
+        tuple(_operation_message(effect, index) for index, effect in enumerate(alternative.effects))
+        for alternative in message.alternatives
+    )
+    return Operation(
+        kind, message.node, target=_path_message(message.target),
+        source=_path_message(message.source), site=message.site or message.node,
+        line=message.line if message.has_line else None, is_null=message.is_null,
+        ordinal=ordinal, alternatives=alternatives, access=message.access or "deref",
+    )
+
+
+def prepared_operations(prepared: lifetime_pb2.PreparedFunction) -> tuple[Operation, ...]:
+    """Decode only the native operation stream for semantic adapters."""
+    return tuple(_operation_message(operation, index)
+                 for index, operation in enumerate(prepared.operations))
+
+
+def decode_prepared_result(item: lifetime_pb2.PreparedFunctionResult):
+    """Convert one native whole-graph result to the existing solver adapter shape."""
+    prepared = item.prepared
+    operations = prepared_operations(prepared)
+    return _decode_result(item.result, prepared.nodes, operations)
+
+
 def prepare_and_solve_pb(functions) -> dict[str, lifetime_pb2.Result]:
     """Run native preparation and lifetime solving in one binary call."""
     request = lifetime_pb2.PrepareRequest()
@@ -420,7 +476,10 @@ def _decode_result(result, nodes, operations):
     placed = {operation for operation in operations if operation.node in set(nodes)}
     unplaced = tuple(operation for operation in operations if operation not in placed)
     analysis = AnalysisResult(
-        findings=set(),
+        findings={Finding(
+            item.pattern, item.line if item.has_line else None,
+            AccessPath(item.path.root, tuple(item.path.selectors)), item.node,
+        ) for item in result.findings if item.path is not None},
         exit_states=exit_states or (exit_state,),
         unplaced=unplaced,
         transfers=int(result.transfers),
