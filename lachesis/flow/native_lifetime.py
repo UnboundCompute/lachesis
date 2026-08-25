@@ -7,6 +7,7 @@ same prepared batch as ``ObjectStateAnalyzer`` and reconstructs the existing Pyt
 from __future__ import annotations
 
 import ctypes
+import mmap
 import os
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,46 @@ def _load():
 
 def available() -> bool:
     return _load() is not None
+
+
+def _call_sidecar(symbol: str, sidecar_path: str | os.PathLike[str], response_type,
+                  operation: str):
+    """Call a native sidecar ABI without materializing a second Python bytes copy.
+
+    ``ACCESS_COPY`` gives ctypes a writable buffer view while keeping the pages backed by
+    the immutable sidecar file (writes are never performed).  The mapping remains alive for
+    the duration of the synchronous native call, so Rust can consume the framed protobuf
+    directly and Python does not retain both ``read_bytes()`` and ``create_string_buffer``.
+    """
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = getattr(library, symbol)
+    function.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                         ctypes.POINTER(ctypes.c_size_t)]
+    function.restype = ctypes.c_void_p
+    path = os.fspath(sidecar_path)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        length = os.fstat(descriptor).st_size
+        if length <= 0:
+            raise RuntimeError(f"{operation} received an empty sidecar")
+        with mmap.mmap(descriptor, length, access=mmap.ACCESS_COPY) as mapped:
+            view = ctypes.c_char.from_buffer(mapped)
+            output_length = ctypes.c_size_t()
+            pointer = function(ctypes.c_void_p(ctypes.addressof(view)), length,
+                               ctypes.byref(output_length))
+            del view
+            if not pointer or not output_length.value:
+                raise RuntimeError(f"{operation} returned no result")
+            try:
+                result = response_type()
+                result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+            finally:
+                library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+            return result
+    finally:
+        os.close(descriptor)
 
 
 def prepare_pb_request(functions, request=None) -> bytes:
@@ -151,70 +192,25 @@ def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime
     the immutable sidecar bytes and passes them through the ABI; it does not
     materialize nodes, edges, calls, or per-function records.
     """
-    library = _load()
-    if library is None:
-        raise RuntimeError("native lifetime library is unavailable")
-    prepare = library.lachesis_lifetime_prepare_graph_pb
-    prepare.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-    prepare.restype = ctypes.c_void_p
-    payload = Path(sidecar_path).read_bytes()
-    output_length = ctypes.c_size_t()
-    request_buffer = ctypes.create_string_buffer(payload)
-    pointer = prepare(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
-                      ctypes.byref(output_length))
-    if not pointer or not output_length.value:
-        raise RuntimeError("native whole-graph preparation returned no result")
-    try:
-        result = lifetime_pb2.PrepareResult()
-        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
-    finally:
-        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    result = _call_sidecar("lachesis_lifetime_prepare_graph_pb", sidecar_path,
+                           lifetime_pb2.PrepareResult,
+                           "native whole-graph preparation")
     return {function.id: function for function in result.functions}
 
 
 def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
     """Run the complete binary-substrate preparation/solve path in Rust."""
-    library = _load()
-    if library is None:
-        raise RuntimeError("native lifetime library is unavailable")
-    solve = library.lachesis_lifetime_prepare_graph_solve_pb
-    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-    solve.restype = ctypes.c_void_p
-    payload = Path(sidecar_path).read_bytes()
-    output_length = ctypes.c_size_t()
-    request_buffer = ctypes.create_string_buffer(payload)
-    pointer = solve(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
-                    ctypes.byref(output_length))
-    if not pointer or not output_length.value:
-        raise RuntimeError("native whole-graph preparation/solve returned no result")
-    try:
-        result = lifetime_pb2.PrepareSolveResult()
-        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
-    finally:
-        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    result = _call_sidecar("lachesis_lifetime_prepare_graph_solve_pb", sidecar_path,
+                           lifetime_pb2.PrepareSolveResult,
+                           "native whole-graph preparation/solve")
     return {function.id: function for function in result.functions}
 
 
 def prepare_graph_solve_details_pb(sidecar_path: str | os.PathLike[str]):
     """Return native prepared CFGs and results without rebuilding them in Python."""
-    library = _load()
-    if library is None:
-        raise RuntimeError("native lifetime library is unavailable")
-    solve = library.lachesis_lifetime_prepare_graph_solve_pb
-    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-    solve.restype = ctypes.c_void_p
-    payload = Path(sidecar_path).read_bytes()
-    output_length = ctypes.c_size_t()
-    request_buffer = ctypes.create_string_buffer(payload)
-    pointer = solve(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
-                    ctypes.byref(output_length))
-    if not pointer or not output_length.value:
-        raise RuntimeError("native whole-graph preparation/solve returned no result")
-    try:
-        result = lifetime_pb2.PrepareSolveResult()
-        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
-    finally:
-        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    result = _call_sidecar("lachesis_lifetime_prepare_graph_solve_pb", sidecar_path,
+                           lifetime_pb2.PrepareSolveResult,
+                           "native whole-graph preparation/solve")
     return {function.id: function for function in result.functions}
 
 
