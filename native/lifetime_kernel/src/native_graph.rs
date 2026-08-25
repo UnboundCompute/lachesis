@@ -82,6 +82,12 @@ fn scalar_edge_value(field: &graph_proto::Field) -> Option<String> {
     })
 }
 
+fn edge_scalar(edge: &graph_proto::EdgeRecord, key: &str) -> Option<String> {
+    edge.properties.iter().find_map(|field| {
+        if field.key == key { scalar_edge_value(field) } else { None }
+    })
+}
+
 fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     if input.len().saturating_sub(*offset) < FRAME_HEADER {
         return Err("truncated graph sidecar frame header".to_owned());
@@ -126,6 +132,14 @@ pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
     let owners: HashMap<String, String> = nodes.iter().filter_map(|item| {
         owner(item).map(|function| (item.id.clone(), function))
     }).collect();
+    let node_by_id: HashMap<String, &graph_proto::NodeRecord> = nodes.iter()
+        .map(|item| (item.id.clone(), item)).collect();
+    let mut parents = HashMap::new();
+    for item in &edges {
+        if item.kind == "AST_CHILD" {
+            parents.entry(item.target.clone()).or_insert_with(|| item.source.clone());
+        }
+    }
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     for item in &nodes {
         let Some(function) = owner(item) else { continue };
@@ -141,6 +155,62 @@ pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
         let Some(function) = source_owner.or(target_owner) else { continue };
         let Some(entry) = functions.get_mut(function) else { continue };
         entry.edges.push(edge(item));
+    }
+    // Calls are part of the graph contract, not a Python-side projection.  The
+    // frontend has already persisted the canonical lifecycle classification;
+    // Rust only links arguments and assignment destinations using AST edges.
+    for item in &nodes {
+        let syntax = scalar(item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+        if syntax != "CallExpr" && syntax != "CXXMemberCallExpr" && syntax != "CXXOperatorCallExpr" {
+            continue;
+        }
+        let Some(function) = owner(item) else { continue };
+        let Some(entry) = functions.get_mut(&function) else { continue };
+        let mut call = lifetime_proto::FunctionCall {
+            node: item.id.clone(),
+            callee: scalar(item, "callee").unwrap_or_else(|| item.label.clone()),
+            assigned: String::new(),
+            receiver: scalar(item, "receiver").unwrap_or_default(),
+            line: scalar(item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
+            has_line: scalar(item, "start_line").is_some(),
+            is_alloc: scalar(item, "is_alloc").as_deref() == Some("true"),
+            is_release: scalar(item, "is_release").as_deref() == Some("true"),
+            is_realloc: scalar(item, "is_realloc").as_deref() == Some("true"),
+            is_source: false,
+            is_aggregate_copy: scalar(item, "is_aggregate_copy").as_deref() == Some("true"),
+            arguments: Vec::new(),
+        };
+        let parent = parents.get(&item.id).and_then(|id| node_by_id.get(id));
+        if let Some(parent) = parent {
+            let parent_kind = scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
+            if parent_kind == "BinaryOperator" && scalar(parent, "operator").as_deref() == Some("=") {
+                if let Some(left) = edges.iter().find(|edge| {
+                    edge.source == parent.id && edge.kind == "AST_CHILD"
+                        && edge_scalar(edge, "role").as_deref() == Some("LEFT_OPERAND")
+                }) {
+                    call.assigned = left.target.clone();
+                }
+            }
+        }
+        if call.assigned.is_empty() {
+            if let Some(initializer) = edges.iter().find(|edge| {
+                edge.kind == "VALUE_FLOWS_TO" && edge.source == item.id
+                    && edge_scalar(edge, "reason").as_deref() == Some("initializer")
+            }) {
+                call.assigned = initializer.target.clone();
+            }
+        }
+        let mut arguments = edges.iter().filter_map(|edge| {
+            if edge.kind != "AST_CHILD" || edge.source != item.id
+                || edge_scalar(edge, "role").as_deref() != Some("ARGUMENT") { return None; }
+            Some(lifetime_proto::FunctionArgument {
+                position: edge_scalar(edge, "position").and_then(|value| value.parse().ok()).unwrap_or_default(),
+                node: edge.target.clone(),
+            })
+        }).collect::<Vec<_>>();
+        arguments.sort_by_key(|argument| argument.position);
+        call.arguments = arguments;
+        entry.calls.push(call);
     }
     for entry in functions.values_mut() {
         entry.parameters.sort();

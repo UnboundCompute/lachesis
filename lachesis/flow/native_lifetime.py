@@ -172,6 +172,29 @@ def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime
     return {function.id: function for function in result.functions}
 
 
+def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
+    """Run the complete binary-substrate preparation/solve path in Rust."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    solve = library.lachesis_lifetime_prepare_graph_solve_pb
+    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    solve.restype = ctypes.c_void_p
+    payload = Path(sidecar_path).read_bytes()
+    output_length = ctypes.c_size_t()
+    request_buffer = ctypes.create_string_buffer(payload)
+    pointer = solve(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
+                    ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native whole-graph preparation/solve returned no result")
+    try:
+        result = lifetime_pb2.PrepareSolveResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return {function.id: function for function in result.functions}
+
+
 def prepare_and_solve_pb(functions) -> dict[str, lifetime_pb2.Result]:
     """Run native preparation and lifetime solving in one binary call."""
     request = lifetime_pb2.PrepareRequest()

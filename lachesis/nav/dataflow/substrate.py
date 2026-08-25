@@ -59,7 +59,7 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
     # the graph without asking Python to rebuild per-function call records.
     "callee", "form", "method_name", "primary_target_id",
     "receiver_member_id", "resolution", "allocation_kind", "allocated_type",
-    "control_kind",
+    "control_kind", "is_alloc", "is_release", "is_realloc", "is_aggregate_copy",
 })
 
 

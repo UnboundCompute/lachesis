@@ -657,6 +657,27 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_pb(
     pointer
 }
 
+/// Read the complete framed substrate and run native preparation plus solving
+/// without returning through Python between the two phases.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_solve_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        let request = native_graph::sidecar_to_request(bytes)?;
+        prepare::prepare_and_solve(&request)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native whole-graph prepare/solve error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
 impl Operation {
     fn access_is_return(&self) -> bool { self.access == "return" }
 }

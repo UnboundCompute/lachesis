@@ -66,6 +66,11 @@ ALLOCATOR_NAMES = frozenset(
      if entry.get("family") in _ALLOC_KINDS}
     | set((_LIFECYCLE_ROLES.get("alloc") or {}).get("c") or ())
 )
+_REALLOCATOR_NAMES = frozenset((_LIFECYCLE_ROLES.get("realloc") or {}).get("c") or ())
+_DEALLOCATOR_NAMES = frozenset((_LIFECYCLE_ROLES.get("dealloc") or {}).get("c") or ())
+_AGGREGATE_COPY_NAMES = frozenset(
+    ((_LIFECYCLE_ROLES.get("aggregate_copy") or {}).get("c") or {}).keys()
+)
 CONTENT_HASHES: Dict[Path, str] = {}
 
 # Memoize the (resolved path, content hash) of each distinct ``absolute_file``
@@ -1524,6 +1529,17 @@ def main() -> int:
                         and declarations_by_raw_id.get(reference.get("id", ""))
                     ), None)
                 callee_name = properties.get("callee")
+                # Persist lifecycle classification beside the call while Pass 1
+                # already has the canonical catalog in memory.  The native
+                # Pass-2 reader consumes these scalar facts directly from the
+                # binary substrate; it must not rebuild Python call records.
+                properties.update({
+                    "is_alloc": callee_name in ALLOCATOR_NAMES and
+                                callee_name not in _REALLOCATOR_NAMES,
+                    "is_release": callee_name in _DEALLOCATOR_NAMES,
+                    "is_realloc": callee_name in _REALLOCATOR_NAMES,
+                    "is_aggregate_copy": callee_name in _AGGREGATE_COPY_NAMES,
+                })
                 if callee_name in ALLOCATOR_NAMES:
                     # An allocation site creates an object; without this node the
                     # heap-identity overlay stays dormant on C and points_to /
