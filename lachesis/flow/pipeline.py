@@ -194,6 +194,7 @@ def run_pass(store, lang="c", lifetime_engine=None):
 
     lifetime = {"requested": requested, "active": "legacy", "available": False}
     legacy_leads = None
+    legacy_fallback_skeletons = []
     leads = []
     if object_requested:
         object_functions = _lifetime_slice(F, succ, lang=lang)
@@ -305,8 +306,9 @@ def run_pass(store, lang="c", lifetime_engine=None):
             legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
             legacy_summaries = {name: summaries.get(name, ())
                                 for name in legacy_functions}
-            skeletons = build_skeletons(legacy_functions, legacy_summaries,
-                                        lang=lang, include_typestate=True)
+            skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
+            legacy_fallback_skeletons = build_skeletons(
+                legacy_functions, legacy_summaries, lang=lang, include_typestate=True)
         object_flow = diagnostics.get("unsafe_object_flow", {})
         covered = set(F) - seed_unsafe
         if requested == "shadow":
@@ -316,13 +318,14 @@ def run_pass(store, lang="c", lifetime_engine=None):
                 object_flow=object_flow)
         else:
             fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
-            if seed_unsafe and not skeletons:
+            if seed_unsafe and not legacy_fallback_skeletons:
                 legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
                 legacy_summaries = {name: summaries.get(name, ())
                                     for name in legacy_functions}
-                skeletons = build_skeletons(legacy_functions, legacy_summaries,
-                                            lang=lang, include_typestate=True)
-            legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
+                legacy_fallback_skeletons = build_skeletons(
+                    legacy_functions, legacy_summaries, lang=lang, include_typestate=True)
+            legacy_leads = _match_object_mode_legacy(
+                legacy_fallback_skeletons, fallback_cfg, seed_unsafe)
             # The frozen graph/matcher is now the production lifetime path.  Keep the old
             # matcher only for non-lifetime reach leads and as a diagnostic fallback for
             # functions whose object projection could not be emitted.
