@@ -858,6 +858,16 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         // the native API is called directly.
         placed.sort_by_key(|operation| operation.line.unwrap_or(0));
     }
+    // State transfer still walks every CFG node, but only operation points,
+    // the entry, and exits are observed by the semantic emitter.  Avoid
+    // cloning/snapshotting large abstract states at every no-op CFG node.
+    let mut tracked_nodes: HashSet<String> = at.keys().cloned().collect();
+    if let Some(first) = nodes.first() {
+        tracked_nodes.insert(first.clone());
+    }
+    tracked_nodes.extend(nodes.iter().filter(|node| {
+        successors.get(*node).is_some_and(Vec::is_empty)
+    }).cloned());
     let mut incoming: HashMap<String, Vec<State>> = nodes.iter()
         .map(|node| (node.clone(), Vec::new()))
         .collect();
@@ -888,7 +898,9 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             current = deduplicate(next);
         }
         transfers += current.len() as u64;
-        post.insert(node.clone(), current.clone());
+        if tracked_nodes.contains(&node) {
+            post.insert(node.clone(), current.clone());
+        }
         for successor in successors.get(&node).into_iter().flatten() {
             if !incoming.contains_key(successor) {
                 continue;
@@ -923,12 +935,12 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         }
     }
 
-    let point_states = nodes.iter().filter_map(|node| {
+    let point_states = nodes.iter().filter(|node| tracked_nodes.contains(*node)).filter_map(|node| {
         incoming.get(node).map(|states| (
             node.clone(), states.iter().map(State::snapshot).collect(),
         ))
     }).collect();
-    let post_states = nodes.iter().filter_map(|node| {
+    let post_states = nodes.iter().filter(|node| tracked_nodes.contains(*node)).filter_map(|node| {
         post.get(node).map(|states| (
             node.clone(), states.iter().map(State::snapshot).collect(),
         ))
