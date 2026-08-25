@@ -776,6 +776,18 @@ pub(crate) fn prepare_and_solve_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<Vec<u8>, String> {
     let prepared = request.functions.into_iter().map(prepare_function).collect::<Vec<_>>();
+    solve_prepared_functions(prepared)
+}
+
+pub(crate) fn solve_prepared(input: &[u8]) -> Result<Vec<u8>, String> {
+    let prepared = lifetime_proto::PrepareResult::decode(input)
+        .map_err(|error| format!("invalid prepared lifetime protobuf: {error}"))?;
+    solve_prepared_functions(prepared.functions)
+}
+
+fn solve_prepared_functions(
+    prepared: Vec<lifetime_proto::PreparedFunction>,
+) -> Result<Vec<u8>, String> {
     let mut results = Vec::with_capacity(prepared.len());
     for function in prepared {
         let prepared_for_output = function.clone();

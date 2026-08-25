@@ -185,6 +185,31 @@ def prepare_pb(functions) -> dict[str, lifetime_pb2.PreparedFunction]:
     return {function.id: function for function in result.functions}
 
 
+def solve_prepared_pb(prepared) -> dict[str, lifetime_pb2.PreparedFunctionResult]:
+    """Solve a native ``PrepareResult`` without repeating graph preparation."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    solve = library.lachesis_lifetime_solve_prepared_pb
+    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                      ctypes.POINTER(ctypes.c_size_t)]
+    solve.restype = ctypes.c_void_p
+    payload = (prepared.SerializeToString()
+               if hasattr(prepared, "SerializeToString") else bytes(prepared))
+    output_length = ctypes.c_size_t()
+    request_buffer = ctypes.create_string_buffer(payload)
+    pointer = solve(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
+                    ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native prepared lifetime solve returned no result")
+    try:
+        result = lifetime_pb2.PrepareSolveResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return {function.id: function for function in result.functions}
+
+
 def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime_pb2.PreparedFunction]:
     """Prepare the complete Pass-1 binary substrate inside Rust.
 

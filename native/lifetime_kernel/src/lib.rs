@@ -650,6 +650,26 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_solve_pb(
     pointer
 }
 
+/// Solve an already prepared binary batch. This lets one native graph preparation
+/// feed both translation consumers and lifetime solving without rebuilding CFGs.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_solve_prepared_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        prepare::solve_prepared(bytes)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native prepared lifetime solve error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
 /// Read the complete framed Pass-1 substrate directly in Rust, then prepare
 /// all function inputs without Python-side graph reconstruction.
 #[no_mangle]
