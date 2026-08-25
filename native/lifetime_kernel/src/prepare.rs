@@ -873,7 +873,7 @@ fn solve_prepared_functions(
     prepared: Vec<lifetime_proto::PreparedFunction>,
 ) -> Result<Vec<u8>, String> {
     let mut results = prepared.into_par_iter().map(|function| -> Result<lifetime_proto::PreparedFunctionResult, String> {
-        let prepared_for_output = function.clone();
+        let id = function.id.clone();
         // A CFG with no lifetime operations cannot produce a finding or a
         // state transition.  Avoid allocating its node/state worklists; keep
         // the prepared CFG in the result so callers retain complete metadata.
@@ -884,25 +884,25 @@ fn solve_prepared_functions(
         });
         if !has_lifetime_transition {
             return Ok(lifetime_proto::PreparedFunctionResult {
-                id: function.id,
+                id,
                 result: Some(lifetime_proto::Result {
                     exit_state: Some(lifetime_proto::Snapshot::default()),
                     ..Default::default()
                 }),
-                prepared: Some(prepared_for_output),
+                prepared: Some(function),
             });
         }
-        let operations = function.operations.into_iter().map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
-        let successors = function.successors.into_iter().map(|entry| (entry.node, entry.targets)).collect::<HashMap<_, _>>();
+        let operations = function.operations.iter().cloned().map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
+        let successors = function.successors.iter().map(|entry| (entry.node.clone(), entry.targets.clone())).collect::<HashMap<_, _>>();
         let mut initial = crate::State::default();
         for (position, root) in function.parameters.iter().enumerate() {
             initial.seed_parameter(Path::root(format!("decl:{root}")), position as u32);
         }
         let solved = crate::solve_graph(&function.nodes, &successors, &operations, initial, 32);
         Ok(lifetime_proto::PreparedFunctionResult {
-            id: function.id,
+            id,
             result: Some(crate::proto_result(solved)),
-            prepared: Some(prepared_for_output),
+            prepared: Some(function),
         })
     }).collect::<Result<Vec<_>, _>>()?;
     results.sort_by(|left, right| left.id.cmp(&right.id));

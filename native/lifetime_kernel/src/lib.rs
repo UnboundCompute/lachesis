@@ -348,14 +348,14 @@ impl State {
         }
     }
 
-    fn apply_variants(&self, op: &Operation, findings: &mut Findings) -> Vec<State> {
+    fn apply_variants(self, op: &Operation, findings: &mut Findings) -> Vec<State> {
         if op.kind != Kind::Summary {
-            let mut state = self.clone();
+            let mut state = self;
             state.apply(op, findings);
             return vec![state];
         }
         if op.alternatives.is_empty() {
-            return vec![self.clone()];
+            return vec![self];
         }
         op.alternatives.iter().map(|effects| {
             let mut state = self.clone();
