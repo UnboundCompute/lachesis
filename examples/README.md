@@ -11,6 +11,23 @@ answer: two sibling functions reach the same database call, one checks
 authorization first and the other does not, and Lachesis tells them apart by
 following the data, not by matching a name.
 
+## Runnable scripts
+
+The narrative below is the security-path story; the `.py` scripts beside this file
+are the library surface, one per operation, each a few `lachesis.Analysis` calls
+you can read and re-run (they double as CI smoke tests):
+
+| script | operation | CLI equivalent |
+| --- | --- | --- |
+| `build_graph.py` | build a graph from source, open it warm | `lachesis build` |
+| `enrich_graph.py` | warm the dataflow + bind sidecars | `lachesis enrich` |
+| `analyze_leads.py` | run the flow pass, filter the held leads | `lachesis analyze` |
+| `find_candidates.py` | enumerate obligations across the whole taxonomy | `lachesis candidates` |
+| `explain_candidate.py` | the whole adjudication chain in one call | `lachesis explain` |
+
+Each takes `--help`. Every operation is available on all three surfaces — the
+library method, the `lachesis` subcommand, and the matching MCP tool.
+
 ## The code under analysis
 
 The fixture lives at `lachesis/frontends/typescript/fixtures/project`. Three of
@@ -89,8 +106,9 @@ instead, which prints `3307 nodes and 6078 edges` and node kinds including `sink
 This moves the cost, it does not remove it: enrichment is a whole-graph in-memory
 operation either way.
 
-The console scripts `lachesis-analyze` and `lachesis-query` are aliases for these
-module invocations once the package is installed. The `python3 -m` form works
+The `lachesis build` and `lachesis query` subcommands are the installed-package
+equivalents of these module invocations (the old `lachesis-analyze` / `lachesis-query`
+scripts still work and print a hint to the new verb). The `python3 -m` form works
 straight from a clone.
 
 ## Step 2: get your bearings

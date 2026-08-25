@@ -248,12 +248,30 @@ class FixtureIntegrationTests(unittest.TestCase):
         self.assertIn(("bind", False), analysis._built)
         self.assertFalse(os.path.isfile(sidecar))
 
+    def test_constructors_lists_the_taxonomy(self):
+        # `constructors` is a @property on the registry, not a method -- regression guard so
+        # Analysis.constructors() never calls the tuple it returns.
+        analysis = Analysis.open(self.GRAPH)
+        families = analysis.constructors()
+        self.assertIsInstance(families, tuple)
+        self.assertTrue(families)
+        self.assertIn("id", families[0])
+
     def _first_candidate(self, analysis):
-        """A real structural candidate row over the fixture (temporal off = fast, no tier)."""
+        """A structural candidate row that carries a source position over the fixture.
+
+        Picks the first candidate whose observations name a file, not merely ``[0]``: a cached
+        temporal bind (any prior test may have written one) legitimately satisfies this
+        ``temporal=False`` query as a superset, and its lifecycle rows can sort first without a
+        file/body -- which explain-by-position needs. Robust to sidecar state, so test order
+        cannot flip which candidate this returns."""
         groups = analysis.candidates(temporal=False, limit=200)["groups"]
-        for group in groups:
-            if group.get("candidates"):
-                return group["candidates"][0]
+        rows = [row for group in groups for row in group.get("candidates", [])]
+        for row in rows:
+            if (row.get("observations") or {}).get("file"):
+                return row
+        if rows:
+            return rows[0]
         self.skipTest("fixture graph carries no candidates")
 
     def test_explain_composes_the_whole_chain(self):

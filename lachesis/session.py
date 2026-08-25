@@ -381,7 +381,7 @@ class Analysis:
         return self._stamp_temporal(bundle["registry"].census(constructor=constructor), bundle)
 
     def constructors(self) -> tuple:
-        return self._registry().constructors()
+        return self._registry().constructors  # a @property on the registry, not a call
 
     def domains(self) -> list:
         return self._registry().domains()
