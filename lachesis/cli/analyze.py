@@ -16,7 +16,6 @@ from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuz
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
-from lachesis.nav.dataflow.substrate import write_substrate_cache
 from lachesis.pipeline import (enrich_project_graph, run_project,
                                run_project_incremental, run_project_parallel,
                                run_project_streaming, run_project_streaming_parallel,
@@ -240,13 +239,6 @@ def _run() -> None:
         source_content_hash=(source_content_hash(args.source_dir)
                              if args.reduced else None),
         build_fingerprint=build_fingerprint,
-    )
-    # The Pass-1 graph is still in memory here. Persist its immutable structural
-    # subset once so Pass 3 can load AST/CFG/reference indexes sequentially instead
-    # of reconstructing them through Kùzu on every request.
-    write_substrate_cache(
-        stored, args.output_path,
-        manifest=read_store_manifest(args.output_path),
     )
     if args.layered_out:
         layered_files = write_layered_graph(build_layered_graph(graph), args.layered_out)
