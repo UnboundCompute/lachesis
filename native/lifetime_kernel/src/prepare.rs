@@ -860,17 +860,17 @@ pub(crate) fn prepare_and_solve_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<Vec<u8>, String> {
     let prepared = request.functions.into_iter().map(prepare_function).collect::<Vec<_>>();
-    solve_prepared_functions(prepared)
+    solve_prepared_functions(prepared, false)
 }
 
 pub(crate) fn solve_prepared(input: &[u8]) -> Result<Vec<u8>, String> {
     let prepared = lifetime_proto::PrepareResult::decode(input)
         .map_err(|error| format!("invalid prepared lifetime protobuf: {error}"))?;
-    solve_prepared_functions(prepared.functions)
+    solve_prepared_functions(prepared.functions, false)
 }
 
 fn solve_prepared_functions(
-    prepared: Vec<lifetime_proto::PreparedFunction>,
+    prepared: Vec<lifetime_proto::PreparedFunction>, include_prepared: bool,
 ) -> Result<Vec<u8>, String> {
     let mut results = prepared.into_par_iter().map(|function| -> Result<lifetime_proto::PreparedFunctionResult, String> {
         let id = function.id.clone();
@@ -889,7 +889,7 @@ fn solve_prepared_functions(
                     exit_state: Some(lifetime_proto::Snapshot::default()),
                     ..Default::default()
                 }),
-                prepared: Some(function),
+                prepared: if include_prepared { Some(function) } else { None },
             });
         }
         let operations = function.operations.iter().cloned().map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
@@ -902,7 +902,7 @@ fn solve_prepared_functions(
         Ok(lifetime_proto::PreparedFunctionResult {
             id,
             result: Some(crate::proto_result(solved)),
-            prepared: Some(function),
+            prepared: if include_prepared { Some(function) } else { None },
         })
     }).collect::<Result<Vec<_>, _>>()?;
     results.sort_by(|left, right| left.id.cmp(&right.id));

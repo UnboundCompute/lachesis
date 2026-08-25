@@ -142,7 +142,27 @@ impl State {
         slots.sort_by(|left, right| left.0.cmp(&right.0));
         let mut freed_paths: Vec<_> = self.freed_paths.iter().map(|(path, oid)| (path.clone(), oid.clone())).collect();
         freed_paths.sort_by(|left, right| path_name(&left.0).cmp(&path_name(&right.0)));
-        let mut objects: Vec<_> = self.objects.iter().map(|(oid, meta)| (oid.clone(), meta.clone())).collect();
+        // Keep only metadata reachable from this snapshot.  Allocation
+        // generations are intentionally retained in `State::objects` for
+        // identity continuity, but serializing every historical generation
+        // into every point/post snapshot needlessly multiplies the result.
+        let mut needed: HashSet<String> = self.env.values().cloned().collect();
+        needed.extend(self.facts.keys().cloned());
+        needed.extend(self.slots.keys().map(|(base, _)| base.clone()));
+        needed.extend(self.slots.values().cloned());
+        needed.extend(self.freed_paths.values().cloned());
+        let mut pending: Vec<String> = needed.iter().cloned().collect();
+        while let Some(oid) = pending.pop() {
+            if let Some(ObjectMeta::UnknownSlot { base, .. }) = self.objects.get(&oid) {
+                if needed.insert(base.clone()) {
+                    pending.push(base.clone());
+                }
+            }
+        }
+        let mut objects: Vec<_> = self.objects.iter()
+            .filter(|(oid, _)| needed.contains(*oid))
+            .map(|(oid, meta)| (oid.clone(), meta.clone()))
+            .collect();
         objects.sort_by(|left, right| left.0.cmp(&right.0));
         Snapshot { env, facts, slots, trace: self.trace.clone(), freed_paths, objects }
     }

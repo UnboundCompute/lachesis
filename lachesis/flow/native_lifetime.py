@@ -186,7 +186,12 @@ def prepare_pb(functions) -> dict[str, lifetime_pb2.PreparedFunction]:
 
 
 def solve_prepared_pb(prepared) -> dict[str, lifetime_pb2.PreparedFunctionResult]:
-    """Solve a native ``PrepareResult`` without repeating graph preparation."""
+    """Solve a native ``PrepareResult`` without repeating graph preparation.
+
+    The native response contains results only.  Prepared CFG metadata is already
+    resident at this adapter boundary, so reattach it here instead of sending a
+    second copy through the Rust response protobuf.
+    """
     library = _load()
     if library is None:
         raise RuntimeError("native lifetime library is unavailable")
@@ -194,10 +199,14 @@ def solve_prepared_pb(prepared) -> dict[str, lifetime_pb2.PreparedFunctionResult
     solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                       ctypes.POINTER(ctypes.c_size_t)]
     solve.restype = ctypes.c_void_p
+    prepared_by_id = None
     if isinstance(prepared, dict):
+        prepared_by_id = prepared
         message = lifetime_pb2.PrepareResult()
         message.functions.extend(prepared.values())
         prepared = message
+    elif hasattr(prepared, "functions"):
+        prepared_by_id = {item.id: item for item in prepared.functions}
     payload = (prepared.SerializeToString()
                if hasattr(prepared, "SerializeToString") else bytes(prepared))
     output_length = ctypes.c_size_t()
@@ -211,6 +220,11 @@ def solve_prepared_pb(prepared) -> dict[str, lifetime_pb2.PreparedFunctionResult
         result.ParseFromString(ctypes.string_at(pointer, output_length.value))
     finally:
         library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    if prepared_by_id is not None:
+        for function in result.functions:
+            original = prepared_by_id.get(function.id)
+            if original is not None:
+                function.prepared.CopyFrom(original)
     return {function.id: function for function in result.functions}
 
 
@@ -245,10 +259,8 @@ def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
 
 def prepare_graph_solve_details_pb(sidecar_path: str | os.PathLike[str]):
     """Return native prepared CFGs and results without rebuilding them in Python."""
-    result = _call_sidecar("lachesis_lifetime_prepare_graph_solve_pb", sidecar_path,
-                           lifetime_pb2.PrepareSolveResult,
-                           "native whole-graph preparation/solve")
-    return {function.id: function for function in result.functions}
+    prepared = prepare_graph_pb(sidecar_path)
+    return solve_prepared_pb(prepared)
 
 
 def _path_message(message):
