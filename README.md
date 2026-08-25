@@ -266,6 +266,37 @@ pass it never asked about. `enrich` is the one-shot "warm it all now" for a batc
 persists the tier and catalog bind as `.dataflow.pb` / `.bind.pb` sidecars so a later,
 fresh process opens warm.
 
+For a large cold graph, enrichment is intentionally a separate, bounded-by-the-caller
+batch step: it materializes the core once, folds the overlays, then writes additive facts
+to `<graph>.dataflow.pb`. The current full-libxml2 reference graph (919,005 nodes / 1,978,145
+core edges) measured about 154s wall for the cold build on the development laptop, with a
+peak near 6.7 GiB RSS. The largest measured stages were core materialization (41s), overlay
+folding (73s), and sidecar/reopen cleanup (about 41s). Pass 2 now skips the redundant full
+core sort before overlay folding and constructs sidecar protobuf records directly; the
+wire format and decoded records remain unchanged. Avoid repeatedly running this cold path
+while profiling because it is memory-intensive and can swap.
+
+Example full cold run against libxml2:
+
+```bash
+SOURCE=/Users/riyandhiman/project/unboundcompute/cve-proof/src/libxml2
+GRAPH=/tmp/libxml2-pass2.kuzu
+lachesis-analyze "$SOURCE" "$GRAPH"
+lachesis enrich "$GRAPH"
+```
+
+To inspect a cold Pass 2 rebuild while retaining the core store, use the repository's
+Python API and force the in-process store to rebuild its dataflow tier:
+
+```bash
+/usr/bin/time -l timeout 300 python3 - <<'PY'
+from lachesis.nav.graph_store import GraphStore
+store = GraphStore._open("/tmp/libxml2-pass2.kuzu")
+store._enriched = False
+store.ensure_dataflow_tier()
+PY
+```
+
 **Pass 3 — `analyze`** runs the flow pass over the enriched graph and produces *leads*:
 safety-obligation sites, scored and matched against bug shapes. It is **bounded** — a
 `hard_stop` budget (default 180s, `--hard-stop 0` to lift it) caps the wall clock and
