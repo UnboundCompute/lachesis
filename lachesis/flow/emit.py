@@ -46,7 +46,7 @@ import re
 from collections import defaultdict
 
 from lachesis.nav.dataflow.reaching_def import ReachingDef
-from lachesis.nav.dataflow.substrate import Substrate
+from lachesis.nav.dataflow.substrate import Substrate, cached_substrate
 
 from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
@@ -56,6 +56,7 @@ from .object_lifetime import (APBuilder, _argument_path, _path,
 from .object_state import AccessPath, OpKind
 from .pipeline import _lifetime_slice
 from .semantic_graph import Event, EventKind, GuardProof, ObjRef, SkeletonGraph
+from lachesis.timeit import timeit
 
 
 # --- OpKind -> universal verb (roles are then looked up in skeleton_ir.VERB_ROLES) ------
@@ -218,7 +219,7 @@ def build_universal_skeletons(store, F, succ, lang="c", graph=None):
         analysis_store = GraphStore(analysis_graph)
     else:
         analysis_store = store
-    sub = Substrate(analysis_store.index).load().load_initializers()
+    sub = cached_substrate(analysis_store.index)
     norm = normalizer(lang)
 
     by_name = {}
@@ -278,34 +279,48 @@ def _operation_generations(sub, operations, cfg=None):
     nodes = tuple((cfg or {}).get("nodes", ()))
     successors = {node: tuple((cfg or {}).get("succ", {}).get(node, ()))
                   for node in nodes}
-    predecessors = defaultdict(set)
+    predecessors = defaultdict(list)
     for source, targets in successors.items():
         for target in targets:
             if target in successors:
-                predecessors[target].add(source)
+                predecessors[target].append(source)
     entry = (cfg or {}).get("entry") or (nodes[0] if nodes else None)
-    dominators = {}
+    # Represent dominator sets as Python integers.  The previous set-of-node-ids
+    # fixed point allocated and intersected large hash tables on every CFG pass;
+    # bitwise meet keeps the same exact relation while making the hot operation
+    # proportional to machine words and avoiding per-iteration object churn.
+    node_index = {node: index for index, node in enumerate(nodes)}
+    dominators = []
     if entry is not None and nodes:
-        all_nodes = set(nodes)
-        dominators = {node: ({node} if node == entry else set(all_nodes))
-                      for node in nodes}
+        all_nodes = (1 << len(nodes)) - 1
+        entry_index = node_index.get(entry)
+        dominators = [((1 << index) if index == entry_index else all_nodes)
+                      for index in range(len(nodes))]
         changed = True
         while changed:
             changed = False
-            for node in nodes:
-                if node == entry:
+            for index, node in enumerate(nodes):
+                if index == entry_index:
                     continue
                 incoming = predecessors.get(node, set())
-                candidate = ({node} | set.intersection(
-                    *(dominators[parent] for parent in incoming))) if incoming else {node}
-                if candidate != dominators[node]:
-                    dominators[node] = candidate
+                if incoming:
+                    meet = all_nodes
+                    for parent in incoming:
+                        meet &= dominators[node_index[parent]]
+                    candidate = meet | (1 << index)
+                else:
+                    candidate = 1 << index
+                if candidate != dominators[index]:
+                    dominators[index] = candidate
                     changed = True
 
     def dominates(left, right):
         if left == right:
             return True
-        return left in dominators.get(right, {right})
+        right_index = node_index.get(right)
+        left_index = node_index.get(left)
+        return (right_index is not None and left_index is not None
+                and bool(dominators[right_index] & (1 << left_index)))
 
     history = defaultdict(list)
     for position, (_original_index, operation) in enumerate(ordered):
@@ -527,13 +542,23 @@ def _native_object_substrate(graph):
     This is a substrate capability check, not a language dispatch.  Frontends without
     these roles still use the frontend-neutral F-IR graph builder below.
     """
-    if not isinstance(graph, dict):
+    if isinstance(graph, dict):
+        syntax = {_props(node).get("syntax_kind")
+                  for node in graph.get("nodes", ())}
+        return "DeclRefExpr" in syntax and "CallExpr" in syntax
+    if not hasattr(graph, "nodes_of_kind"):
         return False
-    syntax = {
-        (_props(node).get("syntax_kind"))
-        for node in graph.get("nodes", ())
-    }
-    return "DeclRefExpr" in syntax and "CallExpr" in syntax
+    found = set()
+    # Probe only a small prefix of expression/call nodes; unlike materializing the
+    # graph, this fetches a bounded number of property blobs and is enough to detect
+    # the declaration-rooted C substrate.
+    for node in graph.nodes_of_kind("call", "expression"):
+        syntax_kind = _props(node).get("syntax_kind")
+        if syntax_kind in {"DeclRefExpr", "CallExpr"}:
+            found.add(syntax_kind)
+            if len(found) == 2:
+                return True
+    return False
 
 
 def _ir_guard_proofs(call):
@@ -1076,9 +1101,10 @@ def _build_ir_semantic_graph(functions, successors, *, lang):
     return result
 
 
+@timeit
 def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None,
                          reach_summaries=None, state_artifacts=None,
-                         work_functions=None):
+                         work_functions=None, cfgs=None):
     """Build the production frozen-v1 graph from the enriched third-pass substrate.
 
     The existing object interpreter supplies identity-bearing operations and a real structured
@@ -1103,21 +1129,37 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         return SkeletonGraph(language=lang)
     analysis_graph = graph if graph is not None else store.graph
     from lachesis.nav.graph_store import GraphStore
-    analysis_store = store if analysis_graph is store.graph else GraphStore(analysis_graph)
+    if hasattr(analysis_graph, "nodes_of_kind"):
+        analysis_index = analysis_graph
+    else:
+        analysis_store = store if analysis_graph is store.graph else GraphStore(analysis_graph)
+        analysis_index = analysis_store.index
     sub_succ = {n: [c for c in succ.get(n, ()) if c in functions] for n in functions}
     obj_summaries = summaries or analyze_object_lifetimes(
         store, functions, sub_succ, lang=lang, graph=graph).summaries
-    sub = Substrate(analysis_store.index).load().load_initializers()
+    sub = cached_substrate(analysis_index)
     norm = normalizer(lang)
     sink_catalog = atropos.sink_catalog(lang)
     by_name = {}
-    for node in analysis_store.index.nodes_of_kind("function", "method", "constructor"):
+    for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
         if _props(node).get("declaration_only"):
             continue
         name = node.get("label")
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
     sub.warm_owned(by_name.values())
+    # Return-origin emission and aggregate-copy fallback lookups need a local
+    # declaration by (owner, label).  Build that index once; querying the complete
+    # variable/parameter relation inside every call site made call-heavy graphs pay
+    # another graph-wide scan during semantic emission.
+    variables_by_owner_label = {}
+    for variable in sub.idx.nodes_of_kind("variable", "parameter"):
+        variable_id = variable.get("id")
+        props = sub.props(variable_id)
+        owner = props.get("owner_function_id") or props.get("function_id")
+        label = sub.label(variable_id)
+        if owner is not None and label is not None:
+            variables_by_owner_label.setdefault((owner, label), variable_id)
 
     result = SkeletonGraph(language=lang)
     pending_calls = []
@@ -1155,13 +1197,18 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         return tuple(sorted(callback_targets.get((caller, callee), ())))
 
     for name, fid in by_name.items():
-        cfg = ReachingDef(sub).analyze(fid, reaching_defs=False)
+        cfg = (cfgs or {}).get(name)
+        if cfg is None:
+            cfg = ReachingDef(sub).analyze(fid, reaching_defs=False)
         if not cfg or cfg.get("bailed"):
             continue
         fragment_cfg[name] = (fid, cfg)
         cfg_nodes = list(cfg.get("nodes", ()))
         if not cfg_nodes:
             continue
+        calls_by_node: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+        for call_index, call in enumerate(functions[name].get("calls", ())):
+            calls_by_node[call.get("node")].append((call_index, call))
         prefix = f"{name}:"
         function_source_reachable = bool(functions[name].get("source_reachable", False))
         source_provenance = functions[name].get("source_provenance", "unknown")
@@ -1194,15 +1241,21 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             sub, operations, cfg)
         loop_nodes = _loop_nodes(cfg)
         artifact = (state_artifacts or {}).get(name)
+        abstract_facts_cache = {}
 
         def abstract_facts(operation, *, post=False):
             """Serialize point-state identities without making them matcher verdicts."""
             if artifact is None:
                 return {}
+            cache_key = (operation, post)
+            cached = abstract_facts_cache.get(cache_key)
+            if cached is not None:
+                return cached
             snapshots = artifact.post_states if post else artifact.point_states
             states = snapshots.get(operation.node, ())
             if not states:
-                return {}
+                abstract_facts_cache[cache_key] = {}
+                return abstract_facts_cache[cache_key]
             facts = {"abstract_state_count": len(states)}
             target_ids = {
                 repr(state.resolve(operation.target, create=False))
@@ -1218,6 +1271,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             source_ids.discard("None")
             if source_ids:
                 facts["abstract_source_ids"] = sorted(source_ids)
+            abstract_facts_cache[cache_key] = facts
             return facts
 
         def annotate(events, operation):
@@ -1393,9 +1447,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             # lifetime facts. They are separate events because a sink does not
             # mutate object state, while its evaluator can consume guards,
             # size expressions, control nesting, and provenance.
-            for call_index, call in enumerate(functions[name].get("calls", ())):
-                if call.get("node") != n:
-                    continue
+            for call_index, call in calls_by_node.get(n, ()):
                 for arg_pos, family in _sink_specs(call, sink_catalog):
                     argument = next((arg for arg in call.get("args", ())
                                      if arg.get("pos") == arg_pos), None)
@@ -1492,18 +1544,15 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
             # proves otherwise. Keep this as an origin fact so the matcher can
             # distinguish an unchecked dereference from a guarded return; the
             # allocator/reallocator branches already emit their own NULL arms.
-            for call_index, call in enumerate(functions[name].get("calls", ())):
-                if call.get("node") != n or not call.get("assigned"):
+            for call_index, call in calls_by_node.get(n, ()):
+                if not call.get("assigned"):
                     continue
                 callee = call.get("callee")
                 if norm.is_alloc(callee) or norm.is_realloc(callee):
                     continue
                 assigned = call.get("assigned")
-                variable = next((candidate for candidate in sub.idx.nodes_of_kind(
-                    "variable", "parameter")
-                    if sub.label(candidate.get("id")) == assigned
-                    and sub.props(candidate.get("id")).get("owner_function_id") == fid), None)
-                if variable is None or "*" not in (sub.props(variable.get("id")).get("type") or ""):
+                variable_id = variables_by_owner_label.get((fid, assigned))
+                if variable_id is None or "*" not in (sub.props(variable_id).get("type") or ""):
                     continue
                 return_id = f"{anchor}:return-origin:{call_index}"
                 result.add_node(
@@ -1589,6 +1638,13 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
 
     # Collect seams only after every fragment has been emitted; otherwise a caller that appears
     # before its callee in graph iteration order would silently lose its return binding.
+    # Index emitted nodes by fragment once.  The old seam loop searched the complete
+    # semantic graph for the callee on every call (and repeated that scan again for
+    # returned aggregate aliases), making a call-heavy graph grow roughly with
+    # ``calls * emitted_nodes`` instead of with its actual seam-local work.
+    nodes_by_fragment = defaultdict(list)
+    for graph_node in result.nodes.values():
+        nodes_by_fragment[graph_node.fragment].append(graph_node)
     for caller, function_ir in functions.items():
         for call in function_ir.get("calls", ()):
             for callee in dispatch_targets(caller, call):
@@ -1621,8 +1677,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                             provenance=_seam_provenance(
                                 sub, call, functions.get(callee, {}).get("params", ()),
                                 (state_artifacts or {}).get(caller), anchor,
-                                [graph_node for graph_node in result.nodes.values()
-                                 if graph_node.fragment == callee],
+                                nodes_by_fragment.get(callee, ()),
                                 caller_function_id=by_name.get(caller),
                                 continuation=continuation))
             result.add_edge(exit_node, f"{caller}:{continuation}")
@@ -1641,9 +1696,7 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     # of guessing from source names. This is language-neutral at
                     # the skeleton boundary: frontends only need to emit the
                     # return event.
-                    for return_node, return_graph_node in result.nodes.items():
-                        if return_graph_node.fragment != callee:
-                            continue
+                    for return_graph_node in nodes_by_fragment.get(callee, ()):
                         event = return_graph_node.event
                         if event is not None and event.kind == EventKind.RETURN_VALUE \
                                 and event.obj is not None:
@@ -1664,18 +1717,17 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                     # object's observable state. Export only relations rooted in
                     # the returned object and rebase them onto the caller's
                     # receiver; unrelated callee locals must not escape.
+                    callee_nodes = nodes_by_fragment.get(callee, ())
                     returned_bases = {
                         graph_node.event.obj.base
-                        for graph_node in result.nodes.values()
-                        if graph_node.fragment == callee
-                        and graph_node.event is not None
+                        for graph_node in callee_nodes
+                        if graph_node.event is not None
                         and graph_node.event.kind == EventKind.RETURN_VALUE
                         and graph_node.event.obj is not None
                     }
-                    for graph_node in result.nodes.values():
+                    for graph_node in callee_nodes:
                         event = graph_node.event
-                        if (graph_node.fragment != callee
-                                or event is None
+                        if (event is None
                                 or event.kind != EventKind.DERIVE
                                 or event.obj is None or event.value is None
                                 or event.obj.base not in returned_bases
