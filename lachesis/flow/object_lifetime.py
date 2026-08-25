@@ -624,7 +624,21 @@ def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summari
 def _analyze_prepared(prepared):
     """Pure, pickleable solver boundary used by process workers."""
     nodes, successors, operations, initial = prepared
-    if os.environ.get("LACHESIS_NATIVE_LIFETIME") == "1":
+    # The Python analyzer has an allocation-free straight-line transfer path.  Calling
+    # the native bridge for that common shape is substantially slower: protobuf request
+    # construction plus a full point/post snapshot round-trip dominates the actual
+    # transfer (especially for the many small wrapper functions in a whole repository).
+    # Reserve Rust for control-flow graphs where its native work can amortize that bridge.
+    linear = bool(nodes)
+    positions = {node: index for index, node in enumerate(nodes)}
+    linear = linear and all(len(successors.get(node, ())) <= 1 for node in nodes)
+    linear = linear and all(
+        successor in positions and positions[successor] > positions[node]
+        for node in nodes
+        for successor in successors.get(node, ())
+    )
+    linear = linear and all(operation.kind != OpKind.SUMMARY for operation in operations)
+    if os.environ.get("LACHESIS_NATIVE_LIFETIME") == "1" and not linear:
         from .native_lifetime import solve_linear
         native = solve_linear(nodes, successors, operations, initial)
         if native is not None:
