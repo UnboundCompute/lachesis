@@ -92,6 +92,15 @@ pub struct Snapshot {
     pub objects: Vec<(String, ObjectMeta)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LinearResult {
+    pub point_states: Vec<(String, Snapshot)>,
+    pub post_states: Vec<(String, Snapshot)>,
+    pub exit_state: Snapshot,
+    pub findings: Findings,
+    pub transfers: u64,
+}
+
 impl State {
     pub fn snapshot(&self) -> Snapshot {
         let mut env: Vec<_> = self.env.iter().map(|(root, oid)| (root.clone(), oid.clone())).collect();
@@ -242,6 +251,25 @@ impl State {
             }
         }
     }
+}
+
+/// Execute the straight-line subset as one native batch.  The Python analyzer already
+/// recognizes this shape; this function exists so the bridge can move the common case
+/// without crossing the FFI boundary for every operation or snapshot.
+pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State) -> LinearResult {
+    let mut point_states = Vec::with_capacity(nodes.len());
+    let mut post_states = Vec::with_capacity(nodes.len());
+    let mut findings = Findings::default();
+    let mut transfers = 0;
+    for node in nodes {
+        point_states.push((node.clone(), state.snapshot()));
+        for operation in operations.iter().filter(|operation| operation.node == *node) {
+            state.apply(operation, &mut findings);
+            transfers += 1;
+        }
+        post_states.push((node.clone(), state.snapshot()));
+    }
+    LinearResult { point_states, post_states, exit_state: state.snapshot(), findings, transfers }
 }
 
 impl Operation {
