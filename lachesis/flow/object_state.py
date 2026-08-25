@@ -466,11 +466,17 @@ class ObjectStateAnalyzer:
     @staticmethod
     @timeit(name="object_state.ObjectStateAnalyzer._transfer")
     def _transfer(
-        states: Iterable[AbstractState],
+        states: Iterable[AbstractState] | Mapping[tuple, AbstractState],
         operations: Sequence[Operation],
         findings: set[Finding],
     ) -> dict[tuple, AbstractState]:
-        current = [state.clone() for state in states]
+        if not operations and isinstance(states, Mapping):
+            # A control-flow node with no placed operations cannot mutate any incoming
+            # state. Preserve the caller's exact keys and state objects; cloning and
+            # rehashing these nodes accounted for most of the 1.5M key calls on libxml2.
+            return dict(states)
+        values = states.values() if isinstance(states, Mapping) else states
+        current = [state.clone() for state in values]
         for op in operations:
             if op.kind != OpKind.SUMMARY:
                 for state in current:
@@ -586,7 +592,7 @@ class ObjectStateAnalyzer:
         while work and transfers < cap:
             node = work.popleft()
             queued.discard(node)
-            outgoing = self._transfer(incoming[node].values(), at.get(node, ()), findings)
+            outgoing = self._transfer(incoming[node], at.get(node, ()), findings)
             post_snapshots[node].update(
                 (key, state.clone()) for key, state in outgoing.items())
             transfers += len(outgoing)
