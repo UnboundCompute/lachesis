@@ -266,6 +266,8 @@ class HeapIdentity:
         locations: dict[tuple[str, tuple[str, ...]], str] = {}
         location_values: dict[str, set[str]] = defaultdict(set)
         effects: set[str] = set()
+        normalized_path_cache: dict[str, tuple[str, ...]] = {}
+        target_location_cache: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
 
         # A property path only needs to be revisited when one of its base/value
         # points-to sets grows. Index those dependencies once so the fixed point
@@ -282,14 +284,20 @@ class HeapIdentity:
                     paths_by_dependency[value_id].append(path)
 
         def normalized_segments(path: dict) -> tuple[str, ...]:
+            cached = normalized_path_cache.get(path["id"])
+            if cached is not None:
+                return cached
             structured = path.get("properties", {}).get("path_segments") or []
             if structured:
-                return tuple(
+                result = tuple(
                     "[*]" if segment.get("dynamic") else str(segment.get("key", "?"))
                     for segment in structured
                 )
-            opaque = path.get("properties", {}).get("path")
-            return (str(opaque or "?"),)
+            else:
+                opaque = path.get("properties", {}).get("path")
+                result = (str(opaque or "?"),)
+            normalized_path_cache[path["id"]] = result
+            return result
 
         def location(object_id: str, segments: tuple[str, ...], evidence: list[str]) -> str:
             key = (object_id, segments)
@@ -314,7 +322,11 @@ class HeapIdentity:
 
         def target_locations(
             object_id: str, segments: tuple[str, ...], evidence: list[str],
-        ) -> set[str]:
+        ) -> frozenset[str]:
+            cache_key = (object_id, segments)
+            cached = target_location_cache.get(cache_key)
+            if cached is not None:
+                return cached
             current_objects = {object_id}
             prefix: tuple[str, ...] = ()
             for segment in segments[:-1]:
@@ -346,10 +358,12 @@ class HeapIdentity:
                         add_edge("POINTS_TO", prefix_location, child_id, evidence)
                     next_objects.update(stored)
                 current_objects = next_objects
-            return {
+            result = frozenset({
                 location(current_object, (segments[-1],), evidence)
                 for current_object in current_objects
-            }
+            })
+            target_location_cache[cache_key] = result
+            return result
 
         def propagate_worklist() -> bool:
             """Reach the property/points-to fixed point without global rescans."""
