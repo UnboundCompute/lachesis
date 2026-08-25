@@ -30,6 +30,7 @@ import json
 import os
 import tempfile
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -451,6 +452,25 @@ class GraphStore:
         from lachesis.pipeline import enrich_graph
         from lachesis.nav.kuzu_index import materialize_graph
 
+        timing_enabled = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
+        timing_started = time.perf_counter()
+
+        def timing(label: str) -> None:
+            if timing_enabled:
+                print(
+                    f"[lachesis pass2] {label}: "
+                    f"{time.perf_counter() - timing_started:.3f}s",
+                    file=sys.stderr, flush=True,
+                )
+
+        def observe(overlay_id: str, elapsed: float, nodes: int, edges: int) -> None:
+            if timing_enabled:
+                print(
+                    f"[lachesis pass2] overlay {overlay_id}: {elapsed:.3f}s "
+                    f"({nodes:,} nodes, {edges:,} edges)",
+                    file=sys.stderr, flush=True,
+                )
+
         core_path = self._core_path
         manifest = read_store_manifest(core_path)
         # Say up front when this will be the heavy, unbounded, in-RAM step (see the class
@@ -485,6 +505,7 @@ class GraphStore:
             restore_defaults=False,
             sort_output=False,
         )
+        timing("materialized core")
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
         cache = dataflow_overlay_path(core_path)
@@ -509,8 +530,10 @@ class GraphStore:
         try:
             enriched = enrich_graph(
                 core, manifest_languages(manifest), manifest_capabilities(manifest),
+                observer=observe if timing_enabled else None,
                 delta_sink=collect_delta,
             )
+            timing("enriched graph")
             # The sidecar path is additive by construction: GraphAccumulator rejects
             # conflicting replacements of an existing canonical node. Release both
             # graph-sized views before the stream is finalized/replaced.
@@ -525,6 +548,7 @@ class GraphStore:
             del core, enriched
             stream.close()
             os.replace(temporary, cache)
+            timing("dataflow sidecar published")
         except BaseException:
             stream.close()
             if os.path.exists(temporary):
@@ -538,11 +562,13 @@ class GraphStore:
         # two Kùzu index objects alive. `attach_overlay` resets its derived caches,
         # so the resulting accessor view is identical to a fresh `_open`.
         dataflow_overlay = _load_dataflow_overlay(cache)
+        timing("dataflow sidecar loaded")
         merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
         self.index.attach_overlay(merged_overlay)
         self.overlay = merged_overlay
         self.graph = None
         self.gl = GraphLib.from_index(self.index)
+        timing("dataflow overlay attached")
         self._retained_enriched_graph = retained
         self._entries = None
         self._enriched = True
