@@ -39,6 +39,13 @@ def _call_path(sub, root, selectors=()):
     return _name(sub, root) + "".join(selectors) if root else None
 
 
+def _argument_root(sub, argument):
+    root = (argument.root or "").removeprefix("decl:")
+    if root and sub.kind(root) in {"VarDecl", "ParmVarDecl", "parameter", "variable"}:
+        return _call_path(sub, argument.root, argument.selectors)
+    return _expression_root(argument.expression)
+
+
 def _native_prepared(index):
     base = (getattr(index, "_pass3_cache_base", None)
             or getattr(index, "_db_dir", None))
@@ -88,9 +95,9 @@ def build_native_F(store, lang="c", *, return_graph=False):
             if not callee:
                 continue
             args = [{"pos": arg.position, "node": arg.node,
-                     "root": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
-                     "var": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
-                     "value": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
+                     "root": _argument_root(sub, arg),
+                     "var": _argument_root(sub, arg),
+                     "value": _argument_root(sub, arg) or arg.expression,
                      "expr": arg.expression or _name(sub, arg.node),
                      "provenance": "const" if not arg.root else "local"}
                     for arg in call.arguments]
