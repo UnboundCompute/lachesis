@@ -276,6 +276,13 @@ core sort before overlay folding and constructs sidecar protobuf records directl
 wire format and decoded records remain unchanged. Avoid repeatedly running this cold path
 while profiling because it is memory-intensive and can swap.
 
+The current optimized implementation also memoizes control-flow statement paths, uses a
+worklist for dynamic-dispatch identity propagation, and lazily restores elided core
+defaults during enrichment. A normal-parallelism cold verification on the same libxml2
+graph completed in about 171s with 6.56 GB peak RSS; the materialization-only stage fell
+from 41.0s to 36.9s. Full-run wall time is machine-pressure-sensitive, so compare runs
+only when Kùzu parallelism and available memory are comparable.
+
 Example full cold run against libxml2:
 
 ```bash
