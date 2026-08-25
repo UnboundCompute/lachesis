@@ -250,20 +250,6 @@ class AbstractState:
         if self.trace.count(effect) < 2 and len(self.trace) < AbstractState.TRACE_LIMIT:
             self.trace += (effect,)
 
-    def _use_changes_trace(self, op: Operation) -> bool:
-        """Whether applying a USE can change this state's exported effects."""
-        assert op.kind == OpKind.USE and op.target is not None
-        oid = self.resolve(op.target, create=False)
-        if not (isinstance(oid, tuple) and len(oid) == 3 and oid[0] == "param"):
-            return False
-        effect = ParamEffect(OpKind.USE, oid[1], oid[2])
-        if self.trace.count(effect) < 2 and len(self.trace) < self.TRACE_LIMIT:
-            return True
-        if op.access == "return":
-            effect = ReturnEffect(oid[1], oid[2])
-            return self.trace.count(effect) < 2 and len(self.trace) < self.TRACE_LIMIT
-        return False
-
     def _merge_object(self, destination: ObjectId, source: ObjectId) -> None:
         self.facts[destination] = frozenset(
             self.facts.get(destination, frozenset())
@@ -531,24 +517,6 @@ class ObjectStateAnalyzer:
             # rehashing these nodes accounted for most of the 1.5M key calls on libxml2.
             return dict(states)
         values = states.values() if isinstance(states, Mapping) else states
-        if (operations and all(op.kind == OpKind.USE for op in operations)
-                and isinstance(findings, _DiscardFindings)):
-            # Summary workers do not collect local findings; USE only contributes to
-            # the exported ParamEffect/ReturnEffect trace when it resolves to a
-            # parameter object. Most reads are therefore completely state-neutral.
-            # Keep those states untouched and clone only at the first trace-changing
-            # observation. This avoids copying large maps and rebuilding state keys
-            # for the common local-read case.
-            current = []
-            for state in values:
-                candidate = state
-                for op in operations:
-                    if candidate._use_changes_trace(op):
-                        if candidate is state:
-                            candidate = state.clone()
-                        candidate.apply(op, findings)
-                current.append(candidate)
-            return {state.key(): state for state in current}
         if operations and all(op.kind == OpKind.USE for op in operations):
             # USE resolves without creating objects and only appends a trace effect for
             # parameter/return observations. The state maps are therefore immutable for
