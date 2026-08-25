@@ -1135,8 +1135,13 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         analysis_store = store if analysis_graph is store.graph else GraphStore(analysis_graph)
         analysis_index = analysis_store.index
     sub_succ = {n: [c for c in succ.get(n, ()) if c in functions] for n in functions}
-    obj_summaries = summaries or analyze_object_lifetimes(
-        store, functions, sub_succ, lang=lang, graph=graph).summaries
+    # An empty summary mapping is a valid result when the selected slice has no
+    # object summaries.  Do not treat it as a cache miss: ``or`` here reran the
+    # complete lifetime analysis (including owner warming and CFG construction)
+    # during semantic emission.
+    obj_summaries = (summaries if summaries is not None else
+                     analyze_object_lifetimes(
+                         store, functions, sub_succ, lang=lang, graph=graph).summaries)
     sub = cached_substrate(analysis_index)
     norm = normalizer(lang)
     sink_catalog = atropos.sink_catalog(lang)
