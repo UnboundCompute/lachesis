@@ -62,7 +62,7 @@ _DEFAULT_FORMAT = "text"
 # remains additive/backward-compatible; a caller has to request the narrower profile.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 HUNTING_TOOLS = SECURITY_TOOLS + (
-    "candidates", "candidate_detail", "candidate_census", "skeleton",
+    "candidates", "candidate_detail", "candidate_census", "explain", "skeleton",
     "flow_pass", "leads", "flow_skeleton", "taint", "scan", "guard_dominance",
     "counterexample", "range_analysis", "object_lifecycle", "error_path_summary",
 )
@@ -122,7 +122,7 @@ TOOL_ORDER = (
     "representation_roundtrip", "cross_boundary_paths", "range_analysis",
     "object_lifecycle", "error_path_summary",
     "flow", "reaches", "sources_of", "points_to", "aliases",
-    "candidates", "candidate_detail", "candidate_census", "skeleton",
+    "candidates", "candidate_detail", "candidate_census", "explain", "skeleton",
     "flow_pass", "leads", "flow_skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
@@ -905,6 +905,26 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "constructor_id": {"type": "string"},
          "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
+    {"name": "explain",
+     "description": "One shot from a candidate (by id, or by the sink's file:line) to a "
+                    "judgeable picture: the obligation and where it lands, the guard the "
+                    "enclosing function does or does not place over it, the bounded reverse "
+                    "value-flow cone into the sink, and the enclosing function's source read "
+                    "inline -- the census->candidates->detail->sources_of->read_body chain "
+                    "composed into one result. Provenance and guard are evidence, not verdicts: "
+                    "an empty cone is 'nothing observed under this tier', not 'unreachable'. "
+                    "Pass candidate_id, or file and line.",
+     "inputSchema": {"type": "object", "properties": {
+         "candidate_id": {"type": "string",
+                          "description": "the candidate to explain (from candidates/census)"},
+         "file": {"type": "string", "description": "with `line`: locate the sink by position "
+                                                   "(full path, suffix, or basename)"},
+         "line": {"type": "integer", "description": "with `file`: the sink's source line"},
+         "provenance_limit": {"type": "integer", "default": 200,
+                              "description": "cap on reverse-cone source nodes shown"},
+         "max_source_chars": {"type": "integer", "default": 4000,
+                              "description": "cap on the inlined enclosing-function source"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
     {"name": "skeleton",
      "description": "Render a function's sink map as a pseudo-function: every catalogued sink "
                     "(all families -- memory, os, file, ...) shown in place, each annotated with "
@@ -1555,6 +1575,21 @@ def call_tool(name, args, format=None):
         # counts only, so a list page stays bounded. Nothing is dropped -- the
         # rows are one census call away.
         result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "explain":
+        # The census->candidates->detail->sources_of->read_body chain in one call, over the
+        # shared Analysis.explain. Bounded like every candidate move (temporal/hard_stop); the
+        # provenance walk folds only a cone around the sink, never the whole graph.
+        common = {"temporal": args.get("temporal", True), "hard_stop": args.get("hard_stop"),
+                  "provenance_limit": int(args.get("provenance_limit", 200)),
+                  "max_source_chars": int(args.get("max_source_chars", 4000))}
+        if args.get("candidate_id"):
+            result = c.explain(args["candidate_id"], **common)
+        elif args.get("file") and args.get("line") is not None:
+            result = c.explain_sink(args["file"], int(args["line"]), **common)
+        else:
+            result = {"move": "explain",
+                      "error": "pass candidate_id, or both file and line"}
         return _emit(name, result, fmt, offset, limit)
     if name == "skeleton":
         bundle = c.candidate_bundle

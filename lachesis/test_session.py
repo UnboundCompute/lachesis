@@ -248,6 +248,49 @@ class FixtureIntegrationTests(unittest.TestCase):
         self.assertIn(("bind", False), analysis._built)
         self.assertFalse(os.path.isfile(sidecar))
 
+    def _first_candidate(self, analysis):
+        """A real structural candidate row over the fixture (temporal off = fast, no tier)."""
+        groups = analysis.candidates(temporal=False, limit=200)["groups"]
+        for group in groups:
+            if group.get("candidates"):
+                return group["candidates"][0]
+        self.skipTest("fixture graph carries no candidates")
+
+    def test_explain_composes_the_whole_chain(self):
+        analysis = Analysis.open(self.GRAPH)
+        row = self._first_candidate(analysis)
+        result = analysis.explain(row["candidate_id"], temporal=False)
+        # one structured record standing in for census->candidates->detail->sources_of->read_body
+        self.assertEqual(result["candidate_id"], row["candidate_id"])
+        self.assertTrue(result["obligation"])
+        self.assertEqual(result["sink"]["line"], row["observations"]["line"])
+        # the guard is read straight from the inference -- present, and never silently "safe"
+        self.assertIn("dominance", result["guard"])
+        # provenance is a bounded reverse cone (evidence, honest counts), source is read inline
+        self.assertIn("cone", result["provenance"])
+        self.assertIsNotNone(result["source"])
+        self.assertTrue(result["source"]["body"])
+        # bounded run flags its own honesty, same as every candidate move
+        self.assertIn("temporal_evaluated", result)
+
+    def test_explain_sink_resolves_a_position(self):
+        analysis = Analysis.open(self.GRAPH)
+        row = self._first_candidate(analysis)
+        observations = row["observations"]
+        # a bare basename plus the line resolves to the same candidate as its opaque id
+        by_position = analysis.explain_sink(os.path.basename(observations["file"]),
+                                            observations["line"], temporal=False)
+        self.assertEqual(by_position["candidate_id"], row["candidate_id"])
+
+    def test_explain_miss_is_honest_not_empty(self):
+        analysis = Analysis.open(self.GRAPH)
+        # an unknown id is a named miss, not a bare empty record
+        self.assertIn("error", analysis.explain("obl_deadbeef", temporal=False))
+        # an unmodeled position says an absent candidate is not a proof of safety
+        miss = analysis.explain_sink("nonexistent.c", 999999, temporal=False)
+        self.assertIn("error", miss)
+        self.assertIn("note", miss)
+
     def test_full_temporal_bind_evaluates_and_flags(self):
         analysis = Analysis.open(self.GRAPH)
         census = analysis.census()  # temporal on by default

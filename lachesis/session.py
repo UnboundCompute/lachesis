@@ -357,10 +357,202 @@ class Analysis:
     def candidate_detail(self, candidate_id: str, *, temporal: bool = True,
                          hard_stop: float | None = None,
                          deadline: Deadline | None = None) -> dict:
-        """The full record for one candidate. Phase 4 grows this into a one-shot ``explain``
-        that also walks provenance and reads the sink source; today it is the registry row."""
+        """The full registry record for one candidate. For the composed one-shot -- provenance
+        cone plus the sink's source read inline -- use :meth:`explain`."""
         bundle = self._bound_bind(temporal=temporal, hard_stop=hard_stop, deadline=deadline)
         return self._stamp_temporal(bundle["registry"].detail(candidate_id), bundle)
+
+    # -- library surface: the one-shot explanation ----------------------------------
+
+    def explain(self, candidate_id: str, *, temporal: bool = True,
+                hard_stop: float | None = None, deadline: Deadline | None = None,
+                provenance_limit: int = 200, max_source_chars: int = 4000) -> dict:
+        """One call from a candidate id to a judgeable picture of the lead.
+
+        Adjudicating a candidate used to be a five-tool ritual, threaded by hand and copying
+        node ids between calls: census -> candidates -> candidate_detail -> sources_of ->
+        read_body, identical for every case and the single biggest per-case cost. This composes
+        that chain into one structured result -- the obligation and where it lands, the guard the
+        enclosing function does or does not place over it, the bounded reverse cone of values that
+        can feed the sink, and the source of the enclosing function read inline -- so a judgement
+        is a read, not a scavenger hunt.
+
+        The ``provenance`` and ``guard`` sections are evidence, never verdicts: an empty reverse
+        cone means "nothing observed under the tier materialized here", not "not reachable", and a
+        ``none-observed`` guard stays exactly that. Bounded like every other candidate call
+        (``temporal``/``hard_stop``), and the provenance walk folds only a cone around the sink,
+        never the whole graph.
+        """
+        bundle = self._bound_bind(temporal=temporal, hard_stop=hard_stop, deadline=deadline)
+        detail = bundle["registry"].detail(candidate_id)
+        candidate = detail.get("candidate")
+        if not candidate:
+            return self._stamp_temporal(
+                {"move": "explain", "candidate_id": candidate_id,
+                 "error": f"no candidate {candidate_id!r} in the registry"}, bundle)
+        return self._stamp_temporal(
+            self._compose_explanation(candidate, provenance_limit, max_source_chars), bundle)
+
+    def explain_sink(self, file: str, line: int, *, temporal: bool = True,
+                     hard_stop: float | None = None, deadline: Deadline | None = None,
+                     provenance_limit: int = 200, max_source_chars: int = 4000) -> dict:
+        """Explain the candidate at a source position, resolving ``file:line`` to it.
+
+        The same one-shot as :meth:`explain`, entered by where the sink sits -- the position a
+        reader has in hand from a diff or a stack trace -- rather than by an opaque id. ``file``
+        matches by full path, path suffix, or basename. When several candidates share the line the
+        best-ranked is explained and the rest are named under ``other_matches``, so the collapse is
+        visible, never silent. An absent match says so honestly: a sink shape the catalog does not
+        model is structurally unnameable, and no candidate there is not a proof of safety.
+        """
+        bundle = self._bound_bind(temporal=temporal, hard_stop=hard_stop, deadline=deadline)
+        registry = bundle["registry"]
+        matches = self._candidates_at(registry, file, line)
+        if not matches:
+            return self._stamp_temporal(
+                {"move": "explain", "file": file, "line": line,
+                 "error": f"no candidate sink at {file}:{line}",
+                 "note": "a sink shape not modeled by the catalog is structurally unnameable "
+                         "here -- an absent candidate is not a proof of safety"}, bundle)
+        # Compose from the FULL detail row (with inferences), not the compact match row, so a
+        # position-resolved explanation is exactly as rich as an id-resolved one.
+        best_id = matches[0].get("candidate_id")
+        full = registry.detail(best_id).get("candidate") or matches[0]
+        result = self._compose_explanation(full, provenance_limit, max_source_chars)
+        if len(matches) > 1:
+            result["other_matches"] = [m.get("candidate_id") for m in matches[1:]]
+        return self._stamp_temporal(result, bundle)
+
+    def _compose_explanation(self, candidate: dict, provenance_limit: int,
+                             max_source_chars: int) -> dict:
+        """Assemble the one-shot record: obligation + where + guard + provenance + source.
+
+        The candidate already carries the obligation, the observations, and the condition
+        inference; this adds the two things a judgement otherwise costs a second tool each -- the
+        reverse value-flow cone into the sink, and the enclosing function's source read inline.
+        """
+        handles = candidate.get("handles") or {}
+        observations = candidate.get("observations") or {}
+        inferences = candidate.get("inferences") or {}
+        value_ids = handles.get("obligation_value_ids") or ()
+        sink_value = value_ids[0] if value_ids else handles.get("site_node_id")
+        return {
+            "move": "explain",
+            "candidate_id": candidate.get("candidate_id"),
+            "constructor": candidate.get("constructor"),
+            "domain": candidate.get("domain"),
+            "language": candidate.get("language"),
+            "obligation": candidate.get("obligation"),
+            "sink": {"callee": observations.get("callee"), "site": observations.get("site"),
+                     "file": observations.get("file"), "line": observations.get("line"),
+                     "sink_kind": observations.get("sink_kind"), "cwe": observations.get("cwe")},
+            "rank": candidate.get("rank"),
+            "rank_reasons": candidate.get("rank_reasons"),
+            "guard": self._guard_view(inferences),
+            "input_reachability": inferences.get("input_reachability"),
+            "provenance": self._provenance(sink_value, provenance_limit),
+            "source": self._read_body(handles.get("enclosing_function_id"), max_source_chars),
+            "next_op": candidate.get("next_op"),
+        }
+
+    @staticmethod
+    def _guard_view(inferences: dict) -> dict:
+        """The guard the enclosing function places over the sink -- read straight from the
+        registry's condition inference, so ``none-observed`` stays ``none-observed`` and never
+        quietly reads as safe."""
+        conditions = inferences.get("conditions") or {}
+        return {"status": conditions.get("status"),
+                "dominance": conditions.get("dominance"),
+                "referencing_conditions": conditions.get("referencing_conditions")}
+
+    def _provenance(self, sink_value: str | None, limit: int) -> dict:
+        """The bounded reverse value-flow cone into the sink.
+
+        Folds the dataflow tier only around this sink (a cone, never the whole graph -- the same
+        bound Phase 3 established) and walks the reverse cone. An empty result means nothing was
+        observed under the tier materialized here, not that the sink is unreachable -- the
+        ``cone``/``truncated`` fields say how much of the neighbourhood was actually in scope.
+        """
+        if not sink_value:
+            return {"status": "no-sink-value", "sources": []}
+        cone = self.store.ensure_dataflow_cone(sink_value)
+        result = self._reach().sources_of(sink_value, limit=limit)
+        manifest = result.get("manifest") or {}
+        return {
+            "sink_value": sink_value,
+            "reached": manifest.get("reached"),
+            "shown": manifest.get("shown"),
+            "truncated": manifest.get("truncated"),
+            "cone": cone,
+            "sources": [{"id": node.get("id"), "name": node.get("name"),
+                         "kind": node.get("kind"), "file": node.get("file"),
+                         "line": node.get("line")}
+                        for node in (result.get("nodes") or ())],
+        }
+
+    def _read_body(self, node_id: str | None, max_chars: int) -> dict | None:
+        """The exact source of a declaration -- offsets first, L3 body nodes as a fallback --
+        the same read the MCP ``read_body`` tool performs, lifted here so ``explain`` returns the
+        function it is judging inline instead of demanding a second call."""
+        if not node_id:
+            return None
+        gl = self.store.gl
+        node = self.store.node(node_id)
+        if node is None:
+            return {"node_id": node_id, "error": "no such node"}
+        file, start, end = gl.loc(node)
+        body = gl.source_text(node)
+        via = "offsets"
+        if not body:  # offsets unavailable -- reconstruct from L3 body nodes in line order
+            parts = sorted(gl.body_nodes(node_id), key=lambda n: (gl.loc(n)[1] or 0))
+            body = "\n".join(gl.label(part) for part in parts if gl.label(part))
+            via = "body_nodes"
+        return {"node_id": node_id, "name": gl.label(node), "file": file,
+                "start_line": start, "end_line": end, "via": via,
+                "truncated": len(body) > max_chars, "body": body[:max_chars]}
+
+    def _reach(self):
+        """A reverse/forward value-flow engine over the current tier, built once per tier.
+
+        Lives on the base session so ``explain`` works without the MCP subclass; ``_Ctx`` exposes
+        the same object under the same memo key as its ``reach`` property, so the two never build
+        two engines over one tier.
+        """
+        from lachesis.nav.reachability import Reachability
+
+        return self._analysis("reach", lambda: Reachability(self.store))
+
+    def _candidates_at(self, registry, file: str, line: int) -> list[dict]:
+        """Every candidate whose sink observation sits at ``file:line``, best-ranked first.
+
+        Scans the whole taxonomy (never one family), so a sink is found whatever catalog family
+        names it; rank orders the matches but never filters them.
+        """
+        matches = [row for row in self._iter_candidates(registry)
+                   if self._observed_at(row, file, line)]
+        matches.sort(key=lambda row: row.get("rank") or 0.0, reverse=True)
+        return matches
+
+    @staticmethod
+    def _iter_candidates(registry) -> Iterator[dict]:
+        """Every candidate row across the whole taxonomy, paged out of the registry's public
+        surface so this never reaches into registry internals."""
+        page = registry.candidates(limit=200)
+        for group in (page.get("groups") or (page,)):
+            yield from group.get("candidates", ())
+            constructor, cursor = group.get("constructor"), group.get("next_cursor")
+            while cursor:
+                more = registry.candidates(constructor=constructor, limit=200, cursor=cursor)
+                yield from more.get("candidates", ())
+                cursor = more.get("next_cursor")
+
+    @staticmethod
+    def _observed_at(row: dict, file: str, line: int) -> bool:
+        observations = row.get("observations") or {}
+        if observations.get("line") != line:
+            return False
+        stored = observations.get("file")
+        return bool(stored) and _file_matches((stored,), file)
 
 
 @dataclass(frozen=True)
