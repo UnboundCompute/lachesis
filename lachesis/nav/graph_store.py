@@ -459,7 +459,14 @@ class GraphStore:
             )
         # Enrichment performs its own final canonical sort.  Sorting the entire
         # core here would pay for the same 2M-edge ordering twice on the cold path.
-        core = materialize_graph(self.index, sort_output=False)
+        # The overlay algorithms use explicit ``get`` lookups and do not need the
+        # three elided compiler defaults copied onto every core record.  Lazy props
+        # preserve those defaults for bracket-based consumers while avoiding millions
+        # of dictionaries/lists that are discarded as soon as the derived sidecar is
+        # written.
+        core = materialize_graph(
+            self.index, restore_defaults=False, sort_output=False,
+        )
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
         enriched = enrich_graph(core, manifest_languages(manifest),
