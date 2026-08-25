@@ -139,12 +139,17 @@ def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
     return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
 
 
-def encode_node(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+def _node_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):
     message = graph_pb2.NodeRecord(
         id=str(record.get("id", "")), kind=str(record.get("kind", "")),
         label=str(record.get("label", "")), tier=str(record.get("tier", "")),
     )
     message.properties.extend(_properties(record.get("properties"), _property_cache))
+    return message
+
+
+def encode_node(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+    message = _node_message(record, _property_cache=_property_cache)
     return message.SerializeToString()
 
 
@@ -166,7 +171,7 @@ def decode_node(payload: bytes, *, properties: bool = True) -> dict[str, Any]:
     return record
 
 
-def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+def _edge_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):
     message = graph_pb2.EdgeRecord(
         kind=str(record.get("kind", "")), source=str(record.get("source", "")),
         target=str(record.get("target", "")),
@@ -174,6 +179,11 @@ def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = Non
         relationship_class=str(record.get("relationship_class", "")),
     )
     message.properties.extend(_properties(record.get("properties"), _property_cache))
+    return message
+
+
+def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+    message = _edge_message(record, _property_cache=_property_cache)
     return message.SerializeToString()
 
 
@@ -198,10 +208,18 @@ def encode_overlay(payload: Mapping[str, Any]) -> bytes:
         source=str(payload.get("source", "")), version=int(payload.get("version", 1)),
         core_content_hash=str(payload.get("core_content_hash", "")),
     )
+    # Build child messages directly.  The old implementation serialized every
+    # record and parsed it back into the repeated field, doing two protobuf
+    # traversals and allocating a temporary bytes object per record.
+    property_cache = {}
     for node in payload.get("derived_nodes", []):
-        message.derived_nodes.add().ParseFromString(encode_node(node))
+        message.derived_nodes.add().CopyFrom(
+            _node_message(node, _property_cache=property_cache)
+        )
     for edge in payload.get("derived_edges", []):
-        message.derived_edges.add().ParseFromString(encode_edge(edge))
+        message.derived_edges.add().CopyFrom(
+            _edge_message(edge, _property_cache=property_cache)
+        )
     return message.SerializeToString()
 
 
