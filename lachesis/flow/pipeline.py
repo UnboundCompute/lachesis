@@ -231,7 +231,17 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     # appropriate catalog/normalizer and contribute their own graph facts; the
     # scheduler, Claus graph, and matcher must not make C the dispatch gate.
     object_requested = requested != "legacy"
-    if object_requested and os.environ.get("LACHESIS_NATIVE_TRANSLATION") == "1":
+    native_translation = os.environ.get("LACHESIS_NATIVE_TRANSLATION") == "1"
+    if object_requested and not native_translation:
+        # Pass 1 now emits a compact binary translation-facts sidecar.  Its
+        # presence is the capability signal: fresh graphs use the Rust
+        # projection automatically, while older stores retain compatibility
+        # until they are rebuilt.
+        from lachesis.nav.dataflow.substrate import translation_facts_path
+        base = (getattr(store.index, "_pass3_cache_base", None)
+                or getattr(store.index, "_db_dir", None))
+        native_translation = bool(base and translation_facts_path(base).is_file())
+    if object_requested and native_translation:
         from .native_translate import build_native_F
         native_translation = build_native_F(store, lang=lang, return_graph=True)
         if native_translation is None:
