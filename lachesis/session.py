@@ -667,6 +667,11 @@ class LeadSet:
             "engine": self.engine,
             "timed_out": self.timed_out,
             "truncated_functions": list(self.truncated_functions),
+            # Which phase the budget stopped before, when it fired before object analysis even
+            # began (tier/projection/summaries). None on a normal run or a mid-analysis timeout.
+            # Lets a caller distinguish "setup alone blew the budget" (warm the graph first)
+            # from "analysis was truncated" (raise the budget).
+            "stopped_before": (self.lifetime.get("diagnostics") or {}).get("stopped_before"),
             "coverage": self._coverage_summary(),
         }
 

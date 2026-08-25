@@ -106,8 +106,16 @@ def command_analyze(args: argparse.Namespace) -> int:
     print(f"{summary['total']} leads  (engine={summary['engine']}, "
           f"timed_out={summary['timed_out']})")
     if summary["timed_out"]:
-        # An empty or thin result over a partial run is not "clean" -- say so.
-        print(f"  ! partial run: {len(summary['truncated_functions'])} functions truncated")
+        # An empty or thin result over a partial run is not "clean" -- say so, and name the
+        # fix. Stopping before object analysis means setup (the dataflow tier) alone spent the
+        # budget: warming the graph once removes that cost from every later analyze.
+        if summary.get("stopped_before"):
+            print(f"  ! stopped before {summary['stopped_before']}: setup (the dataflow tier) "
+                  f"alone spent the budget, so no leads were computed -- this is not 'clean'. "
+                  f"Warm the graph once with `lachesis enrich {args.graph}` (writes the "
+                  f".dataflow.pb sidecar so analyze skips the tier), or raise --hard-stop.")
+        else:
+            print(f"  ! partial run: {len(summary['truncated_functions'])} functions truncated")
     if summary["by_pattern"]:
         print("  by pattern: " + ", ".join(f"{name}={count}"
               for name, count in sorted(summary["by_pattern"].items())))
