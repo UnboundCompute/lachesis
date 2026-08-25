@@ -41,17 +41,43 @@ from typing import Any, Dict, List
 def canonical_index(graph: Dict[str, Any], *, language: str,
                     source: str = "lachesis") -> Dict[str, Any]:
     """Build the neutral symbol-index dict from an (enriched or core) CodeGraph."""
-    # Route 1 (Python/TS): kind="argument" nodes keyed by callsite_id.
+    # Keep this projection linear in the graph size.  The old cursor fallback
+    # searched the complete node list once per cursor write, which made a common
+    # ORM pattern O(writes * nodes) on large CPGs.  We collect the small records
+    # needed by the binder in one pass, then resolve only the target labels that
+    # cursor writes actually reference in a second pass.
     arg_nodes_by_call: Dict[str, List] = {}
-    for node in graph.get("nodes", ()):
+    call_nodes: List[dict] = []
+    cursor_result_ids = set()
+    writes: List[tuple] = []
+    nodes = graph.get("nodes", ())
+    for node in nodes:
+        kind = node.get("kind")
+        props = node.get("properties", {})
+        if kind in {"call", "construct"}:
+            call_nodes.append(node)
+            if (props.get("callee_name") or props.get("method_name")
+                    or props.get("callee")) == "cursor":
+                cursor_result_ids.add(props.get("value_id") or node.get("id"))
+        elif kind == "write":
+            writes.append((props.get("value_id"), props.get("target_id")))
         if node.get("kind") != "argument":
             continue
-        props = node.get("properties", {})
         cid = props.get("callsite_id")
         if cid is None:
             continue
         pos = props.get("position", props.get("index", 0))
         arg_nodes_by_call.setdefault(cid, []).append((pos, node["id"]))
+
+    needed_target_ids = {
+        target_id for value_id, target_id in writes
+        if value_id in cursor_result_ids and target_id is not None
+    }
+    cursor_target_names = set()
+    if needed_target_ids:
+        for node in nodes:
+            if node.get("id") in needed_target_ids and node.get("label"):
+                cursor_target_names.add(str(node["label"]))
 
     # Route 2 (C/clang): HAS_ARGUMENT edges keyed by the call node (edge source).
     has_arg_by_call: Dict[str, List] = {}
@@ -61,30 +87,7 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
             has_arg_by_call.setdefault(edge["source"], []).append((pos, edge["target"]))
 
     callsites: List[Dict[str, Any]] = []
-    # A Python value returned by ``connection.cursor()`` often has no static
-    # type in a framework application.  Retain the lexical evidence needed by
-    # Atropos's DB-API fallback without making the binder inspect Lachesis nodes.
-    cursor_result_ids = set()
-    cursor_target_names = set()
-    for node in graph.get("nodes", ()):
-        if node.get("kind") not in {"call", "construct"}:
-            continue
-        props = node.get("properties", {})
-        if (props.get("callee_name") or props.get("method_name")
-                or props.get("callee")) == "cursor":
-            cursor_result_ids.add(props.get("value_id") or node.get("id"))
-    for node in graph.get("nodes", ()):
-        if node.get("kind") != "write":
-            continue
-        props = node.get("properties", {})
-        if props.get("value_id") not in cursor_result_ids:
-            continue
-        target = next((candidate for candidate in graph.get("nodes", ())
-                       if candidate.get("id") == props.get("target_id")), None)
-        if target and target.get("label"):
-            cursor_target_names.add(str(target["label"]))
-
-    for node in graph.get("nodes", ()):
+    for node in call_nodes:
         if node.get("kind") != "call":
             continue
         props = node.get("properties", {})
