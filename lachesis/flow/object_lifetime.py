@@ -926,9 +926,7 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
     does not rebuild graph nodes, CFGs, calls, or operations in Python.
     """
     from lachesis.nav.dataflow.substrate import substrate_cache_path
-    from .native_lifetime import (decode_prepared_result,
-                                  prepare_graph_pb,
-                                  solve_prepared_pb)
+    from .native_lifetime import decode_prepared_result, solve_selected_graph_pb
 
     base = (getattr(analysis_index, "_pass3_cache_base", None)
             or getattr(analysis_index, "_db_dir", None))
@@ -944,17 +942,8 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
         name = node.get("label")
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
-    prepared = getattr(analysis_index, "_native_prepared", None)
-    if prepared is None:
-        # CFG/operation preparation is whole-graph and cheap (~7s on libxml2),
-        # but abstract solving is not.  Solve only the lifetime slice requested
-        # by this Pass-3 call instead of solving declarations and unrelated
-        # functions whose results are discarded below.
-        prepared = prepare_graph_pb(sidecar)
     selected_ids = set(by_name.values())
-    selected = {function_id: item for function_id, item in prepared.items()
-                if function_id in selected_ids}
-    native = solve_prepared_pb(selected)
+    native = solve_selected_graph_pb(sidecar, selected_ids)
     sub = cached_substrate(analysis_index).load()
     summaries = {}
     artifacts = {}

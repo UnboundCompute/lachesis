@@ -863,6 +863,13 @@ pub(crate) fn prepare_and_solve_request(
     solve_prepared_functions(prepared, false)
 }
 
+pub(crate) fn prepare_and_solve_request_with_metadata(
+    request: lifetime_proto::PrepareRequest,
+) -> Result<Vec<u8>, String> {
+    let prepared = request.functions.into_iter().map(prepare_function).collect::<Vec<_>>();
+    solve_prepared_functions(prepared, true)
+}
+
 pub(crate) fn solve_prepared(input: &[u8]) -> Result<Vec<u8>, String> {
     let prepared = lifetime_proto::PrepareResult::decode(input)
         .map_err(|error| format!("invalid prepared lifetime protobuf: {error}"))?;

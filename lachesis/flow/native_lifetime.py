@@ -257,6 +257,47 @@ def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
     return {function.id: function for function in result.functions}
 
 
+def solve_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
+    """Prepare and solve only selected sidecar functions inside Rust."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    solve = library.lachesis_lifetime_prepare_graph_solve_selected_pb
+    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                      ctypes.c_void_p, ctypes.c_size_t,
+                      ctypes.POINTER(ctypes.c_size_t)]
+    solve.restype = ctypes.c_void_p
+    selection = lifetime_pb2.PrepareRequest()
+    for function_id in function_ids:
+        selection.functions.add(id=str(function_id))
+    selection_payload = selection.SerializeToString()
+    selection_buffer = ctypes.create_string_buffer(selection_payload)
+    path = os.fspath(sidecar_path)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        length = os.fstat(descriptor).st_size
+        if length <= 0:
+            raise RuntimeError("selected lifetime solve received an empty sidecar")
+        with mmap.mmap(descriptor, length, access=mmap.ACCESS_COPY) as mapped:
+            view = ctypes.c_char.from_buffer(mapped)
+            output_length = ctypes.c_size_t()
+            pointer = solve(
+                ctypes.c_void_p(ctypes.addressof(view)), length,
+                ctypes.cast(selection_buffer, ctypes.c_void_p), len(selection_payload),
+                ctypes.byref(output_length))
+            del view
+            if not pointer or not output_length.value:
+                raise RuntimeError("native selected lifetime solve returned no result")
+            try:
+                result = lifetime_pb2.PrepareSolveResult()
+                result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+            finally:
+                library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+            return {function.id: function for function in result.functions}
+    finally:
+        os.close(descriptor)
+
+
 def prepare_graph_solve_details_pb(sidecar_path: str | os.PathLike[str]):
     """Return native prepared CFGs and results without rebuilding them in Python."""
     prepared = prepare_graph_pb(sidecar_path)

@@ -751,6 +751,38 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_solve_pb(
     pointer
 }
 
+/// Read the framed substrate in Rust, retain only the function IDs in the
+/// binary selection request, and return prepared metadata plus lifetime
+/// results for that slice. This avoids materializing the whole prepared graph
+/// in Python when Pass 3 requests a small set of functions.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_solve_selected_pb(
+    input: *const u8, length: usize,
+    selection: *const u8, selection_length: usize,
+    output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        let selected_bytes = slice::from_raw_parts(selection, selection_length);
+        let selected = lifetime_proto::PrepareRequest::decode(selected_bytes)
+            .map_err(|error| format!("invalid lifetime selection protobuf: {error}"))?;
+        let selected_ids: HashSet<String> = selected.functions.into_iter()
+            .map(|function| function.id)
+            .collect();
+        let mut request = native_graph::sidecar_to_request(bytes)?;
+        request.functions.retain(|function| selected_ids.contains(&function.id));
+        prepare::prepare_and_solve_request_with_metadata(request)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native selected graph prepare/solve error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
 impl Operation {
     fn access_is_return(&self) -> bool { self.access == "return" }
 }
@@ -907,7 +939,6 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     let mut transfers = 0u64;
     let mut widenings = 0u64;
     let cap = max_disjuncts.max(1);
-
     while let Some(node) = queue.pop_front() {
         queued.remove(&node);
         let mut current = incoming.get_mut(&node).map(std::mem::take).unwrap_or_default();
