@@ -214,6 +214,7 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     ensure_maps = getattr(store.index, "ensure_maps", None)
     if ensure_maps is not None:
         ensure_maps()
+    _emit("navigation maps")
     tier_done = perf_counter()
     _emit("dataflow tier")
     requested = lifetime_engine or os.environ.get(
@@ -235,6 +236,7 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
+    _emit("translation")
     cached_coverage = getattr(store, "_pass3_coverage_cache", None)
     if (cached_coverage is not None and cached_coverage[0] is F
             and cached_coverage[1] is succ):

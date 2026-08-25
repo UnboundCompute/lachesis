@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+from time import perf_counter
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
@@ -125,6 +127,19 @@ class Analysis:
 
     # -- the two heavy builds, one implementation each ------------------------------
 
+    @staticmethod
+    def _pass2_timing(label: str, started: float) -> None:
+        """Emit opt-in timings for the catalog/temporal half of Pass 2."""
+        if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
+            print(f"[lachesis pass2] {label}: {perf_counter() - started:.3f}s",
+                  file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _pass2_progress(label: str, elapsed: float) -> None:
+        if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
+            print(f"[lachesis pass2] temporal {label}: {elapsed:.3f}s",
+                  file=sys.stderr, flush=True)
+
     def _flow_bundle(self, engine: str | None = None, lang: str = "c",
                      **run_kwargs: Any) -> dict:
         """The interprocedural flow pass over the whole graph, computed once and cached.
@@ -186,7 +201,9 @@ class Analysis:
         from lachesis import bind_cache
 
         # The sidecar always holds the FULL temporal bind, so a hit answers both modes.
+        started = perf_counter()
         cached = bind_cache.load(self.store)
+        self._pass2_timing("bind sidecar load", started)
         if cached is not None:
             stamped, summary = cached
             complete = True
@@ -216,19 +233,26 @@ class Analysis:
         from lachesis.integrations.atropos.enrich import atropos_enrich
         from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
+        started = perf_counter()
         graph = self.store.take_retained_enriched_graph()
         if graph is None:
             graph = materialize_graph(self.store.index)
+            self._pass2_timing("bind graph materialize", started)
         else:
             # enrich_graph sorts by the public three-field edge key.  The Kùzu
             # materializer also orders equal triples by properties, which is
             # observable to downstream bind/flow iteration.  Match that canonical
             # order on the one-shot retained view before handing it to the binder.
             _sort_materialized_edges(graph["edges"])
-        return atropos_enrich(
+            self._pass2_timing("bind retained graph sort", started)
+        bind_started = perf_counter()
+        result = atropos_enrich(
             graph, complete_dataflow=False,
             symbol_index_source=getattr(self.store, "index", None),
         )
+        self._pass2_timing("catalog structural bind", bind_started)
+        self._pass2_timing("catalog structural bind total", started)
+        return result
 
     def _enrich_and_merge(self, *, deadline: Deadline | None = None) -> tuple[dict, dict, bool]:
         """The structural bind plus the Pass 3 semantic skeleton the temporal families read.
@@ -250,10 +274,13 @@ class Analysis:
         semantic_coverages: list = []
         complete = True
         for language in summary.get("languages") or ("c",):
-            flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline)
+            flow_started = perf_counter()
+            flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline,
+                                      progress=self._pass2_progress)
                     if language == "c" else
                     run_pass(self.store, lang=language, lifetime_engine="object",
-                             deadline=deadline))
+                             deadline=deadline, progress=self._pass2_progress))
+            self._pass2_timing(f"catalog temporal flow {language}", flow_started)
             if (flow.get("lifetime") or {}).get("timed_out"):
                 complete = False
             semantic = flow.get("semantic_graph")

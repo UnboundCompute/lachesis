@@ -878,6 +878,20 @@ class KuzuGraphIndex:
                       "properties": self._header_by_id.get(nid, {})}
                      for nid in node_ids)
 
+    @timeit
+    def metadata_by_kind(self, kinds) -> dict[str, dict]:
+        """Read only the property tails for a small set of node kinds."""
+        result = {}
+        res = self._conn.execute(
+            "MATCH (n:Node) WHERE n.kind IN $kinds RETURN n.id, n.props",
+            {"kinds": list(dict.fromkeys(kinds))},
+        )
+        while res.has_next():
+            nid, props = res.get_next()
+            result[decode_id(nid, self._id_prefixes)] = _restore(
+                props, self._props_dict, restore_defaults=False)
+        return result
+
     def _ids_of_kind(self, kinds) -> frozenset:
         key = frozenset(kinds)
         cached = self._kind_ids.get(key)

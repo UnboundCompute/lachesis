@@ -926,6 +926,13 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
                         for nid in ix.by_kind.get(kind, ())]
         callable_headers = {node["id"]: node
                             for node in ix.node_headers(callable_ids)}
+        if hasattr(ix, "metadata_by_kind"):
+            for node_id, metadata in ix.metadata_by_kind(
+                    ("function", "method", "constructor")).items():
+                header = callable_headers.get(node_id)
+                if header is not None:
+                    header["properties"] = {
+                        **header.get("properties", {}), **metadata}
 
         def has_body(owner_id):
             # Declaration-only callables in the C graph own only the synthetic
@@ -965,11 +972,10 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
                    for node_id in ix.by_owner.get(owner_id, ()))
         }
         definition_ids = [nid for nid in all_definition_ids if nid in full_definition_ids]
-        ix._warm_nodes(definition_ids)
         ix._warm_nodes(ix.by_kind.get("macro", ()))
         fnodes = []
         for nid in all_definition_ids:
-            node = ix.nodes.get(nid) if nid in full_definition_ids else callable_headers[nid]
+            node = callable_headers[nid]
             if node is not None:
                 fnodes.append(node)
 
