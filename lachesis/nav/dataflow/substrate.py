@@ -39,10 +39,110 @@ _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOpera
 
 _CACHE_VERSION = 1
 _CACHE_SUFFIX = ".pass3.substrate.pb"
+_PASS2_OWNER_CACHE_VERSION = 1
+_PASS2_OWNER_CACHE_SUFFIX = ".pass2.owner.pb"
 
 
 def substrate_cache_path(graph_path):
     return Path(str(graph_path).rstrip("/") + _CACHE_SUFFIX)
+
+
+def pass2_owner_cache_path(graph_path):
+    """The Pass-1 owner stream consumed by Pass-2 object analysis."""
+    return Path(str(graph_path).rstrip("/") + _PASS2_OWNER_CACHE_SUFFIX)
+
+
+def write_pass2_owner_cache(graph, graph_path, *, manifest=None):
+    """Persist owned node records so Pass 2 need not rescan Kùzu bodies.
+
+    The records are sorted by owner and id, matching ``stream_nodes_by_owner``'s
+    callback contract.  This is deliberately a raw structural sidecar: interprocedural
+    summaries still belong to Pass 2 and are never cached here.
+    """
+    nodes = [node for node in graph.get("nodes", ())
+             if (node.get("properties") or {}).get("owner_function_id")]
+    nodes.sort(key=lambda node: (
+        str((node.get("properties") or {}).get("owner_function_id")),
+        str(node.get("id") or ""),
+    ))
+    manifest = dict(manifest or {})
+    header = {
+        "type": "lachesis-pass2-owner-cache",
+        "version": _PASS2_OWNER_CACHE_VERSION,
+        "node_count": len(nodes),
+        "store_version": manifest.get("version"),
+        "core_content_hash": manifest.get("core_content_hash"),
+        "source_content_hash": manifest.get("source_content_hash"),
+        "build_fingerprint": manifest.get("build_fingerprint"),
+    }
+    target = pass2_owner_cache_path(graph_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".pass2-owner-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            write_frame(handle, encode_document(header))
+            property_cache = {}
+            for node in nodes:
+                write_frame(handle, b"N" + encode_node(node, _property_cache=property_cache))
+        os.replace(temp_name, target)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return str(target)
+
+
+def stream_pass2_owner_cache(index, owner_ids, callback):
+    """Stream valid Pass-1 owner records; return False on a cache miss."""
+    path = pass2_owner_cache_path(
+        getattr(index, "_pass3_cache_base", None) or getattr(index, "_db_dir", ""))
+    if not path.is_file():
+        return False
+    try:
+        frames = read_frames(path)
+        header = decode_document(next(frames))
+        expected = getattr(index, "_store_manifest", {})
+        if (header.get("type") != "lachesis-pass2-owner-cache" or
+                header.get("version") != _PASS2_OWNER_CACHE_VERSION):
+            return False
+        for header_key, manifest_key in {
+                "store_version": "version",
+                "core_content_hash": "core_content_hash",
+                "source_content_hash": "source_content_hash",
+                "build_fingerprint": "build_fingerprint",
+        }.items():
+            if header.get(header_key) != expected.get(manifest_key):
+                return False
+        wanted = {owner for owner in owner_ids if owner}
+        current_owner = None
+        batch = []
+        for frame in frames:
+            if not frame or frame[:1] != b"N":
+                continue
+            node = decode_node(frame[1:])
+            owner = (node.get("properties") or {}).get("owner_function_id")
+            if owner not in wanted:
+                continue
+            if owner != current_owner:
+                if current_owner is not None and batch:
+                    callback(current_owner, batch)
+                current_owner, batch = owner, []
+            overlay = getattr(index, "_overlay", None)
+            if overlay is not None:
+                extra = overlay.node_props.get(node["id"])
+                if extra:
+                    properties = dict(node.get("properties") or {})
+                    properties.update(extra)
+                    node = {**node, "properties": properties}
+            index._node_cache[node["id"]] = node
+            batch.append(node)
+        if current_owner is not None and batch:
+            callback(current_owner, batch)
+        return True
+    except (OSError, StopIteration, ValueError, TypeError, KeyError):
+        return False
 
 
 def write_substrate_cache(graph, graph_path, *, manifest=None):

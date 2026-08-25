@@ -853,7 +853,8 @@ class KuzuGraphIndex:
         if kinds:
             wanted = self._ids_of_kind(kinds)
             owned = [nid for nid in owned if nid in wanted]
-        if len(owned) > 1:
+        if (len(owned) > 1 and
+                not all(self._node_cache.get(nid) is not None for nid in owned)):
             self._warm_nodes(owned)
         return tuple(self._node(nid) for nid in owned)
 
@@ -986,6 +987,13 @@ class KuzuGraphIndex:
         accepted = list(dict.fromkeys(kinds or ()))
         if not owners:
             return
+        if not accepted:
+            # Pass 1 publishes a content-addressed owner stream beside the store. It
+            # contains the same full node records needed by object CFG preparation,
+            # so the cold Pass-2 path can avoid a large Kùzu scan entirely.
+            from lachesis.nav.dataflow.substrate import stream_pass2_owner_cache
+            if stream_pass2_owner_cache(self, owners, callback):
+                return
         kind_clause = " AND n.kind IN $kinds" if accepted else ""
         params = {"owners": owners}
         if accepted:
