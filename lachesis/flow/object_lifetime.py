@@ -745,6 +745,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         name = node.get("label")
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
+    name_by_owner = {owner_id: name for name, owner_id in by_name.items()}
 
     cfgs = {}
     cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}
@@ -772,7 +773,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
             stream_idx = sub.idx
             for node in records:
                 stream_idx._node_cache[node["id"]] = node
-            name = by_name.get(owner_id)
+            name = name_by_owner.get(owner_id)
             if name is not None:
                 cfg_started = perf_counter()
                 prepare_cfg(name, owner_id)
