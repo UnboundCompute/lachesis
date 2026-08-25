@@ -10,6 +10,8 @@ use std::ffi::{c_char, CStr, CString};
 
 use serde::{Deserialize, Serialize};
 
+mod atropos_bind;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Path {
     pub root: String,

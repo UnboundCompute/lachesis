@@ -133,7 +133,12 @@ def atropos_enrich(
                 language=language, source="lachesis",
             )
         index = {**canonical_projection, "language": language}
-        report = binder.bind_all(lang_models, index)
+        report = None
+        if os.environ.get("LACHESIS_NATIVE_ATROPOS") == "1":
+            from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
+            report = native_bind_all(lang_models, index)
+        if report is None:
+            report = binder.bind_all(lang_models, index)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
         unbound: List[dict] = []
