@@ -889,7 +889,12 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
 
     while let Some(node) = queue.pop_front() {
         queued.remove(&node);
-        let mut current = incoming.get(&node).cloned().unwrap_or_default();
+        let mut current = incoming.get_mut(&node).map(std::mem::take).unwrap_or_default();
+        if tracked_nodes.contains(&node) {
+            // Keep the point state available for the semantic emitter, while
+            // allowing unobserved CFG nodes to transfer ownership directly.
+            incoming.insert(node.clone(), current.clone());
+        }
         for operation in at.get(&node).into_iter().flatten() {
             let mut next = Vec::with_capacity(current.len());
             for state in current {
@@ -901,7 +906,43 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         if tracked_nodes.contains(&node) {
             post.insert(node.clone(), current.clone());
         }
-        for successor in successors.get(&node).into_iter().flatten() {
+        let outgoing = successors.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+        if outgoing.len() == 1 {
+            // The common CFG case: no branch means the states have exactly one
+            // destination, so move them instead of cloning every abstract state.
+            let successor = &outgoing[0];
+            if !incoming.contains_key(successor) {
+                continue;
+            }
+            let mut target = incoming.get_mut(successor).map(std::mem::take).unwrap_or_default();
+            let mut new_items = current.into_iter().filter(|state| {
+                !target.iter().any(|existing| existing.semantically_equal(state))
+            }).collect::<Vec<_>>();
+            if new_items.is_empty() {
+                incoming.insert(successor.clone(), target);
+                continue;
+            }
+            let should_widen = target.len() + new_items.len() > cap
+                || widened.contains(successor);
+            let (replacement, changed) = if should_widen {
+                target.append(&mut new_items);
+                let merged = join_states(&target, successor);
+                let changed = target.len() != 1
+                    || !target.first().is_some_and(|old| old.semantically_equal(&merged));
+                widened.insert(successor.clone());
+                widenings += 1;
+                (vec![merged], changed)
+            } else {
+                target.append(&mut new_items);
+                (target, true)
+            };
+            incoming.insert(successor.clone(), replacement);
+            if changed && queued.insert(successor.clone()) {
+                queue.push_back(successor.clone());
+            }
+            continue;
+        }
+        for successor in outgoing {
             if !incoming.contains_key(successor) {
                 continue;
             }
