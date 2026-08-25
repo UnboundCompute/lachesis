@@ -11,6 +11,7 @@ from ..query import GraphIndex
 
 #: Told the overlay id, its wall time, and the size of the delta it contributed.
 OverlayObserver = Callable[[str, float, int, int], None]
+DeltaSink = Callable[[list[dict], list[dict]], None]
 
 
 class CanonicalOverlay(Protocol):
@@ -36,7 +37,10 @@ class OverlayRegistry:
     def overlays(self) -> Tuple[CanonicalOverlay, ...]:
         return tuple(self._overlays)
 
-    def enrich(self, graph: dict, observer: Optional[OverlayObserver] = None) -> dict:
+    def enrich(
+        self, graph: dict, observer: Optional[OverlayObserver] = None,
+        delta_sink: Optional[DeltaSink] = None,
+    ) -> dict:
         """Fold every applicable overlay's facts into one graph.
 
         The accumulator is what makes this affordable. Recomposing the whole graph after
@@ -71,7 +75,13 @@ class OverlayRegistry:
                 # through every later overlay and the final global sort; on large
                 # graphs that otherwise retains a redundant graph-sized pair of lists.
                 graph = None
-            index.absorb(*accumulator.apply(delta))
+            fresh_nodes, fresh_edges = accumulator.apply(delta)
+            if delta_sink is not None:
+                # Emit only records that survived accumulator deduplication.  A
+                # sidecar writer can retain these deltas and release the full
+                # enriched graph immediately after the fold.
+                delta_sink(fresh_nodes, fresh_edges)
+            index.absorb(fresh_nodes, fresh_edges)
             # Overlay predicates and indexes are order-independent.  Defer the
             # global node/edge sort until the fold is complete; sorting the full
             # graph after every small overlay is a large, avoidable cost.

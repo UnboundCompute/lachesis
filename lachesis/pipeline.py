@@ -182,7 +182,7 @@ def _combined_capabilities(snapshots: Sequence[FrontendSnapshot]) -> dict[str, s
 
 def enrich_graph(
     graph: CodeGraph, languages: Iterable[str], capabilities: Dict[str, str],
-    observer=None,
+    observer=None, delta_sink=None,
 ) -> CodeGraph:
     """Fold the four overlay registries over a core graph to produce the dataflow tier.
 
@@ -203,13 +203,14 @@ def enrich_graph(
     from .core.query import GraphIndex
     from .ecosystems import default_ecosystem_registry
 
-    graph = default_overlay_registry().enrich(graph, observer)
+    graph = default_overlay_registry().enrich(graph, observer, delta_sink)
     # Ecosystem models consume kind/adjacency lookups and package_inventory only;
     # defer navigation-only label/file/owner buckets, which otherwise retain several
     # extra references per record during large pass-three enrichments.
     index = GraphIndex(graph, compact=True)
     graph = default_ecosystem_registry().enrich(
         graph, index.package_inventory(), set(languages), capabilities, index,
+        delta_sink,
     )
     # The ecosystem index describes the pre-model graph and is no longer consulted;
     # drop its node/adjacency references before the remaining overlay registries run.
@@ -217,7 +218,9 @@ def enrich_graph(
     # Async model facts must be visible to taint, but both folds only need the same
     # compact index surface. Run them in order through one registry so pass 2 does not
     # rebuild a graph-sized index and accumulator between the two one-overlay registries.
-    graph = default_dataflow_overlay_registry().enrich(graph, observer)
+    graph = default_dataflow_overlay_registry().enrich(
+        graph, observer, delta_sink,
+    )
 
     # Opt-in field-sensitive reaching-def tier. Additive and independent (its
     # applies() is a no-op unless the graph has the C AST + CFG edges), folded here
@@ -229,7 +232,7 @@ def enrich_graph(
         from .core.overlays.c_reaching_def import CReachingDef
         rd_registry = OverlayRegistry()
         rd_registry.register(CReachingDef())
-        graph = rd_registry.enrich(graph, observer)
+        graph = rd_registry.enrich(graph, observer, delta_sink)
     return graph
 
 

@@ -435,8 +435,7 @@ class GraphStore:
         if getattr(self, "_enriched", True):
             return self
         from lachesis.kuzu_store import (graph_content_hash, manifest_capabilities,
-                                         manifest_languages, read_store_manifest,
-                                         write_kuzu_graph)
+                                         manifest_languages, read_store_manifest)
         from lachesis.pipeline import enrich_graph
         from lachesis.nav.kuzu_index import materialize_graph
 
@@ -469,60 +468,57 @@ class GraphStore:
         )
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
-        enriched = enrich_graph(core, manifest_languages(manifest),
-                               manifest_capabilities(manifest))
-        cache = dataflow_overlay_path(core_path)
-        core_node_ids = {id(node) for node in core["nodes"]}
-        core_edge_ids = {id(edge) for edge in core["edges"]}
-        # The identity sets are all that cache classification needs from the core
-        # containers; release their list/dict wrapper before assembling the derived
-        # payload, which may itself retain the shared record objects.
-        del core
-        enriched_node_ids = {id(node) for node in enriched["nodes"]}
-        enriched_edge_ids = {id(edge) for edge in enriched["edges"]}
-        additive = (
-            core_node_ids.issubset(enriched_node_ids)
-            and core_edge_ids.issubset(enriched_edge_ids)
+        # Every registered enrichment is represented by an additive GraphDelta.
+        # Capture only the records accepted by the fold; this lets the cold sidecar
+        # path release the 2.9M-record enriched view before protobuf encoding.
+        derived_nodes = []
+        derived_edges = []
+
+        def collect_delta(nodes, edges):
+            derived_nodes.extend(nodes)
+            derived_edges.extend(edges)
+
+        enriched = enrich_graph(
+            core, manifest_languages(manifest), manifest_capabilities(manifest),
+            delta_sink=collect_delta,
         )
-        if additive:
-            payload = {
-                "overlay_id": "dataflow",
-                "source": Path(core_path).name,
-                "version": 1,
-                "core_content_hash": core_hash,
-                "node_props": {}, "edge_props": {},
-                "derived_nodes": [node for node in enriched["nodes"]
-                                  if id(node) not in core_node_ids],
-                "derived_edges": [edge for edge in enriched["edges"]
-                                  if id(edge) not in core_edge_ids],
-            }
-            fd, temporary = tempfile.mkstemp(
-                prefix=".lachesis-dataflow-", suffix=".pb",
-                dir=os.path.dirname(os.path.abspath(cache)),
-            )
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(encode_overlay(payload))
-                os.replace(temporary, cache)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
-                                     dataflow_path=cache)
-        else:
-            # A future overlay that mutates canonical records is not safe to represent
-            # as a delta; retain the existing full Kùzu-cache fallback for that case.
-            cache = enriched_store_path(core_path)
-            write_kuzu_graph(enriched, None, cache, prune=False,
-                             enriched=True, core_content_hash=core_hash,
-                             low_memory=True, buffer_pool_size=2 << 30,
-                             checkpoint_threshold=256 << 20)
-            _copy_frontend_inventory(core_path, cache)
-            fresh = type(self)._open(cache, overlay_path=self._overlay_path)
-        # The derived graph is now represented by the attached cache. Release the
-        # materialized lists before reopening so large action runs do not overlap
-        # two graph-sized Python representations.
-        del enriched
+        cache = dataflow_overlay_path(core_path)
+        # GraphAccumulator returns fresh records in deterministic delta order.  Match
+        # the prior enriched-view ordering while sorting only the small additive tier,
+        # not the 919k-node/2M-edge core that is about to be released.
+        derived_nodes.sort(key=lambda node: node["id"])
+        derived_edges.sort(key=lambda edge: (
+            edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
+        ))
+        payload = {
+            "overlay_id": "dataflow",
+            "source": Path(core_path).name,
+            "version": 1,
+            "core_content_hash": core_hash,
+            "node_props": {}, "edge_props": {},
+            "derived_nodes": derived_nodes,
+            "derived_edges": derived_edges,
+        }
+        # The sidecar path is additive by construction: GraphAccumulator rejects
+        # conflicting replacements of an existing canonical node. Release both the
+        # core and final enriched containers before serializing the retained deltas.
+        del core, enriched
+        fd, temporary = tempfile.mkstemp(
+            prefix=".lachesis-dataflow-", suffix=".pb",
+            dir=os.path.dirname(os.path.abspath(cache)),
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encode_overlay(payload))
+            os.replace(temporary, cache)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
+                                 dataflow_path=cache)
+        # The derived graph is now represented by the attached cache. The local
+        # payload/derived lists disappear on return; the core graph was released
+        # before encoding, so reopening never overlaps two whole-graph views.
         self.overlay = fresh.overlay
         self.graph = fresh.graph
         self.gl = fresh.gl
