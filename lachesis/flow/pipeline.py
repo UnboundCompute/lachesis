@@ -302,7 +302,11 @@ def run_pass(store, lang="c", lifetime_engine=None):
             # Re-enable the compatibility typestate stream only for functions
             # whose semantic object analysis could not produce a trustworthy
             # graph. Healthy object-mode paths never depend on the old flow.
-            skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
+            legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
+            legacy_summaries = {name: summaries.get(name, ())
+                                for name in legacy_functions}
+            skeletons = build_skeletons(legacy_functions, legacy_summaries,
+                                        lang=lang, include_typestate=True)
         object_flow = diagnostics.get("unsafe_object_flow", {})
         covered = set(F) - seed_unsafe
         if requested == "shadow":
@@ -313,7 +317,11 @@ def run_pass(store, lang="c", lifetime_engine=None):
         else:
             fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
             if seed_unsafe and not skeletons:
-                skeletons = build_skeletons(F, summaries, lang=lang, include_typestate=True)
+                legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
+                legacy_summaries = {name: summaries.get(name, ())
+                                    for name in legacy_functions}
+                skeletons = build_skeletons(legacy_functions, legacy_summaries,
+                                            lang=lang, include_typestate=True)
             legacy_leads = _match_object_mode_legacy(skeletons, fallback_cfg, seed_unsafe)
             # The frozen graph/matcher is now the production lifetime path.  Keep the old
             # matcher only for non-lifetime reach leads and as a diagnostic fallback for
