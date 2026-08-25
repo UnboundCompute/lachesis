@@ -745,16 +745,36 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
 
-    sub.warm_owned(by_name.values())
-
     cfgs = {}
     cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}
-    for name, function_id in by_name.items():
+    def prepare_cfg(name, function_id):
         cfg = ReachingDef(sub).analyze(function_id, reaching_defs=False)
         if cfg is None or cfg.get("bailed"):
             cfg_failures[name] = "too-large" if cfg and cfg.get("bailed") else "no-cfg"
         else:
             cfgs[name] = cfg
+
+        # Streaming callers retain only the current owner's records. The substrate and
+        # index caches are deliberately evicted after CFG preparation so a million-node
+        # graph cannot become a second whole-graph Python object graph.
+    stream = getattr(getattr(sub, "idx", None), "stream_nodes_by_owner", None)
+    if stream is not None:
+        def consume(owner_id, records):
+            stream_ids = {node["id"] for node in records}
+            stream_idx = sub.idx
+            for node in records:
+                stream_idx._node_cache[node["id"]] = node
+            name = by_name.get(owner_id)
+            if name is not None:
+                prepare_cfg(name, owner_id)
+            for node_id in stream_ids:
+                stream_idx._node_cache.pop(node_id, None)
+                sub._node.pop(node_id, None)
+        stream(by_name.values(), consume)
+    else:
+        sub.warm_owned(by_name.values())
+        for name, function_id in by_name.items():
+            prepare_cfg(name, function_id)
     cfg_seconds = perf_counter() - started
 
     # Absence means "no analyzable summary", not "proven to have no effects". That

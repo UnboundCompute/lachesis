@@ -975,6 +975,61 @@ class KuzuGraphIndex:
             }
 
     @timeit
+    def stream_nodes_by_owner(self, owner_ids, callback, kinds=None) -> None:
+        """Feed full owned-node records to ``callback`` one owner at a time.
+
+        The query still scans the selected owners once, but unlike ``_warm_nodes_by_owner``
+        it does not retain every body in ``_node_cache``. Consumers can analyze and evict the
+        current owner's records before the next group arrives.
+        """
+        owners = [owner for owner in owner_ids if owner]
+        accepted = list(dict.fromkeys(kinds or ()))
+        if not owners:
+            return
+        kind_clause = " AND n.kind IN $kinds" if accepted else ""
+        params = {"owners": owners}
+        if accepted:
+            params["kinds"] = accepted
+        merged_without_owner = ", ".join(
+            f"n.{column}" for column in _MERGED_COLUMNS
+            if column != "owner_function_id")
+        res = self._conn.execute(
+            f"MATCH (n:Node) WHERE n.owner_function_id IN $owners"
+            f"{kind_clause} RETURN n.owner_function_id, n.id, n.kind, n.label, "
+            f"{merged_without_owner}, n.props ORDER BY n.owner_function_id",
+            params,
+        )
+        current_owner = None
+        batch = []
+
+        def flush():
+            nonlocal batch, current_owner
+            if current_owner is not None and batch:
+                callback(current_owner, batch)
+            batch = []
+
+        while res.has_next():
+            row = res.get_next()
+            owner = row[0]
+            if owner != current_owner:
+                flush()
+                current_owner = owner
+            node_id = decode_id(row[1], self._id_prefixes)
+            kind, label = row[2:4]
+            selected = iter(row[4:-1])
+            columns = [row[0] if column == "owner_function_id" else next(selected)
+                       for column in _MERGED_COLUMNS]
+            properties = _restore_node_props(
+                columns, row[-1], self._props_dict, self._id_prefixes)
+            if self._overlay is not None:
+                properties.update(self._overlay.node_props.get(node_id) or {})
+            node = {"id": node_id, "kind": kind, "label": label,
+                    "properties": properties}
+            self._node_cache[node_id] = node
+            batch.append(node)
+        flush()
+
+    @timeit
     def _node_spans(self, node_ids, batch_size: int = 5000) -> dict[str, dict]:
         """Fetch only source-span columns for a bounded set of node ids.
 
