@@ -166,7 +166,9 @@ pub(crate) fn sidecar_to_request(
     let node_by_id: HashMap<String, &graph_proto::NodeRecord> = nodes.iter()
         .map(|item| (item.id.clone(), item)).collect();
     let mut parents = HashMap::new();
-    for item in &edges {
+    let mut edges_by_source: HashMap<String, Vec<usize>> = HashMap::new();
+    for (edge_index, item) in edges.iter().enumerate() {
+        edges_by_source.entry(item.source.clone()).or_default().push(edge_index);
         if item.kind == "AST_CHILD" {
             parents.entry(item.target.clone()).or_insert_with(|| item.source.clone());
         }
@@ -220,24 +222,27 @@ pub(crate) fn sidecar_to_request(
         if let Some(parent) = parent {
             let parent_kind = scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
             if parent_kind == "BinaryOperator" && scalar(parent, "operator").as_deref() == Some("=") {
-                if let Some(left) = edges.iter().find(|edge| {
-                    edge.source == parent.id && edge.kind == "AST_CHILD"
-                        && edge_scalar(edge, "role").as_deref() == Some("LEFT_OPERAND")
-                }) {
+                if let Some(left) = edges_by_source.get(&parent.id).into_iter().flatten()
+                    .map(|index| &edges[*index]).find(|edge| {
+                        edge.kind == "AST_CHILD"
+                            && edge_scalar(edge, "role").as_deref() == Some("LEFT_OPERAND")
+                    }) {
                     call.assigned = left.target.clone();
                 }
             }
         }
         if call.assigned.is_empty() {
-            if let Some(initializer) = edges.iter().find(|edge| {
-                edge.kind == "VALUE_FLOWS_TO" && edge.source == item.id
-                    && edge_scalar(edge, "reason").as_deref() == Some("initializer")
-            }) {
+            if let Some(initializer) = edges_by_source.get(&item.id).into_iter().flatten()
+                .map(|index| &edges[*index]).find(|edge| {
+                    edge.kind == "VALUE_FLOWS_TO"
+                        && edge_scalar(edge, "reason").as_deref() == Some("initializer")
+                }) {
                 call.assigned = initializer.target.clone();
             }
         }
-        let mut arguments = edges.iter().filter_map(|edge| {
-            if edge.kind != "AST_CHILD" || edge.source != item.id
+        let mut arguments = edges_by_source.get(&item.id).into_iter().flatten().filter_map(|index| {
+            let edge = &edges[*index];
+            if edge.kind != "AST_CHILD"
                 || edge_scalar(edge, "role").as_deref() != Some("ARGUMENT") { return None; }
             Some(lifetime_proto::FunctionArgument {
                 position: edge_scalar(edge, "position").and_then(|value| value.parse().ok()).unwrap_or_default(),

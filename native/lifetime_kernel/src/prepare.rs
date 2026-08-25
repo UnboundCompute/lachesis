@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use prost::Message;
+use rayon::prelude::*;
 
 use crate::{lifetime_proto, Kind, Operation, Path};
 
@@ -871,9 +872,21 @@ pub(crate) fn solve_prepared(input: &[u8]) -> Result<Vec<u8>, String> {
 fn solve_prepared_functions(
     prepared: Vec<lifetime_proto::PreparedFunction>,
 ) -> Result<Vec<u8>, String> {
-    let mut results = Vec::with_capacity(prepared.len());
-    for function in prepared {
+    let mut results = prepared.into_par_iter().map(|function| -> Result<lifetime_proto::PreparedFunctionResult, String> {
         let prepared_for_output = function.clone();
+        // A CFG with no lifetime operations cannot produce a finding or a
+        // state transition.  Avoid allocating its node/state worklists; keep
+        // the prepared CFG in the result so callers retain complete metadata.
+        if function.operations.is_empty() {
+            return Ok(lifetime_proto::PreparedFunctionResult {
+                id: function.id,
+                result: Some(lifetime_proto::Result {
+                    exit_state: Some(lifetime_proto::Snapshot::default()),
+                    ..Default::default()
+                }),
+                prepared: Some(prepared_for_output),
+            });
+        }
         let operations = function.operations.into_iter().map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
         let successors = function.successors.into_iter().map(|entry| (entry.node, entry.targets)).collect::<HashMap<_, _>>();
         let mut initial = crate::State::default();
@@ -881,12 +894,13 @@ fn solve_prepared_functions(
             initial.seed_parameter(Path::root(format!("decl:{root}")), position as u32);
         }
         let solved = crate::solve_graph(&function.nodes, &successors, &operations, initial, 32);
-        results.push(lifetime_proto::PreparedFunctionResult {
+        Ok(lifetime_proto::PreparedFunctionResult {
             id: function.id,
             result: Some(crate::proto_result(solved)),
             prepared: Some(prepared_for_output),
-        });
-    }
+        })
+    }).collect::<Result<Vec<_>, _>>()?;
+    results.sort_by(|left, right| left.id.cmp(&right.id));
     let result = lifetime_proto::PrepareSolveResult { functions: results };
     let mut output = Vec::new();
     result.encode(&mut output).map_err(|error| error.to_string())?;

@@ -927,7 +927,7 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
     """
     from lachesis.nav.dataflow.substrate import substrate_cache_path
     from .native_lifetime import (decode_prepared_result,
-                                  prepare_graph_solve_details_pb,
+                                  prepare_graph_pb,
                                   solve_prepared_pb)
 
     base = (getattr(analysis_index, "_pass3_cache_base", None)
@@ -945,8 +945,16 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
     prepared = getattr(analysis_index, "_native_prepared", None)
-    native = (solve_prepared_pb(prepared) if prepared is not None
-              else prepare_graph_solve_details_pb(sidecar))
+    if prepared is None:
+        # CFG/operation preparation is whole-graph and cheap (~7s on libxml2),
+        # but abstract solving is not.  Solve only the lifetime slice requested
+        # by this Pass-3 call instead of solving declarations and unrelated
+        # functions whose results are discarded below.
+        prepared = prepare_graph_pb(sidecar)
+    selected_ids = set(by_name.values())
+    selected = {function_id: item for function_id, item in prepared.items()
+                if function_id in selected_ids}
+    native = solve_prepared_pb(selected)
     sub = cached_substrate(analysis_index).load()
     summaries = {}
     artifacts = {}

@@ -9,6 +9,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
+rayon = "1.10"
 
 [build-dependencies]
 prost-build = "0.13"
