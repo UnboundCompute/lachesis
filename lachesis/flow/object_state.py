@@ -570,11 +570,15 @@ class ObjectStateAnalyzer:
         # skipping the solver entirely.
         if not any(at.values()):
             state = seed.clone()
-            point_states = {node: (state.clone(),) for node in nodes}
-            post_states = {node: (state.clone(),) for node in nodes}
+            # No operation can mutate this state.  Keep one immutable snapshot object
+            # for the whole CFG instead of cloning the same empty maps once per node;
+            # large wrapper/declaration-only functions otherwise turn this fast path
+            # into an avoidable allocation and memory-retention cost.
+            point_states = {node: (state,) for node in nodes}
+            post_states = {node: (state,) for node in nodes}
             return AnalysisResult(
                 findings=findings,
-                exit_states=(state.clone(),),
+                exit_states=(state,),
                 unplaced=tuple(unplaced),
                 transfers=0,
                 widenings=0,
