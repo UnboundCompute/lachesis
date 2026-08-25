@@ -231,6 +231,10 @@ def solve_linear(nodes, successors, operations, initial: AbstractState):
         result.ParseFromString(ctypes.string_at(pointer, output_length.value))
     finally:
         library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return _decode_result(result, nodes, operations)
+
+
+def _decode_result(result, nodes, operations):
     memo: dict[str, tuple] = {}
     point_states = {
         item.node: tuple(_snapshot_message(snapshot, memo) for snapshot in item.states)
