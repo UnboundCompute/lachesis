@@ -73,13 +73,13 @@ class Analysis:
 
     @classmethod
     def open(cls, path: str, *, overlay: str | None = None,
-             progress: ProgressFn | None = None) -> "Analysis":
+             progress: ProgressFn | None = None, defer_maps: bool = False) -> "Analysis":
         """Load a graph once and return a warm session over it. ``~`` is expanded."""
         from lachesis.nav.graph_store import GraphStore
 
         path = os.path.expanduser(path)
         overlay = os.path.expanduser(overlay) if overlay else overlay
-        store = GraphStore.load(path, overlay_path=overlay)
+        store = GraphStore.load(path, overlay_path=overlay, defer_maps=defer_maps)
         return cls(store, progress=progress)
 
     @classmethod

@@ -563,6 +563,25 @@ class KuzuGraphIndex:
             for ids in buckets.values():
                 ids.sort()
 
+    def ensure_maps(self) -> None:
+        """Build navigation buckets after a deferred whole-graph operation.
+
+        Pass 2 only needs columnar scans plus the compact projection used by the
+        catalog binder. Building four navigation maps before materializing a million
+        nodes duplicates graph-sized id references during the peak. Deferred callers
+        opt into the maps immediately before a pass-3 translator or navigation query
+        needs them.
+        """
+        if not self._maps_deferred:
+            return
+        overlay = self._overlay
+        self._build_maps()
+        self._maps_deferred = False
+        if overlay is not None:
+            # `_build_maps` covers resident Kùzu rows; reattach additive rows after
+            # rebuilding so warm sidecars are represented in the same buckets too.
+            self.attach_overlay(overlay)
+
     # -- sidecar overlay ----------------------------------------------------
 
     def attach_overlay(self, overlay) -> None:
@@ -606,6 +625,11 @@ class KuzuGraphIndex:
         self._ids.sort()
 
     def _node_count(self) -> int:
+        if self._maps_deferred:
+            result = self._conn.execute("MATCH (n:Node) RETURN count(n)")
+            count = int(result.get_next()[0]) if result.has_next() else 0
+            overlay = getattr(self, "_overlay", None)
+            return count + len(overlay.derived_nodes) if overlay is not None else count
         return len(self._ids)
 
     def _all_ids(self):

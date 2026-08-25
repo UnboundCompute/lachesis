@@ -207,6 +207,13 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         }
 
     store.ensure_dataflow_tier()
+    # A Pass-2 session may have deliberately deferred Kùzu's navigation buckets
+    # until after whole-graph enrichment. At this boundary the retained materialized
+    # graph has already been consumed by the structural bind, so rebuilding maps no
+    # longer overlaps that graph-sized temporary.
+    ensure_maps = getattr(store.index, "ensure_maps", None)
+    if ensure_maps is not None:
+        ensure_maps()
     tier_done = perf_counter()
     _emit("dataflow tier")
     requested = lifetime_engine or os.environ.get(

@@ -39,11 +39,12 @@ def _dump(result) -> int:
     return EXIT_OK
 
 
-def _open(args, *, progress=None):
+def _open(args, *, progress=None, defer_maps=False):
     """Open the graph warm, or fail with a legible message. ``~`` is expanded by ``open``."""
     from lachesis.session import Analysis
 
-    return Analysis.open(args.graph, overlay=getattr(args, "overlay", None), progress=progress)
+    return Analysis.open(args.graph, overlay=getattr(args, "overlay", None),
+                        progress=progress, defer_maps=defer_maps)
 
 
 # --------------------------------------------------------------------------- enrich
@@ -55,7 +56,10 @@ def command_enrich(args: argparse.Namespace) -> int:
 
     with Progress(enabled=not args.json) as progress:
         progress.phase("loading graph")
-        analysis = _open(args)
+        # Pass 2 materializes the complete graph itself; defer navigation-only maps
+        # until the temporal bind enters Pass 3, avoiding another graph-sized set of
+        # references during the cold materialization peak.
+        analysis = _open(args, defer_maps=True)
         progress.phase("materializing dataflow tier + catalog bind")
         report = analysis.enrich(hard_stop=args.hard_stop)
     if args.json:
