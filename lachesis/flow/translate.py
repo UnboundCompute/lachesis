@@ -157,6 +157,7 @@ class ControlNesting:
         self._parent = {}
         self._headers = {}
         self._enclosing_cache = {}
+        self._bulk_parent_kinds = frozenset()
         if isinstance(graph, dict):
             for e in graph.get("edges", ()):
                 if e.get("kind") == "AST_CHILD":
@@ -176,6 +177,7 @@ class ControlNesting:
                 # intermediate parent column costs <1s on the libxml2 store and
                 # avoids falling back to one reverse-edge query per site.
                 target_kinds.append("expression")
+            self._bulk_parent_kinds = frozenset(target_kinds)
             self._parent = self._index.ast_direct_parents(target_kinds)
             if hasattr(self._index, "node_headers"):
                 self._headers = {
@@ -203,6 +205,16 @@ class ControlNesting:
                     cur = self._parent[cur]
                     n = self._headers.get(cur) or _header_node(self._index, cur)
                 else:
+                    # ``ast_direct_parents`` queried every AST child whose target
+                    # kind is in this set.  A missing entry for such a node means
+                    # it has no AST parent; asking Kùzu again through
+                    # incoming_of_kind() only rediscovers that empty result.  A
+                    # parent whose kind was not bulk-queried still uses the
+                    # compatibility fallback below.
+                    if (self._bulk_parent_kinds and
+                            getattr(self._index, "_kind_by_id", {}).get(cur)
+                            in self._bulk_parent_kinds):
+                        break
                     parents = self._index.incoming_of_kind(cur, "AST_CHILD")
                     if not parents:
                         break
