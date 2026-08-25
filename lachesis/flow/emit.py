@@ -52,7 +52,7 @@ from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
 from .patterns import evaluator_for
 from .object_lifetime import (APBuilder, _argument_path, _path,
-                               extract_operations, _props)
+                               analyze_object_lifetimes, extract_operations, _props)
 from .object_state import AccessPath, OpKind
 from .pipeline import _lifetime_slice
 from .semantic_graph import Event, EventKind, GuardProof, ObjRef, SkeletonGraph
