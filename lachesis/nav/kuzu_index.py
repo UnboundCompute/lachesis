@@ -829,17 +829,23 @@ class KuzuGraphIndex:
 
     @timeit
     def nodes_owned_headers(self, owner_id: str) -> tuple[dict, ...]:
-        """Return cheap body headers without inflating property tails."""
+        """Return cheap body headers without inflating property tails.
+
+        Header properties are promoted scalar values owned by this read-only
+        index.  Translation only reads them, so sharing the existing dictionary
+        avoids copying one properties mapping for every owned node on every
+        function projection.
+        """
         owned = self.by_owner.get(owner_id, ())
         return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
                       "label": self._label_by_id.get(nid),
-                      "properties": dict(self._header_by_id.get(nid, {}))}
+                      "properties": self._header_by_id.get(nid, {})}
                      for nid in owned)
 
     def node_headers(self, node_ids) -> tuple[dict, ...]:
         return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
                       "label": self._label_by_id.get(nid),
-                      "properties": dict(self._header_by_id.get(nid, {}))}
+                      "properties": self._header_by_id.get(nid, {})}
                      for nid in node_ids)
 
     def _ids_of_kind(self, kinds) -> frozenset:
