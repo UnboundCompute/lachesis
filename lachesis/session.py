@@ -238,6 +238,35 @@ class Analysis:
         from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
         started = perf_counter()
+        index = getattr(self.store, "index", None)
+        projection_fn = getattr(index, "atropos_projection", None)
+        if projection_fn is not None:
+            # Bind against the compact callsite projection before materializing the
+            # million-node graph.  Keeping the large graph out of the Python heap
+            # during canonical projection avoids allocator/GC pressure that turned a
+            # 0.1s standalone adapter call into ~30s on the cold full-graph path.
+            projection = projection_fn()
+            compact, summary = atropos_enrich(
+                projection, complete_dataflow=False, compact_structural=True,
+            )
+            delta_nodes = [
+                node for node in compact.get("nodes", ())
+                if (node.get("properties") or {}).get("fact_origin") == "atropos-model"
+            ]
+            delta_edges = [
+                edge for edge in compact.get("edges", ())
+                if (edge.get("properties") or {}).get("fact_origin") == "atropos-model"
+                or edge.get("kind") in {"TAINT_SOURCE", "TAINT_SINK"}
+            ]
+            self._pass2_timing("catalog structural bind", started)
+            materialize_started = perf_counter()
+            graph = materialize_graph(index)
+            graph["nodes"].extend(delta_nodes)
+            graph["edges"].extend(delta_edges)
+            self._pass2_timing("bind graph materialize", materialize_started)
+            self._pass2_timing("catalog structural bind total", started)
+            return graph, summary
+
         graph = self.store.take_retained_enriched_graph()
         if graph is None:
             graph = materialize_graph(self.store.index)

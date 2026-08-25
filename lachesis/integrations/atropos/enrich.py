@@ -132,7 +132,11 @@ def atropos_enrich(
         if projection_fn is not None:
             started = perf_counter()
             projection = projection_fn()
-            _phase_timing("Kuzu projection", started)
+            _phase_timing(
+                f"Kuzu projection ({len(projection.get('nodes', ())) if projection else 0:,} "
+                f"nodes, {len(projection.get('edges', ())) if projection else 0:,} edges)",
+                started,
+            )
     canonical_projection = None
     for language in languages:
         lang_models = [m for m in models if m.get("language") == language]
@@ -148,7 +152,10 @@ def atropos_enrich(
                 projection if projection is not None else graph,
                 language=language, source="lachesis",
             )
-            _phase_timing("canonical projection", started)
+            _phase_timing(
+                f"canonical projection ({len(canonical_projection['callsites']):,} callsites)",
+                started,
+            )
         index = {**canonical_projection, "language": language}
         from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
         started = perf_counter()
