@@ -275,13 +275,13 @@ def _copy_frontend_inventory(core_path: str, cache_path: str) -> None:
         handle.write("\n")
 
 
-# The dataflow tier inflates the whole store back into Python objects and folds four
-# overlays over it, all in RAM. That peak is roughly linear in node count; measured on
-# full libxml2 it was ~7.5 GB for ~980k nodes, i.e. roughly 8 KB per node. Above this many
-# nodes we warn before starting, because on a memory-constrained machine the step drops
-# into swap and *looks* hung though it is still progressing. Advisory only, never a refusal.
+# The dataflow tier still inflates the whole store back into Python objects and folds four
+# overlays over it, all in RAM. The streaming delta sidecar removes the old core/enriched
+# overlap during write; recent full-libxml2 runs peak around 5--6 GB for 919k nodes. Keep
+# the estimate conservative because allocator/system pressure varies by machine. Above
+# this many nodes we warn before starting; advisory only, never a refusal.
 _ENRICH_HEAVY_NODES = 400_000
-_ENRICH_BYTES_PER_NODE = 8_000
+_ENRICH_BYTES_PER_NODE = 7_000
 
 
 class GraphStore:

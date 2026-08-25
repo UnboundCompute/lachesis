@@ -283,6 +283,11 @@ graph completed in about 171s with 6.56 GB peak RSS; the materialization-only st
 from 41.0s to 36.9s. Full-run wall time is machine-pressure-sensitive, so compare runs
 only when Kùzu parallelism and available memory are comparable.
 
+New cold builds stream additive records into a framed `.dataflow.pb` sidecar while the
+overlays run, then release the full Python graph before reopening it. Older monolithic
+protobuf sidecars remain readable. A later load validates the stream from its small header
+and decodes the records once.
+
 Example full cold run against libxml2:
 
 ```bash
