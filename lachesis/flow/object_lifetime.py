@@ -1031,7 +1031,13 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         analysis_index = GraphStore(graph).index
     else:
         analysis_index = store.index
-    if os.environ.get("LACHESIS_NATIVE_WHOLE_GRAPH") == "1":
+    native_whole_graph = os.environ.get("LACHESIS_NATIVE_WHOLE_GRAPH") == "1"
+    if not native_whole_graph:
+        from lachesis.nav.dataflow.substrate import translation_facts_path
+        base = (getattr(analysis_index, "_pass3_cache_base", None)
+                or getattr(analysis_index, "_db_dir", None))
+        native_whole_graph = bool(base and translation_facts_path(base).is_file())
+    if native_whole_graph:
         native_result = _native_whole_graph_lifetimes(analysis_index, functions)
         if native_result is not None:
             return native_result
