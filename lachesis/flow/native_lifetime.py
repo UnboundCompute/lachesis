@@ -94,8 +94,11 @@ def _oid(table: dict[str, Any], handle: str, memo: dict[str, tuple]) -> tuple:
     elif "Allocation" in meta:
         allocation = meta["Allocation"]
         target = allocation["target"]
-        value = (allocation["kind"].lower(), "recent", allocation["site"],
+        value = (allocation["kind"].lower(), allocation["generation"], allocation["site"],
                  AccessPath(target["root"], tuple(target["selectors"])))
+    elif "Phi" in meta:
+        phi = meta["Phi"]
+        value = (phi["tag"], phi["node"], int(phi["index"]))
     else:
         raise ValueError(f"unknown native object metadata: {meta!r}")
     memo[handle] = value
@@ -138,12 +141,6 @@ def solve_linear(nodes, successors, operations, initial: AbstractState):
         return None
     if any(operation.kind == OpKind.SUMMARY for operation in operations):
         return None
-    index = {node: position for position, node in enumerate(nodes)}
-    if not all(len(successors.get(node, ())) <= 1 for node in nodes):
-        return None
-    if not all(successor in index and index[successor] > index[node]
-               for node in nodes for successor in successors.get(node, ())):
-        return None
     encoded = [_operation(operation) for operation in operations]
     if any(item is None for item in encoded):
         return None
@@ -153,6 +150,7 @@ def solve_linear(nodes, successors, operations, initial: AbstractState):
             parameters.append((root, int(oid[1])))
     payload = json.dumps({
         "nodes": list(nodes),
+        "successors": {node: list(successors.get(node, ())) for node in nodes},
         "parameters": parameters,
         "operations": encoded,
     }).encode()
@@ -170,23 +168,24 @@ def solve_linear(nodes, successors, operations, initial: AbstractState):
         raise RuntimeError(f"native lifetime solver failed: {result['error']}")
     memo: dict[str, tuple] = {}
     point_states = {
-        node: (_snapshot(snapshot, memo),)
-        for node, snapshot in result["point_states"]
+        node: tuple(_snapshot(snapshot, memo) for snapshot in snapshots)
+        for node, snapshots in result["point_states"]
     }
     post_states = {
-        node: (_snapshot(snapshot, memo),)
-        for node, snapshot in result["post_states"]
+        node: tuple(_snapshot(snapshot, memo) for snapshot in snapshots)
+        for node, snapshots in result["post_states"]
     }
-    exit_state = _snapshot(result["exit_state"], memo)
+    exit_states = tuple(_snapshot(snapshot, memo) for snapshot in result["exit_states"])
+    exit_state = exit_states[0] if exit_states else _snapshot(result["exit_state"], memo)
     placed = {operation for operation in operations if operation.node in set(nodes)}
     unplaced = tuple(operation for operation in operations if operation not in placed)
     analysis = AnalysisResult(
         findings=set(),
-        exit_states=(exit_state,),
+        exit_states=exit_states or (exit_state,),
         unplaced=unplaced,
         transfers=int(result["transfers"]),
-        widenings=0,
-        capped=False,
+        widenings=int(result["widenings"]),
+        capped=bool(result["capped"]),
         point_states=point_states,
         post_states=post_states,
     )

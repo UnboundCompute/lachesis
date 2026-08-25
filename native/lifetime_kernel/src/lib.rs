@@ -5,7 +5,7 @@
 //! the domain here value-oriented avoids allocating Python dictionaries and tuples for
 //! every transfer while preserving the existing analysis semantics.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr, CString};
 
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,8 @@ pub enum ObjectMeta {
     Param { position: u32, selectors: Vec<String> },
     UnknownRoot { root: String },
     UnknownSlot { base: String, selector: String },
-    Allocation { kind: Kind, site: String, target: Path },
+    Allocation { kind: Kind, generation: String, site: String, target: Path },
+    Phi { tag: String, node: String, index: usize },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -97,11 +98,14 @@ pub struct Snapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LinearResult {
-    pub point_states: Vec<(String, Snapshot)>,
-    pub post_states: Vec<(String, Snapshot)>,
+    pub point_states: Vec<(String, Vec<Snapshot>)>,
+    pub post_states: Vec<(String, Vec<Snapshot>)>,
     pub exit_state: Snapshot,
+    pub exit_states: Vec<Snapshot>,
     pub findings: Findings,
     pub transfers: u64,
+    pub widenings: u64,
+    pub capped: bool,
 }
 
 impl State {
@@ -160,7 +164,13 @@ impl State {
                     format!("unknown-slot:{}:{}", base, selector)
                 };
                 self.objects.entry(fresh.clone()).or_insert_with(|| {
-                    ObjectMeta::UnknownSlot { base: base.clone(), selector: selector.clone() }
+                    if let Some((position, selectors)) = parse_param(&base) {
+                        let mut next = selectors;
+                        next.push(selector.clone());
+                        ObjectMeta::Param { position, selectors: next }
+                    } else {
+                        ObjectMeta::UnknownSlot { base: base.clone(), selector: selector.clone() }
+                    }
                 });
                 self.slots.insert(key, fresh.clone());
                 self.facts.entry(fresh.clone()).or_default().insert(Fact::Unknown);
@@ -183,6 +193,44 @@ impl State {
         self.slots.insert((parent_id, path.selectors.last().unwrap().clone()), oid);
     }
 
+    fn merge_object(&mut self, destination: &str, source: &str) {
+        let source_facts = self.facts.get(source).cloned()
+            .unwrap_or_else(|| [Fact::Unknown].into_iter().collect());
+        self.facts.entry(destination.to_owned()).or_default().extend(source_facts);
+        for oid in self.env.values_mut() {
+            if oid == source { *oid = destination.to_owned(); }
+        }
+        for oid in self.slots.values_mut() {
+            if oid == source { *oid = destination.to_owned(); }
+        }
+    }
+
+    fn age(&mut self, recent: &str, summary: &str) {
+        if !self.facts.contains_key(recent) { return; }
+        self.merge_object(summary, recent);
+        let old_slots: Vec<_> = self.slots.iter()
+            .filter(|((base, _), _)| base == recent)
+            .map(|((base, selector), child)| (base.clone(), selector.clone(), child.clone()))
+            .collect();
+        for (base, selector, child) in old_slots {
+            self.slots.remove(&(base, selector.clone()));
+            let destination = (summary.to_owned(), selector);
+            if let Some(previous) = self.slots.get(&destination).cloned() {
+                if previous != child { self.merge_object(&previous, &child); }
+            } else {
+                self.slots.insert(destination, child);
+            }
+        }
+        self.facts.remove(recent);
+    }
+
+    fn compensate_reassignment(&mut self, path: Option<&Path>) {
+        let Some(path) = path else { return };
+        if path.selectors.is_empty() { return; }
+        let Some(oid) = self.freed_paths.remove(path) else { return };
+        self.record_param(Kind::Alloc, &oid);
+    }
+
     fn record_param(&mut self, kind: Kind, oid: &str) {
         let Some((position, selectors)) = parse_param(oid) else { return };
         let effect = Effect::Param { kind, position, selectors };
@@ -202,11 +250,18 @@ impl State {
     fn fresh(&mut self, op: &Operation, fact: Fact) {
         let target = op.target.as_ref().expect("fresh operation target");
         let recent = format!("{}|recent|{}|{}", kind_name(op.kind), op.site, path_name(target));
+        let summary = format!("{}|summary|{}|{}", kind_name(op.kind), op.site, path_name(target));
         self.objects.entry(recent.clone()).or_insert_with(|| ObjectMeta::Allocation {
-            kind: op.kind,
+            kind: op.kind, generation: "recent".into(),
             site: op.site.clone(),
             target: target.clone(),
         });
+        self.objects.entry(summary.clone()).or_insert_with(|| ObjectMeta::Allocation {
+            kind: op.kind, generation: "summary".into(),
+            site: op.site.clone(),
+            target: target.clone(),
+        });
+        self.age(&recent, &summary);
         self.facts.insert(recent.clone(), [fact].into_iter().collect());
         self.bind(target, recent);
     }
@@ -215,31 +270,45 @@ impl State {
         let target = op.target.as_ref().expect("free operation target");
         let Some(oid) = self.resolve(target, true) else { return };
         self.record_param(Kind::Free, &oid);
+        if target.selectors.len() > 0 && parse_param(&oid).is_some() {
+            self.freed_paths.insert(target.clone(), oid.clone());
+        }
         let facts = self.facts.entry(oid.clone()).or_insert_with(|| [Fact::Unknown].into_iter().collect());
-        if facts.contains(&Fact::Freed) {
+        let weak = oid.split('|').nth(1) == Some("summary");
+        if facts.contains(&Fact::Freed) && !weak {
             findings.double_free.push((op.line, target.clone(), op.node.clone()));
         }
-        *facts = [Fact::Freed].into_iter().collect();
+        if *facts != [Fact::Null].into_iter().collect::<HashSet<_>>() {
+            if weak { facts.insert(Fact::Freed); }
+            else { *facts = [Fact::Freed].into_iter().collect(); }
+        }
     }
 
     pub fn apply(&mut self, op: &Operation, findings: &mut Findings) {
         match op.kind {
-            Kind::Alloc => self.fresh(op, Fact::Allocated),
-            Kind::Clobber => self.fresh(op, if op.is_null { Fact::Null } else { Fact::Unknown }),
+            Kind::Alloc => {
+                self.compensate_reassignment(op.target.as_ref());
+                self.fresh(op, Fact::Allocated)
+            }
+            Kind::Clobber => {
+                self.compensate_reassignment(op.target.as_ref());
+                self.fresh(op, if op.is_null { Fact::Null } else { Fact::Unknown })
+            }
             Kind::Copy => {
                 let mut source = op.source.as_ref().expect("copy source").clone();
                 let oid = self.resolve(&mut source, true).expect("copy source resolves");
+                self.compensate_reassignment(op.target.as_ref());
                 self.bind(op.target.as_ref().expect("copy target"), oid);
             }
             Kind::Free => self.free(op, findings),
             Kind::Realloc => {
                 if let Some(source) = &op.source {
-                    let mut source = source.clone();
-                    if let Some(oid) = self.resolve(&mut source, true) {
-                        self.record_param(Kind::Free, &oid);
-                        self.facts.insert(oid, [Fact::Freed].into_iter().collect());
-                    }
+                    let mut free_op = op.clone();
+                    free_op.kind = Kind::Free;
+                    free_op.target = Some(source.clone());
+                    self.free(&free_op, findings);
                 }
+                self.compensate_reassignment(op.target.as_ref());
                 self.fresh(op, Fact::Allocated);
             }
             Kind::Use => {
@@ -254,6 +323,14 @@ impl State {
             }
         }
     }
+
+    fn semantically_equal(&self, other: &State) -> bool {
+        self.env == other.env
+            && self.facts == other.facts
+            && self.slots == other.slots
+            && self.trace == other.trace
+            && self.freed_paths == other.freed_paths
+    }
 }
 
 /// Execute the straight-line subset as one native batch.  The Python analyzer already
@@ -265,19 +342,30 @@ pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State
     let mut findings = Findings::default();
     let mut transfers = 0;
     for node in nodes {
-        point_states.push((node.clone(), state.snapshot()));
+        point_states.push((node.clone(), vec![state.snapshot()]));
         for operation in operations.iter().filter(|operation| operation.node == *node) {
             state.apply(operation, &mut findings);
             transfers += 1;
         }
-        post_states.push((node.clone(), state.snapshot()));
+        post_states.push((node.clone(), vec![state.snapshot()]));
     }
-    LinearResult { point_states, post_states, exit_state: state.snapshot(), findings, transfers }
+    let exit_state = state.snapshot();
+    LinearResult {
+        point_states,
+        post_states,
+        exit_state: exit_state.clone(),
+        exit_states: vec![exit_state],
+        findings,
+        transfers,
+        widenings: 0,
+        capped: false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct WireBatch {
     nodes: Vec<String>,
+    successors: HashMap<String, Vec<String>>,
     operations: Vec<Operation>,
     parameters: Vec<(String, u32)>,
 }
@@ -298,7 +386,7 @@ fn solve_wire(batch: WireBatch) -> LinearResult {
             }
         }
     }
-    solve_linear(&batch.nodes, &batch.operations, state)
+    solve_graph(&batch.nodes, &batch.successors, &batch.operations, state, 32)
 }
 
 /// Solve one prepared linear function batch.  The ABI is intentionally tiny: Python
@@ -325,6 +413,223 @@ pub unsafe extern "C" fn lachesis_lifetime_free_json(value: *mut c_char) {
 
 impl Operation {
     fn access_is_return(&self) -> bool { self.access == "return" }
+}
+
+fn deduplicate(states: Vec<State>) -> Vec<State> {
+    let mut unique = Vec::with_capacity(states.len());
+    'candidate: for state in states {
+        if unique.iter().any(|existing: &State| existing.semantically_equal(&state)) {
+            continue 'candidate;
+        }
+        unique.push(state);
+    }
+    unique
+}
+
+fn attach_joined(states: &[State], node: &str, new_oid: String,
+                 signature: Vec<Option<String>>, joined: &mut State,
+                 queued: &mut Vec<(String, Vec<Option<String>>)>) {
+    let mut facts = HashSet::new();
+    for (state, old_oid) in states.iter().zip(signature.iter()) {
+        if let Some(old_oid) = old_oid {
+            facts.extend(state.facts.get(old_oid).cloned()
+                .unwrap_or_else(|| [Fact::Unknown].into_iter().collect()));
+        } else {
+            facts.insert(Fact::Unknown);
+        }
+    }
+    joined.facts.insert(new_oid.clone(), facts);
+    let tag = new_oid.split('|').nth(1).unwrap_or("phi").to_string();
+    joined.objects.insert(new_oid.clone(), ObjectMeta::Phi {
+        tag, node: node.into(), index: 0,
+    });
+    queued.push((new_oid, signature));
+}
+
+fn join_states(states: &[State], node: &str) -> State {
+    assert!(!states.is_empty());
+    if states.len() == 1 {
+        return states[0].clone();
+    }
+    let mut joined = State::default();
+    let mut roots: Vec<String> = states.iter()
+        .flat_map(|state| state.env.keys().cloned())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let mut signatures: HashMap<String, String> = HashMap::new();
+    let mut queued: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut phi_index = 0usize;
+
+    let mut object_for = |tag: &str, signature: &[Option<String>]| -> String {
+        if signature.first().is_some_and(|first| first.is_some())
+            && signature.iter().all(|item| item.as_ref() == signature[0].as_ref())
+        {
+            return signature[0].clone().unwrap();
+        }
+        let key = format!("{}|{}", tag, signature.iter().map(|item| item.as_deref().unwrap_or("<none>")).collect::<Vec<_>>().join(";"));
+        if let Some(existing) = signatures.get(&key) {
+            return existing.clone();
+        }
+        let value = format!("phi|{}|{}", tag, phi_index);
+        phi_index += 1;
+        signatures.insert(key, value.clone());
+        value
+    };
+
+    for root in roots {
+        let signature: Vec<_> = states.iter().map(|state| state.env.get(&root).cloned()).collect();
+        let oid = object_for("phi", &signature);
+        joined.env.insert(root, oid.clone());
+        if seen.insert(oid.clone()) {
+            attach_joined(states, node, oid, signature, &mut joined, &mut queued);
+        }
+    }
+
+    while let Some((new_base, old_bases)) = queued.pop() {
+        let mut selectors: Vec<String> = states.iter().zip(old_bases.iter())
+            .flat_map(|(state, old_base)| state.slots.keys()
+                .filter(move |(base, _)| Some(base) == old_base.as_ref())
+                .map(|(_, selector)| selector.clone()))
+            .collect();
+        selectors.sort();
+        selectors.dedup();
+        for selector in selectors {
+            let signature: Vec<_> = states.iter().zip(old_bases.iter())
+                .map(|(state, old_base)| old_base.as_ref()
+                    .and_then(|base| state.slots.get(&(base.clone(), selector.clone())).cloned()))
+                .collect();
+            let child = object_for("phi-slot", &signature);
+            joined.slots.insert((new_base.clone(), selector), child.clone());
+            if seen.insert(child.clone()) {
+                attach_joined(states, node, child, signature, &mut joined, &mut queued);
+            }
+        }
+    }
+
+    for state in states {
+        for effect in &state.trace {
+            if joined.trace.iter().filter(|item| *item == effect).count() < 2
+                && joined.trace.len() < 16
+            {
+                joined.trace.push(effect.clone());
+            }
+        }
+        for (path, oid) in &state.freed_paths {
+            joined.freed_paths.entry(path.clone()).or_insert_with(|| oid.clone());
+        }
+    }
+    joined
+}
+
+/// Execute the non-SUMMARY fixpoint subset.  This mirrors Python's worklist shape:
+/// states are deduplicated at each transfer, joins become sticky after the disjunct
+/// budget is exceeded, and snapshots are retained for the semantic emitter.
+pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
+                   operations: &[Operation], initial: State,
+                   max_disjuncts: usize) -> LinearResult {
+    let mut at: HashMap<String, Vec<Operation>> = HashMap::new();
+    for operation in operations {
+        at.entry(operation.node.clone()).or_default().push(operation.clone());
+    }
+    for placed in at.values_mut() {
+        // The Python side has already ordered operations, but preserve the contract if
+        // the native API is called directly.
+        placed.sort_by_key(|operation| operation.line.unwrap_or(0));
+    }
+    let mut incoming: HashMap<String, Vec<State>> = nodes.iter()
+        .map(|node| (node.clone(), Vec::new()))
+        .collect();
+    if let Some(first) = nodes.first() {
+        incoming.insert(first.clone(), vec![initial]);
+    }
+    let mut post: HashMap<String, Vec<State>> = HashMap::new();
+    let mut queue = VecDeque::new();
+    let mut queued = HashSet::new();
+    let mut widened = HashSet::new();
+    if let Some(first) = nodes.first() {
+        queue.push_back(first.clone());
+        queued.insert(first.clone());
+    }
+    let mut findings = Findings::default();
+    let mut transfers = 0u64;
+    let mut widenings = 0u64;
+    let cap = max_disjuncts.max(1);
+
+    while let Some(node) = queue.pop_front() {
+        queued.remove(&node);
+        let mut current = incoming.get(&node).cloned().unwrap_or_default();
+        for operation in at.get(&node).into_iter().flatten() {
+            let mut next = Vec::with_capacity(current.len());
+            for mut state in current {
+                state.apply(operation, &mut findings);
+                next.push(state);
+            }
+            current = deduplicate(next);
+        }
+        transfers += current.len() as u64;
+        post.insert(node.clone(), current.clone());
+        for successor in successors.get(&node).into_iter().flatten() {
+            if !incoming.contains_key(successor) {
+                continue;
+            }
+            let target = incoming.get(successor).cloned().unwrap_or_default();
+            let mut new_items = current.iter().filter(|state| {
+                !target.iter().any(|existing| existing.semantically_equal(state))
+            }).cloned().collect::<Vec<_>>();
+            if new_items.is_empty() {
+                continue;
+            }
+            let should_widen = target.len() + new_items.len() > cap
+                || widened.contains(successor);
+            let (replacement, changed) = if should_widen {
+                let mut candidates = target.clone();
+                candidates.append(&mut new_items);
+                let merged = join_states(&candidates, successor);
+                let changed = target.len() != 1
+                    || !target.first().is_some_and(|old| old.semantically_equal(&merged));
+                widened.insert(successor.clone());
+                widenings += 1;
+                (vec![merged], changed)
+            } else {
+                let mut replacement = target;
+                replacement.append(&mut new_items);
+                (replacement, true)
+            };
+            incoming.insert(successor.clone(), replacement);
+            if changed && queued.insert(successor.clone()) {
+                queue.push_back(successor.clone());
+            }
+        }
+    }
+
+    let point_states = nodes.iter().filter_map(|node| {
+        incoming.get(node).map(|states| (
+            node.clone(), states.iter().map(State::snapshot).collect(),
+        ))
+    }).collect();
+    let post_states = nodes.iter().filter_map(|node| {
+        post.get(node).map(|states| (
+            node.clone(), states.iter().map(State::snapshot).collect(),
+        ))
+    }).collect();
+    let exit_states: Vec<_> = nodes.iter()
+        .filter(|node| successors.get(*node).is_none_or(Vec::is_empty))
+        .flat_map(|node| post.get(node).into_iter().flatten().map(State::snapshot))
+        .collect();
+    let exit_state = exit_states.first().cloned()
+        .unwrap_or_else(|| State::default().snapshot());
+    LinearResult {
+        point_states,
+        post_states,
+        exit_state,
+        exit_states,
+        findings,
+        transfers,
+        widenings,
+        capped: !queue.is_empty(),
+    }
 }
 
 fn kind_name(kind: Kind) -> &'static str {
