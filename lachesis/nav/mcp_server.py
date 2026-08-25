@@ -63,7 +63,7 @@ _DEFAULT_FORMAT = "text"
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 HUNTING_TOOLS = SECURITY_TOOLS + (
     "candidates", "candidate_detail", "candidate_census", "explain", "skeleton",
-    "flow_pass", "leads", "flow_skeleton", "taint", "scan", "guard_dominance",
+    "enrich", "flow_pass", "leads", "flow_skeleton", "taint", "scan", "guard_dominance",
     "counterexample", "range_analysis", "object_lifecycle", "error_path_summary",
 )
 
@@ -123,7 +123,7 @@ TOOL_ORDER = (
     "object_lifecycle", "error_path_summary",
     "flow", "reaches", "sources_of", "points_to", "aliases",
     "candidates", "candidate_detail", "candidate_census", "explain", "skeleton",
-    "flow_pass", "leads", "flow_skeleton", "taint",
+    "enrich", "flow_pass", "leads", "flow_skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -941,6 +941,15 @@ TOOLS = [
          "function": {"type": "string", "description": "function name or node id"},
          "candidate_id": {"type": "string", "description": "candidate id; renders its "
                           "enclosing function"}}}},
+    {"name": "enrich",
+     "description": "Warm this graph's sidecars once (the 2nd pass), so later flow_pass / leads / "
+                    "candidates / explain answer fast instead of paying the cost cold. Folds the "
+                    "dataflow tier over the whole graph and binds the catalog, and persists both "
+                    "beside the store (.dataflow.pb / .bind.pb) -- the difference between a >120s "
+                    "cold census and an instant one. Idempotent: a store already enriched is a "
+                    "no-op that just reports what is on disk. An unevaluated temporal family is "
+                    "reported as 'not evaluated', never 'clean'. No arguments.",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "flow_pass",
      "description": "Run the interprocedural flow pass (the 3rd pass) over the whole graph and "
                     "return its per-function SUMMARY census -- the layer beneath the skeletons. "
@@ -1614,6 +1623,10 @@ def call_tool(name, args, format=None):
             return _emit(name, {"move": "skeleton",
                                 "error": "pass either `function` or `candidate_id`"}, fmt)
         result["move"] = "skeleton"
+        return _emit(name, result, fmt, offset, limit)
+    if name == "enrich":
+        result = c.enrich()
+        result["move"] = "enrich"
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_pass":
         bundle = c.flow_bundle
