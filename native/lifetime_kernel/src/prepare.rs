@@ -351,8 +351,31 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
     let mut params = owned.iter().filter(|node| graph.kind(node) == "ParmVarDecl").cloned().collect::<Vec<_>>();
     params.sort_by_key(|node| graph.offset(node));
     if let Some(exit) = cfg_exit.clone() {
-        successors.entry(exit).or_default();
+        successors.entry(exit.clone()).or_default();
         for item in exits { successors.entry(item).or_default().push(cfg_exit.clone().unwrap()); }
+        // Structured loop emission has a back-edge for the true/body arm, but
+        // the false/termination arm is not represented by a source AST node.
+        // Recover it here so every finite loop has a native CFG exit. Return
+        // statements and other terminal fragments are handled by the same
+        // empty-successor closure below.
+        let controls = owned.iter().filter(|node| matches!(graph.kind(node).as_str(),
+            "IfStmt" | "ForStmt" | "WhileStmt" | "DoStmt")).cloned().collect::<Vec<_>>();
+        for control in controls {
+            let condition = graph.roles.get(&(control.clone(), "CONDITION".to_owned()))
+                .and_then(|items| items.first()).cloned();
+            let Some(condition) = condition else { continue };
+            let mut stream = Vec::new();
+            expression_stream(graph, &condition, owned, &mut stream, &mut HashSet::new(), 0);
+            if let Some(last) = stream.last() {
+                successors.entry(last.clone()).or_default().push(exit.clone());
+            }
+        }
+        let terminals = successors.iter().filter_map(|(node, targets)| {
+            if node != &exit && targets.is_empty() { Some(node.clone()) } else { None }
+        }).collect::<Vec<_>>();
+        for terminal in terminals {
+            successors.entry(terminal).or_default().push(exit.clone());
+        }
     }
     let mut chain = Vec::new();
     if let Some(entry_node) = cfg_entry { chain.push(entry_node); }
@@ -419,8 +442,28 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             successor_map = successors;
         }
     }
-    let cfg_node_set = successor_map.keys().cloned()
+    let mut cfg_node_set = successor_map.keys().cloned()
         .chain(successor_map.values().flatten().cloned()).collect::<HashSet<_>>();
+    // Pass-1's compact substrate may not contain frontend-generated cfg-exit
+    // marker nodes. Keep the native CFG total by adding one synthetic terminal
+    // and connecting explicit returns plus the source-order tail to it. This
+    // also gives downstream semantic emission a valid fragment exit for loops
+    // whose false arm is implicit in the AST.
+    if !cfg_node_set.iter().any(|node| graph.kind(node) == "cfg-exit") {
+        let synthetic_exit = format!("native-exit:{}", input.id);
+        successor_map.entry(synthetic_exit.clone()).or_default();
+        cfg_node_set.insert(synthetic_exit.clone());
+        let mut terminals = node_ids.iter().filter(|node| graph.kind(node) == "ReturnStmt")
+            .cloned().collect::<Vec<_>>();
+        if let Some(last) = node_ids.last() {
+            terminals.push(last.clone());
+        }
+        terminals.sort();
+        terminals.dedup();
+        for terminal in terminals {
+            successor_map.entry(terminal).or_default().push(synthetic_exit.clone());
+        }
+    }
 
     let mut operations = Vec::new();
     let call_by_node = input.calls.iter().map(|call| (call.node.clone(), call)).collect::<HashMap<_, _>>();
@@ -582,7 +625,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         if cfg_node_set.contains(&anchor) { item.node = anchor; }
     }
     operations.retain(|item| node_set.contains(&item.node));
-    let prepared_nodes = if let Some(nodes) = prepared_from_cfg {
+    let mut prepared_nodes = if let Some(nodes) = prepared_from_cfg {
         nodes
     } else if cfg_node_set.is_empty() {
         let operation_nodes = operations.iter().map(|item| item.node.as_str()).collect::<HashSet<_>>();
@@ -604,6 +647,13 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         values.sort_by_key(|node| graph.offset(node));
         values
     };
+    for node in &cfg_node_set {
+        if !prepared_nodes.contains(node) {
+            prepared_nodes.push(node.clone());
+        }
+    }
+    prepared_nodes.sort_by_key(|node| graph.offset(node));
+    prepared_nodes.dedup();
     let prepared_set = prepared_nodes.iter().cloned().collect::<HashSet<_>>();
     operations.retain(|item| prepared_set.contains(&item.node));
 

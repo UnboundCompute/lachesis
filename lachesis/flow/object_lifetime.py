@@ -918,6 +918,95 @@ class ObjectLifetimeResult:
     cfgs: dict[str, dict] = field(default_factory=dict)
 
 
+def _native_whole_graph_lifetimes(analysis_index, functions):
+    """Run the complete binary-substrate lifetime path inside Rust.
+
+    This is intentionally opt-in while differential parity is being closed.  The
+    adapter maps native snapshots/findings into the existing result envelope; it
+    does not rebuild graph nodes, CFGs, calls, or operations in Python.
+    """
+    from lachesis.nav.dataflow.substrate import substrate_cache_path
+    from .native_lifetime import decode_prepared_result, prepare_graph_solve_details_pb
+
+    base = (getattr(analysis_index, "_pass3_cache_base", None)
+            or getattr(analysis_index, "_db_dir", None))
+    if not base:
+        return None
+    sidecar = substrate_cache_path(base)
+    if not sidecar.is_file():
+        return None
+    by_name = {}
+    for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
+        if _props(node).get("declaration_only"):
+            continue
+        name = node.get("label")
+        if name in functions and name not in by_name:
+            by_name[name] = node["id"]
+    native = prepare_graph_solve_details_pb(sidecar)
+    sub = cached_substrate(analysis_index).load()
+    summaries = {}
+    artifacts = {}
+    cfgs = {}
+    cfg_failures = {}
+    leads = []
+    total_transfers = total_widenings = 0
+    capped = []
+    for name in sorted(functions):
+        function_id = by_name.get(name)
+        item = native.get(function_id) if function_id else None
+        if item is None or item.prepared is None or item.result is None:
+            cfg_failures[name] = "native-no-result"
+            continue
+        summary, analysis = decode_prepared_result(item)
+        summaries[name] = summary
+        artifacts[name] = analysis
+        cfgs[name] = {
+            "nodes": tuple(item.prepared.nodes),
+            "succ": {
+                entry.node: tuple(entry.targets)
+                for entry in item.prepared.successors
+            },
+        }
+        total_transfers += analysis.transfers
+        total_widenings += analysis.widenings
+        if analysis.capped:
+            capped.append(name)
+        best = {}
+        for finding in sorted(analysis.findings):
+            root_id = finding.path.root.removeprefix("decl:")
+            root = sub.label(root_id) or root_id
+            suffix = "".join(finding.path.selectors)
+            key = (finding.pattern, root + suffix)
+            existing = best.get(key)
+            if existing is None:
+                best[key] = {
+                    "pattern": finding.pattern, "var": root + suffix,
+                    "root": root, "entry": name, "line": finding.line,
+                    "node": finding.node, "engine": "native-object-identity",
+                    "sites": 1,
+                }
+            else:
+                existing["sites"] += 1
+                if finding.line is not None and (
+                        existing["line"] is None or finding.line < existing["line"]):
+                    existing["line"], existing["node"] = finding.line, finding.node
+        leads.extend(best[key] for key in sorted(best))
+    diagnostics = {
+        "backend": "rust-whole-graph",
+        "functions": len(functions), "analyzed": len(artifacts),
+        "cfg_failures": cfg_failures, "unplaced": 0,
+        "unplaced_functions": {}, "capped": capped,
+        "summary_capped": [], "summary_analyses": len(artifacts),
+        "summary_recomputations": 0, "summary_transfers": total_transfers,
+        "summary_workers": 1, "timed_out": False, "widenings": total_widenings,
+        "transfers": total_transfers, "total_seconds": 0.0,
+        "unsafe_functions": sorted(cfg_failures),
+        "seed_unsafe_functions": sorted(cfg_failures),
+        "unsafe_object_flow": {},
+    }
+    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics, artifacts, cfgs)
+
+
 @timeit
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None,
                              workers=None, deadline=None):
@@ -938,6 +1027,10 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         analysis_index = GraphStore(graph).index
     else:
         analysis_index = store.index
+    if os.environ.get("LACHESIS_NATIVE_WHOLE_GRAPH") == "1":
+        native_result = _native_whole_graph_lifetimes(analysis_index, functions)
+        if native_result is not None:
+            return native_result
     norm = normalizer(lang)
     function_node_ids = [node_id for kind in ("function", "method", "constructor")
                          for node_id in getattr(analysis_index, "by_kind", {}).get(kind, ())]
