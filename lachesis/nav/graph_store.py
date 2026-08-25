@@ -39,6 +39,7 @@ from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
 from lachesis.core.graph_wire import (
     decode_overlay, is_dataflow_stream, read_dataflow_stream,
+    read_dataflow_stream_header,
     write_dataflow_stream_edge, write_dataflow_stream_header,
     write_dataflow_stream_node,
 )
@@ -93,7 +94,7 @@ def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
         return False
     try:
         sidecar = Path(path)
-        payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
+        payload = (read_dataflow_stream_header(sidecar) if is_dataflow_stream(sidecar)
                    else decode_overlay(sidecar.read_bytes()))
     except (OSError, ValueError, TypeError):
         return False

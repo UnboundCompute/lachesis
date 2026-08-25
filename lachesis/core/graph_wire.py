@@ -268,6 +268,26 @@ def is_dataflow_stream(path: Path) -> bool:
         return False
 
 
+def read_dataflow_stream_header(path: Path) -> dict[str, Any]:
+    """Read only stream metadata for cheap cache validation."""
+    with path.open("rb") as handle:
+        if handle.read(len(DATAFLOW_STREAM_MAGIC)) != DATAFLOW_STREAM_MAGIC:
+            raise ValueError(f"not a dataflow stream: {path}")
+        header = handle.read(FRAME.size)
+        if len(header) != FRAME.size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        (size,) = FRAME.unpack(header)
+        payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        message = graph_pb2.DataflowOverlay()
+        message.ParseFromString(payload)
+        return {
+            "overlay_id": message.overlay_id, "source": message.source,
+            "version": message.version, "core_content_hash": message.core_content_hash,
+        }
+
+
 def read_dataflow_stream(path: Path) -> dict[str, Any]:
     """Read a framed dataflow sidecar without requiring one giant input bytestring."""
     with path.open("rb") as handle:
