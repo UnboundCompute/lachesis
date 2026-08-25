@@ -128,6 +128,17 @@ class AtroposOverlay:
         # Keep the standalone fallback for direct overlay callers and tests.
         node_ids = (index.nodes if index is not None and hasattr(index, "nodes")
                     else {node["id"] for node in graph.get("nodes", ())})
+        return self.delta_for_node_ids(node_ids)
+
+    def delta_for_node_ids(self, node_ids: Iterable[str]) -> GraphDelta:
+        """Build the additive delta against a caller-owned bounded membership set.
+
+        Structural catalog binding already resolved every endpoint from the neutral
+        callsite projection.  Its endpoint set is therefore much smaller than the
+        full CPG.  This seam lets the disk-backed Pass 2 path validate those exact
+        endpoints without constructing a million-entry graph index solely to fold a
+        few role nodes and summary edges.
+        """
         nodes: List[dict] = []
         edges: List[dict] = []
         # A model can bind the same value node at more than one callsite; those

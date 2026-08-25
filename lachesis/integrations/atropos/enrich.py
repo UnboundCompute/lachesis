@@ -164,6 +164,64 @@ def atropos_enrich(
             "unbound": unbound,
         }
 
+    if not complete_dataflow:
+        # Structural binding is additive: the catalog contributes only role nodes,
+        # taint edges, and summary flow edges.  Every endpoint came from this
+        # bounded neutral callsite projection, so validate against that projection
+        # rather than constructing a million-entry GraphIndex and copying/sorting
+        # the entire base graph just to append a tiny delta.
+        known_node_ids = set()
+        for callsite in (canonical_projection or {}).get("callsites", ()):
+            known_node_ids.add(callsite.get("id"))
+            known_node_ids.add(callsite.get("call_value_id"))
+            known_node_ids.add(callsite.get("receiver_value_id"))
+            known_node_ids.update(callsite.get("arg_value_ids") or ())
+        known_node_ids.discard(None)
+        delta = AtroposOverlay(stamps).delta_for_node_ids(known_node_ids)
+        # Preserve the generic registry's idempotence when a caller reuses the
+        # same in-memory graph.  Probe only the tiny delta identity set; do not
+        # materialize a second graph-sized node/edge index.
+        candidate_node_ids = {node["id"] for node in delta.nodes}
+        existing_node_ids = {
+            node.get("id") for node in graph.get("nodes", ())
+            if node.get("id") in candidate_node_ids
+        }
+        delta.nodes = [node for node in delta.nodes
+                       if node["id"] not in existing_node_ids]
+        candidate_edge_keys = {
+            (edge["kind"], edge["source"], edge["target"])
+            for edge in delta.edges
+        }
+        existing_edge_keys = {
+            (edge.get("kind"), edge.get("source"), edge.get("target"))
+            for edge in graph.get("edges", ())
+            if (edge.get("kind"), edge.get("source"), edge.get("target"))
+            in candidate_edge_keys
+        }
+        delta.edges = [edge for edge in delta.edges
+                       if (edge["kind"], edge["source"], edge["target"])
+                       not in existing_edge_keys]
+        if isinstance(graph.get("nodes"), list):
+            graph["nodes"].extend(delta.nodes)
+        else:
+            graph["nodes"] = [*graph.get("nodes", ()), *delta.nodes]
+        if isinstance(graph.get("edges"), list):
+            graph["edges"].extend(delta.edges)
+        else:
+            graph["edges"] = [*graph.get("edges", ()), *delta.edges]
+        role_nodes: Dict[str, int] = {}
+        for node in delta.nodes:
+            kind = node.get("kind", "?")
+            role_nodes[kind] = role_nodes.get(kind, 0) + 1
+        return graph, {
+            "applied": True,
+            "atropos_root": str(root),
+            "languages": languages,
+            "per_language": per_language,
+            "stamps": len(stamps),
+            "role_nodes": role_nodes,
+        }
+
     registry = OverlayRegistry()
     if "c" in languages and complete_dataflow:
         # The C frontend links a call result to the variable it initializes by AST
