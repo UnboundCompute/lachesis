@@ -361,15 +361,19 @@ def _read_root(label, tracked):
 
 
 @timeit
-def _arg_records(ix, call, argument_edges=None):
+def _arg_records(ix, call, argument_edges=None, *, presorted=False):
     """Ordered argument records for a call, resolved through argument_value_ids."""
     p = _props(call)
     av = p.get("argument_value_ids") or []
     out = []
-    edges = sorted((argument_edges.get(call["id"], ())
-                    if argument_edges is not None
-                    else ix.outgoing_of_kind(call["id"], "HAS_ARGUMENT")),
-                   key=lambda e: _props(e).get("position") or 0)
+    raw_edges = (argument_edges.get(call["id"], ())
+                 if argument_edges is not None
+                 else ix.outgoing_of_kind(call["id"], "HAS_ARGUMENT"))
+    # KùzuGraphIndex.argument_edges_by_source sorts each source once while
+    # building its immutable cache.  Avoid sorting the same argument tuple for
+    # every call; retain sorting for the generic/third-party accessor contract.
+    edges = raw_edges if presorted else sorted(
+        raw_edges, key=lambda e: _props(e).get("position") or 0)
     for e in edges:
         pos = _props(e).get("position")
         vid = av[pos] if (isinstance(pos, int) and pos < len(av)) else None
@@ -522,9 +526,16 @@ def _guards_for(regions, fid, idents, span):
     candidate enumerators use (guarded-region only; early-return guards read as none)."""
     if not idents or span is None:
         return []
+    return _guard_info(regions, fid, idents, span)[0]
+
+
+def _guard_info(regions, fid, idents, span):
+    """Compute the guard list and status from one region classification."""
+    if not idents or span is None:
+        return [], "not-computed"
     verdict = regions.classify(fid, idents, span)
     if verdict.get("status") != "guarded-region":
-        return []
+        return [], verdict.get("status", "not-computed")
     out, seen = [], set()
     for reg in verdict.get("regions", ()):
         canon = reg.get("condition")
@@ -533,7 +544,7 @@ def _guards_for(regions, fid, idents, span):
                 continue
             seen.add((name, canon))
             out.append({"var": name, "canon": canon})
-    return out
+    return out, verdict.get("status", "not-computed")
 
 
 @timeit
@@ -545,9 +556,7 @@ def _guard_status_for(regions, fid, idents, span):
     guard list lets sink evaluators consume it without weakening lifetime/null
     guard handling.
     """
-    if not idents or span is None:
-        return "not-computed"
-    return regions.classify(fid, idents, span).get("status", "not-computed")
+    return _guard_info(regions, fid, idents, span)[1]
 
 
 @timeit
@@ -588,7 +597,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
                    cfg_edges_by_source=None, macro_defs=None,
                    argument_edges=None, invoke_edges=None, value_edges=None,
                    return_values=None,
-                   object_only=False, prewarmed=False):
+                   object_only=False, prewarmed=False,
+                   argument_edges_presorted=False):
     """Reconstruct one function's F IR from its owned graph nodes.
 
     Callee names are canonicalized through `norm` (the Atropos form oracle) as they leave the
@@ -663,11 +673,11 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
             continue
         line = _stmt_line(c)
         callees.append(callee)
-        args = _arg_records(ix, c, argument_edges)
+        args = _arg_records(ix, c, argument_edges,
+                            presorted=argument_edges_presorted)
         cp = _props(c)
         idents = {a["root"] for a in args if a["root"]}
-        guards = _guards_for(regions, fid, idents, _span(c))
-        guard_status = _guard_status_for(regions, fid, idents, _span(c))
+        guards, guard_status = _guard_info(regions, fid, idents, _span(c))
         cat, catalog_name = _catalog_sink(sinks, callee, cp)
         # the variable this call's result is assigned to (any callee, not just allocators), so
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
@@ -1103,11 +1113,13 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         if not name or name in recs:
             continue
         if f.get("id") in full_definition_set:
-            recs[name] = _walk_function(ix, regions, nest, sinks, norm, f,
-                                        cfg_edges_by_source, macro_defs,
-                                        argument_edges, invoke_edges, value_edges,
-                                        return_values,
-                                        object_only, prewarmed_flow_nodes)
+            recs[name] = _walk_function(
+                ix, regions, nest, sinks, norm, f,
+                cfg_edges_by_source, macro_defs,
+                argument_edges, invoke_edges, value_edges,
+                return_values, object_only, prewarmed_flow_nodes,
+                argument_edges_presorted=(argument_edges is not None and
+                                           hasattr(ix, "argument_edges_by_source")))
         else:
             recs[name] = lightweight_record(f)
         recs[name]["name"] = name
