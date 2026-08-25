@@ -144,6 +144,34 @@ def prepare_pb(functions) -> dict[str, lifetime_pb2.PreparedFunction]:
     return {function.id: function for function in result.functions}
 
 
+def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime_pb2.PreparedFunction]:
+    """Prepare the complete Pass-1 binary substrate inside Rust.
+
+    This is the whole-graph migration boundary.  The Python side reads only
+    the immutable sidecar bytes and passes them through the ABI; it does not
+    materialize nodes, edges, calls, or per-function records.
+    """
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    prepare = library.lachesis_lifetime_prepare_graph_pb
+    prepare.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    prepare.restype = ctypes.c_void_p
+    payload = Path(sidecar_path).read_bytes()
+    output_length = ctypes.c_size_t()
+    request_buffer = ctypes.create_string_buffer(payload)
+    pointer = prepare(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
+                      ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native whole-graph preparation returned no result")
+    try:
+        result = lifetime_pb2.PrepareResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return {function.id: function for function in result.functions}
+
+
 def prepare_and_solve_pb(functions) -> dict[str, lifetime_pb2.Result]:
     """Run native preparation and lifetime solving in one binary call."""
     request = lifetime_pb2.PrepareRequest()

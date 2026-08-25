@@ -37,7 +37,7 @@ _LITERALS = {"IntegerLiteral", "FloatingLiteral", "StringLiteral", "CharacterLit
 _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOperator",
             "UnaryOperator", "CompoundAssignOperator", "ConditionalOperator"}
 
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 _CACHE_SUFFIX = ".pass3.substrate.pb"
 _SUBSTRATE_NODE_KINDS = frozenset({
     "ArraySubscriptExpr", "BinaryOperator", "BreakStmt", "CallExpr", "CaseStmt",
@@ -54,6 +54,12 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
     "operator", "owner_function_id", "receiver", "receiver_id",
     "receiver_symbol_id", "receiver_value", "receiver_value_id",
     "start_line", "start_offset", "syntax_kind", "type",
+    # Native Pass-2 input.  These are scalar call-site facts already produced
+    # during Pass 1; retaining them in the binary substrate lets Rust consume
+    # the graph without asking Python to rebuild per-function call records.
+    "callee", "form", "method_name", "primary_target_id",
+    "receiver_member_id", "resolution", "allocation_kind", "allocated_type",
+    "control_kind",
 })
 
 

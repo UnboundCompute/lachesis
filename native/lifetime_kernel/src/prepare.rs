@@ -149,9 +149,8 @@ impl GraphView {
     }
 
     fn deref_base(&self, id: &str) -> Option<Path> {
-        let id = self.peel(id.to_owned());
-        let children = self.children.get(&id)?;
-        match self.kind(&id).as_str() {
+        let children = self.children.get(id)?;
+        match self.kind(id).as_str() {
             "UnaryOperator" if self.operator(&id) == "*" => self.access_path(children.first()?, 0),
             "MemberExpr" if self.label(&id).contains("->") => self.access_path(children.first()?, 0),
             "ArraySubscriptExpr" => children.iter().find_map(|child| self.access_path(child, 0)),

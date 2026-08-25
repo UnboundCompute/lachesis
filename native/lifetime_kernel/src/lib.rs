@@ -16,7 +16,11 @@ mod atropos_bind;
 mod lifetime_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.lifetime.rs"));
 }
+mod graph_proto {
+    include!(concat!(env!("OUT_DIR"), "/lachesis.graph.rs"));
+}
 mod prepare;
+mod native_graph;
 
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
@@ -624,6 +628,27 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_solve_pb(
     })();
     let mut payload = result.unwrap_or_else(|error| {
         eprintln!("native lifetime prepare/solve error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
+/// Read the complete framed Pass-1 substrate directly in Rust, then prepare
+/// all function inputs without Python-side graph reconstruction.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        let request = native_graph::sidecar_to_request(bytes)?;
+        prepare::solve(&request)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native graph preparation error: {error}");
         Vec::new()
     });
     if !output_length.is_null() { *output_length = payload.len(); }
