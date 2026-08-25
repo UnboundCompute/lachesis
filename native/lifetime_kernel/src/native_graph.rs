@@ -244,6 +244,7 @@ pub(crate) fn sidecar_to_request(
                 node: edge.target.clone(),
                 root: String::new(),
                 selectors: Vec::new(),
+                expression: String::new(),
             })
         }).collect::<Vec<_>>();
         arguments.sort_by_key(|argument| argument.position);

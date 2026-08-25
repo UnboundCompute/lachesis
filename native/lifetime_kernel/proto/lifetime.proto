@@ -142,6 +142,7 @@ message FunctionArgument {
   string node = 2;
   string root = 3;
   repeated string selectors = 4;
+  string expression = 5;
 }
 
 message FunctionCall {

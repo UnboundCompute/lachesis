@@ -546,6 +546,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     calls.sort_by_key(|call| (if call.has_line { call.line } else { i64::MAX }, call.node.clone()));
     for call in &mut calls {
         for argument in &mut call.arguments {
+            argument.expression = graph.label(&argument.node).to_owned();
             if let Some(path) = graph.access_path(&argument.node, 0) {
                 argument.root = path.root;
                 argument.selectors = path.selectors;

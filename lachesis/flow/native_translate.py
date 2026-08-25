@@ -90,7 +90,9 @@ def build_native_F(store, lang="c", *, return_graph=False):
             args = [{"pos": arg.position, "node": arg.node,
                      "root": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
                      "var": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
-                     "value": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node)}
+                     "value": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
+                     "expr": arg.expression or _name(sub, arg.node),
+                     "provenance": "const" if not arg.root else "local"}
                     for arg in call.arguments]
             assigned = (_call_path(sub, call.assigned_root, call.assigned_selectors)
                         or (_name(sub, call.assigned) if call.assigned else None))
@@ -119,7 +121,7 @@ def build_native_F(store, lang="c", *, return_graph=False):
                 size_arg = catalog.get("size_arg")
                 record["sink"] = {"size_arg": size_arg}
                 size = next((arg for arg in args if arg["pos"] == size_arg), None)
-                record["size_expr"] = size.get("value") if size else None
+                record["size_expr"] = size.get("expr") if size else None
                 record["dst"] = assigned if call.is_alloc else (args[0].get("value") if args else None)
             calls.append(record)
             callees.append(callee)
