@@ -32,6 +32,11 @@ def _path_root(sub, path):
     return value + "".join(path.selectors)
 
 
+def _call_path(sub, root, selectors=()):
+    root = (root or "").removeprefix("decl:")
+    return _name(sub, root) + "".join(selectors) if root else None
+
+
 def _native_prepared(index):
     base = (getattr(index, "_pass3_cache_base", None)
             or getattr(index, "_db_dir", None))
@@ -79,9 +84,12 @@ def build_native_F(store, lang="c", *, return_graph=False):
             if not callee:
                 continue
             args = [{"pos": arg.position, "node": arg.node,
-                     "root": _name(sub, arg.node), "var": _name(sub, arg.node),
-                     "value": _name(sub, arg.node)} for arg in call.arguments]
-            assigned = _name(sub, call.assigned) if call.assigned else None
+                     "root": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
+                     "var": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node),
+                     "value": _call_path(sub, arg.root, arg.selectors) or _name(sub, arg.node)}
+                    for arg in call.arguments]
+            assigned = (_call_path(sub, call.assigned_root, call.assigned_selectors)
+                        or (_name(sub, call.assigned) if call.assigned else None))
             catalog = sinks.get(callee)
             record = {
                 "callee": callee, "line": call.line if call.has_line else None,

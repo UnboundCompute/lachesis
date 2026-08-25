@@ -544,6 +544,18 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     let summary_by_callee = input.summaries.iter().map(|summary| (summary.callee.as_str(), summary)).collect::<HashMap<_, _>>();
     let mut calls = input.calls;
     calls.sort_by_key(|call| (if call.has_line { call.line } else { i64::MAX }, call.node.clone()));
+    for call in &mut calls {
+        for argument in &mut call.arguments {
+            if let Some(path) = graph.access_path(&argument.node, 0) {
+                argument.root = path.root;
+                argument.selectors = path.selectors;
+            }
+        }
+        if let Some(path) = graph.access_path(&call.assigned, 0) {
+            call.assigned_root = path.root;
+            call.assigned_selectors = path.selectors;
+        }
+    }
     for call in &calls {
         let argument = |position: u32| call.arguments.iter().find(|item| item.position == position)
             .and_then(|item| graph.access_path(&item.node, 0).or_else(|| path(Some(&item.node))));

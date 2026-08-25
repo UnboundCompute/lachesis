@@ -137,7 +137,12 @@ message GraphEdge {
   bool has_position = 6;
 }
 
-message FunctionArgument { uint32 position = 1; string node = 2; }
+message FunctionArgument {
+  uint32 position = 1;
+  string node = 2;
+  string root = 3;
+  repeated string selectors = 4;
+}
 
 message FunctionCall {
   string node = 1;
@@ -152,6 +157,8 @@ message FunctionCall {
   bool is_source = 10;
   bool is_aggregate_copy = 11;
   repeated FunctionArgument arguments = 12;
+  string assigned_root = 13;
+  repeated string assigned_selectors = 14;
 }
 
 message FunctionSummaryEffect {

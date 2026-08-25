@@ -213,6 +213,8 @@ pub(crate) fn sidecar_to_request(
             is_source: false,
             is_aggregate_copy: scalar(item, "is_aggregate_copy").as_deref() == Some("true"),
             arguments: Vec::new(),
+            assigned_root: String::new(),
+            assigned_selectors: Vec::new(),
         };
         let parent = parents.get(&item.id).and_then(|id| node_by_id.get(id));
         if let Some(parent) = parent {
@@ -240,6 +242,8 @@ pub(crate) fn sidecar_to_request(
             Some(lifetime_proto::FunctionArgument {
                 position: edge_scalar(edge, "position").and_then(|value| value.parse().ok()).unwrap_or_default(),
                 node: edge.target.clone(),
+                root: String::new(),
+                selectors: Vec::new(),
             })
         }).collect::<Vec<_>>();
         arguments.sort_by_key(|argument| argument.position);
