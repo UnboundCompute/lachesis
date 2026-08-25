@@ -786,6 +786,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     streamed_cfg_seconds = 0.0
     streamed_query_seconds = 0.0
     slowest_cfgs = []
+    progress_interval = max(25, min(500, max(1, len(by_name) // 10)))
     group_by_name = {
         name: group
         for group in schedule
@@ -854,7 +855,7 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 query_started = perf_counter()
                 stream(owner_ids, consume)
                 streamed_query_seconds += perf_counter() - query_started
-                if progress and streamed_owners and streamed_owners % 500 == 0:
+                if progress and streamed_owners and streamed_owners % progress_interval == 0:
                     print(
                         "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs "
                         "query=%.1fs cfg=%.1fs"

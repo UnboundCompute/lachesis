@@ -555,7 +555,11 @@ class ObjectStateAnalyzer:
         exits: list[AbstractState] = []
         for node in nodes:
             if not successors.get(node):
-                exits.extend(self._transfer(incoming[node].values(), at.get(node, ()), findings).values())
+                # Exit nodes have no successors, so they cannot be re-queued after their
+                # first transfer. ``post_snapshots`` already contains their outgoing
+                # states; re-running the transfer here duplicated the hottest state-key
+                # hashing step for every terminal node.
+                exits.extend(post_snapshots[node].values())
         point_states = {
             node: tuple(state.clone() for state in states.values())
             for node, states in incoming.items()
