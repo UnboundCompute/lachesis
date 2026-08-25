@@ -56,6 +56,122 @@ def available() -> bool:
     return _load() is not None
 
 
+def prepare_pb_request(functions, request=None) -> bytes:
+    """Encode raw function graph records into the native binary request."""
+
+    request = request or lifetime_pb2.PrepareRequest()
+    for item in functions:
+        encoded_function = request.functions.add(id=str(item["id"]))
+        for node in item.get("nodes", ()):
+            encoded_node = encoded_function.nodes.add(
+                id=str(node.get("id", "")), kind=str(node.get("kind", "")),
+                label=str(node.get("label", "")),
+            )
+            for key, value in (node.get("properties") or {}).items():
+                prop = encoded_node.properties.add(key=str(key))
+                if isinstance(value, bool):
+                    prop.boolean = value
+                elif isinstance(value, int):
+                    prop.integer = value
+                elif isinstance(value, (str, bytes)):
+                    prop.text = value.decode() if isinstance(value, bytes) else value
+        for edge in item.get("edges", ()):
+            encoded_edge = encoded_function.edges.add(
+                kind=str(edge.get("kind", "")), source=str(edge.get("source", "")),
+                target=str(edge.get("target", "")), role=str(edge.get("role", "")),
+            )
+            if isinstance(edge.get("position"), int):
+                encoded_edge.position = edge["position"]
+                encoded_edge.has_position = True
+        encoded_function.parameters.extend(str(value) for value in item.get("parameters", ()))
+        for call in item.get("calls", ()):
+            encoded_call = encoded_function.calls.add(
+                node=str(call.get("node", "")), callee=str(call.get("callee", "")),
+                assigned=str(call.get("assigned", "") or ""),
+                receiver=str(call.get("receiver", "") or ""),
+                is_alloc=bool(call.get("is_alloc")), is_release=bool(call.get("is_release")),
+                is_realloc=bool(call.get("is_realloc")), is_source=bool(call.get("is_source")),
+                is_aggregate_copy=bool(call.get("is_aggregate_copy")),
+            )
+            if call.get("line") is not None:
+                encoded_call.line = int(call["line"])
+                encoded_call.has_line = True
+            for argument in call.get("args", ()):
+                encoded_call.arguments.add(
+                    position=int(argument["pos"]),
+                    node=str(argument.get("node") or argument.get("root") or ""),
+                )
+        for summary in item.get("summaries", ()):
+            encoded_summary = encoded_function.summaries.add(callee=str(summary["callee"]))
+            for alternative in summary.get("alternatives", ()):
+                encoded_alternative = encoded_summary.alternatives.add()
+                for effect in alternative:
+                    encoded_effect = encoded_alternative.effects.add(
+                        kind=getattr(lifetime_pb2.Operation, str(effect["kind"]).upper()),
+                        position=int(effect.get("position", 0)),
+                        is_return=bool(effect.get("is_return", False)),
+                    )
+                    encoded_effect.selectors.extend(str(value) for value in effect.get("selectors", ()))
+    return request.SerializeToString()
+
+
+def prepare_pb(functions) -> dict[str, lifetime_pb2.PreparedFunction]:
+    """Prepare raw function graph records in Rust and return binary-projected CFGs.
+
+    The input is intentionally a plain mapping only at this public adapter seam;
+    it is encoded immediately and never enters the native implementation as JSON
+    or Python objects. This is the migration boundary for moving CFG/operation
+    preparation out of the Python lifetime pipeline.
+    """
+    payload = prepare_pb_request(functions)
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    prepare = library.lachesis_lifetime_prepare_pb
+    prepare.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    prepare.restype = ctypes.c_void_p
+    output_length = ctypes.c_size_t()
+    request_buffer = ctypes.create_string_buffer(payload)
+    pointer = prepare(ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
+                      ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native lifetime preparation returned no result")
+    try:
+        result = lifetime_pb2.PrepareResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return {function.id: function for function in result.functions}
+
+
+def prepare_and_solve_pb(functions) -> dict[str, lifetime_pb2.Result]:
+    """Run native preparation and lifetime solving in one binary call."""
+    request = lifetime_pb2.PrepareRequest()
+    # Reuse the exact marshaling contract without exposing an intermediate
+    # Python prepared-operation representation to callers.
+    # The helper accepts a request builder through the local implementation below
+    # to keep the C ABI payload construction in one place.
+    encoded = prepare_pb_request(functions, request)
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    solve = library.lachesis_lifetime_prepare_solve_pb
+    solve.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    solve.restype = ctypes.c_void_p
+    output_length = ctypes.c_size_t()
+    request_buffer = ctypes.create_string_buffer(encoded)
+    pointer = solve(ctypes.cast(request_buffer, ctypes.c_void_p), len(encoded),
+                    ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native lifetime preparation/solve returned no result")
+    try:
+        result = lifetime_pb2.PrepareSolveResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return {function.id: function.result for function in result.functions}
+
+
 def _oid(table: dict[str, Any], handle: str, memo: dict[str, tuple]) -> tuple:
     cached = memo.get(handle)
     if cached is not None:
@@ -177,10 +293,10 @@ def _request(nodes, successors, operations, initial: AbstractState) -> bytes:
     for node, targets in successors.items():
         entry = request.successors.add(node=node)
         entry.targets.extend(targets)
-    for operation in operations:
-        if operation.kind == OpKind.SUMMARY or not isinstance(operation.node, str):
-            raise ValueError("native protobuf lifetime solver does not accept SUMMARY operations")
-        encoded = request.operations.add(
+    def encode(parent, operation):
+        if not isinstance(operation.node, str):
+            raise ValueError("native protobuf lifetime solver requires string operation nodes")
+        encoded = parent.add(
             kind=getattr(lifetime_pb2.Operation, operation.kind.name),
             node=operation.node,
             site=str(operation.site if operation.site is not None else operation.node),
@@ -196,6 +312,12 @@ def _request(nodes, successors, operations, initial: AbstractState) -> bytes:
         if operation.line is not None:
             encoded.line = int(operation.line)
             encoded.has_line = True
+        for alternative in operation.alternatives:
+            encoded_alternative = encoded.alternatives.add()
+            for effect in alternative:
+                encode(encoded_alternative.effects, effect)
+    for operation in operations:
+        encode(request.operations, operation)
     for root, object_id in initial.env.items():
         parsed = object_id if isinstance(object_id, tuple) else None
         if parsed is not None and len(parsed) == 3 and parsed[0] == "param":
@@ -210,10 +332,7 @@ def solve_linear(nodes, successors, operations, initial: AbstractState):
     """Return a native ``(summary, AnalysisResult)`` or ``None`` when unsupported."""
     if any(not isinstance(node, str) for node in nodes):
         return None
-    if any(operation.kind == OpKind.SUMMARY for operation in operations):
-        return None
-    if any(operation.kind == OpKind.SUMMARY or not isinstance(operation.node, str)
-           for operation in operations):
+    if any(not isinstance(operation.node, str) for operation in operations):
         return None
     payload = _request(nodes, successors, operations, initial)
     library = _load()

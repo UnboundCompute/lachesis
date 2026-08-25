@@ -16,6 +16,7 @@ mod atropos_bind;
 mod lifetime_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.lifetime.rs"));
 }
+mod prepare;
 
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
@@ -49,6 +50,7 @@ pub enum Kind {
     Free,
     Realloc,
     Use,
+    Summary,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ pub struct Operation {
     pub line: Option<i64>,
     pub is_null: bool,
     pub access: String,
+    pub alternatives: Vec<Vec<Operation>>,
 }
 
 /// Stable metadata for converting native IDs back to Python's tuple-shaped ObjectIds.
@@ -332,7 +335,30 @@ impl State {
                     findings.use_after_free.push((op.line, target.clone(), op.node.clone()));
                 }
             }
+            // Summary operations are expanded by `apply_variants` at the graph
+            // transfer boundary. Keeping this arm fail-closed prevents a
+            // malformed direct call from silently changing state.
+            Kind::Summary => {}
         }
+    }
+
+    fn apply_variants(&self, op: &Operation) -> Vec<State> {
+        if op.kind != Kind::Summary {
+            let mut state = self.clone();
+            state.apply(op, &mut Findings::default());
+            return vec![state];
+        }
+        if op.alternatives.is_empty() {
+            return vec![self.clone()];
+        }
+        op.alternatives.iter().map(|effects| {
+            let mut state = self.clone();
+            let mut findings = Findings::default();
+            for effect in effects {
+                state.apply(effect, &mut findings);
+            }
+            state
+        }).collect()
     }
 
     fn semantically_equal(&self, other: &State) -> bool {
@@ -386,7 +412,50 @@ fn proto_kind(kind: i32) -> Result<Kind, String> {
         ProtoKind::Free => Ok(Kind::Free),
         ProtoKind::Realloc => Ok(Kind::Realloc),
         ProtoKind::Use => Ok(Kind::Use),
+        ProtoKind::Summary => Ok(Kind::Summary),
         ProtoKind::Unspecified => Err("operation kind is unspecified".into()),
+    }
+}
+
+pub(crate) fn proto_operation(operation: lifetime_proto::Operation) -> Result<Operation, String> {
+    let alternatives = operation.alternatives.into_iter().map(|alternative| {
+        alternative.effects.into_iter().map(proto_operation).collect::<Result<Vec<_>, _>>()
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok(Operation {
+        kind: proto_kind(operation.kind)?,
+        node: operation.node,
+        target: operation.target.map(proto_path),
+        source: operation.source.map(proto_path),
+        site: operation.site,
+        line: operation.has_line.then_some(operation.line),
+        is_null: operation.is_null,
+        access: operation.access,
+        alternatives,
+    })
+}
+
+pub(crate) fn proto_operation_message(operation: Operation) -> lifetime_proto::Operation {
+    lifetime_proto::Operation {
+        kind: proto_kind_value(operation.kind),
+        node: operation.node,
+        target: operation.target.map(|path| lifetime_proto::Path {
+            root: path.root,
+            selectors: path.selectors,
+        }),
+        source: operation.source.map(|path| lifetime_proto::Path {
+            root: path.root,
+            selectors: path.selectors,
+        }),
+        site: operation.site,
+        line: operation.line.unwrap_or_default(),
+        has_line: operation.line.is_some(),
+        is_null: operation.is_null,
+        access: operation.access,
+        alternatives: operation.alternatives.into_iter().map(|effects| {
+            lifetime_proto::Alternative {
+                effects: effects.into_iter().map(proto_operation_message).collect(),
+            }
+        }).collect(),
     }
 }
 
@@ -395,18 +464,7 @@ fn solve_proto(input: &[u8]) -> Result<LinearResult, String> {
         .map_err(|error| format!("invalid lifetime protobuf: {error}"))?;
     let nodes = request.nodes;
     let successors = request.successors.into_iter().map(|entry| (entry.node, entry.targets)).collect();
-    let operations = request.operations.into_iter().map(|operation| {
-        Ok(Operation {
-            kind: proto_kind(operation.kind)?,
-            node: operation.node,
-            target: operation.target.map(proto_path),
-            source: operation.source.map(proto_path),
-            site: operation.site,
-            line: operation.has_line.then_some(operation.line),
-            is_null: operation.is_null,
-            access: operation.access,
-        })
-    }).collect::<Result<Vec<_>, String>>()?;
+    let operations = request.operations.into_iter().map(proto_operation).collect::<Result<Vec<_>, String>>()?;
     let mut state = State::default();
     for parameter in request.parameters {
         state.seed_parameter(Path::root(parameter.root), parameter.position);
@@ -447,6 +505,7 @@ fn proto_kind_value(kind: Kind) -> i32 {
         Kind::Free => ProtoKind::Free as i32,
         Kind::Realloc => ProtoKind::Realloc as i32,
         Kind::Use => ProtoKind::Use as i32,
+        Kind::Summary => ProtoKind::Summary as i32,
     }
 }
 
@@ -481,7 +540,7 @@ fn proto_snapshot(snapshot: Snapshot) -> lifetime_proto::Snapshot {
     }
 }
 
-fn proto_result(result: LinearResult) -> lifetime_proto::Result {
+pub(crate) fn proto_result(result: LinearResult) -> lifetime_proto::Result {
     let states = |items: Vec<(String, Vec<Snapshot>)>| items.into_iter().map(|(node, snapshots)| {
         lifetime_proto::StateAt { node, states: snapshots.into_iter().map(proto_snapshot).collect() }
     }).collect();
@@ -528,6 +587,47 @@ pub unsafe extern "C" fn lachesis_lifetime_free_bytes(pointer: *mut u8, length: 
     if !pointer.is_null() {
         drop(Vec::from_raw_parts(pointer, length, length));
     }
+}
+
+/// Binary protobuf ABI for native CFG/operation preparation. The input is raw
+/// function graph data; the output is a solver-ready function batch.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        prepare::solve(bytes)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native lifetime preparation error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
+/// Prepare and solve a batch without returning through Python between the two
+/// native phases. Python sends raw binary graph records and receives binary
+/// lifetime results only.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_solve_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        prepare::prepare_and_solve(bytes)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native lifetime prepare/solve error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
 }
 
 impl Operation {
@@ -681,9 +781,8 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         let mut current = incoming.get(&node).cloned().unwrap_or_default();
         for operation in at.get(&node).into_iter().flatten() {
             let mut next = Vec::with_capacity(current.len());
-            for mut state in current {
-                state.apply(operation, &mut findings);
-                next.push(state);
+            for state in current {
+                next.extend(state.apply_variants(operation));
             }
             current = deduplicate(next);
         }
@@ -752,7 +851,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
 }
 
 fn kind_name(kind: Kind) -> &'static str {
-    match kind { Kind::Alloc => "alloc", Kind::Clobber => "clobber", Kind::Copy => "copy", Kind::Free => "free", Kind::Realloc => "realloc", Kind::Use => "use" }
+    match kind { Kind::Alloc => "alloc", Kind::Clobber => "clobber", Kind::Copy => "copy", Kind::Free => "free", Kind::Realloc => "realloc", Kind::Use => "use", Kind::Summary => "summary" }
 }
 
 fn path_name(path: &Path) -> String {
@@ -777,7 +876,7 @@ mod tests {
     use super::*;
 
     fn op(kind: Kind, target: Path, site: &str) -> Operation {
-        Operation { kind, node: site.into(), target: Some(target), source: None, site: site.into(), line: Some(1), is_null: false, access: "deref".into() }
+        Operation { kind, node: site.into(), target: Some(target), source: None, site: site.into(), line: Some(1), is_null: false, access: "deref".into(), alternatives: Vec::new() }
     }
 
     #[test]

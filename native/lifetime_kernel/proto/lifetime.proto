@@ -16,6 +16,7 @@ message Operation {
     FREE = 4;
     REALLOC = 5;
     USE = 6;
+    SUMMARY = 7;
   }
   Kind kind = 1;
   string node = 2;
@@ -26,7 +27,10 @@ message Operation {
   bool has_line = 7;
   bool is_null = 8;
   string access = 9;
+  repeated Alternative alternatives = 10;
 }
+
+message Alternative { repeated Operation effects = 1; }
 
 message Successors {
   string node = 1;
@@ -95,3 +99,83 @@ message Result {
   uint64 widenings = 6;
   bool capped = 7;
 }
+
+// Raw, function-scoped graph input for the native preparation path. Python only
+// marshals records into these messages; CFG synthesis and operation extraction
+// happen in Rust. Properties intentionally use a small scalar union because the
+// lifetime preparer only needs syntax/ordering/type metadata.
+message ScalarProperty {
+  string key = 1;
+  oneof value {
+    string text = 2;
+    sint64 integer = 3;
+    bool boolean = 4;
+  }
+}
+
+message GraphNode {
+  string id = 1;
+  string kind = 2;
+  string label = 3;
+  repeated ScalarProperty properties = 4;
+}
+
+message GraphEdge {
+  string kind = 1;
+  string source = 2;
+  string target = 3;
+  string role = 4;
+  sint64 position = 5;
+  bool has_position = 6;
+}
+
+message FunctionArgument { uint32 position = 1; string node = 2; }
+
+message FunctionCall {
+  string node = 1;
+  string callee = 2;
+  string assigned = 3;
+  string receiver = 4;
+  sint64 line = 5;
+  bool has_line = 6;
+  bool is_alloc = 7;
+  bool is_release = 8;
+  bool is_realloc = 9;
+  bool is_source = 10;
+  bool is_aggregate_copy = 11;
+  repeated FunctionArgument arguments = 12;
+}
+
+message FunctionSummaryEffect {
+  Operation.Kind kind = 1;
+  uint32 position = 2;
+  repeated string selectors = 3;
+  bool is_return = 4;
+}
+
+message FunctionSummaryAlternative { repeated FunctionSummaryEffect effects = 1; }
+message FunctionSummary {
+  string callee = 1;
+  repeated FunctionSummaryAlternative alternatives = 2;
+}
+
+message FunctionInput {
+  string id = 1;
+  repeated GraphNode nodes = 2;
+  repeated GraphEdge edges = 3;
+  repeated string parameters = 4;
+  repeated FunctionCall calls = 5;
+  repeated FunctionSummary summaries = 6;
+}
+
+message PrepareRequest { repeated FunctionInput functions = 1; }
+message PreparedFunction {
+  string id = 1;
+  repeated string nodes = 2;
+  repeated Successors successors = 3;
+  repeated Operation operations = 4;
+  repeated string parameters = 5;
+}
+message PrepareResult { repeated PreparedFunction functions = 1; }
+message PreparedFunctionResult { string id = 1; Result result = 2; }
+message PrepareSolveResult { repeated PreparedFunctionResult functions = 1; }
