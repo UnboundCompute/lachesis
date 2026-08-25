@@ -348,10 +348,10 @@ impl State {
         }
     }
 
-    fn apply_variants(&self, op: &Operation) -> Vec<State> {
+    fn apply_variants(&self, op: &Operation, findings: &mut Findings) -> Vec<State> {
         if op.kind != Kind::Summary {
             let mut state = self.clone();
-            state.apply(op, &mut Findings::default());
+            state.apply(op, findings);
             return vec![state];
         }
         if op.alternatives.is_empty() {
@@ -359,9 +359,8 @@ impl State {
         }
         op.alternatives.iter().map(|effects| {
             let mut state = self.clone();
-            let mut findings = Findings::default();
             for effect in effects {
-                state.apply(effect, &mut findings);
+                state.apply(effect, findings);
             }
             state
         }).collect()
@@ -834,7 +833,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         queue.push_back(first.clone());
         queued.insert(first.clone());
     }
-    let findings = Findings::default();
+    let mut findings = Findings::default();
     let mut transfers = 0u64;
     let mut widenings = 0u64;
     let cap = max_disjuncts.max(1);
@@ -845,7 +844,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         for operation in at.get(&node).into_iter().flatten() {
             let mut next = Vec::with_capacity(current.len());
             for state in current {
-                next.extend(state.apply_variants(operation));
+                next.extend(state.apply_variants(operation, &mut findings));
             }
             current = deduplicate(next);
         }
@@ -980,5 +979,21 @@ mod tests {
         assert_eq!(result.post_states.len(), 2);
         assert_eq!(result.transfers, 2);
         assert!(result.findings.double_free.is_empty());
+    }
+
+    #[test]
+    fn graph_batch_publishes_findings_from_transfers() {
+        let nodes = vec!["alloc".to_string(), "free1".to_string(), "free2".to_string()];
+        let mut successors = HashMap::new();
+        successors.insert("alloc".into(), vec!["free1".into()]);
+        successors.insert("free1".into(), vec!["free2".into()]);
+        let target = Path::root("p");
+        let operations = vec![
+            op(Kind::Alloc, target.clone(), "alloc"),
+            op(Kind::Free, target.clone(), "free1"),
+            op(Kind::Free, target, "free2"),
+        ];
+        let result = solve_graph(&nodes, &successors, &operations, State::default(), 32);
+        assert_eq!(result.findings.double_free.len(), 1);
     }
 }
