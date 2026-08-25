@@ -160,6 +160,16 @@ class AbstractState:
         cloned.freed_paths = self.freed_paths.copy()
         return cloned
 
+    def shallow_clone(self) -> "AbstractState":
+        """Fork for read-only operations without copying the state maps."""
+        cloned = object.__new__(AbstractState)
+        cloned.env = self.env
+        cloned.facts = self.facts
+        cloned.slots = self.slots
+        cloned.trace = self.trace
+        cloned.freed_paths = self.freed_paths
+        return cloned
+
     @timeit(name="object_state.AbstractState.key")
     def key(self) -> tuple:
         # These mappings are mathematical sets for state-equivalence purposes.
@@ -493,7 +503,13 @@ class ObjectStateAnalyzer:
             # rehashing these nodes accounted for most of the 1.5M key calls on libxml2.
             return dict(states)
         values = states.values() if isinstance(states, Mapping) else states
-        current = [state.clone() for state in values]
+        if operations and all(op.kind == OpKind.USE for op in operations):
+            # USE resolves without creating objects and only appends a trace effect for
+            # parameter/return observations. The state maps are therefore immutable for
+            # this transfer; fork their object shell and avoid copying large dictionaries.
+            current = [state.shallow_clone() for state in values]
+        else:
+            current = [state.clone() for state in values]
         for op in operations:
             if op.kind != OpKind.SUMMARY:
                 for state in current:
