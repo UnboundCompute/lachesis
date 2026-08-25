@@ -88,6 +88,26 @@ fn edge_scalar(edge: &graph_proto::EdgeRecord, key: &str) -> Option<String> {
     })
 }
 
+fn input_scalar(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
+    node.properties.iter().find_map(|property| {
+        if property.key != key { return None; }
+        property.value.as_ref().map(|value| match value {
+            lifetime_proto::scalar_property::Value::Text(value) => value.clone(),
+            lifetime_proto::scalar_property::Value::Integer(value) => value.to_string(),
+            lifetime_proto::scalar_property::Value::Boolean(value) => value.to_string(),
+        })
+    })
+}
+
+fn resolve_decl(node: &str, refs: &HashMap<String, String>,
+               children: &HashMap<String, Vec<String>>,
+               seen: &mut std::collections::HashSet<String>) -> Option<String> {
+    if !seen.insert(node.to_owned()) { return None; }
+    if let Some(declaration) = refs.get(node) { return Some(declaration.clone()); }
+    children.get(node).into_iter().flatten()
+        .find_map(|child| resolve_decl(child, refs, children, seen))
+}
+
 fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     if input.len().saturating_sub(*offset) < FRAME_HEADER {
         return Err("truncated graph sidecar frame header".to_owned());
@@ -132,6 +152,15 @@ pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
     let owners: HashMap<String, String> = nodes.iter().filter_map(|item| {
         owner(item).map(|function| (item.id.clone(), function))
     }).collect();
+    let function_names: HashMap<String, String> = nodes.iter().filter_map(|item| {
+        let syntax = scalar(item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+        if matches!(syntax.as_str(), "function" | "method" | "constructor"
+            | "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
+            Some((item.id.clone(), item.label.clone()))
+        } else {
+            None
+        }
+    }).collect();
     let node_by_id: HashMap<String, &graph_proto::NodeRecord> = nodes.iter()
         .map(|item| (item.id.clone(), item)).collect();
     let mut parents = HashMap::new();
@@ -168,7 +197,10 @@ pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
         let Some(entry) = functions.get_mut(&function) else { continue };
         let mut call = lifetime_proto::FunctionCall {
             node: item.id.clone(),
-            callee: scalar(item, "callee").unwrap_or_else(|| item.label.clone()),
+            callee: scalar(item, "primary_target_id")
+                .and_then(|target| function_names.get(&target).cloned())
+                .or_else(|| scalar(item, "callee"))
+                .unwrap_or_else(|| item.label.clone()),
             assigned: String::new(),
             receiver: scalar(item, "receiver").unwrap_or_default(),
             line: scalar(item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
@@ -212,8 +244,110 @@ pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
         call.arguments = arguments;
         entry.calls.push(call);
     }
+    // Build the first native interprocedural summary lattice.  These effects
+    // are deliberately expressed in formal-parameter positions, which is the
+    // same contract consumed by the lifetime preparer.  A small fixed-point is
+    // enough here because the summary domain is finite (callee, position,
+    // selectors); recursive SCCs converge by set union.
+    let function_names_by_id = function_names;
+    let names_by_input_id: HashMap<String, String> = functions.keys().filter_map(|id| {
+        function_names_by_id.get(id).map(|name| (id.clone(), name.clone()))
+    }).collect();
+    let mut summary_effects: HashMap<String, Vec<(u32, Vec<String>)>> = HashMap::new();
+    for (id, input) in &functions {
+        let Some(name) = names_by_input_id.get(id) else { continue };
+        let refs: HashMap<String, String> = input.edges.iter()
+            .filter(|edge| edge.kind == "REFERS_TO")
+            .map(|edge| (edge.source.clone(), edge.target.clone()))
+            .collect();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for edge in input.edges.iter().filter(|edge| edge.kind == "AST_CHILD") {
+            children.entry(edge.source.clone()).or_default().push(edge.target.clone());
+        }
+        let parameter_positions: HashMap<String, u32> = input.parameters.iter()
+            .enumerate().map(|(position, node)| (node.clone(), position as u32)).collect();
+        let mut effects: Vec<(u32, Vec<String>)> = Vec::new();
+        for call in &input.calls {
+            if !call.is_release && !call.is_realloc { continue; }
+            for argument in &call.arguments {
+                let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
+                    &mut std::collections::HashSet::new()) else { continue };
+                let Some(position) = parameter_positions.get(&declaration) else { continue };
+                if !effects.iter().any(|(existing, selectors)| *existing == *position && selectors.is_empty()) {
+                    effects.push((*position, Vec::new()));
+                }
+            }
+        }
+        summary_effects.insert(name.clone(), effects);
+    }
+    for _ in 0..32 {
+        let mut changed = false;
+        for input in functions.values() {
+            let Some(name) = names_by_input_id.get(&input.id) else { continue };
+            let refs: HashMap<String, String> = input.edges.iter()
+                .filter(|edge| edge.kind == "REFERS_TO")
+                .map(|edge| (edge.source.clone(), edge.target.clone()))
+                .collect();
+            let mut children: HashMap<String, Vec<String>> = HashMap::new();
+            for edge in input.edges.iter().filter(|edge| edge.kind == "AST_CHILD") {
+                children.entry(edge.source.clone()).or_default().push(edge.target.clone());
+            }
+            let parameter_positions: HashMap<String, u32> = input.parameters.iter()
+                .enumerate().map(|(position, node)| (node.clone(), position as u32)).collect();
+            let mut additions = Vec::new();
+            for call in &input.calls {
+                let Some(callee_effects) = summary_effects.get(&call.callee) else { continue };
+                for (callee_position, selectors) in callee_effects {
+                    let Some(argument) = call.arguments.iter()
+                        .find(|argument| argument.position == *callee_position) else { continue };
+                    let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
+                        &mut std::collections::HashSet::new()) else { continue };
+                    let Some(position) = parameter_positions.get(&declaration) else { continue };
+                    additions.push((*position, selectors.clone()));
+                }
+            }
+            let target = summary_effects.get_mut(name).expect("summary entry exists");
+            for addition in additions {
+                if !target.iter().any(|existing| *existing == addition) {
+                    target.push(addition);
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    for input in functions.values_mut() {
+        for call in &input.calls {
+            let Some(effects) = summary_effects.get(&call.callee) else { continue };
+            if effects.is_empty() { continue; }
+            let summary_index = input.summaries.iter()
+                .position(|summary| summary.callee == call.callee);
+            let summary_index = summary_index.unwrap_or_else(|| {
+                input.summaries.push(lifetime_proto::FunctionSummary {
+                    callee: call.callee.clone(), alternatives: Vec::new(),
+                });
+                input.summaries.len() - 1
+            });
+            let summary = &mut input.summaries[summary_index];
+            let mut alternative = lifetime_proto::FunctionSummaryAlternative { effects: Vec::new() };
+            for (position, selectors) in effects {
+                alternative.effects.push(lifetime_proto::FunctionSummaryEffect {
+                    kind: lifetime_proto::operation::Kind::Free as i32,
+                    position: *position,
+                    selectors: selectors.clone(),
+                    is_return: false,
+                });
+            }
+            summary.alternatives.push(alternative);
+        }
+    }
     for entry in functions.values_mut() {
-        entry.parameters.sort();
+        let offsets: HashMap<String, i64> = entry.nodes.iter().filter_map(|node| {
+            if node.id.is_empty() { return None; }
+            input_scalar(node, "start_offset").and_then(|value| value.parse().ok())
+                .map(|offset| (node.id.clone(), offset))
+        }).collect();
+        entry.parameters.sort_by_key(|id| offsets.get(id).copied().unwrap_or(i64::MAX));
         entry.parameters.dedup();
         entry.nodes.sort_by(|left, right| left.id.cmp(&right.id));
         entry.edges.sort_by(|left, right| {

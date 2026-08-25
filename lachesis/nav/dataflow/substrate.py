@@ -47,7 +47,8 @@ _SUBSTRATE_NODE_KINDS = frozenset({
     "IfStmt", "ImplicitCastExpr", "ImplicitValueInitExpr", "IntegerLiteral", "LabelStmt",
     "MemberExpr", "ParenExpr", "ParmVarDecl", "ReturnStmt", "StringLiteral", "SwitchStmt",
     "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
-    "cfg-exit", "cfg-merge", "cfg-condition",
+    "cfg-exit", "cfg-merge", "cfg-condition", "function", "method", "constructor",
+    "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
 })
 _SUBSTRATE_PROPERTY_KEYS = frozenset({
     "absolute_file", "end_line", "end_offset", "file", "function_id",
@@ -60,6 +61,7 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
     "callee", "form", "method_name", "primary_target_id",
     "receiver_member_id", "resolution", "allocation_kind", "allocated_type",
     "control_kind", "is_alloc", "is_release", "is_realloc", "is_aggregate_copy",
+    "declaration_only", "storage_class", "owner_id",
 })
 
 
