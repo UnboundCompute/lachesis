@@ -35,7 +35,7 @@ Known limitations vs a full object-state analysis (honest, not silent):
     emitted by that frontend.
 """
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import json
 import re
 
@@ -1004,6 +1004,11 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
     # in a class hierarchy.  Preserve a stable qualified identity when the frontend
     # gives us a class owner; retain the old spelling for unique functions and for
     # non-class callables so existing language-neutral consumers remain compatible.
+    non_declared_name_counts = Counter(
+        f.get("label") for f in fnodes
+        if f.get("label") and not _props(f).get("declaration_only")
+    )
+
     def function_key(fnode):
         name = fnode.get("label")
         props = _props(fnode)
@@ -1011,9 +1016,7 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         owner = (_header_node(ix, owner_id) if owner_id else None)
         if owner and owner.get("kind") == "class" and owner.get("label"):
             return f"{owner['label']}.{name}"
-        if sum(1 for candidate in fnodes
-               if candidate.get("label") == name
-               and not _props(candidate).get("declaration_only")) > 1:
+        if non_declared_name_counts.get(name, 0) > 1:
             return f"{name}@{props.get('absolute_file') or props.get('file')}:{props.get('start_line')}"
         return name
 
