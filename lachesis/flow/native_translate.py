@@ -87,7 +87,9 @@ def build_native_F(store, lang="c", *, return_graph=False):
     prepared = _native_prepared(index)
     if prepared is None:
         return None
-    sub = cached_substrate(index).load()
+    # cached_substrate() performs the one lazy bulk load itself. Calling load()
+    # again here needlessly re-enters the graph-sized substrate boundary.
+    sub = cached_substrate(index)
     norm = normalizer(lang)
     sinks = atropos.sink_catalog(lang)
     source_names = set(atropos.source_catalog(lang))

@@ -944,7 +944,7 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
             by_name[name] = node["id"]
     selected_ids = set(by_name.values())
     native = solve_selected_graph_pb(sidecar, selected_ids)
-    sub = cached_substrate(analysis_index).load()
+    sub = cached_substrate(analysis_index)
     summaries = {}
     artifacts = {}
     cfgs = {}
