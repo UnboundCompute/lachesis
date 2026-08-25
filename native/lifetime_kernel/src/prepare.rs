@@ -747,6 +747,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         successors,
         operations: operations.into_iter().map(crate::proto_operation_message).collect(),
         parameters: input.parameters,
+        calls,
     }
 }
 

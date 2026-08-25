@@ -183,6 +183,9 @@ message PreparedFunction {
   repeated Successors successors = 3;
   repeated Operation operations = 4;
   repeated string parameters = 5;
+  // Native translation facts retained for the Rust-owned Pass-2 path.  Keeping
+  // the calls beside the prepared CFG avoids a second Kùzu walk in Python.
+  repeated FunctionCall calls = 6;
 }
 message PrepareResult { repeated PreparedFunction functions = 1; }
 message PreparedFunctionResult {
