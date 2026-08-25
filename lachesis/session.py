@@ -253,6 +253,7 @@ class Analysis:
         result = atropos_enrich(
             graph, complete_dataflow=False,
             symbol_index_source=getattr(self.store, "index", None),
+            compact_structural=True,
         )
         self._pass2_timing("catalog structural bind", bind_started)
         self._pass2_timing("catalog structural bind total", started)

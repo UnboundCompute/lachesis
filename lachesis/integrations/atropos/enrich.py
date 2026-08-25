@@ -86,6 +86,7 @@ def _languages_present(graph: Dict[str, Any]) -> List[str]:
 def atropos_enrich(
     graph: Dict[str, Any], *, atropos_root: Optional[str] = None,
     complete_dataflow: bool = True, symbol_index_source: Any = None,
+    compact_structural: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return ``(taint_aware_graph, summary)``; graph unchanged if Atropos absent.
 
@@ -164,7 +165,7 @@ def atropos_enrich(
             "unbound": unbound,
         }
 
-    if not complete_dataflow:
+    if compact_structural and not complete_dataflow:
         # Structural binding is additive: the catalog contributes only role nodes,
         # taint edges, and summary flow edges.  Every endpoint came from this
         # bounded neutral callsite projection, so validate against that projection
@@ -178,29 +179,6 @@ def atropos_enrich(
             known_node_ids.update(callsite.get("arg_value_ids") or ())
         known_node_ids.discard(None)
         delta = AtroposOverlay(stamps).delta_for_node_ids(known_node_ids)
-        # Preserve the generic registry's idempotence when a caller reuses the
-        # same in-memory graph.  Probe only the tiny delta identity set; do not
-        # materialize a second graph-sized node/edge index.
-        candidate_node_ids = {node["id"] for node in delta.nodes}
-        existing_node_ids = {
-            node.get("id") for node in graph.get("nodes", ())
-            if node.get("id") in candidate_node_ids
-        }
-        delta.nodes = [node for node in delta.nodes
-                       if node["id"] not in existing_node_ids]
-        candidate_edge_keys = {
-            (edge["kind"], edge["source"], edge["target"])
-            for edge in delta.edges
-        }
-        existing_edge_keys = {
-            (edge.get("kind"), edge.get("source"), edge.get("target"))
-            for edge in graph.get("edges", ())
-            if (edge.get("kind"), edge.get("source"), edge.get("target"))
-            in candidate_edge_keys
-        }
-        delta.edges = [edge for edge in delta.edges
-                       if (edge["kind"], edge["source"], edge["target"])
-                       not in existing_edge_keys]
         if isinstance(graph.get("nodes"), list):
             graph["nodes"].extend(delta.nodes)
         else:
