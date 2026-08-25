@@ -290,6 +290,8 @@ def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, .
             expression_items = sub.idx.member_expression_nodes()
         else:
             expression_items = sub.idx.nodes_of_kind("expression")
+        pending = []
+        root_ids = set()
         for item in expression_items:
             node = item.get("id") if isinstance(item, dict) else item
             item_props = item.get("properties", {}) if isinstance(item, dict) else {}
@@ -302,9 +304,18 @@ def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, .
             # combination here causes avoidable state multiplication in summaries.
             if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
                 root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
-                root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
-                cache[root_type].add(path.selectors)
-                cache[_aggregate_type_key(root_type)].add(path.selectors)
+                if root_id is not None:
+                    root_ids.add(root_id)
+                pending.append((root_id, path.selectors))
+        # Root type is the only property needed from this catalogue.  Resolve it in
+        # bounded batches instead of calling ``sub.props`` once per member expression;
+        # the latter becomes thousands of Kùzu primary-key round trips on a full graph.
+        if root_ids:
+            sub.warm_nodes(root_ids)
+        for root_id, selectors in pending:
+            root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
+            cache[root_type].add(selectors)
+            cache[_aggregate_type_key(root_type)].add(selectors)
         sub._aggregate_field_paths_loaded = True
     if type_key is None:
         paths = set().union(*cache.values()) if cache else set()
