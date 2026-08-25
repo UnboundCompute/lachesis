@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 from typing import Any, Iterable
+from lachesis.timeit import timeit
 
 
 class EventKind(str, Enum):
@@ -452,6 +453,10 @@ class _WitnessPath(tuple):
         return value
 
 
+from lachesis.timeit import timeit
+
+
+@timeit
 def match_graph(graph: SkeletonGraph, *, patterns: Iterable[str] | None = None) -> list[dict[str, Any]]:
     """Find facts on compatible pushdown paths.
 

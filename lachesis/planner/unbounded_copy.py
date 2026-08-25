@@ -159,20 +159,60 @@ class BranchRegions:
     rank nor removes a candidate."""
 
     def __init__(self, graph: dict) -> None:
-        by_id = {n["id"]: n for n in graph.get("nodes", ())}
+        disk_index = None if isinstance(graph, dict) else graph
+        by_id = ({n["id"]: n for n in graph.get("nodes", ())}
+                 if disk_index is None else {})
         # condition-node-id -> [region body spans], from the branch-region edges.
         self._regions_of: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
         self._has_substrate = False
-        for edge in graph.get("edges", ()):
-            if edge.get("kind") not in _REGION_EDGE_KINDS:
-                continue
-            self._has_substrate = True
-            span = _node_span(by_id.get(edge.get("target")))
-            if span is not None:
-                self._regions_of[edge.get("source")].append(span)
+        if disk_index is None:
+            edges = graph.get("edges", ())
+            for edge in edges:
+                if edge.get("kind") not in _REGION_EDGE_KINDS:
+                    continue
+                self._has_substrate = True
+                span = _node_span(by_id.get(edge.get("target")))
+                if span is not None:
+                    self._regions_of[edge.get("source")].append(span)
         # function-id -> [(condition_node_id, controlling-expression head)].
         self._conditions_of: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
-        for node in graph.get("nodes", ()):
+        if disk_index is None:
+            condition_nodes = graph.get("nodes", ())
+        else:
+            condition_ids = tuple(graph.by_kind.get("cfg-condition", ()))
+            condition_nodes = ()
+        if disk_index is not None:
+            # Branch classification consumes only the condition kind, label,
+            # function owner, and the region-edge target spans.  Use the promoted
+            # header columns on the lazy Kùzu path instead of inflating every
+            # condition node's property tail.  Overlay-mutated nodes retain the
+            # old full fetch so sidecar semantics remain exact.
+            if (hasattr(disk_index, "node_headers")
+                    and not getattr(disk_index, "_overlay", None)):
+                condition_nodes = tuple(disk_index.node_headers(condition_ids))
+            else:
+                warmer = getattr(disk_index, "_warm_nodes", None)
+                if warmer is not None:
+                    warmer(condition_ids)
+                condition_nodes = tuple(graph.nodes.get(node_id)
+                                        for node_id in condition_ids)
+            if hasattr(disk_index, "_edges_with_target_spans"):
+                region_rows = disk_index._edges_with_target_spans(_REGION_EDGE_KINDS)
+                region_edges = [
+                    {"source": source, "target": target, "kind": kind,
+                     "_target_span": span}
+                    for source, target, kind, span in region_rows
+                ]
+            else:
+                region_edges = list(disk_index.edges_of_kind(*_REGION_EDGE_KINDS))
+            span_by_id = {edge["target"]: edge.get("_target_span")
+                          for edge in region_edges if edge.get("_target_span")}
+            edges_by_source = defaultdict(list)
+            for edge in region_edges:
+                edges_by_source[edge.get("source")].append(edge)
+        else:
+            edges_by_source = None
+        for node in condition_nodes:
             if node.get("kind") != "cfg-condition":
                 continue
             props = node.get("properties") or {}
@@ -180,6 +220,21 @@ class BranchRegions:
             if function_id:
                 self._conditions_of[function_id].append(
                     (node["id"], condition_head(node.get("label"))))
+            if disk_index is not None:
+                for edge in edges_by_source.get(node["id"], ()):
+                    self._has_substrate = True
+                    # Kùzu's span-aware edge query returns the promoted span
+                    # fields as a small dict rather than a full node.  Reuse
+                    # the same normalization as the dict-backed path.
+                    raw_span = span_by_id.get(edge.get("target"))
+                    span = (_node_span(raw_span) if raw_span and
+                            "properties" in raw_span else
+                            ((raw_span.get("absolute_file") or raw_span.get("file"),
+                              raw_span.get("start_offset"),
+                              raw_span.get("end_offset"))
+                             if raw_span else None))
+                    if span is not None:
+                        self._regions_of[node["id"]].append(span)
 
     @property
     def has_substrate(self) -> bool:

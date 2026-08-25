@@ -15,6 +15,7 @@ Everything a temporal shape query needs to be path-sensitive (two frees on mutua
 branches never meet; a free across a loop back-edge does) comes from these two.
 """
 from collections import defaultdict
+from lachesis.timeit import timeit
 
 # the reader's control-flow edge kinds (control_flow overlay). MERGES_AT joins branch tails
 # so a post-branch use sees the union of both arms; LOOP_BACK carries the back-edge that makes
@@ -23,6 +24,7 @@ _CFG_EDGES = ("CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK",
               "SWITCH_CASE", "EXCEPTION_BRANCH", "RUNS_FINALLY", "MERGES_AT")
 
 
+@timeit
 def cfg_bundle(store):
     """Build {"succ", "resolve"} from an opened store whose dataflow tier is ensured."""
     idx = store.index
