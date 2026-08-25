@@ -146,6 +146,7 @@ class AbstractState:
         # Pointer-field paths freed on this path but not yet reassigned. Book-keeping for
         # the free-then-reallocate compensation; almost always empty between statements.
         self.freed_paths = dict(freed_paths or {})
+        self._key_cache = None
 
     def clone(self) -> "AbstractState":
         # This is an extremely hot path in the fixpoint solver. Bypass the generic
@@ -158,6 +159,7 @@ class AbstractState:
         cloned.slots = self.slots.copy()
         cloned.trace = self.trace
         cloned.freed_paths = self.freed_paths.copy()
+        cloned._key_cache = self._key_cache
         return cloned
 
     def shallow_clone(self) -> "AbstractState":
@@ -168,25 +170,32 @@ class AbstractState:
         cloned.slots = self.slots
         cloned.trace = self.trace
         cloned.freed_paths = self.freed_paths
+        cloned._key_cache = self._key_cache
         return cloned
 
     @timeit(name="object_state.AbstractState.key")
     def key(self) -> tuple:
+        cached = self._key_cache
+        if cached is not None:
+            return cached
         # These mappings are mathematical sets for state-equivalence purposes.
         # Sorting them used ``repr(object_id)`` because recursively constructed phi
         # IDs are not naturally orderable; on large CFGs that repeatedly rendered
         # enormous nested tuples.  Frozensets preserve exact structural equality and
         # hashing without inventing an ordering or allocating those strings.
-        return (
+        key = (
             frozenset(self.env.items()),
             frozenset(self.facts.items()),
             frozenset(self.slots.items()),
             self.trace,
             frozenset(self.freed_paths.items()),
         )
+        self._key_cache = key
+        return key
 
     def seed_parameter(self, path: AccessPath, position: int) -> None:
         """Bind a formal root to a symbolic caller-owned object."""
+        self._key_cache = None
         if path.selectors:
             raise ValueError("a formal parameter seed must be a root access path")
         oid = ("param", position, ())
@@ -220,6 +229,7 @@ class AbstractState:
         return oid
 
     def bind(self, path: AccessPath, oid: ObjectId) -> None:
+        self._key_cache = None
         if not path.selectors:
             self.env[path.root] = oid
             return
@@ -330,6 +340,10 @@ class AbstractState:
             self.facts[oid] = (facts | freed) if is_summary else freed
 
     def apply(self, op: Operation, findings: set[Finding]) -> None:
+        # A transfer may mutate any of the five key components. Invalidate once at
+        # the public mutation boundary; the internal helpers can then update maps
+        # freely without repeatedly clearing the cache.
+        self._key_cache = None
         if op.kind == OpKind.ALLOC:
             self._compensate_reassignment(op)
             self._fresh(op, ObjectFact.ALLOCATED)
