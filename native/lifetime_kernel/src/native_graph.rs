@@ -129,7 +129,9 @@ fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
 /// Convert the complete framed substrate to the existing native preparation
 /// contract. This is deliberately one conversion inside Rust; Python never
 /// creates FunctionInput/FunctionCall records for this path.
-pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn sidecar_to_request(
+    input: &[u8],
+) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut offset = 0;
     let header = frame(input, &mut offset)?;
     let _: graph_proto::Document = graph_proto::Document::decode(header)
@@ -355,8 +357,5 @@ pub(crate) fn sidecar_to_request(input: &[u8]) -> Result<Vec<u8>, String> {
                 .cmp(&(&right.kind, &right.source, &right.target, right.position))
         });
     }
-    let request = lifetime_proto::PrepareRequest { functions: functions.into_values().collect() };
-    let mut output = Vec::new();
-    request.encode(&mut output).map_err(|error| error.to_string())?;
-    Ok(output)
+    Ok(lifetime_proto::PrepareRequest { functions: functions.into_values().collect() })
 }

@@ -659,7 +659,7 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_pb(
     let result = (|| {
         let bytes = slice::from_raw_parts(input, length);
         let request = native_graph::sidecar_to_request(bytes)?;
-        prepare::solve(&request)
+        prepare::solve_request(request)
     })();
     let mut payload = result.unwrap_or_else(|error| {
         eprintln!("native graph preparation error: {error}");
@@ -680,7 +680,7 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_solve_pb(
     let result = (|| {
         let bytes = slice::from_raw_parts(input, length);
         let request = native_graph::sidecar_to_request(bytes)?;
-        prepare::prepare_and_solve(&request)
+        prepare::prepare_and_solve_request(request)
     })();
     let mut payload = result.unwrap_or_else(|error| {
         eprintln!("native whole-graph prepare/solve error: {error}");
