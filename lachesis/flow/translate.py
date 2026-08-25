@@ -40,14 +40,13 @@ import json
 import re
 
 from lachesis.nav.graph_store import GraphStore
-from lachesis.nav.kuzu_index import materialize_graph
-from lachesis.core.query import GraphIndex
 from lachesis.planner.unbounded_copy import BranchRegions
 
 from . import atropos
 from .normalize import normalizer
 from .source_discovery import discover_sources
 from .coverage import CoverageScheduler
+from lachesis.timeit import timeit
 
 
 # --- small helpers ---------------------------------------------------------------
@@ -60,6 +59,30 @@ def _callee_name(node):
     p = _props(node)
     return (p.get("callee") or p.get("callee_name") or p.get("method_name")
             or node.get("label"))
+
+
+def _header_node(ix, node_id):
+    """Return the kind/label view needed by projection without a Kùzu fetch."""
+    if node_id is None:
+        return None
+    if hasattr(ix, "_kind_by_id"):
+        # Header nodes are read-only projection values.  Translation asks for the
+        # same callee/argument/control headers repeatedly; rebuilding a dict and
+        # copying its promoted properties on every lookup adds measurable Python
+        # allocation pressure after the Kùzu fetches have been batched.
+        cache = getattr(ix, "_translation_header_cache", None)
+        if cache is None:
+            cache = ix._translation_header_cache = {}
+        cached = cache.get(node_id)
+        if cached is not None:
+            return cached
+        kind = ix._kind_by_id.get(node_id)
+        label = ix._label_by_id.get(node_id)
+        node = {"id": node_id, "kind": kind, "label": label,
+                "properties": dict(ix._header_by_id.get(node_id, {}))}
+        cache[node_id] = node
+        return node
+    return ix.nodes.get(node_id)
 
 
 def _span(node):
@@ -128,29 +151,77 @@ class ControlNesting:
     control text. We read each enclosing statement's leading keyword; that is the nesting."""
 
     def __init__(self, graph):
-        self._by_id = {n["id"]: n for n in graph.get("nodes", ())}
+        self._index = None if isinstance(graph, dict) else graph
+        self._by_id = ({n["id"]: n for n in graph.get("nodes", ())}
+                       if isinstance(graph, dict) else {})
         self._parent = {}
-        for e in graph.get("edges", ()):
-            if e.get("kind") == "AST_CHILD":
-                self._parent[e["target"]] = e["source"]   # child -> parent
+        self._headers = {}
+        self._enclosing_cache = {}
+        if isinstance(graph, dict):
+            for e in graph.get("edges", ()):
+                if e.get("kind") == "AST_CHILD":
+                    self._parent[e["target"]] = e["source"]   # child -> parent
+        elif hasattr(self._index, "ast_direct_parents"):
+            target_kinds = ["call", "construct", "dynamic-behavior", "write"]
+            # On large repositories, the next ancestor after a call is commonly
+            # a statement. Prefetching that one additional level amortizes the
+            # generic reverse-edge query; skip it on small fixtures where setup
+            # would dominate.
+            site_count = sum(len(self._index.by_kind.get(kind, ()))
+                             for kind in target_kinds)
+            if site_count > 10000:
+                target_kinds.append("statement")
+                # Calls are often nested through expression wrappers before reaching
+                # the statement that carries the control keyword.  Prefetching this
+                # intermediate parent column costs <1s on the libxml2 store and
+                # avoids falling back to one reverse-edge query per site.
+                target_kinds.append("expression")
+            self._parent = self._index.ast_direct_parents(target_kinds)
+            if hasattr(self._index, "node_headers"):
+                self._headers = {
+                    node["id"]: node
+                    for node in self._index.node_headers(self._parent.values())
+                }
 
+    @timeit
     def enclosing(self, node_id):
         """Ordered control kinds around ``node_id``, outermost first (``['for']`` for a copy
         nested one loop deep). Empty when the call sits at function top level."""
+        cached = self._enclosing_cache.get(node_id)
+        if cached is not None:
+            return list(cached)
         kinds, cur, seen = [], node_id, set()
-        while cur in self._parent and cur not in seen:
+        while cur not in seen:
             seen.add(cur)
-            cur = self._parent[cur]
-            n = self._by_id.get(cur)
+            if self._index is None:
+                if cur not in self._parent:
+                    break
+                cur = self._parent[cur]
+                n = self._by_id.get(cur)
+            else:
+                if cur in self._parent:
+                    cur = self._parent[cur]
+                    n = self._headers.get(cur) or _header_node(self._index, cur)
+                else:
+                    parents = self._index.incoming_of_kind(cur, "AST_CHILD")
+                    if not parents:
+                        break
+                    cur = parents[0]["source"]
+                    n = self._index.nodes.get(cur)
             if n and n.get("kind") == "statement":
                 kw = _leading_control(n.get("label"))
                 if kw:
                     kinds.append(kw)
         kinds.reverse()                                    # outermost -> innermost
+        # The returned list is never mutated by translation.  Store a tuple so
+        # repeated projections share the value and callers cannot corrupt the cache.
+        result = tuple(kinds)
+        self._enclosing_cache[node_id] = result
         return kinds
 
 
-def _assigned_var(ix, call_id):
+@timeit
+def _assigned_var(ix, call_id, value_edges=None):
     """The variable a call result initializes: call --VFT--> ... --VFT--> variable.
 
     C emits ``buf = kmalloc(...)`` as call -> call-expression (value-preserving) ->
@@ -162,9 +233,19 @@ def _assigned_var(ix, call_id):
         if nid in seen or d > 3:
             continue
         seen.add(nid)
-        for e in ix.outgoing_of_kind(nid, "VALUE_FLOWS_TO"):
-            tn = ix.nodes.get(e["target"])
-            if tn is None:
+        if value_edges is not None:
+            edges = value_edges.get(nid, ())
+        else:
+            edges = ix.outgoing_of_kind(nid, "VALUE_FLOWS_TO")
+        for e in edges:
+            target_id = e if isinstance(e, str) else e["target"]
+            if hasattr(ix, "_kind_by_id"):
+                target_kind = ix._kind_by_id.get(target_id)
+                target_label = ix._label_by_id.get(target_id)
+                tn = {"kind": target_kind, "label": target_label}
+            else:
+                tn = ix.nodes.get(target_id)
+            if tn is None or tn.get("kind") is None:
                 continue
             if tn.get("kind") == "variable":
                 return tn.get("label")
@@ -177,11 +258,47 @@ def _assigned_var(ix, call_id):
                 label = tn.get("label") or ""
                 if any(marker in label for marker in _SUBOBJECT):
                     return label
-            frontier.append((e["target"], d + 1))
+            frontier.append((target_id, d + 1))
     return None
 
 
 _SUBOBJECT = ("->", ".", "[", "*")
+
+
+def _flow_node_needed(ix, node_id, kind=None, label=None):
+    """Whether a lazy body node can contribute to the structural read stream."""
+    kind = kind or ix._kind_by_id.get(node_id)
+    if kind not in {"expression", "body", "read"}:
+        return True
+    label = label or ix._label_by_id.get(node_id) or ""
+    return any(marker in str(label) for marker in _SUBOBJECT)
+
+
+def _flow_header_node(node):
+    """Make the read projection from promoted header fields only.
+
+    Read events consume only ``kind``, spelling, and source line.  Inferring the
+    accepted structural syntax from the spelling avoids inflating the large
+    property tail for every expression node; ambiguous spellings are left out,
+    which is safer than inventing a dereference.
+    """
+    label = str(node.get("label") or "")
+    text = label.strip()
+    syntax = None
+    if "->" in label:
+        syntax = "MemberExpr"
+    elif "[" in label and "]" in label:
+        syntax = "ArraySubscriptExpr"
+    elif re.match(r"\s*\*", label):
+        syntax = "UnaryOperator"
+    elif re.search(r"[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*", label):
+        syntax = "MemberExpr"
+    if syntax is None:
+        return None
+    properties = dict(node.get("properties") or {})
+    properties["syntax_kind"] = syntax
+    return {"id": node.get("id"), "kind": node.get("kind"),
+            "label": node.get("label"), "properties": properties}
 
 
 def _freed_identity(arg):
@@ -210,26 +327,29 @@ def _read_root(label, tracked):
     return root if root in tracked else None
 
 
-def _arg_records(ix, call):
+@timeit
+def _arg_records(ix, call, argument_edges=None):
     """Ordered argument records for a call, resolved through argument_value_ids."""
     p = _props(call)
     av = p.get("argument_value_ids") or []
     out = []
-    edges = sorted(ix.outgoing_of_kind(call["id"], "HAS_ARGUMENT"),
+    edges = sorted((argument_edges.get(call["id"], ())
+                    if argument_edges is not None
+                    else ix.outgoing_of_kind(call["id"], "HAS_ARGUMENT")),
                    key=lambda e: _props(e).get("position") or 0)
     for e in edges:
         pos = _props(e).get("position")
         vid = av[pos] if (isinstance(pos, int) and pos < len(av)) else None
-        vn = ix.nodes.get(vid) if vid else None
+        vn = _header_node(ix, vid) if vid else None
         # the argument AS WRITTEN (`p->field`, `p[i]`, `*p`) before value-flow resolves it to
         # its base decl -- the base loses the access path, which the lifetime identity needs.
-        expr = (ix.nodes.get(e["target"], {}) or {}).get("label")
+        expr = (_header_node(ix, e["target"]) or {}).get("label")
         if vn is not None:                       # resolves to a decl/value the arg carries
             root = vn.get("label")
             out.append({"pos": pos, "var": root, "value": root, "expr": expr,
                         "root": root, "provenance": _prov(vn.get("kind"))})
         else:                                     # literal / unresolved expression
-            an = ix.nodes.get(e["target"], {})
+            an = _header_node(ix, e["target"]) or {}
             out.append({"pos": pos, "var": None, "value": an.get("label"), "expr": expr,
                         "root": None, "provenance": "const"})
     return out
@@ -260,6 +380,7 @@ def _catalog_sink(sinks, callee, call_props):
     return (sinks.get(qualified), qualified) if qualified else (None, None)
 
 
+@timeit
 def _dynamic_property_writes(ix, regions, nest, fid):
     """Project computed member writes into the common sink vocabulary.
 
@@ -361,6 +482,7 @@ def _expanded_macro_size(call, args, macro_defs, callee):
     return match.group(1).strip() if match else None
 
 
+@timeit
 def _guards_for(regions, fid, idents, span):
     """Guards active at a call site: {var, canon} for each arg-root a dominating
     size-testing branch names. Uses the same sound region-containment the reader's
@@ -381,6 +503,7 @@ def _guards_for(regions, fid, idents, span):
     return out
 
 
+@timeit
 def _guard_status_for(regions, fid, idents, span):
     """Return the Atropos guard-dimension status without collapsing it to a bool.
 
@@ -394,7 +517,9 @@ def _guard_status_for(regions, fid, idents, span):
     return regions.classify(fid, idents, span).get("status", "not-computed")
 
 
-def _returns(ix, fid, alloc_vars, params, norm):
+@timeit
+def _returns(ix, fid, alloc_vars, params, norm, value_edges=None,
+             return_values=None):
     """Return records: alloc-owned / param passthrough / call result / plain value.
 
     A `return expr` node is usually a cast/paren wrapper, not the variable itself, so when the
@@ -403,14 +528,17 @@ def _returns(ix, fid, alloc_vars, params, norm):
     `var` return so the summary can flag a dangling return -- without it, `return p` after
     `free(p)` reads as an anonymous value and the interprocedural use-after-free is invisible."""
     out = []
-    for rv in ix.sources(fid, "RETURNS_VALUE"):
+    source_nodes = (return_values.get(fid, ()) if return_values is not None
+                    else ix.sources(fid, "RETURNS_VALUE"))
+    for rv in source_nodes:
         if rv.get("kind") == "call":
             out.append({"kind": "call", "callee": norm.canon_callee(_props(rv).get("callee")),
                         "line": _props(rv).get("start_line")})
             continue
         line = _props(rv).get("start_line")
         label = rv.get("label")
-        var = label if (label in alloc_vars or label in params) else _assigned_var(ix, rv["id"])
+        var = (label if (label in alloc_vars or label in params)
+               else _assigned_var(ix, rv["id"], value_edges))
         if var in alloc_vars:
             out.append({"kind": "var", "prov": "alloc", "var": var, "line": line})
         elif var in params:
@@ -422,31 +550,78 @@ def _returns(ix, fid, alloc_vars, params, norm):
     return out
 
 
-def _walk_function(ix, regions, nest, sinks, norm, fnode):
+@timeit
+def _walk_function(ix, regions, nest, sinks, norm, fnode,
+                   cfg_edges_by_source=None, macro_defs=None,
+                   argument_edges=None, invoke_edges=None, value_edges=None,
+                   return_values=None,
+                   object_only=False, prewarmed=False):
     """Reconstruct one function's F IR from its owned graph nodes.
 
     Callee names are canonicalized through `norm` (the Atropos form oracle) as they leave the
     graph, so every downstream fact -- sink lookup, alloc/free events, summaries, skeletons --
     speaks one vocabulary. The graph node keeps its surface name; only this IR is rewritten."""
     fid = fnode["id"]
-    owned_nodes = ix.nodes_owned_by(fid)
+    disk_index = hasattr(ix, "nodes_owned_headers")
+    owned_nodes = (ix.nodes_owned_headers(fid) if disk_index
+                   else ix.nodes_owned_by(fid))
+    owned_by_kind = defaultdict(list)
+    for node in owned_nodes:
+        owned_by_kind[node.get("kind")].append(node)
+
+    # Kùzu property tails are fetched in batches.  The old disk path issued a
+    # separate warm-up for each requested kind (calls, parameters, reads,
+    # returns, ...), which multiplied query planning and decoding by the number
+    # of functions.  Warm exactly the union of those same kinds once, then use
+    # the cached nodes for every owned_of call.  Headers remain the source for
+    # the broad body census, so unrelated node kinds are still not inflated.
+    loaded_by_kind = None
+    if disk_index:
+        warm_kinds = {
+            "parameter", "call", "construct", "release",
+            "dynamic-behavior", "write", "return",
+        }
+        warm_ids = [node_id for kind in warm_kinds
+                    for node_id in ix.by_owner.get(fid, ())
+                    if ix._kind_by_id.get(node_id) == kind and
+                    _flow_node_needed(ix, node_id, kind)]
+        if not prewarmed:
+            ix._warm_nodes(warm_ids)
+        loaded_by_kind = defaultdict(list)
+        for node_id in warm_ids:
+            node = ix.nodes.get(node_id)
+            if node is not None:
+                loaded_by_kind[node.get("kind")].append(node)
+        for header in owned_nodes:
+            if header.get("kind") in {"read", "body", "expression"}:
+                node = _flow_header_node(header)
+                if node is not None:
+                    loaded_by_kind[node["kind"]].append(node)
+
+    def owned_of(*kinds):
+        if disk_index:
+            return tuple(node for kind in kinds
+                         for node in loaded_by_kind.get(kind, ()))
+        return tuple(node for kind in kinds for node in owned_by_kind.get(kind, ()))
+
     body_node_count = sum(
         1 for node in owned_nodes
         if node.get("kind") not in {"cfg-entry", "cfg-exit", "cfg-merge", "cfg-condition"}
     )
-    params = [p.get("label") for p in _by_offset(ix.nodes_owned_by(fid, "parameter"))]
+    params = [p.get("label") for p in _by_offset(owned_of("parameter"))]
     param_set = set(params)
     calls, callees, events, assigns = [], [], [], []
-    macro_defs = {node.get("label"): _props(node)
-                  for node in ix.nodes_of_kind("macro") if node.get("label")}
+    if macro_defs is None:
+        macro_defs = {node.get("label"): _props(node)
+                      for node in ix.nodes_of_kind("macro") if node.get("label")}
 
-    for c in _by_offset(ix.nodes_owned_by(fid, "call", "construct")):
+    for c in _by_offset(owned_of("call", "construct")):
         callee = norm.canon_callee(_callee_name(c))
         if not callee:
             continue
         line = _stmt_line(c)
         callees.append(callee)
-        args = _arg_records(ix, c)
+        args = _arg_records(ix, c, argument_edges)
         cp = _props(c)
         idents = {a["root"] for a in args if a["root"]}
         guards = _guards_for(regions, fid, idents, _span(c))
@@ -456,7 +631,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
         # wrapper's `returns=alloc` seeds an alloc, a freed-return's `returns_dangling` seeds a
         # free. `alloc_dst` is the is_alloc-gated subset used for the alloc event and sink dst.
-        assigned = _assigned_var(ix, c["id"])
+        assigned = _assigned_var(ix, c["id"], value_edges)
         alloc_dst = assigned if norm.is_acquire(callee) else None
         rec = {"callee": callee, "line": line, "args": args, "guards": guards,
                "guard_status": guard_status,
@@ -501,8 +676,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         # cross-seam use-after-free and a second free a cross-seam double-free. May-
         # semantics: the union over handlers (freed if ANY handler frees) is the sound
         # over-approximation for the temporal lattice; the judge prunes the spurious arms.
-        for mi in ix.outgoing_of_kind(c["id"], "MAY_INVOKE"):
-            hnode = ix.nodes.get(mi["target"])
+        may_invoke = (invoke_edges.get(c["id"], ()) if invoke_edges is not None
+                      else ix.outgoing_of_kind(c["id"], "MAY_INVOKE"))
+        for mi in may_invoke:
+            hnode = _header_node(ix, mi["target"])
             hcallee = norm.canon_callee(hnode.get("label")) if hnode else None
             if not hcallee or hcallee == callee:
                 continue
@@ -539,7 +716,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
         if norm.is_release(callee) or norm.is_realloc(callee):
             receiver_id = cp.get("receiver_value_id") or cp.get("receiver_symbol_id")
             if release_arg is None and receiver_id:
-                receiver = ix.nodes.get(receiver_id) or {}
+                receiver = _header_node(ix, receiver_id) or {}
                 receiver_label = receiver.get("label") or cp.get("receiver")
                 if receiver_label:
                     release_arg = {"root": receiver_label, "expr": receiver_label}
@@ -564,13 +741,13 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     # Explicit frontend release nodes (Python `del`/context exit) are also
     # evidence that their target is a tracked resource.  Collect them before
     # scanning reads so a subsequent member/index access is in scope.
-    for n in ix.nodes_owned_by(fid, "release"):
+    for n in owned_of("release"):
         target = ix.nodes.get((_props(n)).get("target_id")) or {}
         root = _read_root(target.get("label") or n.get("label"), set(params))
         if root:
             tracked_vars.add(root)
     if norm.lang == "c":
-        for n in ix.nodes_owned_by(fid):
+        for n in owned_nodes:
             p = _props(n)
             syntax = p.get("syntax_kind") or n.get("kind")
             label = n.get("label") or ""
@@ -581,7 +758,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     # Expression-level reads are the structural use alphabet for all frontends.
     # They are emitted only when the base is already tracked by an acquisition,
     # release, or source; ordinary object/property reads never enter the stream.
-    for n in ix.nodes_owned_by(fid, "read", "body", "expression"):
+    for n in owned_of("read", "body", "expression"):
         p = _props(n)
         syntax = p.get("syntax_kind") or n.get("kind")
         label = n.get("label") or p.get("expression")
@@ -593,7 +770,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             events.append({"kind": "use", "family": ("memory.deref" if norm.lang == "c"
                            else "lifecycle.use"), "var": root,
                            "line": p.get("start_line"), "node": n.get("id")})
-    for n in ix.nodes_owned_by(fid, "release"):
+    for n in owned_of("release"):
         p = _props(n)
         target = ix.nodes.get(p.get("target_id")) or {}
         root = _read_root(target.get("label") or n.get("label"), tracked_vars)
@@ -606,7 +783,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     # Clang represents delete/delete[] as an expression rather than a call.
     # It is still a catalogue release and must enter the same structural stream.
     if norm.lang == "c":
-        for n in ix.nodes_owned_by(fid):
+        for n in owned_nodes:
             p = _props(n)
             syntax = p.get("syntax_kind") or n.get("kind")
             label = n.get("label") or ""
@@ -617,7 +794,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
                 events.append({"kind": "free", "family": "memory.free", "var": root,
                                "line": p.get("start_line"), "node": n.get("id"),
                                "callee": "delete"})
-    returns = _returns(ix, fid, alloc_vars, param_set, norm)
+    returns = _returns(ix, fid, alloc_vars, param_set, norm, value_edges, return_values)
     for r in returns:                             # a returned alloc'd local escapes
         if r.get("kind") == "var" and r.get("prov") == "alloc":
             events.append({"kind": "escape", "var": r["var"], "line": r.get("line")})
@@ -630,8 +807,12 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
     owned_ids = {node.get("id") for node in owned_nodes}
     cfg_successors = defaultdict(list)
     cfg_nodes = set()
+    if cfg_edges_by_source is None:
+        cfg_edges_by_source = defaultdict(list)
+        for edge in ix.edges_of_kind(*cfg_edge_kinds):
+            cfg_edges_by_source[edge.get("source")].append(edge)
     for source in owned_ids:
-        for edge in ix.outgoing_of_kind(source, *cfg_edge_kinds):
+        for edge in cfg_edges_by_source.get(source, ()):
             target = edge.get("target")
             if target not in owned_ids:
                 continue
@@ -639,7 +820,7 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             cfg_successors[source].append({
                 "target": target,
                 "kind": kind,
-                "predicate": ix.nodes.get(source, {}).get("label"),
+                "predicate": (_header_node(ix, source) or {}).get("label"),
                 "properties": edge.get("properties") or {},
             })
             cfg_nodes.update((source, target))
@@ -667,7 +848,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode):
             "body_node_count": body_node_count, "cfg": cfg}
 
 
-def build_F(store, lang="c", *, return_graph=False):
+@timeit
+def build_F(store, lang="c", *, return_graph=False, object_only=False):
     """Build the whole-graph F dict + succ (callee-edge) map from an enriched store.
 
     Reproduces order.load's return so the pass is input-source agnostic. Taxonomy /
@@ -676,8 +858,11 @@ def build_F(store, lang="c", *, return_graph=False):
     # Disk-backed stores need a columnar materialization for BranchRegions. Tests and
     # embedding callers can supply an already-materialized in-memory GraphStore; do not
     # assume its GraphIndex has Kuzu's private connection surface.
-    graph = (store.graph if store.graph is not None
-             else materialize_graph(source_ix))
+    # Keep disk-backed Pass 3 lazy.  Materializing the complete Kùzu graph here
+    # inflates every property blob before the flow pass can select its function
+    # slice, dominating both cold startup time and peak RSS on large repositories.
+    # The Kùzu index implements the same navigation surface needed by translation.
+    graph = store.graph if store.graph is not None else source_ix
     # Once a disk graph has been materialized, keep the complete projection on its
     # in-memory index.  Continuing to use ``source_ix`` here turned every helper in
     # ``_walk_function`` into another Kuzu query for each of thousands of functions.
@@ -686,15 +871,106 @@ def build_F(store, lang="c", *, return_graph=False):
     # Flow translation only needs kind/adjacency/ownership access.  A full GraphStore
     # wrapper would retain navigation-only label/file buckets over the materialized
     # graph; the compact index defers those buckets until a caller explicitly asks.
-    ix = source_ix if store.graph is not None else GraphIndex(graph, compact=True)
+    ix = source_ix if store.graph is not None else source_ix
     regions = BranchRegions(graph)
     nest = ControlNesting(graph)                   # loop/branch nesting from AST containment
     sinks = atropos.sink_catalog(lang)
     sink_names = set(sinks)
     norm = normalizer(lang)                        # form oracle: canonicalize callee names
     source_methods = set(atropos.source_catalog(lang))
+    cfg_edge_kinds = ("CFG_NEXT", "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_BACK",
+                      "EXCEPTION_BRANCH", "SWITCH_CASE")
+    cfg_edges_by_source = defaultdict(list)
+    for edge in ix.edges_of_kind(*cfg_edge_kinds):
+        cfg_edges_by_source[edge.get("source")].append(edge)
+    macro_defs = {node.get("label"): _props(node)
+                  for node in ix.nodes_of_kind("macro") if node.get("label")}
 
-    fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
+    prewarmed_flow_nodes = False
+    definition_ids = None
+    if hasattr(ix, "node_headers"):
+        callable_ids = [nid for kind in ("function", "method", "constructor")
+                        for nid in ix.by_kind.get(kind, ())]
+        callable_headers = {node["id"]: node
+                            for node in ix.node_headers(callable_ids)}
+
+        def has_body(owner_id):
+            # Declaration-only callables in the C graph own only the synthetic
+            # entry/exit pair.  Their ownership headers are intentionally cheap
+            # and may not have a promoted kind for overlay-derived CFG nodes,
+            # so use both kind and the stable entry/exit labels.
+            owned = ix.by_owner.get(owner_id, ())
+            if not owned:
+                return False
+            for node_id in owned:
+                cached = getattr(ix, "_node_cache", {}).get(node_id) or {}
+                kind = (ix._kind_by_id.get(node_id) or
+                        cached.get("kind"))
+                label = (ix._label_by_id.get(node_id) or
+                         cached.get("label") or "")
+                if kind not in {None, "cfg-entry", "cfg-exit"}:
+                    return True
+                if not (str(label).startswith("entry:") or
+                        str(label).startswith("exit:")):
+                    return True
+            return False
+
+        flow_kinds = {
+            "parameter", "call", "construct", "release",
+            "dynamic-behavior", "write", "return",
+        }
+
+        # ``object_only`` is retained as an API compatibility switch, but the
+        # default projection must keep every body-bearing callable so caller
+        # closure and source discovery remain exact.  The filter only removes
+        # declaration-only stubs that the old path discarded after inflating
+        # their full properties.
+        all_definition_ids = [nid for nid in callable_ids if has_body(nid)]
+        full_definition_ids = {
+            owner_id for owner_id in all_definition_ids
+            if any(ix._kind_by_id.get(node_id) in flow_kinds
+                   for node_id in ix.by_owner.get(owner_id, ()))
+        }
+        definition_ids = [nid for nid in all_definition_ids if nid in full_definition_ids]
+        ix._warm_nodes(definition_ids)
+        ix._warm_nodes(ix.by_kind.get("macro", ()))
+        fnodes = []
+        for nid in all_definition_ids:
+            node = ix.nodes.get(nid) if nid in full_definition_ids else callable_headers[nid]
+            if node is not None:
+                fnodes.append(node)
+
+        # Warm the exact node kinds consumed by _walk_function once for the
+        # whole definition set.  _warm_nodes bounds each Kùzu IN-list at 5,000,
+        # so this remains predictable while avoiding one query plan per
+        # function.  The per-function implementation still constructs its
+        # owned-kind views from the cache, preserving all selection semantics.
+        if hasattr(ix, "_warm_nodes_by_owner"):
+            ix._warm_nodes_by_owner(definition_ids, flow_kinds)
+        else:
+            flow_ids = {
+                node_id for owner_id in definition_ids
+                for node_id in ix.by_owner.get(owner_id, ())
+                if ix._kind_by_id.get(node_id) in flow_kinds and
+                _flow_node_needed(ix, node_id)
+            }
+            ix._warm_nodes(flow_ids)
+        prewarmed_flow_nodes = True
+        full_definition_set = set(full_definition_ids)
+    else:
+        fnodes = list(ix.nodes_of_kind("function", "method", "constructor"))
+        full_definition_set = {f.get("id") for f in fnodes}
+    # These relations are intentionally left lazy: the full VALUE_FLOWS_TO
+    # relation is much larger than the call slice, so globally indexing it would
+    # trade round trips for a larger-than-Pass-2 resident graph.
+    argument_edges = (ix.argument_edges_by_source()
+                      if hasattr(ix, "argument_edges_by_source") else None)
+    invoke_edges = (ix.invoke_edges_by_source()
+                    if hasattr(ix, "invoke_edges_by_source") else None)
+    value_edges = (ix.value_targets_by_source()
+                   if hasattr(ix, "value_targets_by_source") else None)
+    return_values = (ix.return_value_sources_by_target()
+                     if hasattr(ix, "return_value_sources_by_target") else None)
     defined = {f.get("label") for f in fnodes if not _props(f).get("declaration_only")}
 
     # Python permits many methods with the same surface name (`extract`, `close`,
@@ -706,7 +982,8 @@ def build_F(store, lang="c", *, return_graph=False):
     def function_key(fnode):
         name = fnode.get("label")
         props = _props(fnode)
-        owner = ix.nodes.get(props.get("owner_id")) if props.get("owner_id") else None
+        owner_id = props.get("owner_id")
+        owner = (_header_node(ix, owner_id) if owner_id else None)
         if owner and owner.get("kind") == "class" and owner.get("label"):
             return f"{owner['label']}.{name}"
         if sum(1 for candidate in fnodes
@@ -715,6 +992,51 @@ def build_F(store, lang="c", *, return_graph=False):
             return f"{name}@{props.get('absolute_file') or props.get('file')}:{props.get('start_line')}"
         return name
 
+    def lightweight_record(fnode):
+        """Header-only IR for functions with no flow-bearing owned nodes."""
+        fid = fnode.get("id")
+        if hasattr(ix, "nodes_owned_headers"):
+            owned = ix.nodes_owned_headers(fid)
+            params = [node.get("label") for node in _by_offset(owned)
+                      if node.get("kind") == "parameter"]
+            body_count = sum(1 for node in owned if node.get("kind") not in
+                             {"cfg-entry", "cfg-exit", "cfg-merge", "cfg-condition"})
+        else:
+            owned, params, body_count = (), [], 0
+        owned_ids = {node.get("id") for node in owned}
+        cfg_successors = defaultdict(list)
+        cfg_nodes = set()
+        for source in owned_ids:
+            for edge in cfg_edges_by_source.get(source, ()):
+                target = edge.get("target")
+                if target not in owned_ids:
+                    continue
+                kind = ix.semantic_edge_kind(edge) or edge.get("kind")
+                cfg_successors[source].append({
+                    "target": target, "kind": kind,
+                    "predicate": ix._label_by_id.get(source)
+                    if hasattr(ix, "_label_by_id") else None,
+                    "properties": edge.get("properties") or {},
+                })
+                cfg_nodes.update((source, target))
+        cfg = None
+        if cfg_nodes:
+            entries = [node.get("id") for node in owned
+                       if node.get("id") in cfg_nodes and node.get("kind") == "cfg-entry"]
+            cfg = {
+                "nodes": tuple(sorted(cfg_nodes)),
+                "entry": entries[0] if entries else None,
+                "succ": {source: tuple(sorted(edges, key=lambda item: (
+                    item.get("kind") or "", item.get("target") or "")))
+                          for source, edges in cfg_successors.items()},
+            }
+        props = _props(fnode)
+        return {"name": fnode.get("label"), "file": props.get("file"),
+                "line": props.get("start_line"), "externally_visible": True,
+                "params": params, "calls": [], "events": [], "assigns": [],
+                "returns": [], "callees": [], "body_node_count": body_count,
+                "cfg": cfg}
+
     recs = {}
     for f in fnodes:
         if _props(f).get("declaration_only"):
@@ -722,7 +1044,14 @@ def build_F(store, lang="c", *, return_graph=False):
         name = function_key(f)
         if not name or name in recs:
             continue
-        recs[name] = _walk_function(ix, regions, nest, sinks, norm, f)
+        if f.get("id") in full_definition_set:
+            recs[name] = _walk_function(ix, regions, nest, sinks, norm, f,
+                                        cfg_edges_by_source, macro_defs,
+                                        argument_edges, invoke_edges, value_edges,
+                                        return_values,
+                                        object_only, prewarmed_flow_nodes)
+        else:
+            recs[name] = lightweight_record(f)
         recs[name]["name"] = name
 
     def is_lifecycle_or_sink(c):
