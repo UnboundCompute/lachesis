@@ -13,13 +13,11 @@ from enum import Enum
 import hashlib
 import json
 import os
-from collections import defaultdict
 from pathlib import Path
 import tempfile
 from typing import Any, Mapping
 
 from .semantic_graph import SkeletonGraph
-from lachesis.timeit import timeit
 
 
 @dataclass
@@ -32,8 +30,6 @@ class FragmentStore:
     ] = field(default_factory=dict)
     covered_states: set[tuple[str, str]] = field(default_factory=set)
     covered_contexts: set[tuple[str, str, str]] = field(default_factory=set)
-    _fingerprint_cache: dict[int, tuple[Any, str]] = field(default_factory=dict,
-                                                          repr=False)
 
     @staticmethod
     def _coverage_key(coverage) -> tuple[tuple[str, str], ...]:
@@ -64,17 +60,9 @@ class FragmentStore:
             + [("context",) + key for key in cls._context_key(coverage)]
         )
 
-    def _fingerprint(self, value: Any) -> str:
+    @staticmethod
+    def _fingerprint(value: Any) -> str:
         """Stable content identity for semantic inputs rebuilt by each pass."""
-        # A single Pass 3 request validates the same large F-IR, summaries, and
-        # state-artifact objects during snapshot restore, cache lookup, and put.
-        # Keep the object alive alongside its digest so repeated validation does
-        # not recursively normalize and JSON-encode millions of values.
-        cache_key = id(value)
-        cached = self._fingerprint_cache.get(cache_key)
-        if cached is not None and cached[0] is value:
-            return cached[1]
-
         def normalize(item):
             # State artifacts contain AbstractState/AnalysisResult instances whose
             # default repr includes insertion-ordered dicts and unordered sets.  The
@@ -86,10 +74,6 @@ class FragmentStore:
             if isinstance(item, Enum):
                 return {"__enum__": f"{type(item).__qualname__}:{item.value}"}
             if isinstance(item, Mapping):
-                if all(isinstance(key, str) for key in item):
-                    return {"__mapping__": {
-                        key: normalize(val) for key, val in item.items()
-                    }}
                 pairs = [(normalize(key), normalize(val))
                          for key, val in item.items()]
                 pairs.sort(key=lambda pair: json.dumps(pair[0], sort_keys=True,
@@ -98,10 +82,6 @@ class FragmentStore:
                 return {"__mapping__": pairs}
             if isinstance(item, (set, frozenset)):
                 values = [normalize(val) for val in item]
-                if all(isinstance(val, (str, int, float, bool)) or val is None
-                       for val in item):
-                    values.sort(key=lambda val: (type(val).__name__, repr(val)))
-                    return {"__set__": values}
                 values.sort(key=lambda val: json.dumps(val, sort_keys=True,
                                                         separators=(",", ":"),
                                                         default=str))
@@ -123,9 +103,7 @@ class FragmentStore:
                                  separators=(",", ":"))
         except (TypeError, ValueError):
             encoded = repr(value)
-        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        self._fingerprint_cache[cache_key] = (value, digest)
-        return digest
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def key(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None,
@@ -134,15 +112,16 @@ class FragmentStore:
                               state_artifacts) + (
             self._coverage_key(coverage), self._context_key(coverage))
 
-    def _base_key(self, functions: Mapping[str, Mapping], lang: str, graph: Any,
+    @staticmethod
+    def _base_key(functions: Mapping[str, Mapping], lang: str, graph: Any,
                   summaries: Any, reach_summaries: Any,
                   state_artifacts: Any = None) -> tuple[Any, ...]:
-        graph_key = (self._fingerprint(graph)
+        graph_key = (FragmentStore._fingerprint(graph)
                      if isinstance(graph, (dict, list, tuple)) else id(graph))
-        return (lang, graph_key, self._fingerprint(functions),
-                self._fingerprint(summaries),
-                self._fingerprint(reach_summaries),
-                self._fingerprint(state_artifacts))
+        return (lang, graph_key, FragmentStore._fingerprint(functions),
+                FragmentStore._fingerprint(summaries),
+                FragmentStore._fingerprint(reach_summaries),
+                FragmentStore._fingerprint(state_artifacts))
 
     def get(self, functions: Mapping[str, Mapping], lang: str, graph: Any = None,
             summaries: Any = None, coverage=None, reach_summaries: Any = None,
@@ -391,42 +370,6 @@ class Claus:
         self.fragments = store or FragmentStore()
 
     @staticmethod
-    def _reachable_fragments(graph: SkeletonGraph, starts) -> set[str]:
-        """Return fragments reachable by the matcher-compatible pushdown walk.
-
-        Coverage commonly contains many target/source pairs sharing the same source.
-        Walking the graph once per pair repeats the same call/return traversal; this
-        keeps the full stack state in the visited key while sharing the result across
-        all targets in that source cone.
-        """
-        queue = [(entry, ()) for entry in starts]
-        seen = set(queue)
-        reachable = set()
-        while queue:
-            node, stack = queue.pop()
-            current = graph.nodes.get(node)
-            if current is None:
-                continue
-            if current.fragment is not None:
-                reachable.add(current.fragment)
-            for edge in graph.edges.get(node, ()):
-                next_stack = stack
-                if edge.kind == "call":
-                    if edge.return_to is None:
-                        continue
-                    next_stack = stack + (edge.return_to,)
-                elif edge.kind == "return":
-                    if not stack or edge.target != stack[-1]:
-                        continue
-                    next_stack = stack[:-1]
-                state = (edge.target, next_stack)
-                if state not in seen:
-                    seen.add(state)
-                    queue.append(state)
-        return reachable
-
-    @staticmethod
-    @timeit(name="fragment_store.Claus._materialized_states")
     def _materialized_states(graph: SkeletonGraph, state_keys) -> list[tuple[str, str]]:
         """Keep only source states with a concrete graph path to their target.
 
@@ -439,44 +382,67 @@ class Claus:
         source cones were analysed.
         """
         materialized = []
-        grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for key in state_keys:
             if len(key) != 2:
                 continue
             target, source = key
-            if source not in graph.fragments or target not in graph.fragments:
+            source_fragment = graph.fragments.get(source)
+            target_fragment = graph.fragments.get(target)
+            if source_fragment is None or target_fragment is None:
                 continue
-            grouped[source].append((target, source))
-        for source, keys in grouped.items():
-            source_fragment = graph.fragments[source]
             launch_nodes = sorted(
                 node_id for node_id in graph.source_reachable
                 if graph.nodes.get(node_id) is not None
                 and graph.nodes[node_id].fragment == source)
             starts = launch_nodes or [source_fragment.entry]
-            non_self = [key for key in keys if key[0] != source]
-            if non_self:
-                reachable = Claus._reachable_fragments(graph, starts)
-                materialized.extend(key for key in non_self if key[0] in reachable)
-            if launch_nodes or not graph.source_reachable:
-                materialized.extend(key for key in keys if key[0] == source)
+            if source == target:
+                if launch_nodes or not graph.source_reachable:
+                    materialized.append((target, source))
+                continue
+            # Coverage must use the same call/return discipline as the matcher.
+            # Plain graph reachability can walk from a callee to a continuation
+            # belonging to a different caller (or accept a malformed return edge),
+            # then incorrectly mark the target source-state as analysed.  The
+            # fragment graph already carries the explicit continuation on call
+            # edges, so a small pushdown walk is enough; this remains independent
+            # of any vulnerability pattern.
+            queue = [(entry, ()) for entry in starts]
+            seen = set(queue)
+            reachable = False
+            while queue and not reachable:
+                node, stack = queue.pop()
+                if graph.nodes[node].fragment == target:
+                    reachable = True
+                    break
+                for edge in graph.edges.get(node, ()):
+                    next_stack = stack
+                    if edge.kind == "call":
+                        if edge.return_to is None:
+                            continue
+                        next_stack = stack + (edge.return_to,)
+                    elif edge.kind == "return":
+                        if not stack or edge.target != stack[-1]:
+                            continue
+                        next_stack = stack[:-1]
+                    state = (edge.target, next_stack)
+                    if state not in seen:
+                        seen.add(state)
+                        queue.append(state)
+            if reachable:
+                materialized.append((target, source))
         return materialized
 
     @staticmethod
-    @timeit(name="fragment_store.Claus._materialized_contexts")
     def _materialized_contexts(graph: SkeletonGraph, context_keys):
         """Prove source-site contexts using the same pushdown walk as states."""
         materialized = []
-        grouped: dict[tuple[str, str], list[tuple[str, str, str]]] = defaultdict(list)
         for key in context_keys:
             if len(key) != 3:
                 continue
             target, source, context = key
-            if source not in graph.fragments or target not in graph.fragments:
+            source_fragment = graph.fragments.get(source)
+            if source_fragment is None or target not in graph.fragments:
                 continue
-            grouped[(source, context)].append((target, source, context))
-        for (source, context), keys in grouped.items():
-            source_fragment = graph.fragments[source]
             if context == "__entry__":
                 starts = [source_fragment.entry]
             else:
@@ -494,16 +460,45 @@ class Claus:
                     starts = sorted(explicit)
                 elif any("source_site" in graph.nodes[node_id].metadata
                          for node_id in launch_nodes):
+                    # The graph has explicit launch metadata, so an unmatched
+                    # context is genuinely unresolved. Do not fall back to a
+                    # loose node-id heuristic and credit a neighbouring site.
                     starts = []
                 else:
-                    starts = sorted(node_id for node_id in launch_nodes if context in node_id)
+                    # Compatibility for pre-metadata serialized graphs. New
+                    # production graphs always take the exact branch above.
+                    starts = sorted(node_id for node_id in launch_nodes
+                                    if context in node_id)
+                # A declared source site without a corresponding emitted launch
+                # node is unresolved; do not silently credit it via the entry.
                 if not starts:
                     continue
-            reachable = Claus._reachable_fragments(graph, starts)
-            materialized.extend(key for key in keys if key[0] in reachable)
+            queue = [(entry, ()) for entry in starts]
+            seen = set(queue)
+            reachable = False
+            while queue and not reachable:
+                node, stack = queue.pop()
+                if graph.nodes[node].fragment == target:
+                    reachable = True
+                    break
+                for edge in graph.edges.get(node, ()):
+                    next_stack = stack
+                    if edge.kind == "call":
+                        if edge.return_to is None:
+                            continue
+                        next_stack = stack + (edge.return_to,)
+                    elif edge.kind == "return":
+                        if not stack or edge.target != stack[-1]:
+                            continue
+                        next_stack = stack[:-1]
+                    state = (edge.target, next_stack)
+                    if state not in seen:
+                        seen.add(state)
+                        queue.append(state)
+            if reachable:
+                materialized.append((target, source, context))
         return materialized
 
-    @timeit(name="fragment_store.Claus._record_coverage")
     def _record_coverage(self, graph: SkeletonGraph, coverage) -> SkeletonGraph:
         """Attach honest coverage accounting to both fresh and cached graphs."""
         if coverage is None:
@@ -531,9 +526,8 @@ class Claus:
         })
         return graph
 
-    @timeit
     def build(self, store, functions, successors, *, lang="c", graph=None, summaries=None,
-              coverage=None, reach_summaries=None, state_artifacts=None, cfgs=None):
+              coverage=None, reach_summaries=None, state_artifacts=None):
         cached = self.fragments.get(functions, lang, graph, summaries, coverage,
                                     reach_summaries, state_artifacts)
         if cached is not None:
@@ -560,7 +554,7 @@ class Claus:
         built = build_semantic_graph(store, functions, successors, lang=lang,
                                      graph=graph, summaries=summaries,
                                      reach_summaries=reach_summaries,
-                                     state_artifacts=state_artifacts, cfgs=cfgs,
+                                     state_artifacts=state_artifacts,
                                      work_functions=work_functions)
         self._record_coverage(built, coverage)
         return self.fragments.put(functions, lang, graph, built, summaries, coverage,
