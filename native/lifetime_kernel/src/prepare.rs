@@ -422,6 +422,51 @@ fn raw_operation(kind: Kind, node: &str, target: Option<Path>, source: Option<Pa
     }
 }
 
+/// Add only the access-path facts needed by the compact translation ABI. This
+/// deliberately avoids CFG synthesis and operation extraction.
+pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
+    for input in &mut request.functions {
+        let graph = GraphView::new(input);
+        for call in &mut input.calls {
+            for argument in &mut call.arguments {
+                argument.expression = graph.label(&argument.node).to_owned();
+                if let Some(path) = graph.access_path(&argument.node, 0) {
+                    argument.root = path.root;
+                    argument.selectors = path.selectors;
+                }
+            }
+            if let Some(path) = graph.access_path(&call.assigned, 0) {
+                call.assigned_root = path.root;
+                call.assigned_selectors = path.selectors;
+            }
+        }
+        let call_by_node = input.calls.iter()
+            .map(|call| (call.node.clone(), call.clone()))
+            .collect::<HashMap<_, _>>();
+        input.returns.clear();
+        for (node_id, node) in &graph.nodes {
+            if graph.kind(node_id) != "ReturnStmt" { continue; }
+            let line = property(node, "start_line").and_then(|value| value.parse().ok());
+            let Some(child) = graph.children.get(node_id).into_iter().flatten()
+                .min_by_key(|child| graph.offset(child)) else { continue };
+            let peeled = graph.peel(child.clone());
+            if let Some(call) = call_by_node.get(&peeled) {
+                input.returns.push(lifetime_proto::FunctionReturn {
+                    kind: "call".to_owned(), callee: call.callee.clone(),
+                    root: String::new(), selectors: Vec::new(),
+                    line: line.unwrap_or_default(), has_line: line.is_some(),
+                });
+            } else if let Some(path) = graph.access_path(child, 0) {
+                input.returns.push(lifetime_proto::FunctionReturn {
+                    kind: "var".to_owned(), callee: String::new(),
+                    root: path.root, selectors: path.selectors,
+                    line: line.unwrap_or_default(), has_line: line.is_some(),
+                });
+            }
+        }
+    }
+}
+
 fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::PreparedFunction {
     let graph = GraphView::new(&input);
     let mut nodes = input.nodes;

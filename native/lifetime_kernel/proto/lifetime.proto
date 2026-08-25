@@ -191,6 +191,7 @@ message FunctionInput {
   repeated string parameters = 4;
   repeated FunctionCall calls = 5;
   repeated FunctionSummary summaries = 6;
+  repeated FunctionReturn returns = 7;
 }
 
 message PrepareRequest { repeated FunctionInput functions = 1; }
@@ -212,3 +213,14 @@ message PreparedFunctionResult {
   PreparedFunction prepared = 3;
 }
 message PrepareSolveResult { repeated PreparedFunctionResult functions = 1; }
+
+// Compact translation-only result. Unlike PrepareResult this intentionally
+// carries no graph nodes, edges, CFG, or operation stream; Python only needs
+// the native call/return facts at this boundary.
+message TranslationFunction {
+  string id = 1;
+  repeated string parameters = 2;
+  repeated FunctionCall calls = 3;
+  repeated FunctionReturn returns = 4;
+}
+message TranslationResult { repeated TranslationFunction functions = 1; }

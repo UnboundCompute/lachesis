@@ -691,6 +691,25 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_pb(
     pointer
 }
 
+/// Read the framed substrate and return only compact native translation facts.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_translate_graph_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        native_graph::sidecar_to_translation(bytes)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native graph translation error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
 /// Read the complete framed substrate and run native preparation plus solving
 /// without returning through Python between the two phases.
 #[no_mangle]

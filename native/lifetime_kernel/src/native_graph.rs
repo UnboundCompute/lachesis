@@ -364,3 +364,21 @@ pub(crate) fn sidecar_to_request(
     }
     Ok(lifetime_proto::PrepareRequest { functions: functions.into_values().collect() })
 }
+
+pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut request = sidecar_to_request(input)?;
+    crate::prepare::annotate_request(&mut request);
+    let result = lifetime_proto::TranslationResult {
+        functions: request.functions.into_iter().map(|function| {
+            lifetime_proto::TranslationFunction {
+                id: function.id,
+                parameters: function.parameters,
+                calls: function.calls,
+                returns: function.returns,
+            }
+        }).collect(),
+    };
+    let mut output = Vec::new();
+    result.encode(&mut output).map_err(|error| error.to_string())?;
+    Ok(output)
+}

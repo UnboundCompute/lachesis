@@ -227,6 +227,14 @@ def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime
     return {function.id: function for function in result.functions}
 
 
+def translate_graph_pb(sidecar_path: str | os.PathLike[str]):
+    """Return compact native call/return facts without prepared CFG expansion."""
+    result = _call_sidecar("lachesis_lifetime_translate_graph_pb", sidecar_path,
+                           lifetime_pb2.TranslationResult,
+                           "native whole-graph translation")
+    return {function.id: function for function in result.functions}
+
+
 def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
     """Run the complete binary-substrate preparation/solve path in Rust."""
     result = _call_sidecar("lachesis_lifetime_prepare_graph_solve_pb", sidecar_path,

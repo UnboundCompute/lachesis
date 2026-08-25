@@ -13,7 +13,7 @@ from . import atropos
 from .coverage import CoverageScheduler
 from .normalize import normalizer
 from .source_discovery import discover_sources
-from .native_lifetime import prepare_graph_pb
+from .native_lifetime import translate_graph_pb
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import cached_substrate, substrate_cache_path
@@ -54,11 +54,11 @@ def _native_prepared(index):
     sidecar = substrate_cache_path(base)
     if not sidecar.is_file():
         return None
-    cached = getattr(index, "_native_prepared", None)
+    cached = getattr(index, "_native_translation", None)
     if cached is not None:
         return cached
-    prepared = prepare_graph_pb(sidecar)
-    index._native_prepared = prepared
+    prepared = translate_graph_pb(sidecar)
+    index._native_translation = prepared
     return prepared
 
 
@@ -137,7 +137,7 @@ def build_native_F(store, lang="c", *, return_graph=False):
                                 "line": record["line"], "node": call.node})
 
         events = []
-        for operation in item.operations:
+        for operation in getattr(item, "operations", ()):
             kind = lifetime_pb2.Operation.Kind.Name(operation.kind)
             # Native preparation also records assignment-side writes as USE
             # operations. They are state transitions, not dereference events in
@@ -156,6 +156,23 @@ def build_native_F(store, lang="c", *, return_graph=False):
                            "var": _path_root(sub, operation.target),
                            "line": operation.line if operation.has_line else None,
                            "node": operation.node})
+        # The compact translation ABI intentionally omits the full operation
+        # stream. Preserve the lifecycle events that are directly represented
+        # on native calls so the semantic F projection remains useful.
+        for call in item.calls:
+            line = call.line if call.has_line else None
+            if call.is_alloc and call.assigned_root:
+                events.append({"kind": "alloc", "family": "memory.alloc",
+                               "var": _call_path(sub, call.assigned_root,
+                                                   call.assigned_selectors),
+                               "line": line, "node": call.node})
+            if call.is_release and call.arguments:
+                argument = call.arguments[0]
+                root = _argument_root(sub, argument)
+                if root:
+                    events.append({"kind": "free", "family": "memory.free",
+                                   "var": root, "line": line, "node": call.node,
+                                   "callee": call.callee})
         params = tuple(_name(sub, value) for value in item.parameters)
         returns = []
         for returned in item.returns:
@@ -175,9 +192,8 @@ def build_native_F(store, lang="c", *, return_graph=False):
             "externally_visible": _props(node).get("storage_class") != "static",
             "params": params, "calls": calls, "events": events,
             "assigns": assigns, "returns": returns, "callees": callees,
-            "body_node_count": len(item.nodes),
-            "cfg": {"nodes": tuple(item.nodes), "entry": item.nodes[0] if item.nodes else None,
-                    "succ": {entry.node: tuple(entry.targets) for entry in item.successors}},
+            "body_node_count": len(getattr(item, "nodes", ())),
+            "cfg": None,
         }
 
     reverse_callers = defaultdict(set)
