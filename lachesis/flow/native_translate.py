@@ -28,6 +28,8 @@ def _props(node):
 
 
 def _name(sub, node_id):
+    if sub is None:
+        return node_id or ""
     return sub.label(node_id) or node_id
 
 
@@ -43,7 +45,11 @@ def _call_path(sub, root, selectors=()):
 
 
 def _argument_root(sub, argument):
+    if getattr(argument, "root_name", ""):
+        return argument.root_name + "".join(argument.selectors)
     root = (argument.root or "").removeprefix("decl:")
+    if sub is None:
+        return _expression_root(argument.expression)
     if root and sub.kind(root) in {"VarDecl", "ParmVarDecl", "parameter", "variable"}:
         return _call_path(sub, argument.root, argument.selectors)
     return _expression_root(argument.expression)
@@ -87,26 +93,28 @@ def build_native_F(store, lang="c", *, return_graph=False):
     prepared = _native_prepared(index)
     if prepared is None:
         return None
-    # cached_substrate() performs the one lazy bulk load itself. Calling load()
-    # again here needlessly re-enters the graph-sized substrate boundary.
-    sub = cached_substrate(index)
+    # Rust emits resolved root labels and declaration metadata in the compact
+    # translation result.  Keep the million-node Python substrate out of the
+    # normal path; only old/incomplete sidecars use it as a compatibility
+    # fallback.
+    native_complete = all(
+        getattr(item, "name", "") and
+        all(getattr(arg, "root_name", "") or not arg.root
+            for call in item.calls for arg in call.arguments)
+        for item in prepared.values()
+    )
+    sub = None if native_complete else cached_substrate(index)
     norm = normalizer(lang)
     sinks = atropos.sink_catalog(lang)
     source_names = set(atropos.source_catalog(lang))
     graph = store.graph if store.graph is not None else index
     regions = BranchRegions(graph)
-    function_nodes = {}
-    for node in index.nodes_of_kind("function", "method", "constructor"):
-        if _props(node).get("declaration_only"):
-            continue
-        function_nodes[node["id"]] = node
 
     recs = {}
     for function_id, item in prepared.items():
-        node = function_nodes.get(function_id)
-        if node is None:
+        if not item.name and sub is None:
             continue
-        name = node.get("label") or function_id
+        name = item.name or _name(sub, function_id) or function_id
         if name in recs:
             name = f"{name}@{function_id}"
         calls = []
@@ -123,7 +131,9 @@ def build_native_F(store, lang="c", *, return_graph=False):
                      "expr": arg.expression or _name(sub, arg.node),
                      "provenance": "const" if not arg.root else "local"}
                     for arg in call.arguments]
-            assigned = (_call_path(sub, call.assigned_root, call.assigned_selectors)
+            assigned = (getattr(call, "assigned_name", "") + "".join(call.assigned_selectors)
+                        if getattr(call, "assigned_name", "") else None)
+            assigned = (assigned or _call_path(sub, call.assigned_root, call.assigned_selectors)
                         or (_name(sub, call.assigned) if call.assigned else None))
             call_header = _header_node(index, call.node)
             catalog = sinks.get(callee)
@@ -169,7 +179,7 @@ def build_native_F(store, lang="c", *, return_graph=False):
                     (kind == "USE" and operation.access == "write")):
                 continue
             target_root = operation.target.root.removeprefix("decl:")
-            if sub.kind(target_root) not in {"VarDecl", "ParmVarDecl", "parameter", "variable"}:
+            if sub is None or sub.kind(target_root) not in {"VarDecl", "ParmVarDecl", "parameter", "variable"}:
                 continue
             event_kind = {"ALLOC": "alloc", "FREE": "free", "USE": "use"}[kind]
             events.append({"kind": event_kind,
@@ -195,7 +205,7 @@ def build_native_F(store, lang="c", *, return_graph=False):
                     events.append({"kind": "free", "family": "memory.free",
                                    "var": root, "line": line, "node": call.node,
                                    "callee": call.callee})
-        params = tuple(_name(sub, value) for value in item.parameters)
+        params = tuple(item.parameter_names) or tuple(_name(sub, value) for value in item.parameters)
         returns = []
         for returned in item.returns:
             value = {
@@ -205,13 +215,15 @@ def build_native_F(store, lang="c", *, return_graph=False):
             if returned.kind == "call":
                 value["callee"] = returned.callee
             elif returned.root:
-                value["var"] = _call_path(sub, returned.root, returned.selectors)
+                value["var"] = (getattr(returned, "root_name", "") + "".join(returned.selectors)
+                                 if getattr(returned, "root_name", "")
+                                 else _call_path(sub, returned.root, returned.selectors))
                 value["prov"] = "param" if value["var"] in params else "local"
             returns.append(value)
         recs[name] = {
-            "name": name, "file": _props(node).get("file"),
-            "line": _props(node).get("start_line"),
-            "externally_visible": _props(node).get("storage_class") != "static",
+            "name": name, "file": item.file or None,
+            "line": item.start_line if item.has_start_line else None,
+            "externally_visible": item.externally_visible,
             "params": params, "calls": calls, "events": events,
             "assigns": assigns, "returns": returns, "callees": callees,
             "body_node_count": len(getattr(item, "nodes", ())),

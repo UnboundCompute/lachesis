@@ -143,6 +143,9 @@ message FunctionArgument {
   string root = 3;
   repeated string selectors = 4;
   string expression = 5;
+  // Resolved declaration label for the path root.  This avoids reopening the
+  // graph substrate in Python merely to turn a root id into a user-facing path.
+  string root_name = 6;
 }
 
 message FunctionCall {
@@ -160,6 +163,7 @@ message FunctionCall {
   repeated FunctionArgument arguments = 12;
   string assigned_root = 13;
   repeated string assigned_selectors = 14;
+  string assigned_name = 15;
 }
 
 message FunctionReturn {
@@ -169,6 +173,7 @@ message FunctionReturn {
   repeated string selectors = 4;
   sint64 line = 5;
   bool has_line = 6;
+  string root_name = 7;
 }
 
 message FunctionSummaryEffect {
@@ -222,5 +227,11 @@ message TranslationFunction {
   repeated string parameters = 2;
   repeated FunctionCall calls = 3;
   repeated FunctionReturn returns = 4;
+  string name = 5;
+  string file = 6;
+  sint64 start_line = 7;
+  bool has_start_line = 8;
+  bool externally_visible = 9;
+  repeated string parameter_names = 10;
 }
 message TranslationResult { repeated TranslationFunction functions = 1; }

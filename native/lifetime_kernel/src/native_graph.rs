@@ -165,6 +165,7 @@ pub(crate) fn sidecar_to_request(
             arguments: Vec::new(),
             assigned_root: String::new(),
             assigned_selectors: Vec::new(),
+            assigned_name: String::new(),
         };
         let parent = parents.get(&item.id).and_then(|id| parent_nodes.get(id));
         if let Some(parent) = parent {
@@ -195,6 +196,7 @@ pub(crate) fn sidecar_to_request(
                 root: String::new(),
                 selectors: Vec::new(),
                 expression: String::new(),
+                root_name: String::new(),
             })
         }).collect::<Vec<_>>();
         arguments.sort_by_key(|argument| argument.position);
@@ -323,6 +325,13 @@ struct CompactNode {
     properties: HashMap<String, String>,
 }
 
+fn compact_path_name(nodes: &HashMap<String, CompactNode>, root: &str) -> String {
+    let root = root.strip_prefix("decl:").unwrap_or(root);
+    nodes.get(root)
+        .map(|node| if node.label.is_empty() { root.to_owned() } else { node.label.clone() })
+        .unwrap_or_else(|| root.to_owned())
+}
+
 #[derive(Clone)]
 struct CompactEdge {
     kind: String,
@@ -339,7 +348,7 @@ fn compact_node(record: graph_proto::NodeRecord) -> CompactNode {
             "syntax_kind" | "owner_function_id" | "function_id" | "start_line" |
             "start_offset" | "primary_target_id" | "callee" | "receiver" |
             "is_alloc" | "is_release" | "is_realloc" | "is_aggregate_copy" |
-            "type" | "operator" | "storage_class") {
+            "type" | "operator" | "storage_class" | "file") {
             return None;
         }
         let value = field.value?.kind?;
@@ -674,8 +683,22 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         if compact_kind(node) == "ParmVarDecl" { entry.parameters.push(node.id.clone()); }
     }
     for entry in functions.values_mut() {
+        if let Some(function) = nodes.get(&entry.id) {
+            entry.name = function.label.clone();
+            entry.file = compact_property(function, "file").unwrap_or("").to_owned();
+            if let Some(line) = compact_property(function, "start_line")
+                .and_then(|value| value.parse::<i64>().ok())
+            {
+                entry.start_line = line;
+                entry.has_start_line = true;
+            }
+            entry.externally_visible = compact_property(function, "storage_class") != Some("static");
+        }
+    }
+    for entry in functions.values_mut() {
         entry.parameters.sort_by_key(|id| nodes.get(id).and_then(|node| compact_property(node, "start_offset"))
             .and_then(|value| value.parse::<i64>().ok()).unwrap_or(i64::MAX));
+        entry.parameter_names = entry.parameters.iter().map(|id| compact_path_name(&nodes, id)).collect();
     }
     for node in nodes.values() {
         if !matches!(compact_kind(node), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") { continue; }
@@ -696,6 +719,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             is_source: false,
             is_aggregate_copy: compact_property(node, "is_aggregate_copy") == Some("true"),
             arguments: Vec::new(), assigned_root: String::new(), assigned_selectors: Vec::new(),
+            assigned_name: String::new(),
         };
         if let Some(parent) = parents.get(&node.id).and_then(|id| nodes.get(id)) {
             if compact_kind(parent) == "BinaryOperator" && compact_property(parent, "operator") == Some("=") {
@@ -710,14 +734,20 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             }
         }
         if let Some(path) = compact_path(&nodes, &children, &refers, &call.assigned, 0) {
+            call.assigned_name = compact_path_name(&nodes, &path.root);
             call.assigned_root = path.root; call.assigned_selectors = path.selectors;
         }
         let mut arguments = edges.iter().filter(|edge| edge.kind == "AST_CHILD" && edge.source == node.id && edge.role == "ARGUMENT")
-            .map(|edge| lifetime_proto::FunctionArgument {
-                position: edge.position.unwrap_or_default(), node: edge.target.clone(),
-                root: compact_path(&nodes, &children, &refers, &edge.target, 0).map(|path| path.root).unwrap_or_default(),
-                selectors: compact_path(&nodes, &children, &refers, &edge.target, 0).map(|path| path.selectors).unwrap_or_default(),
-                expression: nodes.get(&edge.target).map(|node| node.label.clone()).unwrap_or_default(),
+            .map(|edge| {
+                let path = compact_path(&nodes, &children, &refers, &edge.target, 0);
+                let root_name = path.as_ref().map(|path| compact_path_name(&nodes, &path.root)).unwrap_or_default();
+                lifetime_proto::FunctionArgument {
+                    position: edge.position.unwrap_or_default(), node: edge.target.clone(),
+                    root: path.as_ref().map(|path| path.root.clone()).unwrap_or_default(),
+                    selectors: path.map(|path| path.selectors).unwrap_or_default(),
+                    expression: nodes.get(&edge.target).map(|node| node.label.clone()).unwrap_or_default(),
+                    root_name,
+                }
             }).collect::<Vec<_>>();
         arguments.sort_by_key(|argument| argument.position);
         call.arguments = arguments;
@@ -738,9 +768,10 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                     .and_then(|id| function_names.get(id).cloned())
                     .or_else(|| nodes.get(child).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
                     .unwrap_or_else(|| nodes.get(child).map(|node| node.label.clone()).unwrap_or_default());
-                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some() });
+                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new() });
             } else if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
-                entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some() });
+                let root_name = compact_path_name(&nodes, &path.root);
+                entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some(), root_name });
             }
         }
     }

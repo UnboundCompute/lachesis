@@ -169,6 +169,12 @@ def _translation_facts(nodes, records):
     function_names = {node["id"]: node.get("label", "") for node in nodes
                       if syntax(node["id"]) in function_kinds}
     function_ids = set(function_names)
+
+    def root_label(root):
+        root = (root or "").removeprefix("decl:")
+        node = by_id.get(root)
+        return (node.get("label") or root) if node else root
+
     functions = {}
     return_nodes = defaultdict(list)
     for node in nodes:
@@ -176,12 +182,21 @@ def _translation_facts(nodes, records):
         if not owner:
             continue
         item = functions.setdefault(owner, lifetime_pb2.TranslationFunction(id=owner))
+        if owner in by_id:
+            function = by_id[owner]
+            item.name = function.get("label", "")
+            item.file = props(function).get("file", "")
+            if "start_line" in props(function):
+                item.start_line = int(props(function).get("start_line") or 0)
+                item.has_start_line = True
+            item.externally_visible = props(function).get("storage_class") != "static"
         if syntax(node["id"]) == "ParmVarDecl":
             item.parameters.append(node["id"])
         if syntax(node["id"]) == "ReturnStmt":
             return_nodes[owner].append(node)
     for item in functions.values():
         item.parameters.sort(key=lambda node_id: int(props(by_id[node_id]).get("start_offset") or 2**63 - 1))
+        item.parameter_names.extend(root_label(node_id) for node_id in item.parameters)
 
     call_kinds = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}
     for node in nodes:
@@ -215,6 +230,7 @@ def _translation_facts(nodes, records):
         if assigned:
             call.assigned_root = assigned[0]
             call.assigned_selectors.extend(assigned[1])
+            call.assigned_name = root_label(assigned[0])
         args = [(edge["target"], edge.get("properties", {}).get("position", 0))
                 for edge in source_edges[node_id] if edge["kind"] == "AST_CHILD" and
                 (edge.get("properties") or {}).get("role") == "ARGUMENT"]
@@ -227,6 +243,7 @@ def _translation_facts(nodes, records):
             if arg_path:
                 argument.root = arg_path[0]
                 argument.selectors.extend(arg_path[1])
+                argument.root_name = root_label(arg_path[0])
             call.arguments.append(argument)
         item.calls.append(call)
 
@@ -251,6 +268,7 @@ def _translation_facts(nodes, records):
                 if return_path:
                     item.returns.append(lifetime_pb2.FunctionReturn(
                         kind="var", root=return_path[0], selectors=return_path[1],
+                        root_name=root_label(return_path[0]),
                         line=int(line_props.get("start_line") or 0), has_line="start_line" in line_props))
     return lifetime_pb2.TranslationResult(functions=[functions[key] for key in sorted(functions)])
 

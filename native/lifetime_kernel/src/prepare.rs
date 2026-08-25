@@ -456,12 +456,14 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
                     kind: "call".to_owned(), callee: call.callee.clone(),
                     root: String::new(), selectors: Vec::new(),
                     line: line.unwrap_or_default(), has_line: line.is_some(),
+                    root_name: String::new(),
                 });
             } else if let Some(path) = graph.access_path(child, 0) {
                 input.returns.push(lifetime_proto::FunctionReturn {
                     kind: "var".to_owned(), callee: String::new(),
                     root: path.root, selectors: path.selectors,
                     line: line.unwrap_or_default(), has_line: line.is_some(),
+                    root_name: String::new(),
                 });
             }
         }
@@ -678,12 +680,14 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 kind: "call".to_owned(), callee: call.callee.clone(),
                 root: String::new(), selectors: Vec::new(),
                 line: line.unwrap_or_default(), has_line: line.is_some(),
+                root_name: String::new(),
             });
         } else if let Some(path) = graph.access_path(&child, 0) {
             returns.push(lifetime_proto::FunctionReturn {
                 kind: "var".to_owned(), callee: String::new(),
                 root: path.root, selectors: path.selectors,
                 line: line.unwrap_or_default(), has_line: line.is_some(),
+                root_name: String::new(),
             });
         }
     }
