@@ -506,9 +506,53 @@ class ObjectStateAnalyzer:
                 unplaced.append(op)
         for placed in at.values():
             placed.sort(key=lambda op: op.ordinal)
+        seed = initial or AbstractState()
+        findings = set() if self.collect_findings else _DiscardFindings()
+
+        # Most small helpers have a single straight-line CFG. There is exactly one
+        # abstract state on that shape: no join, loop, or summary alternative can create
+        # a second state. Carry it directly instead of allocating a keyed state map and
+        # hashing five frozensets at every node. The generic fixpoint below remains the
+        # authority for every graph with control-flow fan-out, fan-in, or a back-edge.
+        linear_index = {node: index for index, node in enumerate(nodes)}
+        linear = all(len(successors.get(node, ())) <= 1 for node in nodes)
+        linear = linear and all(
+            successor in linear_index and linear_index[successor] > linear_index[node]
+            for node in nodes
+            for successor in successors.get(node, ())
+        )
+        linear = linear and all(
+            op.kind != OpKind.SUMMARY for placed in at.values() for op in placed)
+        if linear:
+            chain = []
+            current = nodes[0]
+            seen = set()
+            while current is not None and current not in seen:
+                seen.add(current)
+                chain.append(current)
+                next_nodes = successors.get(current, ())
+                current = next_nodes[0] if next_nodes else None
+            if len(chain) == len(nodes) and set(chain) == set(nodes):
+                state = (initial or AbstractState()).clone()
+                point_states = {}
+                post_states = {}
+                for node in chain:
+                    point_states[node] = (state.clone(),)
+                    for op in at.get(node, ()):
+                        state.apply(op, findings)
+                    post_states[node] = (state.clone(),)
+                return AnalysisResult(
+                    findings=findings,
+                    exit_states=(state.clone(),),
+                    unplaced=tuple(unplaced),
+                    transfers=len(chain),
+                    widenings=0,
+                    capped=False,
+                    point_states=point_states,
+                    post_states=post_states,
+                )
 
         incoming: dict[Hashable, dict[tuple, AbstractState]] = {node: {} for node in nodes}
-        seed = initial or AbstractState()
         incoming[nodes[0]][seed.key()] = seed
         work = deque([nodes[0]])
         queued = {nodes[0]}
@@ -516,7 +560,6 @@ class ObjectStateAnalyzer:
         post_snapshots: dict[Hashable, dict[tuple, AbstractState]] = {
             node: {} for node in nodes
         }
-        findings = set() if self.collect_findings else _DiscardFindings()
         transfers = widenings = 0
         cap = self.transfer_cap or max(10000, len(nodes) * 500)
 
