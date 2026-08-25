@@ -260,7 +260,10 @@ class Analysis:
             ]
             self._pass2_timing("catalog structural bind", started)
             materialize_started = perf_counter()
-            graph = materialize_graph(index)
+            # Structural consumers build their own deterministic candidate order;
+            # they do not use the global graph ordering for semantics.  Avoid
+            # sorting ~1.2M nodes and ~2.5M edges on this one-shot Pass 2 view.
+            graph = materialize_graph(index, sort_output=False)
             graph["nodes"].extend(delta_nodes)
             graph["edges"].extend(delta_edges)
             self._pass2_timing("bind graph materialize", materialize_started)
