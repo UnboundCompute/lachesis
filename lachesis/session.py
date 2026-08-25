@@ -318,12 +318,17 @@ class Analysis:
         ``candidates`` / ``explain`` skips both costs. Idempotent: a store already enriched, and a
         bind already cached, are no-ops that simply report what is present.
 
-        Bounded by default, exactly like :meth:`analyze`: the temporal bind (the flow pass, the
-        one part that can run long) is held to ``hard_stop`` (or ``LACHESIS_HARD_STOP``, else
+        The *bind* is bounded by default, exactly like :meth:`analyze`: the temporal bind (the
+        flow pass) is held to ``hard_stop`` (or ``LACHESIS_HARD_STOP``, else
         :data:`DEFAULT_HARD_STOP`); ``hard_stop=0`` runs it unbounded. A bind that hits the budget
         degrades to the structural families and is not persisted (a partial temporal sidecar is
-        never written), so a later, more patient ``enrich`` still completes it -- pass 2 can no
-        longer hang the way it used to.
+        never written), so a later, more patient ``enrich`` still completes it.
+
+        The *tier* materialization (``ensure_dataflow_tier`` above the bind) is NOT bounded by
+        ``hard_stop`` -- it is a whole-graph, in-RAM step that runs to completion before the bind's
+        clock ever starts. On a large graph it is the dominant cost and, on a machine short on RAM,
+        it swaps; ``ensure_dataflow_tier`` warns up front when that is about to happen. It is cached
+        to ``.dataflow.pb`` afterwards, so it is paid once per graph version, not per call.
 
         Returns a small report -- the sidecar paths, whether each is on disk, and whether the
         temporal families were evaluated -- so a CLI or a caller can say what it warmed.

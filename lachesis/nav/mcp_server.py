@@ -139,7 +139,7 @@ def _visible_tools():
 
 
 def log(*a):
-    print("[lachesis-mcp]", *a, file=sys.stderr, flush=True)
+    print("[lachesis mcp]", *a, file=sys.stderr, flush=True)
 
 
 def _expand(path):
@@ -432,7 +432,7 @@ TOOLS = [
          "required": ["path"]}},
     {"name": "build_graph",
      "description": "Build a Lachesis graph from a source directory and attach it — the zero-config "
-                    "way to start on a repo that has no graph yet, no separate lachesis-analyze step "
+                    "way to start on a repo that has no graph yet, no separate lachesis build step "
                     "needed. Content-addressed: an unchanged tree returns instantly from cache; pass "
                     "refresh=true to force a rebuild. On success the new graph is loaded, so the next "
                     "tool call reasons over it. Toolchain: Python needs nothing extra; TypeScript/"
@@ -440,7 +440,7 @@ TOOLS = [
                     "an actionable 'missing toolchain prerequisite' error, not a crash. Builds run "
                     "in-process and can take minutes on a large tree (capped by timeout_seconds, "
                     "default 300); a build longer than the MCP client's own request timeout may need a "
-                    "smaller subtree or an out-of-band `lachesis-analyze`.",
+                    "smaller subtree or an out-of-band `lachesis build`.",
      "inputSchema": {"type": "object", "properties": {
          "source": {"type": "string", "description": "path to the source directory to analyse"},
          "refresh": {"type": "boolean", "default": False,
@@ -1859,7 +1859,7 @@ def _build_graph(args):
     """Build (or reuse) a graph for a source directory, then attach it in one call.
 
     Zero-config on-ramp: an agent that only has a repo path can call this and go, with no
-    prior `lachesis-analyze` step. In-process wrapper around `ensure_graph`, the same
+    prior `lachesis build` step. In-process wrapper around `ensure_graph`, the same
     build-or-reuse path the server's own startup uses — content-addressed, so a second
     build of an unchanged tree returns instantly from cache. On success the freshly built
     store is loaded exactly as `load_graph` would, so the next tool call hits it."""
@@ -1889,7 +1889,7 @@ def _build_graph(args):
     except Exception as error:  # noqa: BLE001 - a frontend timeout or compile failure
         return json.dumps({"error": f"build failed: {error}",
                            "hint": "large trees can exceed timeout_seconds (default 300); "
-                                   "raise it and retry, or run lachesis-analyze out of band"})
+                                   "raise it and retry, or run lachesis build out of band"})
     meta = entry_for(source).meta() or {}
     loaded = json.loads(_load_graph({"path": str(graph_path)}))
     if "error" in loaded:  # built fine but could not attach — surface that, not a fake success
@@ -1967,7 +1967,7 @@ def _dispatch(msg):
 def main():
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _DEFAULT_FORMAT
     if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
-        print("usage: lachesis-mcp [graph.kuzu] [overlay] [profile]")
+        print("usage: lachesis mcp [graph.kuzu] [overlay] [profile]")
         print("Serve a Lachesis graph over MCP stdio; --version prints the installed version.")
         return 0
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
@@ -1990,10 +1990,10 @@ def main():
             graph, _ = ensure_graph(source, progress=Progress(enabled=True))
         except EnvironmentProblem as error:
             for check in error.checks:
-                print(f"lachesis-mcp: {check.name}: {check.detail}", file=sys.stderr)
+                print(f"lachesis mcp: {check.name}: {check.detail}", file=sys.stderr)
             return 3
         except NoSourceFound as error:
-            print(f"lachesis-mcp: {error}", file=sys.stderr)
+            print(f"lachesis mcp: {error}", file=sys.stderr)
             return 2
         _GRAPH_PATH = str(graph)
     _OVERLAY_PATH = _expand(sys.argv[2] if len(sys.argv) > 2 else None)

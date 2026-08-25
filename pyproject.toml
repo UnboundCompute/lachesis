@@ -45,17 +45,9 @@ dev = ["pytest>=8"]
 concept-search = ["fastembed>=0.8,<0.9"]
 
 [project.scripts]
-# The product surface. Everything below it is the engine, kept because a
-# graph you hold yourself is a legitimate thing to want.
+# One entrypoint. The reader is a single `lachesis` with subcommands; every pass
+# and engine tool is a verb under it (build/enrich/analyze/query/plan/mcp/...).
 lachesis = "lachesis.cli.main:main"
-# Deprecated aliases: the reader is one `lachesis` with subcommands now. Each old
-# script still runs its exact prior behaviour and prints a stderr hint to the new
-# verb (lachesis-analyze -> `lachesis build`, it is pass 1 the builder).
-lachesis-analyze = "lachesis.cli.deprecated:analyze"
-lachesis-query = "lachesis.cli.deprecated:query"
-lachesis-mcp = "lachesis.cli.deprecated:mcp"
-lachesis-plan = "lachesis.cli.deprecated:plan"
-lachesis-candidates = "lachesis.cli.deprecated:candidates"
 
 [project.urls]
 Homepage = "https://github.com/UnboundCompute/lachesis"

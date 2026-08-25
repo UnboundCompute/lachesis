@@ -42,7 +42,13 @@ def _run() -> None:
     parser.add_argument(
         "output_path", nargs="?", default="graph_out/compiler_project.kuzu",
         help="Kùzu store directory to write (holds graph.kuzu plus the store "
-             "manifest). This is the graph: nav and lachesis-query both read it.",
+             "manifest). This is the graph: nav and `lachesis query` both read it.",
+    )
+    parser.add_argument(
+        "-o", "--output", dest="output_flag", metavar="PATH", default=None,
+        help="the same output path as the positional argument, spelled as a flag "
+             "so it matches `lachesis analyze -o`; a user who learned -o on one pass "
+             "should not be rejected on the other. If both are given, the flag wins.",
     )
     parser.add_argument(
         "--frontend-out", metavar="DIR", default=None,
@@ -128,6 +134,8 @@ def _run() -> None:
         help="stream core-only frontend shards directly into Kùzu",
     )
     args = parser.parse_args()
+    if args.output_flag is not None:
+        args.output_path = args.output_flag
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
             "incremental manifest keys bundles by frontend, not by package")
@@ -276,12 +284,12 @@ def main() -> int:
     try:
         _run()
     except KeyboardInterrupt:
-        print("lachesis-analyze: interrupted", file=sys.stderr)
+        print("lachesis build: interrupted", file=sys.stderr)
         return 130
     except Exception as error:  # noqa: BLE001 - CLI converts build errors to guidance
         if os.environ.get("LACHESIS_TRACEBACK"):
             raise
-        print(f"lachesis-analyze: {error}", file=sys.stderr)
+        print(f"lachesis build: {error}", file=sys.stderr)
         print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
         return 2
     return 0

@@ -222,7 +222,7 @@ def command_mcp(args: argparse.Namespace) -> int:
     os.environ["LACHESIS_GRAPH"] = str(graph_path)
     if args.profile:
         os.environ["LACHESIS_PROFILE"] = args.profile
-    sys.argv = ["lachesis-mcp"]
+    sys.argv = ["lachesis mcp"]
     return mcp_server.main() or EXIT_OK
 
 
@@ -615,9 +615,9 @@ def _run_engine(name: str, rest: list[str]) -> int:
     from lachesis.cli import analyze, query
     from lachesis.planner import cli as planner_cli
     if name == "build":
-        sys.argv = ["lachesis-analyze", *rest]
+        sys.argv = ["lachesis build", *rest]
         return analyze.main()
-    sys.argv = [f"lachesis-{name}", *rest]
+    sys.argv = [f"lachesis {name}", *rest]
     return (query.main() if name == "query" else planner_cli.main()) or EXIT_OK
 
 

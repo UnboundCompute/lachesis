@@ -84,11 +84,14 @@ echo "installed into $workspace/v"
 say "imports resolve"
 ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner; print('ok')"
 
-say "console scripts are on PATH"
-for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan lachesis-candidates; do
-  [[ -x "./v/bin/$script" ]] || { echo "FAIL: missing $script" >&2; exit 1; }
-  "./v/bin/$script" --version >/dev/null
-  echo "  $script"
+say "console script is on PATH"
+# One console script now: the reader is a single `lachesis` with subcommands.
+[[ -x "./v/bin/lachesis" ]] || { echo "FAIL: missing lachesis" >&2; exit 1; }
+./v/bin/lachesis --version >/dev/null
+echo "  lachesis"
+for verb in build enrich analyze query plan candidates mcp; do
+  ./v/bin/lachesis "$verb" --help >/dev/null || { echo "FAIL: verb $verb" >&2; exit 1; }
+  echo "  lachesis $verb"
 done
 
 say "analyse a TypeScript project with no npm install anywhere"

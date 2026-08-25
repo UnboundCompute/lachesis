@@ -34,9 +34,11 @@ echo "installing source distribution into $workspace/v"
 ./v/bin/python -m pip install --quiet --disable-pip-version-check --no-input --upgrade pip
 ./v/bin/python -m pip install --quiet --disable-pip-version-check --no-input "$sdist"
 
-for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan lachesis-candidates; do
-  [[ -x "./v/bin/$script" ]] || { echo "FAIL: missing $script" >&2; exit 1; }
-  "./v/bin/$script" --version >/dev/null
+# One console script now: the reader is a single `lachesis` with subcommands.
+[[ -x "./v/bin/lachesis" ]] || { echo "FAIL: missing lachesis" >&2; exit 1; }
+./v/bin/lachesis --version >/dev/null
+for verb in build enrich analyze query plan candidates mcp; do
+  ./v/bin/lachesis "$verb" --help >/dev/null || { echo "FAIL: verb $verb" >&2; exit 1; }
 done
 
 ./v/bin/python - <<'PY'
