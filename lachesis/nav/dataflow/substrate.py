@@ -113,7 +113,8 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
 
 def read_substrate_cache(index):
     """Load a valid Pass-1 structural sidecar, or return None on a cache miss."""
-    graph_path = getattr(index, "_db_dir", None)
+    graph_path = (getattr(index, "_pass3_cache_base", None)
+                  or getattr(index, "_db_dir", None))
     if not graph_path:
         return None
     path = substrate_cache_path(graph_path)
