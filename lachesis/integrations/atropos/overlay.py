@@ -91,6 +91,23 @@ class AtroposOverlay:
     def __init__(self, stamps: Iterable[dict]) -> None:
         self._stamps: List[dict] = list(stamps)
 
+    def minimal_index(self, graph: dict):
+        """Build only the index surface this one-overlay fold needs.
+
+        The generic registry index also builds by-kind and incoming adjacency
+        buckets for arbitrary overlays. Atropos only validates node membership
+        and deduplicates outgoing edges from resolved source values, so retaining
+        those unrelated buckets is pure peak-RSS overhead.
+        """
+        from lachesis.core.overlays.registry import _MinimalOverlayIndex
+        sources = {
+            stamp.get("value_id") or stamp.get("from")
+            for stamp in self._stamps
+        }
+        sources.update(stamp.get("from") for stamp in self._stamps
+                       if stamp.get("from") is not None)
+        return _MinimalOverlayIndex(graph, sources)
+
     def applies(self, graph: dict, index: Any = None) -> bool:
         # Nothing resolved -> nothing to fold, and the registry then charges the
         # caller nothing for a pass that would add no node.
