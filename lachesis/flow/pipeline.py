@@ -317,13 +317,20 @@ def run_pass(store, lang="c", lifetime_engine=None):
                 legacy_leads, object_result.leads, requested, covered_entries=covered,
                 object_flow=object_flow)
         else:
-            fallback_cfg = cfg_bundle(fallback_store) if seed_unsafe else None
+            fallback_tokens = sum(len(skeleton.get("tokens", ()))
+                                 for skeleton in legacy_fallback_skeletons)
+            fallback_cfg = (cfg_bundle(fallback_store)
+                            if fallback_tokens <= 100_000 and seed_unsafe else None)
             if seed_unsafe and not legacy_fallback_skeletons:
                 legacy_functions = {name: F[name] for name in seed_unsafe if name in F}
                 legacy_summaries = {name: summaries.get(name, ())
                                     for name in legacy_functions}
                 legacy_fallback_skeletons = build_skeletons(
                     legacy_functions, legacy_summaries, lang=lang, include_typestate=True)
+            # These functions are already outside the trustworthy object-analysis
+            # set.  Use the legacy flat fallback rather than replaying the full CFG
+            # parent-resolution automaton over their potentially enormous streams;
+            # the flat may-analysis is conservative for this compatibility path.
             legacy_leads = _match_object_mode_legacy(
                 legacy_fallback_skeletons, fallback_cfg, seed_unsafe)
             # The frozen graph/matcher is now the production lifetime path.  Keep the old
