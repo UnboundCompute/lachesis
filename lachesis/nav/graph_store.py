@@ -530,15 +530,19 @@ class GraphStore:
             if os.path.exists(temporary):
                 os.unlink(temporary)
             raise
-        fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
-                                 dataflow_path=cache)
-        # The derived graph is now represented by the attached cache. The local
-        # payload/derived lists disappear on return; the core graph was released
-        # before encoding, so reopening never overlaps two whole-graph views.
-        self.overlay = fresh.overlay
-        self.graph = fresh.graph
-        self.gl = fresh.gl
-        self.index = fresh.index
+        # The index that loaded the core is still live and has already paid the
+        # expensive Kùzu map scan. Attach the freshly written additive sidecar to it
+        # in place instead of reopening the store. Reopening here used to repeat the
+        # full load/index-map pass immediately after enrichment (roughly the same
+        # work that `loading graph` paid at the start of Pass 2), and briefly kept
+        # two Kùzu index objects alive. `attach_overlay` resets its derived caches,
+        # so the resulting accessor view is identical to a fresh `_open`.
+        dataflow_overlay = _load_dataflow_overlay(cache)
+        merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+        self.index.attach_overlay(merged_overlay)
+        self.overlay = merged_overlay
+        self.graph = None
+        self.gl = GraphLib.from_index(self.index)
         self._retained_enriched_graph = retained
         self._entries = None
         self._enriched = True
