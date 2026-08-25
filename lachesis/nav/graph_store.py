@@ -457,7 +457,9 @@ class GraphStore:
                 f"smaller subtree.",
                 file=sys.stderr, flush=True,
             )
-        core = materialize_graph(self.index)
+        # Enrichment performs its own final canonical sort.  Sorting the entire
+        # core here would pay for the same 2M-edge ordering twice on the cold path.
+        core = materialize_graph(self.index, sort_output=False)
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
         enriched = enrich_graph(core, manifest_languages(manifest),

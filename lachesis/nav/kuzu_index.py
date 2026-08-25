@@ -232,7 +232,8 @@ def materialize_subgraph(index: "KuzuGraphIndex", keep, *, restore_defaults: boo
     return _materialize(index, keep, restore_defaults=restore_defaults)
 
 
-def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True) -> dict:
+def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True,
+                     sort_output: bool = True) -> dict:
     """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
 
     The rest of this module exists precisely to avoid this — the per-node primitives
@@ -246,10 +247,12 @@ def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True)
     matches ``combine_graphs`` (nodes by id, edges by ``(kind, source, target)``) so a
     materialized graph compares equal to a freshly composed one.
     """
-    return _materialize(index, None, restore_defaults=restore_defaults)
+    return _materialize(index, None, restore_defaults=restore_defaults,
+                        sort_output=sort_output)
 
 
-def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True) -> dict:
+def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True,
+                 sort_output: bool = True) -> dict:
     """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
 
     One body rather than two because a subgraph that restored props even slightly
@@ -352,8 +355,9 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
             if (keep is None or
                 (edge.get("source") in resident and edge.get("target") in resident))
         )
-    _sort_materialized_edges(edges)
-    nodes.sort(key=lambda n: n["id"])
+    if sort_output:
+        _sort_materialized_edges(edges)
+        nodes.sort(key=lambda n: n["id"])
     return {"nodes": nodes, "edges": edges}
 
 
