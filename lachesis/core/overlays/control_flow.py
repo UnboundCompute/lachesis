@@ -41,6 +41,12 @@ class ControlFlow:
         sequential: dict[str, list[str]] = defaultdict(list)
         contained: dict[str, list[str]] = defaultdict(list)
         direct_control: dict[str, list[tuple[str, str, dict]]] = defaultdict(list)
+        # These inputs are immutable during one fold. Cache repeated CFG lookups
+        # so nested functions do not rebuild and sort the same statement paths.
+        statement_children_cache: dict[tuple[str, str], list[str]] = {}
+        successor_cache: dict[tuple[str, str], list[str]] = {}
+        branch_end_cache: dict[tuple[str, str], str] = {}
+        position_cache: dict[str, tuple[int, int]] = {}
 
         for edge in graph.get("edges", []):
             kind = index.semantic_edge_kind(edge)
@@ -64,11 +70,16 @@ class ControlFlow:
                 ))
 
         def position(node_id: str) -> tuple[int, int]:
+            cached = position_cache.get(node_id)
+            if cached is not None:
+                return cached
             properties = index.nodes.get(node_id, {}).get("properties", {})
-            return (
+            result = (
                 properties.get("start_offset", 1 << 60),
                 properties.get("end_offset", 1 << 60),
             )
+            position_cache[node_id] = result
+            return result
 
         def add_edge(
             kind: str, source: str, target: str, evidence: list[str], **properties,
@@ -87,6 +98,10 @@ class ControlFlow:
             })
 
         def statement_children(node_id: str, owner_id: str) -> list[str]:
+            cache_key = (node_id, owner_id)
+            cached = statement_children_cache.get(cache_key)
+            if cached is not None:
+                return cached
             # A block's direct AST children ARE its statement sequence. Most are
             # `statement` nodes, but an expression-statement (`free(p);`, `use(p);`,
             # `x = f();`) is emitted by the frontends as a bare `call`/`expression`
@@ -108,9 +123,15 @@ class ControlFlow:
                     or (in_block and child.get("kind") in ("call", "expression"))
                 )
             ]
-            return sorted(dict.fromkeys(result), key=position)
+            result = sorted(dict.fromkeys(result), key=position)
+            statement_children_cache[cache_key] = result
+            return result
 
         def branch_end(node_id: str, owner_id: str) -> str:
+            cache_key = (node_id, owner_id)
+            cached = branch_end_cache.get(cache_key)
+            if cached is not None:
+                return cached
             # Walk the last-child chain to its deepest statement. Iterative, not
             # recursive: a Suricata function nests statements >1000 deep, which
             # overflowed Python's stack when this descended by recursion. The
@@ -123,6 +144,7 @@ class ControlFlow:
                 if not children:
                     break
                 node_id = children[-1]
+            branch_end_cache[cache_key] = node_id
             return node_id
 
         def next_in_block(node_id: str, owner_id: str) -> list[str]:
@@ -142,13 +164,19 @@ class ControlFlow:
             return []
 
         def same_owner_successors(node_id: str, owner_id: str) -> list[str]:
+            cache_key = (node_id, owner_id)
+            cached = successor_cache.get(cache_key)
+            if cached is not None:
+                return cached
             explicit = sorted((
                 target for target in sequential.get(node_id, [])
                 if index.nodes.get(target, {}).get("properties", {}).get(
                     "owner_function_id"
                 ) == owner_id
             ), key=position)
-            return explicit or next_in_block(node_id, owner_id)
+            result = explicit or next_in_block(node_id, owner_id)
+            successor_cache[cache_key] = result
+            return result
 
         # Bucket statements by owner ONCE (was O(functions x statements) = O(files^2)).
         statements_by_function: dict[str, list[dict]] = defaultdict(list)
