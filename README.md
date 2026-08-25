@@ -197,6 +197,75 @@ MCP-capable client. The graph model is documented in
 [`docs/graph-model.md`](./docs/graph-model.md); large-build and CI tuning lives in
 [`docs/scaling.md`](./docs/scaling.md).
 
+## Pass 3 cold-path audit (developers)
+
+Pass 3 is the object-identity and semantic-matching flow over an existing CPG store. This
+is a cold-path benchmark: use a fresh Python process and `LACHESIS_LIFETIME_WORKERS=1`;
+do not compare a warm in-process run with Pass 1 or Pass 2.
+
+Build or rebuild the graph first. The graph writer automatically publishes the compact
+structural sidecar that Pass 3 consumes:
+
+```bash
+cd /Users/riyandhiman/project/unboundcompute/arachne
+
+SOURCE=/Users/riyandhiman/project/unboundcompute/cve-proof/src/libxml2
+GRAPH=/tmp/codex-pass3-audit-20260825/libxml2-clean/pass2.kuzu
+
+lachesis-analyze "$SOURCE" "$GRAPH"
+# From a source checkout, use this equivalent command:
+# python3 -m lachesis.cli.analyze "$SOURCE" "$GRAPH"
+```
+
+Run the complete cold Pass 3 flow with the five-minute safety stop and maximum RSS
+measurement (macOS):
+
+```bash
+cd /Users/riyandhiman/project/unboundcompute/arachne
+
+LACHESIS_LIFETIME_WORKERS=1 /usr/bin/time -l timeout 300 python3 - <<'PY'
+from lachesis.nav.graph_store import GraphStore
+from lachesis.flow.pipeline import run_pass
+
+graph = "/tmp/codex-pass3-audit-20260825/libxml2-clean/pass2.kuzu"
+store = GraphStore.load(graph)
+result = run_pass(store, lang="c", lifetime_engine="object")
+
+print("leads", len(result["leads"]))
+print("timings", result["timings"])
+PY
+```
+
+The timeout rule is `max(5 minutes, max(Pass 1, Pass 2) + 1 minute)`. The current Pass 1
+and Pass 2 baselines are about 99.1s and 147.2s, so the active hard stop is 300s. On
+Linux, replace `/usr/bin/time -l` with `/usr/bin/time -v`.
+
+The expected sidecar is next to the store:
+
+```text
+/tmp/codex-pass3-audit-20260825/libxml2-clean/pass2.kuzu.pass3.substrate.pb
+```
+
+If it is absent, rebuild the store so the writer can create it. The large semantic JSON
+snapshot is intentionally excluded from the cold path. Enable it only when explicitly
+testing snapshot reuse:
+
+```bash
+LACHESIS_PASS3_SNAPSHOT=1 ...the same Pass 3 command...
+```
+
+Run the small deterministic parity fixture separately:
+
+```bash
+python3 -m lachesis.flow.match \
+  --graph /tmp/codex-pass3-audit-20260825/example/pass2n.kuzu \
+  --workers 1
+```
+
+The current reference result is `468 leads over 201 skeletons`. The latest full cold
+libxml2 result is approximately 110.9s wall time, 85.9s internal Pass 3 time, and
+6.74 GiB peak RSS; measurements vary with the machine and graph cache state.
+
 ## Install from source
 
 Lachesis also installs from a clone — the workflow for contributors and for building the
