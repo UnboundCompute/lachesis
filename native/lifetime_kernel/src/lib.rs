@@ -6,11 +6,16 @@
 //! every transfer while preserving the existing analysis semantics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{c_char, CStr, CString};
+use std::slice;
+use prost::Message;
 
 use serde::{Deserialize, Serialize};
 
 mod atropos_bind;
+
+mod lifetime_proto {
+    include!(concat!(env!("OUT_DIR"), "/lachesis.lifetime.rs"));
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Path {
@@ -364,23 +369,45 @@ pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct WireBatch {
-    nodes: Vec<String>,
-    successors: HashMap<String, Vec<String>>,
-    operations: Vec<Operation>,
-    parameters: Vec<(String, u32)>,
+fn proto_path(path: lifetime_proto::Path) -> Path {
+    Path { root: path.root, selectors: path.selectors }
 }
 
-fn solve_wire(batch: WireBatch) -> LinearResult {
-    let mut state = State::default();
-    for (root, position) in batch.parameters {
-        state.seed_parameter(Path::root(root), position);
+fn proto_kind(kind: i32) -> Result<Kind, String> {
+    use lifetime_proto::operation::Kind as ProtoKind;
+    match ProtoKind::try_from(kind).map_err(|_| format!("unknown operation kind {kind}"))? {
+        ProtoKind::Alloc => Ok(Kind::Alloc),
+        ProtoKind::Clobber => Ok(Kind::Clobber),
+        ProtoKind::Copy => Ok(Kind::Copy),
+        ProtoKind::Free => Ok(Kind::Free),
+        ProtoKind::Realloc => Ok(Kind::Realloc),
+        ProtoKind::Use => Ok(Kind::Use),
+        ProtoKind::Unspecified => Err("operation kind is unspecified".into()),
     }
-    // The Python initializer materializes parameter-relative fields mentioned by the
-    // batch.  Resolve them once with creation enabled so the native state has the same
-    // stable parameter identities before the first transfer.
-    for operation in &batch.operations {
+}
+
+fn solve_proto(input: &[u8]) -> Result<LinearResult, String> {
+    let request = lifetime_proto::Request::decode(input)
+        .map_err(|error| format!("invalid lifetime protobuf: {error}"))?;
+    let nodes = request.nodes;
+    let successors = request.successors.into_iter().map(|entry| (entry.node, entry.targets)).collect();
+    let operations = request.operations.into_iter().map(|operation| {
+        Ok(Operation {
+            kind: proto_kind(operation.kind)?,
+            node: operation.node,
+            target: operation.target.map(proto_path),
+            source: operation.source.map(proto_path),
+            site: operation.site,
+            line: operation.has_line.then_some(operation.line),
+            is_null: operation.is_null,
+            access: operation.access,
+        })
+    }).collect::<Result<Vec<_>, String>>()?;
+    let mut state = State::default();
+    for parameter in request.parameters {
+        state.seed_parameter(Path::root(parameter.root), parameter.position);
+    }
+    for operation in &operations {
         for path in [operation.target.as_ref(), operation.source.as_ref()].into_iter().flatten() {
             let mut path = path.clone();
             if state.env.contains_key(&path.root) && !path.selectors.is_empty() {
@@ -388,28 +415,114 @@ fn solve_wire(batch: WireBatch) -> LinearResult {
             }
         }
     }
-    solve_graph(&batch.nodes, &batch.successors, &batch.operations, state, 32)
+    Ok(solve_graph(&nodes, &successors, &operations, state, 32))
 }
 
-/// Solve one prepared linear function batch.  The ABI is intentionally tiny: Python
-/// passes one UTF-8 JSON document and receives one owned UTF-8 JSON document.  This is
-/// an opt-in bridge during development; the normal Python solver remains the fallback
-/// until parity is established.
+fn proto_effect(effect: Effect) -> lifetime_proto::Effect {
+    let value = match effect {
+        Effect::Param { kind, position, selectors } => {
+            lifetime_proto::effect::Value::Param(lifetime_proto::ParamEffect {
+                kind: proto_kind_value(kind), position, selectors,
+            })
+        }
+        Effect::Return { position, selectors } => {
+            lifetime_proto::effect::Value::ReturnValue(lifetime_proto::ReturnEffect {
+                position, selectors,
+            })
+        }
+    };
+    lifetime_proto::Effect { value: Some(value) }
+}
+
+fn proto_kind_value(kind: Kind) -> i32 {
+    use lifetime_proto::operation::Kind as ProtoKind;
+    match kind {
+        Kind::Alloc => ProtoKind::Alloc as i32,
+        Kind::Clobber => ProtoKind::Clobber as i32,
+        Kind::Copy => ProtoKind::Copy as i32,
+        Kind::Free => ProtoKind::Free as i32,
+        Kind::Realloc => ProtoKind::Realloc as i32,
+        Kind::Use => ProtoKind::Use as i32,
+    }
+}
+
+fn proto_meta(meta: ObjectMeta) -> lifetime_proto::ObjectMeta {
+    use lifetime_proto::object_meta::Value;
+    let value = match meta {
+        ObjectMeta::Param { position, selectors } => Value::Param(lifetime_proto::ParamMeta { position, selectors }),
+        ObjectMeta::UnknownRoot { root } => Value::UnknownRoot(lifetime_proto::UnknownRootMeta { root }),
+        ObjectMeta::UnknownSlot { base, selector } => Value::UnknownSlot(lifetime_proto::UnknownSlotMeta { base, selector }),
+        ObjectMeta::Allocation { kind, generation, site, target } => Value::Allocation(lifetime_proto::AllocationMeta {
+            kind: proto_kind_value(kind), generation, site,
+            target: Some(lifetime_proto::Path { root: target.root, selectors: target.selectors }),
+        }),
+        ObjectMeta::Phi { tag, node, index } => Value::Phi(lifetime_proto::PhiMeta { tag, node, index: index as u64 }),
+    };
+    lifetime_proto::ObjectMeta { value: Some(value) }
+}
+
+fn proto_snapshot(snapshot: Snapshot) -> lifetime_proto::Snapshot {
+    lifetime_proto::Snapshot {
+        env: snapshot.env.into_iter().map(|(root, object_id)| lifetime_proto::Binding { root, object_id }).collect(),
+        facts: snapshot.facts.into_iter().map(|(object_id, values)| lifetime_proto::FactSet {
+            object_id,
+            values: values.into_iter().map(|value| value as u32).collect(),
+        }).collect(),
+        slots: snapshot.slots.into_iter().map(|((base, selector), object_id)| lifetime_proto::Slot { base, selector, object_id }).collect(),
+        trace: snapshot.trace.into_iter().map(proto_effect).collect(),
+        freed_paths: snapshot.freed_paths.into_iter().map(|(path, object_id)| lifetime_proto::FreedPath {
+            path: Some(lifetime_proto::Path { root: path.root, selectors: path.selectors }), object_id,
+        }).collect(),
+        objects: snapshot.objects.into_iter().map(|(id, meta)| lifetime_proto::Object { id, meta: Some(proto_meta(meta)) }).collect(),
+    }
+}
+
+fn proto_result(result: LinearResult) -> lifetime_proto::Result {
+    let states = |items: Vec<(String, Vec<Snapshot>)>| items.into_iter().map(|(node, snapshots)| {
+        lifetime_proto::StateAt { node, states: snapshots.into_iter().map(proto_snapshot).collect() }
+    }).collect();
+    lifetime_proto::Result {
+        point_states: states(result.point_states),
+        post_states: states(result.post_states),
+        exit_state: Some(proto_snapshot(result.exit_state)),
+        exit_states: result.exit_states.into_iter().map(proto_snapshot).collect(),
+        transfers: result.transfers,
+        widenings: result.widenings,
+        capped: result.capped,
+    }
+}
+
+/// Binary protobuf lifetime ABI. Both request and response stay typed binary data;
+/// JSON is not involved in the internal solver boundary.
 #[no_mangle]
-pub unsafe extern "C" fn lachesis_lifetime_solve_json(input: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn lachesis_lifetime_solve_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
     let result = (|| {
-        let input = CStr::from_ptr(input).to_str().map_err(|error| error.to_string())?;
-        let batch: WireBatch = serde_json::from_str(input).map_err(|error| error.to_string())?;
-        serde_json::to_string(&solve_wire(batch)).map_err(|error| error.to_string())
+        let bytes = slice::from_raw_parts(input, length);
+        let mut output = Vec::new();
+        proto_result(solve_proto(bytes)?).encode(&mut output)
+            .map_err(|error| error.to_string())?;
+        Ok::<Vec<u8>, String>(output)
     })();
-    let payload = result.unwrap_or_else(|error| serde_json::json!({"error": error}).to_string());
-    CString::new(payload).expect("JSON cannot contain NUL").into_raw()
+    let mut payload = result.unwrap_or_else(|error| {
+        // A malformed request has no normal Result representation. Return an
+        // empty buffer; the caller treats zero length as an ABI error.
+        eprintln!("native lifetime protobuf error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() {
+        *output_length = payload.len();
+    }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lachesis_lifetime_free_json(value: *mut c_char) {
-    if !value.is_null() {
-        drop(CString::from_raw(value));
+pub unsafe extern "C" fn lachesis_lifetime_free_bytes(pointer: *mut u8, length: usize) {
+    if !pointer.is_null() {
+        drop(Vec::from_raw_parts(pointer, length, length));
     }
 }
 

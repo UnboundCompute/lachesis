@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package lachesis.lifetime;
+
+message Path {
+  string root = 1;
+  repeated string selectors = 2;
+}
+
+message Operation {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    ALLOC = 1;
+    CLOBBER = 2;
+    COPY = 3;
+    FREE = 4;
+    REALLOC = 5;
+    USE = 6;
+  }
+  Kind kind = 1;
+  string node = 2;
+  Path target = 3;
+  Path source = 4;
+  string site = 5;
+  sint64 line = 6;
+  bool has_line = 7;
+  bool is_null = 8;
+  string access = 9;
+}
+
+message Successors {
+  string node = 1;
+  repeated string targets = 2;
+}
+
+message Parameter {
+  string root = 1;
+  uint32 position = 2;
+}
+
+message Request {
+  repeated string nodes = 1;
+  repeated Successors successors = 2;
+  repeated Operation operations = 3;
+  repeated Parameter parameters = 4;
+}
+
+message ParamMeta { uint32 position = 1; repeated string selectors = 2; }
+message UnknownRootMeta { string root = 1; }
+message UnknownSlotMeta { string base = 1; string selector = 2; }
+message AllocationMeta {
+  Operation.Kind kind = 1;
+  string generation = 2;
+  string site = 3;
+  Path target = 4;
+}
+message PhiMeta { string tag = 1; string node = 2; uint64 index = 3; }
+message ObjectMeta {
+  oneof value {
+    ParamMeta param = 1;
+    UnknownRootMeta unknown_root = 2;
+    UnknownSlotMeta unknown_slot = 3;
+    AllocationMeta allocation = 4;
+    PhiMeta phi = 5;
+  }
+}
+message Object { string id = 1; ObjectMeta meta = 2; }
+message Binding { string root = 1; string object_id = 2; }
+message FactSet { string object_id = 1; repeated uint32 values = 2; }
+message Slot { string base = 1; string selector = 2; string object_id = 3; }
+message FreedPath { Path path = 1; string object_id = 2; }
+message ParamEffect { Operation.Kind kind = 1; uint32 position = 2; repeated string selectors = 3; }
+message ReturnEffect { uint32 position = 1; repeated string selectors = 2; }
+message Effect {
+  oneof value {
+    ParamEffect param = 1;
+    ReturnEffect return_value = 2;
+  }
+}
+message Snapshot {
+  repeated Binding env = 1;
+  repeated FactSet facts = 2;
+  repeated Slot slots = 3;
+  repeated Effect trace = 4;
+  repeated FreedPath freed_paths = 5;
+  repeated Object objects = 6;
+}
+message StateAt { string node = 1; repeated Snapshot states = 2; }
+message Result {
+  repeated StateAt point_states = 1;
+  repeated StateAt post_states = 2;
+  Snapshot exit_state = 3;
+  repeated Snapshot exit_states = 4;
+  uint64 transfers = 5;
+  uint64 widenings = 6;
+  bool capped = 7;
+}
