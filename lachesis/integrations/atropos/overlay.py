@@ -97,7 +97,11 @@ class AtroposOverlay:
         return bool(self._stamps)
 
     def enrich(self, graph: dict, index: Any = None) -> GraphDelta:
-        node_ids = {node["id"] for node in graph.get("nodes", ())}
+        # OverlayRegistry already owns a node map for this graph. Reusing it avoids
+        # allocating a second million-entry set just to validate resolved endpoints.
+        # Keep the standalone fallback for direct overlay callers and tests.
+        node_ids = (index.nodes if index is not None and hasattr(index, "nodes")
+                    else {node["id"] for node in graph.get("nodes", ())})
         nodes: List[dict] = []
         edges: List[dict] = []
         # A model can bind the same value node at more than one callsite; those
