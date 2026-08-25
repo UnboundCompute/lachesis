@@ -301,6 +301,27 @@ def _flow_header_node(node):
             "label": node.get("label"), "properties": properties}
 
 
+def _prefetched_owned(ix, owner_id, kind):
+    """Read an already-prefetched owned-node slice without starting a query.
+
+    Translation prefetches the small set of flow-bearing node kinds in one owner
+    scan.  Calling the generic ``nodes_owned_by`` accessor afterwards can repeat a
+    per-function warm-up for dynamic/write projections, defeating that prefetch.
+    Keep the fallback for in-memory and third-party indexes.
+    """
+    prefetched = getattr(ix, "_translation_prefetched_kinds", ())
+    if kind not in prefetched or not hasattr(ix, "_node_cache"):
+        return ix.nodes_owned_by(owner_id, kind)
+    out = []
+    for node_id in ix.by_owner.get(owner_id, ()):
+        if ix._kind_by_id.get(node_id) != kind:
+            continue
+        node = ix._node_cache.get(node_id)
+        if node is not None:
+            out.append(node)
+    return tuple(out)
+
+
 def _freed_identity(arg):
     """The lifetime identity of the object a `free(...)` releases -- the argument AS WRITTEN.
 
@@ -432,7 +453,7 @@ def _dynamic_property_writes(ix, regions, nest, fid):
         records.append(record)
 
     # TypeScript/JavaScript emits the key's value node and target path directly.
-    for node in _by_offset(ix.nodes_owned_by(fid, "dynamic-behavior")):
+    for node in _by_offset(_prefetched_owned(ix, fid, "dynamic-behavior")):
         props = _props(node)
         if props.get("behavior_kind") != "computed-property-write":
             continue
@@ -442,7 +463,7 @@ def _dynamic_property_writes(ix, regions, nest, fid):
 
     # Python, C, and any future frontend can use the shared write/property-path
     # contract without needing a frontend-specific behavior marker.
-    for node in _by_offset(ix.nodes_owned_by(fid, "write")):
+    for node in _by_offset(_prefetched_owned(ix, fid, "write")):
         props = _props(node)
         target = ix.nodes.get(props.get("target_id"))
         target_props = _props(target)
@@ -947,6 +968,10 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         # owned-kind views from the cache, preserving all selection semantics.
         if hasattr(ix, "_warm_nodes_by_owner"):
             ix._warm_nodes_by_owner(definition_ids, flow_kinds)
+            # The dynamic/write projection below must consume this cache directly;
+            # otherwise its generic owner accessor can issue one warm-up per
+            # function after this scan has already completed.
+            ix._translation_prefetched_kinds = frozenset(flow_kinds)
         else:
             flow_ids = {
                 node_id for owner_id in definition_ids
