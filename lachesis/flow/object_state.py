@@ -573,9 +573,9 @@ class ObjectStateAnalyzer:
             for successor in successors.get(node, ()):
                 if successor not in incoming:
                     continue
-                before = set(incoming[successor])
-                for key, state in outgoing.items():
-                    incoming[successor].setdefault(key, state)
+                target = incoming[successor]
+                new_items = [(key, state) for key, state in outgoing.items()
+                             if key not in target]
                 # Sticky widening: once a node's disjunct budget is exceeded it stays
                 # collapsed to a single joined state, and every later update joins into
                 # that state instead of re-expanding. Without this a loop node oscillates
@@ -583,15 +583,26 @@ class ObjectStateAnalyzer:
                 # widen again -- burning the whole transfer budget and capping the
                 # function. Collapsing monotonically bounds the lattice height so the
                 # fixpoint terminates; the join is a sound may-approximation.
-                if len(incoming[successor]) > self.max_disjuncts or successor in widened:
-                    merged = join_states(incoming[successor].values(), successor)
-                    incoming[successor] = {merged.key(): merged}
-                    if successor not in widened:
-                        widened.add(successor)
+                if (len(target) + len(new_items) > self.max_disjuncts
+                        or successor in widened):
+                    if not new_items:
+                        continue
+                    old_keys = tuple(target)
+                    candidates = tuple(target.values()) + tuple(
+                        state for _key, state in new_items)
+                    merged = join_states(candidates, successor)
+                    merged_key = merged.key()
+                    incoming[successor] = {merged_key: merged}
+                    widened.add(successor)
                     widenings += 1
+                    changed = old_keys != (merged_key,)
+                else:
+                    for key, state in new_items:
+                        target[key] = state
+                    changed = bool(new_items)
                 # Re-queue only when the successor's state set actually changed; a
                 # collapsed node that re-joins to the same key has reached its fixpoint.
-                if set(incoming[successor]) != before and successor not in queued:
+                if changed and successor not in queued:
                     work.append(successor)
                     queued.add(successor)
 
