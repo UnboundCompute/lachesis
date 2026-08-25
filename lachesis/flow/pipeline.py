@@ -16,6 +16,7 @@ from .object_lifetime import ObjectLifetimeResult, analyze_object_lifetimes
 from .semantic_graph import match_graph
 from .fragment_store import Claus
 from .coverage import CoverageScheduler
+from lachesis.timeit import timeit
 
 
 _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
@@ -144,6 +145,7 @@ def _match_object_mode_legacy(skels, cfg, fallback_entries):
     return leads
 
 
+@timeit
 def run_pass(store, lang="c", lifetime_engine=None):
     """Return {F, succ, summaries, skeletons, leads, lifetime} for an opened GraphStore.
 
@@ -173,7 +175,12 @@ def run_pass(store, lang="c", lifetime_engine=None):
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
-    coverage = CoverageScheduler(F, succ).plan()
+    cached_coverage = getattr(store, "_pass3_coverage_cache", None)
+    if (cached_coverage is not None and cached_coverage[0] is F
+            and cached_coverage[1] is succ):
+        coverage = cached_coverage[2]
+    else:
+        coverage = CoverageScheduler(F, succ).plan()
     projection_done = perf_counter()
     summaries = _summaries_for(F, succ)
     legacy_summaries_done = perf_counter()
@@ -242,17 +249,22 @@ def run_pass(store, lang="c", lifetime_engine=None):
                 snapshot_path, F, lang, analysis_graph,
                 object_result.summaries, summaries, object_result.artifacts)
             store._pass3_snapshot_loaded = True
+        semantic_build_started = perf_counter()
         semantic_graph = claus.build(
             store, F, succ, lang=lang, graph=analysis_graph,
             summaries=object_result.summaries, coverage=semantic_coverage,
-            reach_summaries=summaries, state_artifacts=object_result.artifacts)
+            reach_summaries=summaries, state_artifacts=object_result.artifacts,
+            cfgs=object_result.cfgs)
+        semantic_build_done = perf_counter()
         if snapshot_path:
             claus.fragments.save_snapshot(snapshot_path)
+        semantic_match_started = perf_counter()
         semantic_leads = match_graph(semantic_graph)
+        semantic_match_done = perf_counter()
         # The projection already paid to materialize the disk graph. Reuse that same
         # in-memory index for the legacy coverage fallback instead of issuing another
         # whole-graph set of Kuzu scans merely to project CFG edges.
-        if analysis_graph is not store.graph:
+        if analysis_graph is not store.graph and not hasattr(analysis_graph, "nodes_of_kind"):
             from lachesis.nav.graph_store import GraphStore
             fallback_store = GraphStore(analysis_graph)
         else:
@@ -340,6 +352,15 @@ def run_pass(store, lang="c", lifetime_engine=None):
         "matching_seconds": round(finished - skeletons_done, 6),
         "total_seconds": round(finished - started, 6),
     }
+    if object_requested:
+        timings.update({
+            "semantic_build_seconds": round(
+                locals().get("semantic_build_done", finished)
+                - locals().get("semantic_build_started", finished), 6),
+            "semantic_match_seconds": round(
+                locals().get("semantic_match_done", finished)
+                - locals().get("semantic_match_started", finished), 6),
+        })
     return {"F": F, "succ": succ, "summaries": summaries,
             "skeletons": skeletons, "semantic_graph": locals().get("semantic_graph"),
             "coverage": locals().get("coverage"),

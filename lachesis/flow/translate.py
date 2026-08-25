@@ -1214,6 +1214,13 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         record["coverage_functions"] = region.functions if region else ()
         record["coverage_state_keys"] = region.state_keys if region else ()
         record["coverage_unresolved"] = name in coverage.uncovered_functions
+    # build_F already paid for this exact plan to annotate the projected records.
+    # Keep it on the live GraphStore so run_pass can reuse it instead of planning
+    # the same (F, succ) graph a second time in the same request.
+    try:
+        store._pass3_coverage_cache = (F, succ, coverage)
+    except AttributeError:
+        pass
     return (F, succ, graph) if return_graph else (F, succ)
 
 
