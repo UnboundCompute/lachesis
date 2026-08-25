@@ -160,7 +160,8 @@ class Analysis:
         return bundle
 
     def _bind_bundle(self, *, temporal: bool = True,
-                     deadline: Deadline | None = None) -> dict:
+                     deadline: Deadline | None = None,
+                     workers: int | None = None) -> dict:
         """The catalog-stamped graph and its cached obligation registry.
 
         Candidate enumeration binds catalog facts against the core symbol index. The
@@ -191,12 +192,14 @@ class Analysis:
             full = self._built.get(("bind", True))
             if full is not None and not full.get("partial"):
                 return full
-        bundle = self._build_bind(temporal=temporal, deadline=deadline)
+        bundle = self._build_bind(temporal=temporal, deadline=deadline,
+                                  workers=workers)
         if not bundle.get("partial"):
             self._built[key] = bundle
         return bundle
 
-    def _build_bind(self, *, temporal: bool, deadline: Deadline | None) -> dict:
+    def _build_bind(self, *, temporal: bool, deadline: Deadline | None,
+                    workers: int | None = None) -> dict:
         from lachesis.planner.registry import default_candidate_registry
         from lachesis import bind_cache
 
@@ -211,7 +214,8 @@ class Analysis:
             stamped, summary = self._structural_bind()
             complete = False  # temporal families were not evaluated in the fast path
         else:
-            stamped, summary, complete = self._enrich_and_merge(deadline=deadline)
+            stamped, summary, complete = self._enrich_and_merge(
+                deadline=deadline, workers=workers)
             if complete:
                 bind_cache.store(self.store, stamped, summary)
             else:
@@ -254,7 +258,8 @@ class Analysis:
         self._pass2_timing("catalog structural bind total", started)
         return result
 
-    def _enrich_and_merge(self, *, deadline: Deadline | None = None) -> tuple[dict, dict, bool]:
+    def _enrich_and_merge(self, *, deadline: Deadline | None = None,
+                          workers: int | None = None) -> tuple[dict, dict, bool]:
         """The structural bind plus the Pass 3 semantic skeleton the temporal families read.
 
         Returns ``(stamped, summary, complete)`` where ``complete`` is ``False`` if any flow
@@ -276,10 +281,12 @@ class Analysis:
         for language in summary.get("languages") or ("c",):
             flow_started = perf_counter()
             flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline,
+                                      workers=workers,
                                       progress=self._pass2_progress)
                     if language == "c" else
                     run_pass(self.store, lang=language, lifetime_engine="object",
-                             deadline=deadline, progress=self._pass2_progress))
+                             deadline=deadline, workers=workers,
+                             progress=self._pass2_progress))
             self._pass2_timing(f"catalog temporal flow {language}", flow_started)
             if (flow.get("lifetime") or {}).get("timed_out"):
                 complete = False
@@ -347,7 +354,8 @@ class Analysis:
     # -- library surface: pass 2 (enrich -> warm sidecars) --------------------------
 
     def enrich(self, *, hard_stop: float | None = None,
-               deadline: Deadline | None = None) -> dict:
+               deadline: Deadline | None = None,
+               workers: int | None = None) -> dict:
         """Materialize the dataflow tier and the catalog bind to disk, so later reads are warm.
 
         Pass 2 as one call. ``ensure_dataflow_tier`` folds the overlay dataflow tier over the
@@ -377,7 +385,8 @@ class Analysis:
         self.store.ensure_dataflow_tier(retain_materialized=True)
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
-                                   deadline=self._resolve_deadline(hard_stop, deadline))
+                                   deadline=self._resolve_deadline(hard_stop, deadline),
+                                   workers=workers)
         graph_path = getattr(self.store, "graph_path", None)
         dataflow = dataflow_overlay_path(self.store._core_path) if graph_path else None
         sidecar = bind_cache.sidecar_path(graph_path) if graph_path else None
