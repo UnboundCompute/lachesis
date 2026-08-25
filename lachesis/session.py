@@ -308,7 +308,8 @@ class Analysis:
 
     # -- library surface: pass 2 (enrich -> warm sidecars) --------------------------
 
-    def enrich(self) -> dict:
+    def enrich(self, *, hard_stop: float | None = None,
+               deadline: Deadline | None = None) -> dict:
         """Materialize the dataflow tier and the catalog bind to disk, so later reads are warm.
 
         Pass 2 as one call. ``ensure_dataflow_tier`` folds the overlay dataflow tier over the
@@ -316,6 +317,13 @@ class Analysis:
         then writes the ``.bind.pb`` sidecar. After this a fresh process answering ``analyze`` /
         ``candidates`` / ``explain`` skips both costs. Idempotent: a store already enriched, and a
         bind already cached, are no-ops that simply report what is present.
+
+        Bounded by default, exactly like :meth:`analyze`: the temporal bind (the flow pass, the
+        one part that can run long) is held to ``hard_stop`` (or ``LACHESIS_HARD_STOP``, else
+        :data:`DEFAULT_HARD_STOP`); ``hard_stop=0`` runs it unbounded. A bind that hits the budget
+        degrades to the structural families and is not persisted (a partial temporal sidecar is
+        never written), so a later, more patient ``enrich`` still completes it -- pass 2 can no
+        longer hang the way it used to.
 
         Returns a small report -- the sidecar paths, whether each is on disk, and whether the
         temporal families were evaluated -- so a CLI or a caller can say what it warmed.
@@ -325,7 +333,8 @@ class Analysis:
 
         self.store.ensure_dataflow_tier()
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
-        bundle = self._bind_bundle(temporal=True)
+        bundle = self._bind_bundle(temporal=True,
+                                   deadline=self._resolve_deadline(hard_stop, deadline))
         graph_path = getattr(self.store, "graph_path", None)
         dataflow = dataflow_overlay_path(self.store._core_path) if graph_path else None
         sidecar = bind_cache.sidecar_path(graph_path) if graph_path else None

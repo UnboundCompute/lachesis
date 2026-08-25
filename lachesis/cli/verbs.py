@@ -57,7 +57,7 @@ def command_enrich(args: argparse.Namespace) -> int:
         progress.phase("loading graph")
         analysis = _open(args)
         progress.phase("materializing dataflow tier + catalog bind")
-        report = analysis.enrich()
+        report = analysis.enrich(hard_stop=args.hard_stop)
     if args.json:
         return _dump(report)
     tier = "present" if report["dataflow_tier"] else "not built (in-memory or unsupported)"
@@ -67,7 +67,8 @@ def command_enrich(args: argparse.Namespace) -> int:
     print(f"catalog bind:  {report['bind_sidecar']}  "
           f"({'written' if report['bind_written'] else 'not cached'})")
     if not report["temporal_evaluated"]:
-        print("  ! temporal families were not evaluated -- the bind was not fully warmed")
+        print("  ! temporal families were not evaluated within the budget -- the bind was not "
+              "fully warmed; rerun `lachesis enrich --hard-stop 0` to finish it unbounded")
     return EXIT_OK
 
 
@@ -81,14 +82,17 @@ def command_analyze(args: argparse.Namespace) -> int:
         analysis = _open(args, progress=progress_to(progress))
         leads = analysis.analyze(engine=args.engine, hard_stop=args.hard_stop)
 
+    # --summary is the rollup alone; it wins over any filter so `analyze --summary` always
+    # reads the same whether or not a stray --pattern/--at rode along.
     view = leads
-    if args.pattern:
-        view = view.by_pattern(args.pattern)
-    if args.function:
-        view = view.by_function(args.function)
-    if args.at:
-        file, lines = _parse_at(args.at)
-        view = view.near(file, lines)
+    if not args.summary:
+        if args.pattern:
+            view = view.by_pattern(args.pattern)
+        if args.function:
+            view = view.by_function(args.function)
+        if args.at:
+            file, lines = _parse_at(args.at)
+            view = view.near(file, lines)
 
     if args.out:
         path = view.to_json(args.out)
@@ -267,6 +271,10 @@ def add_reader_verbs(subcommands) -> None:
         "enrich", help="pass 2: warm the dataflow tier + catalog bind sidecars for a graph")
     enrich.add_argument("graph", help="path to a built .kuzu graph (~ is expanded)")
     enrich.add_argument("--overlay", help="optional overlay path")
+    enrich.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
+                        dest="hard_stop",
+                        help="wall-clock budget for the temporal bind (default: "
+                             "LACHESIS_HARD_STOP or 180s; 0 = unbounded)")
     enrich.add_argument("--json", action="store_true", help="emit the report as JSON")
     enrich.set_defaults(handler=command_enrich)
 
@@ -274,6 +282,8 @@ def add_reader_verbs(subcommands) -> None:
         "analyze", help="pass 3: run the flow pass and query its leads")
     analyze.add_argument("graph", help="path to a built .kuzu graph (~ is expanded)")
     analyze.add_argument("--overlay", help="optional overlay path")
+    analyze.add_argument("--summary", action="store_true",
+                         help="the by-pattern rollup (the default when no filter is given)")
     analyze.add_argument("--pattern", help="show only this bug-shape pattern")
     analyze.add_argument("--function", help="show only leads in this function")
     analyze.add_argument("--at", metavar="FILE[:LINE|:LO-HI]",

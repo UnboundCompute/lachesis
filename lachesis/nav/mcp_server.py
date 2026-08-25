@@ -239,8 +239,14 @@ class _Ctx(Analysis):
         symbol index and publishes the cached semantic skeleton to the temporal constructors,
         which emit observations, never verdicts; the graph matcher remains the authority for
         proving a lifecycle relation.
+
+        Bounded by the same default budget as every other temporal path
+        (:meth:`Analysis._resolve_deadline`: ``LACHESIS_HARD_STOP`` or 180s) so the temporal
+        bind cannot hang the request loop; a bind that hits the budget degrades to the
+        structural families (``temporal_evaluated=False``) and is not cached, so a later call
+        with a larger budget completes it. ``LACHESIS_HARD_STOP=0`` runs it unbounded.
         """
-        return self._bind_bundle()
+        return self._bind_bundle(deadline=self._resolve_deadline(None, None))
 
     @property
     def flow_bundle(self):
@@ -249,9 +255,16 @@ class _Ctx(Analysis):
         Delegates to :meth:`Analysis._flow_bundle` with ``engine=None`` so an operator who
         runs this server with ``LACHESIS_LIFETIME_ENGINE=legacy`` is not silently forced into
         object mode -- the env fallback inside ``run_pass`` still wins. The library's
-        ``analyze`` is opinionated (object by default); the server stays neutral.
+        ``analyze`` is opinionated (object by default); the server stays neutral on engine.
+
+        It is *not* neutral on the clock: the pass is bounded by the same default budget the
+        library uses (:meth:`Analysis._resolve_deadline`: ``LACHESIS_HARD_STOP`` or 180s), so a
+        large graph degrades to partial leads instead of hanging the request loop. A timed-out
+        result is never memoized (see ``_flow_bundle``), so a later call with a larger budget
+        recomputes cleanly. ``LACHESIS_HARD_STOP=0`` runs it unbounded.
         """
-        return self._flow_bundle(engine=None)
+        return self._flow_bundle(engine=None,
+                                 deadline=self._resolve_deadline(None, None))
 
     @property
     def scan_bundle(self):

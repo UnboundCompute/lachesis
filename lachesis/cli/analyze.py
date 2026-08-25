@@ -59,12 +59,16 @@ def _run() -> None:
              "LLM-drillable view of the same canonical graph.",
     )
     parser.add_argument(
-        "--prune", action="store_true",
+        "--prune", action=argparse.BooleanOptionalAction, default=True,
         help="drop the pure-lexical `token` and `source-span` nodes (and the edges "
              "that touch them) from the store. Every navigation tool answers "
              "identically without them (source excerpts are read from the file by "
-             "offset), so this is lossless for nav and roughly halves the store — but "
-             "it does drop real T0 graph content, so it is off by default.",
+             "offset), so this is lossless for nav and roughly halves the store — and "
+             "it also spares the frontend the token/proof passes that produced them "
+             "(for C, a whole extra clang parse of every file). ON by default so a "
+             "normal build is lean and fast without any flag; pass --no-prune to keep "
+             "the full T0 lexical content, which only matters when literal value nodes "
+             "must be observable (e.g. maximum guard-rank fidelity).",
     )
     parser.add_argument(
         "--enrich", action="store_true",
