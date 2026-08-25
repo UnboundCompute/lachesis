@@ -611,7 +611,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
     loaded_by_kind = None
     if disk_index:
         warm_kinds = {
-            "parameter", "call", "construct", "release",
+            # Parameters are consumed only through their promoted label below.
+            # Keep their cheap ownership headers instead of inflating the full
+            # property tail for every function during the cold translation path.
+            "call", "construct", "release",
             "dynamic-behavior", "write", "return",
         }
         warm_ids = [node_id for kind in warm_kinds
@@ -626,8 +629,14 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
             if node is not None:
                 loaded_by_kind[node.get("kind")].append(node)
         for header in owned_nodes:
-            if header.get("kind") in {"read", "body", "expression"}:
+            if header.get("kind") in {"parameter", "read", "body", "expression"}:
                 node = _flow_header_node(header)
+                if header.get("kind") == "parameter":
+                    # Parameter records need no syntax inference: their label is
+                    # the only field consumed by the translation walk.
+                    node = {"id": header.get("id"), "kind": "parameter",
+                            "label": header.get("label"),
+                            "properties": header.get("properties") or {}}
                 if node is not None:
                     loaded_by_kind[node["kind"]].append(node)
 
@@ -959,6 +968,9 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
             "parameter", "call", "construct", "release",
             "dynamic-behavior", "write", "return",
         }
+        # ``parameter`` is header-only in Translation.  It remains in the
+        # definition/body census above, but does not need a full Kùzu payload.
+        translation_warm_kinds = flow_kinds - {"parameter"}
 
         # ``object_only`` is retained as an API compatibility switch, but the
         # default projection must keep every body-bearing callable so caller
@@ -985,16 +997,16 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         # function.  The per-function implementation still constructs its
         # owned-kind views from the cache, preserving all selection semantics.
         if hasattr(ix, "_warm_nodes_by_owner"):
-            ix._warm_nodes_by_owner(definition_ids, flow_kinds)
+            ix._warm_nodes_by_owner(definition_ids, translation_warm_kinds)
             # The dynamic/write projection below must consume this cache directly;
             # otherwise its generic owner accessor can issue one warm-up per
             # function after this scan has already completed.
-            ix._translation_prefetched_kinds = frozenset(flow_kinds)
+            ix._translation_prefetched_kinds = frozenset(translation_warm_kinds)
         else:
             flow_ids = {
                 node_id for owner_id in definition_ids
                 for node_id in ix.by_owner.get(owner_id, ())
-                if ix._kind_by_id.get(node_id) in flow_kinds and
+                if ix._kind_by_id.get(node_id) in translation_warm_kinds and
                 _flow_node_needed(ix, node_id)
             }
             ix._warm_nodes(flow_ids)
