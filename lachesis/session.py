@@ -306,6 +306,38 @@ class Analysis:
         """Alias for :meth:`analyze` -- reads naturally as ``a.leads().near(...)``."""
         return self.analyze(**kwargs)
 
+    # -- library surface: pass 2 (enrich -> warm sidecars) --------------------------
+
+    def enrich(self) -> dict:
+        """Materialize the dataflow tier and the catalog bind to disk, so later reads are warm.
+
+        Pass 2 as one call. ``ensure_dataflow_tier`` folds the overlay dataflow tier over the
+        whole graph and persists it beside the store as ``.dataflow.pb``; a full temporal bind
+        then writes the ``.bind.pb`` sidecar. After this a fresh process answering ``analyze`` /
+        ``candidates`` / ``explain`` skips both costs. Idempotent: a store already enriched, and a
+        bind already cached, are no-ops that simply report what is present.
+
+        Returns a small report -- the sidecar paths, whether each is on disk, and whether the
+        temporal families were evaluated -- so a CLI or a caller can say what it warmed.
+        """
+        from lachesis import bind_cache
+        from lachesis.nav.graph_store import dataflow_overlay_path
+
+        self.store.ensure_dataflow_tier()
+        self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
+        bundle = self._bind_bundle(temporal=True)
+        graph_path = getattr(self.store, "graph_path", None)
+        dataflow = dataflow_overlay_path(self.store._core_path) if graph_path else None
+        sidecar = bind_cache.sidecar_path(graph_path) if graph_path else None
+        return {
+            "dataflow_tier": self.store.dataflow_ready,
+            "dataflow_sidecar": dataflow,
+            "dataflow_written": bool(dataflow and os.path.isfile(dataflow)),
+            "bind_sidecar": sidecar,
+            "bind_written": bool(sidecar and os.path.isfile(sidecar)),
+            "temporal_evaluated": bool(bundle.get("temporal_evaluated")),
+        }
+
     # -- library surface: the obligation registry (candidates / census) -------------
 
     def _bound_bind(self, *, temporal: bool, hard_stop: float | None,
