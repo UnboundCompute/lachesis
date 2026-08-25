@@ -119,6 +119,21 @@ struct Candidate {
     arity: Option<i64>,
 }
 
+fn python_sort_key(candidate: &Candidate) -> String {
+    // Atropos's oracle uses ``sorted(distinct, key=str)`` for ambiguity
+    // candidates.  Reproduce Python's tuple spelling rather than Rust's Option
+    // ordering (where None would otherwise sort before every string).
+    fn quoted(value: &Option<String>) -> String {
+        match value {
+            None => "None".into(),
+            Some(value) => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")),
+        }
+    }
+    let arity = candidate.arity.map_or_else(|| "None".into(), |value| value.to_string());
+    format!("({}, {}, {})", quoted(&candidate.module),
+            quoted(&candidate.receiver_type), arity)
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Summary {
     #[serde(rename = "symbol-not-found")]
@@ -215,8 +230,9 @@ fn bind_model(model: &Model, index: &Index) -> ResultRow {
         let mut row = base(); row.status = "ambiguous".into();
         let distinct: BTreeSet<(Option<String>, Option<String>, Option<i64>)> = callsites.iter()
             .map(|c| (c.callee.module.clone(), c.callee.receiver_type.clone(), c.callee.arity)).collect();
-        let candidates = distinct.into_iter().map(|(module, receiver_type, arity)|
+        let mut candidates: Vec<_> = distinct.into_iter().map(|(module, receiver_type, arity)|
             Candidate { module, receiver_type, arity }).collect();
+        candidates.sort_by_key(python_sort_key);
         row.candidates = Some(candidates); return row;
     }
 

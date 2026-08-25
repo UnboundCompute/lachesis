@@ -150,16 +150,10 @@ def atropos_enrich(
             )
             _phase_timing("canonical projection", started)
         index = {**canonical_projection, "language": language}
-        report = None
-        if os.environ.get("LACHESIS_NATIVE_ATROPOS") == "1":
-            from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
-            started = perf_counter()
-            report = native_bind_all(lang_models, index)
-            _phase_timing(f"native bind {language}", started)
-        if report is None:
-            started = perf_counter()
-            report = binder.bind_all(lang_models, index)
-            _phase_timing(f"Python bind {language}", started)
+        from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
+        started = perf_counter()
+        report = native_bind_all(lang_models, index)
+        _phase_timing(f"Rust bind {language}", started)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
         unbound: List[dict] = []

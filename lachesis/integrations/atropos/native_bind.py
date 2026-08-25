@@ -1,8 +1,8 @@
-"""Opt-in bridge to the Rust Atropos binder.
+"""Bridge to the Rust Atropos binder.
 
-The JSON boundary is temporary and intentionally matches ``tools/bind.py``.  It
-lets us run differential checks before making the Rust implementation the only
-production binder; the Python binder remains the oracle during that transition.
+The JSON boundary intentionally matches ``tools/bind.py``.  Atropos's Python
+module remains a model-loader and offline differential oracle; production model
+matching is implemented only by Rust.
 """
 from __future__ import annotations
 
@@ -43,11 +43,15 @@ def available() -> bool:
     return _load() is not None
 
 
-def bind_all(models: list[dict[str, Any]], index: dict[str, Any]) -> dict[str, Any] | None:
-    """Bind models with Rust, returning ``None`` when the library is unavailable."""
+def bind_all(models: list[dict[str, Any]], index: dict[str, Any]) -> dict[str, Any]:
+    """Bind models with Rust; fail clearly if the native kernel is not installed."""
     library = _load()
     if library is None:
-        return None
+        candidates = ", ".join(str(path) for path in _library_candidates())
+        raise RuntimeError(
+            "Rust Atropos binder is unavailable; build native/lifetime_kernel "
+            f"or set LACHESIS_NATIVE_ATROPOS_LIB (checked: {candidates})"
+        )
     payload = json.dumps({"models": models, "index": index}, separators=(",", ":"),
                          ensure_ascii=False).encode("utf-8")
     pointer = library.lachesis_atropos_bind_json(payload)
