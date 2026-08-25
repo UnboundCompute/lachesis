@@ -388,7 +388,16 @@ impl State {
     }
 
     fn semantically_equal(&self, other: &State) -> bool {
-        self.env == other.env
+        // Length checks reject the overwhelmingly common non-equal states
+        // without walking several hash maps. Objects are intentionally not
+        // compared: historical allocation metadata is not part of the
+        // abstract state semantics.
+        self.env.len() == other.env.len()
+            && self.facts.len() == other.facts.len()
+            && self.slots.len() == other.slots.len()
+            && self.trace.len() == other.trace.len()
+            && self.freed_paths.len() == other.freed_paths.len()
+            && self.env == other.env
             && self.facts == other.facts
             && self.slots == other.slots
             && self.trace == other.trace
