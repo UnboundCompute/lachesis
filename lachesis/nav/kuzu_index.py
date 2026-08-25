@@ -449,6 +449,7 @@ class KuzuGraphIndex:
             )
         self._db = kuzu.Database(db_file(db_dir), read_only=True)
         self._conn = kuzu.Connection(self._db)
+        self._db_dir = db_dir
         set_threads = getattr(self._conn, "set_max_threads_for_exec", None)
         if set_threads is not None:
             set_threads(_query_threads())
@@ -457,6 +458,7 @@ class KuzuGraphIndex:
         # this same manifest, so a store whose dictionary this reader could not use has
         # been rejected before here.
         manifest = read_store_manifest(db_dir)
+        self._store_manifest = manifest
         self._props_dict = manifest_props_dictionary(manifest)
         self._id_prefixes = manifest_id_prefixes(manifest)
         # The same table inverted, for the lookup direction: `_node`/`_edges` take a
@@ -1232,6 +1234,9 @@ class KuzuGraphIndex:
     @timeit
     def member_expression_nodes(self) -> tuple[dict, ...]:
         """Columnarly read only expression nodes whose syntax is MemberExpr."""
+        cached = getattr(self, "_pass3_member_expression_cache", None)
+        if cached is not None:
+            return cached
         cached = getattr(self, "_member_expression_cache", None)
         if cached is not None:
             return cached
