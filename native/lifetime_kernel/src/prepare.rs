@@ -25,6 +25,27 @@ fn property(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
     })
 }
 
+fn text_property<'a>(node: &'a lifetime_proto::GraphNode, key: &str) -> Option<&'a str> {
+    node.properties.iter().find_map(|item| {
+        if item.key != key { return None; }
+        match item.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Text(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+fn integer_property(node: &lifetime_proto::GraphNode, key: &str) -> Option<i64> {
+    node.properties.iter().find_map(|item| {
+        if item.key != key { return None; }
+        match item.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Integer(value) => Some(*value),
+            lifetime_proto::scalar_property::Value::Text(value) => value.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
 fn path(node: Option<&str>) -> Option<Path> {
     node.filter(|value| !value.is_empty())
         .map(|value| Path::root(format!("decl:{value}")))
@@ -64,28 +85,28 @@ impl GraphView {
 
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> { self.nodes.get(id) }
 
-    fn kind(&self, id: &str) -> String {
-        self.node(id).map(|node| property(node, "syntax_kind").unwrap_or_else(|| node.kind.clone())).unwrap_or_default()
+    fn kind(&self, id: &str) -> &str {
+        self.node(id).map(|node| text_property(node, "syntax_kind").unwrap_or(node.kind.as_str())).unwrap_or("")
     }
 
     fn label(&self, id: &str) -> &str { self.node(id).map(|node| node.label.as_str()).unwrap_or("") }
 
     fn offset(&self, id: &str) -> i64 {
-        self.node(id).and_then(|node| property(node, "start_offset")).and_then(|value| value.parse().ok()).unwrap_or(i64::MAX)
+        self.node(id).and_then(|node| integer_property(node, "start_offset")).unwrap_or(i64::MAX)
     }
 
-    fn operator(&self, id: &str) -> String {
-        self.node(id).and_then(|node| property(node, "operator")).unwrap_or_default()
+    fn operator(&self, id: &str) -> &str {
+        self.node(id).and_then(|node| text_property(node, "operator")).unwrap_or("")
     }
 
     fn is_pointer(&self, id: &str) -> bool {
-        self.node(id).and_then(|node| property(node, "type"))
+        self.node(id).and_then(|node| text_property(node, "type"))
             .is_some_and(|value| value.contains('*') || value.contains('['))
     }
 
     fn peel(&self, mut id: String) -> String {
         for _ in 0..12 {
-            if matches!(self.kind(&id).as_str(), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
+            if matches!(self.kind(&id), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
                 "CXXConstCastExpr" | "CXXStaticCastExpr" | "CXXReinterpretCastExpr" | "CXXFunctionalCastExpr") {
                 if let Some(child) = self.children.get(&id).and_then(|items| items.first()) {
                     id = child.clone();
@@ -100,7 +121,7 @@ impl GraphView {
     fn access_path(&self, id: &str, depth: usize) -> Option<Path> {
         if depth > 40 { return None; }
         let id = self.peel(id.to_owned());
-        match self.kind(&id).as_str() {
+        match self.kind(&id) {
             "DeclRefExpr" => self.access_path(self.refers.get(&id).map(String::as_str).unwrap_or(&id), depth + 1),
             "ParmVarDecl" | "VarDecl" => path(Some(&id)),
             "MemberExpr" => {
@@ -138,7 +159,7 @@ impl GraphView {
             "UnaryOperator" => {
                 let child = self.children.get(&id)?.first()?;
                 let mut base = self.access_path(child, depth + 1)?;
-                match self.operator(&id).as_str() {
+                match self.operator(&id) {
                     "*" => base.selectors.push("*".to_owned()),
                     "&" => base.selectors.push("&".to_owned()),
                     _ => {}
@@ -151,7 +172,7 @@ impl GraphView {
 
     fn deref_base(&self, id: &str) -> Option<Path> {
         let children = self.children.get(id)?;
-        match self.kind(id).as_str() {
+        match self.kind(id) {
             "UnaryOperator" if self.operator(&id) == "*" => self.access_path(children.first()?, 0),
             "MemberExpr" if self.label(&id).contains("->") => self.access_path(children.first()?, 0),
             "ArraySubscriptExpr" => children.iter().find_map(|child| self.access_path(child, 0)),
@@ -230,7 +251,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let mut exits: Vec<String> = Vec::new();
             for child in items {
                 let (entry, next_exits) = {
-                if is_statement(graph.kind(&child).as_str()) {
+                if is_statement(graph.kind(&child)) {
                     emit(graph, owned, &child, successors, memo, in_progress, depth + 1)
                 } else {
                     let mut stream = Vec::new();
@@ -291,7 +312,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let case_nodes = body.as_ref().map(|body| {
                 graph.children.get(body).cloned().unwrap_or_default()
                     .into_iter().filter(|child| owned.contains(child)
-                        && matches!(graph.kind(child).as_str(), "CaseStmt" | "DefaultStmt"))
+                        && matches!(graph.kind(child), "CaseStmt" | "DefaultStmt"))
                     .collect::<Vec<_>>()
             }).unwrap_or_default();
             let mut case_entries = Vec::new();
@@ -308,7 +329,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let mut exits = body_result.1;
             if !has_default { exits.extend(condition_stream.last().cloned()); }
             (condition_stream.first().cloned().or(body_result.0), exits)
-        } else if matches!(kind.as_str(), "CaseStmt" | "DefaultStmt") {
+        } else if matches!(kind, "CaseStmt" | "DefaultStmt") {
             // Case bodies contain nested statements, not just expressions.
             // Preserve fallthrough only when the case's final child has an
             // exit; a break/return therefore terminates that case chain.
@@ -316,7 +337,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let mut sorted = children;
             sorted.sort_by_key(|child| graph.offset(child));
             for child in sorted {
-                if is_statement(graph.kind(&child).as_str()) {
+                if is_statement(graph.kind(&child)) {
                     let (entry, exits) = emit(graph, owned, &child, successors, memo, in_progress, depth + 1);
                     if let Some(entry) = entry { units.push((entry, exits)); }
                 } else {
@@ -372,7 +393,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             let entry = init_result.0.or(condition_result.0).or(body_result.0);
             (entry, condition_result.1.into_iter().chain(body_result.1).collect())
-        } else if matches!(kind.as_str(), "WhileStmt" | "DoStmt") {
+        } else if matches!(kind, "WhileStmt" | "DoStmt") {
             let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned();
             let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned();
             let mut condition_stream = Vec::new();
@@ -394,7 +415,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             append_chain(successors, &stream);
             if let Some(last) = stream.last() { successors.entry(last.clone()).or_default(); }
             (stream.first().cloned().or_else(|| Some(id.to_owned())), Vec::new())
-        } else if is_statement(kind.as_str()) {
+        } else if is_statement(kind) {
             let mut stream = Vec::new();
             let mut sorted = children;
             sorted.sort_by_key(|child| graph.offset(child));
@@ -426,7 +447,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         // Recover it here so every finite loop has a native CFG exit. Return
         // statements and other terminal fragments are handled by the same
         // empty-successor closure below.
-        let controls = owned.iter().filter(|node| matches!(graph.kind(node).as_str(),
+        let controls = owned.iter().filter(|node| matches!(graph.kind(node),
             "IfStmt" | "ForStmt" | "WhileStmt" | "DoStmt")).cloned().collect::<Vec<_>>();
         for control in controls {
             let condition = graph.roles.get(&(control.clone(), "CONDITION".to_owned()))
@@ -741,7 +762,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                             }
                             else if call.is_source { (Kind::Clobber, None, false) }
                             else { (Kind::Clobber, graph.access_path(&rhs_id, 0), false) }
-                        } else if matches!(graph.kind(&rhs_id).as_str(), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
+                        } else if matches!(graph.kind(&rhs_id), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
                             (Kind::Clobber, None, true)
                         } else if let Some(source) = graph.access_path(&rhs_id, 0) {
                             (Kind::Copy, Some(source), false)
@@ -762,7 +783,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                     else if call.is_realloc { (Kind::Realloc, None, false) }
                     else if call.is_source { (Kind::Clobber, None, false) }
                     else { (Kind::Copy, graph.access_path(&initializer, 0), false) }
-                } else if matches!(graph.kind(&initializer).as_str(), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
+                } else if matches!(graph.kind(&initializer), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
                     (Kind::Clobber, None, true)
                 } else if let Some(source) = graph.access_path(&initializer, 0) {
                     (Kind::Copy, Some(source), false)
@@ -915,7 +936,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     } else if cfg_node_set.is_empty() {
         let operation_nodes = operations.iter().map(|item| item.node.as_str()).collect::<HashSet<_>>();
         let mut values = node_ids.iter().filter(|node| {
-            operation_nodes.contains(node.as_str()) || matches!(graph.kind(node).as_str(),
+            operation_nodes.contains(node.as_str()) || matches!(graph.kind(node),
                 "DeclRefExpr" | "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr" |
                 "BinaryOperator" | "CompoundAssignOperator" | "UnaryOperator" |
                 "ConditionalOperator" | "MemberExpr" | "ArraySubscriptExpr" |
