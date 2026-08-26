@@ -30,6 +30,7 @@ mod prepare;
 mod native_graph;
 mod planner;
 mod pass2;
+mod control_flow;
 
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
@@ -877,6 +878,43 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_path(
     })();
     let mut payload = result.unwrap_or_else(|error| {
         eprintln!("native graph path preparation error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
+/// Native control-flow overlay endpoint.  It consumes the complete Pass-2
+/// input path and returns an additive protobuf delta; the final Pass-2 runner
+/// will chain this delta with the remaining native overlays before publishing
+/// the sidecar.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_pass2_control_flow_path(
+    input_path: *const c_char, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        if input_path.is_null() {
+            return Err("native graph path is null".to_owned());
+        }
+        let path = CStr::from_ptr(input_path)
+            .to_str().map_err(|error| format!("invalid native graph path: {error}"))?;
+        let graph = pass2::read_path(path)?;
+        let delta = control_flow::enrich(&graph);
+        let mut output = Vec::new();
+        graph_proto::DataflowOverlay {
+            overlay_id: "control-flow".to_owned(),
+            source: path.to_owned(),
+            version: 1,
+            core_content_hash: String::new(),
+            derived_nodes: delta.nodes,
+            derived_edges: delta.edges,
+        }.encode(&mut output).map_err(|error| error.to_string())?;
+        Ok::<Vec<u8>, String>(output)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native control-flow error: {error}");
         Vec::new()
     });
     if !output_length.is_null() { *output_length = payload.len(); }
