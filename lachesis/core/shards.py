@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from itertools import chain
 from pathlib import Path
+import shutil
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
 from . import graph_pb2
@@ -251,6 +252,41 @@ class ShardSetWriter:
                 entry.update({
                     "status": "complete", "node_count": writer.node_count,
                     "edge_count": writer.edge_count,
+                })
+                break
+        self._save()
+
+    def complete_payloads(
+        self, shard_id: str, nodes_path: str | Path, edges_path: str | Path,
+        node_count: int, edge_count: int,
+    ) -> None:
+        """Publish already-framed protobuf payload files without decoding records.
+
+        Native frontends can emit the exact shard wire format themselves. Copying
+        those files directly avoids a Python protobuf decode/re-encode pass while
+        preserving the same atomic manifest protocol as ``complete``.
+        """
+        relative = f"shard-{shard_id}"
+        entries = [entry for entry in self.manifest["shards"] if entry["shard_id"] != shard_id]
+        entries.append({"shard_id": shard_id, "directory": relative, "status": "running"})
+        self.manifest["shards"] = entries
+        self._save()
+        target = self.directory / relative
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(nodes_path, target / "nodes.pb")
+        shutil.copyfile(edges_path, target / "edges.pb")
+        shard_manifest = graph_pb2.ShardManifest(
+            format_version=SHARD_FORMAT_VERSION,
+            frontend_id=self.frontend_id, shard_id=str(shard_id),
+            node_count=int(node_count), edge_count=int(edge_count),
+            nodes_file="nodes.pb", edges_file="edges.pb",
+        )
+        (target / "manifest.pb").write_bytes(shard_manifest.SerializeToString())
+        for entry in self.manifest["shards"]:
+            if entry["shard_id"] == shard_id:
+                entry.update({
+                    "status": "complete", "node_count": int(node_count),
+                    "edge_count": int(edge_count),
                 })
                 break
         self._save()
