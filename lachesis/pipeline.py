@@ -350,13 +350,32 @@ def run_project_streaming(
     previous = os.environ.get("LACHESIS_SHARD_ROOT")
     os.environ["LACHESIS_SHARD_ROOT"] = shard_root
     try:
+        frontend_jobs = []
         for frontend_id in sorted(groups):
             frontend = registry.get(frontend_id)
             frontend_output = os.path.join(output_root, frontend_id)
-            snapshot = run_frontend(
-                frontend, source_dir, frontend_output, timeout_seconds,
-                roots=groups[frontend_id],
+            frontend_jobs.append((frontend_id, frontend, frontend_output,
+                                  groups[frontend_id]))
+
+        def run_frontend_job(job):
+            _frontend_id, frontend, frontend_output, roots = job
+            return run_frontend(
+                frontend, source_dir, frontend_output, timeout_seconds, roots=roots,
             )
+
+        # Frontends are isolated subprocesses and publish disjoint shard sets.  Run
+        # them concurrently so the slowest compiler, rather than the sum of all
+        # compiler times, sets the Pass-1 wall clock.  The Kuzu materializer still
+        # starts only after all snapshots are released, preserving its memory cap.
+        if len(frontend_jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(frontend_jobs)) as pool:
+                frontend_snapshots = list(pool.map(run_frontend_job, frontend_jobs))
+        else:
+            frontend_snapshots = [run_frontend_job(frontend_jobs[0])]
+
+        for (frontend_id, _frontend, _frontend_output, _roots), snapshot in zip(
+                frontend_jobs, frontend_snapshots):
             snapshots.append(snapshot)
             readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
             snapshot.release()
