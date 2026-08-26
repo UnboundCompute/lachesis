@@ -80,8 +80,10 @@ A full `.enriched` Kùzu cache remains the fallback for overlays that mutate cor
 
 The streaming scheduler runs independent C/C++, Python, and TypeScript/JavaScript
 frontends concurrently, then releases their snapshots before Kùzu materialization. On
-the full-core libxml2 reference tree this measured 38.03 seconds cold at approximately
-1.0 GiB peak RSS with no swap. This is a timing reference, not a cache-warm result.
+the full-core libxml2 reference tree this measured 33.20 seconds cold at approximately
+1.26 GB peak RSS with no swap. The previous 38.03-second run used the older streamed
+frontend handoff. This is a timing reference, not a cache-warm result; RSS is still
+being investigated and is not claimed as an improvement by this measurement.
 
 ## TypeScript monorepos
 

@@ -94,7 +94,7 @@ form remains available when the intermediate shard directory must be retained.
 Independent frontend subprocesses are run concurrently during the streaming build;
 their shard sets are then projected together by Rust, preserving cross-language edges
 without reconstructing a graph-sized Python object. On the reference full-core libxml2
-build, the current cold baseline is 38.03 seconds and approximately 1.0 GiB peak RSS
+build, the current cold measurement is 33.20 seconds and approximately 1.26 GB peak RSS
 (C/C++, Python, and TypeScript/JavaScript; no swap). The Rust publisher writes
 `<store>.pass2.input.pb`, `<store>.pass2.facts.pb`, and `<store>.pass3.substrate.pb`.
 When the native binary inputs are present, `enrich` hands their paths directly to
