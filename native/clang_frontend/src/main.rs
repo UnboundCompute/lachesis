@@ -1209,15 +1209,17 @@ fn property_text(properties: &[graph::Field], key: &str) -> Option<String> {
     })
 }
 
-fn add_contract_defaults(properties: &mut Vec<graph::Field>, frontend_id: &str) {
+fn add_contract_defaults(
+    properties: &mut Vec<graph::Field>, frontend_id: &str, source_node: bool,
+) {
     if !has_property(properties, "fact_origin") {
         properties.push(field("fact_origin", text("compiler")));
     }
     if !has_property(properties, "confidence") {
         properties.push(field("confidence", text("exact")));
     }
-    if !has_property(properties, "evidence_ids") {
-        properties.push(field("evidence_ids", text_list(Vec::new())));
+    if !source_node {
+        return;
     }
     if !has_property(properties, "frontend_id") {
         properties.push(field("frontend_id", text(frontend_id)));
@@ -1324,7 +1326,7 @@ fn write_frontend_bundle(
         };
         let tier = contract_tier(&record.kind, &initial_tier).to_owned();
         record.tier = tier.clone();
-        add_contract_defaults(&mut record.properties, frontend_id);
+        add_contract_defaults(&mut record.properties, frontend_id, true);
         node_tiers.insert(id_key(&record.id), tier.clone());
         *node_counts.entry(tier.clone()).or_default() += 1;
         let encoded = record.encode_to_vec();
@@ -1359,7 +1361,7 @@ fn write_frontend_bundle(
         };
         record.source_tier = source_tier.clone();
         record.relationship_class = collection.to_owned();
-        add_contract_defaults(&mut record.properties, frontend_id);
+        add_contract_defaults(&mut record.properties, frontend_id, false);
         let encoded = record.encode_to_vec();
         let sink = tier_files
             .get_mut(source_tier.as_str())
