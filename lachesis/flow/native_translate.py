@@ -1,9 +1,9 @@
-"""Native whole-graph translation adapter.
+"""Binary boundary for the native Pass-2/Pass-3 engine.
 
-The Rust preparer already owns the sidecar walk and emits calls, CFGs, and lifetime
-operations.  This module only projects that binary result into the legacy F-shaped
-boundary used by the remaining semantic matcher.  It is deliberately opt-in while
-its recall is compared with :func:`translate.build_F`.
+Rust owns preparation, planning, summaries, temporal analysis, and semantic graph
+construction. Python may decode a compact protobuf result for the public SDK, but it
+must not silently substitute the removed graph implementation when native processing
+is unavailable or incomplete.
 """
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def _native_prepared(index):
     base = (getattr(index, "_pass3_cache_base", None)
             or getattr(index, "_db_dir", None))
     if not base:
-        return None
+        raise RuntimeError("native Pass-2 requires a store-backed binary substrate")
     facts_path = translation_facts_path(base)
     if facts_path.is_file():
         cached = getattr(index, "_native_translation", None)
@@ -84,7 +84,7 @@ def _native_prepared(index):
     if not sidecar.is_file():
         sidecar = substrate_cache_path(base)
     if not sidecar.is_file():
-        return None
+        raise RuntimeError("native Pass-2 translation facts sidecar is missing")
     cached = getattr(index, "_native_translation", None)
     if cached is not None:
         return cached
@@ -186,8 +186,6 @@ def build_native_F(store, lang="c", *, return_graph=False):
     base = (getattr(index, "_pass3_cache_base", None)
             or getattr(index, "_db_dir", None))
     prepared = _native_prepared(index)
-    if prepared is None:
-        return None
     # Rust emits resolved root labels and declaration metadata in the compact
     # translation result.  Keep the million-node Python substrate out of the
     # normal path; only old/incomplete sidecars use it as a compatibility
@@ -379,27 +377,17 @@ def build_native_F(store, lang="c", *, return_graph=False):
     # roots.  Keep source discovery and coverage planning in the same Rust
     # process as translation; Python only adapts the typed result for legacy
     # consumers below.
-    try:
-        # The native planner is now the default: full libxml2 parity covers
-        # duplicate symbols, source sites, reachability, and influence roots.
-        # Set this escape hatch only when diagnosing an older native library.
-        if os.environ.get("LACHESIS_NATIVE_PLAN") == "0":
-            raise RuntimeError("native planner explicitly disabled")
-        facts_path = translation_facts_path(base)
-        from lachesis.integrations.atropos.enrich import locate_atropos
-        atropos_root = locate_atropos()
-        catalog_path = (_compiled_catalog(atropos_root, base)
-                        if facts_path.is_file() and atropos_root is not None else None)
-        discovery, coverage = _native_plan(
-            functions, prepared, atropos.source_catalog(lang),
-            facts_path=facts_path if facts_path.is_file() else None,
-            catalog_path=catalog_path)
-    except RuntimeError:
-        # Older development builds may not expose the planner symbol yet.  The
-        # native translation result remains usable while the compatibility path
-        # keeps existing callers functional.
-        discovery = discover_sources(functions, succ, atropos.source_catalog(lang))
-        coverage = CoverageScheduler(functions, succ).plan()
+    facts_path = translation_facts_path(base)
+    if not facts_path.is_file():
+        raise RuntimeError("native Pass-2 translation facts sidecar is missing")
+    from lachesis.integrations.atropos.enrich import locate_atropos
+    atropos_root = locate_atropos()
+    if atropos_root is None:
+        raise RuntimeError("native Pass-2 requires the Atropos catalog")
+    catalog_path = _compiled_catalog(atropos_root, base)
+    discovery, coverage = _native_plan(
+        functions, prepared, atropos.source_catalog(lang),
+        facts_path=facts_path, catalog_path=catalog_path)
     coverage_by_target = {region.target: region for region in coverage.regions}
     for name, record in functions.items():
         record["source_sites"] = [{"node": site.node, "callee": site.callee,
@@ -503,10 +491,10 @@ def build_native_semantic_graph(store, lang="c"):
     base = (getattr(store.index, "_pass3_cache_base", None)
             or getattr(store.index, "_db_dir", None))
     if not base:
-        return None
+        raise RuntimeError("native Pass-3 requires a store-backed binary substrate")
     input_path = pass2_input_cache_path(base)
     if not input_path.is_file():
-        return None
+        raise RuntimeError("native Pass-3 substrate sidecar is missing")
     output_path = native_semantic_sidecar_path(store)
     result = semantic_path(input_path, output_path) if not output_path.is_file() else None
     if result is None:
@@ -519,10 +507,9 @@ def build_native_semantic_graph(store, lang="c"):
 def native_semantic_capable(store, languages=None) -> bool:
     """Whether this store has the complete binary inputs for native Pass 2.
 
-    This is a capability check, not a feature switch.  Fresh native Pass-1
-    stores carry translation facts and the path-only substrate; older stores
-    fall back to the compatibility Python pipeline.  Keeping the check here
-    makes the production decision identical for the CLI and SDK callers.
+    This is a capability check for the one supported engine path. A store
+    without these artifacts is invalid for Pass 2/3 and must be rebuilt; it
+    is not routed to a compatibility Python implementation.
     """
     index = getattr(store, "index", None)
     base = (getattr(index, "_pass3_cache_base", None)
@@ -538,10 +525,10 @@ def ensure_native_semantic_sidecar(store):
     base = (getattr(store.index, "_pass3_cache_base", None)
             or getattr(store.index, "_db_dir", None))
     if not base:
-        return None
+        raise RuntimeError("native Pass-3 requires a store-backed binary substrate")
     input_path = pass2_input_cache_path(base)
     if not input_path.is_file():
-        return None
+        raise RuntimeError("native Pass-3 substrate sidecar is missing")
     output_path = native_semantic_sidecar_path(store)
     if not output_path.is_file():
         semantic_path(input_path, output_path)
@@ -560,7 +547,9 @@ def ensure_native_semantic_sidecar(store):
                 temporary.unlink()
             except OSError:
                 pass
-    return output_path if output_path.is_file() else None
+    if not output_path.is_file():
+        raise RuntimeError("native Pass-3 semantic sidecar was not published")
+    return output_path
 
 
 def load_native_semantic_graph_sidecar(path, lang="c"):

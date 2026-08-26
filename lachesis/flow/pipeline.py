@@ -219,9 +219,10 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     _emit("dataflow tier")
     requested = lifetime_engine or os.environ.get(
         "LACHESIS_LIFETIME_ENGINE", _DEFAULT_LIFETIME_ENGINE)
-    if requested not in {"legacy", "shadow", "object"}:
+    if requested not in {"object"}:
         raise ValueError(
-            "LACHESIS_LIFETIME_ENGINE must be one of legacy, shadow, or object")
+            "the Python legacy and shadow engines were removed; "
+            "Pass 3 requires the native Rust engine")
     # The tier is the single most expensive step and it runs before any other checkpoint,
     # so a budget already spent here stops the pass now instead of paying for the whole
     # projection + summaries + object analysis that follow.
@@ -231,56 +232,53 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     # appropriate catalog/normalizer and contribute their own graph facts; the
     # scheduler, Claus graph, and matcher must not make C the dispatch gate.
     object_requested = requested != "legacy"
-    # In the native semantic lane Rust already consumes the Pass-1 substrate,
-    # prepares/solves the object flow, and emits the compact semantic graph.
-    # Do not rebuild an unused Python F/coverage/summary graph before consuming
-    # that result.  This is deliberately gated: the compact graph is not yet
-    # recall-equivalent to the compatibility renderer for every lead family.
-    if object_requested and os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+    # Rust consumes the complete binary Pass-1 substrate, prepares/solves the
+    # object flow, and emits the compact semantic graph. There is intentionally
+    # no Python implementation or environment-gated fallback for this stage.
+    if object_requested:
         from .native_translate import build_native_semantic_graph
         native_graph = build_native_semantic_graph(store, lang=lang)
-        if native_graph is not None:
-            _emit("translation")
-            _emit("projection")
-            _emit("summaries")
-            semantic_build_started = perf_counter()
-            semantic_build_done = perf_counter()
-            _emit("semantic graph")
-            semantic_match_started = perf_counter()
-            native_leads = match_graph(native_graph)
-            semantic_match_done = perf_counter()
-            _emit("matching")
-            finished = perf_counter()
-            return {
-                "F": None, "succ": {}, "summaries": {}, "skeletons": [],
-                "semantic_graph": native_graph,
+        _emit("translation")
+        _emit("projection")
+        _emit("summaries")
+        semantic_build_started = perf_counter()
+        semantic_build_done = perf_counter()
+        _emit("semantic graph")
+        semantic_match_started = perf_counter()
+        native_leads = match_graph(native_graph)
+        semantic_match_done = perf_counter()
+        _emit("matching")
+        finished = perf_counter()
+        return {
+            "F": None, "succ": {}, "summaries": {}, "skeletons": [],
+            "semantic_graph": native_graph,
+            "coverage": native_graph.coverage,
+            "leads": native_leads,
+            "lifetime": {
+                "requested": requested, "active": "object",
+                "available": True, "timed_out": False,
+                "diagnostics": {"backend": "rust-semantic",
+                                 "analyzed": len(native_graph.nodes)},
+                "candidate_functions": len(native_graph.fragments),
+                "semantic_graph_nodes": len(native_graph.nodes),
+                "semantic_graph_edges": sum(
+                    len(edges) for edges in native_graph.edges.values()),
+                "semantic_leads": len(native_leads),
                 "coverage": native_graph.coverage,
-                "leads": native_leads,
-                "lifetime": {
-                    "requested": requested, "active": "object",
-                    "available": True, "timed_out": False,
-                    "diagnostics": {"backend": "rust-semantic",
-                                     "analyzed": len(native_graph.nodes)},
-                    "candidate_functions": len(native_graph.fragments),
-                    "semantic_graph_nodes": len(native_graph.nodes),
-                    "semantic_graph_edges": sum(
-                        len(edges) for edges in native_graph.edges.values()),
-                    "semantic_leads": len(native_leads),
-                    "coverage": native_graph.coverage,
-                },
-                "timings": {
-                    "dataflow_tier_seconds": round(tier_done - started, 6),
-                    "projection_seconds": 0.0,
-                    "legacy_summary_seconds": 0.0,
-                    "skeleton_seconds": 0.0,
-                    "matching_seconds": round(finished - tier_done, 6),
-                    "total_seconds": round(finished - started, 6),
-                    "semantic_build_seconds": round(
-                        semantic_build_done - semantic_build_started, 6),
-                    "semantic_match_seconds": round(
-                        semantic_match_done - semantic_match_started, 6),
-                },
-            }
+            },
+            "timings": {
+                "dataflow_tier_seconds": round(tier_done - started, 6),
+                "projection_seconds": 0.0,
+                "legacy_summary_seconds": 0.0,
+                "skeleton_seconds": 0.0,
+                "matching_seconds": round(finished - tier_done, 6),
+                "total_seconds": round(finished - started, 6),
+                "semantic_build_seconds": round(
+                    semantic_build_done - semantic_build_started, 6),
+                "semantic_match_seconds": round(
+                    semantic_match_done - semantic_match_started, 6),
+            },
+        }
     native_translation = os.environ.get("LACHESIS_NATIVE_TRANSLATION") == "1"
     if object_requested and not native_translation:
         # Pass 1 now emits a compact binary translation-facts sidecar.  Its
@@ -293,11 +291,8 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         native_translation = bool(base and translation_facts_path(base).is_file())
     if object_requested and native_translation:
         from .native_translate import build_native_F
-        native_translation = build_native_F(store, lang=lang, return_graph=True)
-        if native_translation is None:
-            F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
-        else:
-            F, succ, analysis_graph = native_translation
+        F, succ, analysis_graph = build_native_F(
+            store, lang=lang, return_graph=True)
     elif object_requested:
         F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
     else:

@@ -395,93 +395,23 @@ class Analysis:
         skeleton. This is the expensive, graph-version-invariant work the ``.bind.pb`` sidecar
         persists; a sidecar hit skips this method entirely (enrich *and* flow pass).
         """
-        from lachesis.flow.pipeline import run_pass
-        from lachesis.planner.temporal_obligation import merge_semantic_nodes
-
         stamped, summary = self._structural_bind()
-        # Fresh native Pass-1 stores already have the complete binary substrate
-        # required by Rust's path-only semantic stage.  Use it by capability,
-        # without an environment flag, and retain the old path for stores built
-        # before the native sidecars existed.
+        # Fresh Pass-1 stores have the complete binary substrate required by
+        # Rust's path-only semantic stage. There is no Python compatibility
+        # path: stores without these artifacts must be rebuilt.
         from lachesis.flow.native_translate import native_semantic_capable
         native_semantic = native_semantic_capable(
             self.store, languages=summary.get("languages"))
-        native_sidecar = None
-        if native_semantic or os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
-            from lachesis.flow.native_translate import ensure_native_semantic_sidecar
-            native_sidecar = ensure_native_semantic_sidecar(self.store)
-            if native_sidecar is not None:
-                # For a C-only store the semantic graph is already a Rust-owned
-                # binary artifact. Do not route it through run_pass just to
-                # reconstruct Python nodes that the bind command never queries.
-                # Mixed stores continue below for their non-C languages.
-                stamped["semantic_graph"] = {
-                    "native_sidecar": str(native_sidecar),
-                    "coverage": {"converged": True},
-                }
-                if set(summary.get("languages") or {"c"}) <= {"c"}:
-                    return stamped, summary, True
-                return stamped, summary, True
-        # Temporal families observe semantic operations (release, origin, dereference) that are
-        # not catalog role nodes in the base CPG. Reuse the same cached Pass 3 graph the flow
-        # bundle exposes rather than a second traversal or a language-specific lifecycle
-        # extractor taught to the registry.
-        semantic_nodes: dict = {}
-        semantic_coverages: list = []
-        complete = True
-        native_semantic_graph = None
-        # The native semantic sidecar is language-neutral: Rust scans the
-        # complete Pass-1 substrate once and emits all function fragments in
-        # one result.  The catalog language list is a list of model families,
-        # not a request to rerun that whole-graph flow once per language.  Keep
-        # the per-language loop for the compatibility renderer only.
-        languages = summary.get("languages") or ("c",)
-        for language in languages:
-            if language == "c" and native_sidecar is not None:
-                continue
-            flow_started = perf_counter()
-            flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline,
-                                      workers=workers,
-                                      progress=self._pass2_progress)
-                    if language == "c" else
-                    run_pass(self.store, lang=language, lifetime_engine="object",
-                             deadline=deadline, workers=workers,
-                             progress=self._pass2_progress))
-            self._pass2_timing(f"catalog temporal flow {language}", flow_started)
-            if (flow.get("lifetime") or {}).get("timed_out"):
-                complete = False
-            semantic = flow.get("semantic_graph")
-            if semantic is not None:
-                merge_semantic_nodes(semantic_nodes, semantic, language)
-                semantic_coverages.append(dict(semantic.coverage or {}))
-        if native_sidecar is not None:
-            from lachesis.flow.native_translate import native_semantic_sidecar_path
-            sidecar = native_semantic_sidecar_path(self.store)
-            stamped["semantic_graph"] = {
-                "native_sidecar": str(sidecar) if sidecar else "",
-                "nodes": semantic_nodes,
-            }
-            if semantic_coverages:
-                stamped["semantic_graph"]["coverage"] = {
-                    "converged": all(item.get("converged", True)
-                                     for item in semantic_coverages),
-                    "uncovered_states": [state for item in semantic_coverages
-                                         for state in item.get("uncovered_states", ())],
-                    "uncovered_contexts": [context for item in semantic_coverages
-                                           for context in item.get("uncovered_contexts", ())],
-                }
-        elif semantic_nodes:
-            stamped["semantic_graph"] = {"nodes": semantic_nodes}
-            if semantic_coverages:
-                stamped["semantic_graph"]["coverage"] = {
-                    "converged": all(item.get("converged", True)
-                                     for item in semantic_coverages),
-                    "uncovered_states": [state for item in semantic_coverages
-                                         for state in item.get("uncovered_states", ())],
-                    "uncovered_contexts": [context for item in semantic_coverages
-                                           for context in item.get("uncovered_contexts", ())],
-                }
-        return stamped, summary, complete
+        if not native_semantic:
+            raise RuntimeError(
+                "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
+        from lachesis.flow.native_translate import ensure_native_semantic_sidecar
+        native_sidecar = ensure_native_semantic_sidecar(self.store)
+        stamped["semantic_graph"] = {
+            "native_sidecar": str(native_sidecar),
+            "coverage": {"converged": True},
+        }
+        return stamped, summary, True
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 
