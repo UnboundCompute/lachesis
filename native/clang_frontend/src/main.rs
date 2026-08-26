@@ -1486,6 +1486,88 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn is_header(path: &Path) -> bool {
+    matches!(path.extension().and_then(|extension| extension.to_str()),
+             Some("h" | "hpp"))
+}
+
+fn is_translation_unit(path: &Path) -> bool {
+    matches!(path.extension().and_then(|extension| extension.to_str()),
+             Some("c" | "cc" | "cpp" | "cxx"))
+}
+
+fn include_name(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    let rest = rest.strip_prefix("include")?.trim_start();
+    let (open, close) = match rest.as_bytes().first()? {
+        b'"' => ('"', '"'),
+        b'<' => ('<', '>'),
+        _ => return None,
+    };
+    let body = rest.strip_prefix(open)?;
+    let end = body.find(close)?;
+    Some(&body[..end])
+}
+
+fn canonical_existing(path: PathBuf) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.is_file().then_some(canonical)
+}
+
+fn standalone_roots(files: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut by_relative: FxHashMap<String, PathBuf> = FxHashMap::default();
+    let mut by_name: FxHashMap<String, Vec<PathBuf>> = FxHashMap::default();
+    let source_dir = files
+        .iter()
+        .filter_map(|path| path.parent())
+        .min()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    for path in files {
+        if !is_header(path) {
+            continue;
+        }
+        if let Ok(relative) = path.strip_prefix(&source_dir) {
+            by_relative.insert(relative.to_string_lossy().replace('\\', "/"), path.clone());
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            by_name.entry(name.to_owned()).or_default().push(path.clone());
+        }
+    }
+
+    let mut included = FxHashSet::default();
+    let mut pending: Vec<PathBuf> = files.iter().filter(|path| is_translation_unit(path)).cloned().collect();
+    let mut visited = FxHashSet::default();
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        for line in text.lines() {
+            let Some(name) = include_name(line) else { continue };
+            let relative = name.replace('\\', "/");
+            let candidate = path.parent()
+                .and_then(|parent| canonical_existing(parent.join(name)))
+                .or_else(|| by_relative.get(&relative).cloned())
+                .or_else(|| by_name.get(name).and_then(|paths| {
+                    (paths.len() == 1).then(|| paths[0].clone())
+                }));
+            let Some(candidate) = candidate else { continue };
+            if included.insert(candidate.clone()) {
+                pending.push(candidate);
+            }
+        }
+    }
+
+    let mut roots: Vec<PathBuf> = files.iter()
+        .filter(|path| is_translation_unit(path) || (is_header(path) && !included.contains(*path)))
+        .cloned()
+        .collect();
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 fn automatic_include_arguments(files: &[PathBuf]) -> Vec<String> {
     let mut directories = FxHashSet::default();
     for path in files {
@@ -1628,6 +1710,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
             let (_source_dir, files) = selected_files(&input)?;
+            let parse_files = standalone_roots(&files)?;
             let mut clang_arguments = Vec::new();
             if let Some(separator) = arguments.iter().position(|argument| argument == "--") {
                 clang_arguments.extend(arguments[separator + 1..].iter().cloned());
@@ -1638,7 +1721,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Python to inspect or translate any source/configuration data.
                 clang_arguments = automatic_include_arguments(&files);
             }
-            for source in files {
+            for source in parse_files {
                 let unit = graph::NativeTranslationUnit {
                     path: source.to_string_lossy().into_owned(),
                     arguments: clang_arguments.clone(),
