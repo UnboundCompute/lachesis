@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -1057,6 +1057,264 @@ fn write_manifests(output: &Path, frontend_id: &str, node_count: u64, edge_count
     fs::write(output.parent().unwrap_or(output).join("shards.pb"), set.encode_to_vec())
 }
 
+fn write_varint(file: &mut File, mut value: usize) -> io::Result<()> {
+    while value > 0x7f {
+        file.write_all(&[((value as u8) & 0x7f) | 0x80])?;
+        value >>= 7;
+    }
+    file.write_all(&[value as u8])
+}
+
+fn write_delimited(file: &mut File, field_number: u32, payload: &[u8]) -> io::Result<()> {
+    write_varint(file, ((field_number << 3) | 2) as usize)?;
+    write_varint(file, payload.len())?;
+    file.write_all(payload)
+}
+
+fn read_frame(file: &mut File) -> io::Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 4];
+    match file.read_exact(&mut header) {
+        Ok(()) => {
+            let length = u32::from_be_bytes(header) as usize;
+            let mut payload = vec![0u8; length];
+            file.read_exact(&mut payload)?;
+            Ok(Some(payload))
+        }
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn has_property(properties: &[graph::Field], key: &str) -> bool {
+    properties.iter().any(|property| property.key == key)
+}
+
+fn property_text(properties: &[graph::Field], key: &str) -> Option<String> {
+    properties.iter().find_map(|property| {
+        if property.key != key {
+            return None;
+        }
+        match property.value.as_ref()?.kind.as_ref()? {
+            graph::value::Kind::Text(value) => Some(value.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn add_contract_defaults(properties: &mut Vec<graph::Field>, frontend_id: &str) {
+    if !has_property(properties, "fact_origin") {
+        properties.push(field("fact_origin", text("compiler")));
+    }
+    if !has_property(properties, "confidence") {
+        properties.push(field("confidence", text("exact")));
+    }
+    if !has_property(properties, "evidence_ids") {
+        properties.push(field("evidence_ids", text_list(Vec::new())));
+    }
+    if !has_property(properties, "frontend_id") {
+        properties.push(field("frontend_id", text(frontend_id)));
+    }
+    if !has_property(properties, "compiler_node_id") {
+        properties.push(field("compiler_node_id", text(frontend_id)));
+    }
+    if !has_property(properties, "language") {
+        properties.push(field("language", text("c")));
+    }
+    if !has_property(properties, "absolute_file") {
+        let file = property_text(properties, "file").unwrap_or_default();
+        properties.push(field("absolute_file", text(&file)));
+    }
+    if !has_property(properties, "content_hash") {
+        properties.push(field("content_hash", text("")));
+    }
+    for key in [
+        "start_offset", "end_offset", "start_line", "start_column",
+        "end_line", "end_column",
+    ] {
+        if !has_property(properties, key) {
+            properties.push(field(key, integer(0)));
+        }
+    }
+}
+
+fn object(fields: Vec<graph::Field>) -> graph::Value {
+    graph::Value {
+        kind: Some(graph::value::Kind::Object(graph::ObjectValue { fields })),
+    }
+}
+
+fn list(values: Vec<graph::Value>) -> graph::Value {
+    graph::Value {
+        kind: Some(graph::value::Kind::List(graph::ListValue { values })),
+    }
+}
+
+fn tier_name(tier: &str) -> &'static str {
+    match tier {
+        "T0" => "perimeter",
+        "T1" => "reachability",
+        "T2" => "path",
+        "T3" => "body",
+        "T4" => "proof",
+        _ => "unknown",
+    }
+}
+
+fn contract_tier<'a>(kind: &str, fallback: &'a str) -> &'a str {
+    match kind {
+        "file" | "directory" | "package" | "module" => "T0",
+        "declaration" | "definition" | "function" | "method" | "constructor"
+        | "class" | "interface" | "type" | "enum" | "record" | "macro" => "T1",
+        "parameter" | "variable" | "binding" | "property" | "constant"
+        | "value" | "expression-value" | "argument" | "call-value"
+        | "return" | "return-value" => "T2",
+        "statement" | "expression" | "call" | "operator" | "literal"
+        | "allocation" | "read" | "write" | "release" => "T3",
+        _ => fallback,
+    }
+}
+
+fn is_structural_edge(kind: &str) -> bool {
+    matches!(
+        kind,
+        "DECLARES"
+            | "DECLARES_MEMBER"
+            | "DECLARES_VALUE"
+            | "CONTAINS_BODY"
+            | "AST_CHILD"
+            | "EVIDENCED_BY"
+            | "HAS_ARGUMENT"
+    )
+}
+
+fn write_frontend_bundle(
+    output: &Path,
+    shard: &Path,
+    frontend_id: &str,
+    node_count: u64,
+    _edge_count: u64,
+) -> io::Result<(u64, u64)> {
+    let mut tier_files: FxHashMap<&'static str, File> = FxHashMap::default();
+    for tier in ["T0", "T1", "T2", "T3", "T4"] {
+        let name = tier_name(tier);
+        let path = output.join(format!("{}_{}.pb", tier.to_lowercase(), name));
+        let mut file = File::create(path)?;
+        write_delimited(&mut file, 1, tier.as_bytes())?;
+        write_delimited(&mut file, 2, name.as_bytes())?;
+        tier_files.insert(tier, file);
+    }
+
+    let mut node_tiers: FxHashMap<IdKey, String> = FxHashMap::default();
+    let mut node_counts: FxHashMap<String, u64> = FxHashMap::default();
+    let mut node_stream = File::open(shard.join("nodes.pb"))?;
+    while let Some(payload) = read_frame(&mut node_stream)? {
+        let mut record = graph::NodeRecord::decode(payload.as_slice())?;
+        let initial_tier = if record.tier.is_empty() {
+            "T0".to_owned()
+        } else {
+            record.tier.clone()
+        };
+        let tier = contract_tier(&record.kind, &initial_tier).to_owned();
+        record.tier = tier.clone();
+        add_contract_defaults(&mut record.properties, frontend_id);
+        node_tiers.insert(id_key(&record.id), tier.clone());
+        *node_counts.entry(tier.clone()).or_default() += 1;
+        let encoded = record.encode_to_vec();
+        let sink = tier_files
+            .get_mut(tier.as_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid node tier"))?;
+        write_delimited(sink, 3, &encoded)?;
+    }
+
+    let mut edge_counts: FxHashMap<String, (u64, u64, u64)> = FxHashMap::default();
+    let mut emitted_edges = 0u64;
+    let mut edge_stream = File::open(shard.join("edges.pb"))?;
+    while let Some(payload) = read_frame(&mut edge_stream)? {
+        let mut record = graph::EdgeRecord::decode(payload.as_slice())?;
+        let source_tier = node_tiers.get(&id_key(&record.source)).cloned();
+        let target_tier = node_tiers.get(&id_key(&record.target)).cloned();
+        if source_tier.is_none() || target_tier.is_none() {
+            continue;
+        }
+        let source_tier = source_tier.unwrap();
+        let target_tier = target_tier.unwrap();
+        let collection = if source_tier == target_tier {
+            "edges"
+        } else if is_structural_edge(&record.kind) {
+            let original_kind = record.kind.clone();
+            record.kind = "EXPANDS_TO".to_owned();
+            record.properties.push(field("via", text(&original_kind)));
+            "expands_to"
+        } else {
+            record.properties.push(field("target_tier", text(&target_tier)));
+            "links"
+        };
+        record.source_tier = source_tier.clone();
+        record.relationship_class = collection.to_owned();
+        add_contract_defaults(&mut record.properties, frontend_id);
+        let encoded = record.encode_to_vec();
+        let sink = tier_files
+            .get_mut(source_tier.as_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid edge tier"))?;
+        let field_number = match collection {
+            "edges" => 4,
+            "expands_to" => 5,
+            "links" => 6,
+            _ => unreachable!(),
+        };
+        write_delimited(sink, field_number, &encoded)?;
+        emitted_edges += 1;
+        let counters = edge_counts.entry(source_tier).or_default();
+        match collection {
+            "edges" => counters.0 += 1,
+            "expands_to" => counters.1 += 1,
+            "links" => counters.2 += 1,
+            _ => unreachable!(),
+        }
+    }
+    drop(tier_files);
+
+    let mut tier_values = Vec::new();
+    for tier in ["T0", "T1", "T2", "T3", "T4"] {
+        let (edges, expands, links) = edge_counts.get(tier).copied().unwrap_or_default();
+        tier_values.push(object(vec![
+            field("tier", text(tier)),
+            field("name", text(tier_name(tier))),
+            field("node_count", integer(*node_counts.get(tier).unwrap_or(&0) as i64)),
+            field("edge_count", integer(edges as i64)),
+            field("expands_to_count", integer(expands as i64)),
+            field("cross_tier_link_count", integer(links as i64)),
+            field("file", text(&format!("{}_{}.pb", tier.to_lowercase(), tier_name(tier)))),
+        ]));
+    }
+    let manifest = graph::Document {
+        format_version: 1,
+        fields: Some(graph::ObjectValue {
+            fields: vec![
+                field("version", integer(2)),
+                field("frontend_contract_version", integer(2)),
+                field("frontend_id", text(frontend_id)),
+                field("generator", text(frontend_id)),
+                field("languages", text_list(vec!["c".to_owned()])),
+                field("lexical_tokens", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
+                field("capabilities", object(vec![
+                    field("lexical", text("none")),
+                    field("syntax", text("partial")),
+                    field("symbols", text("partial")),
+                    field("types", text("partial")),
+                    field("calls", text("partial")),
+                    field("direct_data_flow", text("partial")),
+                ])),
+                field("node_count", integer(node_count as i64)),
+                field("edge_count", integer(emitted_edges as i64)),
+                field("tiers", list(tier_values)),
+            ],
+        }),
+    };
+    fs::write(output.join("manifest.pb"), manifest.encode_to_vec())?;
+    Ok((node_count, emitted_edges))
+}
+
 fn parse_unit(
     index: CXIndex,
     unit: &graph::NativeTranslationUnit,
@@ -1260,6 +1518,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let edge_count = emitter.edge_count;
         clang_disposeIndex(index);
         write_manifests(&shard, "clang-c-native", node_count, edge_count)?;
+        write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count)?;
         println!("native clang emitted {node_count} nodes and {edge_count} edges to {}", output.display());
     }
     Ok(())
