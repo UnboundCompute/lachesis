@@ -542,6 +542,31 @@ def token_source_length(token_text: str) -> int:
         return len(token_text)
 
 
+def has_macro_definition(text: str) -> bool:
+    """Whether a source file contains a local ``#define`` directive.
+
+    The macro pass asks Clang to preprocess each root, but ``parse_macro_definitions``
+    keeps only definitions whose origin is that root.  A root without a local
+    directive therefore cannot emit a macro record; definitions from included files
+    are recovered when those files are visited as roots.  This deliberately accepts
+    both ``#define`` and ``# define`` spellings and only uses a conservative
+    line-start check, so a false positive costs one subprocess while a false negative
+    is impossible for a normal preprocessor directive.
+    """
+    for line in text.splitlines():
+        directive = line.lstrip()
+        if not directive.startswith("#"):
+            continue
+        directive = directive[1:].lstrip()
+        if directive.startswith("define") and (
+            len(directive) == len("define")
+            or not (directive[len("define")].isalnum()
+                    or directive[len("define")] == "_")
+        ):
+            return True
+    return False
+
+
 def parse_clang_token(line: str) -> Optional[Tuple[str, str, Path, int, int]]:
     """Decode one compiler token-dump record without interpreting C source."""
     location_marker = "Loc=<"
@@ -1821,9 +1846,17 @@ def main() -> int:
     # Preprocessor macro recovery. The JSON AST is post-preprocessor, so macros
     # are reconstructed from a dedicated -E -dD pass (macros.py) and made
     # addressable. Preprocessing is lexical, so this succeeds even for a file
-    # whose C body failed to parse — its #defines are still real.
+    # whose C body failed to parse — its #defines are still real. A root with no
+    # local #define cannot contribute a macro record: the parser filters included
+    # definitions by origin, and each included project header is itself a root when
+    # it has definitions. Avoid paying for a compiler invocation that can emit
+    # nothing while retaining a conservative source-level check.
+    macro_roots = [
+        path for path in files if path in file_ids
+        and has_macro_definition(source_text(path, texts))
+    ]
     for path, result in run_clang_over(
-        [path for path in files if path in file_ids], source_dir, "-E", "-dD",
+        macro_roots, source_dir, "-E", "-dD",
         file_flags_of=compile_commands,
         label="macros",
     ):
