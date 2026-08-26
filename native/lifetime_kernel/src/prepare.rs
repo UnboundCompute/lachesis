@@ -111,6 +111,13 @@ impl<'a> GraphView<'a> {
                 _ => {}
             }
         }
+        for children in &mut children_by_node {
+            children.sort_by_key(|child| {
+                node_index.get(child).and_then(|index| nodes_input.get(*index))
+                    .and_then(|node| integer_property(node, "start_offset"))
+                    .unwrap_or(i64::MAX)
+            });
+        }
         let mut child_offsets = Vec::with_capacity(children_by_node.len() + 1);
         let mut child_targets = Vec::new();
         child_offsets.push(0);
@@ -270,7 +277,6 @@ fn expression_stream(graph: &GraphView, id: &str, owned: &HashSet<String>, out: 
     }
     let mut children = graph.children_owned(id)
         .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
-    children.sort_by_key(|child| graph.offset(child));
     if graph.kind(id) == "BinaryOperator" && graph.operator(id) == "=" && children.len() >= 2 {
         children.swap(0, 1);
     }
@@ -306,8 +312,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         let children = graph.children_owned(id)
             .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
         let result = if kind == "CompoundStmt" {
-            let mut items = children;
-            items.sort_by_key(|child| graph.offset(child));
+            let items = children;
             let mut first = None;
             let mut exits: Vec<String> = Vec::new();
             for child in items {
@@ -395,8 +400,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             // Preserve fallthrough only when the case's final child has an
             // exit; a break/return therefore terminates that case chain.
             let mut units: Vec<(String, Vec<String>)> = Vec::new();
-            let mut sorted = children;
-            sorted.sort_by_key(|child| graph.offset(child));
+            let sorted = children;
             for child in sorted {
                 if is_statement(graph.kind(&child)) {
                     let (entry, exits) = emit(graph, owned, &child, successors, memo, in_progress, depth + 1);
@@ -425,7 +429,6 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
             let mut others = children;
             others.retain(|child| Some(child) != body.as_ref() && Some(child) != condition.as_ref());
-            others.sort_by_key(|child| graph.offset(child));
             let condition_offset = condition.as_ref().map(|node| graph.offset(node)).unwrap_or(i64::MAX);
             let init = others.iter().find(|node| graph.offset(node) < condition_offset).cloned();
             let increment = others.iter().rev().find(|node| graph.offset(node) > condition_offset).cloned();
@@ -478,8 +481,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             (stream.first().cloned().or_else(|| Some(id.to_owned())), Vec::new())
         } else if is_statement(kind) {
             let mut stream = Vec::new();
-            let mut sorted = children;
-            sorted.sort_by_key(|child| graph.offset(child));
+            let sorted = children;
             for child in sorted { expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0); }
             append_chain(successors, &stream);
             (stream.first().cloned(), stream.last().cloned().into_iter().collect())
