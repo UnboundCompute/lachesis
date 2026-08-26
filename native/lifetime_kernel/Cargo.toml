@@ -13,6 +13,7 @@ rayon = "1.10"
 rustc-hash = "2"
 hashbrown = "0.15"
 sha2 = "0.10"
+roaring = "0.10"
 
 [build-dependencies]
 prost-build = "0.13"

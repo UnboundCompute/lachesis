@@ -5,6 +5,7 @@
 
 use hashbrown::HashSet;
 use rustc_hash::{FxHashMap, FxHashSet};
+use roaring::RoaringBitmap;
 use crate::graph_proto;
 use crate::pass2::{self, Delta, Graph};
 
@@ -21,8 +22,57 @@ fn list_field(key: &str, values: &[String]) -> graph_proto::Field { graph_proto:
 fn fact(evidence: &[String], confidence: &str) -> Vec<graph_proto::Field> { vec![pass2::text_field("fact_origin", "core-inference"), pass2::text_field("confidence", confidence), list_field("evidence_ids", evidence)] }
 fn node(id: String, kind: &str, label: String, properties: Vec<graph_proto::Field>) -> graph_proto::NodeRecord { graph_proto::NodeRecord { id, kind: kind.to_owned(), label, properties, tier: String::new() } }
 fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Field>) -> graph_proto::EdgeRecord { graph_proto::EdgeRecord { kind: kind.to_owned(), source: source.to_owned(), target: target.to_owned(), properties, source_tier: String::new(), relationship_class: String::new() } }
-fn add_points(points: &mut FxHashMap<u32, FxHashSet<u32>>, value: u32, objects: &FxHashSet<u32>) -> bool {
-    let entry = points.entry(value).or_default(); let before = entry.len(); entry.extend(objects); entry.len() != before
+type PointSet = RoaringBitmap;
+
+fn add_points(points: &mut FxHashMap<u32, PointSet>, value: u32, objects: &PointSet) -> bool {
+    let entry = points.entry(value).or_default(); let before = entry.len(); entry.extend(objects.iter()); entry.len() != before
+}
+fn add_point_iter<I: IntoIterator<Item = u32>>(
+    points: &mut FxHashMap<u32, PointSet>, value: u32, objects: I,
+) -> bool {
+    let entry = points.entry(value).or_default(); let before = entry.len();
+    entry.extend(objects); entry.len() != before
+}
+/// Propagate individual newly discovered object memberships instead of cloning
+/// an entire points-to set for every worklist item.  The old set-at-a-time loop
+/// copied large sets repeatedly on the full graph and made heap enrichment look
+/// non-terminating even though the lattice is finite.
+fn propagate_identity(
+    points: &mut FxHashMap<u32, PointSet>,
+    identity_targets: &FxHashMap<u32, Vec<u32>>,
+) {
+    let mut queue: std::collections::VecDeque<(u32, u32)> = points.iter()
+        .flat_map(|(value, objects)| objects.iter().map(|object| (*value, object)))
+        .collect();
+    while let Some((source, object)) = queue.pop_front() {
+        for target in identity_targets.get(&source).into_iter().flatten() {
+            if points.entry(*target).or_default().insert(object) {
+                queue.push_back((*target, object));
+            }
+        }
+    }
+}
+fn propagate_identity_seed(
+    points: &mut FxHashMap<u32, PointSet>,
+    identity_targets: &FxHashMap<u32, Vec<u32>>,
+    seeds: impl IntoIterator<Item = u32>,
+) -> FxHashSet<u32> {
+    let mut queue: std::collections::VecDeque<u32> = seeds.into_iter().collect();
+    let mut queued: FxHashSet<u32> = queue.iter().copied().collect();
+    let mut changed = FxHashSet::default();
+    while let Some(source) = queue.pop_front() {
+        queued.remove(&source);
+        let objects = points.get(&source).cloned().unwrap_or_default();
+        for target in identity_targets.get(&source).into_iter().flatten() {
+            let entry = points.entry(*target).or_default(); let before = entry.len();
+            entry.extend(objects.iter());
+            if entry.len() != before {
+                changed.insert(*target);
+                if queued.insert(*target) { queue.push_back(*target); }
+            }
+        }
+    }
+    changed
 }
 fn value_text(value: &graph_proto::Value) -> Option<&str> { match value.kind.as_ref()? { graph_proto::value::Kind::Text(value) => Some(value), _ => None } }
 fn object_field<'a>(value: &'a graph_proto::Value, key: &str) -> Option<&'a graph_proto::Value> {
@@ -84,7 +134,16 @@ fn target_locations(
 }
 
 pub(crate) fn enrich(graph: &mut Graph) -> Delta {
-    let mut points: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
+    let started = std::time::Instant::now();
+    let report = |name: &str, points: &FxHashMap<u32, PointSet>| {
+        if timing_enabled {
+            let memberships = points.values().map(RoaringBitmap::len).sum::<u64>();
+            eprintln!("[lachesis native pass2] heap {name}: {:.3}s ({} values, {} memberships)",
+                started.elapsed().as_secs_f64(), points.len(), memberships);
+        }
+    };
+    let mut points: FxHashMap<u32, PointSet> = FxHashMap::default();
     let mut object_owner: FxHashMap<u32, Option<u32>> = FxHashMap::default();
     let mut object_properties: FxHashMap<u32, Vec<graph_proto::Field>> = FxHashMap::default();
     let mut parameter_objects: FxHashMap<u32, u32> = FxHashMap::default();
@@ -147,18 +206,12 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
     }
 
     // Worklist propagation over all value-preserving identity edges.
-    let mut queue: std::collections::VecDeque<u32> = points.keys().copied().collect(); let mut queued: FxHashSet<u32> = queue.iter().copied().collect();
-    while let Some(source) = queue.pop_front() {
-        queued.remove(&source); let source_objects = points.get(&source).cloned().unwrap_or_default();
-        for target in identity_targets.get(&source).into_iter().flatten() {
-            let target_set = points.entry(*target).or_default(); let before = target_set.len(); target_set.extend(&source_objects);
-            if target_set.len() != before && queued.insert(*target) { queue.push_back(*target); }
-        }
-    }
+    propagate_identity(&mut points, &identity_targets);
+    report("initial propagation", &points);
 
     // Keep context-specific parameter objects separate, then instantiate
     // callee-local allocation templates at context returns.
-    let mut substitutions: FxHashMap<String, FxHashMap<u32, FxHashSet<u32>>> = FxHashMap::default();
+    let mut substitutions: FxHashMap<String, FxHashMap<u32, PointSet>> = FxHashMap::default();
     for binding in graph.nodes.iter().filter(|node| graph.kind(node.kind) == "context-parameter") {
         let Some(context) = text(graph, binding, "context_id") else { continue }; let Some(argument) = text(graph, binding, "argument_id").and_then(|id| graph.symbol(id)) else { continue }; let Some(parameter) = text(graph, binding, "parameter_id").and_then(|id| graph.symbol(id)) else { continue };
         let Some(abstract_object) = parameter_objects.get(&parameter).copied() else { continue }; let caller_objects = points.get(&argument).cloned().unwrap_or_default(); add_points(&mut points, binding.id, &caller_objects); substitutions.entry(context.to_owned()).or_default().insert(abstract_object, caller_objects);
@@ -167,18 +220,18 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
     for returned_index in returned_indices {
         let returned = &graph.nodes[returned_index];
         let returned_id = returned.id;
-        let Some(context) = text(graph, returned, "context_id").map(str::to_owned) else { continue }; let callee = text(graph, returned, "callee_function_id").and_then(|id| graph.symbol(id)); let mut returned_objects = FxHashSet::default();
-        for source in context_return_sources.get(&returned_id).into_iter().flatten() { for object in points.get(source).into_iter().flatten() {
-            if let Some(replacement) = substitutions.get(&context).and_then(|map| map.get(object)) { returned_objects.extend(replacement); continue; }
-            if callee.is_some() && object_owner.get(object).copied().flatten() == callee {
-                let object_text = pass2::stable_id("core", "heap-identity", "heap-object", &["context", &context, graph.id(*object)]); let instance = graph.symbols.intern(object_text.clone());
-                let mut properties = fact(&[graph.id(returned_id).to_owned(), context.clone(), graph.id(*object).to_owned()], "exact"); properties.push(pass2::text_field("context_id", &context)); properties.push(pass2::text_field("allocation_template_id", graph.id(*object))); object_owner.insert(instance, Some(callee.unwrap())); object_properties.insert(instance, properties.clone()); add_node(object_text.clone(), "heap-object", format!("context-object:{}", graph.id(*object)), properties); add_edge("CONTEXT_ALLOCATES", context.clone(), object_text, fact(&[graph.id(returned_id).to_owned(), context.clone(), graph.id(*object).to_owned()], "exact")); returned_objects.insert(instance);
-            } else { returned_objects.insert(*object); }
-        }}
+        let Some(context) = text(graph, returned, "context_id").map(str::to_owned) else { continue }; let callee = text(graph, returned, "callee_function_id").and_then(|id| graph.symbol(id)); let mut returned_objects = PointSet::new();
+        for source in context_return_sources.get(&returned_id).into_iter().flatten() { if let Some(source_objects) = points.get(source) { for object in source_objects.iter() {
+            if let Some(replacement) = substitutions.get(&context).and_then(|map| map.get(&object)) { returned_objects.extend(replacement.iter()); continue; }
+            if callee.is_some() && object_owner.get(&object).copied().flatten() == callee {
+                let object_text = pass2::stable_id("core", "heap-identity", "heap-object", &["context", &context, graph.id(object)]); let instance = graph.symbols.intern(object_text.clone());
+                let mut properties = fact(&[graph.id(returned_id).to_owned(), context.clone(), graph.id(object).to_owned()], "exact"); properties.push(pass2::text_field("context_id", &context)); properties.push(pass2::text_field("allocation_template_id", graph.id(object))); object_owner.insert(instance, Some(callee.unwrap())); object_properties.insert(instance, properties.clone()); add_node(object_text.clone(), "heap-object", format!("context-object:{}", graph.id(object)), properties); add_edge("CONTEXT_ALLOCATES", context.clone(), object_text, fact(&[graph.id(returned_id).to_owned(), context.clone(), graph.id(object).to_owned()], "exact")); returned_objects.insert(instance);
+            } else { returned_objects.insert(object); }
+        }} }
         add_points(&mut points, returned.id, &returned_objects);
     }
-    let mut queue: std::collections::VecDeque<u32> = points.keys().copied().collect(); let mut queued: FxHashSet<u32> = queue.iter().copied().collect();
-    while let Some(source) = queue.pop_front() { queued.remove(&source); let source_objects = points.get(&source).cloned().unwrap_or_default(); for target in identity_targets.get(&source).into_iter().flatten() { let set = points.entry(*target).or_default(); let before = set.len(); set.extend(&source_objects); if set.len() != before && queued.insert(*target) { queue.push_back(*target); } } }
+    propagate_identity(&mut points, &identity_targets);
+    report("context propagation", &points);
     drop(add_node);
     drop(add_edge);
 
@@ -194,28 +247,69 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
     }
     let mut locations: FxHashMap<(u32, String), u32> = FxHashMap::default();
     let mut location_values: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (path, base, segments) in &path_specs {
-            let objects = points.get(base).cloned().unwrap_or_default();
-            for object in objects {
-                let evidence = vec![graph.id(*path).to_owned(), graph.id(*base).to_owned(), graph.id(object).to_owned()];
-                let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, object, segments, &evidence);
-                for location in targets {
-                    for (write, value) in writes_by_path.get(path).into_iter().flatten() {
-                        let values = value.and_then(|id| points.get(&id)).cloned().unwrap_or_default(); let slot = location_values.entry(location).or_default(); let before = slot.len(); slot.extend(values); if slot.len() != before { changed = true; }
-                        let write_text = graph.id(*write).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "WRITES_HEAP", write_text.clone(), location_text.clone(), fact(&[write_text, path_text, location_text], "high"));
-                    }
-                    for read in reads_by_path.get(path).into_iter().flatten() {
-                        let values = location_values.get(&location).cloned().unwrap_or_default(); if add_points(&mut points, *read, &values) { changed = true; }
-                        let read_text = graph.id(*read).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "READS_HEAP", location_text.clone(), read_text.clone(), fact(&[read_text, path_text, location_text], "high"));
+    let mut locations_by_path: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut paths_by_dependency: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    for (index, (path, base, _)) in path_specs.iter().enumerate() {
+        paths_by_dependency.entry(*base).or_default().push(index);
+        for (_, value) in writes_by_path.get(path).into_iter().flatten() {
+            if let Some(value) = value { paths_by_dependency.entry(*value).or_default().push(index); }
+        }
+    }
+    let mut pending: std::collections::VecDeque<usize> = (0..path_specs.len()).collect();
+    let mut queued: FxHashSet<usize> = (0..path_specs.len()).collect();
+    let mut readers: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    while let Some(path_index) = pending.pop_front() {
+        queued.remove(&path_index);
+        let (path, base, segments) = &path_specs[path_index];
+        let objects: Vec<u32> = points.get(base).map(|set| set.iter().collect()).unwrap_or_default();
+        for object in objects {
+            let evidence = vec![graph.id(*path).to_owned(), graph.id(*base).to_owned(), graph.id(object).to_owned()];
+            let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, object, segments, &evidence);
+            let path_locations = locations_by_path.entry(*path).or_default();
+            for location in targets { if !path_locations.contains(&location) { path_locations.push(location); } }
+        }
+        let mut changed_values = FxHashSet::default();
+        for location in locations_by_path.get(path).into_iter().flatten().copied() {
+            for (write, value) in writes_by_path.get(path).into_iter().flatten() {
+                let Some(value_id) = value else { continue };
+                let values = points.get(value_id).cloned().unwrap_or_default();
+                let slot = location_values.entry(location).or_default(); let before = slot.len(); slot.extend(values.iter());
+                if slot.len() != before {
+                    for read in readers.get(&location).into_iter().flatten().copied() {
+                        let read_values = location_values.get(&location).cloned().unwrap_or_default();
+                        if add_point_iter(&mut points, read, read_values.into_iter()) { changed_values.insert(read); }
                     }
                 }
             }
+            for read in reads_by_path.get(path).into_iter().flatten().copied() {
+                readers.entry(location).or_default().insert(read);
+                let values = location_values.get(&location).cloned().unwrap_or_default();
+                if add_point_iter(&mut points, read, values.into_iter()) { changed_values.insert(read); }
+            }
         }
-        let mut queue: std::collections::VecDeque<u32> = points.keys().copied().collect(); let mut queued: FxHashSet<u32> = queue.iter().copied().collect();
-        while let Some(source) = queue.pop_front() { queued.remove(&source); let source_objects = points.get(&source).cloned().unwrap_or_default(); for target in identity_targets.get(&source).into_iter().flatten() { let set = points.entry(*target).or_default(); let before = set.len(); set.extend(&source_objects); if set.len() != before { changed = true; if queued.insert(*target) { queue.push_back(*target); } } } }
+        changed_values.extend(propagate_identity_seed(&mut points, &identity_targets, changed_values.clone()));
+        for value in changed_values {
+            for dependency in paths_by_dependency.get(&value).into_iter().flatten().copied() {
+                if queued.insert(dependency) { pending.push_back(dependency); }
+            }
+        }
+    }
+    report("property worklist", &points);
+    // Emit the final read/write facts once, after the monotone state has converged.
+    for (path, base, segments) in &path_specs {
+        let objects: Vec<u32> = points.get(base).map(|set| set.iter().collect()).unwrap_or_default();
+        for object in objects {
+            let evidence = vec![graph.id(*path).to_owned(), graph.id(*base).to_owned(), graph.id(object).to_owned()];
+            let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, object, segments, &evidence);
+            for location in targets {
+                for (write, _) in writes_by_path.get(path).into_iter().flatten() {
+                    let write_text = graph.id(*write).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "WRITES_HEAP", write_text.clone(), location_text.clone(), fact(&[write_text, path_text, location_text], "high"));
+                }
+                for read in reads_by_path.get(path).into_iter().flatten() {
+                    let read_text = graph.id(*read).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "READS_HEAP", location_text.clone(), read_text.clone(), fact(&[read_text, path_text, location_text], "high"));
+                }
+            }
+        }
     }
     for (value, objects) in points {
         let value_text = graph.id(value).to_owned();

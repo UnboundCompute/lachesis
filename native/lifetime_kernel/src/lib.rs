@@ -56,35 +56,61 @@ fn absorb_native_delta(
     graph.absorb(delta)
 }
 
+fn report_native_phase(
+    enabled: bool, started: std::time::Instant, name: &str,
+    nodes: &[graph_proto::NodeRecord], edges: &[graph_proto::EdgeRecord],
+) {
+    if enabled {
+        eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges)",
+            started.elapsed().as_secs_f64(), nodes.len(), edges.len());
+    }
+}
+
 /// Native-chain runner for the binary Pass-2 path.  The ordering mirrors the
 /// canonical Python registry so each later overlay observes the preceding
 /// additive facts.
 fn run_native_overlay_chain(
     input: &std::path::Path, output: &std::path::Path,
 ) -> Result<(usize, usize), String> {
+    let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
+    let started = std::time::Instant::now();
     let mut graph = pass2::read_path(input)?;
+    if timing_enabled {
+        eprintln!("[lachesis native pass2] read graph: {:.3}s ({} nodes, {} edges)",
+            started.elapsed().as_secs_f64(), graph.nodes.len(), graph.edges.len());
+    }
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let delta = control_flow::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "control-flow", &nodes, &edges);
     let delta = branch_history::enrich(&mut graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "branch-history", &nodes, &edges);
     let delta = dispatch::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "dynamic-dispatch", &nodes, &edges);
     let delta = dynamic_behavior::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "dynamic-behavior", &nodes, &edges);
     let delta = interprocedural::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "interprocedural-contexts", &nodes, &edges);
     let delta = heap::enrich(&mut graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "heap-identity", &nodes, &edges);
     let delta = module_initialization::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "module-initialization", &nodes, &edges);
     let delta = property_effects::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "parameter-property-effects", &nodes, &edges);
     let delta = async_events::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "async-events", &nodes, &edges);
     let delta = taint::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    report_native_phase(timing_enabled, started, "taint-propagation", &nodes, &edges);
     pass2::publish_dataflow_stream(
         output, &input.to_string_lossy(), &graph.core_content_hash, &nodes, &edges,
     )?;
