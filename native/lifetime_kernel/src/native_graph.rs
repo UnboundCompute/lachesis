@@ -183,6 +183,15 @@ fn call_kind(kind: &str) -> bool {
         | "allocation" | "release" | "realloc")
 }
 
+fn translation_call_kind(kind: &str) -> bool {
+    matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
+        | "call" | "Call" | "CallExpression" | "construct" | "NewExpression")
+}
+
+fn translation_return_kind(kind: &str) -> bool {
+    matches!(kind, "ReturnStmt" | "Return" | "ReturnStatement" | "return")
+}
+
 /// Convert the complete framed substrate to the existing native preparation
 /// contract. This is deliberately one conversion inside Rust; Python never
 /// creates FunctionInput/FunctionCall records for this path.
@@ -746,19 +755,18 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     // purpose of the compact ABI on million-node graphs.
     let mut seed_nodes = HashMap::new();
     scan_compact_records(input, |record| {
-        if matches!(record_kind(&record),
-            "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr" |
-            "ReturnStmt" | "function" | "method" | "constructor" |
-            "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
-            "CXXDestructorDecl" | "ParmVarDecl") {
+        if function_kind(record_kind(&record))
+            || translation_call_kind(record_kind(&record))
+            || translation_return_kind(record_kind(&record))
+            || record_kind(&record) == "ParmVarDecl" {
             let node = compact_node(record);
             seed_nodes.insert(node.id.clone(), node);
         }
     }, |_| {})?;
     let edge_offset = compact_edge_offset(input)?;
-    let call_ids: HashSet<String> = seed_nodes.values().filter(|node| matches!(compact_kind(node),
-        "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr")).map(|node| node.id.clone()).collect();
-    let return_ids: HashSet<String> = seed_nodes.values().filter(|node| compact_kind(node) == "ReturnStmt")
+    let call_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_call_kind(compact_kind(node)))
+        .map(|node| node.id.clone()).collect();
+    let return_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_return_kind(compact_kind(node)))
         .map(|node| node.id.clone()).collect();
     let mut relevant = call_ids.union(&return_ids).cloned().collect::<HashSet<_>>();
     for _ in 0..2 {
@@ -803,27 +811,43 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     let mut parents = HashMap::new();
     let mut refers = HashMap::new();
-    let mut initializers = HashMap::new();
-    for edge in &edges {
+    let mut assignment_left = HashMap::new();
+    let mut initializer_targets = HashMap::new();
+    let mut argument_edges: HashMap<String, Vec<usize>> = HashMap::new();
+    for (edge_index, edge) in edges.iter().enumerate() {
         match edge.kind.as_str() {
             "AST_CHILD" => {
                 children.entry(edge.source.clone()).or_default().push(edge.target.clone());
                 parents.entry(edge.target.clone()).or_insert_with(|| edge.source.clone());
+                if edge.role == "LEFT_OPERAND" {
+                    assignment_left.insert(edge.source.clone(), edge.target.clone());
+                } else if edge.role == "ARGUMENT" {
+                    argument_edges.entry(edge.source.clone()).or_default().push(edge_index);
+                }
             }
             "REFERS_TO" => { refers.insert(edge.source.clone(), edge.target.clone()); }
-            "VALUE_FLOWS_TO" => { initializers.insert(edge.target.clone(), edge.source.clone()); }
+            "VALUE_FLOWS_TO" if edge.reason == "initializer" => {
+                initializer_targets.insert(edge.source.clone(), edge.target.clone());
+            }
             _ => {}
         }
     }
     let function_names: HashMap<String, String> = nodes.values().filter_map(|node| {
-        if matches!(compact_kind(node), "function" | "method" | "constructor" | "FunctionDecl" |
-            "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
+        if function_kind(compact_kind(node)) {
             Some((node.id.clone(), node.label.clone()))
         } else { None }
     }).collect();
     let mut functions: BTreeMap<String, lifetime_proto::TranslationFunction> = BTreeMap::new();
+    let mut nodes_by_owner: HashMap<String, Vec<String>> = HashMap::new();
     for node in nodes.values() {
-        let Some(owner) = compact_owner(node) else { continue };
+        // A declaration-only function owns its declaration node.  This mirrors
+        // the language-neutral Python projection and is required for headers
+        // whose bodies are intentionally absent from the substrate.
+        let owner = compact_owner(node).or_else(|| {
+            function_kind(compact_kind(node)).then_some(node.id.clone())
+        });
+        let Some(owner) = owner else { continue };
+        nodes_by_owner.entry(owner.clone()).or_default().push(node.id.clone());
         let entry = functions.entry(owner.clone()).or_insert_with(||
             lifetime_proto::TranslationFunction { id: owner, ..Default::default() });
         if compact_kind(node) == "ParmVarDecl" { entry.parameters.push(node.id.clone()); }
@@ -855,7 +879,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         entry.parameter_names = entry.parameters.iter().map(|id| compact_path_name(&nodes, id)).collect();
     }
     for node in nodes.values() {
-        if !matches!(compact_kind(node), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") { continue; }
+        if !translation_call_kind(compact_kind(node)) { continue; }
         let Some(owner) = compact_owner(node) else { continue };
         let Some(entry) = functions.get_mut(&owner) else { continue };
         let callee = compact_property(node, "primary_target_id")
@@ -877,22 +901,18 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         };
         if let Some(parent) = parents.get(&node.id).and_then(|id| nodes.get(id)) {
             if compact_kind(parent) == "BinaryOperator" && compact_property(parent, "operator") == Some("=") {
-                if let Some(left) = edges.iter().find(|edge| edge.source == parent.id && edge.kind == "AST_CHILD" && edge.role == "LEFT_OPERAND") {
-                    call.assigned = left.target.clone();
-                }
+                call.assigned = assignment_left.get(&parent.id).cloned().unwrap_or_default();
             }
         }
         if call.assigned.is_empty() {
-            if let Some(initializer) = edges.iter().find(|edge| edge.kind == "VALUE_FLOWS_TO" && edge.source == node.id && edge.role == "initializer") {
-                call.assigned = initializer.target.clone();
-            }
+            call.assigned = initializer_targets.get(&node.id).cloned().unwrap_or_default();
         }
         if let Some(path) = compact_path(&nodes, &children, &refers, &call.assigned, 0) {
             call.assigned_name = compact_path_name(&nodes, &path.root);
             call.assigned_root = path.root; call.assigned_selectors = path.selectors;
         }
-        let mut arguments = edges.iter().filter(|edge| edge.kind == "AST_CHILD" && edge.source == node.id && edge.role == "ARGUMENT")
-            .map(|edge| {
+        let mut arguments = argument_edges.get(&node.id).into_iter().flatten()
+            .filter_map(|edge_index| edges.get(*edge_index)).map(|edge| {
                 let path = compact_path(&nodes, &children, &refers, &edge.target, 0);
                 let root_name = path.as_ref().map(|path| compact_path_name(&nodes, &path.root)).unwrap_or_default();
                 lifetime_proto::FunctionArgument {
@@ -908,20 +928,21 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         entry.calls.push(call);
     }
     for entry in functions.values_mut() {
-        let function_nodes: HashSet<String> = nodes.values().filter_map(|node| {
-            (compact_owner(node).as_deref() == Some(entry.id.as_str())).then_some(node.id.clone())
-        }).collect();
-        for node_id in function_nodes {
-            if compact_kind(nodes.get(&node_id).unwrap()) != "ReturnStmt" { continue; }
-            let line = nodes.get(&node_id).and_then(|node| compact_property(node, "start_line"))
+        for node_id in nodes_by_owner.get(&entry.id).into_iter().flatten() {
+            if !translation_return_kind(compact_kind(nodes.get(node_id).unwrap())) { continue; }
+            let line = nodes.get(node_id).and_then(|node| compact_property(node, "start_line"))
                 .and_then(|value| value.parse::<i64>().ok());
-            let Some(child) = children.get(&node_id).and_then(|items| items.first()) else { continue };
-            if call_ids.contains(child) {
-                let callee = nodes.get(child)
+            let Some(child) = children.get(node_id).and_then(|items| items.first()) else { continue };
+            // Return expressions may be wrapped in an implicit cast or
+            // parenthesized node.  Classify the peeled child exactly as the
+            // Python projection does before deciding between call and value.
+            let peeled = compact_peel(&nodes, &children, child.clone());
+            if call_ids.contains(&peeled) {
+                let callee = nodes.get(&peeled)
                     .and_then(|node| compact_property(node, "primary_target_id"))
                     .and_then(|id| function_names.get(id).cloned())
-                    .or_else(|| nodes.get(child).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
-                    .unwrap_or_else(|| nodes.get(child).map(|node| node.label.clone()).unwrap_or_default());
+                    .or_else(|| nodes.get(&peeled).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
+                    .unwrap_or_else(|| nodes.get(&peeled).map(|node| node.label.clone()).unwrap_or_default());
                 entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new() });
             } else if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
                 let root_name = compact_path_name(&nodes, &path.root);
