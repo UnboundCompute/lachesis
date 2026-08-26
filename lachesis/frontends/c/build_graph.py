@@ -409,12 +409,16 @@ def run_clang_over(
 
     def report() -> None:
         if timing_enabled:
-            print(
+            line = (
                 "[lachesis timing] clang %s: %.3fs (%d/%d files, jobs=%d)"
                 % (label or "pass", time.perf_counter() - timing_started,
                    completed_count, len(paths), jobs),
-                file=sys.stderr, flush=True,
             )
+            print(line, file=sys.stderr, flush=True)
+            timing_path = os.environ.get("LACHESIS_TIMINGS_FILE")
+            if timing_path:
+                with open(timing_path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
 
     if jobs <= 1 or len(paths) <= 1:
         for path in paths:
