@@ -430,6 +430,32 @@ fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+fn retain_node_property(field: &graph_proto::Field) -> bool {
+    matches!(field.key.as_str(),
+        "owner_function_id" | "function_id" | "control_kind" |
+        "start_offset" | "end_offset" |
+        "receiver_value_id" | "receiver_member_id" | "primary_target_id" |
+        "method_name" | "callee" | "name" |
+        "path_segments" | "path" | "value_category" |
+        "allocation_kind" | "allocated_type" | "type" |
+        "target_id" | "callsite_id" | "context_id" |
+        "argument_id" | "parameter_id" | "callee_function_id" |
+        "base_value_id" | "value_id" | "origin" |
+        "argument_value_ids" | "resolution" | "behavior_kind" |
+        "key_value_id" | "roles" | "confidence" |
+        "source_kind" | "sink_kind" | "effect_kind" | "operator" |
+        "behaviors" | "callback_argument" | "event_name" |
+        "position" | "version" | "write_kind" | "symbol_kind"
+    )
+}
+
+fn retain_edge_property(field: &graph_proto::Field) -> bool {
+    matches!(field.key.as_str(),
+        "role" | "via" | "reason" | "context_id" | "position" |
+        "receiver_position" | "value_position"
+    )
+}
+
 fn read_optional_stream_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
     let mut header = [0u8; FRAME_HEADER];
     let mut read = 0;
@@ -464,6 +490,8 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
             b'N' => {
                 let record = graph_proto::NodeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid Pass-2 node frame: {error}"))?;
+                let mut record = record;
+                record.properties.retain(retain_node_property);
                 nodes.push(Node {
                     id: symbols.intern(record.id),
                     kind: symbols.intern(record.kind),
@@ -474,6 +502,8 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid Pass-2 edge frame: {error}"))?;
+                let mut record = record;
+                record.properties.retain(retain_edge_property);
                 edges.push(make_edge(&mut symbols, record.kind, record.source, record.target, record.properties));
             }
             _ => return Err("unknown Pass-2 input record prefix".to_owned()),
