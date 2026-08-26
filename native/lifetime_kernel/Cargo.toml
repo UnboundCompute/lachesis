@@ -10,6 +10,8 @@ crate-type = ["rlib", "cdylib"]
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 rayon = "1.10"
+rustc-hash = "2"
+hashbrown = "0.15"
 
 [build-dependencies]
 prost-build = "0.13"

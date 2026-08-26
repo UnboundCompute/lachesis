@@ -7,7 +7,7 @@
 //! access-path extraction is added on top of this boundary without changing the
 //! ABI.
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 use prost::Message;
 use rayon::prelude::*;

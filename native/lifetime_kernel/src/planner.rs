@@ -3,7 +3,8 @@
 //! This is intentionally independent of Kùzu.  Pass 1 has already emitted the
 //! call/parameter facts needed by these two deterministic graph algorithms.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use hashbrown::{HashMap, HashSet};
 
 use crate::lifetime_proto;
 

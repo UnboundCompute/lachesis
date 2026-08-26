@@ -5,7 +5,8 @@
 //! expensive model/callsite matching and attachment construction runs on compact Rust
 //! values.  The output is the existing `atropos-binding-report` contract.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use hashbrown::HashMap;
 use prost::Message;
 
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};

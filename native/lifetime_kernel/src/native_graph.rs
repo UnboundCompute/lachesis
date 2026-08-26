@@ -4,7 +4,8 @@
 //! Pass 2 does not receive Python dictionaries: Rust reads the framed protobuf
 //! records directly and constructs the function inputs in native memory.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use hashbrown::{HashMap, HashSet};
 
 use prost::Message;
 
@@ -77,7 +78,7 @@ fn input_scalar(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
 
 fn resolve_decl(node: &str, refs: &HashMap<String, String>,
                children: &HashMap<String, Vec<String>>,
-               seen: &mut std::collections::HashSet<String>) -> Option<String> {
+               seen: &mut HashSet<String>) -> Option<String> {
     if !seen.insert(node.to_owned()) { return None; }
     if let Some(declaration) = refs.get(node) { return Some(declaration.clone()); }
     children.get(node).into_iter().flatten()
@@ -215,6 +216,7 @@ fn sidecar_to_request_with_selection(
         call.arguments = arguments;
         built_calls.push((function, call));
     }
+    drop(node_lookup);
     for (function, call) in built_calls {
         if let Some(entry) = functions.get_mut(&function) {
             entry.calls.push(call);
@@ -247,7 +249,7 @@ fn sidecar_to_request_with_selection(
             if !call.is_release && !call.is_realloc { continue; }
             for argument in &call.arguments {
                 let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
-                    &mut std::collections::HashSet::new()) else { continue };
+                    &mut HashSet::new()) else { continue };
                 let Some(position) = parameter_positions.get(&declaration) else { continue };
                 if !effects.iter().any(|(existing, selectors)| *existing == *position && selectors.is_empty()) {
                     effects.push((*position, Vec::new()));
@@ -277,7 +279,7 @@ fn sidecar_to_request_with_selection(
                     let Some(argument) = call.arguments.iter()
                         .find(|argument| argument.position == *callee_position) else { continue };
                     let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
-                        &mut std::collections::HashSet::new()) else { continue };
+                        &mut HashSet::new()) else { continue };
                     let Some(position) = parameter_positions.get(&declaration) else { continue };
                     additions.push((*position, selectors.clone()));
                 }

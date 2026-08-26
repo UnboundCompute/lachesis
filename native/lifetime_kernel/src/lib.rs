@@ -5,9 +5,10 @@
 //! the domain here value-oriented avoids allocating Python dictionaries and tuples for
 //! every transfer while preserving the existing analysis semantics.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
+use hashbrown::{HashMap, HashSet};
+use rustc_hash::FxHasher;
 use std::slice;
 use std::sync::Arc;
 use prost::Message;
@@ -960,7 +961,7 @@ fn deduplicate_shared(states: Vec<Arc<State>>) -> Vec<Arc<State>> {
 /// bucket still performs the exact equality check, so this is an optimization
 /// only and cannot alter abstract-state semantics.
 fn state_fingerprint(state: &State) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     let mut env: Vec<_> = state.env.iter().collect();
     env.sort_by(|left, right| left.0.cmp(right.0));
     env.hash(&mut hasher);
