@@ -1,6 +1,7 @@
 """Branch-sensitive reaching definitions over the canonical control-flow graph."""
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import defaultdict, deque
 
 from ..composition import GraphDelta
@@ -91,6 +92,23 @@ class BranchHistory:
             if owner:
                 statements_by_function[owner].append(statement)
 
+        # The AST walk handles the normal case.  Events without an AST body used
+        # to fall back to an O(events * statements-in-function) scan.  Keep a
+        # source-ordered interval index for that fallback.  Scanning candidates
+        # from the latest start finds the tightest nested span first and stops
+        # once an earlier interval cannot beat the current result.
+        statement_intervals: dict[str, tuple[list[int], list[tuple[int, int, str]]]] = {}
+        for owner, statements in statements_by_function.items():
+            intervals = []
+            for statement in statements:
+                properties = statement.get("properties", {})
+                left = properties.get("start_offset")
+                right = properties.get("end_offset")
+                if isinstance(left, int) and isinstance(right, int) and left <= right:
+                    intervals.append((left, right, statement["id"]))
+            intervals.sort(key=lambda item: (item[0], item[1], item[2]))
+            statement_intervals[owner] = ([item[0] for item in intervals], intervals)
+
         def containing_statement(event: dict, function_id: str) -> str | None:
             body_id = evidence_body.get(event["id"])
             current = body_id
@@ -106,15 +124,24 @@ class BranchHistory:
             end = properties.get("end_offset", start)
             if not isinstance(start, int):
                 return None
-            candidates = []
-            for statement in statements_by_function.get(function_id, []):
-                statement_properties = statement.get("properties", {})
-                left = statement_properties.get("start_offset")
-                right = statement_properties.get("end_offset")
-                if isinstance(left, int) and isinstance(right, int) \
-                        and left <= start and (end is None or end <= right):
-                    candidates.append((right - left, left, statement["id"]))
-            return min(candidates)[2] if candidates else None
+            if not isinstance(end, int):
+                end = start
+            starts, intervals = statement_intervals.get(function_id, ([], []))
+            limit = bisect_right(starts, start)
+            best = None
+            for index in range(limit - 1, -1, -1):
+                left, right, statement_id = intervals[index]
+                if right < end:
+                    continue
+                span = right - left
+                if best is not None and end >= start and start - left >= best[0]:
+                    # Earlier intervals have a larger left gap and must still
+                    # contain ``end``, so they cannot be shorter.
+                    break
+                candidate = (span, left, statement_id)
+                if best is None or candidate < best:
+                    best = candidate
+            return best[2] if best is not None else None
 
         definitions_by_function: dict[str, list[dict]] = defaultdict(list)
         reads_by_function: dict[str, list[dict]] = defaultdict(list)
@@ -319,4 +346,3 @@ class BranchHistory:
                         environment[target_id] = {event["id"]}
 
         return GraphDelta(self.overlay_id, nodes, edges)
-

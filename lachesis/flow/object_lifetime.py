@@ -13,6 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import os
+import sys
 from time import perf_counter
 from typing import Iterable
 
@@ -289,6 +290,8 @@ def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, .
             expression_items = sub.idx.member_expression_nodes()
         else:
             expression_items = sub.idx.nodes_of_kind("expression")
+        pending = []
+        root_ids = set()
         for item in expression_items:
             node = item.get("id") if isinstance(item, dict) else item
             item_props = item.get("properties", {}) if isinstance(item, dict) else {}
@@ -301,9 +304,18 @@ def _aggregate_field_paths(sub, ap_builder, type_key=None) -> tuple[tuple[str, .
             # combination here causes avoidable state multiplication in summaries.
             if path is not None and len(path.selectors) == 2 and path.selectors[0] == "*":
                 root_id = path.root[len("decl:"):] if path.root.startswith("decl:") else None
-                root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
-                cache[root_type].add(path.selectors)
-                cache[_aggregate_type_key(root_type)].add(path.selectors)
+                if root_id is not None:
+                    root_ids.add(root_id)
+                pending.append((root_id, path.selectors))
+        # Root type is the only property needed from this catalogue.  Resolve it in
+        # bounded batches instead of calling ``sub.props`` once per member expression;
+        # the latter becomes thousands of Kùzu primary-key round trips on a full graph.
+        if root_ids:
+            sub.warm_nodes(root_ids)
+        for root_id, selectors in pending:
+            root_type = (sub.props(root_id).get("type") if root_id else None) or "<unknown>"
+            cache[root_type].add(selectors)
+            cache[_aggregate_type_key(root_type)].add(selectors)
         sub._aggregate_field_paths_loaded = True
     if type_key is None:
         paths = set().union(*cache.values()) if cache else set()
@@ -343,8 +355,116 @@ def _op(kind, node, *, target=None, source=None, line=None, ordinal=0,
                      access=access)
 
 
+def _native_function_item(sub, norm, function_id, function_ir, summaries, records=None):
+    """Marshal one raw function graph into the native preparation ABI.
+
+    This is intentionally a record marshaler, not a second lifetime implementation:
+    Rust receives the AST/CFG/reference facts and performs CFG placement, access-path
+    extraction, call effects, and solving. Keeping this seam small makes it possible
+    to compare the native result with the existing Python implementation function by
+    function before changing the production scheduler.
+    """
+    if records is None:
+        records = [sub.node(node) for node in sub._owned(function_id)]
+    node_ids = {record.get("id") for record in records if record.get("id") is not None}
+    edges = []
+    for source in node_ids:
+        for target in sub.ast_children.get(source, ()):
+            if target not in node_ids:
+                continue
+            role = ""
+            position = None
+            for candidate_role, children in sub.ast_by_role.get(source, {}).items():
+                if target not in children:
+                    continue
+                role = candidate_role
+                position = next((index for index, value in
+                                 sub.ast_by_position.get(source, {}).get(candidate_role, {}).items()
+                                 if value == target), None)
+                break
+            edge = {"kind": "AST_CHILD", "source": source, "target": target,
+                    "role": role}
+            if position is not None:
+                edge["position"] = position
+            edges.append(edge)
+        referent = sub.refers.get(source)
+        if referent in node_ids:
+            edges.append({"kind": "REFERS_TO", "source": source, "target": referent})
+        initializer = sub.initializer_source.get(source)
+        if initializer in node_ids:
+            edges.append({"kind": "VALUE_FLOWS_TO", "source": initializer, "target": source})
+        for target in sub.cfg_next.get(source, ()):
+            if target in node_ids:
+                edges.append({"kind": "CFG_NEXT", "source": source, "target": target})
+
+    source_nodes = {item.get("node") for item in function_ir.get("source_calls", ())}
+    calls = []
+    for call in function_ir.get("calls", ()):
+        call_node = call.get("node")
+        if call_node not in node_ids:
+            continue
+        callee = call.get("callee")
+        args = []
+        for argument in call.get("args", ()):
+            position = argument.get("pos")
+            if not isinstance(position, int):
+                continue
+            argument_node = sub.role_child_at(call_node, "ARGUMENT", position)
+            args.append({"pos": position, "node": argument_node or argument.get("root") or ""})
+        calls.append({
+            "node": call_node, "callee": callee, "line": call.get("line"),
+            "assigned": call.get("assigned"), "receiver": call.get("receiver"),
+            "is_alloc": bool(norm.is_acquire(callee) and not norm.is_realloc(callee)),
+            "is_release": bool(norm.is_release(callee)),
+            "is_realloc": bool(norm.is_realloc(callee)),
+            "is_source": call_node in source_nodes,
+            "is_aggregate_copy": bool(norm.is_aggregate_copy(callee, sub.label(call_node) or "")),
+            "args": args,
+        })
+
+    params = [record["id"] for record in records
+              if (sub.kind(record.get("id")) == "ParmVarDecl"
+                  and sub.label(record.get("id")) in set(function_ir.get("params", ())))]
+    encoded_summaries = []
+    for callee, alternatives in summaries.items():
+        encoded_alternatives = []
+        for alternative in alternatives:
+            effects = []
+            for effect in alternative:
+                if isinstance(effect, ReturnEffect):
+                    effects.append({"is_return": True, "position": effect.position,
+                                    "selectors": effect.selectors, "kind": "copy"})
+                else:
+                    effects.append({"is_return": False, "position": effect.position,
+                                    "selectors": effect.selectors, "kind": effect.kind.value})
+            encoded_alternatives.append(effects)
+        encoded_summaries.append({"callee": callee, "alternatives": encoded_alternatives})
+
+    item = {"id": function_id, "nodes": records, "edges": edges, "parameters": params,
+            "calls": calls, "summaries": encoded_summaries}
+    return item
+
+
+def _native_function_input(sub, norm, function_id, function_ir, summaries, records=None):
+    from .native_lifetime import prepare_and_solve_pb
+    item = _native_function_item(sub, norm, function_id, function_ir, summaries, records)
+    return prepare_and_solve_pb([item])[function_id]
+
+
+@dataclass(frozen=True)
+class _DeferredSummaryCall:
+    """Graph-independent call facts used to compose a callee summary later."""
+
+    node: str
+    callee: str | None
+    line: int | None
+    destination: AccessPath | None
+    actuals: tuple[tuple[int, AccessPath], ...]
+
+
 @timeit
-def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
+def extract_operations(sub, norm, function_id, function_ir, all_functions, summaries, cfg,
+                        deferred_summary_calls=None):
     """Extract graph-derived operations for one function; no expected result enters here."""
     owned = set(sub._owned(function_id))
     cfg_nodes = set(cfg["nodes"])
@@ -354,25 +474,23 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
     for node in owned:
         if sub.is_plain_assign(node):
             lhs, rhs = _assignment_operands(sub, node)
-            if lhs is None or rhs is None:
-                continue
-            line = _line(sub, node)
-            base = _deref_base(sub, ap_builder, lhs)
-            if base is not None and not _is_unevaluated(sub, lhs):
-                rhs_source = _path(ap_builder, rhs)
-                operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
-                                      target=base, source=rhs_source, line=line, ordinal=0,
-                                      access="write"))
-            # Only pointer-valued stores alter this lifetime environment. Scalar
-            # ``*p = 0`` is a use of p, not a rebinding of p.
-            if not _is_pointer(sub, lhs):
-                continue
-            target = _path(ap_builder, lhs)
-            if target is None:
-                continue
-            kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, rhs)
-            operations.append(_op(kind, _place(sub, cfg_nodes, node), target=target,
-                                  source=payload, line=line, ordinal=1, is_null=is_null))
+            if lhs is not None and rhs is not None:
+                line = _line(sub, node)
+                base = _deref_base(sub, ap_builder, lhs)
+                if base is not None and not _is_unevaluated(sub, lhs):
+                    rhs_source = _path(ap_builder, rhs)
+                    operations.append(_op(OpKind.USE, _place(sub, cfg_nodes, lhs, node),
+                                          target=base, source=rhs_source, line=line, ordinal=0,
+                                          access="write"))
+                # Only pointer-valued stores alter this lifetime environment. Scalar
+                # ``*p = 0`` is a use of p, not a rebinding of p.
+                if _is_pointer(sub, lhs):
+                    target = _path(ap_builder, lhs)
+                    if target is not None:
+                        kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, rhs)
+                        operations.append(_op(
+                            kind, _place(sub, cfg_nodes, node), target=target,
+                            source=payload, line=line, ordinal=1, is_null=is_null))
 
         elif sub.kind(node) == "VarDecl" and _is_pointer(sub, node):
             initializer = _initializer(sub, node)
@@ -386,25 +504,24 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
                     OpKind.CLOBBER, _place(sub, cfg_nodes, node, node),
                     target=target, line=_line(sub, node), ordinal=1,
                     access="uninitialized"))
-                continue
-            target = AccessPath("decl:" + str(node))
-            kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, initializer)
-            anchor = _place(sub, cfg_nodes, _peel(sub, initializer), node)
-            operations.append(_op(kind, anchor, target=target, source=payload,
-                                  line=_line(sub, node), ordinal=1, is_null=is_null))
-            arithmetic_source = _pointer_arithmetic_source(sub, ap_builder, initializer)
-            if arithmetic_source is not None:
-                # Preserve the derived pointer and its source object as a
-                # semantic fact. The lifetime engine may ignore this USE, but
-                # the reusable skeleton can match a later dereference against
-                # the derived pointer without reparsing the expression.
-                operations.append(_op(
-                    OpKind.USE, anchor, target=target, source=arithmetic_source,
-                    line=_line(sub, node), ordinal=2,
-                    access="pointer-arithmetic"))
+            else:
+                target = AccessPath("decl:" + str(node))
+                kind, payload, is_null = _rhs_kind(sub, ap_builder, norm, initializer)
+                anchor = _place(sub, cfg_nodes, _peel(sub, initializer), node)
+                operations.append(_op(kind, anchor, target=target, source=payload,
+                                      line=_line(sub, node), ordinal=1, is_null=is_null))
+                arithmetic_source = _pointer_arithmetic_source(sub, ap_builder, initializer)
+                if arithmetic_source is not None:
+                    # Preserve the derived pointer and its source object as a
+                    # semantic fact. The lifetime engine may ignore this USE, but
+                    # the reusable skeleton can match a later dereference against
+                    # the derived pointer without reparsing the expression.
+                    operations.append(_op(
+                        OpKind.USE, anchor, target=target, source=arithmetic_source,
+                        line=_line(sub, node), ordinal=2,
+                        access="pointer-arithmetic"))
 
-    # A real memory read/write through an access expression uses its base object.
-    for node in owned:
+        # A real memory read/write through an access expression uses its base object.
         if _is_pointer_comparison(sub, node):
             for child in sub.ast_children.get(node, ()):
                 path = _path(ap_builder, child)
@@ -475,6 +592,26 @@ def extract_operations(sub, norm, function_id, function_ir, all_functions, summa
 
         callee_summary = summaries.get(callee)
         if callee in all_functions and callee_summary is not None:
+            if deferred_summary_calls is not None:
+                assigned = call.get("assigned")
+                destination = next((candidate for candidate in owned
+                                    if sub.kind(candidate) == "variable"
+                                    and sub.label(candidate) == assigned), None)
+                receiver = (_path(ap_builder, destination)
+                            if destination is not None else
+                            (AccessPath(str(assigned)) if assigned else None))
+                actuals = tuple(
+                    (int(argument.get("pos")), actual)
+                    for argument in call.get("args", ())
+                    if isinstance(argument.get("pos"), int)
+                    for actual in (_argument_path(
+                        sub, ap_builder, call_node, argument.get("pos")),)
+                    if actual is not None
+                )
+                deferred_summary_calls.append(_DeferredSummaryCall(
+                    node=anchor, callee=callee, line=line,
+                    destination=receiver, actuals=actuals))
+                continue
             alternatives = []
             for alternative in callee_summary:
                 effects = []
@@ -607,9 +744,61 @@ def _initial_state(cfg, operations):
     return initial
 
 
-def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, cfg):
-    prepared = _prepare_summary(
-        sub, norm, function_id, function_ir, all_functions, summaries, cfg)
+def _compose_deferred_operations(base_operations, deferred_calls, summaries):
+    """Add wave-ready interprocedural effects to compact local operations."""
+    operations = list(base_operations)
+    for call in deferred_calls:
+        actuals = dict(call.actuals)
+        callee_summary = summaries.get(call.callee)
+        if callee_summary is None:
+            operations.extend(
+                _op(OpKind.USE, call.node, target=path, line=call.line,
+                    ordinal=10 + position, access="pass")
+                for position, path in call.actuals)
+            continue
+        alternatives = []
+        for alternative in callee_summary:
+            effects = []
+            for effect in alternative:
+                if isinstance(effect, ReturnEffect):
+                    actual = actuals.get(effect.position)
+                    if call.destination is None or actual is None:
+                        continue
+                    effects.append(_op(
+                        OpKind.COPY, call.node, target=call.destination,
+                        source=_compose(actual, effect.selectors), line=call.line,
+                        ordinal=20 + len(effects), access="return-alias"))
+                    continue
+                actual = actuals.get(effect.position)
+                if actual is None:
+                    continue
+                effects.append(_op(
+                    effect.kind, call.node,
+                    target=_compose(actual, effect.selectors), line=call.line,
+                    ordinal=20 + len(effects)))
+            alternatives.append(tuple(effects))
+        if alternatives and any(alternatives):
+            operations.append(_op(
+                OpKind.SUMMARY, call.node, line=call.line, ordinal=20,
+                alternatives=tuple(alternatives)))
+    unique = {}
+    for operation in operations:
+        key = (operation.kind, operation.node, operation.target, operation.source,
+               operation.is_null, operation.alternatives, operation.access)
+        unique[key] = operation
+    return tuple(unique.values())
+
+
+def _summary_for(sub, norm, function_id, function_ir, all_functions, summaries, cfg,
+                 cached=None):
+    if cached is None:
+        prepared = _prepare_summary(
+            sub, norm, function_id, function_ir, all_functions, summaries, cfg)
+    else:
+        local_operations, deferred = cached
+        operations = _compose_deferred_operations(local_operations, deferred, summaries)
+        prepared = (cfg["nodes"], cfg["succ"], operations,
+                    _initial_state(cfg, operations))
     return _analyze_prepared(prepared)
 
 
@@ -623,6 +812,25 @@ def _prepare_summary(sub, norm, function_id, function_ir, all_functions, summari
 def _analyze_prepared(prepared):
     """Pure, pickleable solver boundary used by process workers."""
     nodes, successors, operations, initial = prepared
+    # The Python analyzer has an allocation-free straight-line transfer path.  Calling
+    # the native bridge for that common shape is substantially slower: protobuf request
+    # construction plus a full point/post snapshot round-trip dominates the actual
+    # transfer (especially for the many small wrapper functions in a whole repository).
+    # Reserve Rust for control-flow graphs where its native work can amortize that bridge.
+    linear = bool(nodes)
+    positions = {node: index for index, node in enumerate(nodes)}
+    linear = linear and all(len(successors.get(node, ())) <= 1 for node in nodes)
+    linear = linear and all(
+        successor in positions and positions[successor] > positions[node]
+        for node in nodes
+        for successor in successors.get(node, ())
+    )
+    linear = linear and all(operation.kind != OpKind.SUMMARY for operation in operations)
+    if os.environ.get("LACHESIS_NATIVE_LIFETIME") == "1" and not linear:
+        from .native_lifetime import solve_linear
+        native = solve_linear(nodes, successors, operations, initial)
+        if native is not None:
+            return native
     # 32 disjuncts/node (not 64): a fully-wired CFG closes every loop's def-use cycle,
     # so a looping function accumulates disjuncts across the back-edge until widening
     # fires. At 64 the widening fired so late that small pipeline-walk functions blew
@@ -710,6 +918,140 @@ class ObjectLifetimeResult:
     cfgs: dict[str, dict] = field(default_factory=dict)
 
 
+def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
+    """Run the complete binary-substrate lifetime path inside Rust.
+
+    This is intentionally opt-in while differential parity is being closed.  The
+    adapter maps native snapshots/findings into the existing result envelope; it
+    does not rebuild graph nodes, CFGs, calls, or operations in Python.
+    """
+    from lachesis.nav.dataflow.substrate import substrate_cache_path
+    from .native_lifetime import (decode_prepared_result_light, prepared_operations,
+                                  solve_selected_graph_pb)
+
+    base = (getattr(analysis_index, "_pass3_cache_base", None)
+            or getattr(analysis_index, "_db_dir", None))
+    if not base:
+        return None
+    sidecar = substrate_cache_path(base)
+    if not sidecar.is_file():
+        return None
+    by_name = {}
+    for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
+        if _props(node).get("declaration_only"):
+            continue
+        name = node.get("label")
+        if name in functions and name not in by_name:
+            by_name[name] = node["id"]
+    selected_ids = set(by_name.values())
+    # The native small-function pool is intentionally configured at the FFI
+    # boundary so the public ``workers`` knob controls Rust as well as the
+    # Python fallback.  Preserve the caller's environment for embedded users.
+    previous_workers = os.environ.get("LACHESIS_LIFETIME_WORKERS")
+    if workers is not None:
+        os.environ["LACHESIS_LIFETIME_WORKERS"] = str(max(1, int(workers)))
+    try:
+        native = solve_selected_graph_pb(sidecar, selected_ids)
+    finally:
+        if previous_workers is None:
+            os.environ.pop("LACHESIS_LIFETIME_WORKERS", None)
+        else:
+            os.environ["LACHESIS_LIFETIME_WORKERS"] = previous_workers
+    # Native translation facts carry the declaration labels needed to render
+    # findings. Do not decode the full structural substrate just to resolve a
+    # handful of result roots; semantic emission may load it later only when a
+    # legacy metadata lookup is genuinely required.
+    root_labels = {
+        root_id: metadata[0]
+        for function in functions.values()
+        for root_id, metadata in function.get("root_metadata", {}).items()
+        if metadata and metadata[0]
+    }
+    summaries = {}
+    artifacts = {}
+    cfgs = {}
+    cfg_failures = {}
+    leads = []
+    total_transfers = total_widenings = 0
+    capped = []
+    for name in sorted(functions):
+        function_id = by_name.get(name)
+        item = native.get(function_id) if function_id else None
+        if item is None or item.prepared is None or item.result is None:
+            cfg_failures[name] = "native-no-result"
+            continue
+        # Whole-graph native results contain millions of abstract-state snapshots.
+        # The native metadata emitter does not consume them, so do not reconstruct
+        # those snapshots as Python objects here; retain only findings and counters.
+        summary, analysis = decode_prepared_result_light(item)
+        summaries[name] = summary
+        artifacts[name] = analysis
+        # Rust has already prepared the complete local operation stream for
+        # this function. Retain it so semantic emission does not repeat the
+        # expensive Python AST walk over the structural substrate.
+        native_operations = prepared_operations(item.prepared)
+        cfgs[name] = {
+            "nodes": tuple(item.prepared.nodes),
+            "succ": {
+                entry.node: tuple(entry.targets)
+                for entry in item.prepared.successors
+            },
+            "loop_nodes": tuple(item.prepared.loop_nodes),
+            "operations": native_operations,
+            "metadata": {
+                node.id: (node.label, node.kind, node.owner, node.type,
+                          node.offset if node.has_offset else 0)
+                for node in item.prepared.metadata
+            },
+            "native_capped": bool(analysis.capped),
+        }
+        total_transfers += analysis.transfers
+        total_widenings += analysis.widenings
+        if analysis.capped:
+            capped.append(name)
+            # A capped result is a partial abstract interpretation.  Do not
+            # publish its findings as if they were complete; retain the
+            # prepared metadata for the native emitter, but route this
+            # function through the conservative compatibility fallback.
+            cfg_failures[name] = "transfer-cap"
+        best = {}
+        if analysis.capped:
+            continue
+        for finding in sorted(analysis.findings):
+            root_id = finding.path.root.removeprefix("decl:")
+            root = root_labels.get(root_id, root_id)
+            suffix = "".join(finding.path.selectors)
+            key = (finding.pattern, root + suffix)
+            existing = best.get(key)
+            if existing is None:
+                best[key] = {
+                    "pattern": finding.pattern, "var": root + suffix,
+                    "root": root, "entry": name, "line": finding.line,
+                    "node": finding.node, "engine": "native-object-identity",
+                    "sites": 1,
+                }
+            else:
+                existing["sites"] += 1
+                if finding.line is not None and (
+                        existing["line"] is None or finding.line < existing["line"]):
+                    existing["line"], existing["node"] = finding.line, finding.node
+        leads.extend(best[key] for key in sorted(best))
+    diagnostics = {
+        "backend": "rust-whole-graph",
+        "functions": len(functions), "analyzed": len(artifacts),
+        "cfg_failures": cfg_failures, "unplaced": 0,
+        "unplaced_functions": {}, "capped": capped,
+        "summary_capped": [], "summary_analyses": len(artifacts),
+        "summary_recomputations": 0, "summary_transfers": total_transfers,
+        "summary_workers": 1, "timed_out": False, "widenings": total_widenings,
+        "transfers": total_transfers, "total_seconds": 0.0,
+        "unsafe_functions": sorted(cfg_failures),
+        "seed_unsafe_functions": sorted(cfg_failures),
+        "unsafe_object_flow": {},
+    }
+    return ObjectLifetimeResult(tuple(leads), summaries, diagnostics, artifacts, cfgs)
+
+
 @timeit
 def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", graph=None,
                              workers=None, deadline=None):
@@ -730,6 +1072,17 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         analysis_index = GraphStore(graph).index
     else:
         analysis_index = store.index
+    native_whole_graph = os.environ.get("LACHESIS_NATIVE_WHOLE_GRAPH") == "1"
+    if not native_whole_graph:
+        from lachesis.nav.dataflow.substrate import translation_facts_path
+        base = (getattr(analysis_index, "_pass3_cache_base", None)
+                or getattr(analysis_index, "_db_dir", None))
+        native_whole_graph = bool(base and translation_facts_path(base).is_file())
+    if native_whole_graph:
+        native_result = _native_whole_graph_lifetimes(
+            analysis_index, functions, workers=workers)
+        if native_result is not None:
+            return native_result
     norm = normalizer(lang)
     function_node_ids = [node_id for kind in ("function", "method", "constructor")
                          for node_id in getattr(analysis_index, "by_kind", {}).get(kind, ())]
@@ -744,18 +1097,27 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
         name = node.get("label")
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
-
-    sub.warm_owned(by_name.values())
+    name_by_owner = {owner_id: name for name, owner_id in by_name.items()}
 
     cfgs = {}
     cfg_failures = {name: "no-function-node" for name in functions if name not in by_name}
-    for name, function_id in by_name.items():
+    def prepare_cfg(name, function_id):
         cfg = ReachingDef(sub).analyze(function_id, reaching_defs=False)
         if cfg is None or cfg.get("bailed"):
             cfg_failures[name] = "too-large" if cfg and cfg.get("bailed") else "no-cfg"
         else:
             cfgs[name] = cfg
-    cfg_seconds = perf_counter() - started
+
+    # Disk-backed callers stream records in the dependency waves below. This keeps one
+    # owner's records resident through both CFG preparation and summary preparation, then
+    # evicts them; doing CFG first and evicting would make the summary phase decode every
+    # owner a second time. In-memory callers retain the original whole-substrate path.
+    stream = getattr(getattr(sub, "idx", None), "stream_nodes_by_owner", None)
+    if stream is None:
+        sub.warm_owned(by_name.values())
+        for name, function_id in by_name.items():
+            prepare_cfg(name, function_id)
+    cfg_seconds = perf_counter() - started if stream is None else 0.0
 
     # Absence means "no analyzable summary", not "proven to have no effects". That
     # distinction makes callers of a CFG failure take the conservative external-call
@@ -770,6 +1132,54 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
     pool_context = (ProcessPoolExecutor(max_workers=workers)
                     if workers > 1 else nullcontext(None))
     timed_out = False
+    progress = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
+    streamed_owners = 0
+    streamed_nodes = 0
+    streamed_cfg_seconds = 0.0
+    streamed_query_seconds = 0.0
+    slowest_cfgs = []
+    progress_interval = max(25, min(500, max(1, len(by_name) // 10)))
+    group_by_name = {
+        name: group
+        for group in schedule
+        for name in group["members"]
+    }
+    # Disk-backed callers are scanned once.  The graph records are converted immediately
+    # into compact local operations plus deferred call templates, then evicted; later
+    # dependency waves only compose summaries over those graph-independent values.
+    cached_operations = None
+    if stream is not None:
+        cached_operations = {}
+        deferred_empty = {name: () for name in functions}
+        owner_ids = tuple(by_name.values())
+        owner_set = set(owner_ids)
+        query_started = perf_counter()
+
+        def cache_owner(owner_id, records):
+            nonlocal streamed_owners, streamed_nodes, streamed_cfg_seconds
+            if owner_id in owner_set:
+                name = name_by_owner.get(owner_id)
+                if name is not None:
+                    cfg_started = perf_counter()
+                    prepare_cfg(name, owner_id)
+                    cfg_elapsed = perf_counter() - cfg_started
+                    streamed_cfg_seconds += cfg_elapsed
+                    if name in cfgs:
+                        deferred = []
+                        operations = extract_operations(
+                            sub, norm, owner_id, functions[name], functions,
+                            deferred_empty, cfgs[name], deferred)
+                        cached_operations[name] = (operations, tuple(deferred))
+                    streamed_owners += 1
+                    streamed_nodes += len(records)
+            for node in records:
+                node_id = node["id"]
+                getattr(sub.idx, "_node_cache", {}).pop(node_id, None)
+                sub._node.pop(node_id, None)
+
+        stream(owner_ids, cache_owner)
+        streamed_query_seconds = perf_counter() - query_started
+        stream = None
     with pool_context as executor:
         for wave in _schedule_levels(schedule, call_successors):
             # A wave boundary is the natural preemption point: the previous wave's futures
@@ -780,21 +1190,58 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 if executor is not None:
                     executor.shutdown(cancel_futures=True)
                 break
-            # Prepare graph-derived operations in the parent. Workers receive only the
-            # pure CFG/state problem, never a Kuzu connection or the materialized graph.
             pending = []
+            retained_cyclic = defaultdict(list)
+
+            if cached_operations is not None:
+                # Compose graph-independent local operations with the summaries available
+                # at this dependency wave. Workers receive only the pure CFG/state problem.
+                owner_ids = [by_name[name]
+                             for group in wave
+                             for name in group["members"]
+                             if name in by_name]
+                for owner_id in owner_ids:
+                    name = name_by_owner[owner_id]
+                    if group_by_name[name]["cyclic"]:
+                        continue
+                    cached = cached_operations.get(name)
+                    if cached is None or name not in cfgs:
+                        continue
+                    local_operations, deferred = cached
+                    operations = _compose_deferred_operations(
+                        local_operations, deferred, summaries)
+                    prepared = (cfgs[name]["nodes"], cfgs[name]["succ"], operations,
+                                _initial_state(cfgs[name], operations))
+                    future = (executor.submit(_analyze_prepared, prepared)
+                              if executor is not None else None)
+                    pending.append((name, prepared, future))
+                if progress and streamed_owners and streamed_owners % progress_interval == 0:
+                    print(
+                        "pass2 object-cfg: owners=%d/%d nodes=%d elapsed=%.1fs "
+                        "query=%.1fs cfg=%.1fs"
+                        % (streamed_owners, len(by_name), streamed_nodes,
+                           perf_counter() - started, streamed_query_seconds,
+                           streamed_cfg_seconds),
+                        file=sys.stderr, flush=True)
+            else:
+                # Prepare graph-derived operations in the parent. Workers receive only the
+                # pure CFG/state problem, never a Kuzu connection or the materialized graph.
+                for group in wave:
+                    if group["cyclic"]:
+                        continue
+                    analysable = [name for name in group["members"] if name in cfgs]
+                    if not analysable:
+                        continue
+                    name = analysable[0]
+                    prepared = _prepare_summary(
+                        sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
+                    future = (executor.submit(_analyze_prepared, prepared)
+                              if executor is not None else None)
+                    pending.append((name, prepared, future))
+
             for group in wave:
                 if group["cyclic"]:
                     continue
-                analysable = [name for name in group["members"] if name in cfgs]
-                if not analysable:
-                    continue
-                name = analysable[0]
-                prepared = _prepare_summary(
-                    sub, norm, by_name[name], functions[name], functions, summaries, cfgs[name])
-                future = (executor.submit(_analyze_prepared, prepared)
-                          if executor is not None else None)
-                pending.append((name, prepared, future))
 
             # Recursive SCCs retain their dependency-driven local worklist. They are
             # few and require newly changed member summaries immediately; meanwhile,
@@ -822,7 +1269,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                         break
                     summary, result = _summary_for(
                         sub, norm, by_name[name], functions[name], functions,
-                        summaries, cfgs[name])
+                        summaries, cfgs[name],
+                        cached_operations.get(name) if cached_operations is not None else None)
                     summary_runs[name] += 1
                     summary_transfers += result.transfers
                     artifacts[name] = result
@@ -834,6 +1282,10 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                             queue.append(caller)
                             queued.add(caller)
 
+                if stream is not None:
+                    for _name, records in retained_cyclic.pop(id(group), ()):
+                        evict(records)
+
             for name, prepared, future in pending:
                 summary, result = (future.result() if future is not None
                                    else _analyze_prepared(prepared))
@@ -841,6 +1293,23 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 artifacts[name] = result
                 summary_runs[name] += 1
                 summary_transfers += result.transfers
+            if progress and cached_operations is not None and retained_cyclic:
+                # Defensive cleanup if an unusual malformed schedule leaves a retained SCC
+                # without a normal iteration path.
+                for records in retained_cyclic.values():
+                    for _name, owner_records in records:
+                        evict(owner_records)
+
+    if progress and cached_operations is not None:
+        print(
+            "pass2 object-cfg: complete owners=%d/%d nodes=%d query=%.1fs cfg=%.1fs slowest=%s"
+            % (streamed_owners, len(by_name), streamed_nodes, streamed_query_seconds,
+               streamed_cfg_seconds,
+               [(name, round(seconds, 3), count)
+                for seconds, name, count in slowest_cfgs]),
+            file=sys.stderr, flush=True)
+    if cached_operations is not None:
+        cfg_seconds = streamed_query_seconds + streamed_cfg_seconds
 
     leads = []
     summary_seconds = perf_counter() - started - cfg_seconds

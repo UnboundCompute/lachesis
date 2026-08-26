@@ -39,11 +39,12 @@ def _dump(result) -> int:
     return EXIT_OK
 
 
-def _open(args, *, progress=None):
+def _open(args, *, progress=None, defer_maps=False):
     """Open the graph warm, or fail with a legible message. ``~`` is expanded by ``open``."""
     from lachesis.session import Analysis
 
-    return Analysis.open(args.graph, overlay=getattr(args, "overlay", None), progress=progress)
+    return Analysis.open(args.graph, overlay=getattr(args, "overlay", None),
+                        progress=progress, defer_maps=defer_maps)
 
 
 # --------------------------------------------------------------------------- enrich
@@ -55,9 +56,13 @@ def command_enrich(args: argparse.Namespace) -> int:
 
     with Progress(enabled=not args.json) as progress:
         progress.phase("loading graph")
-        analysis = _open(args)
+        # Pass 2 materializes the complete graph itself; defer navigation-only maps
+        # until the temporal bind enters Pass 3, avoiding another graph-sized set of
+        # references during the cold materialization peak.
+        analysis = _open(args, defer_maps=True)
         progress.phase("materializing dataflow tier + catalog bind")
-        report = analysis.enrich(hard_stop=args.hard_stop)
+        report = analysis.enrich(hard_stop=args.hard_stop,
+                                 workers=args.lifetime_workers)
     if args.json:
         return _dump(report)
     tier = "present" if report["dataflow_tier"] else "not built (in-memory or unsupported)"
@@ -80,7 +85,8 @@ def command_analyze(args: argparse.Namespace) -> int:
 
     with Progress(enabled=not args.json) as progress:
         analysis = _open(args, progress=progress_to(progress))
-        leads = analysis.analyze(engine=args.engine, hard_stop=args.hard_stop)
+        leads = analysis.analyze(engine=args.engine, hard_stop=args.hard_stop,
+                                 workers=args.lifetime_workers)
 
     # --summary is the rollup alone; it wins over any filter so `analyze --summary` always
     # reads the same whether or not a stray --pattern/--at rode along.
@@ -140,7 +146,10 @@ def command_candidates(args: argparse.Namespace) -> int:
     temporal = not args.no_temporal
     with Progress(enabled=not args.json) as progress:
         progress.phase("loading graph")
-        analysis = _open(args)
+        # Candidate binding consumes the cached bind/event sidecars and the
+        # structural view lazily. Do not eagerly build the four graph-sized
+        # navigation maps before the selected constructor is known.
+        analysis = _open(args, defer_maps=True)
         progress.phase("binding catalog" + (" + temporal skeleton" if temporal else ""))
         if args.census:
             result = analysis.census(args.constructor, temporal=temporal,
@@ -283,6 +292,9 @@ def add_reader_verbs(subcommands) -> None:
                         dest="hard_stop",
                         help="wall-clock budget for the temporal bind (default: "
                              "LACHESIS_HARD_STOP or 180s; 0 = unbounded)")
+    enrich.add_argument("--lifetime-workers", type=int, default=2, metavar="N",
+                        help="object-summary worker processes (default: 2; use 1 for lower "
+                             "memory/heat)")
     enrich.add_argument("--json", action="store_true", help="emit the report as JSON")
     enrich.set_defaults(handler=command_enrich)
 
@@ -299,6 +311,9 @@ def add_reader_verbs(subcommands) -> None:
     analyze.add_argument("--engine", default="object", help="lifetime engine (default: object)")
     analyze.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
                          dest="hard_stop", help="wall-clock budget (0 = unbounded)")
+    analyze.add_argument("--lifetime-workers", type=int, default=2, metavar="N",
+                         help="object-summary worker processes (default: 2; use 1 for lower "
+                              "memory/heat)")
     analyze.add_argument("-o", "--out", metavar="PATH", help="persist the (filtered) leads as JSON")
     analyze.add_argument("--json", action="store_true", help="emit the result as JSON")
     analyze.set_defaults(handler=command_analyze)

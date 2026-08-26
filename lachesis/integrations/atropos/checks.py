@@ -13,7 +13,6 @@ failure.
 """
 from __future__ import annotations
 
-import importlib.util
 import os
 import shutil
 import sys
@@ -38,17 +37,16 @@ def _locate_atropos() -> Path | None:
     candidates.append(repo_parent / "atropos")
     candidates.append(Path.home() / "project" / "unboundcompute" / "atropos")
     for candidate in candidates:
-        if (candidate / "tools" / "bind.py").exists():
+        if (candidate / "models").is_dir():
             return candidate
     return None
 
 
-def _load_binder(atropos_root: Path):
-    spec = importlib.util.spec_from_file_location(
-        "atropos_bind", str(atropos_root / "tools" / "bind.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _native_catalog():
+    from types import SimpleNamespace
+    from lachesis.integrations.atropos.models import load_models
+    from lachesis.integrations.atropos.native_bind import bind_all
+    return SimpleNamespace(load_models=load_models, bind_all=bind_all)
 
 
 class AtroposCSlice(unittest.TestCase):
@@ -61,7 +59,7 @@ class AtroposCSlice(unittest.TestCase):
         atropos = _locate_atropos()
         if atropos is None:
             raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
-        binder = _load_binder(atropos)
+        binder = _native_catalog()
         graph, _ = run_project(str(FIXTURE), enrich=False)
         cls.graph = graph
         cls.label_of = {n["id"]: n["properties"].get("label") or n.get("label")
@@ -142,7 +140,7 @@ class AtroposCSliceEnrich(unittest.TestCase):
         atropos = _locate_atropos()
         if atropos is None:
             raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
-        binder = _load_binder(atropos)
+        binder = _native_catalog()
         from lachesis.core.overlays import (
             default_overlay_registry, default_security_overlay_registry)
         from lachesis.core.overlays.registry import OverlayRegistry
@@ -369,7 +367,7 @@ class AtroposOutParamWitness(unittest.TestCase):
         if atropos is None:
             raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
         cls.atropos = atropos
-        cls.binder = _load_binder(atropos)
+        cls.binder = _native_catalog()
 
     def _witnesses(self, graph):
         by_id = {node["id"]: node for node in graph["nodes"]}
@@ -441,7 +439,7 @@ class AtroposInterprocWitness(unittest.TestCase):
         if atropos is None:
             raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
         cls.atropos = atropos
-        cls.binder = _load_binder(atropos)
+        cls.binder = _native_catalog()
 
     def _witnesses(self, graph):
         by_id = {node["id"]: node for node in graph["nodes"]}
@@ -476,7 +474,7 @@ class AtroposCSliceWitness(unittest.TestCase):
         if atropos is None:
             raise unittest.SkipTest("Atropos repo not found (set ATROPOS_ROOT)")
         cls.atropos = atropos
-        cls.binder = _load_binder(atropos)
+        cls.binder = _native_catalog()
 
     def _witnesses(self, graph):
         by_id = {node["id"]: node for node in graph["nodes"]}

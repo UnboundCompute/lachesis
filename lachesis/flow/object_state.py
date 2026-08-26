@@ -41,9 +41,17 @@ class AccessPath:
 
     root: str
     selectors: tuple[str, ...] = ()
+    _hash_cache: int | None = field(default=None, init=False, repr=False, compare=False)
 
     def child(self, selector: str) -> "AccessPath":
         return AccessPath(self.root, self.selectors + (selector,))
+
+    def __hash__(self) -> int:
+        cached = self._hash_cache
+        if cached is None:
+            cached = hash((self.root, self.selectors))
+            object.__setattr__(self, "_hash_cache", cached)
+        return cached
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,10 @@ class Operation:
     alternatives: tuple[tuple["Operation", ...], ...] = ()
     # Access form for the frozen skeleton split: dereference, pointer-value pass, or return.
     access: str = "deref"
+    # Native preparation may publish dominance-aware generations.  ``None``
+    # keeps compatibility with operations produced by the Python fallback.
+    generation: str | None = None
+    fresh_generation: str | None = None
 
 
 @dataclass(frozen=True, order=True)
@@ -122,6 +134,7 @@ class AbstractState:
     """One path-correlated environment and object-property state."""
 
     TRACE_LIMIT = 16
+    __slots__ = ("env", "facts", "slots", "trace", "freed_paths", "_key_cache")
 
     def __init__(
         self,
@@ -138,28 +151,56 @@ class AbstractState:
         # Pointer-field paths freed on this path but not yet reassigned. Book-keeping for
         # the free-then-reallocate compensation; almost always empty between statements.
         self.freed_paths = dict(freed_paths or {})
+        self._key_cache = None
 
     def clone(self) -> "AbstractState":
-        return AbstractState(self.env, self.facts, self.slots, self.trace,
-                             self.freed_paths)
+        # This is an extremely hot path in the fixpoint solver. Bypass the generic
+        # constructor's Mapping normalization: all five fields are already in their
+        # canonical representation here, so direct copies preserve isolation while
+        # avoiding a second layer of argument/default handling for every state.
+        cloned = object.__new__(AbstractState)
+        cloned.env = self.env.copy()
+        cloned.facts = self.facts.copy()
+        cloned.slots = self.slots.copy()
+        cloned.trace = self.trace
+        cloned.freed_paths = self.freed_paths.copy()
+        cloned._key_cache = self._key_cache
+        return cloned
+
+    def shallow_clone(self) -> "AbstractState":
+        """Fork for read-only operations without copying the state maps."""
+        cloned = object.__new__(AbstractState)
+        cloned.env = self.env
+        cloned.facts = self.facts
+        cloned.slots = self.slots
+        cloned.trace = self.trace
+        cloned.freed_paths = self.freed_paths
+        cloned._key_cache = self._key_cache
+        return cloned
 
     @timeit(name="object_state.AbstractState.key")
     def key(self) -> tuple:
+        cached = self._key_cache
+        if cached is not None:
+            return cached
         # These mappings are mathematical sets for state-equivalence purposes.
         # Sorting them used ``repr(object_id)`` because recursively constructed phi
         # IDs are not naturally orderable; on large CFGs that repeatedly rendered
         # enormous nested tuples.  Frozensets preserve exact structural equality and
         # hashing without inventing an ordering or allocating those strings.
-        return (
+        key = (
             frozenset(self.env.items()),
             frozenset(self.facts.items()),
             frozenset(self.slots.items()),
             self.trace,
             frozenset(self.freed_paths.items()),
         )
+        self._key_cache = key
+        return key
 
     def seed_parameter(self, path: AccessPath, position: int) -> None:
         """Bind a formal root to a symbolic caller-owned object."""
+        self._key_cache = None
         if path.selectors:
             raise ValueError("a formal parameter seed must be a root access path")
         oid = ("param", position, ())
@@ -193,6 +234,7 @@ class AbstractState:
         return oid
 
     def bind(self, path: AccessPath, oid: ObjectId) -> None:
+        self._key_cache = None
         if not path.selectors:
             self.env[path.root] = oid
             return
@@ -303,6 +345,10 @@ class AbstractState:
             self.facts[oid] = (facts | freed) if is_summary else freed
 
     def apply(self, op: Operation, findings: set[Finding]) -> None:
+        # A transfer may mutate any of the five key components. Invalidate once at
+        # the public mutation boundary; the internal helpers can then update maps
+        # freely without repeatedly clearing the cache.
+        self._key_cache = None
         if op.kind == OpKind.ALLOC:
             self._compensate_reassignment(op)
             self._fresh(op, ObjectFact.ALLOCATED)
@@ -466,11 +512,23 @@ class ObjectStateAnalyzer:
     @staticmethod
     @timeit(name="object_state.ObjectStateAnalyzer._transfer")
     def _transfer(
-        states: Iterable[AbstractState],
+        states: Iterable[AbstractState] | Mapping[tuple, AbstractState],
         operations: Sequence[Operation],
         findings: set[Finding],
     ) -> dict[tuple, AbstractState]:
-        current = [state.clone() for state in states]
+        if not operations and isinstance(states, Mapping):
+            # A control-flow node with no placed operations cannot mutate any incoming
+            # state. Preserve the caller's exact keys and state objects; cloning and
+            # rehashing these nodes accounted for most of the 1.5M key calls on libxml2.
+            return dict(states)
+        values = states.values() if isinstance(states, Mapping) else states
+        if operations and all(op.kind == OpKind.USE for op in operations):
+            # USE resolves without creating objects and only appends a trace effect for
+            # parameter/return observations. The state maps are therefore immutable for
+            # this transfer; fork their object shell and avoid copying large dictionaries.
+            current = [state.shallow_clone() for state in values]
+        else:
+            current = [state.clone() for state in values]
         for op in operations:
             if op.kind != OpKind.SUMMARY:
                 for state in current:
@@ -506,9 +564,77 @@ class ObjectStateAnalyzer:
                 unplaced.append(op)
         for placed in at.values():
             placed.sort(key=lambda op: op.ordinal)
+        seed = initial or AbstractState()
+        findings = set() if self.collect_findings else _DiscardFindings()
+
+        # A translated function can have a large control-flow skeleton but no placed
+        # object operation (for example a pure wrapper or declaration-only body). Its
+        # abstract state is identical on every path, so a fixpoint would only spend time
+        # hashing and rejoining the same value. Preserve snapshots for consumers while
+        # skipping the solver entirely.
+        if not any(at.values()):
+            state = seed.clone()
+            # No operation can mutate this state.  Keep one immutable snapshot object
+            # for the whole CFG instead of cloning the same empty maps once per node;
+            # large wrapper/declaration-only functions otherwise turn this fast path
+            # into an avoidable allocation and memory-retention cost.
+            point_states = {node: (state,) for node in nodes}
+            post_states = {node: (state,) for node in nodes}
+            return AnalysisResult(
+                findings=findings,
+                exit_states=(state,),
+                unplaced=tuple(unplaced),
+                transfers=0,
+                widenings=0,
+                capped=False,
+                point_states=point_states,
+                post_states=post_states,
+            )
+
+        # Most small helpers have a single straight-line CFG. There is exactly one
+        # abstract state on that shape: no join, loop, or summary alternative can create
+        # a second state. Carry it directly instead of allocating a keyed state map and
+        # hashing five frozensets at every node. The generic fixpoint below remains the
+        # authority for every graph with control-flow fan-out, fan-in, or a back-edge.
+        linear_index = {node: index for index, node in enumerate(nodes)}
+        linear = all(len(successors.get(node, ())) <= 1 for node in nodes)
+        linear = linear and all(
+            successor in linear_index and linear_index[successor] > linear_index[node]
+            for node in nodes
+            for successor in successors.get(node, ())
+        )
+        linear = linear and all(
+            op.kind != OpKind.SUMMARY for placed in at.values() for op in placed)
+        if linear:
+            chain = []
+            current = nodes[0]
+            seen = set()
+            while current is not None and current not in seen:
+                seen.add(current)
+                chain.append(current)
+                next_nodes = successors.get(current, ())
+                current = next_nodes[0] if next_nodes else None
+            if len(chain) == len(nodes) and set(chain) == set(nodes):
+                state = (initial or AbstractState()).clone()
+                point_states = {}
+                post_states = {}
+                for node in chain:
+                    point_states[node] = (state.clone(),)
+                    for op in at.get(node, ()):
+                        state.apply(op, findings)
+                    post_states[node] = (state.clone(),)
+                return AnalysisResult(
+                    findings=findings,
+                    exit_states=(state.clone(),),
+                    unplaced=tuple(unplaced),
+                    transfers=len(chain),
+                    widenings=0,
+                    capped=False,
+                    point_states=point_states,
+                    post_states=post_states,
+                )
 
         incoming: dict[Hashable, dict[tuple, AbstractState]] = {node: {} for node in nodes}
-        seed = initial or AbstractState()
         incoming[nodes[0]][seed.key()] = seed
         work = deque([nodes[0]])
         queued = {nodes[0]}
@@ -516,23 +642,22 @@ class ObjectStateAnalyzer:
         post_snapshots: dict[Hashable, dict[tuple, AbstractState]] = {
             node: {} for node in nodes
         }
-        findings = set() if self.collect_findings else _DiscardFindings()
         transfers = widenings = 0
         cap = self.transfer_cap or max(10000, len(nodes) * 500)
 
         while work and transfers < cap:
             node = work.popleft()
             queued.discard(node)
-            outgoing = self._transfer(incoming[node].values(), at.get(node, ()), findings)
+            outgoing = self._transfer(incoming[node], at.get(node, ()), findings)
             post_snapshots[node].update(
                 (key, state.clone()) for key, state in outgoing.items())
             transfers += len(outgoing)
             for successor in successors.get(node, ()):
                 if successor not in incoming:
                     continue
-                before = set(incoming[successor])
-                for key, state in outgoing.items():
-                    incoming[successor].setdefault(key, state)
+                target = incoming[successor]
+                new_items = [(key, state) for key, state in outgoing.items()
+                             if key not in target]
                 # Sticky widening: once a node's disjunct budget is exceeded it stays
                 # collapsed to a single joined state, and every later update joins into
                 # that state instead of re-expanding. Without this a loop node oscillates
@@ -540,22 +665,37 @@ class ObjectStateAnalyzer:
                 # widen again -- burning the whole transfer budget and capping the
                 # function. Collapsing monotonically bounds the lattice height so the
                 # fixpoint terminates; the join is a sound may-approximation.
-                if len(incoming[successor]) > self.max_disjuncts or successor in widened:
-                    merged = join_states(incoming[successor].values(), successor)
-                    incoming[successor] = {merged.key(): merged}
-                    if successor not in widened:
-                        widened.add(successor)
+                if (len(target) + len(new_items) > self.max_disjuncts
+                        or successor in widened):
+                    if not new_items:
+                        continue
+                    old_keys = tuple(target)
+                    candidates = tuple(target.values()) + tuple(
+                        state for _key, state in new_items)
+                    merged = join_states(candidates, successor)
+                    merged_key = merged.key()
+                    incoming[successor] = {merged_key: merged}
+                    widened.add(successor)
                     widenings += 1
+                    changed = old_keys != (merged_key,)
+                else:
+                    for key, state in new_items:
+                        target[key] = state
+                    changed = bool(new_items)
                 # Re-queue only when the successor's state set actually changed; a
                 # collapsed node that re-joins to the same key has reached its fixpoint.
-                if set(incoming[successor]) != before and successor not in queued:
+                if changed and successor not in queued:
                     work.append(successor)
                     queued.add(successor)
 
         exits: list[AbstractState] = []
         for node in nodes:
             if not successors.get(node):
-                exits.extend(self._transfer(incoming[node].values(), at.get(node, ()), findings).values())
+                # Exit nodes have no successors, so they cannot be re-queued after their
+                # first transfer. ``post_snapshots`` already contains their outgoing
+                # states; re-running the transfer here duplicated the hottest state-key
+                # hashing step for every terminal node.
+                exits.extend(post_snapshots[node].values())
         point_states = {
             node: tuple(state.clone() for state in states.values())
             for node, states in incoming.items()

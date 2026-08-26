@@ -23,7 +23,7 @@ _LIFETIME_PATTERNS = {"double-free", "use-after-free"}
 _DEFAULT_LIFETIME_ENGINE = "object"
 
 
-def _lifetime_slice(F, succ, lang="c"):
+def _lifetime_slice(F, succ, lang="c", *, include_source_roots=True):
     """Select the semantic call-graph region carrying lifecycle or sink facts.
 
     The name is retained for API compatibility.  The production skeleton must
@@ -56,7 +56,7 @@ def _lifetime_slice(F, succ, lang="c"):
         # and still be the only route to a matcher pattern.  The source
         # discovery result is the authoritative reachability gate; Claus and
         # the matcher decide later whether the region contains useful facts.
-        if (function.get("source_reachable") and
+        if (include_source_roots and function.get("source_reachable") and
             materializable(function))
         or any(event.get("kind") in {"alloc", "free", "escape", "realloc"}
                for event in function.get("events", ()))
@@ -207,6 +207,14 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         }
 
     store.ensure_dataflow_tier()
+    # A Pass-2 session may have deliberately deferred Kùzu's navigation buckets
+    # until after whole-graph enrichment. At this boundary the retained materialized
+    # graph has already been consumed by the structural bind, so rebuilding maps no
+    # longer overlaps that graph-sized temporary.
+    ensure_maps = getattr(store.index, "ensure_maps", None)
+    if ensure_maps is not None:
+        ensure_maps()
+    _emit("navigation maps")
     tier_done = perf_counter()
     _emit("dataflow tier")
     requested = lifetime_engine or os.environ.get(
@@ -223,11 +231,79 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     # appropriate catalog/normalizer and contribute their own graph facts; the
     # scheduler, Claus graph, and matcher must not make C the dispatch gate.
     object_requested = requested != "legacy"
-    if object_requested:
+    # In the native semantic lane Rust already consumes the Pass-1 substrate,
+    # prepares/solves the object flow, and emits the compact semantic graph.
+    # Do not rebuild an unused Python F/coverage/summary graph before consuming
+    # that result.  This is deliberately gated: the compact graph is not yet
+    # recall-equivalent to the compatibility renderer for every lead family.
+    if object_requested and os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+        from .native_translate import build_native_semantic_graph
+        native_graph = build_native_semantic_graph(store, lang=lang)
+        if native_graph is not None:
+            _emit("translation")
+            _emit("projection")
+            _emit("summaries")
+            semantic_build_started = perf_counter()
+            semantic_build_done = perf_counter()
+            _emit("semantic graph")
+            semantic_match_started = perf_counter()
+            native_leads = match_graph(native_graph)
+            semantic_match_done = perf_counter()
+            _emit("matching")
+            finished = perf_counter()
+            return {
+                "F": None, "succ": {}, "summaries": {}, "skeletons": [],
+                "semantic_graph": native_graph,
+                "coverage": native_graph.coverage,
+                "leads": native_leads,
+                "lifetime": {
+                    "requested": requested, "active": "object",
+                    "available": True, "timed_out": False,
+                    "diagnostics": {"backend": "rust-semantic",
+                                     "analyzed": len(native_graph.nodes)},
+                    "candidate_functions": len(native_graph.fragments),
+                    "semantic_graph_nodes": len(native_graph.nodes),
+                    "semantic_graph_edges": sum(
+                        len(edges) for edges in native_graph.edges.values()),
+                    "semantic_leads": len(native_leads),
+                    "coverage": native_graph.coverage,
+                },
+                "timings": {
+                    "dataflow_tier_seconds": round(tier_done - started, 6),
+                    "projection_seconds": 0.0,
+                    "legacy_summary_seconds": 0.0,
+                    "skeleton_seconds": 0.0,
+                    "matching_seconds": round(finished - tier_done, 6),
+                    "total_seconds": round(finished - started, 6),
+                    "semantic_build_seconds": round(
+                        semantic_build_done - semantic_build_started, 6),
+                    "semantic_match_seconds": round(
+                        semantic_match_done - semantic_match_started, 6),
+                },
+            }
+    native_translation = os.environ.get("LACHESIS_NATIVE_TRANSLATION") == "1"
+    if object_requested and not native_translation:
+        # Pass 1 now emits a compact binary translation-facts sidecar.  Its
+        # presence is the capability signal: fresh graphs use the Rust
+        # projection automatically, while older stores retain compatibility
+        # until they are rebuilt.
+        from lachesis.nav.dataflow.substrate import translation_facts_path
+        base = (getattr(store.index, "_pass3_cache_base", None)
+                or getattr(store.index, "_db_dir", None))
+        native_translation = bool(base and translation_facts_path(base).is_file())
+    if object_requested and native_translation:
+        from .native_translate import build_native_F
+        native_translation = build_native_F(store, lang=lang, return_graph=True)
+        if native_translation is None:
+            F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
+        else:
+            F, succ, analysis_graph = native_translation
+    elif object_requested:
         F, succ, analysis_graph = build_F(store, lang=lang, return_graph=True)
     else:
         F, succ = build_F(store, lang=lang)
         analysis_graph = None
+    _emit("translation")
     cached_coverage = getattr(store, "_pass3_coverage_cache", None)
     if (cached_coverage is not None and cached_coverage[0] is F
             and cached_coverage[1] is succ):
@@ -238,7 +314,21 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     _emit("projection")
     if _expired():
         return _timed_out_return("summaries", F=F, succ=succ, coverage=coverage)
-    summaries = _summaries_for(F, succ)
+    # Native object mode owns lifetime summaries.  The Python composer only
+    # supplies reach/presence sink-flow observations on the production path.
+    # Shadow and legacy retain the complete compatibility summary.
+    native_summaries = None
+    # The native semantic path owns the lifetime preparation/solve stage.  It is
+    # therefore also able to provide the compact reach summaries; running the
+    # Python summary composer here would recreate the same call/parameter work
+    # before Rust prepares the substrate again.
+    if object_requested and (
+            os.environ.get("LACHESIS_NATIVE_SUMMARIES") == "1"
+            or os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1"):
+        from .native_translate import build_native_summaries
+        native_summaries = build_native_summaries(store, lang=lang)
+    summaries = (native_summaries if native_summaries is not None else
+                 _summaries_for(F, succ, reach_only=object_requested))
     legacy_summaries_done = perf_counter()
     _emit("summaries")
     if _expired():
@@ -262,8 +352,35 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
             name: [callee for callee in succ.get(name, ()) if callee in object_functions]
             for name in object_functions
         }
+        native_semantic = None
+        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+            from .native_translate import build_native_semantic_graph
+            # Rust's path-only semantic entry point prepares, solves, and emits
+            # the compact event graph in one pass.  Do this before the legacy
+            # object analyzer so the native mode does not pay for both engines.
+            native_semantic = build_native_semantic_graph(store, lang=lang)
+
         from .emit import _native_object_substrate
-        if _native_object_substrate(analysis_graph):
+        if native_semantic is not None:
+            # The compact native graph is the authoritative result for this
+            # opt-in lane.  There is deliberately no Python lifetime fallback
+            # here: if Rust cannot produce the graph, the code below falls back
+            # to the established compatibility path instead.
+            object_result = ObjectLifetimeResult(
+                (), {}, {
+                    "backend": "rust-semantic",
+                    "analyzed": len(object_functions),
+                    "unsafe_functions": [],
+                    "seed_unsafe_functions": [],
+                    "unsafe_object_flow": {},
+                    "unplaced": 0,
+                    "unplaced_functions": {},
+                    "capped": [],
+                    "widenings": 0,
+                    "transfers": 0,
+                    "total_seconds": 0.0,
+                }, {})
+        elif _native_object_substrate(analysis_graph):
             object_result = analyze_object_lifetimes(
                 store, object_functions, object_succ, lang=lang, graph=analysis_graph,
                 workers=workers, deadline=deadline)
@@ -318,17 +435,20 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         snapshot_path = (f"{store.graph_path}.pass3.json"
                          if snapshot_enabled and getattr(store, "graph_path", None)
                          else None)
+        if native_semantic is not None:
+            snapshot_path = None
         if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
             claus.fragments.load_snapshot(
                 snapshot_path, F, lang, analysis_graph,
                 object_result.summaries, summaries, object_result.artifacts)
             store._pass3_snapshot_loaded = True
         semantic_build_started = perf_counter()
-        semantic_graph = claus.build(
-            store, F, succ, lang=lang, graph=analysis_graph,
-            summaries=object_result.summaries, coverage=semantic_coverage,
-            reach_summaries=summaries, state_artifacts=object_result.artifacts,
-            cfgs=object_result.cfgs)
+        semantic_graph = (native_semantic if native_semantic is not None else
+                          claus.build(
+                              store, F, succ, lang=lang, graph=analysis_graph,
+                              summaries=object_result.summaries, coverage=semantic_coverage,
+                              reach_summaries=summaries, state_artifacts=object_result.artifacts,
+                              cfgs=object_result.cfgs))
         semantic_build_done = perf_counter()
         _emit("semantic graph")
         if snapshot_path:
@@ -351,6 +471,11 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
         # filtered per-object by the object-flow map. Legacy fallback covers seed-unsafe.
         seed_unsafe = set(diagnostics.get("seed_unsafe_functions", unsafe))
+        if seed_unsafe and requested == "object":
+            # Only failed native functions need the compatibility typestate
+            # renderer.  Pay for the complete Python summaries lazily, after
+            # the native semantic graph has already been built.
+            summaries = _summaries_for(F, succ)
         if requested == "shadow":
             # Shadow mode is an explicit differential, so it must materialize
             # the legacy stream even when object analysis has no fallback

@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+from time import perf_counter
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
@@ -73,13 +75,13 @@ class Analysis:
 
     @classmethod
     def open(cls, path: str, *, overlay: str | None = None,
-             progress: ProgressFn | None = None) -> "Analysis":
+             progress: ProgressFn | None = None, defer_maps: bool = False) -> "Analysis":
         """Load a graph once and return a warm session over it. ``~`` is expanded."""
         from lachesis.nav.graph_store import GraphStore
 
         path = os.path.expanduser(path)
         overlay = os.path.expanduser(overlay) if overlay else overlay
-        store = GraphStore.load(path, overlay_path=overlay)
+        store = GraphStore.load(path, overlay_path=overlay, defer_maps=defer_maps)
         return cls(store, progress=progress)
 
     @classmethod
@@ -125,6 +127,19 @@ class Analysis:
 
     # -- the two heavy builds, one implementation each ------------------------------
 
+    @staticmethod
+    def _pass2_timing(label: str, started: float) -> None:
+        """Emit opt-in timings for the catalog/temporal half of Pass 2."""
+        if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
+            print(f"[lachesis pass2] {label}: {perf_counter() - started:.3f}s",
+                  file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _pass2_progress(label: str, elapsed: float) -> None:
+        if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
+            print(f"[lachesis pass2] temporal {label}: {elapsed:.3f}s",
+                  file=sys.stderr, flush=True)
+
     def _flow_bundle(self, engine: str | None = None, lang: str = "c",
                      **run_kwargs: Any) -> dict:
         """The interprocedural flow pass over the whole graph, computed once and cached.
@@ -145,7 +160,8 @@ class Analysis:
         return bundle
 
     def _bind_bundle(self, *, temporal: bool = True,
-                     deadline: Deadline | None = None) -> dict:
+                     deadline: Deadline | None = None,
+                     workers: int | None = None) -> dict:
         """The catalog-stamped graph and its cached obligation registry.
 
         Candidate enumeration binds catalog facts against the core symbol index. The
@@ -176,17 +192,21 @@ class Analysis:
             full = self._built.get(("bind", True))
             if full is not None and not full.get("partial"):
                 return full
-        bundle = self._build_bind(temporal=temporal, deadline=deadline)
+        bundle = self._build_bind(temporal=temporal, deadline=deadline,
+                                  workers=workers)
         if not bundle.get("partial"):
             self._built[key] = bundle
         return bundle
 
-    def _build_bind(self, *, temporal: bool, deadline: Deadline | None) -> dict:
+    def _build_bind(self, *, temporal: bool, deadline: Deadline | None,
+                    workers: int | None = None) -> dict:
         from lachesis.planner.registry import default_candidate_registry
         from lachesis import bind_cache
 
         # The sidecar always holds the FULL temporal bind, so a hit answers both modes.
+        started = perf_counter()
         cached = bind_cache.load(self.store)
+        self._pass2_timing("bind sidecar load", started)
         if cached is not None:
             stamped, summary = cached
             complete = True
@@ -194,7 +214,8 @@ class Analysis:
             stamped, summary = self._structural_bind()
             complete = False  # temporal families were not evaluated in the fast path
         else:
-            stamped, summary, complete = self._enrich_and_merge(deadline=deadline)
+            stamped, summary, complete = self._enrich_and_merge(
+                deadline=deadline, workers=workers)
             if complete:
                 bind_cache.store(self.store, stamped, summary)
             else:
@@ -214,12 +235,159 @@ class Analysis:
         """The catalog bind alone: fast, and forces no dataflow tier. This is the fast path's
         whole cost, and the base the temporal merge builds on."""
         from lachesis.integrations.atropos.enrich import atropos_enrich
-        from lachesis.nav.kuzu_index import materialize_graph
+        from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
-        graph = materialize_graph(self.store.index)
-        return atropos_enrich(graph, complete_dataflow=False)
+        started = perf_counter()
+        index = getattr(self.store, "index", None)
+        projection_fn = getattr(index, "atropos_projection", None)
+        if projection_fn is not None:
+            # Bind against the compact callsite projection before materializing the
+            # million-node graph.  Keeping the large graph out of the Python heap
+            # during canonical projection avoids allocator/GC pressure that turned a
+            # 0.1s standalone adapter call into ~30s on the cold full-graph path.
+            projection = projection_fn()
+            compact, summary = atropos_enrich(
+                projection, complete_dataflow=False,
+                symbol_index_source=index, compact_structural=True,
+            )
+            delta_nodes = [
+                node for node in compact.get("nodes", ())
+                if (node.get("properties") or {}).get("fact_origin") == "atropos-model"
+            ]
+            delta_edges = [
+                edge for edge in compact.get("edges", ())
+                if (edge.get("properties") or {}).get("fact_origin") == "atropos-model"
+                or edge.get("kind") in {"TAINT_SOURCE", "TAINT_SINK"}
+            ]
+            self._pass2_timing("catalog structural bind", started)
+            materialize_started = perf_counter()
+            # The catalog projection already contains every callsite/value record
+            # structural candidates can bind to.  Materializing the complete CPG
+            # here used to add ~980k nodes/~2M edges and cost ~45s on libxml2.  Add
+            # only the branch substrate and the bounded reverse value cones needed
+            # for candidate evidence; the temporal path has its own native sidecars.
+            graph = self._compact_structural_graph(index, projection, delta_nodes,
+                                                    delta_edges)
+            self._pass2_timing("bind graph materialize", materialize_started)
+            self._pass2_timing("catalog structural bind total", started)
+            return graph, summary
 
-    def _enrich_and_merge(self, *, deadline: Deadline | None = None) -> tuple[dict, dict, bool]:
+        graph = self.store.take_retained_enriched_graph()
+        if graph is None:
+            graph = materialize_graph(self.store.index)
+            self._pass2_timing("bind graph materialize", started)
+        else:
+            # enrich_graph sorts by the public three-field edge key.  The Kùzu
+            # materializer also orders equal triples by properties, which is
+            # observable to downstream bind/flow iteration.  Match that canonical
+            # order on the one-shot retained view before handing it to the binder.
+            _sort_materialized_edges(graph["edges"])
+            self._pass2_timing("bind retained graph sort", started)
+        bind_started = perf_counter()
+        result = atropos_enrich(
+            graph, complete_dataflow=False,
+            symbol_index_source=getattr(self.store, "index", None),
+            compact_structural=True,
+        )
+        self._pass2_timing("catalog structural bind", bind_started)
+        self._pass2_timing("catalog structural bind total", started)
+        return result
+
+    @staticmethod
+    def _compact_structural_graph(index, projection, delta_nodes, delta_edges) -> dict:
+        """Build the structural candidate view without materializing the whole CPG.
+
+        Structural enumerators need call/value records, branch-region containment,
+        and reaching-definition evidence.  They do not need declarations, AST
+        wrappers, or unrelated edges.  Keep the projection as the base, fetch all
+        branch-region records (small and shared), then walk backwards only from the
+        Atropos sink values through ``VALUE_FLOWS_TO``.  This is exact for the
+        evidence the structural constructors consume and avoids a graph-sized
+        Python object population on every cold Pass 2 bind.
+        """
+        nodes = {node["id"]: node for node in projection.get("nodes", ())}
+        edges = list(projection.get("edges", ()))
+        for node in delta_nodes:
+            nodes[node["id"]] = node
+        edges.extend(delta_edges)
+
+        from lachesis.planner.unbounded_copy import _REGION_EDGE_KINDS
+
+        materialize_started = perf_counter()
+        region_edges = list(index.edges_of_kind(*_REGION_EDGE_KINDS))
+        edges.extend(region_edges)
+        region_done = perf_counter()
+        needed = {edge.get("source") for edge in region_edges}
+        needed.update(edge.get("target") for edge in region_edges)
+
+        # Atropos sink nodes identify the roots of the only value-flow walks the
+        # structural constructors perform.  Traverse all incoming flow edges so
+        # pass-through and definition/origin facts remain identical to the full
+        # graph view, while never retaining unrelated function-local flow.
+        work = [
+            (node.get("properties") or {}).get("value_id")
+            for node in delta_nodes
+            if node.get("kind") == "sink"
+        ]
+        seen = set()
+        while work:
+            batch = []
+            while work and len(batch) < 5000:
+                target = work.pop()
+                if target and target not in seen:
+                    seen.add(target)
+                    needed.add(target)
+                    batch.append(target)
+            if not batch:
+                continue
+            batch_edges = (index.incoming_edges_for_targets(batch, "VALUE_FLOWS_TO")
+                           if hasattr(index, "incoming_edges_for_targets") else
+                           [edge for target in batch
+                            for edge in index.incoming_of_kind(
+                                target, "VALUE_FLOWS_TO")])
+            for edge in batch_edges:
+                edges.append(edge)
+                source = edge.get("source")
+                if source and source not in seen:
+                    work.append(source)
+                if source:
+                    needed.add(source)
+        cone_done = perf_counter()
+
+        # Fetch only endpoints absent from the narrow Atropos projection.  Kùzu's
+        # batch warmer turns this into a small number of primary-key probes rather
+        # than one query per record.
+        missing = needed.difference(nodes)
+        # Cone endpoints are used by the structural evidence walkers for their
+        # identity, kind, label, and source span.  The Atropos projection already
+        # carries the full property tails for every candidate call/value node;
+        # inflating another 90k Kùzu property blobs here only to read those header
+        # fields cost ~18s on libxml2.  Promoted headers are exact for this use and
+        # avoid that allocation/decompression entirely.
+        headers = getattr(index, "node_headers", None)
+        if missing and headers is not None:
+            for node in headers(missing):
+                nodes[node["id"]] = node
+        else:
+            warmer = getattr(index, "_warm_nodes", None)
+            if missing and warmer is not None:
+                warmer(missing)
+            for node_id in missing:
+                node = index.nodes.get(node_id)
+                if node is not None:
+                    nodes[node_id] = node
+        if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
+            print(
+                "[lachesis pass2] structural phases: regions=%.3fs cone=%.3fs "
+                "warm=%.3fs region_edges=%d cone_nodes=%d missing=%d"
+                % (region_done - materialize_started, cone_done - region_done,
+                   perf_counter() - cone_done, len(region_edges), len(seen),
+                   len(missing)),
+                file=sys.stderr, flush=True)
+        return {"nodes": list(nodes.values()), "edges": edges}
+
+    def _enrich_and_merge(self, *, deadline: Deadline | None = None,
+                          workers: int | None = None) -> tuple[dict, dict, bool]:
         """The structural bind plus the Pass 3 semantic skeleton the temporal families read.
 
         Returns ``(stamped, summary, complete)`` where ``complete`` is ``False`` if any flow
@@ -231,6 +399,46 @@ class Analysis:
         from lachesis.planner.temporal_obligation import merge_semantic_nodes
 
         stamped, summary = self._structural_bind()
+        # Experimental native temporal seam.  Rust owns substrate decoding and
+        # lifetime solving; only compact findings are retained in the bind
+        # sidecar.  Keep this disabled until its candidate coverage is proven
+        # equivalent to the semantic graph path.
+        if os.environ.get("LACHESIS_NATIVE_TEMPORAL") == "1":
+            from lachesis.flow.native_translate import build_native_temporal
+            native = build_native_temporal(self.store)
+            if native is not None:
+                stamped["native_temporal"] = {
+                    "functions": [{
+                        "id": item.id,
+                        "findings": [{
+                            "function": finding.function,
+                            "pattern": finding.pattern,
+                            "path": {
+                                "root": finding.path.root if finding.path else "",
+                                "selectors": list(finding.path.selectors) if finding.path else [],
+                            },
+                            "line": finding.line if finding.has_line else None,
+                            "node": finding.node,
+                        } for finding in item.findings],
+                        "transfers": item.transfers,
+                        "widenings": item.widenings,
+                        "capped": item.capped,
+                    } for item in native.functions],
+                }
+                complete = not any(item.capped for item in native.functions)
+                return stamped, summary, complete
+        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+            from lachesis.flow.native_translate import ensure_native_semantic_sidecar
+            sidecar = ensure_native_semantic_sidecar(self.store)
+            if sidecar is not None:
+                # The semantic graph is already a Rust-owned binary artifact.
+                # Do not route it through run_pass just to reconstruct Python
+                # nodes that the bind command never queries.
+                stamped["semantic_graph"] = {
+                    "native_sidecar": str(sidecar),
+                    "coverage": {"converged": True},
+                }
+                return stamped, summary, True
         # Temporal families observe semantic operations (release, origin, dereference) that are
         # not catalog role nodes in the base CPG. Reuse the same cached Pass 3 graph the flow
         # bundle exposes rather than a second traversal or a language-specific lifecycle
@@ -238,18 +446,49 @@ class Analysis:
         semantic_nodes: dict = {}
         semantic_coverages: list = []
         complete = True
-        for language in summary.get("languages") or ("c",):
-            flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline)
+        native_semantic_graph = None
+        # The native semantic sidecar is language-neutral: Rust scans the
+        # complete Pass-1 substrate once and emits all function fragments in
+        # one result.  The catalog language list is a list of model families,
+        # not a request to rerun that whole-graph flow once per language.  Keep
+        # the per-language loop for the compatibility renderer only.
+        languages = (("c",) if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1"
+                     else (summary.get("languages") or ("c",)))
+        for language in languages:
+            flow_started = perf_counter()
+            flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline,
+                                      workers=workers,
+                                      progress=self._pass2_progress)
                     if language == "c" else
                     run_pass(self.store, lang=language, lifetime_engine="object",
-                             deadline=deadline))
+                             deadline=deadline, workers=workers,
+                             progress=self._pass2_progress))
+            self._pass2_timing(f"catalog temporal flow {language}", flow_started)
             if (flow.get("lifetime") or {}).get("timed_out"):
                 complete = False
             semantic = flow.get("semantic_graph")
             if semantic is not None:
-                merge_semantic_nodes(semantic_nodes, semantic, language)
+                if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+                    native_semantic_graph = semantic
+                else:
+                    merge_semantic_nodes(semantic_nodes, semantic, language)
                 semantic_coverages.append(dict(semantic.coverage or {}))
-        if semantic_nodes:
+        if native_semantic_graph is not None:
+            from lachesis.flow.native_translate import native_semantic_sidecar_path
+            sidecar = native_semantic_sidecar_path(self.store)
+            stamped["semantic_graph"] = {
+                "native_sidecar": str(sidecar) if sidecar else "",
+            }
+            if semantic_coverages:
+                stamped["semantic_graph"]["coverage"] = {
+                    "converged": all(item.get("converged", True)
+                                     for item in semantic_coverages),
+                    "uncovered_states": [state for item in semantic_coverages
+                                         for state in item.get("uncovered_states", ())],
+                    "uncovered_contexts": [context for item in semantic_coverages
+                                           for context in item.get("uncovered_contexts", ())],
+                }
+        elif semantic_nodes:
             stamped["semantic_graph"] = {"nodes": semantic_nodes}
             if semantic_coverages:
                 stamped["semantic_graph"]["coverage"] = {
@@ -309,7 +548,8 @@ class Analysis:
     # -- library surface: pass 2 (enrich -> warm sidecars) --------------------------
 
     def enrich(self, *, hard_stop: float | None = None,
-               deadline: Deadline | None = None) -> dict:
+               deadline: Deadline | None = None,
+               workers: int | None = None) -> dict:
         """Materialize the dataflow tier and the catalog bind to disk, so later reads are warm.
 
         Pass 2 as one call. ``ensure_dataflow_tier`` folds the overlay dataflow tier over the
@@ -336,10 +576,15 @@ class Analysis:
         from lachesis import bind_cache
         from lachesis.nav.graph_store import dataflow_overlay_path
 
+        # Do not retain the whole enriched Python graph for the catalog bind.  The retained
+        # path requires sorting roughly two million edge dictionaries before binding, which
+        # can dominate Pass 2 and keep the graph-sized object peak alive.  The indexed
+        # materializer below is bounded and was already the measured ~46s path on libxml2.
         self.store.ensure_dataflow_tier()
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
-                                   deadline=self._resolve_deadline(hard_stop, deadline))
+                                   deadline=self._resolve_deadline(hard_stop, deadline),
+                                   workers=workers)
         graph_path = getattr(self.store, "graph_path", None)
         dataflow = dataflow_overlay_path(self.store._core_path) if graph_path else None
         sidecar = bind_cache.sidecar_path(graph_path) if graph_path else None

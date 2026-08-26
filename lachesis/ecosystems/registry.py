@@ -1,7 +1,7 @@
 """Language-neutral registry contract for runtime and framework models."""
 from __future__ import annotations
 
-from typing import Iterable, Protocol, Tuple
+from typing import Callable, Iterable, Protocol, Tuple
 
 from ..core.composition import GraphAccumulator, GraphDelta
 from ..core.contract import ContractError
@@ -16,6 +16,9 @@ class EcosystemModel(Protocol):
     def applies(self, graph: dict, package_inventory: frozenset[str]) -> bool: ...
 
     def enrich(self, graph: dict, index: GraphIndex | None = None) -> GraphDelta: ...
+
+
+DeltaSink = Callable[[list[dict], list[dict]], None]
 
 
 class EcosystemRegistry:
@@ -55,6 +58,7 @@ class EcosystemRegistry:
         languages: Iterable[str],
         capabilities: dict[str, str],
         index: GraphIndex | None = None,
+        delta_sink: DeltaSink | None = None,
     ) -> dict:
         """Union every applicable model's delta into the graph they all read.
 
@@ -69,5 +73,7 @@ class EcosystemRegistry:
         for model in self.applicable(
             graph, package_inventory, languages, capabilities,
         ):
-            accumulator.apply(model.enrich(graph, index))
+            fresh_nodes, fresh_edges = accumulator.apply(model.enrich(graph, index))
+            if delta_sink is not None:
+                delta_sink(fresh_nodes, fresh_edges)
         return accumulator.result()

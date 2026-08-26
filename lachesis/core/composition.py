@@ -49,17 +49,29 @@ class _EdgeKeys:
     across a fold.
     """
 
-    __slots__ = ("_first", "_tied")
+    __slots__ = ("_first", "_tied", "_seed_edge_lookup")
 
-    def __init__(self) -> None:
+    def __init__(self, *, seed_edge_lookup=None) -> None:
         self._first: dict = {}
         self._tied: dict = {}
+        self._seed_edge_lookup = seed_edge_lookup
 
     def add(self, edge: dict) -> bool:
         """Record the edge, and say whether it was one we had not seen."""
         triple = (edge["kind"], edge["source"], edge["target"])
         first = self._first.get(triple)
         if first is None:
+            # Enrichment already has the canonical seed edges in GraphIndex. Avoid
+            # indexing every seed edge a second time; consult only the source's
+            # existing adjacency when a new delta edge arrives.
+            if self._seed_edge_lookup is not None:
+                for existing in self._seed_edge_lookup(edge["source"]):
+                    if ((existing.get("kind"), existing.get("source"),
+                         existing.get("target")) == triple):
+                        if encode_document(existing.get("properties", {})) == \
+                                encode_document(edge.get("properties", {})):
+                            return False
+                        break
             self._first[triple] = edge
             return True
         properties = self._tied.get(triple)
@@ -141,15 +153,31 @@ class GraphAccumulator:
     edges wait and are checked with the first delta that arrives.
     """
 
-    def __init__(self, nodes: Iterable[dict] = (), edges: Iterable[dict] = ()) -> None:
-        self._nodes: dict = {}
-        self._edges: List[dict] = []
-        self._edge_keys = _EdgeKeys()
-        self._sorted_nodes: Optional[List[dict]] = None
-        self._sorted_edges: Optional[List[dict]] = None
-        _, self._unchecked = self._absorb(
-            GraphDelta("canonical-input", list(nodes), list(edges)),
-        )
+    def __init__(
+        self, nodes: Iterable[dict] = (), edges: Iterable[dict] = (), *,
+        shared_nodes: dict | None = None, shared_edges: list[dict] | None = None,
+        seed_edge_lookup=None,
+    ) -> None:
+        if shared_nodes is None:
+            self._nodes: dict = {}
+            self._edges: List[dict] = []
+            self._edge_keys = _EdgeKeys()
+            self._sorted_nodes: Optional[List[dict]] = None
+            self._sorted_edges: Optional[List[dict]] = None
+            _, self._unchecked = self._absorb(
+                GraphDelta("canonical-input", list(nodes), list(edges)),
+            )
+            return
+        # The enrichment seed is already canonical and indexed. Share its node map
+        # and edge list instead of retaining a second graph-sized pair of containers.
+        # New deltas still go through normal conflict/dedup checks; only the trusted
+        # seed avoids re-indexing.
+        self._nodes = shared_nodes
+        self._edges = shared_edges if shared_edges is not None else list(edges)
+        self._edge_keys = _EdgeKeys(seed_edge_lookup=seed_edge_lookup)
+        self._sorted_nodes = None
+        self._sorted_edges = None
+        self._unchecked = []
 
     def _absorb(self, delta: GraphDelta) -> Tuple[List[dict], List[dict]]:
         """Take in a delta's facts and return the ones this accumulator had not seen.

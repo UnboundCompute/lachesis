@@ -88,6 +88,18 @@ message Document {
   ObjectValue fields = 2;
 }
 
+// Typed cache envelope for the structural Pass-2 bind.  The graph records are
+// kept in their native repeated-message form; only the small cache header,
+// stamped metadata, and Atropos summary use the generic document value.
+message BindCache {
+  uint32 format_version = 1;
+  Document header = 2;
+  Document stamped_meta = 3;
+  repeated NodeRecord nodes = 4;
+  repeated EdgeRecord edges = 5;
+  Document summary = 6;
+}
+
 // Typed frontend tier payload. Keeping records typed avoids repeating the field
 // names `id`, `kind`, `source`, and `target` for every record in generic Documents.
 message TierPayload {

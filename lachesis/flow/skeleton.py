@@ -37,8 +37,7 @@ from lachesis.timeit import timeit
 from . import atropos
 from .patterns import evaluator_for
 from .translate import load_graph
-from .traverse import traverse_all
-from .order import tarjan_scc, is_cyclic
+from .order import build_order
 from .summarize import summarize_one
 
 
@@ -247,34 +246,40 @@ def render_text(skel):
 
 
 @timeit
-def _summaries_for(F, succ):
-    """Run traverse + bottom-up summarise over the whole graph (same as walk.py)."""
-    import random
-    order = sorted(F.keys())
-    random.Random(0).shuffle(order)
-    components, _ = traverse_all(F, order)
+def _summaries_for(F, succ, *, reach_only=False):
+    """Run bottom-up summarisation over the whole graph.
+
+    ``reach_only`` is the object-mode projection: it preserves the complete
+    sink-flow composition but omits legacy lifetime streams, which are already
+    produced by the native object engine.
+
+    Summary order depends only on the call graph.  Use the shared SCC scheduler
+    directly instead of allocating traversal traces and discovering SCCs again
+    inside each traversal component.
+    """
     summaries = {}
-    for _seed, trace in components:
-        members = [t["name"] for t in trace]
-        for comp in tarjan_scc(members, succ):
-            if not is_cyclic(comp, succ):
-                summaries[comp[0]] = summarize_one(comp[0], F, summaries)
-                continue
+    for group in build_order(F, succ):
+        comp = group["members"]
+        if not group["cyclic"]:
+            summaries[comp[0]] = summarize_one(
+                comp[0], F, summaries, reach_only=reach_only)
+            continue
+        for m in comp:
+            summaries[m] = {"name": m, "params": F[m]["params"], "taxonomy": F[m]["taxonomy"],
+                            "sink_flows": [], "sink_params": {}, "typestate": {},
+                            "param_typestate": {}, "frees_params": {}, "returns": "value",
+                            "returns_param": None}
+        for _ in range(len(comp) + 3):
+            # Summary records are immutable from the caller's perspective;
+            # summarize_one returns fresh containers and only reads callee
+            # summaries.  Structural dict equality avoids serializing the
+            # entire recursive group on every fixpoint iteration.
+            before = {m: summaries[m] for m in comp}
             for m in comp:
-                summaries[m] = {"name": m, "params": F[m]["params"], "taxonomy": F[m]["taxonomy"],
-                                "sink_flows": [], "sink_params": {}, "typestate": {},
-                                "param_typestate": {}, "frees_params": {}, "returns": "value",
-                                "returns_param": None}
-            for _ in range(len(comp) + 3):
-                # Summary records are immutable from the caller's perspective;
-                # summarize_one returns fresh containers and only reads callee
-                # summaries.  Structural dict equality avoids serializing the
-                # entire recursive group on every fixpoint iteration.
-                before = {m: summaries[m] for m in comp}
-                for m in comp:
-                    summaries[m] = summarize_one(m, F, summaries)
-                if {m: summaries[m] for m in comp} == before:
-                    break
+                summaries[m] = summarize_one(
+                    m, F, summaries, reach_only=reach_only)
+            if {m: summaries[m] for m in comp} == before:
+                break
     return summaries
 
 

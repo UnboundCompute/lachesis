@@ -361,15 +361,19 @@ def _read_root(label, tracked):
 
 
 @timeit
-def _arg_records(ix, call, argument_edges=None):
+def _arg_records(ix, call, argument_edges=None, *, presorted=False):
     """Ordered argument records for a call, resolved through argument_value_ids."""
     p = _props(call)
     av = p.get("argument_value_ids") or []
     out = []
-    edges = sorted((argument_edges.get(call["id"], ())
-                    if argument_edges is not None
-                    else ix.outgoing_of_kind(call["id"], "HAS_ARGUMENT")),
-                   key=lambda e: _props(e).get("position") or 0)
+    raw_edges = (argument_edges.get(call["id"], ())
+                 if argument_edges is not None
+                 else ix.outgoing_of_kind(call["id"], "HAS_ARGUMENT"))
+    # KùzuGraphIndex.argument_edges_by_source sorts each source once while
+    # building its immutable cache.  Avoid sorting the same argument tuple for
+    # every call; retain sorting for the generic/third-party accessor contract.
+    edges = raw_edges if presorted else sorted(
+        raw_edges, key=lambda e: _props(e).get("position") or 0)
     for e in edges:
         pos = _props(e).get("position")
         vid = av[pos] if (isinstance(pos, int) and pos < len(av)) else None
@@ -522,9 +526,16 @@ def _guards_for(regions, fid, idents, span):
     candidate enumerators use (guarded-region only; early-return guards read as none)."""
     if not idents or span is None:
         return []
+    return _guard_info(regions, fid, idents, span)[0]
+
+
+def _guard_info(regions, fid, idents, span):
+    """Compute the guard list and status from one region classification."""
+    if not idents or span is None:
+        return [], "not-computed"
     verdict = regions.classify(fid, idents, span)
     if verdict.get("status") != "guarded-region":
-        return []
+        return [], verdict.get("status", "not-computed")
     out, seen = [], set()
     for reg in verdict.get("regions", ()):
         canon = reg.get("condition")
@@ -533,7 +544,7 @@ def _guards_for(regions, fid, idents, span):
                 continue
             seen.add((name, canon))
             out.append({"var": name, "canon": canon})
-    return out
+    return out, verdict.get("status", "not-computed")
 
 
 @timeit
@@ -545,9 +556,7 @@ def _guard_status_for(regions, fid, idents, span):
     guard list lets sink evaluators consume it without weakening lifetime/null
     guard handling.
     """
-    if not idents or span is None:
-        return "not-computed"
-    return regions.classify(fid, idents, span).get("status", "not-computed")
+    return _guard_info(regions, fid, idents, span)[1]
 
 
 @timeit
@@ -588,7 +597,8 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
                    cfg_edges_by_source=None, macro_defs=None,
                    argument_edges=None, invoke_edges=None, value_edges=None,
                    return_values=None,
-                   object_only=False, prewarmed=False):
+                   object_only=False, prewarmed=False,
+                   argument_edges_presorted=False):
     """Reconstruct one function's F IR from its owned graph nodes.
 
     Callee names are canonicalized through `norm` (the Atropos form oracle) as they leave the
@@ -611,7 +621,10 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
     loaded_by_kind = None
     if disk_index:
         warm_kinds = {
-            "parameter", "call", "construct", "release",
+            # Parameters are consumed only through their promoted label below.
+            # Keep their cheap ownership headers instead of inflating the full
+            # property tail for every function during the cold translation path.
+            "call", "construct", "release",
             "dynamic-behavior", "write", "return",
         }
         warm_ids = [node_id for kind in warm_kinds
@@ -626,8 +639,14 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
             if node is not None:
                 loaded_by_kind[node.get("kind")].append(node)
         for header in owned_nodes:
-            if header.get("kind") in {"read", "body", "expression"}:
+            if header.get("kind") in {"parameter", "read", "body", "expression"}:
                 node = _flow_header_node(header)
+                if header.get("kind") == "parameter":
+                    # Parameter records need no syntax inference: their label is
+                    # the only field consumed by the translation walk.
+                    node = {"id": header.get("id"), "kind": "parameter",
+                            "label": header.get("label"),
+                            "properties": header.get("properties") or {}}
                 if node is not None:
                     loaded_by_kind[node["kind"]].append(node)
 
@@ -654,11 +673,11 @@ def _walk_function(ix, regions, nest, sinks, norm, fnode,
             continue
         line = _stmt_line(c)
         callees.append(callee)
-        args = _arg_records(ix, c, argument_edges)
+        args = _arg_records(ix, c, argument_edges,
+                            presorted=argument_edges_presorted)
         cp = _props(c)
         idents = {a["root"] for a in args if a["root"]}
-        guards = _guards_for(regions, fid, idents, _span(c))
-        guard_status = _guard_status_for(regions, fid, idents, _span(c))
+        guards, guard_status = _guard_info(regions, fid, idents, _span(c))
         cat, catalog_name = _catalog_sink(sinks, callee, cp)
         # the variable this call's result is assigned to (any callee, not just allocators), so
         # `x = udf(...)` is a first-class assign the summary can compose through -- an allocator
@@ -926,6 +945,13 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
                         for nid in ix.by_kind.get(kind, ())]
         callable_headers = {node["id"]: node
                             for node in ix.node_headers(callable_ids)}
+        if hasattr(ix, "metadata_by_kind"):
+            for node_id, metadata in ix.metadata_by_kind(
+                    ("function", "method", "constructor")).items():
+                header = callable_headers.get(node_id)
+                if header is not None:
+                    header["properties"] = {
+                        **header.get("properties", {}), **metadata}
 
         def has_body(owner_id):
             # Declaration-only callables in the C graph own only the synthetic
@@ -952,6 +978,9 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
             "parameter", "call", "construct", "release",
             "dynamic-behavior", "write", "return",
         }
+        # ``parameter`` is header-only in Translation.  It remains in the
+        # definition/body census above, but does not need a full Kùzu payload.
+        translation_warm_kinds = flow_kinds - {"parameter"}
 
         # ``object_only`` is retained as an API compatibility switch, but the
         # default projection must keep every body-bearing callable so caller
@@ -965,11 +994,10 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
                    for node_id in ix.by_owner.get(owner_id, ()))
         }
         definition_ids = [nid for nid in all_definition_ids if nid in full_definition_ids]
-        ix._warm_nodes(definition_ids)
         ix._warm_nodes(ix.by_kind.get("macro", ()))
         fnodes = []
         for nid in all_definition_ids:
-            node = ix.nodes.get(nid) if nid in full_definition_ids else callable_headers[nid]
+            node = callable_headers[nid]
             if node is not None:
                 fnodes.append(node)
 
@@ -979,16 +1007,16 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         # function.  The per-function implementation still constructs its
         # owned-kind views from the cache, preserving all selection semantics.
         if hasattr(ix, "_warm_nodes_by_owner"):
-            ix._warm_nodes_by_owner(definition_ids, flow_kinds)
+            ix._warm_nodes_by_owner(definition_ids, translation_warm_kinds)
             # The dynamic/write projection below must consume this cache directly;
             # otherwise its generic owner accessor can issue one warm-up per
             # function after this scan has already completed.
-            ix._translation_prefetched_kinds = frozenset(flow_kinds)
+            ix._translation_prefetched_kinds = frozenset(translation_warm_kinds)
         else:
             flow_ids = {
                 node_id for owner_id in definition_ids
                 for node_id in ix.by_owner.get(owner_id, ())
-                if ix._kind_by_id.get(node_id) in flow_kinds and
+                if ix._kind_by_id.get(node_id) in translation_warm_kinds and
                 _flow_node_needed(ix, node_id)
             }
             ix._warm_nodes(flow_ids)
@@ -1085,11 +1113,13 @@ def build_F(store, lang="c", *, return_graph=False, object_only=False):
         if not name or name in recs:
             continue
         if f.get("id") in full_definition_set:
-            recs[name] = _walk_function(ix, regions, nest, sinks, norm, f,
-                                        cfg_edges_by_source, macro_defs,
-                                        argument_edges, invoke_edges, value_edges,
-                                        return_values,
-                                        object_only, prewarmed_flow_nodes)
+            recs[name] = _walk_function(
+                ix, regions, nest, sinks, norm, f,
+                cfg_edges_by_source, macro_defs,
+                argument_edges, invoke_edges, value_edges,
+                return_values, object_only, prewarmed_flow_nodes,
+                argument_edges_presorted=(argument_edges is not None and
+                                           hasattr(ix, "argument_edges_by_source")))
         else:
             recs[name] = lightweight_record(f)
         recs[name]["name"] = name

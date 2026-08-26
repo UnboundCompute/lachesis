@@ -30,6 +30,7 @@ import json
 import os
 import tempfile
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,7 +38,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lachesis.nav.graphlib import GraphLib
 from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
-from lachesis.core.graph_wire import decode_overlay, encode_overlay
+from lachesis.core.graph_wire import (
+    decode_overlay, is_dataflow_stream, read_dataflow_stream,
+    read_dataflow_stream_header,
+    write_dataflow_stream_edge, write_dataflow_stream_header,
+    write_dataflow_stream_node,
+)
 
 
 def node_view(node: dict) -> dict:
@@ -88,7 +94,9 @@ def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
     if not core_hash or not os.path.isfile(path):
         return False
     try:
-        payload = decode_overlay(Path(path).read_bytes())
+        sidecar = Path(path)
+        payload = (read_dataflow_stream_header(sidecar) if is_dataflow_stream(sidecar)
+                   else decode_overlay(sidecar.read_bytes()))
     except (OSError, ValueError, TypeError):
         return False
     return payload.get("version") == 1 and payload.get("core_content_hash") == core_hash
@@ -106,7 +114,10 @@ def _merge_overlays(primary: Overlay, secondary: Overlay) -> Overlay:
 
 def _load_dataflow_overlay(path: str) -> Overlay:
     """Load the internal protobuf dataflow sidecar."""
-    return Overlay.from_dict(decode_overlay(Path(path).read_bytes()))
+    sidecar = Path(path)
+    payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
+               else decode_overlay(sidecar.read_bytes()))
+    return Overlay.from_dict(payload)
 
 
 def joined_store_path(graph_path: str) -> str:
@@ -265,13 +276,13 @@ def _copy_frontend_inventory(core_path: str, cache_path: str) -> None:
         handle.write("\n")
 
 
-# The dataflow tier inflates the whole store back into Python objects and folds four
-# overlays over it, all in RAM. That peak is roughly linear in node count; measured on
-# full libxml2 it was ~7.5 GB for ~980k nodes, i.e. roughly 8 KB per node. Above this many
-# nodes we warn before starting, because on a memory-constrained machine the step drops
-# into swap and *looks* hung though it is still progressing. Advisory only, never a refusal.
+# The dataflow tier still inflates the whole store back into Python objects and folds four
+# overlays over it, all in RAM. The streaming delta sidecar removes the old core/enriched
+# overlap during write; recent full-libxml2 runs peak around 5--6 GB for 919k nodes. Keep
+# the estimate conservative because allocator/system pressure varies by machine. Above
+# this many nodes we warn before starting; advisory only, never a refusal.
 _ENRICH_HEAVY_NODES = 400_000
-_ENRICH_BYTES_PER_NODE = 8_000
+_ENRICH_BYTES_PER_NODE = 7_000
 
 
 class GraphStore:
@@ -298,6 +309,7 @@ class GraphStore:
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
+        self._retained_enriched_graph = None
 
     @classmethod
     def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None,
@@ -317,6 +329,7 @@ class GraphStore:
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
+        self._retained_enriched_graph = None
         return self
 
     @classmethod
@@ -409,7 +422,7 @@ class GraphStore:
         cache ``store.index`` can watch this to tell when they have gone stale."""
         return bool(getattr(self, "_enriched", True))
 
-    def ensure_dataflow_tier(self) -> "GraphStore":
+    def ensure_dataflow_tier(self, *, retain_materialized: bool = False) -> "GraphStore":
         """Guarantee the overlay dataflow tier is present, building it if needed.
 
         Idempotent, and a no-op for a store that was built with ``--enrich`` or for an
@@ -435,13 +448,53 @@ class GraphStore:
         if getattr(self, "_enriched", True):
             return self
         from lachesis.kuzu_store import (graph_content_hash, manifest_capabilities,
-                                         manifest_languages, read_store_manifest,
-                                         write_kuzu_graph)
+                                         manifest_languages, read_store_manifest)
         from lachesis.pipeline import enrich_graph
         from lachesis.nav.kuzu_index import materialize_graph
 
+        timing_enabled = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
+        timing_started = time.perf_counter()
+
+        def timing(label: str) -> None:
+            if timing_enabled:
+                print(
+                    f"[lachesis pass2] {label}: "
+                    f"{time.perf_counter() - timing_started:.3f}s",
+                    file=sys.stderr, flush=True,
+                )
+
+        def observe(overlay_id: str, elapsed: float, nodes: int, edges: int) -> None:
+            if timing_enabled:
+                print(
+                    f"[lachesis pass2] overlay {overlay_id}: {elapsed:.3f}s "
+                    f"({nodes:,} nodes, {edges:,} edges)",
+                    file=sys.stderr, flush=True,
+                )
+
         core_path = self._core_path
         manifest = read_store_manifest(core_path)
+        # The Pass-1 complete binary input is the native Pass-2 contract. When it is
+        # present, keep Python out of the whole-graph enrichment step: Rust opens the
+        # framed protobuf by path, runs the overlays, and publishes the sidecar. The
+        # Python index is only rebound afterwards for query/bind consumers.
+        from lachesis.nav.dataflow.substrate import pass2_input_cache_path
+        native_input = pass2_input_cache_path(core_path)
+        native_cache = dataflow_overlay_path(core_path)
+        if native_input.is_file() and not _dataflow_cache_matches(native_cache, manifest.get("core_content_hash")):
+            from lachesis.flow.native_lifetime import run_pass2_path
+            timing("native Pass-2 starting")
+            run_pass2_path(native_input, native_cache)
+            timing("native Pass-2 published")
+            dataflow_overlay = _load_dataflow_overlay(native_cache)
+            merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+            self.index.attach_overlay(merged_overlay)
+            self.overlay = merged_overlay
+            self.graph = None
+            self.gl = GraphLib.from_index(self.index)
+            self._retained_enriched_graph = None
+            self._entries = None
+            self._enriched = True
+            return self
         # Say up front when this will be the heavy, unbounded, in-RAM step (see the class
         # docstring). A slow first enrich on a large graph then reads as "big in-RAM step",
         # not "frozen", and the message names the ways out. We never refuse the work.
@@ -457,70 +510,97 @@ class GraphStore:
                 f"smaller subtree.",
                 file=sys.stderr, flush=True,
             )
-        core = materialize_graph(self.index)
+        # Enrichment performs its own final canonical sort.  Sorting the entire
+        # core here would pay for the same 2M-edge ordering twice on the cold path.
+        # The overlay algorithms use explicit ``get`` lookups and do not need the
+        # three elided compiler defaults copied onto every core record.  Lazy props
+        # preserve those defaults for bracket-based consumers while avoiding millions
+        # of dictionaries/lists that are discarded as soon as the derived sidecar is
+        # written.
+        core = materialize_graph(
+            self.index,
+            # The retained graph is consumed by the binder and candidate registry,
+            # both of which use property lookup (`get`/`[]`) and therefore work with
+            # lazy compiler constants.  Do not expand three constant properties onto
+            # every node merely because this view is retained for the bind; the new
+            # Kùzu symbol projection no longer requires canonical dict equality here.
+            restore_defaults=False,
+            sort_output=False,
+        )
+        timing("materialized core")
         core_hash = (manifest.get("core_content_hash")
                      or graph_content_hash(core["nodes"], core["edges"]))
-        enriched = enrich_graph(core, manifest_languages(manifest),
-                               manifest_capabilities(manifest))
         cache = dataflow_overlay_path(core_path)
-        core_node_ids = {id(node) for node in core["nodes"]}
-        core_edge_ids = {id(edge) for edge in core["edges"]}
-        # The identity sets are all that cache classification needs from the core
-        # containers; release their list/dict wrapper before assembling the derived
-        # payload, which may itself retain the shared record objects.
-        del core
-        enriched_node_ids = {id(node) for node in enriched["nodes"]}
-        enriched_edge_ids = {id(edge) for edge in enriched["edges"]}
-        additive = (
-            core_node_ids.issubset(enriched_node_ids)
-            and core_edge_ids.issubset(enriched_edge_ids)
+        fd, temporary = tempfile.mkstemp(
+            prefix=".lachesis-dataflow-", suffix=".pb",
+            dir=os.path.dirname(os.path.abspath(cache)),
         )
-        if additive:
-            payload = {
-                "overlay_id": "dataflow",
-                "source": Path(core_path).name,
-                "version": 1,
-                "core_content_hash": core_hash,
-                "node_props": {}, "edge_props": {},
-                "derived_nodes": [node for node in enriched["nodes"]
-                                  if id(node) not in core_node_ids],
-                "derived_edges": [edge for edge in enriched["edges"]
-                                  if id(edge) not in core_edge_ids],
-            }
-            fd, temporary = tempfile.mkstemp(
-                prefix=".lachesis-dataflow-", suffix=".pb",
-                dir=os.path.dirname(os.path.abspath(cache)),
+        stream = os.fdopen(fd, "wb")
+        write_dataflow_stream_header(stream, {
+            "overlay_id": "dataflow",
+            "source": Path(core_path).name,
+            "version": 1,
+            "core_content_hash": core_hash,
+        })
+
+        def collect_delta(nodes, edges):
+            for node in nodes:
+                write_dataflow_stream_node(stream, node)
+            for edge in edges:
+                write_dataflow_stream_edge(stream, edge)
+
+        try:
+            enriched = enrich_graph(
+                core, manifest_languages(manifest), manifest_capabilities(manifest),
+                observer=observe if timing_enabled else None,
+                delta_sink=collect_delta,
             )
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(encode_overlay(payload))
-                os.replace(temporary, cache)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
-                                     dataflow_path=cache)
-        else:
-            # A future overlay that mutates canonical records is not safe to represent
-            # as a delta; retain the existing full Kùzu-cache fallback for that case.
-            cache = enriched_store_path(core_path)
-            write_kuzu_graph(enriched, None, cache, prune=False,
-                             enriched=True, core_content_hash=core_hash,
-                             low_memory=True, buffer_pool_size=2 << 30,
-                             checkpoint_threshold=256 << 20)
-            _copy_frontend_inventory(core_path, cache)
-            fresh = type(self)._open(cache, overlay_path=self._overlay_path)
-        # The derived graph is now represented by the attached cache. Release the
-        # materialized lists before reopening so large action runs do not overlap
-        # two graph-sized Python representations.
-        del enriched
-        self.overlay = fresh.overlay
-        self.graph = fresh.graph
-        self.gl = fresh.gl
-        self.index = fresh.index
+            timing("enriched graph")
+            # The sidecar path is additive by construction: GraphAccumulator rejects
+            # conflicting replacements of an existing canonical node. Release both
+            # graph-sized views before the stream is finalized/replaced.
+            if retain_materialized:
+                # The CLI bind immediately needs a canonical graph view. Keeping this
+                # result avoids a second full Kùzu materialization after the dataflow
+                # sidecar is written; ordinary callers leave it false to minimize
+                # retained memory.
+                retained = enriched
+            else:
+                retained = None
+            del core, enriched
+            stream.close()
+            os.replace(temporary, cache)
+            timing("dataflow sidecar published")
+        except BaseException:
+            stream.close()
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+        # The index that loaded the core is still live and has already paid the
+        # expensive Kùzu map scan. Attach the freshly written additive sidecar to it
+        # in place instead of reopening the store. Reopening here used to repeat the
+        # full load/index-map pass immediately after enrichment (roughly the same
+        # work that `loading graph` paid at the start of Pass 2), and briefly kept
+        # two Kùzu index objects alive. `attach_overlay` resets its derived caches,
+        # so the resulting accessor view is identical to a fresh `_open`.
+        dataflow_overlay = _load_dataflow_overlay(cache)
+        timing("dataflow sidecar loaded")
+        merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+        self.index.attach_overlay(merged_overlay)
+        self.overlay = merged_overlay
+        self.graph = None
+        self.gl = GraphLib.from_index(self.index)
+        timing("dataflow overlay attached")
+        self._retained_enriched_graph = retained
         self._entries = None
         self._enriched = True
         return self
+
+    def take_retained_enriched_graph(self):
+        """Return the one-shot graph retained for the immediately following bind."""
+        graph = getattr(self, "_retained_enriched_graph", None)
+        self._retained_enriched_graph = None
+        return graph
 
     def ensure_dataflow_cone(self, seed_id: str, budget: int = None) -> dict:
         """Fold the overlay dataflow tier over the neighbourhood of ``seed_id`` only.

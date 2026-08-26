@@ -20,8 +20,10 @@ is an additive :class:`GraphDelta` folded over a graph the caller already holds.
 """
 from __future__ import annotations
 
-import importlib.util
 import os
+import sys
+import tempfile
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,17 +53,9 @@ def locate_atropos(explicit: Optional[str] = None) -> Optional[Path]:
     candidates.append(Path(__file__).resolve().parents[3].parent / "atropos")
     candidates.append(Path.home() / "project" / "unboundcompute" / "atropos")
     for candidate in candidates:
-        if (candidate / "tools" / "bind.py").exists():
+        if (candidate / "models").is_dir():
             return candidate
     return None
-
-
-def _load_binder(atropos_root: Path):
-    spec = importlib.util.spec_from_file_location(
-        "atropos_bind", str(atropos_root / "tools" / "bind.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _languages_present(graph: Dict[str, Any]) -> List[str]:
@@ -83,9 +77,16 @@ def _languages_present(graph: Dict[str, Any]) -> List[str]:
     return langs
 
 
+def _phase_timing(label: str, started: float) -> None:
+    if os.environ.get("LACHESIS_ATROPOS_TIMINGS") == "1":
+        print(f"[lachesis atropos] {label}: {perf_counter() - started:.3f}s",
+              file=sys.stderr, flush=True)
+
+
 def atropos_enrich(
     graph: Dict[str, Any], *, atropos_root: Optional[str] = None,
-    complete_dataflow: bool = True,
+    complete_dataflow: bool = True, symbol_index_source: Any = None,
+    compact_structural: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return ``(taint_aware_graph, summary)``; graph unchanged if Atropos absent.
 
@@ -102,23 +103,138 @@ def atropos_enrich(
     if root is None:
         return graph, {"applied": False, "reason": "atropos-not-found"}
 
+    started = perf_counter()
     languages = _languages_present(graph)
+    _phase_timing("language detection", started)
     if not languages:
         return graph, {"applied": False, "reason": "no-recognized-frontend",
                        "atropos_root": str(root)}
 
-    binder = _load_binder(root)
-    models = list(binder.load_models(root / "models"))
+    started = perf_counter()
+    from lachesis.integrations.atropos.models import load_models
+
+    models = load_models(root / "models")
     models_by_id = {model["id"]: model for model in models}
+    _phase_timing("catalog load", started)
 
     stamps: List[dict] = []
     per_language: Dict[str, Any] = {}
+    projection = None
+    native_path_report = None
+    native_path_output = None
+    if symbol_index_source is not None:
+        # The complete Pass-1 stream is already the native binder's input. Use
+        # it directly when available instead of first building a Python
+        # canonical callsite index for the whole graph.
+        base = (getattr(symbol_index_source, "_pass3_cache_base", None)
+                or getattr(symbol_index_source, "_db_dir", None))
+        if base:
+            from lachesis.nav.dataflow.substrate import pass2_input_cache_path
+            native_input = pass2_input_cache_path(base)
+            if os.environ.get("LACHESIS_ATROPOS_TIMINGS") == "1":
+                print(f"[lachesis atropos] native path candidate: {native_input}",
+                      file=sys.stderr, flush=True)
+            if native_input.is_file():
+                try:
+                    from .native_bind import bind_path
+                    from lachesis.flow.native_translate import _compiled_catalog
+                    catalog_path = _compiled_catalog(root, base)
+                    with tempfile.NamedTemporaryFile(prefix="lachesis-bind-",
+                                                     suffix=".pb", delete=False) as output:
+                        native_path_output = Path(output.name)
+                    native_path_report = bind_path(native_input, catalog_path,
+                                                   native_path_output)
+                except (OSError, RuntimeError, ValueError) as error:
+                    # A Pass-1 binary input is the current store contract. Do
+                    # not silently re-enter the old Python canonical-index
+                    # binder if the native implementation fails: that creates
+                    # two production paths and hides native regressions.
+                    raise RuntimeError(
+                        f"native catalog binding failed for {native_input}: {error}"
+                    ) from error
+                finally:
+                    if native_path_output is not None:
+                        try:
+                            native_path_output.unlink()
+                        except OSError:
+                            pass
+    if native_path_report is not None:
+        # The path report contains all catalog languages. Preserve the existing
+        # summary shape while using the one Rust bind result for every language.
+        stamps.extend(stamps_from_report(native_path_report, models_by_id))
+        for language in languages:
+            rows = [row for row in native_path_report.get("results", ())
+                    if (models_by_id.get(row.get("model_id")) or {}).get("language")
+                    == language]
+            counts: Dict[str, int] = {}
+            unbound: List[dict] = []
+            for row in rows:
+                status = row.get("status", "unknown")
+                counts[status] = counts.get(status, 0) + 1
+                if status != "bound":
+                    model = models_by_id.get(row.get("model_id")) or {}
+                    unbound.append({
+                        "model_id": row.get("model_id"), "method": row.get("method"),
+                        "access_path": row.get("access_path"), "role": row.get("role"),
+                        "kind": model.get("kind"), "status": status,
+                        "detail": row.get("detail"),
+                    })
+            per_language[language] = {
+                "callsites": sum(node.get("kind") in {"call", "construct"}
+                                  for node in graph.get("nodes", ())),
+                "bind": counts, "unbound": unbound,
+            }
+        if compact_structural and not complete_dataflow:
+            known_node_ids = {node.get("id") for node in graph.get("nodes", ())}
+            known_node_ids.discard(None)
+            delta = AtroposOverlay(stamps).delta_for_node_ids(known_node_ids)
+            graph["nodes"] = list(graph.get("nodes", ()))
+            graph["edges"] = list(graph.get("edges", ()))
+            graph["nodes"].extend(delta.nodes)
+            graph["edges"].extend(delta.edges)
+            role_nodes: Dict[str, int] = {}
+            for node in delta.nodes:
+                kind = node.get("kind", "?")
+                role_nodes[kind] = role_nodes.get(kind, 0) + 1
+            return graph, {
+                "applied": True, "atropos_root": str(root),
+                "languages": languages, "per_language": per_language,
+                "stamps": len(stamps), "role_nodes": role_nodes,
+            }
+    if symbol_index_source is not None:
+        projection_fn = getattr(symbol_index_source, "atropos_projection", None)
+        if projection_fn is not None:
+            started = perf_counter()
+            projection = projection_fn()
+            _phase_timing(
+                f"Kuzu projection ({len(projection.get('nodes', ())) if projection else 0:,} "
+                f"nodes, {len(projection.get('edges', ())) if projection else 0:,} edges)",
+                started,
+            )
+    canonical_projection = None
     for language in languages:
         lang_models = [m for m in models if m.get("language") == language]
         if not lang_models:
             continue
-        index = canonical_index(graph, language=language, source="lachesis")
-        report = binder.bind_all(lang_models, index)
+        # The graph projection is language-neutral: canonical_index's language argument
+        # only stamps the output envelope, while the calls/edges scan is identical for
+        # every catalog language. Build that million-node/two-million-edge projection
+        # once and share its immutable callsite lists across the per-language binders.
+        if canonical_projection is None:
+            started = perf_counter()
+            canonical_projection = canonical_index(
+                projection if projection is not None else graph,
+                language=language, source="lachesis",
+            )
+            _phase_timing(
+                f"canonical projection ({len(canonical_projection['callsites']):,} callsites)",
+                started,
+            )
+        index = {**canonical_projection, "language": language}
+        from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
+        started = perf_counter()
+        report = native_bind_all(lang_models, index)
+        _phase_timing(f"Rust bind {language}", started)
         stamps.extend(stamps_from_report(report, models_by_id))
         counts: Dict[str, int] = {}
         unbound: List[dict] = []
@@ -142,6 +258,41 @@ def atropos_enrich(
             "callsites": len(index["callsites"]),
             "bind": counts,
             "unbound": unbound,
+        }
+
+    if compact_structural and not complete_dataflow:
+        # Structural binding is additive: the catalog contributes only role nodes,
+        # taint edges, and summary flow edges.  Every endpoint came from this
+        # bounded neutral callsite projection, so validate against that projection
+        # rather than constructing a million-entry GraphIndex and copying/sorting
+        # the entire base graph just to append a tiny delta.
+        known_node_ids = set()
+        for callsite in (canonical_projection or {}).get("callsites", ()):
+            known_node_ids.add(callsite.get("id"))
+            known_node_ids.add(callsite.get("call_value_id"))
+            known_node_ids.add(callsite.get("receiver_value_id"))
+            known_node_ids.update(callsite.get("arg_value_ids") or ())
+        known_node_ids.discard(None)
+        delta = AtroposOverlay(stamps).delta_for_node_ids(known_node_ids)
+        if isinstance(graph.get("nodes"), list):
+            graph["nodes"].extend(delta.nodes)
+        else:
+            graph["nodes"] = [*graph.get("nodes", ()), *delta.nodes]
+        if isinstance(graph.get("edges"), list):
+            graph["edges"].extend(delta.edges)
+        else:
+            graph["edges"] = [*graph.get("edges", ()), *delta.edges]
+        role_nodes: Dict[str, int] = {}
+        for node in delta.nodes:
+            kind = node.get("kind", "?")
+            role_nodes[kind] = role_nodes.get(kind, 0) + 1
+        return graph, {
+            "applied": True,
+            "atropos_root": str(root),
+            "languages": languages,
+            "per_language": per_language,
+            "stamps": len(stamps),
+            "role_nodes": role_nodes,
         }
 
     registry = OverlayRegistry()

@@ -73,6 +73,20 @@ class TemporalLifecycle:
         # publication without coupling it to the C frontend.
         semantic = graph.get("semantic_graph") or {}
         self.language = graph.get("language")
+        if (isinstance(semantic, dict) and semantic.get("native_sidecar")
+                and not semantic.get("nodes")):
+            # Native Pass 2 persists the Rust protobuf sidecar by reference.
+            # Expand it only when a temporal constructor is actually queried;
+            # ``enrich`` itself must not parse a 300MB semantic graph merely to
+            # build an unused registry.
+            from ..flow.native_translate import load_native_semantic_graph_sidecar
+            native = load_native_semantic_graph_sidecar(
+                semantic["native_sidecar"], self.language or "c")
+            if native is not None:
+                semantic = {
+                    "nodes": native.to_dict().get("nodes", {}),
+                    "coverage": semantic.get("coverage") or native.coverage,
+                }
         self.coverage = {}
         if isinstance(semantic, dict):
             self.language = self.language or semantic.get("language")
@@ -83,6 +97,25 @@ class TemporalLifecycle:
                                    for node_id, node in semantic_nodes.items()])
             else:
                 self.nodes.extend(semantic_nodes)
+        # The native migration seam publishes compact findings instead of a
+        # graph of snapshots.  Represent those validated temporal sites as
+        # read-only candidate observations until the Rust matcher owns the
+        # complete temporal relation.  This branch is intentionally additive
+        # and is only populated by the opt-in native bind path.
+        for function in graph.get("native_temporal", {}).get("functions", ()):
+            for finding in function.get("findings", ()):
+                pattern = finding.get("pattern") or ""
+                event_kind = "release" if pattern == "double-free" else "read_storage"
+                self.nodes.append({
+                    "id": f"native:{function.get('id')}:{finding.get('node')}:{finding.get('line')}",
+                    "event": {"kind": event_kind, "line": finding.get("line")},
+                    "fragment": function.get("id"),
+                    "metadata": {
+                        "owner_function_id": function.get("id"),
+                        "native_pattern": pattern,
+                        "native_path": finding.get("path"),
+                    },
+                })
 
     def _language(self, node):
         props = node.get("properties") or {}

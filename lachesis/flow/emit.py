@@ -51,6 +51,7 @@ from lachesis.nav.dataflow.substrate import Substrate, cached_substrate
 from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
 from .patterns import evaluator_for
+from .order import is_cyclic, tarjan_scc
 from .object_lifetime import (APBuilder, _argument_path, _path,
                                analyze_object_lifetimes, extract_operations, _props)
 from .object_state import AccessPath, OpKind
@@ -73,6 +74,68 @@ _OP_VERB = {
 }
 
 _SUBOBJECT = ("->", ".", "[", "*")
+
+
+class _NativeSemanticSubstrate:
+    """Small metadata view backed by Rust-prepared function records.
+
+    Native Pass 2 already has the CFG anchors and operation roots needed by
+    emission. This view supplies the handful of label/type/offset lookups the
+    existing emitter uses without decoding the complete structural sidecar.
+    """
+    def __init__(self, functions, cfgs):
+        self.idx = self
+        # Keep the native metadata compact.  Expanding every prepared CFG
+        # anchor into a Python dict here largely recreated the per-node memory
+        # overhead that this path is intended to avoid.  The emitter only
+        # needs dict-shaped records when it asks for declarations by kind; the
+        # scalar lookups below can stay tuple-backed.
+        # (label, kind, owner, type, offset)
+        self._nodes = {}
+        for record in functions.values():
+            for root_id, metadata in record.get("root_metadata", {}).items():
+                label, owner, type_name = metadata
+                self._nodes.setdefault(
+                    root_id, (label, "variable", owner, type_name, 0))
+        for cfg in cfgs.values():
+            for node_id, metadata in cfg.get("metadata", {}).items():
+                label, kind, owner, type_name, offset = metadata
+                self._nodes[node_id] = (label, kind, owner, type_name, offset)
+
+    def nodes_of_kind(self, *kinds):
+        result = []
+        for node_id, (label, kind, owner, type_name, offset) in self._nodes.items():
+            if not (kind in kinds or
+                    (kind == "ParmVarDecl" and "parameter" in kinds) or
+                    (kind == "VarDecl" and "variable" in kinds)):
+                continue
+            result.append({
+                "id": node_id, "label": label, "kind": kind,
+                "properties": {"owner_function_id": owner, "type": type_name,
+                               "start_offset": offset},
+            })
+        return result
+
+    def label(self, node_id):
+        node = self._nodes.get(str(node_id))
+        return node[0] if node else str(node_id)
+
+    def props(self, node_id):
+        node = self._nodes.get(str(node_id))
+        if node is None:
+            return {}
+        return {"owner_function_id": node[2], "type": node[3],
+                "start_offset": node[4]}
+
+    def kind(self, node_id):
+        node = self._nodes.get(str(node_id))
+        return node[1] if node else ""
+
+    def offset(self, node_id):
+        return int(self.props(node_id).get("start_offset") or 0)
+
+    def warm_owned(self, _owners):
+        return self
 
 
 def _readable_root(sub, root: str, scope=None) -> str:
@@ -269,6 +332,14 @@ def _operation_generations(sub, operations, cfg=None):
     without inventing a path-sensitive generation set in the frozen graph.
     Loop re-entry remains an explicit matcher widening event.
     """
+    # Rust preparation has the complete CFG and operation stream already.  A
+    # native generation on every targeted operation means the expensive Python
+    # dominator fixed point below is unnecessary on the production path.
+    if operations and all(op.target is None or op.generation for op in operations):
+        return ({op: op.generation or "g0" for op in operations},
+                {op: op.fresh_generation for op in operations
+                 if op.fresh_generation})
+
     generations = {}
     fresh = {}
     ordered = sorted(
@@ -360,37 +431,25 @@ def _loop_nodes(cfg):
     reach the back-edge source.  This is language-neutral and avoids relying
     on source spelling or loop keywords.
     """
+    published = cfg.get("loop_nodes")
+    if published is not None:
+        return set(published)
     nodes = set(cfg.get("nodes", ()))
     successors = {
         node: tuple(target for target in cfg.get("succ", {}).get(node, ())
                     if target in nodes)
         for node in nodes
     }
-    reverse = defaultdict(set)
-    for source, targets in successors.items():
-        for target in targets:
-            reverse[target].add(source)
-
-    def walk(start, adjacency):
-        seen, pending = set(), [start]
-        while pending:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            pending.extend(adjacency.get(current, ()))
-        return seen
-
+    # A node belongs to a loop precisely when it is part of a cyclic strongly
+    # connected component.  The previous implementation called a forward and
+    # reverse reachability walk for every CFG edge, which repeated most of the
+    # function graph O(E) times and became dominant on loop-heavy functions.
+    # Tarjan is linear in the CFG size and gives the same cycle region without
+    # depending on source order or frontend loop spelling.
     result = set()
-    for source, targets in successors.items():
-        for target in targets:
-            # Any edge whose target can reach its source is a back edge in the
-            # structural sense, independent of frontend node ordering.
-            if target not in nodes or source not in nodes:
-                continue
-            if source not in walk(target, successors):
-                continue
-            result.update(walk(target, successors) & walk(source, reverse))
+    for component in tarjan_scc(tuple(nodes), successors):
+        if is_cyclic(component, successors):
+            result.update(component)
     return result
 
 
@@ -1142,17 +1201,24 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     obj_summaries = (summaries if summaries is not None else
                      analyze_object_lifetimes(
                          store, functions, sub_succ, lang=lang, graph=graph).summaries)
-    sub = cached_substrate(analysis_index)
+    native_metadata = bool(cfgs) and all(
+        "operations" in item and "metadata" in item for item in cfgs.values())
+    sub = (_NativeSemanticSubstrate(functions, cfgs)
+           if native_metadata else cached_substrate(analysis_index))
     norm = normalizer(lang)
     sink_catalog = atropos.sink_catalog(lang)
     by_name = {}
-    for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
-        if _props(node).get("declaration_only"):
-            continue
-        name = node.get("label")
-        if name in functions and name not in by_name:
-            by_name[name] = node["id"]
-    sub.warm_owned(by_name.values())
+    if native_metadata:
+        by_name = {name: record.get("function_id", name)
+                   for name, record in functions.items()}
+    else:
+        for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
+            if _props(node).get("declaration_only"):
+                continue
+            name = node.get("label")
+            if name in functions and name not in by_name:
+                by_name[name] = node["id"]
+        sub.warm_owned(by_name.values())
     # Return-origin emission and aggregate-copy fallback lookups need a local
     # declaration by (owner, label).  Build that index once; querying the complete
     # variable/parameter relation inside every call site made call-heavy graphs pay
@@ -1203,7 +1269,20 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
 
     for name, fid in by_name.items():
         cfg = (cfgs or {}).get(name)
+        # Native transfer-capped functions retain their compact records for
+        # diagnostics, but their partial state must not be stitched into the
+        # production semantic graph.  Pipeline fallback handles their lifetime
+        # findings conservatively.
+        if cfg is not None and cfg.get("native_capped"):
+            continue
         if cfg is None:
+            # A native result can legitimately omit a function whose
+            # preparation failed.  The lightweight metadata view is not a
+            # complete ReachingDef substrate, so do not route that miss into
+            # the legacy analyzer; object_lifetime has already recorded the
+            # function as unsafe for the compatibility fallback.
+            if native_metadata:
+                continue
             cfg = ReachingDef(sub).analyze(fid, reaching_defs=False)
         if not cfg or cfg.get("bailed"):
             continue
@@ -1240,8 +1319,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         # Native graph composition uses explicit seam edges for known callees.  Do not
         # flatten their SUMMARY effects into the caller as a second release/use stream;
         # that would manufacture double-frees when the callee fragment is also traversed.
-        operations = extract_operations(
-            sub, norm, fid, functions[name], functions, obj_summaries, cfg)
+        operations = cfg.get("operations")
+        if operations is None:
+            operations = extract_operations(
+                sub, norm, fid, functions[name], functions, obj_summaries, cfg)
         operation_generations, realloc_generations = _operation_generations(
             sub, operations, cfg)
         loop_nodes = _loop_nodes(cfg)
@@ -1679,12 +1760,15 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                             kind="call", return_to=exit_node,
                             guard=_call_guard_proofs(call),
                             binding=_call_bindings(sub, call, functions.get(callee, {}).get("params", ())),
-                            provenance=_seam_provenance(
-                                sub, call, functions.get(callee, {}).get("params", ()),
-                                (state_artifacts or {}).get(caller), anchor,
-                                nodes_by_fragment.get(callee, ()),
-                                caller_function_id=by_name.get(caller),
-                                continuation=continuation))
+                            provenance=(()
+                                        if native_metadata else
+                                        _seam_provenance(
+                                            sub, call,
+                                            functions.get(callee, {}).get("params", ()),
+                                            (state_artifacts or {}).get(caller), anchor,
+                                            nodes_by_fragment.get(callee, ()),
+                                            caller_function_id=by_name.get(caller),
+                                            continuation=continuation)))
             result.add_edge(exit_node, f"{caller}:{continuation}")
             for callee_exit in result.fragments[callee].exits:
                 return_binding = list(_return_bindings(
