@@ -510,8 +510,8 @@ def run_project_incremental(
 
     The compose tail is shared verbatim with ``run_project``, so the result
     is identical to a full run: a reused snapshot is exactly the bytes a recompile of
-    unchanged files would produce, and ``combine_graphs``/``_enrich_graph`` are
-    deterministic over the same snapshot set. ``output_root`` is required — the reused
+    unchanged files would produce, and ``combine_graphs`` is deterministic over the same
+    snapshot set. ``output_root`` is required — the reused
     bundles and the change manifest both live under it. Build-time enrichment is removed;
     callers must run native Pass 2 after writing the binary store."""
     _reject_removed_enrich(enrich)

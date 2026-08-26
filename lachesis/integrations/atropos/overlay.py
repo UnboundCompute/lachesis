@@ -7,13 +7,12 @@ role nodes plus precise summary flow edges, each attached to the exact value nod
 a model resolved to. It never rewrites an existing node, so folding it costs only
 what the delta is worth and leaves the base graph, its build time, and its size
 untouched. It is meant to run after core value-flow enrichment and before
-``TaintPropagation``, whose vocabulary it speaks.
+the native taint engine, whose vocabulary it speaks.
 
 The overlay does not resolve models and never imports the Atropos binder:
 resolution is the catalog's own contract (a model + a neutral symbol index -> a
 binding report with a per-model status). The engine's only job here is to
-translate each *bound* fact into the graph vocabulary ``TaintPropagation``
-already consumes:
+translate each *bound* fact into the graph vocabulary the native engine consumes:
 
 * a ``kind="source"`` / ``kind="sink"`` node keyed by ``value_id`` (the exact
   resolved node), which taint reads directly; and
@@ -32,7 +31,7 @@ from typing import Any, Dict, Iterable, List
 from lachesis.core.composition import GraphDelta
 from lachesis.core.identities import stable_id
 
-#: Summary edges must be a flow kind TaintPropagation walks (see taint.py).
+#: Summary edges must be a flow kind the native taint engine walks.
 FLOW_KIND = "VALUE_FLOWS_TO"
 
 #: All Atropos facts are stamped under one identity owner/namespace so they can
