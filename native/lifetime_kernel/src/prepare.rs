@@ -1091,15 +1091,36 @@ pub(crate) fn prepare_and_solve(input: &[u8]) -> Result<Vec<u8>, String> {
 pub(crate) fn prepare_and_solve_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<Vec<u8>, String> {
-    let prepared = request.functions.into_iter().map(prepare_function).collect::<Vec<_>>();
+    let prepared = prepare_functions(request.functions)?;
     solve_prepared_functions(prepared, false)
 }
 
 pub(crate) fn prepare_and_solve_request_with_metadata(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<Vec<u8>, String> {
-    let prepared = request.functions.into_iter().map(prepare_function).collect::<Vec<_>>();
+    let prepared = prepare_functions(request.functions)?;
     solve_prepared_functions(prepared, true)
+}
+
+fn prepare_functions(
+    functions: Vec<lifetime_proto::FunctionInput>,
+) -> Result<Vec<lifetime_proto::PreparedFunction>, String> {
+    // Function preparation is independent.  Keep the worker count bounded and
+    // explicit because each in-flight function temporarily owns its AST indexes;
+    // unbounded parallelism trades CPU time for paging on large substrates.
+    let worker_count = std::env::var("LACHESIS_PREPARE_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    match worker_count {
+        Some(1) => Ok(functions.into_iter().map(prepare_function).collect()),
+        Some(count) => Ok(rayon::ThreadPoolBuilder::new()
+            .num_threads(count)
+            .build()
+            .map_err(|error| format!("cannot create preparation worker pool: {error}"))?
+            .install(|| functions.into_par_iter().map(prepare_function).collect())),
+        None => Ok(functions.into_par_iter().map(prepare_function).collect()),
+    }
 }
 
 pub(crate) fn solve_prepared(input: &[u8]) -> Result<Vec<u8>, String> {
