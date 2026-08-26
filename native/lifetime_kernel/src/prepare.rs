@@ -14,6 +14,24 @@ use rayon::prelude::*;
 
 use crate::{lifetime_proto, Kind, Operation, Path};
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum Role {
+    Condition,
+    TrueBranch,
+    FalseBranch,
+    LoopBody,
+}
+
+fn role(value: &str) -> Option<Role> {
+    Some(match value {
+        "CONDITION" => Role::Condition,
+        "TRUE_BRANCH" => Role::TrueBranch,
+        "FALSE_BRANCH" => Role::FalseBranch,
+        "LOOP_BODY" => Role::LoopBody,
+        _ => return None,
+    })
+}
+
 fn property(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
     node.properties.iter().find_map(|item| {
         if item.key != key { return None; }
@@ -56,31 +74,34 @@ struct GraphView<'a> {
     // typed borrowed records here instead of cloning every node and its property
     // vector into a second graph-sized allocation.
     nodes: HashMap<&'a str, &'a lifetime_proto::GraphNode>,
-    children: HashMap<String, Vec<String>>,
-    roles: HashMap<(String, String), Vec<String>>,
-    parent: HashMap<String, String>,
-    refers: HashMap<String, String>,
-    initializers: HashMap<String, String>,
+    children: HashMap<&'a str, Vec<&'a str>>,
+    roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>>,
+    parent: HashMap<&'a str, &'a str>,
+    refers: HashMap<&'a str, &'a str>,
+    initializers: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> GraphView<'a> {
     fn new(nodes_input: &'a [lifetime_proto::GraphNode],
-           edges_input: &[lifetime_proto::GraphEdge]) -> Self {
+           edges_input: &'a [lifetime_proto::GraphEdge]) -> Self {
         let nodes = nodes_input.iter().map(|node| (node.id.as_str(), node)).collect();
         let mut children = HashMap::new();
         let mut parent = HashMap::new();
-        let mut roles = HashMap::new();
+        let mut roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>> = HashMap::new();
         let mut refers = HashMap::new();
         let mut initializers = HashMap::new();
         for edge in edges_input {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
-                    children.entry(edge.source.clone()).or_insert_with(Vec::new).push(edge.target.clone());
-                    parent.entry(edge.target.clone()).or_insert_with(|| edge.source.clone());
-                    roles.entry((edge.source.clone(), edge.role.clone())).or_insert_with(Vec::new).push(edge.target.clone());
+                    children.entry(edge.source.as_str()).or_insert_with(Vec::new).push(edge.target.as_str());
+                    parent.entry(edge.target.as_str()).or_insert(edge.source.as_str());
+                    if let Some(role) = role(edge.role.as_str()) {
+                        roles.entry(edge.source.as_str()).or_default()
+                            .entry(role).or_default().push(edge.target.as_str());
+                    }
                 }
-                "REFERS_TO" => { refers.insert(edge.source.clone(), edge.target.clone()); }
-                "VALUE_FLOWS_TO" => { initializers.insert(edge.target.clone(), edge.source.clone()); }
+                "REFERS_TO" => { refers.insert(edge.source.as_str(), edge.target.as_str()); }
+                "VALUE_FLOWS_TO" => { initializers.insert(edge.target.as_str(), edge.source.as_str()); }
                 _ => {}
             }
         }
@@ -90,6 +111,24 @@ impl<'a> GraphView<'a> {
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> {
         self.nodes.get(id).copied()
     }
+
+    fn children_of(&self, id: &str) -> Option<&Vec<&'a str>> { self.children.get(id) }
+
+    fn children_owned(&self, id: &str) -> Vec<String> {
+        self.children_of(id).into_iter().flatten().map(|child| (*child).to_owned()).collect()
+    }
+
+    fn parent_of(&self, id: &str) -> Option<&'a str> { self.parent.get(id).copied() }
+
+    fn role_children(&self, id: &str, role_name: &str) -> Option<&Vec<&'a str>> {
+        self.roles.get(id).and_then(|roles| role(role_name).and_then(|role| roles.get(&role)))
+    }
+
+    fn role_children_owned(&self, id: &str, role: &str) -> Vec<String> {
+        self.role_children(id, role).into_iter().flatten().map(|child| (*child).to_owned()).collect()
+    }
+
+    fn initializer_of(&self, id: &str) -> Option<&'a str> { self.initializers.get(id).copied() }
 
     fn kind(&self, id: &str) -> &str {
         self.node(id).map(|node| text_property(node, "syntax_kind").unwrap_or(node.kind.as_str())).unwrap_or("")
@@ -114,8 +153,8 @@ impl<'a> GraphView<'a> {
         for _ in 0..12 {
             if matches!(self.kind(&id), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
                 "CXXConstCastExpr" | "CXXStaticCastExpr" | "CXXReinterpretCastExpr" | "CXXFunctionalCastExpr") {
-                if let Some(child) = self.children.get(&id).and_then(|items| items.first()) {
-                    id = child.clone();
+                if let Some(child) = self.children_of(&id).and_then(|items| items.first()) {
+                    id = (*child).to_owned();
                     continue;
                 }
             }
@@ -128,10 +167,10 @@ impl<'a> GraphView<'a> {
         if depth > 40 { return None; }
         let id = self.peel(id.to_owned());
         match self.kind(&id) {
-            "DeclRefExpr" => self.access_path(self.refers.get(&id).map(String::as_str).unwrap_or(&id), depth + 1),
+            "DeclRefExpr" => self.access_path(self.refers.get(id.as_str()).copied().unwrap_or(&id), depth + 1),
             "ParmVarDecl" | "VarDecl" => path(Some(&id)),
             "MemberExpr" => {
-                let child = self.children.get(&id)?.first()?;
+                let child = self.children_of(&id)?.first()?;
                 let mut base = self.access_path(child, depth + 1)?;
                 let label = self.label(&id);
                 let arrow = label.rfind("->");
@@ -152,7 +191,7 @@ impl<'a> GraphView<'a> {
                 Some(base)
             }
             "ArraySubscriptExpr" => {
-                let children = self.children.get(&id)?;
+                let children = self.children_of(&id)?;
                 let base_id = children.iter().find(|child| {
                     self.node(child).and_then(|node| property(node, "type"))
                         .is_some_and(|value| value.contains('*') || value.contains('['))
@@ -163,7 +202,7 @@ impl<'a> GraphView<'a> {
                 Some(base)
             }
             "UnaryOperator" => {
-                let child = self.children.get(&id)?.first()?;
+                let child = self.children_of(&id)?.first()?;
                 let mut base = self.access_path(child, depth + 1)?;
                 match self.operator(&id) {
                     "*" => base.selectors.push("*".to_owned()),
@@ -177,7 +216,7 @@ impl<'a> GraphView<'a> {
     }
 
     fn deref_base(&self, id: &str) -> Option<Path> {
-        let children = self.children.get(id)?;
+        let children = self.children_of(id)?;
         match self.kind(id) {
             "UnaryOperator" if self.operator(&id) == "*" => self.access_path(children.first()?, 0),
             "MemberExpr" if self.label(&id).contains("->") => self.access_path(children.first()?, 0),
@@ -191,7 +230,7 @@ impl<'a> GraphView<'a> {
         let mut seen = HashSet::new();
         while seen.insert(current.to_owned()) {
             if current == root { return true; }
-            let Some(parent) = self.parent.get(current) else { return false };
+            let Some(parent) = self.parent_of(current) else { return false };
             current = parent;
         }
         false
@@ -213,7 +252,7 @@ fn expression_stream(graph: &GraphView, id: &str, owned: &HashSet<String>, out: 
         }
         return;
     }
-    let mut children = graph.children.get(id).cloned().unwrap_or_default()
+    let mut children = graph.children_owned(id)
         .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
     children.sort_by_key(|child| graph.offset(child));
     if graph.kind(id) == "BinaryOperator" && graph.operator(id) == "=" && children.len() >= 2 {
@@ -231,7 +270,7 @@ fn append_chain(successors: &mut HashMap<String, Vec<String>>, nodes: &[String])
 
 fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<String>, HashMap<String, Vec<String>>)> {
     let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
-        graph.parent.get(*node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
+        graph.parent_of(node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
     if roots.is_empty() { roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt").cloned().collect(); }
     let root = roots.into_iter().min_by_key(|node| graph.offset(node))?;
     let mut successors: HashMap<String, Vec<String>> = HashMap::new();
@@ -248,7 +287,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         if let Some(value) = memo.get(id) { return value.clone(); }
         if !in_progress.insert(id.to_owned()) { return (None, Vec::new()); }
         let kind = graph.kind(id);
-        let children = graph.children.get(id).cloned().unwrap_or_default()
+        let children = graph.children_owned(id)
             .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
         let result = if kind == "CompoundStmt" {
             let mut items = children;
@@ -274,7 +313,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             (first, exits)
         } else if kind == "IfStmt" {
-            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned()
+            let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
                 .or_else(|| children.iter().min_by_key(|child| graph.offset(child)).cloned());
             let mut condition_stream = Vec::new();
             if let Some(condition) = condition {
@@ -283,7 +322,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             let mut branches = Vec::new();
             for role in ["TRUE_BRANCH", "FALSE_BRANCH"] {
-                if let Some(branch) = graph.roles.get(&(id.to_owned(), role.to_owned())).and_then(|items| items.first()) {
+                if let Some(branch) = graph.role_children(id, role).and_then(|items| items.first()) {
                     branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
                 }
             }
@@ -303,9 +342,9 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             // statement path would serialize all case bodies into one chain,
             // making a large opcode switch look like one giant sequential
             // transfer on every loop iteration.
-            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned()
+            let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
                 .or_else(|| children.iter().find(|child| graph.kind(child) != "CompoundStmt").cloned());
-            let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned()
+            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned())
                 .or_else(|| children.iter().find(|child| graph.kind(child) == "CompoundStmt").cloned());
             let mut condition_stream = Vec::new();
             if let Some(condition) = condition {
@@ -316,7 +355,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
                 .map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1))
                 .unwrap_or((None, Vec::new()));
             let case_nodes = body.as_ref().map(|body| {
-                graph.children.get(body).cloned().unwrap_or_default()
+                graph.children_owned(body)
                     .into_iter().filter(|child| owned.contains(child)
                         && matches!(graph.kind(child), "CaseStmt" | "DefaultStmt"))
                     .collect::<Vec<_>>()
@@ -366,8 +405,8 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             successors.entry(id.to_owned()).or_default();
             (Some(id.to_owned()), Vec::new())
         } else if kind == "ForStmt" {
-            let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned();
-            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned();
+            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned());
+            let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
             let mut others = children;
             others.retain(|child| Some(child) != body.as_ref() && Some(child) != condition.as_ref());
             others.sort_by_key(|child| graph.offset(child));
@@ -400,8 +439,8 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let entry = init_result.0.or(condition_result.0).or(body_result.0);
             (entry, condition_result.1.into_iter().chain(body_result.1).collect())
         } else if matches!(kind, "WhileStmt" | "DoStmt") {
-            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned();
-            let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned();
+            let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
+            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned());
             let mut condition_stream = Vec::new();
             if let Some(condition) = condition.as_ref() { expression_stream(graph, condition, owned, &mut condition_stream, &mut HashSet::new(), 0); append_chain(successors, &condition_stream); }
             let body_result = body.as_ref().map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
@@ -456,7 +495,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         let controls = owned.iter().filter(|node| matches!(graph.kind(node),
             "IfStmt" | "ForStmt" | "WhileStmt" | "DoStmt")).cloned().collect::<Vec<_>>();
         for control in controls {
-            let condition = graph.roles.get(&(control.clone(), "CONDITION".to_owned()))
+            let condition = graph.role_children(&control, "CONDITION")
                 .and_then(|items| items.first()).cloned();
             let Some(condition) = condition else { continue };
             let mut stream = Vec::new();
@@ -673,9 +712,9 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
         for (node_id, node) in &graph.nodes {
             if graph.kind(node_id) != "ReturnStmt" { continue; }
             let line = property(node, "start_line").and_then(|value| value.parse().ok());
-            let Some(child) = graph.children.get(*node_id).into_iter().flatten()
+            let Some(child) = graph.children_of(node_id).into_iter().flatten()
                 .min_by_key(|child| graph.offset(child)) else { continue };
-            let peeled = graph.peel(child.clone());
+            let peeled = graph.peel((*child).to_owned());
             if let Some(call) = call_by_node.get(&peeled) {
                 input.returns.push(lifetime_proto::FunctionReturn {
                     kind: "call".to_owned(), callee: call.callee.clone(),
@@ -745,7 +784,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     // raw AST here, before the request reaches the abstract-state solver.
     for node_id in &node_ids {
         let kind = graph.kind(node_id);
-        let children = graph.children.get(node_id).cloned().unwrap_or_default();
+        let children = graph.children_owned(node_id);
         if kind == "BinaryOperator" && graph.operator(node_id) == "=" && children.len() >= 2 {
             let mut ordered = children;
             ordered.sort_by_key(|child| graph.offset(child));
@@ -782,8 +821,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         } else if kind == "VarDecl" && graph.is_pointer(node_id) {
             let line = graph.node(node_id).and_then(|node| property(node, "start_line")).and_then(|value| value.parse().ok());
             let target = path(Some(node_id));
-            if let Some(initializer) = graph.initializers.get(node_id) {
-                let initializer = graph.peel(initializer.clone());
+            if let Some(initializer) = graph.initializer_of(node_id) {
+                let initializer = graph.peel(initializer.to_owned());
                 let (kind, source, is_null) = if let Some(call) = call_by_node.get(&initializer) {
                     if call.is_alloc { (Kind::Alloc, None, false) }
                     else if call.is_realloc { (Kind::Realloc, None, false) }
@@ -800,11 +839,11 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         }
 
-        let assignment_lhs = graph.parent.get(node_id).is_some_and(|parent| {
+        let assignment_lhs = graph.parent_of(node_id).is_some_and(|parent| {
             graph.kind(parent) == "BinaryOperator" && graph.operator(parent) == "=" &&
-            graph.children.get(parent).into_iter().flatten()
+            graph.children_of(parent).into_iter().flatten()
                 .min_by_key(|child| graph.offset(child))
-                .is_some_and(|child| graph.peel(child.clone()) == graph.peel(node_id.clone()))
+                .is_some_and(|child| graph.peel((*child).to_owned()) == graph.peel(node_id.clone()))
         });
         if !assignment_lhs {
             if let Some(base) = graph.deref_base(node_id) {
@@ -896,10 +935,10 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for (node_id, node) in &graph.nodes {
         if graph.kind(node_id) != "ReturnStmt" { continue; }
         let line = property(node, "start_line").and_then(|value| value.parse().ok());
-        let child = graph.children.get(*node_id).into_iter().flatten()
+        let child = graph.children_of(node_id).into_iter().flatten()
             .min_by_key(|child| graph.offset(child));
         let Some(child) = child else { continue };
-        let peeled = graph.peel(child.clone());
+        let peeled = graph.peel((*child).to_owned());
         if let Some(call) = call_by_node.get(&peeled) {
             returns.push(lifetime_proto::FunctionReturn {
                 kind: "call".to_owned(), callee: call.callee.clone(),
@@ -925,12 +964,12 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         let mut anchor = item.node.clone();
         let mut seen = HashSet::new();
         while !cfg_node_set.contains(&anchor) && seen.insert(anchor.clone()) {
-            let Some(parent) = graph.parent.get(&anchor) else { break };
-            anchor = parent.clone();
+            let Some(parent) = graph.parent_of(&anchor) else { break };
+            anchor = parent.to_owned();
         }
         if !cfg_node_set.contains(&anchor) {
-            if let Some(initializer) = graph.initializers.get(&item.node) {
-                let initializer = graph.peel(initializer.clone());
+            if let Some(initializer) = graph.initializer_of(&item.node) {
+                let initializer = graph.peel(initializer.to_owned());
                 if cfg_node_set.contains(&initializer) { anchor = initializer; }
             }
         }
@@ -983,8 +1022,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             let mut if_nodes = graph.nodes.keys().filter(|node| graph.kind(node) == "IfStmt").cloned().collect::<Vec<_>>();
         if_nodes.sort_by_key(|node| graph.offset(node));
         for if_node in if_nodes {
-            let true_roots = graph.roles.get(&(if_node.to_string(), "TRUE_BRANCH".to_owned())).cloned().unwrap_or_default();
-            let false_roots = graph.roles.get(&(if_node.to_string(), "FALSE_BRANCH".to_owned())).cloned().unwrap_or_default();
+            let true_roots = graph.role_children_owned(&if_node, "TRUE_BRANCH");
+            let false_roots = graph.role_children_owned(&if_node, "FALSE_BRANCH");
             if true_roots.is_empty() { continue; }
             let branch_nodes = |roots: &[String]| prepared_nodes.iter().filter(|node| {
                 roots.iter().any(|root| graph.is_descendant(node, root))
