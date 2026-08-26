@@ -185,13 +185,28 @@ def atropos_enrich(
                 "bind": counts, "unbound": unbound,
             }
         if compact_structural and not complete_dataflow:
-            known_node_ids = {node.get("id") for node in graph.get("nodes", ())}
-            known_node_ids.discard(None)
+            # The native binder has already resolved attachments against the
+            # complete Pass-1 stream.  In compact mode the caller keeps the
+            # projection as its base and only needs the additive delta here;
+            # rebuilding a graph-sized membership set and copying every
+            # projection record defeats the path-based native handoff.
+            known_node_ids = {
+                stamp.get("value_id")
+                for stamp in stamps
+                if stamp.get("value_id") is not None
+            }
+            known_node_ids.update(
+                stamp.get(endpoint)
+                for stamp in stamps
+                for endpoint in ("from", "to")
+                if stamp.get(endpoint) is not None
+            )
             delta = AtroposOverlay(stamps).delta_for_node_ids(known_node_ids)
-            graph["nodes"] = list(graph.get("nodes", ()))
-            graph["edges"] = list(graph.get("edges", ()))
-            graph["nodes"].extend(delta.nodes)
-            graph["edges"].extend(delta.edges)
+            # This branch is consumed by Session._structural_bind, which
+            # combines the delta with its narrow structural projection.  Keep
+            # the return value delta-only so no second graph-sized Python copy
+            # is created on the native path.
+            graph = {"nodes": delta.nodes, "edges": delta.edges}
             role_nodes: Dict[str, int] = {}
             for node in delta.nodes:
                 kind = node.get("kind", "?")
