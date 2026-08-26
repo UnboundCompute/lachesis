@@ -6,6 +6,9 @@
 //! values.  The output is the existing `atropos-binding-report` contract.
 
 use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use hashbrown::HashMap;
 use prost::Message;
 
@@ -317,6 +320,172 @@ fn bind_all(models: &[Model], index: &Index) -> Report {
             unsupported_path: counts["unsupported-path"], attempted: results.len(),
         }, results,
     }
+}
+
+fn property(node: &crate::graph_proto::NodeRecord, key: &str) -> Option<String> {
+    node.properties.iter().find_map(|field| {
+        if field.key != key { return None; }
+        let value = field.value.as_ref()?.kind.as_ref()?;
+        Some(match value {
+            crate::graph_proto::value::Kind::Text(value) => value.clone(),
+            crate::graph_proto::value::Kind::Integer(value) => value.to_string(),
+            crate::graph_proto::value::Kind::Boolean(value) => value.to_string(),
+            _ => return None,
+        })
+    })
+}
+
+fn simple_identifier(value: &str) -> bool {
+    !value.is_empty() && value.chars().enumerate().all(|(index, ch)|
+        if index == 0 { ch == '_' || ch.is_ascii_alphabetic() }
+        else { ch == '_' || ch.is_ascii_alphanumeric() })
+}
+
+fn framed_record(reader: &mut BufReader<File>) -> Result<Option<Vec<u8>>, String> {
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(format!("cannot read graph frame: {error}")),
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)
+        .map_err(|error| format!("cannot read graph frame payload: {error}"))?;
+    Ok(Some(payload))
+}
+
+/// Build the neutral Atropos index directly from the complete Pass-1 stream.
+///
+/// Only call nodes, argument nodes, and HAS_ARGUMENT edges are retained. The
+/// million-node graph never becomes a Python object graph and the full edge
+/// stream is not retained in Rust either.
+fn index_from_path(path: &Path) -> Result<Index, String> {
+    let file = File::open(path).map_err(|error| format!("cannot open Pass-1 input: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
+    let mut arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut has_arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut language = None;
+    while let Some(mut payload) = framed_record(&mut reader)? {
+        if payload.is_empty() { continue; }
+        let tag = payload.remove(0);
+        match tag {
+            b'N' => {
+                let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
+                    .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
+                if language.is_none() {
+                    language = if node.id.contains(":clang-c:") { Some("c") }
+                        else if node.id.contains(":cpython-ast:") { Some("python") }
+                        else if node.id.contains(":typescript-compiler-api:") { Some("typescript") }
+                        else { None };
+                }
+                if node.kind == "call" || node.kind == "construct" {
+                    calls.push(node);
+                } else if node.kind == "argument" {
+                    let call = property(&node, "callsite_id");
+                    let position = property(&node, "position")
+                        .and_then(|value| value.parse().ok()).unwrap_or(0);
+                    if let Some(call) = call {
+                        arguments.entry(call).or_default().push((position, node.id));
+                    }
+                }
+            }
+            b'E' => {
+                let edge = crate::graph_proto::EdgeRecord::decode(payload.as_slice())
+                    .map_err(|error| format!("invalid Pass-1 edge: {error}"))?;
+                if edge.kind == "HAS_ARGUMENT" {
+                    let position = edge.properties.iter().find_map(|field| {
+                        (field.key == "position").then(|| field.value.as_ref()?.kind.as_ref())
+                    }).and_then(|value| match value? {
+                        crate::graph_proto::value::Kind::Integer(value) => (*value).try_into().ok(),
+                        crate::graph_proto::value::Kind::Text(value) => value.parse().ok(),
+                        _ => None,
+                    }).unwrap_or(0);
+                    has_arguments.entry(edge.source).or_default().push((position, edge.target));
+                }
+            }
+            // The first frame is the graph header Document. It is metadata only.
+            _ => {}
+        }
+    }
+    let callsites = calls.into_iter().filter_map(|node| {
+        let raw_name = property(&node, "callee")
+            .or_else(|| property(&node, "method_name"))
+            .or_else(|| property(&node, "callee_name"))?;
+        let mut name = raw_name;
+        let mut receiver = property(&node, "receiver");
+        if receiver.is_none() {
+            if let Some((prefix, leaf)) = name.rsplit_once('.').map(|(prefix, leaf)|
+                (prefix.to_owned(), leaf.to_owned())) {
+                if simple_identifier(&prefix) {
+                    name = leaf;
+                    receiver = Some(prefix);
+                }
+            }
+        }
+        let module = property(&node, "module").or_else(|| receiver.as_deref()
+            .filter(|value| simple_identifier(value)).map(str::to_owned));
+        let receiver_type = property(&node, "receiver_type");
+        let call_value_id = property(&node, "value_id").or_else(|| Some(node.id.clone()));
+        let receiver_value_id = property(&node, "receiver_value_id");
+        let mut args = arguments.remove(&node.id)
+            .or_else(|| has_arguments.remove(&node.id)).unwrap_or_default();
+        args.sort_by_key(|item| item.0);
+        Some(Callsite {
+            id: node.id,
+            callee: Callee {
+                name, module, receiver_type,
+                arity: Some(args.len() as i64),
+            },
+            call_value_id,
+            receiver_value_id,
+            arg_value_ids: args.into_iter().map(|(_, id)| id).collect(),
+        })
+    }).collect();
+    Ok(Index { language: language.map(str::to_owned), source: Some(path.display().to_string()), callsites })
+}
+
+fn load_models_path(root: &Path) -> Result<Vec<Model>, String> {
+    let mut paths = Vec::<PathBuf>::new();
+    fn visit(path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in fs::read_dir(path).map_err(|error| format!("cannot read catalog: {error}"))? {
+            let entry = entry.map_err(|error| format!("cannot read catalog entry: {error}"))?;
+            let path = entry.path();
+            if path.is_dir() { visit(&path, paths)?; }
+            else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    }
+    visit(root, &mut paths)?;
+    paths.sort();
+    let mut models = Vec::new();
+    for path in paths {
+        let bytes = fs::read(&path).map_err(|error| format!("cannot read catalog {path:?}: {error}"))?;
+        let document: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid catalog {path:?}: {error}"))?;
+        let entries = document.get("entries").and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("catalog {path:?} has no entries"))?;
+        for entry in entries {
+            models.push(serde_json::from_value(entry.clone())
+                .map_err(|error| format!("invalid catalog model {path:?}: {error}"))?);
+        }
+    }
+    Ok(models)
+}
+
+pub(crate) fn bind_path(input: &Path, catalog: &Path, output: &Path) -> Result<(), String> {
+    let index = index_from_path(input)?;
+    let models = load_models_path(catalog)?;
+    let report = to_proto(bind_all(&models, &index));
+    let mut bytes = Vec::new();
+    report.encode(&mut bytes).map_err(|error| format!("cannot encode bind report: {error}"))?;
+    let temporary = output.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&temporary, bytes).map_err(|error| format!("cannot write bind report: {error}"))?;
+    fs::rename(&temporary, output).map_err(|error| format!("cannot publish bind report: {error}"))?;
+    Ok(())
 }
 
 fn optional_string(value: String) -> Option<String> {

@@ -1032,6 +1032,32 @@ pub unsafe extern "C" fn lachesis_pass2_run_path(
     }
 }
 
+/// Scan a framed Pass-1 substrate and bind the Atropos catalog entirely in
+/// Rust. The report is written as protobuf to `output_path`; no graph or report
+/// payload crosses the Python ABI.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_atropos_bind_path(
+    input_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || catalog_path.is_null() || output_path.is_null() {
+            return Err("native Atropos bind path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path).to_str()
+            .map_err(|error| format!("invalid input path: {error}"))?;
+        let catalog = CStr::from_ptr(catalog_path).to_str()
+            .map_err(|error| format!("invalid catalog path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid output path: {error}"))?;
+        atropos_bind::bind_path(std::path::Path::new(input), std::path::Path::new(catalog),
+                                std::path::Path::new(output))
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native Atropos path bind error: {error}"); 1 }
+    }
+}
+
 /// Plan source launches, formal/actual seams, and coverage regions directly
 /// from compact translation facts and catalog entries.
 #[no_mangle]

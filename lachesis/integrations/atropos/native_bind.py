@@ -40,6 +40,26 @@ def available() -> bool:
     return _load() is not None
 
 
+def bind_path(input_path: str | os.PathLike[str], catalog_path: str | os.PathLike[str],
+              output_path: str | os.PathLike[str]) -> None:
+    """Bind a framed Pass-1 substrate without constructing a Python callsite index.
+
+    This is the path-only boundary used by the native Pass-2 engine. Rust scans the
+    substrate and catalog and writes the protobuf report directly to ``output_path``.
+    """
+    library = _load()
+    if library is None:
+        raise RuntimeError("native Atropos binder is unavailable")
+    function = library.lachesis_atropos_bind_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(os.fsencode(os.fspath(input_path)),
+                      os.fsencode(os.fspath(catalog_path)),
+                      os.fsencode(os.fspath(output_path)))
+    if status != 0:
+        raise RuntimeError(f"native Atropos path bind failed with status {status}")
+
+
 def bind_all(models: list[dict[str, Any]], index: dict[str, Any]) -> dict[str, Any]:
     """Bind models with Rust over typed protobuf; no JSON crosses the ABI."""
     library = _load()
