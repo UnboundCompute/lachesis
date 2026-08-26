@@ -29,6 +29,19 @@ fn edge_text<'a>(edge: &'a pass2::Edge, key: &str) -> Option<&'a str> {
     edge_property(edge, key).and_then(value_text)
 }
 
+fn text_list_field(key: &str, values: &[String]) -> graph_proto::Field {
+    graph_proto::Field {
+        key: key.to_owned(),
+        value: Some(graph_proto::Value {
+            kind: Some(graph_proto::value::Kind::List(graph_proto::ListValue {
+                values: values.iter().map(|value| graph_proto::Value {
+                    kind: Some(graph_proto::value::Kind::Text(value.clone())),
+                }).collect(),
+            })),
+        }),
+    }
+}
+
 fn last_name(value: &str) -> String {
     let mut result = value.split("?.").last().unwrap_or(value);
     if let Some((_, suffix)) = result.rsplit_once('.') { result = suffix; }
@@ -41,7 +54,7 @@ fn fact(evidence: &[String], confidence: &str, reason: Option<&str>) -> Vec<grap
     let mut fields = vec![
         pass2::text_field("fact_origin", "core-inference"),
         pass2::text_field("confidence", confidence),
-        pass2::text_field("evidence_ids", evidence.join("\x1f")),
+        text_list_field("evidence_ids", evidence),
     ];
     if let Some(reason) = reason { fields.push(pass2::text_field("reason", reason)); }
     fields
@@ -62,7 +75,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     let mut identity_out: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut references: FxHashMap<u32, HashSet<u32>> = FxHashMap::default();
     let mut read_by_evidence: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    let mut ast_children: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut ast_children: FxHashMap<u32, Vec<(u32, Vec<graph_proto::Field>)>> = FxHashMap::default();
     let mut bindings_by_parameter: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut callbacks_by_argument: FxHashMap<u32, HashSet<u32>> = FxHashMap::default();
     let mut identity_edges = Vec::new();
@@ -96,7 +109,10 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 identity_edges.push((item.source, item.target));
             }
             "DEFINES" => { identity_edges.push((item.target, item.source)); }
-            "AST_CHILD" => { ast_children.entry(item.source).or_default().push(item.target); }
+            "AST_CHILD" => {
+                ast_children.entry(item.source).or_default()
+                    .push((item.target, item.properties.clone()));
+            }
             "REFERS_TO" => { references.entry(item.source).or_default().insert(item.target); }
             "READ_EVIDENCED_BY" => { read_by_evidence.entry(item.target).or_default().push(item.source); }
             "ARGUMENT_BINDS_PARAMETER" => { bindings_by_parameter.entry(item.target).or_default().push(item.source); }
@@ -158,24 +174,41 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             }
         }
         let children = ast_children.get(&call_id).cloned().unwrap_or_default();
-        for child in children {
-            for target in callable_targets.get(&child).into_iter().flatten() {
-                if emitted.insert((call_id, *target)) {
-                    let source = graph.id(call_id).to_owned(); let target_name = graph.id(*target).to_owned();
-                    edges.push(output_edge("MAY_INVOKE", &source, &target_name,
-                        fact(&[source.clone(), graph.id(child).to_owned(), target_name.clone()], "high",
-                             Some("function-valued-reference"))));
+        for (child, child_properties) in children {
+            let role = child_properties.iter().find(|field| field.key == "role")
+                .and_then(|field| field.value.as_ref()).and_then(value_text);
+            if role != Some("CALLEE") { continue; }
+            let mut referenced_values = HashSet::new();
+            let mut queue = vec![child];
+            let mut seen = HashSet::new();
+            seen.insert(child);
+            while let Some(current) = queue.pop() {
+                referenced_values.extend(references.get(&current).into_iter().flatten().copied());
+                referenced_values.extend(read_by_evidence.get(&current).into_iter().flatten().copied());
+                for (descendant, _) in ast_children.get(&current).into_iter().flatten() {
+                    if seen.insert(*descendant) { queue.push(*descendant); }
                 }
             }
-            if let Some(arguments) = bindings_by_parameter.get(&child) {
-                for argument in arguments {
+            for referenced in referenced_values {
+                for target in callable_targets.get(&referenced).into_iter().flatten() {
+                    if emitted.insert((call_id, *target)) {
+                        let source = graph.id(call_id).to_owned(); let target_name = graph.id(*target).to_owned();
+                        edges.push(output_edge("MAY_INVOKE", &source, &target_name,
+                            fact(&[source.clone(), graph.id(referenced).to_owned(), target_name.clone()], "high",
+                                 Some("function-valued-reference"))));
+                    }
+                }
+                let is_parameter = graph.node_index(graph.id(referenced))
+                    .is_some_and(|index| graph.node_kind(index) == "parameter");
+                if !is_parameter { continue; }
+                for argument in bindings_by_parameter.get(&referenced).into_iter().flatten() {
                     let mut targets = callbacks_by_argument.get(argument).cloned().unwrap_or_default();
                     targets.extend(callable_targets.get(argument).into_iter().flatten().copied());
                     for target in targets {
                         if emitted.insert((call_id, target)) {
                             let source = graph.id(call_id).to_owned(); let target_name = graph.id(target).to_owned();
                             edges.push(output_edge("MAY_INVOKE", &source, &target_name,
-                                fact(&[source.clone(), graph.id(child).to_owned(), graph.id(*argument).to_owned(), target_name.clone()], "high",
+                                fact(&[source.clone(), graph.id(referenced).to_owned(), graph.id(*argument).to_owned(), target_name.clone()], "high",
                                      Some("contextual-callback-binding"))));
                         }
                     }
@@ -183,6 +216,37 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             }
         }
     }
-    let _ = (references, read_by_evidence, last_name);
+
+    // Keep the conservative unresolved-call fallback from the Python overlay.
+    // It only fires when there is no compiler target and no native candidate.
+    let mut callables_by_name: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+    for item in &graph.nodes {
+        if !CALLABLE_KINDS.contains(&graph.kind(item.kind)) { continue; }
+        let name = graph.node_property_text(item, "name")
+            .map(str::to_owned).unwrap_or_else(|| last_name(&item.label));
+        if !name.is_empty() { callables_by_name.entry(name).or_default().push(item.id); }
+    }
+    for node in &graph.nodes {
+        if !["call", "construct"].contains(&graph.kind(node.kind)) { continue; }
+        if graph.node_property_text(node, "primary_target_id").is_some() { continue; }
+        let call_id = node.id;
+        let has_existing = graph.outgoing.get(graph.node_by_id.get(&call_id).copied().unwrap_or(usize::MAX))
+            .into_iter().flatten().any(|edge_index| {
+                ["INVOKES", "MAY_INVOKE"].contains(&graph.edge_kind(&graph.edges[*edge_index]).as_str())
+            });
+        if has_existing || emitted.iter().any(|(source, _)| *source == call_id) { continue; }
+        let name = graph.node_property_text(node, "method_name")
+            .map(str::to_owned).unwrap_or_else(|| last_name(
+                graph.node_property_text(node, "callee").unwrap_or(&node.label)));
+        let candidates = callables_by_name.get(&name).cloned().unwrap_or_default();
+        let confidence = "low";
+        let reason = if candidates.len() == 1 { "name-fallback" } else { "name-fallback-polymorphic" };
+        for target in candidates {
+            if target == call_id || !emitted.insert((call_id, target)) { continue; }
+            let source = graph.id(call_id).to_owned(); let target_name = graph.id(target).to_owned();
+            edges.push(output_edge("MAY_INVOKE", &source, &target_name,
+                fact(&[source.clone(), target_name.clone()], confidence, Some(reason))));
+        }
+    }
     Delta { nodes: Vec::new(), edges }
 }
