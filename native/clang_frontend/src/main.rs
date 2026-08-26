@@ -879,6 +879,27 @@ fn parse_unit(
     Ok(())
 }
 
+fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if matches!(path.extension().and_then(|extension| extension.to_str()),
+                        Some("c" | "h")) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // clang-sys's `runtime` feature keeps libclang out of the process until
     // the frontend is actually used.  Loading it here also makes the binary
@@ -941,14 +962,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 emit_macros_for_file(&mut emitter, &path_text)?;
             }
         } else {
-            let path = PathBuf::from(&arguments[1])
+            let input = PathBuf::from(&arguments[1])
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
-            let path_text = path.to_string_lossy().into_owned();
-            emitter.root_files.insert(path_text.clone());
-            let source_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy();
-            emit_file_node(&mut emitter, &path_text, &source_dir)?;
-            emit_macros_for_file(&mut emitter, &path_text)?;
+            let (source_dir, files) = if input.is_dir() {
+                (input.clone(), source_files(&input)?)
+            } else {
+                (input.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(), vec![input])
+            };
+            if files.is_empty() {
+                clang_disposeIndex(index);
+                return Err(format!("no C or header roots found under {}", source_dir.display()).into());
+            }
+            let source_dir_text = source_dir.to_string_lossy().into_owned();
+            for path in &files {
+                let path_text = path.to_string_lossy().into_owned();
+                emitter.root_files.insert(path_text.clone());
+                emit_file_node(&mut emitter, &path_text, &source_dir_text)?;
+                emit_macros_for_file(&mut emitter, &path_text)?;
+            }
         }
         if let Some(request) = request {
             if request.translation_units.is_empty() {
@@ -959,15 +991,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parse_unit(index, unit, &mut emitter)?;
             }
         } else {
-            let source = PathBuf::from(&arguments[1]);
-            let mut unit = graph::NativeTranslationUnit {
-                path: source.to_string_lossy().into_owned(),
-                arguments: Vec::new(),
-            };
+            let input = PathBuf::from(&arguments[1])
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
+            let files = if input.is_dir() { source_files(&input)? } else { vec![input] };
+            let mut clang_arguments = Vec::new();
             if let Some(separator) = arguments.iter().position(|argument| argument == "--") {
-                unit.arguments.extend(arguments[separator + 1..].iter().cloned());
+                clang_arguments.extend(arguments[separator + 1..].iter().cloned());
             }
-            parse_unit(index, &unit, &mut emitter)?;
+            for source in files {
+                let unit = graph::NativeTranslationUnit {
+                    path: source.to_string_lossy().into_owned(),
+                    arguments: clang_arguments.clone(),
+                };
+                parse_unit(index, &unit, &mut emitter)?;
+            }
         }
         emit_cross_tu_links(&mut emitter)?;
         emitter.nodes.flush()?;
