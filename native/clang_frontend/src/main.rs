@@ -283,10 +283,10 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
 
     let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
         "FunctionDecl" => Some("function"),
-        "RecordDecl" => Some("record"),
+        "RecordDecl" | "StructDecl" | "UnionDecl" => Some("record"),
         "EnumDecl" => Some("enum"),
         "TypedefDecl" => Some("type"),
-        "ParmVarDecl" => Some("parameter"),
+        "ParmVarDecl" | "ParmDecl" => Some("parameter"),
         "VarDecl" => Some("variable"),
         "FieldDecl" => Some("property"),
         "EnumConstantDecl" => Some("constant"),
@@ -342,7 +342,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             if !target_file.is_empty() {
                 let target_id_kind = match target_kind.as_str() {
                     "FunctionDecl" => Some("function"),
-                    "VarDecl" | "ParmVarDecl" | "FieldDecl" => Some("value"),
+                    "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                     _ => None,
                 };
                 if let Some(target_id_kind) = target_id_kind {
@@ -387,7 +387,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             let (target_file, _, _, target_offset, target_end) = cursor_file(referenced);
             let id_kind = match target_kind.as_str() {
                 "FunctionDecl" => Some("function"),
-                "VarDecl" | "ParmVarDecl" | "FieldDecl" => Some("value"),
+                "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                 _ => None,
             };
             if let (Some(id_kind), Some(_owner_id)) = (id_kind, owner_id) {
@@ -471,10 +471,10 @@ fn cursor_identity(
     }
     let (kind, tier, id_kind) = match syntax_kind {
         "FunctionDecl" => ("function", "T1", "function"),
-        "RecordDecl" => ("record", "T1", "record"),
+        "RecordDecl" | "StructDecl" | "UnionDecl" => ("record", "T1", "record"),
         "EnumDecl" => ("enum", "T1", "enum"),
         "TypedefDecl" => ("type", "T1", "type"),
-        "ParmVarDecl" => ("parameter", "T2", "value"),
+        "ParmVarDecl" | "ParmDecl" => ("parameter", "T2", "value"),
         "VarDecl" => ("variable", "T2", "value"),
         "FieldDecl" => ("property", "T2", "value"),
         "EnumConstantDecl" => ("constant", "T2", "value"),
