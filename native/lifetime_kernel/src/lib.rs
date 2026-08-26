@@ -86,7 +86,7 @@ fn run_native_overlay_chain(
     let delta = taint::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     pass2::publish_dataflow_stream(
-        output, &input.to_string_lossy(), "", &nodes, &edges,
+        output, &input.to_string_lossy(), &graph.core_content_hash, &nodes, &edges,
     )?;
     Ok((nodes.len(), edges.len()))
 }
@@ -980,6 +980,34 @@ pub unsafe extern "C" fn lachesis_pass2_control_flow_path(
     let pointer = payload.as_mut_ptr();
     std::mem::forget(payload);
     pointer
+}
+
+/// Run the complete native Pass-2 overlay chain from a framed Pass-1 input
+/// sidecar and publish the additive dataflow sidecar.  The ABI deliberately
+/// returns only a status code: no graph records cross into Python.
+///
+/// Return value: 0 on success, 1 on invalid/null paths or a native failure.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_pass2_run_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native Pass-2 path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path)
+            .to_str().map_err(|error| format!("invalid native Pass-2 input path: {error}"))?;
+        let output = CStr::from_ptr(output_path)
+            .to_str().map_err(|error| format!("invalid native Pass-2 output path: {error}"))?;
+        run_native_overlay_chain(std::path::Path::new(input), std::path::Path::new(output))
+            .map(|(nodes, edges)| {
+                eprintln!("[lachesis native pass2] published {nodes} nodes and {edges} edges");
+            })
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native Pass-2 error: {error}"); 1 }
+    }
 }
 
 /// Plan source launches, formal/actual seams, and coverage regions directly

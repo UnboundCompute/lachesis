@@ -473,6 +473,28 @@ class GraphStore:
 
         core_path = self._core_path
         manifest = read_store_manifest(core_path)
+        # The Pass-1 complete binary input is the native Pass-2 contract. When it is
+        # present, keep Python out of the whole-graph enrichment step: Rust opens the
+        # framed protobuf by path, runs the overlays, and publishes the sidecar. The
+        # Python index is only rebound afterwards for query/bind consumers.
+        from lachesis.nav.dataflow.substrate import pass2_input_cache_path
+        native_input = pass2_input_cache_path(core_path)
+        native_cache = dataflow_overlay_path(core_path)
+        if native_input.is_file() and not _dataflow_cache_matches(native_cache, manifest.get("core_content_hash")):
+            from lachesis.flow.native_lifetime import run_pass2_path
+            timing("native Pass-2 starting")
+            run_pass2_path(native_input, native_cache)
+            timing("native Pass-2 published")
+            dataflow_overlay = _load_dataflow_overlay(native_cache)
+            merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+            self.index.attach_overlay(merged_overlay)
+            self.overlay = merged_overlay
+            self.graph = None
+            self.gl = GraphLib.from_index(self.index)
+            self._retained_enriched_graph = None
+            self._entries = None
+            self._enriched = True
+            return self
         # Say up front when this will be the heavy, unbounded, in-RAM step (see the class
         # docstring). A slow first enrich on a large graph then reads as "big in-RAM step",
         # not "frozen", and the message names the ways out. We never refuse the work.

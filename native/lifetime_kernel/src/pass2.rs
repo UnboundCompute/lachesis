@@ -60,6 +60,7 @@ pub(crate) struct Edge {
 }
 
 pub(crate) struct Graph {
+    pub(crate) core_content_hash: String,
     pub(crate) symbols: Symbols,
     pub(crate) nodes: Vec<Node>,
     pub(crate) edges: Vec<Edge>,
@@ -253,8 +254,15 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
         .map_err(|error| format!("cannot open Pass-2 input: {error}"))?;
     let mut input = BufReader::with_capacity(1024 * 1024, file);
     let header = read_stream_frame(&mut input)?;
-    let _: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
+    let document: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 input header: {error}"))?;
+    let core_content_hash = document.fields.as_ref()
+        .and_then(|fields| fields.fields.iter().find(|field| field.key == "core_content_hash"))
+        .and_then(|field| field.value.as_ref())
+        .and_then(|value| match value.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.clone()),
+            _ => None,
+        }).unwrap_or_default();
 
     let mut symbols = Symbols::default();
     let mut nodes = Vec::new();
@@ -278,11 +286,11 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
             _ => return Err("unknown Pass-2 input record prefix".to_owned()),
         }
     }
-    finish_graph(symbols, nodes, edges)
+    finish_graph(symbols, nodes, edges, core_content_hash)
 }
 
 fn finish_graph(
-    symbols: Symbols, nodes: Vec<Node>, edges: Vec<Edge>,
+    symbols: Symbols, nodes: Vec<Node>, edges: Vec<Edge>, core_content_hash: String,
 ) -> Result<Graph, String> {
     let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
     for (index, node) in nodes.iter().enumerate() { node_by_id.insert(node.id, index); }
@@ -296,7 +304,7 @@ fn finish_graph(
     for (index, edge) in edges.iter().enumerate() {
         edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
     }
-    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
+    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
 }
 
 fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
@@ -378,7 +386,7 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
     for (index, edge) in edges.iter().enumerate() {
         edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
     }
-    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
+    Ok(Graph { core_content_hash: String::new(), symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
 }
 
 pub(crate) fn publish_dataflow_stream(

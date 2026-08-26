@@ -24,6 +24,64 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
 fn add_points(points: &mut FxHashMap<u32, FxHashSet<u32>>, value: u32, objects: &FxHashSet<u32>) -> bool {
     let entry = points.entry(value).or_default(); let before = entry.len(); entry.extend(objects); entry.len() != before
 }
+fn value_text(value: &graph_proto::Value) -> Option<&str> { match value.kind.as_ref()? { graph_proto::value::Kind::Text(value) => Some(value), _ => None } }
+fn object_field<'a>(value: &'a graph_proto::Value, key: &str) -> Option<&'a graph_proto::Value> {
+    match value.kind.as_ref()? { graph_proto::value::Kind::Object(object) => object.fields.iter().find_map(|field| (field.key == key).then(|| field.value.as_ref()).flatten()), _ => None }
+}
+fn property_segments(graph: &Graph, node: &pass2::Node) -> Vec<String> {
+    if let Some(value) = graph.node_property(node, "path_segments") {
+        if let Some(list) = value.kind.as_ref().and_then(|kind| match kind { graph_proto::value::Kind::List(list) => Some(list), _ => None }) {
+            let result: Vec<String> = list.values.iter().map(|segment| {
+                if object_field(segment, "dynamic").and_then(|value| match value.kind.as_ref()? { graph_proto::value::Kind::Boolean(value) => Some(*value), _ => None }).unwrap_or(false) { "[*]".to_owned() } else { object_field(segment, "key").and_then(value_text).unwrap_or("?").to_owned() }
+            }).collect();
+            if !result.is_empty() { return result; }
+        }
+    }
+    graph.node_property_text(node, "path").map(|value| vec![value.to_owned()]).unwrap_or_default()
+}
+fn emit_node(nodes: &mut Vec<graph_proto::NodeRecord>, emitted: &mut HashSet<String>, id: String, kind: &str, label: String, properties: Vec<graph_proto::Field>) {
+    if emitted.insert(id.clone()) { nodes.push(node(id, kind, label, properties)); }
+}
+fn emit_edge(edges: &mut Vec<graph_proto::EdgeRecord>, emitted: &mut HashSet<(String, String, String)>, kind: &str, source: String, target: String, properties: Vec<graph_proto::Field>) {
+    if source != target && !source.is_empty() && !target.is_empty() && emitted.insert((kind.to_owned(), source.clone(), target.clone())) { edges.push(edge(kind, &source, &target, properties)); }
+}
+fn ensure_location(
+    graph: &mut Graph, locations: &mut FxHashMap<(u32, String), u32>, location_values: &mut FxHashMap<u32, FxHashSet<u32>>,
+    nodes: &mut Vec<graph_proto::NodeRecord>, edges: &mut Vec<graph_proto::EdgeRecord>, emitted_nodes: &mut HashSet<String>, emitted_edges: &mut HashSet<(String, String, String)>, object: u32, segments: &[String], evidence: &[String],
+) -> u32 {
+    let key = (object, segments.join("\0"));
+    if let Some(location) = locations.get(&key) { return *location; }
+    let object_text = graph.id(object).to_owned(); let path_text = segments.join(".");
+    let location_text = pass2::stable_id("core", "heap-identity", "heap-location", &[&object_text, &path_text]);
+    let location = graph.symbols.intern(location_text.clone());
+    let mut properties = fact(evidence, "high"); properties.extend([pass2::text_field("object_id", &object_text), list_field("path_segments", segments), pass2::text_field("path", &path_text)]);
+    emit_node(nodes, emitted_nodes, location_text.clone(), "heap-location", format!("{}.{}", object_text, path_text), properties);
+    emit_edge(edges, emitted_edges, "POINTS_TO", object_text, location_text, [fact(evidence, "high"), vec![pass2::text_field("relationship", "property")]].concat());
+    locations.insert(key, location); location_values.entry(location).or_default(); location
+}
+fn target_locations(
+    graph: &mut Graph, locations: &mut FxHashMap<(u32, String), u32>, location_values: &mut FxHashMap<u32, FxHashSet<u32>>,
+    nodes: &mut Vec<graph_proto::NodeRecord>, edges: &mut Vec<graph_proto::EdgeRecord>, emitted_nodes: &mut HashSet<String>, emitted_edges: &mut HashSet<(String, String, String)>, object: u32, segments: &[String], evidence: &[String],
+) -> Vec<u32> {
+    let mut current = vec![object];
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        let mut next = Vec::new();
+        for current_object in current {
+            let location = ensure_location(graph, locations, location_values, nodes, edges, emitted_nodes, emitted_edges, current_object, &[segment.clone()], evidence);
+            if location_values.get(&location).is_none_or(FxHashSet::is_empty) {
+                let current_text = graph.id(current_object).to_owned(); let location_text = graph.id(location).to_owned();
+                let child_text = pass2::stable_id("core", "heap-identity", "heap-object", &["property", &current_text, segment]);
+                let child = graph.symbols.intern(child_text.clone()); let child_fact = fact(&[evidence, &[location_text.clone()][..]].concat(), "conservative");
+                emit_node(nodes, emitted_nodes, child_text.clone(), "heap-object", format!("property-object:{segment}"), child_fact.clone());
+                location_values.entry(location).or_default().insert(child);
+                emit_edge(edges, emitted_edges, "POINTS_TO", location_text, child_text, child_fact);
+            }
+            next.extend(location_values.get(&location).into_iter().flatten().copied());
+        }
+        current = next;
+    }
+    current.into_iter().map(|object| ensure_location(graph, locations, location_values, nodes, edges, emitted_nodes, emitted_edges, object, &segments[segments.len() - 1..], evidence)).collect()
+}
 
 pub(crate) fn enrich(graph: &mut Graph) -> Delta {
     let mut points: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
@@ -121,6 +179,48 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
     }
     let mut queue: std::collections::VecDeque<u32> = points.keys().copied().collect(); let mut queued: FxHashSet<u32> = queue.iter().copied().collect();
     while let Some(source) = queue.pop_front() { queued.remove(&source); let source_objects = points.get(&source).cloned().unwrap_or_default(); for target in identity_targets.get(&source).into_iter().flatten() { let set = points.entry(*target).or_default(); let before = set.len(); set.extend(&source_objects); if set.len() != before && queued.insert(*target) { queue.push_back(*target); } } }
+    drop(add_node);
+    drop(add_edge);
+
+    let path_specs: Vec<(u32, u32, Vec<String>)> = graph.nodes.iter().filter(|node| graph.kind(node.kind) == "property-path").filter_map(|path| Some((path.id, text(graph, path, "base_value_id").and_then(|id| graph.symbol(id))?, property_segments(graph, path)))).filter(|(_, _, segments)| !segments.is_empty()).collect();
+    let mut writes_by_path: FxHashMap<u32, Vec<(u32, Option<u32>)>> = FxHashMap::default();
+    let mut reads_by_path: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for item in &graph.nodes {
+        match graph.kind(item.kind) {
+            "write" => if let Some(path) = text(graph, item, "target_id").and_then(|id| graph.symbol(id)) { writes_by_path.entry(path).or_default().push((item.id, text(graph, item, "value_id").and_then(|id| graph.symbol(id)))); },
+            "read" => if let Some(path) = text(graph, item, "target_id").and_then(|id| graph.symbol(id)) { reads_by_path.entry(path).or_default().push(item.id); },
+            _ => {}
+        }
+    }
+    let mut locations: FxHashMap<(u32, String), u32> = FxHashMap::default();
+    let mut location_values: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (path, base, segments) in &path_specs {
+            let objects = points.get(base).cloned().unwrap_or_default();
+            for object in objects {
+                let evidence = vec![graph.id(*path).to_owned(), graph.id(*base).to_owned(), graph.id(object).to_owned()];
+                let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, object, segments, &evidence);
+                for location in targets {
+                    for (write, value) in writes_by_path.get(path).into_iter().flatten() {
+                        let values = value.and_then(|id| points.get(&id)).cloned().unwrap_or_default(); let slot = location_values.entry(location).or_default(); let before = slot.len(); slot.extend(values); if slot.len() != before { changed = true; }
+                        let write_text = graph.id(*write).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "WRITES_HEAP", write_text.clone(), location_text.clone(), fact(&[write_text, path_text, location_text], "high"));
+                    }
+                    for read in reads_by_path.get(path).into_iter().flatten() {
+                        let values = location_values.get(&location).cloned().unwrap_or_default(); if add_points(&mut points, *read, &values) { changed = true; }
+                        let read_text = graph.id(*read).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "READS_HEAP", location_text.clone(), read_text.clone(), fact(&[read_text, path_text, location_text], "high"));
+                    }
+                }
+            }
+        }
+        let mut queue: std::collections::VecDeque<u32> = points.keys().copied().collect(); let mut queued: FxHashSet<u32> = queue.iter().copied().collect();
+        while let Some(source) = queue.pop_front() { queued.remove(&source); let source_objects = points.get(&source).cloned().unwrap_or_default(); for target in identity_targets.get(&source).into_iter().flatten() { let set = points.entry(*target).or_default(); let before = set.len(); set.extend(&source_objects); if set.len() != before { changed = true; if queued.insert(*target) { queue.push_back(*target); } } } }
+    }
+    for (value, objects) in points {
+        let value_text = graph.id(value).to_owned();
+        for object in objects { let object_text = graph.id(object).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "POINTS_TO", value_text.clone(), object_text.clone(), fact(&[value_text.clone(), object_text], "high")); }
+    }
     let _ = object_properties;
     Delta { nodes, edges }
 }

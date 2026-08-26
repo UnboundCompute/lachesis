@@ -361,6 +361,23 @@ def solve_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
         os.close(descriptor)
 
 
+def run_pass2_path(input_path: str | os.PathLike[str], output_path: str | os.PathLike[str]) -> None:
+    """Run native Pass 2 using only sidecar paths.
+
+    Rust owns opening/decoding the Pass-1 protobuf stream and atomically publishes
+    the additive dataflow sidecar. No graph payload is reconstructed in Python.
+    """
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = library.lachesis_pass2_run_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(os.fsencode(os.fspath(input_path)), os.fsencode(os.fspath(output_path)))
+    if status != 0:
+        raise RuntimeError(f"native Pass-2 runner failed with status {status}")
+
+
 def prepare_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
     """Prepare selected functions without running the lifetime fixpoint."""
     library = _load()
