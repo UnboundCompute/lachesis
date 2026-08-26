@@ -14,6 +14,7 @@ literal), which the gen/kill transfer function keys on.
 Pure reader over a GraphStore index; no mutation, no load_graph.
 """
 import os
+import shutil
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -113,6 +114,18 @@ class _CompactEdge:
             return getattr(self, key)
         except AttributeError as error:
             raise KeyError(key) from error
+
+
+def _CompactNode_from_payload(payload):
+    node = decode_node(payload)
+    return _CompactNode(node.get("id"), node.get("kind"), node.get("label"),
+                        node.get("properties") or {})
+
+
+def _CompactEdge_from_payload(payload):
+    edge = decode_edge(payload)
+    return _CompactEdge(edge.get("source"), edge.get("target"), edge.get("kind"),
+                        edge.get("properties") or {})
 
 
 def substrate_cache_path(graph_path):
@@ -325,7 +338,7 @@ def _translation_facts(nodes, records):
     return lifetime_pb2.TranslationResult(functions=[functions[key] for key in sorted(functions)])
 
 
-def _translation_records(nodes, records):
+def _translation_records(nodes, records, *, node_source=None):
     """Return the compact call/return projection used by native Pass 2.
 
     Pass 1 already owns these filtered records while writing the substrate.  Keeping
@@ -365,7 +378,8 @@ def _translation_records(nodes, records):
     # same time and needlessly raises peak RSS.  Slice assignment retains the
     # existing list objects while dropping the records that translation does not
     # need before facts are assembled.
-    nodes[:] = (node for node in nodes if node["id"] in node_ids)
+    source = node_source() if node_source is not None else nodes
+    nodes[:] = (node for node in source if node["id"] in node_ids)
     records[:] = (edge for edge in records if (
         (edge["kind"] == "AST_CHILD" and
          (edge["source"] in relevant or edge["target"] in relevant)) or
@@ -421,104 +435,155 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                                  keep_node=None):
     """Publish Pass-1 caches from a replayable shard reader.
 
-    The complete Pass-2 input is copied record-by-record.  Only the narrower
-    Pass-3/translation subset is retained briefly, so streaming Kùzu builds keep
-    their bounded-memory property while preserving the normal Pass-1 ABI.
+    The complete Pass-2 input is copied record-by-record.  Pass-3 records are
+    staged as framed protobuf on disk; only the seed nodes and relevant edges
+    needed by the compact translation projection are loaded into Python.  This
+    keeps the streamed build's peak independent of the full substrate node count.
     """
     manifest = dict(manifest or {})
     kept_ids = set()
-    substrate_nodes = []
     target = Path(graph_path)
     pass2_target = pass2_input_cache_path(target)
     fd, pass2_temp = tempfile.mkstemp(
         prefix=".pass2-input-", dir=str(pass2_target.parent))
-    substrate_edges = []
-    try:
+    with tempfile.TemporaryDirectory(prefix=".pass1-substrate-",
+                                      dir=str(target.parent)) as stage_dir:
+        stage_nodes = Path(stage_dir) / "nodes.pb"
+        stage_edges = Path(stage_dir) / "edges.pb"
+        substrate_node_count = 0
+        substrate_edge_count = 0
+        member_count = 0
+        translation_seed_nodes = []
+        translation_seed_kinds = {
+            "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
+            "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
+            "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl",
+        }
+
+        try:
         # The complete Pass-2 header is known from the store manifest.  Open the
         # output before scanning nodes so the replayable shard stream only needs
         # one node pass and one edge pass; the old implementation scanned both
         # streams a second time for the complete sidecar.
-        pass2_header = {
-            "format": "lachesis-pass2-input", "version": _PASS2_INPUT_VERSION,
-            "node_count": int(manifest.get("node_count", 0)),
-            "edge_count": int(manifest.get("edge_count", 0)),
-            "store_version": manifest.get("version"),
-            "core_content_hash": manifest.get("core_content_hash"),
-            "source_content_hash": manifest.get("source_content_hash"),
-            "build_fingerprint": manifest.get("build_fingerprint"),
-        }
-        with os.fdopen(fd, "wb") as pass2:
-            write_frame(pass2, encode_document(pass2_header))
-            for node in reader.nodes():
-                if keep_node is not None and not keep_node(node):
-                    continue
-                kept_ids.add(node.get("id"))
-                write_frame(pass2, b"N" + encode_node(node))
-                props = node.get("properties") or {}
-                syntax_kind = props.get("syntax_kind") or node.get("kind")
-                if syntax_kind in _SUBSTRATE_NODE_KINDS:
-                    substrate_nodes.append(_CompactNode(
-                        node.get("id"), node.get("kind"), node.get("label"), {
+            pass2_header = {
+                "format": "lachesis-pass2-input", "version": _PASS2_INPUT_VERSION,
+                "node_count": int(manifest.get("node_count", 0)),
+                "edge_count": int(manifest.get("edge_count", 0)),
+                "store_version": manifest.get("version"),
+                "core_content_hash": manifest.get("core_content_hash"),
+                "source_content_hash": manifest.get("source_content_hash"),
+                "build_fingerprint": manifest.get("build_fingerprint"),
+            }
+            with (os.fdopen(fd, "wb") as pass2,
+                  stage_nodes.open("wb") as node_stage,
+                  stage_edges.open("wb") as edge_stage):
+                write_frame(pass2, encode_document(pass2_header))
+                for node in reader.nodes():
+                    if keep_node is not None and not keep_node(node):
+                        continue
+                    node_id = node.get("id")
+                    kept_ids.add(node_id)
+                    write_frame(pass2, b"N" + encode_node(node))
+                    props = node.get("properties") or {}
+                    syntax_kind = props.get("syntax_kind") or node.get("kind")
+                    if syntax_kind not in _SUBSTRATE_NODE_KINDS:
+                        continue
+                    compact = _CompactNode(
+                        node_id, node.get("kind"), node.get("label"), {
                             key: value for key, value in props.items()
                             if key in _SUBSTRATE_PROPERTY_KEYS
                             and isinstance(value, (str, int, float, bool, type(None)))
-                        }))
+                        })
+                    write_frame(node_stage, b"N" + encode_node(compact))
+                    substrate_node_count += 1
+                    if syntax_kind == "MemberExpr":
+                        member_count += 1
+                    if syntax_kind in translation_seed_kinds:
+                        translation_seed_nodes.append(compact)
 
-            for edge in reader.edges():
-                if (edge.get("source") not in kept_ids
-                        or edge.get("target") not in kept_ids):
-                    continue
-                write_frame(pass2, b"E" + encode_edge(edge))
-                props = edge.get("properties") or {}
-                kind = (props.get("semantic_kind") or edge.get("semantic_kind")
-                        or edge.get("kind"))
-                if kind == "AST_CHILD":
-                    props = {key: props[key]
-                             for key in ("role", "position") if key in props}
-                elif kind in {"REFERS_TO", "CFG_NEXT"}:
-                    props = {}
-                elif kind == "VALUE_FLOWS_TO" and props.get("reason") == "initializer":
-                    props = {"reason": "initializer"}
-                else:
-                    continue
-                substrate_edges.append(_CompactEdge(
-                    edge.get("source"), edge.get("target"), kind, props))
-        os.replace(pass2_temp, pass2_target)
-    except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(pass2_temp)
-        except OSError:
-            pass
-        raise
+                for edge in reader.edges():
+                    if (edge.get("source") not in kept_ids
+                            or edge.get("target") not in kept_ids):
+                        continue
+                    write_frame(pass2, b"E" + encode_edge(edge))
+                    props = edge.get("properties") or {}
+                    kind = (props.get("semantic_kind") or edge.get("semantic_kind")
+                            or edge.get("kind"))
+                    if kind == "AST_CHILD":
+                        props = {key: props[key]
+                                 for key in ("role", "position") if key in props}
+                    elif kind in {"REFERS_TO", "CFG_NEXT"}:
+                        props = {}
+                    elif kind == "VALUE_FLOWS_TO" and props.get("reason") == "initializer":
+                        props = {"reason": "initializer"}
+                    else:
+                        continue
+                    write_frame(edge_stage, b"E" + encode_edge(_CompactEdge(
+                        edge.get("source"), edge.get("target"), kind, props)))
+                    substrate_edge_count += 1
+            os.replace(pass2_temp, pass2_target)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(pass2_temp)
+            except OSError:
+                pass
+            raise
 
-    common = {"store_version": manifest.get("version"),
-              "core_content_hash": manifest.get("core_content_hash"),
-              "source_content_hash": manifest.get("source_content_hash"),
-              "build_fingerprint": manifest.get("build_fingerprint")}
-    # Publish the complete Pass-3 substrate before narrowing the shared lists
-    # below for the compact translation projection.  The translation filter
-    # intentionally reuses these list objects to reduce peak RSS, so ordering is
-    # significant: Pass 3 must retain the full substrate contract.
-    _write_framed_sidecar(
-        substrate_cache_path(target), ".pass3-substrate-",
-        {"format": "lachesis-pass3-substrate", "version": _CACHE_VERSION,
-         "edge_count": len(substrate_edges), "node_count": len(substrate_nodes),
-         "member_count": sum(1 for node in substrate_nodes
-                              if (node.get("properties") or {}).get("syntax_kind") == "MemberExpr"),
-         **common}, substrate_nodes, substrate_edges)
-    translation_nodes, translation_edges = _translation_records(
-        substrate_nodes, substrate_edges)
-    _write_framed_sidecar(
-        translation_cache_path(target), ".pass2-translation-",
-        {"format": "lachesis-pass2-translation", "version": _CACHE_VERSION,
-         "edge_count": len(translation_edges), "node_count": len(translation_nodes),
-         **common}, translation_nodes, translation_edges)
-    _write_translation_facts(translation_facts_path(target),
-                             _translation_facts(translation_nodes, translation_edges))
+        common = {"store_version": manifest.get("version"),
+                  "core_content_hash": manifest.get("core_content_hash"),
+                  "source_content_hash": manifest.get("source_content_hash"),
+                  "build_fingerprint": manifest.get("build_fingerprint")}
+
+        def copy_staged_sidecar(output, prefix, header):
+            output = Path(output)
+            fd, temporary = tempfile.mkstemp(prefix=prefix, dir=str(output.parent))
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    write_frame(handle, encode_document({"type": "header", **header}))
+                    with stage_nodes.open("rb") as source:
+                        shutil.copyfileobj(source, handle, length=1024 * 1024)
+                    with stage_edges.open("rb") as source:
+                        shutil.copyfileobj(source, handle, length=1024 * 1024)
+                os.replace(temporary, output)
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+
+        copy_staged_sidecar(
+            substrate_cache_path(target), ".pass3-substrate-",
+            {"format": "lachesis-pass3-substrate", "version": _CACHE_VERSION,
+             "edge_count": substrate_edge_count, "node_count": substrate_node_count,
+             "member_count": member_count, **common})
+
+        def staged_nodes():
+            for payload in read_frames(stage_nodes):
+                yield _CompactNode_from_payload(payload[1:])
+
+        def staged_edges():
+            for payload in read_frames(stage_edges):
+                yield _CompactEdge_from_payload(payload[1:])
+
+        translation_edges = list(staged_edges())
+        translation_nodes, translation_edges = _translation_records(
+            translation_seed_nodes, translation_edges, node_source=staged_nodes)
+        _write_framed_sidecar(
+            translation_cache_path(target), ".pass2-translation-",
+            {"format": "lachesis-pass2-translation", "version": _CACHE_VERSION,
+             "edge_count": len(translation_edges), "node_count": len(translation_nodes),
+             **common}, translation_nodes, translation_edges)
+        _write_translation_facts(translation_facts_path(target),
+                                 _translation_facts(translation_nodes, translation_edges))
 
 
 def _write_translation_facts(target, result):
