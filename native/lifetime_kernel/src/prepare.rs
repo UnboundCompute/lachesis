@@ -55,7 +55,7 @@ struct GraphView<'a> {
     // The input owns the protobuf nodes for the duration of preparation.  Keep
     // typed borrowed records here instead of cloning every node and its property
     // vector into a second graph-sized allocation.
-    nodes: HashMap<String, &'a lifetime_proto::GraphNode>,
+    nodes: HashMap<&'a str, &'a lifetime_proto::GraphNode>,
     children: HashMap<String, Vec<String>>,
     roles: HashMap<(String, String), Vec<String>>,
     parent: HashMap<String, String>,
@@ -66,7 +66,7 @@ struct GraphView<'a> {
 impl<'a> GraphView<'a> {
     fn new(nodes_input: &'a [lifetime_proto::GraphNode],
            edges_input: &[lifetime_proto::GraphEdge]) -> Self {
-        let nodes = nodes_input.iter().map(|node| (node.id.clone(), node)).collect();
+        let nodes = nodes_input.iter().map(|node| (node.id.as_str(), node)).collect();
         let mut children = HashMap::new();
         let mut parent = HashMap::new();
         let mut roles = HashMap::new();
@@ -673,7 +673,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
         for (node_id, node) in &graph.nodes {
             if graph.kind(node_id) != "ReturnStmt" { continue; }
             let line = property(node, "start_line").and_then(|value| value.parse().ok());
-            let Some(child) = graph.children.get(node_id).into_iter().flatten()
+            let Some(child) = graph.children.get(*node_id).into_iter().flatten()
                 .min_by_key(|child| graph.offset(child)) else { continue };
             let peeled = graph.peel(child.clone());
             if let Some(call) = call_by_node.get(&peeled) {
@@ -896,7 +896,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for (node_id, node) in &graph.nodes {
         if graph.kind(node_id) != "ReturnStmt" { continue; }
         let line = property(node, "start_line").and_then(|value| value.parse().ok());
-        let child = graph.children.get(node_id).into_iter().flatten()
+        let child = graph.children.get(*node_id).into_iter().flatten()
             .min_by_key(|child| graph.offset(child));
         let Some(child) = child else { continue };
         let peeled = graph.peel(child.clone());
@@ -983,8 +983,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             let mut if_nodes = graph.nodes.keys().filter(|node| graph.kind(node) == "IfStmt").cloned().collect::<Vec<_>>();
         if_nodes.sort_by_key(|node| graph.offset(node));
         for if_node in if_nodes {
-            let true_roots = graph.roles.get(&(if_node.clone(), "TRUE_BRANCH".to_owned())).cloned().unwrap_or_default();
-            let false_roots = graph.roles.get(&(if_node.clone(), "FALSE_BRANCH".to_owned())).cloned().unwrap_or_default();
+            let true_roots = graph.roles.get(&(if_node.to_string(), "TRUE_BRANCH".to_owned())).cloned().unwrap_or_default();
+            let false_roots = graph.roles.get(&(if_node.to_string(), "FALSE_BRANCH".to_owned())).cloned().unwrap_or_default();
             if true_roots.is_empty() { continue; }
             let branch_nodes = |roots: &[String]| prepared_nodes.iter().filter(|node| {
                 roots.iter().any(|root| graph.is_descendant(node, root))
