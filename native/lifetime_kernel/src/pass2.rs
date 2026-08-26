@@ -19,6 +19,63 @@ use crate::graph_proto;
 const FRAME_HEADER: usize = 4;
 const DATAFLOW_STREAM_MAGIC: &[u8] = b"LACHESIS-DATAFLOW-STREAM\0";
 
+pub(crate) struct DataflowStreamWriter {
+    file: File,
+    temporary: std::path::PathBuf,
+    output: std::path::PathBuf,
+    committed: bool,
+    pub(crate) nodes: usize,
+    pub(crate) edges: usize,
+}
+
+impl DataflowStreamWriter {
+    pub(crate) fn begin(
+        path: impl AsRef<Path>, source: &str, core_content_hash: &str,
+    ) -> Result<Self, String> {
+        let output = path.as_ref().to_path_buf();
+        let directory = output.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let temporary = directory.join(format!(".pass2-native-{}", std::process::id()));
+        let mut file = File::create(&temporary)
+            .map_err(|error| format!("cannot create native Pass-2 sidecar: {error}"))?;
+        file.write_all(DATAFLOW_STREAM_MAGIC)
+            .map_err(|error| format!("cannot write native Pass-2 sidecar: {error}"))?;
+        let header = graph_proto::DataflowOverlay {
+            overlay_id: "dataflow".to_owned(), source: source.to_owned(), version: 1,
+            core_content_hash: core_content_hash.to_owned(),
+            derived_nodes: Vec::new(), derived_edges: Vec::new(),
+        };
+        write_frame(&mut file, &header.encode_to_vec())?;
+        Ok(Self { file, temporary, output, committed: false, nodes: 0, edges: 0 })
+    }
+
+    pub(crate) fn append(&mut self, delta: &Delta) -> Result<(), String> {
+        for node in &delta.nodes {
+            write_record_frame(&mut self.file, b'N', &node.encode_to_vec())?;
+            self.nodes += 1;
+        }
+        for edge in &delta.edges {
+            write_record_frame(&mut self.file, b'E', &edge.encode_to_vec())?;
+            self.edges += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(usize, usize), String> {
+        self.file.flush()
+            .map_err(|error| format!("cannot flush native Pass-2 sidecar: {error}"))?;
+        fs::rename(&self.temporary, &self.output)
+            .map_err(|error| format!("cannot publish native Pass-2 sidecar: {error}"))?;
+        self.committed = true;
+        Ok((self.nodes, self.edges))
+    }
+}
+
+impl Drop for DataflowStreamWriter {
+    fn drop(&mut self) {
+        if !self.committed { let _ = fs::remove_file(&self.temporary); }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Symbols {
     values: Vec<String>,

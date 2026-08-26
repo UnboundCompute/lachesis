@@ -270,7 +270,7 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
         }
         let mut changed_values = FxHashSet::default();
         for location in locations_by_path.get(path).into_iter().flatten().copied() {
-            for (write, value) in writes_by_path.get(path).into_iter().flatten() {
+            for (_write, value) in writes_by_path.get(path).into_iter().flatten() {
                 let Some(value_id) = value else { continue };
                 let values = points.get(value_id).cloned().unwrap_or_default();
                 let slot = location_values.entry(location).or_default(); let before = slot.len(); slot.extend(values.iter());

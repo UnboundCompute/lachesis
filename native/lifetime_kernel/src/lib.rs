@@ -48,21 +48,19 @@ mod heap;
 fn absorb_native_delta(
     graph: &mut pass2::Graph,
     delta: pass2::Delta,
-    nodes: &mut Vec<graph_proto::NodeRecord>,
-    edges: &mut Vec<graph_proto::EdgeRecord>,
+    writer: &mut pass2::DataflowStreamWriter,
 ) -> Result<(), String> {
-    nodes.extend(delta.nodes.iter().cloned());
-    edges.extend(delta.edges.iter().cloned());
+    writer.append(&delta)?;
     graph.absorb(delta)
 }
 
 fn report_native_phase(
     enabled: bool, started: std::time::Instant, name: &str,
-    nodes: &[graph_proto::NodeRecord], edges: &[graph_proto::EdgeRecord],
+    nodes: usize, edges: usize,
 ) {
     if enabled {
         eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges)",
-            started.elapsed().as_secs_f64(), nodes.len(), edges.len());
+            started.elapsed().as_secs_f64(), nodes, edges);
     }
 }
 
@@ -79,42 +77,40 @@ fn run_native_overlay_chain(
         eprintln!("[lachesis native pass2] read graph: {:.3}s ({} nodes, {} edges)",
             started.elapsed().as_secs_f64(), graph.nodes.len(), graph.edges.len());
     }
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    let delta = control_flow::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "control-flow", &nodes, &edges);
-    let delta = branch_history::enrich(&mut graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "branch-history", &nodes, &edges);
-    let delta = dispatch::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "dynamic-dispatch", &nodes, &edges);
-    let delta = dynamic_behavior::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "dynamic-behavior", &nodes, &edges);
-    let delta = interprocedural::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "interprocedural-contexts", &nodes, &edges);
-    let delta = heap::enrich(&mut graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "heap-identity", &nodes, &edges);
-    let delta = module_initialization::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "module-initialization", &nodes, &edges);
-    let delta = property_effects::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "parameter-property-effects", &nodes, &edges);
-    let delta = async_events::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "async-events", &nodes, &edges);
-    let delta = taint::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    report_native_phase(timing_enabled, started, "taint-propagation", &nodes, &edges);
-    pass2::publish_dataflow_stream(
-        output, &input.to_string_lossy(), &graph.core_content_hash, &nodes, &edges,
+    let mut writer = pass2::DataflowStreamWriter::begin(
+        output, &input.to_string_lossy(), &graph.core_content_hash,
     )?;
-    Ok((nodes.len(), edges.len()))
+    let delta = control_flow::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "control-flow", writer.nodes, writer.edges);
+    let delta = branch_history::enrich(&mut graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "branch-history", writer.nodes, writer.edges);
+    let delta = dispatch::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "dynamic-dispatch", writer.nodes, writer.edges);
+    let delta = dynamic_behavior::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "dynamic-behavior", writer.nodes, writer.edges);
+    let delta = interprocedural::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "interprocedural-contexts", writer.nodes, writer.edges);
+    let delta = heap::enrich(&mut graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "heap-identity", writer.nodes, writer.edges);
+    let delta = module_initialization::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "module-initialization", writer.nodes, writer.edges);
+    let delta = property_effects::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "parameter-property-effects", writer.nodes, writer.edges);
+    let delta = async_events::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "async-events", writer.nodes, writer.edges);
+    let delta = taint::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "taint-propagation", writer.nodes, writer.edges);
+    writer.finish()
 }
 
 mod atropos_proto {
