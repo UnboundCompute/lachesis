@@ -1068,6 +1068,77 @@ fn join_states(states: &[State], node: &str) -> State {
     joined
 }
 
+/// Widen with identities independent of the incoming path signature.  Once a
+/// loop has exceeded the disjunct budget, retaining the full signature creates
+/// a fresh phi/object graph on every revisit.  Stable identities turn this into
+/// a finite may-state while preserving the union of all object facts.
+fn stable_join_states(states: &[State], node: &str) -> State {
+    assert!(!states.is_empty());
+    let mut joined = State::default();
+    let mut roots: Vec<String> = states.iter()
+        .flat_map(|state| state.env.keys().cloned())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let mut maps = Vec::with_capacity(states.len());
+    let mut slots_by_base = Vec::with_capacity(states.len());
+    let mut pending = Vec::new();
+
+    for (index, state) in states.iter().enumerate() {
+        let mut map = HashMap::new();
+        for root in &roots {
+            if let Some(old) = state.env.get(root) {
+                let candidate = format!("phi|stable|{}|root|{}", node, root);
+                let stable = map.entry(old.clone()).or_insert_with(|| {
+                    pending.push((index, old.clone(), candidate.clone()));
+                    candidate
+                }).clone();
+                joined.env.insert(root.clone(), stable);
+            }
+        }
+        let mut by_base: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for ((base, selector), child) in &state.slots {
+            by_base.entry(base.clone()).or_default()
+                .push((selector.clone(), child.clone()));
+        }
+        slots_by_base.push(by_base);
+        maps.push(map);
+    }
+    while let Some((index, old_base, stable_base)) = pending.pop() {
+        let Some(entries) = slots_by_base[index].get(&old_base) else { continue };
+        for (selector, old_child) in entries {
+            let stable_child = format!("{}|slot|{}", stable_base, selector);
+            let map = &mut maps[index];
+            let child = map.entry(old_child.clone()).or_insert_with(|| {
+                pending.push((index, old_child.clone(), stable_child.clone()));
+                stable_child
+            }).clone();
+            joined.slots.insert((stable_base.clone(), selector.clone()), child);
+        }
+    }
+    for (index, state) in states.iter().enumerate() {
+        for (old, stable) in &maps[index] {
+            joined.facts.entry(stable.clone()).or_default().extend(
+                state.facts.get(old).cloned().unwrap_or_default());
+            joined.objects.entry(stable.clone()).or_insert_with(|| ObjectMeta::Phi {
+                tag: "stable".into(), node: node.into(), index: 0,
+            });
+        }
+        for effect in &state.trace {
+            if joined.trace.iter().filter(|item| *item == effect).count() < 2
+                && joined.trace.len() < 16 {
+                joined.trace.push(effect.clone());
+            }
+        }
+        for (path, old) in &state.freed_paths {
+            if let Some(stable) = maps[index].get(old) {
+                joined.freed_paths.entry(path.clone()).or_insert_with(|| stable.clone());
+            }
+        }
+    }
+    joined
+}
+
 /// Execute the non-SUMMARY fixpoint subset.  This mirrors Python's worklist shape:
 /// states are deduplicated at each transfer, joins become sticky after the disjunct
 /// budget is exceeded, and snapshots are retained for the semantic emitter.
@@ -1105,6 +1176,10 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     let mut queue = VecDeque::new();
     let mut queued = HashSet::new();
     let mut widened = HashSet::new();
+    // Widening is part of the native production solver.  Stable identities
+    // prevent recursive alias/phi graphs from allocating a fresh object graph
+    // on every loop revisit while retaining the joined may-facts.
+    let stable_widen = true;
     if let Some(first) = nodes.first() {
         queue.push_back(first.clone());
         queued.insert(first.clone());
@@ -1116,7 +1191,10 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     // Match the existing Python analyzer's bounded fixpoint budget.  This is
     // an analysis-work guard for pathological loop/alias graphs, not a wall
     // clock limit; capped results are surfaced to the caller as unsafe.
-    let transfer_cap = 10_000u64.max(nodes.len() as u64 * 500);
+    let transfer_cap = std::env::var("LACHESIS_DIAGNOSTIC_TRANSFER_CAP")
+        .ok().and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| 10_000u64.max(nodes.len() as u64 * 500));
     while transfers < transfer_cap {
         let Some(node) = queue.pop_front() else { break };
         queued.remove(&node);
@@ -1154,7 +1232,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
                 let previous = (target.len() == 1).then(|| target[0].clone());
                 target.append(&mut new_items);
                 let candidates = target.iter().map(|state| (**state).clone()).collect::<Vec<_>>();
-                let merged = join_states(&candidates, successor);
+                let merged = if stable_widen {
+                    stable_join_states(&candidates, successor)
+                } else {
+                    join_states(&candidates, successor)
+                };
                 let changed = previous.is_none_or(|old| !old.as_ref().semantically_equal(&merged));
                 widened.insert(successor.clone());
                 widenings += 1;
@@ -1186,7 +1268,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
                 let previous = (target.len() == 1).then(|| target[0].clone());
                 let mut candidates = target.iter().map(|state| (**state).clone()).collect::<Vec<_>>();
                 candidates.extend(new_items.iter().map(|state| (**state).clone()));
-                let merged = join_states(&candidates, successor);
+                let merged = if stable_widen {
+                    stable_join_states(&candidates, successor)
+                } else {
+                    join_states(&candidates, successor)
+                };
                 let changed = previous.is_none_or(|old| !old.as_ref().semantically_equal(&merged));
                 widened.insert(successor.clone());
                 widenings += 1;
