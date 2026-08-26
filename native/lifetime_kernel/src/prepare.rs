@@ -73,8 +73,10 @@ struct GraphView<'a> {
     // The input owns the protobuf nodes for the duration of preparation.  Keep
     // typed borrowed records here instead of cloning every node and its property
     // vector into a second graph-sized allocation.
-    nodes: HashMap<&'a str, &'a lifetime_proto::GraphNode>,
-    children: HashMap<&'a str, Vec<&'a str>>,
+    nodes: Vec<&'a lifetime_proto::GraphNode>,
+    node_index: HashMap<&'a str, usize>,
+    child_offsets: Vec<usize>,
+    child_targets: Vec<&'a str>,
     roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>>,
     parent: HashMap<&'a str, &'a str>,
     refers: HashMap<&'a str, &'a str>,
@@ -84,8 +86,10 @@ struct GraphView<'a> {
 impl<'a> GraphView<'a> {
     fn new(nodes_input: &'a [lifetime_proto::GraphNode],
            edges_input: &'a [lifetime_proto::GraphEdge]) -> Self {
-        let nodes = nodes_input.iter().map(|node| (node.id.as_str(), node)).collect();
-        let mut children = HashMap::new();
+        let nodes = nodes_input.iter().collect::<Vec<_>>();
+        let node_index: HashMap<&'a str, usize> = nodes_input.iter().enumerate()
+            .map(|(index, node)| (node.id.as_str(), index)).collect();
+        let mut children_by_node: Vec<Vec<&'a str>> = vec![Vec::new(); nodes_input.len()];
         let mut parent = HashMap::new();
         let mut roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>> = HashMap::new();
         let mut refers = HashMap::new();
@@ -93,7 +97,9 @@ impl<'a> GraphView<'a> {
         for edge in edges_input {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
-                    children.entry(edge.source.as_str()).or_insert_with(Vec::new).push(edge.target.as_str());
+                    if let Some(&source) = node_index.get(edge.source.as_str()) {
+                        children_by_node[source].push(edge.target.as_str());
+                    }
                     parent.entry(edge.target.as_str()).or_insert(edge.source.as_str());
                     if let Some(role) = role(edge.role.as_str()) {
                         roles.entry(edge.source.as_str()).or_default()
@@ -105,14 +111,24 @@ impl<'a> GraphView<'a> {
                 _ => {}
             }
         }
-        Self { nodes, children, roles, parent, refers, initializers }
+        let mut child_offsets = Vec::with_capacity(children_by_node.len() + 1);
+        let mut child_targets = Vec::new();
+        child_offsets.push(0);
+        for children in children_by_node {
+            child_targets.extend(children);
+            child_offsets.push(child_targets.len());
+        }
+        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers }
     }
 
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> {
-        self.nodes.get(id).copied()
+        self.node_index.get(id).and_then(|index| self.nodes.get(*index).copied())
     }
 
-    fn children_of(&self, id: &str) -> Option<&Vec<&'a str>> { self.children.get(id) }
+    fn children_of(&self, id: &str) -> Option<&[&'a str]> {
+        let index = *self.node_index.get(id)?;
+        Some(&self.child_targets[self.child_offsets[index]..self.child_offsets[index + 1]])
+    }
 
     fn children_owned(&self, id: &str) -> Vec<String> {
         self.children_of(id).into_iter().flatten().map(|child| (*child).to_owned()).collect()
@@ -709,7 +725,8 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
             .map(|call| (call.node.clone(), call.clone()))
             .collect::<HashMap<_, _>>();
         input.returns.clear();
-        for (node_id, node) in &graph.nodes {
+        for node in &graph.nodes {
+            let node_id = node.id.as_str();
             if graph.kind(node_id) != "ReturnStmt" { continue; }
             let line = property(node, "start_line").and_then(|value| value.parse().ok());
             let Some(child) = graph.children_of(node_id).into_iter().flatten()
@@ -932,7 +949,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         }
     }
     let mut returns = Vec::new();
-    for (node_id, node) in &graph.nodes {
+    for node in &graph.nodes {
+        let node_id = node.id.as_str();
         if graph.kind(node_id) != "ReturnStmt" { continue; }
         let line = property(node, "start_line").and_then(|value| value.parse().ok());
         let child = graph.children_of(node_id).into_iter().flatten()
@@ -1019,7 +1037,9 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         // Recover the common if/else shape from AST role edges. This keeps
         // path correlation for the native solver even when the persisted graph
         // has statement CFG markers but no CFG_NEXT relation.
-            let mut if_nodes = graph.nodes.keys().filter(|node| graph.kind(node) == "IfStmt").cloned().collect::<Vec<_>>();
+            let mut if_nodes = graph.nodes.iter().filter_map(|node| {
+                (graph.kind(node.id.as_str()) == "IfStmt").then(|| node.id.clone())
+            }).collect::<Vec<_>>();
         if_nodes.sort_by_key(|node| graph.offset(node));
         for if_node in if_nodes {
             let true_roots = graph.role_children_owned(&if_node, "TRUE_BRANCH");
