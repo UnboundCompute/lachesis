@@ -8,13 +8,16 @@ its recall is compared with :func:`translate.build_F`.
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 import os
+from pathlib import Path
+import tempfile
 
 from . import atropos
 from .coverage import CoveragePlan, CoverageRegion, CoverageScheduler
 from .normalize import normalizer
 from .source_discovery import SourceDiscovery, SourceSite, SeamBinding, discover_sources
-from .native_lifetime import plan_pass2_pb, translate_graph_pb
+from .native_lifetime import plan_pass2_pb, plan_path, translate_graph_pb
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import (
@@ -89,7 +92,28 @@ def _native_prepared(index):
     return prepared
 
 
-def _native_plan(functions, prepared, source_catalog):
+def _compiled_catalog(root, base):
+    """Return a versioned protobuf catalog sidecar for the native path planner."""
+    models_root = Path(root) / "models"
+    model_files = sorted(models_root.rglob("*.json"))
+    fingerprint = hashlib.sha256()
+    for path in model_files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        fingerprint.update(str(path).encode())
+        fingerprint.update(str(stat.st_mtime_ns).encode())
+        fingerprint.update(str(stat.st_size).encode())
+    target = Path(f"{base}.atropos.{fingerprint.hexdigest()[:16]}.catalog.pb")
+    if not target.is_file():
+        from lachesis.integrations.atropos.native_bind import compile_catalog
+        compile_catalog(models_root, target)
+    return target
+
+
+def _native_plan(functions, prepared, source_catalog, *, facts_path=None,
+                 catalog_path=None):
     """Adapt the native plan protobuf to the existing Python envelope."""
     def _argument_position(value):
         try:
@@ -97,7 +121,19 @@ def _native_plan(functions, prepared, source_catalog):
         except (TypeError, ValueError):
             return value
 
-    result = plan_pass2_pb(prepared, source_catalog)
+    if facts_path is not None and catalog_path is not None:
+        output = tempfile.NamedTemporaryFile(prefix="lachesis-plan-", suffix=".pb",
+                                              delete=False)
+        output.close()
+        try:
+            result = plan_path(facts_path, catalog_path, output.name)
+        finally:
+            try:
+                os.unlink(output.name)
+            except OSError:
+                pass
+    else:
+        result = plan_pass2_pb(prepared, source_catalog)
     by_name = {item.name: item for item in result.functions}
     discovery_sites = []
     launch_nodes = {}
@@ -346,8 +382,15 @@ def build_native_F(store, lang="c", *, return_graph=False):
         # Set this escape hatch only when diagnosing an older native library.
         if os.environ.get("LACHESIS_NATIVE_PLAN") == "0":
             raise RuntimeError("native planner explicitly disabled")
+        facts_path = translation_facts_path(base)
+        from lachesis.integrations.atropos.enrich import locate_atropos
+        atropos_root = locate_atropos()
+        catalog_path = (_compiled_catalog(atropos_root, base)
+                        if facts_path.is_file() and atropos_root is not None else None)
         discovery, coverage = _native_plan(
-            functions, prepared, atropos.source_catalog(lang))
+            functions, prepared, atropos.source_catalog(lang),
+            facts_path=facts_path if facts_path.is_file() else None,
+            catalog_path=catalog_path)
     except RuntimeError:
         # Older development builds may not expose the planner symbol yet.  The
         # native translation result remains usable while the compatibility path
