@@ -37,6 +37,48 @@ mod dynamic_behavior;
 mod async_events;
 mod interprocedural;
 
+/// Apply one additive overlay to the shared graph and retain its records for
+/// publication.  Keeping this in one place guarantees that every subsequent
+/// overlay sees the preceding overlay's facts and that edge deduplication is
+/// applied consistently.
+fn absorb_native_delta(
+    graph: &mut pass2::Graph,
+    delta: pass2::Delta,
+    nodes: &mut Vec<graph_proto::NodeRecord>,
+    edges: &mut Vec<graph_proto::EdgeRecord>,
+) -> Result<(), String> {
+    nodes.extend(delta.nodes.iter().cloned());
+    edges.extend(delta.edges.iter().cloned());
+    graph.absorb(delta)
+}
+
+/// Internal native-chain runner used while the remaining parity overlays are
+/// being ported.  It is deliberately not exposed to the Python CLI yet: the
+/// production launcher must not publish a sidecar that omits an overlay.
+fn run_native_overlay_chain(
+    input: &std::path::Path, output: &std::path::Path,
+) -> Result<(usize, usize), String> {
+    let mut graph = pass2::read_path(input)?;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let delta = control_flow::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = dispatch::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = dynamic_behavior::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = interprocedural::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = async_events::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = taint::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    pass2::publish_dataflow_stream(
+        output, &input.to_string_lossy(), "", &nodes, &edges,
+    )?;
+    Ok((nodes.len(), edges.len()))
+}
+
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
 }

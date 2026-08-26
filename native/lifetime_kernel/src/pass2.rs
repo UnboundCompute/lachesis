@@ -72,6 +72,7 @@ pub(crate) struct Graph {
     pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Delta {
     pub(crate) nodes: Vec<graph_proto::NodeRecord>,
     pub(crate) edges: Vec<graph_proto::EdgeRecord>,
