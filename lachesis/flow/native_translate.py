@@ -17,8 +17,8 @@ from . import atropos
 from .coverage import CoveragePlan, CoverageRegion, CoverageScheduler
 from .normalize import normalizer
 from .source_discovery import SourceDiscovery, SourceSite, SeamBinding, discover_sources
-from .native_lifetime import (plan_pass2_pb, plan_path, summaries_path, temporal_path,
-                               translate_graph_pb)
+from .native_lifetime import (plan_pass2_pb, plan_path, semantic_path, summaries_path,
+                               temporal_path, translate_graph_pb)
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import (
@@ -494,3 +494,45 @@ def build_native_temporal(store):
     result = lifetime_pb2.NativeTemporalResult()
     result.ParseFromString(output_path.read_bytes())
     return result
+
+
+def build_native_semantic_graph(store, lang="c"):
+    """Decode the compact Rust event graph into the query graph only."""
+    from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
+
+    base = (getattr(store.index, "_pass3_cache_base", None)
+            or getattr(store.index, "_db_dir", None))
+    if not base:
+        return None
+    input_path = pass2_input_cache_path(base)
+    if not input_path.is_file():
+        return None
+    output_path = Path(f"{base}.pass3.semantic.pb")
+    result = semantic_path(input_path, output_path) if not output_path.is_file() else None
+    if result is None:
+        from .native_lifetime import lifetime_pb2
+        result = lifetime_pb2.NativeSemanticResult()
+        result.ParseFromString(output_path.read_bytes())
+    graph = SkeletonGraph(language=lang)
+    for function in result.functions:
+        if not function.nodes:
+            continue
+        node_ids = {node.id for node in function.nodes}
+        for node in function.nodes:
+            kind = getattr(EventKind, node.event_kind, node.event_kind)
+            obj = (ObjRef(node.object_root, tuple(node.object_selectors),
+                          node.generation or "g0") if node.object_root else None)
+            event = Event(kind, obj=obj, base=obj,
+                          path="*" if obj is not None else None,
+                          line=node.line if node.has_line else None)
+            graph.add_node(node.id, event, fragment=function.id,
+                           owner_function_id=function.id, native_anchor=node.anchor)
+        for edge in function.edges:
+            if edge.source in node_ids and edge.target in node_ids:
+                graph.add_edge(edge.source, edge.target, kind=edge.kind or "normal")
+        exits = [node for node in function.exits if node in node_ids]
+        graph.add_fragment(function.id, function.entry if function.entry in node_ids else function.nodes[0].id,
+                           exits=exits or [function.nodes[-1].id])
+    if not result.complete:
+        graph.coverage["converged"] = False
+    return graph

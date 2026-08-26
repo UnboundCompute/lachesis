@@ -326,6 +326,10 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         # passing the whole-program plan here would mark functions absent from the
         # skeleton as covered and make Pass 3's convergence claim unsound.
         semantic_coverage = CoverageScheduler(object_functions, object_succ).plan()
+        native_semantic = None
+        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+            from .native_translate import build_native_semantic_graph
+            native_semantic = build_native_semantic_graph(store, lang=lang)
         # Keep the fragment store on the loaded graph session so repeated Pass 3
         # requests can reuse covered semantic regions.  The store key fingerprints
         # rebuilt summaries, so this is safe across fresh F dictionaries as long as
@@ -352,17 +356,20 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         snapshot_path = (f"{store.graph_path}.pass3.json"
                          if snapshot_enabled and getattr(store, "graph_path", None)
                          else None)
+        if native_semantic is not None:
+            snapshot_path = None
         if snapshot_path and not getattr(store, "_pass3_snapshot_loaded", False):
             claus.fragments.load_snapshot(
                 snapshot_path, F, lang, analysis_graph,
                 object_result.summaries, summaries, object_result.artifacts)
             store._pass3_snapshot_loaded = True
         semantic_build_started = perf_counter()
-        semantic_graph = claus.build(
-            store, F, succ, lang=lang, graph=analysis_graph,
-            summaries=object_result.summaries, coverage=semantic_coverage,
-            reach_summaries=summaries, state_artifacts=object_result.artifacts,
-            cfgs=object_result.cfgs)
+        semantic_graph = (native_semantic if native_semantic is not None else
+                          claus.build(
+                              store, F, succ, lang=lang, graph=analysis_graph,
+                              summaries=object_result.summaries, coverage=semantic_coverage,
+                              reach_summaries=summaries, state_artifacts=object_result.artifacts,
+                              cfgs=object_result.cfgs))
         semantic_build_done = perf_counter()
         _emit("semantic graph")
         if snapshot_path:
