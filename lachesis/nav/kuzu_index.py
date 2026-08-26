@@ -1156,6 +1156,46 @@ class KuzuGraphIndex:
         return edges
 
     @timeit
+    def incoming_edges_for_targets(self, targets, edge_kind: str) -> tuple[dict, ...]:
+        """Return one value-flow batch for many target ids.
+
+        Candidate evidence walks backwards from catalog sinks.  Issuing one Kùzu
+        traversal per sink/value made the structural Pass 2 bind pay thousands of
+        query plans.  This keeps the same edge shape while using bounded primary-key
+        batches; derived overlay edges are appended so the result remains identical
+        after the dataflow sidecar is attached.
+        """
+        wanted = tuple(dict.fromkeys(value for value in targets if value))
+        if not wanted:
+            return ()
+        result = []
+        for start in range(0, len(wanted), 5000):
+            batch = wanted[start:start + 5000]
+            coded = [encode_id(value, self._id_codes) for value in batch]
+            query = (
+                "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+                "WHERE e.semantic_kind = $kind AND b.id IN $ids "
+                "RETURN a.id, b.id, e.kind, e.props"
+            )
+            res = self._conn.execute(query, {"kind": edge_kind, "ids": coded})
+            while res.has_next():
+                source, target, kind, props = res.get_next()
+                result.append({
+                    "source": decode_id(source, self._id_prefixes),
+                    "target": decode_id(target, self._id_prefixes),
+                    "kind": kind or edge_kind,
+                    "properties": _restore(props, self._props_dict),
+                })
+        if self._overlay is not None:
+            result.extend(
+                dict(edge) for edge in self._overlay.derived_edges
+                if edge.get("kind") == edge_kind
+                and edge.get("target") in set(wanted)
+            )
+        result.sort(key=_EDGE_SORT)
+        return tuple(result)
+
+    @timeit
     def argument_edges_by_source(self) -> dict[str, tuple[dict, ...]]:
         """Return the small call-argument relation indexed by call id.
 

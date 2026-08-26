@@ -260,12 +260,13 @@ class Analysis:
             ]
             self._pass2_timing("catalog structural bind", started)
             materialize_started = perf_counter()
-            # Structural consumers build their own deterministic candidate order;
-            # they do not use the global graph ordering for semantics.  Avoid
-            # sorting ~1.2M nodes and ~2.5M edges on this one-shot Pass 2 view.
-            graph = materialize_graph(index, sort_output=False)
-            graph["nodes"].extend(delta_nodes)
-            graph["edges"].extend(delta_edges)
+            # The catalog projection already contains every callsite/value record
+            # structural candidates can bind to.  Materializing the complete CPG
+            # here used to add ~980k nodes/~2M edges and cost ~45s on libxml2.  Add
+            # only the branch substrate and the bounded reverse value cones needed
+            # for candidate evidence; the temporal path has its own native sidecars.
+            graph = self._compact_structural_graph(index, projection, delta_nodes,
+                                                    delta_edges)
             self._pass2_timing("bind graph materialize", materialize_started)
             self._pass2_timing("catalog structural bind total", started)
             return graph, summary
@@ -290,6 +291,77 @@ class Analysis:
         self._pass2_timing("catalog structural bind", bind_started)
         self._pass2_timing("catalog structural bind total", started)
         return result
+
+    @staticmethod
+    def _compact_structural_graph(index, projection, delta_nodes, delta_edges) -> dict:
+        """Build the structural candidate view without materializing the whole CPG.
+
+        Structural enumerators need call/value records, branch-region containment,
+        and reaching-definition evidence.  They do not need declarations, AST
+        wrappers, or unrelated edges.  Keep the projection as the base, fetch all
+        branch-region records (small and shared), then walk backwards only from the
+        Atropos sink values through ``VALUE_FLOWS_TO``.  This is exact for the
+        evidence the structural constructors consume and avoids a graph-sized
+        Python object population on every cold Pass 2 bind.
+        """
+        nodes = {node["id"]: node for node in projection.get("nodes", ())}
+        edges = list(projection.get("edges", ()))
+        for node in delta_nodes:
+            nodes[node["id"]] = node
+        edges.extend(delta_edges)
+
+        from lachesis.planner.unbounded_copy import _REGION_EDGE_KINDS
+
+        region_edges = list(index.edges_of_kind(*_REGION_EDGE_KINDS))
+        edges.extend(region_edges)
+        needed = {edge.get("source") for edge in region_edges}
+        needed.update(edge.get("target") for edge in region_edges)
+
+        # Atropos sink nodes identify the roots of the only value-flow walks the
+        # structural constructors perform.  Traverse all incoming flow edges so
+        # pass-through and definition/origin facts remain identical to the full
+        # graph view, while never retaining unrelated function-local flow.
+        work = [
+            (node.get("properties") or {}).get("value_id")
+            for node in delta_nodes
+            if node.get("kind") == "sink"
+        ]
+        seen = set()
+        while work:
+            batch = []
+            while work and len(batch) < 5000:
+                target = work.pop()
+                if target and target not in seen:
+                    seen.add(target)
+                    needed.add(target)
+                    batch.append(target)
+            if not batch:
+                continue
+            batch_edges = (index.incoming_edges_for_targets(batch, "VALUE_FLOWS_TO")
+                           if hasattr(index, "incoming_edges_for_targets") else
+                           [edge for target in batch
+                            for edge in index.incoming_of_kind(
+                                target, "VALUE_FLOWS_TO")])
+            for edge in batch_edges:
+                edges.append(edge)
+                source = edge.get("source")
+                if source and source not in seen:
+                    work.append(source)
+                if source:
+                    needed.add(source)
+
+        # Fetch only endpoints absent from the narrow Atropos projection.  Kùzu's
+        # batch warmer turns this into a small number of primary-key probes rather
+        # than one query per record.
+        missing = needed.difference(nodes)
+        warmer = getattr(index, "_warm_nodes", None)
+        if missing and warmer is not None:
+            warmer(missing)
+        for node_id in missing:
+            node = index.nodes.get(node_id)
+            if node is not None:
+                nodes[node_id] = node
+        return {"nodes": list(nodes.values()), "edges": edges}
 
     def _enrich_and_merge(self, *, deadline: Deadline | None = None,
                           workers: int | None = None) -> tuple[dict, dict, bool]:
