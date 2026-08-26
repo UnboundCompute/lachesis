@@ -490,6 +490,50 @@ fn raw_operation(kind: Kind, node: &str, target: Option<Path>, source: Option<Pa
     }
 }
 
+fn cyclic_nodes(nodes: &[String], successors: &HashMap<String, Vec<String>>) -> Vec<String> {
+    // Kosaraju is linear in the prepared CFG and avoids handing loop discovery
+    // back to the Python semantic emitter.  A singleton with a self edge is a
+    // cycle as well; all members of larger SCCs are loop-region nodes.
+    let node_set: HashSet<String> = nodes.iter().cloned().collect();
+    let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+    for source in nodes {
+        for target in successors.get(source).into_iter().flatten() {
+            if node_set.contains(target) {
+                reverse.entry(target.clone()).or_default().push(source.clone());
+            }
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut order = Vec::with_capacity(nodes.len());
+    fn visit(node: &str, graph: &HashMap<String, Vec<String>>, visited: &mut HashSet<String>, order: &mut Vec<String>) {
+        if !visited.insert(node.to_owned()) { return; }
+        for next in graph.get(node).into_iter().flatten() {
+            visit(next, graph, visited, order);
+        }
+        order.push(node.to_owned());
+    }
+    for node in nodes { visit(node, successors, &mut visited, &mut order); }
+    visited.clear();
+    let mut result = Vec::new();
+    fn collect(node: &str, graph: &HashMap<String, Vec<String>>, visited: &mut HashSet<String>, component: &mut Vec<String>) {
+        if !visited.insert(node.to_owned()) { return; }
+        component.push(node.to_owned());
+        for next in graph.get(node).into_iter().flatten() {
+            collect(next, graph, visited, component);
+        }
+    }
+    for node in order.into_iter().rev() {
+        if visited.contains(&node) { continue; }
+        let mut component = Vec::new();
+        collect(&node, &reverse, &mut visited, &mut component);
+        let cyclic = component.len() > 1 || successors.get(&node).into_iter().flatten().any(|target| target == &node);
+        if cyclic { result.extend(component); }
+    }
+    result.sort();
+    result.dedup();
+    result
+}
+
 /// Add only the access-path facts needed by the compact translation ABI. This
 /// deliberately avoids CFG synthesis and operation extraction.
 pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
@@ -887,6 +931,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         }
     }
+    let loop_nodes = cyclic_nodes(&prepared_nodes, &successor_map);
     let mut successors = successor_map.into_iter().map(|(node, mut targets)| {
         targets.sort();
         targets.dedup();
@@ -926,6 +971,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         calls,
         returns,
         metadata,
+        loop_nodes,
     }
 }
 

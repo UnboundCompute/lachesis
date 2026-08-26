@@ -993,6 +993,7 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
                 entry.node: tuple(entry.targets)
                 for entry in item.prepared.successors
             },
+            "loop_nodes": tuple(item.prepared.loop_nodes),
             "operations": native_operations,
             "metadata": {
                 node.id: (node.label, node.kind, node.owner, node.type,

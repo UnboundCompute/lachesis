@@ -211,6 +211,7 @@ message PreparedFunction {
   repeated FunctionCall calls = 6;
   repeated FunctionReturn returns = 7;
   repeated SemanticNodeMetadata metadata = 8;
+  repeated string loop_nodes = 9;
 }
 message PrepareResult { repeated PreparedFunction functions = 1; }
 message PreparedFunctionResult {

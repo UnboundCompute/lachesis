@@ -423,6 +423,9 @@ def _loop_nodes(cfg):
     reach the back-edge source.  This is language-neutral and avoids relying
     on source spelling or loop keywords.
     """
+    published = cfg.get("loop_nodes")
+    if published is not None:
+        return set(published)
     nodes = set(cfg.get("nodes", ()))
     successors = {
         node: tuple(target for target in cfg.get("succ", {}).get(node, ())
