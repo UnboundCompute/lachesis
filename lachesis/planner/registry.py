@@ -58,10 +58,22 @@ class CandidateRegistry:
         if constructor not in self._specs:
             raise KeyError(f"unknown candidate constructor: {constructor}")
         if constructor not in self._results:
+            self._ensure_typed_structural()
             self._ensure_native_semantic()
             impl = self._specs[constructor].implementation(self.graph, self.bind_summary)
             self._results[constructor] = impl.enumerate()
         return self._results[constructor]
+
+    def _ensure_typed_structural(self) -> None:
+        path = self.graph.pop("_typed_bind_cache_path", None)
+        if not path:
+            return
+        from .. import bind_cache
+
+        document = bind_cache._load_typed_graph(path)
+        stamped = document.get("stamped") or {}
+        self.graph["nodes"] = stamped.get("nodes", [])
+        self.graph["edges"] = stamped.get("edges", [])
 
     def _ensure_native_semantic(self) -> None:
         """Expand a native semantic sidecar once for all temporal constructors."""

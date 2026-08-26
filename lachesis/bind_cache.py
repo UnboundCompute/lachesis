@@ -107,7 +107,8 @@ def _encode_typed(payload: dict) -> bytes:
         header=_document_message({key: payload[key]
                                   for key in ("version", "core_content_hash", "options")}),
         stamped_meta=_document_message({key: value for key, value in stamped.items()
-                                        if key not in {"nodes", "edges"}}),
+                                        if key not in {"nodes", "edges",
+                                                       "_typed_bind_cache_path"}}),
         summary=_document_message(payload["summary"]),
     )
     property_cache = {}
@@ -135,6 +136,57 @@ def _decode_typed(blob: bytes) -> dict:
             "summary": _document_value(message.summary)}
 
 
+def _varint(blob: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(blob):
+        byte = blob[offset]
+        offset += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            raise ValueError("invalid bind cache varint")
+    raise ValueError("truncated bind cache varint")
+
+
+def _decode_typed_metadata(blob: bytes) -> dict:
+    """Decode only cache metadata while skipping repeated graph records."""
+    fields = {}
+    offset = 0
+    while offset < len(blob):
+        key, offset = _varint(blob, offset)
+        number, wire = key >> 3, key & 7
+        if wire == 2:
+            length, offset = _varint(blob, offset)
+            end = offset + length
+            if end > len(blob):
+                raise ValueError("truncated bind cache field")
+            if number in {2, 3, 6}:
+                fields[number] = blob[offset:end]
+            offset = end
+        elif wire == 0:
+            _, offset = _varint(blob, offset)
+        elif wire == 1:
+            offset += 8
+        elif wire == 5:
+            offset += 4
+        else:
+            raise ValueError("unsupported bind cache wire type")
+    if set(fields) != {2, 3, 6}:
+        raise ValueError("incomplete typed bind cache")
+    header = _document_value(graph_pb2.Document.FromString(fields[2]))
+    stamped = _document_value(graph_pb2.Document.FromString(fields[3]))
+    summary = _document_value(graph_pb2.Document.FromString(fields[6]))
+    return {**header, "stamped": stamped, "summary": summary}
+
+
+def _load_typed_graph(path: str) -> dict:
+    with open(path, "rb") as stream:
+        return _decode_typed(stream.read())
+
+
 def _graph_path(store) -> str | None:
     path = getattr(store, "graph_path", None)
     return path or None
@@ -160,8 +212,10 @@ def load(store) -> tuple[dict, dict] | None:
             blob = stream.read()
     except OSError:
         return None
+    typed = False
     try:
-        document = _decode_typed(blob)
+        document = _decode_typed_metadata(blob)
+        typed = True
     except (ValueError, TypeError):
         try:
             document = decode_document(blob)
@@ -172,6 +226,12 @@ def load(store) -> tuple[dict, dict] | None:
     stamped, summary = document.get("stamped"), document.get("summary")
     if not isinstance(stamped, dict) or not isinstance(summary, dict):
         return None
+    if typed:
+        # Keep repeated graph records on disk until a candidate constructor
+        # actually needs them. This makes cached enrich metadata-only.
+        stamped["_typed_bind_cache_path"] = sidecar_path(graph_path)
+        stamped["nodes"] = []
+        stamped["edges"] = []
     return stamped, summary
 
 
