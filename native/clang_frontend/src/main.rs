@@ -105,7 +105,8 @@ unsafe fn cx_string(value: CXString) -> String {
 }
 
 unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32) {
-    let location = clang_getCursorLocation(cursor);
+    let extent = clang_getCursorExtent(cursor);
+    let location = clang_getRangeStart(extent);
     let mut file = ptr::null_mut();
     let mut line = 0;
     let mut column = 0;
@@ -117,7 +118,6 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32
         cx_string(clang_getFileName(file))
     };
 
-    let extent = clang_getCursorExtent(cursor);
     let end_location = clang_getRangeEnd(extent);
     let mut end_file = ptr::null_mut();
     let mut end_line = 0;
