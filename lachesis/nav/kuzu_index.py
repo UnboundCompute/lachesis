@@ -1172,6 +1172,27 @@ class KuzuGraphIndex:
         for start in range(0, len(wanted), 5000):
             batch = wanted[start:start + 5000]
             coded = [encode_id(value, self._id_codes) for value in batch]
+            if edge_kind in _HOT_SET:
+                # Hot relations have their own typed Kùzu table, so querying
+                # EDGE here misses the base value-flow rows entirely.  The
+                # typed relation also avoids a semantic_kind predicate and is
+                # the indexed representation used by the normal adjacency
+                # path.
+                query = (
+                    f"MATCH (a:Node)-[e:{edge_kind}]->(b:Node) "
+                    "WHERE b.id IN $ids "
+                    "RETURN a.id, b.id, e.props"
+                )
+                res = self._conn.execute(query, {"ids": coded})
+                while res.has_next():
+                    source, target, props = res.get_next()
+                    result.append({
+                        "source": decode_id(source, self._id_prefixes),
+                        "target": decode_id(target, self._id_prefixes),
+                        "kind": edge_kind,
+                        "properties": _restore(props, self._props_dict),
+                    })
+                continue
             query = (
                 "MATCH (a:Node)-[e:EDGE]->(b:Node) "
                 "WHERE e.semantic_kind = $kind AND b.id IN $ids "
