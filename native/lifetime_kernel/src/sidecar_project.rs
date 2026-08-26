@@ -224,9 +224,8 @@ fn temporary_path(output: &Path, label: &str) -> PathBuf {
 /// Project one already-framed native shard into Pass-2 and Pass-3 sidecars.
 /// The input remains on disk; records are decoded one at a time and no graph
 /// sized Python or Rust collection is created.
-pub(crate) fn project_shard(
-    nodes_path: &Path,
-    edges_path: &Path,
+pub(crate) fn project_shards(
+    shard_paths: &[(PathBuf, PathBuf)],
     pass2_output: &Path,
     pass3_output: &Path,
     store_version: &str,
@@ -250,28 +249,30 @@ pub(crate) fn project_shard(
         let mut pass3_node_count = 0usize;
         let mut member_count = 0usize;
         {
-            let input = File::open(nodes_path)
-                .map_err(|error| format!("cannot open native node shard: {error}"))?;
-            let mut input = BufReader::new(input);
             let mut complete = BufWriter::new(File::create(&pass2_nodes)
                 .map_err(|error| format!("cannot create Pass-2 node staging: {error}"))?);
             let mut compact = BufWriter::new(File::create(&pass3_nodes)
                 .map_err(|error| format!("cannot create Pass-3 node staging: {error}"))?);
-            while let Some(payload) = frame_read(&mut input)? {
-                let record = graph_proto::NodeRecord::decode(payload.as_slice())
-                    .map_err(|error| format!("invalid native node protobuf: {error}"))?;
-                if prune && matches!(record.kind.as_str(), "token" | "source-span") {
-                    continue;
+            for (nodes_path, _) in shard_paths {
+                let input = File::open(nodes_path)
+                    .map_err(|error| format!("cannot open native node shard: {error}"))?;
+                let mut input = BufReader::new(input);
+                while let Some(payload) = frame_read(&mut input)? {
+                    let record = graph_proto::NodeRecord::decode(payload.as_slice())
+                        .map_err(|error| format!("invalid native node protobuf: {error}"))?;
+                    if prune && matches!(record.kind.as_str(), "token" | "source-span") {
+                        continue;
+                    }
+                    kept_ids.insert(record.id.clone());
+                    frame_write(&mut complete, &record_frame(b'N', record.encode_to_vec()))?;
+                    pass2_node_count += 1;
+                    let syntax = syntax_kind(&record).to_owned();
+                    if !SUBSTRATE_NODE_KINDS.contains(&syntax.as_str()) { continue; }
+                    let compact_record = compact_node(record);
+                    frame_write(&mut compact, &record_frame(b'N', compact_record.encode_to_vec()))?;
+                    pass3_node_count += 1;
+                    if syntax == "MemberExpr" { member_count += 1; }
                 }
-                kept_ids.insert(record.id.clone());
-                frame_write(&mut complete, &record_frame(b'N', record.encode_to_vec()))?;
-                pass2_node_count += 1;
-                let syntax = syntax_kind(&record).to_owned();
-                if !SUBSTRATE_NODE_KINDS.contains(&syntax.as_str()) { continue; }
-                let compact_record = compact_node(record);
-                frame_write(&mut compact, &record_frame(b'N', compact_record.encode_to_vec()))?;
-                pass3_node_count += 1;
-                if syntax == "MemberExpr" { member_count += 1; }
             }
             complete.flush().map_err(|error| format!("flush Pass-2 node staging: {error}"))?;
             compact.flush().map_err(|error| format!("flush Pass-3 node staging: {error}"))?;
@@ -279,24 +280,26 @@ pub(crate) fn project_shard(
         let mut pass2_edge_count = 0usize;
         let mut pass3_edge_count = 0usize;
         {
-            let input = File::open(edges_path)
-                .map_err(|error| format!("cannot open native edge shard: {error}"))?;
-            let mut input = BufReader::new(input);
             let mut complete = BufWriter::new(File::create(&pass2_edges)
                 .map_err(|error| format!("cannot create Pass-2 edge staging: {error}"))?);
             let mut compact = BufWriter::new(File::create(&pass3_edges)
                 .map_err(|error| format!("cannot create Pass-3 edge staging: {error}"))?);
-            while let Some(payload) = frame_read(&mut input)? {
-                let record = graph_proto::EdgeRecord::decode(payload.as_slice())
-                    .map_err(|error| format!("invalid native edge protobuf: {error}"))?;
-                if !kept_ids.contains(&record.source) || !kept_ids.contains(&record.target) {
-                    continue;
-                }
-                frame_write(&mut complete, &record_frame(b'E', record.encode_to_vec()))?;
-                pass2_edge_count += 1;
-                if let Some(compact_record) = compact_edge(record) {
-                    frame_write(&mut compact, &record_frame(b'E', compact_record.encode_to_vec()))?;
-                    pass3_edge_count += 1;
+            for (_, edges_path) in shard_paths {
+                let input = File::open(edges_path)
+                    .map_err(|error| format!("cannot open native edge shard: {error}"))?;
+                let mut input = BufReader::new(input);
+                while let Some(payload) = frame_read(&mut input)? {
+                    let record = graph_proto::EdgeRecord::decode(payload.as_slice())
+                        .map_err(|error| format!("invalid native edge protobuf: {error}"))?;
+                    if !kept_ids.contains(&record.source) || !kept_ids.contains(&record.target) {
+                        continue;
+                    }
+                    frame_write(&mut complete, &record_frame(b'E', record.encode_to_vec()))?;
+                    pass2_edge_count += 1;
+                    if let Some(compact_record) = compact_edge(record) {
+                        frame_write(&mut compact, &record_frame(b'E', compact_record.encode_to_vec()))?;
+                        pass3_edge_count += 1;
+                    }
                 }
             }
             complete.flush().map_err(|error| format!("flush Pass-2 edge staging: {error}"))?;
@@ -330,6 +333,24 @@ pub(crate) fn project_shard(
     })();
     cleanup();
     result
+}
+
+pub(crate) fn project_shard(
+    nodes_path: &Path,
+    edges_path: &Path,
+    pass2_output: &Path,
+    pass3_output: &Path,
+    store_version: &str,
+    core_content_hash: &str,
+    source_content_hash: &str,
+    build_fingerprint: &str,
+    prune: bool,
+) -> Result<(), String> {
+    project_shards(
+        &[(nodes_path.to_owned(), edges_path.to_owned())], pass2_output,
+        pass3_output, store_version, core_content_hash, source_content_hash,
+        build_fingerprint, prune,
+    )
 }
 
 fn publish(header: &[u8], nodes: &Path, edges: &Path, output: &Path) -> Result<(), String> {

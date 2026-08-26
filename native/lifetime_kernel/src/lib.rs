@@ -1134,6 +1134,61 @@ pub unsafe extern "C" fn lachesis_pass1_project_shard(
     }
 }
 
+/// Project several language frontend shards together.  Rust first collects
+/// retained node IDs across all shards, then streams every edge shard, so
+/// cross-language edges are preserved without a Python graph reconstruction.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_pass1_project_shards(
+    shard_set_path: *const c_char,
+    pass2_output: *const c_char,
+    pass3_output: *const c_char,
+    store_version: *const c_char,
+    core_content_hash: *const c_char,
+    source_content_hash: *const c_char,
+    build_fingerprint: *const c_char,
+    prune: i32,
+) -> i32 {
+    let result = (|| {
+        let paths = [shard_set_path, pass2_output, pass3_output]
+            .into_iter().map(|path| {
+                if path.is_null() { return Err("native Pass-1 shard-set path is null".to_owned()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 shard-set path: {error}"))
+            }).collect::<Result<Vec<_>, _>>()?;
+        let metadata = [store_version, core_content_hash, source_content_hash, build_fingerprint]
+            .into_iter().map(|path| {
+                if path.is_null() { return Ok(String::new()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 metadata: {error}"))
+            }).collect::<Result<Vec<_>, String>>()?;
+        let request = graph_proto::NativeShardSet::decode(
+            fs::read(&paths[0]).map_err(|error| format!("cannot read native shard set: {error}"))?
+                .as_slice(),
+        ).map_err(|error| format!("invalid native shard set: {error}"))?;
+        if request.shards.is_empty() {
+            return Err("native Pass-1 shard set is empty".to_owned());
+        }
+        let shard_paths = request.shards.into_iter().map(|shard| {
+            if shard.nodes_path.is_empty() || shard.edges_path.is_empty() {
+                return Err("native Pass-1 shard has an empty record path".to_owned());
+            }
+            Ok((std::path::PathBuf::from(shard.nodes_path),
+                std::path::PathBuf::from(shard.edges_path)))
+        }).collect::<Result<Vec<_>, String>>()?;
+        sidecar_project::project_shards(
+            &shard_paths, std::path::Path::new(&paths[1]),
+            std::path::Path::new(&paths[2]), &metadata[0], &metadata[1],
+            &metadata[2], &metadata[3], prune != 0,
+        )
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native Pass-1 shard-set projector error: {error}"); 1 }
+    }
+}
+
 /// Scan a framed Pass-1 substrate and bind the Atropos catalog entirely in
 /// Rust. The report is written as protobuf to `output_path`; no graph or report
 /// payload crosses the Python ABI.

@@ -10,6 +10,7 @@ import ctypes
 import mmap
 import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from .object_state import (
@@ -23,7 +24,7 @@ from .object_state import (
     ParamEffect,
     ReturnEffect,
 )
-from lachesis.core import lifetime_pb2
+from lachesis.core import graph_pb2, lifetime_pb2
 
 
 def _library_candidates() -> tuple[Path, ...]:
@@ -426,6 +427,52 @@ def project_pass1_shard(
     )
     if status != 0:
         raise RuntimeError(f"native Pass-1 shard projector failed with status {status}")
+
+
+def project_pass1_shards(
+    shard_paths, pass2_output: str | os.PathLike[str],
+    pass3_output: str | os.PathLike[str], manifest: dict[str, Any], *, prune: bool = False,
+) -> None:
+    """Project all language shards together through the binary Rust boundary."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    request = graph_pb2.NativeShardSet(format_version=1)
+    for frontend_id, nodes_path, edges_path in shard_paths:
+        request.shards.add(
+            frontend_id=str(frontend_id), nodes_path=os.fspath(nodes_path),
+            edges_path=os.fspath(edges_path),
+        )
+    if not request.shards:
+        raise ValueError("native Pass-1 shard set is empty")
+    temporary = tempfile.NamedTemporaryFile(prefix="lachesis-shards-", suffix=".pb", delete=False)
+    temporary_path = temporary.name
+    try:
+        temporary.write(request.SerializeToString())
+        temporary.close()
+        function = library.lachesis_pass1_project_shards
+        function.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
+        ]
+        function.restype = ctypes.c_int
+
+        def encoded(value: Any) -> bytes:
+            return os.fsencode(str(value or ""))
+
+        status = function(
+            encoded(temporary_path), encoded(pass2_output), encoded(pass3_output),
+            encoded(manifest.get("version")), encoded(manifest.get("core_content_hash")),
+            encoded(manifest.get("source_content_hash")),
+            encoded(manifest.get("build_fingerprint")), int(bool(prune)),
+        )
+        if status != 0:
+            raise RuntimeError(f"native Pass-1 shard-set projector failed with status {status}")
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
 
 
 def plan_path(facts_path: str | os.PathLike[str],

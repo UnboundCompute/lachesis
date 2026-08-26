@@ -529,13 +529,12 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
     # translation/facts projection.  A custom keep predicate is deliberately
     # excluded until its semantics have a native representation.
     raw_paths = getattr(reader, "raw_shard_paths", lambda: ())()
-    if (len(raw_paths) == 1 and raw_paths[0][0].startswith("clang-c")
-            and keep_node is None and prune is not None):
-        from lachesis.flow.native_lifetime import project_pass1_shard
+    if raw_paths and keep_node is None and prune is not None:
+        from lachesis.flow.native_lifetime import project_pass1_shards
         target = Path(graph_path)
-        project_pass1_shard(
-            raw_paths[0][1], raw_paths[0][2], pass2_input_cache_path(target),
-            substrate_cache_path(target), manifest, prune=bool(prune),
+        project_pass1_shards(
+            raw_paths, pass2_input_cache_path(target), substrate_cache_path(target),
+            manifest, prune=bool(prune),
         )
         # Rust owns the binary translation projection as well.  The Python
         # process only passes paths and does not reconstruct the substrate.
