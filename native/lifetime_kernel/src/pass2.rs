@@ -38,7 +38,7 @@ impl Symbols {
         self.values.get(symbol as usize).map(String::as_str).unwrap_or("")
     }
 
-    fn find(&self, value: &str) -> Option<u32> { self.lookup.get(value).copied() }
+    pub(crate) fn find(&self, value: &str) -> Option<u32> { self.lookup.get(value).copied() }
 }
 
 pub(crate) struct Node {
