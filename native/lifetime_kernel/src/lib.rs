@@ -7,6 +7,9 @@
 
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
+use std::ffi::CStr;
+use std::os::raw::c_char;
+use std::fs;
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxHasher;
 use std::slice;
@@ -820,6 +823,59 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_pb(
     })();
     let mut payload = result.unwrap_or_else(|error| {
         eprintln!("native graph translation error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
+/// Path-based ABI for whole-graph Pass-2 input.  Python passes an immutable
+/// filesystem path; Rust owns opening and reading the framed substrate so the
+/// launcher never reconstructs or mmaps graph records.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_translate_graph_path(
+    input_path: *const c_char, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        if input_path.is_null() {
+            return Err("native graph path is null".to_owned());
+        }
+        let path = CStr::from_ptr(input_path)
+            .to_str().map_err(|error| format!("invalid native graph path: {error}"))?;
+        let bytes = fs::read(path).map_err(|error| format!("cannot read native graph substrate: {error}"))?;
+        native_graph::sidecar_to_translation(&bytes)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native graph path translation error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
+/// Path-based ABI for whole-graph preparation.  The substrate is opened only
+/// by Rust and the prepared protobuf is returned through the existing allocator
+/// contract until the complete sidecar-writing engine replaces this boundary.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_path(
+    input_path: *const c_char, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        if input_path.is_null() {
+            return Err("native graph path is null".to_owned());
+        }
+        let path = CStr::from_ptr(input_path)
+            .to_str().map_err(|error| format!("invalid native graph path: {error}"))?;
+        let bytes = fs::read(path).map_err(|error| format!("cannot read native graph substrate: {error}"))?;
+        let request = native_graph::sidecar_to_request(&bytes)?;
+        prepare::solve_request(request)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native graph path preparation error: {error}");
         Vec::new()
     });
     if !output_length.is_null() { *output_length = payload.len(); }

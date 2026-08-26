@@ -97,6 +97,32 @@ def _call_sidecar(symbol: str, sidecar_path: str | os.PathLike[str], response_ty
         os.close(descriptor)
 
 
+def _call_path(symbol: str, sidecar_path: str | os.PathLike[str], response_type,
+               operation: str):
+    """Invoke a native whole-graph operation by path.
+
+    The launcher passes only the substrate pathname.  Rust opens the file and
+    owns its decoding; this keeps Python out of the Pass-2 graph transport.
+    """
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = getattr(library, symbol)
+    function.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)]
+    function.restype = ctypes.c_void_p
+    encoded_path = os.fsencode(os.fspath(sidecar_path))
+    output_length = ctypes.c_size_t()
+    pointer = function(ctypes.c_char_p(encoded_path), ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError(f"{operation} returned no result")
+    try:
+        result = response_type()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return result
+
+
 def prepare_pb_request(functions, request=None) -> bytes:
     """Encode raw function graph records into the native binary request."""
 
@@ -235,7 +261,7 @@ def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime
     the immutable sidecar bytes and passes them through the ABI; it does not
     materialize nodes, edges, calls, or per-function records.
     """
-    result = _call_sidecar("lachesis_lifetime_prepare_graph_pb", sidecar_path,
+    result = _call_path("lachesis_lifetime_prepare_graph_path", sidecar_path,
                            lifetime_pb2.PrepareResult,
                            "native whole-graph preparation")
     return {function.id: function for function in result.functions}
@@ -243,7 +269,7 @@ def prepare_graph_pb(sidecar_path: str | os.PathLike[str]) -> dict[str, lifetime
 
 def translate_graph_pb(sidecar_path: str | os.PathLike[str]):
     """Return compact native call/return facts without prepared CFG expansion."""
-    result = _call_sidecar("lachesis_lifetime_translate_graph_pb", sidecar_path,
+    result = _call_path("lachesis_lifetime_translate_graph_path", sidecar_path,
                            lifetime_pb2.TranslationResult,
                            "native whole-graph translation")
     return {function.id: function for function in result.functions}
