@@ -434,6 +434,27 @@ extern "C" fn collect_callee_reference(
     CXChildVisit_Recurse
 }
 
+extern "C" fn collect_parameter_reference(
+    cursor: CXCursor,
+    _parent: CXCursor,
+    data: CXClientData,
+) -> CXChildVisitResult {
+    unsafe {
+        let probe = &mut *(data as *mut ReferenceProbe);
+        let referenced = clang_getCursorReferenced(cursor);
+        let kind = if clang_is_null(referenced) == 0 {
+            clang_getCursorKind(referenced)
+        } else {
+            clang_getCursorKind(cursor)
+        };
+        if kind == CXCursor_ParmDecl {
+            probe.cursor = Some(if clang_is_null(referenced) == 0 { referenced } else { cursor });
+            return CXChildVisit_Break;
+        }
+    }
+    CXChildVisit_Recurse
+}
+
 unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
     let direct = clang_getCursorReferenced(cursor);
     let mut probe = ReferenceProbe { cursor: None };
@@ -468,6 +489,71 @@ unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opti
         target_offset,
         target_end,
         &target_name,
+    ))
+}
+
+unsafe fn referenced_target_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<(String, String)> {
+    let direct = clang_getCursorReferenced(cursor);
+    let mut probe = ReferenceProbe { cursor: None };
+    if clang_is_null(direct) != 0 {
+        clang_visitChildren(
+            cursor,
+            collect_callee_reference,
+            &mut probe as *mut ReferenceProbe as *mut c_void,
+        );
+    }
+    let referenced = if clang_is_null(direct) == 0 {
+        direct
+    } else {
+        probe.cursor.unwrap_or_default()
+    };
+    if clang_is_null(referenced) != 0 {
+        return None;
+    }
+    let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
+    let id_kind = match target_kind.as_str() {
+        "FunctionDecl" => "function",
+        "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => "value",
+        _ => return None,
+    };
+    let target_name = cx_string(clang_getCursorSpelling(referenced));
+    let (raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+    let target_file = emitter.canonical_file(raw_file);
+    if target_file.is_empty() {
+        return None;
+    }
+    Some((
+        target_kind,
+        stable_id(id_kind, &target_file, target_offset, target_end, &target_name),
+    ))
+}
+
+unsafe fn parameter_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
+    let direct = clang_getCursorReferenced(cursor);
+    let direct_kind = if clang_is_null(direct) == 0 {
+        clang_getCursorKind(direct)
+    } else {
+        CXCursor_InvalidFile
+    };
+    let referenced = if direct_kind == CXCursor_ParmDecl {
+        direct
+    } else {
+        let mut probe = ReferenceProbe { cursor: None };
+        clang_visitChildren(
+            cursor,
+            collect_parameter_reference,
+            &mut probe as *mut ReferenceProbe as *mut c_void,
+        );
+        probe.cursor?
+    };
+    let target_name = cx_string(clang_getCursorSpelling(referenced));
+    let (raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+    let target_file = emitter.canonical_file(raw_file);
+    if target_file.is_empty() {
+        return None;
+    }
+    Some(stable_id(
+        "value", &target_file, target_offset, target_end, &target_name,
     ))
 }
 
@@ -694,6 +780,50 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                     properties: vec![field("reason", text("assignment"))],
                     source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
                 })?;
+                if operator == "=" {
+                    let left_reference = children
+                        .cursors
+                        .first()
+                        .and_then(|child| referenced_target_id(*child, emitter));
+                    let right_reference = children
+                        .cursors
+                        .get(1)
+                        .and_then(|child| referenced_target_id(*child, emitter));
+                    if let (Some((left_kind, left_target)), Some((right_kind, right_target))) =
+                        (left_reference, right_reference)
+                    {
+                        if left_kind == "FieldDecl" {
+                            let receiver_id = children
+                                .cursors
+                                .first()
+                                .and_then(|child| parameter_reference_id(*child, emitter));
+                            emitter.edge(graph::EdgeRecord {
+                                kind: "VALUE_FLOWS_TO".to_owned(), source: left.clone(), target: left_target.clone(),
+                                properties: vec![field("reason", text("field-write")), field("confidence", text("conservative"))],
+                                source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
+                            })?;
+                            if let Some(owner) = owner_id.as_ref() {
+                                let parameters = emitter.function_parameters.get(owner).cloned().unwrap_or_default();
+                                let receiver_position = receiver_id
+                                    .as_ref()
+                                    .and_then(|id| parameters.iter().position(|item| item == id));
+                                let value_position = parameters.iter().position(|id| id == &right_target);
+                                if let (Some(receiver_position), Some(value_position)) =
+                                    (receiver_position, value_position)
+                                {
+                                    emitter.edge(graph::EdgeRecord {
+                                        kind: "WRITES_PARAMETER_PROPERTY".to_owned(), source: owner.clone(), target: left_target,
+                                        properties: vec![
+                                            field("receiver_position", integer(receiver_position as i64)),
+                                            field("value_position", integer(value_position as i64)),
+                                        ], source_tier: "T1".to_owned(), relationship_class: "WRITES_PARAMETER_PROPERTY".to_owned(),
+                                    })?;
+                                }
+                            }
+                        }
+                        let _ = right_kind;
+                    }
+                }
             }
         } else if matches!(syntax_kind.as_str(), "UnaryOperator" | "ConditionalOperator") || syntax_kind == "BinaryOperator" && !child_ids.is_empty() {
             let operand_start = if syntax_kind == "ConditionalOperator" { 1 } else { 0 };
