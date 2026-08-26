@@ -17,12 +17,13 @@ from . import atropos
 from .coverage import CoveragePlan, CoverageRegion, CoverageScheduler
 from .normalize import normalizer
 from .source_discovery import SourceDiscovery, SourceSite, SeamBinding, discover_sources
-from .native_lifetime import plan_pass2_pb, plan_path, summaries_path, translate_graph_pb
+from .native_lifetime import (plan_pass2_pb, plan_path, summaries_path, temporal_path,
+                               translate_graph_pb)
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import (
     cached_substrate, substrate_cache_path, translation_cache_path,
-    translation_facts_path,
+    translation_facts_path, pass2_input_cache_path,
 )
 from lachesis.core import lifetime_pb2
 
@@ -470,3 +471,26 @@ def build_native_summaries(store, lang="c"):
             "returns_param": None, "returns_dangling": False,
         }
     return summaries
+
+
+def build_native_temporal(store):
+    """Run the compact Rust temporal solver from the Pass-1 path.
+
+    This is an opt-in migration seam.  It intentionally returns the protobuf
+    result rather than pretending that findings are equivalent to the richer
+    semantic graph used by the compatibility matcher.
+    """
+    base = (getattr(store.index, "_pass3_cache_base", None)
+            or getattr(store.index, "_db_dir", None))
+    if not base:
+        return None
+    input_path = pass2_input_cache_path(base)
+    if not input_path.is_file():
+        return None
+    output_path = Path(f"{base}.pass3.temporal.pb")
+    if not output_path.is_file():
+        temporal_path(input_path, output_path)
+    from .native_lifetime import lifetime_pb2
+    result = lifetime_pb2.NativeTemporalResult()
+    result.ParseFromString(output_path.read_bytes())
+    return result

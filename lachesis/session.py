@@ -376,6 +376,34 @@ class Analysis:
         from lachesis.planner.temporal_obligation import merge_semantic_nodes
 
         stamped, summary = self._structural_bind()
+        # Experimental native temporal seam.  Rust owns substrate decoding and
+        # lifetime solving; only compact findings are retained in the bind
+        # sidecar.  Keep this disabled until its candidate coverage is proven
+        # equivalent to the semantic graph path.
+        if os.environ.get("LACHESIS_NATIVE_TEMPORAL") == "1":
+            from lachesis.flow.native_translate import build_native_temporal
+            native = build_native_temporal(self.store)
+            if native is not None:
+                stamped["native_temporal"] = {
+                    "functions": [{
+                        "id": item.id,
+                        "findings": [{
+                            "function": finding.function,
+                            "pattern": finding.pattern,
+                            "path": {
+                                "root": finding.path.root if finding.path else "",
+                                "selectors": list(finding.path.selectors) if finding.path else [],
+                            },
+                            "line": finding.line if finding.has_line else None,
+                            "node": finding.node,
+                        } for finding in item.findings],
+                        "transfers": item.transfers,
+                        "widenings": item.widenings,
+                        "capped": item.capped,
+                    } for item in native.functions],
+                }
+                complete = not any(item.capped for item in native.functions)
+                return stamped, summary, complete
         # Temporal families observe semantic operations (release, origin, dereference) that are
         # not catalog role nodes in the base CPG. Reuse the same cached Pass 3 graph the flow
         # bundle exposes rather than a second traversal or a language-specific lifecycle
