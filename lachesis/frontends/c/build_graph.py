@@ -625,18 +625,32 @@ def position_from_line(
     ``read_body`` shows the whole ``#define``."""
     text = source_text(path, texts)
     starts = line_starts(path, text, line_starts_cache)
-    lines = text.splitlines()
     index = max(0, min(line, len(starts)) - 1)
     start = starts[index]
     last = index
-    while last < len(lines) and lines[last].endswith("\\"):
+    # Do not call ``splitlines`` here: macro recovery invokes this once per
+    # definition, and splitting the complete source for every macro turns a
+    # header-heavy tree into repeated whole-file scans and allocations.  The
+    # line-offset table is already cached, so inspect only the physical lines
+    # participating in this definition.
+    while last < len(starts):
+        line_end = text.find("\n", starts[last])
+        if line_end < 0:
+            line_end = len(text)
+        if not text[starts[last]:line_end].endswith("\\"):
+            break
         last += 1
     end = starts[last + 1] - 1 if last + 1 < len(starts) else len(text)
+    end_line = last + 1
+    final_line_end = text.find("\n", starts[last])
+    if final_line_end < 0:
+        final_line_end = len(text)
+    end_column = final_line_end - starts[last] + 1
     return {
         "file": str(path), "absolute_file": str(path),
         "start_offset": start, "end_offset": max(start, end),
         "start_line": index + 1, "start_column": 1,
-        "end_line": last + 1, "end_column": len(lines[last]) + 1 if last < len(lines) else 1,
+        "end_line": end_line, "end_column": end_column,
     }
 
 
