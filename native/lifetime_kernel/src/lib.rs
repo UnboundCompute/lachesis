@@ -171,6 +171,43 @@ impl State {
         Snapshot { env, facts, slots, trace: self.trace.clone(), freed_paths, objects }
     }
 
+    /// Snapshot used at operation points by the semantic emitter.
+    ///
+    /// Point/post consumers only resolve access paths through `env` and `slots`;
+    /// they do not inspect the complete fact lattice or historical freed-path
+    /// bookkeeping.  Keeping those fields out of every observation avoids
+    /// serializing the same large maps once per operation while the full exit
+    /// snapshot still preserves summaries and the public result contract.
+    pub fn compact_snapshot(&self) -> Snapshot {
+        let mut env: Vec<_> = self.env.iter()
+            .map(|(root, oid)| (root.clone(), oid.clone()))
+            .collect();
+        env.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut slots: Vec<_> = self.slots.iter().map(|((base, selector), oid)| {
+            ((base.clone(), selector.clone()), oid.clone())
+        }).collect();
+        slots.sort_by(|left, right| left.0.cmp(&right.0));
+
+        // Retain metadata for every handle that path resolution can return,
+        // including the parent chain of synthetic unknown slots.
+        let mut needed: HashSet<String> = self.env.values().cloned().collect();
+        needed.extend(self.slots.keys().map(|(base, _)| base.clone()));
+        needed.extend(self.slots.values().cloned());
+        let mut pending: Vec<String> = needed.iter().cloned().collect();
+        while let Some(oid) = pending.pop() {
+            if let Some(ObjectMeta::UnknownSlot { base, .. }) = self.objects.get(&oid) {
+                if needed.insert(base.clone()) { pending.push(base.clone()); }
+            }
+        }
+        let mut objects: Vec<_> = self.objects.iter()
+            .filter(|(oid, _)| needed.contains(*oid))
+            .map(|(oid, meta)| (oid.clone(), meta.clone()))
+            .collect();
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        Snapshot { env, facts: Vec::new(), slots, trace: Vec::new(),
+                   freed_paths: Vec::new(), objects }
+    }
+
     pub fn seed_parameter(&mut self, path: Path, position: u32) {
         let oid = param_id(position, &path.selectors);
         self.objects.entry(oid.clone()).or_insert_with(|| ObjectMeta::Param {
@@ -1064,6 +1101,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     }
     let mut point_snapshots: HashMap<String, Vec<Snapshot>> = HashMap::new();
     let mut post_snapshots: HashMap<String, Vec<Snapshot>> = HashMap::new();
+    let mut exit_snapshots: Vec<Snapshot> = Vec::new();
     let mut queue = VecDeque::new();
     let mut queued = HashSet::new();
     let mut widened = HashSet::new();
@@ -1173,7 +1211,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         let current = incoming.get(node).map(Vec::as_slice).unwrap_or(&[]);
         point_snapshots.insert(
             node.clone(),
-            current.iter().map(|state| state.snapshot()).collect(),
+            current.iter().map(|state| state.compact_snapshot()).collect(),
         );
         let mut post = current.iter().cloned().collect::<Vec<_>>();
         let mut ignored_findings = Findings::default();
@@ -1189,8 +1227,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         }
         post_snapshots.insert(
             node.clone(),
-            post.iter().map(|state| state.snapshot()).collect(),
+            post.iter().map(|state| state.compact_snapshot()).collect(),
         );
+        if successors.get(node).is_none_or(Vec::is_empty) {
+            exit_snapshots.extend(post.iter().map(|state| state.snapshot()));
+        }
     }
 
     let point_states = nodes.iter().filter_map(|node| {
@@ -1199,10 +1240,7 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     let post_states = nodes.iter().filter_map(|node| {
         post_snapshots.get(node).map(|states| (node.clone(), states.clone()))
     }).collect();
-    let exit_states: Vec<_> = nodes.iter()
-        .filter(|node| successors.get(*node).is_none_or(Vec::is_empty))
-        .flat_map(|node| post_snapshots.get(node).into_iter().flatten().cloned())
-        .collect();
+    let exit_states = exit_snapshots;
     let exit_state = exit_states.first().cloned()
         .unwrap_or_else(|| State::default().snapshot());
     LinearResult {
