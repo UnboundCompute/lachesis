@@ -1268,6 +1268,7 @@ def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
 
 
 def _edge_tables_proto(edges, *, elide: bool, node_units: dict,
+                       unit_names: Sequence[str],
                        codec: PropsCodec, id_codes: Optional[dict] = None,
                        index_offset: int = 0) -> dict:
     """Build relation tables directly from parsed EdgeRecord messages."""
@@ -1282,7 +1283,13 @@ def _edge_tables_proto(edges, *, elide: bool, node_units: dict,
         kind = edge.kind or None
         fields = edge.properties
         file_value = _proto_promoted_value(fields, "file")
-        unit = file_value or node_units.get(edge.source)
+        source_unit = node_units.get(edge.source)
+        if file_value:
+            unit = file_value
+        elif isinstance(source_unit, int):
+            unit = unit_names[source_unit]
+        else:  # compatibility for callers that provide the old string map
+            unit = source_unit
         stored = codec.blob_fields(index_offset, fields, elide)
         index_offset += 1
         src, tgt = encode_id(edge.source, codes), encode_id(edge.target, codes)
@@ -1575,7 +1582,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         core_digest.update(str(value or "").encode("utf-8"))
         core_digest.update(b"\0")
 
-    node_units: dict[str, str] = {}
+    node_units: dict[str, object] = {}
+    unit_names: list[str] = []
+    unit_codes: dict[str, int] = {}
+
+    def unit_code(value: str) -> int:
+        code = unit_codes.get(value)
+        if code is None:
+            code = len(unit_names)
+            unit_codes[value] = code
+            unit_names.append(value)
+        return code
     prefixes: set[str] = set()
     # Index candidates are spilled while the large node/edge streams are loaded.
     # Keeping hundreds of thousands of full property dictionaries alive here was a
@@ -1597,7 +1614,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             file_value = _proto_promoted_value(node.properties, "file")
             compiler_id = _proto_promoted_value(node.properties, "compiler_node_id")
             if file_value:
-                node_units[node_id] = file_value
+                node_units[node_id] = unit_code(file_value)
             for value in (node_id, compiler_id):
                 match = _ID_SHAPE.match(value) if isinstance(value, str) else None
                 if match:
@@ -1716,8 +1733,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         if bulk:
             table_builder = (_edge_tables_proto if isinstance(
                 batch[0], graph_pb2.EdgeRecord) else _edge_tables)
+            table_kwargs = ({"unit_names": unit_names}
+                            if isinstance(batch[0], graph_pb2.EdgeRecord) else {})
             for kind, table in table_builder(
                 batch, elide=True, node_units=node_units,
+                **table_kwargs,
                 codec=codec, id_codes=id_codes,
             ).items():
                 writer = edge_writers.get(kind)
@@ -1792,7 +1812,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # Endpoint filtering and edge unit attribution are complete.  The index rows
     # and manifest need only the count, not these graph-sized lookup maps; release
     # them before rebuilding the declaration/callsite indexes.
-    del kept_ids, node_units
+    del kept_ids, node_units, unit_codes, unit_names
     index_stage.close()
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
     decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
