@@ -1449,8 +1449,12 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
 
     # Streamed materialization is explicitly the bounded-memory path. Keep a
     # predictable 1 GiB cache by default; callers can raise/lower it with the env.
+    # The streamed writer is the bounded-memory build path. A 1 GiB pool left
+    # little headroom for Python, Arrow, and Kùzu's COPY working set on a laptop;
+    # 512 MiB is sufficient for the partitioned bulk loads and keeps the store
+    # materialization from turning the buffer pool into the process's peak RSS.
     db = kuzu.Database(
-        db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(1 << 30),
+        db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(512 << 20),
         checkpoint_threshold=_kuzu_checkpoint_threshold(256 << 20),
     )
     conn = kuzu.Connection(db)
