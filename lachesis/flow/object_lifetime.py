@@ -957,7 +957,16 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
             os.environ.pop("LACHESIS_LIFETIME_WORKERS", None)
         else:
             os.environ["LACHESIS_LIFETIME_WORKERS"] = previous_workers
-    sub = cached_substrate(analysis_index)
+    # Native translation facts carry the declaration labels needed to render
+    # findings. Do not decode the full structural substrate just to resolve a
+    # handful of result roots; semantic emission may load it later only when a
+    # legacy metadata lookup is genuinely required.
+    root_labels = {
+        root_id: metadata[0]
+        for function in functions.values()
+        for root_id, metadata in function.get("root_metadata", {}).items()
+        if metadata and metadata[0]
+    }
     summaries = {}
     artifacts = {}
     cfgs = {}
@@ -985,6 +994,11 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
                 for entry in item.prepared.successors
             },
             "operations": native_operations,
+            "metadata": {
+                node.id: (node.label, node.kind, node.owner, node.type,
+                          node.offset if node.has_offset else 0)
+                for node in item.prepared.metadata
+            },
         }
         total_transfers += analysis.transfers
         total_widenings += analysis.widenings
@@ -993,7 +1007,7 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
         best = {}
         for finding in sorted(analysis.findings):
             root_id = finding.path.root.removeprefix("decl:")
-            root = sub.label(root_id) or root_id
+            root = root_labels.get(root_id, root_id)
             suffix = "".join(finding.path.selectors)
             key = (finding.pattern, root + suffix)
             existing = best.get(key)

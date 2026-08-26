@@ -895,6 +895,28 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     successors.sort_by(|left, right| left.node.cmp(&right.node));
     operations.sort_by_key(|item| (item.line.unwrap_or(i64::MAX), item.node.clone(), item.kind as u8));
 
+    // Retain only metadata needed by semantic emission: prepared CFG anchors,
+    // operation paths, and their declaration roots. This is intentionally
+    // bounded by the prepared function rather than the complete substrate.
+    let mut metadata_ids: HashSet<String> = prepared_nodes.iter().cloned().collect();
+    for operation in &operations {
+        metadata_ids.insert(operation.node.clone());
+        for path in [operation.target.as_ref(), operation.source.as_ref()].into_iter().flatten() {
+            metadata_ids.insert(path.root.trim_start_matches("decl:").to_owned());
+        }
+    }
+    let metadata = nodes.iter().filter(|node| metadata_ids.contains(&node.id)).map(|node| {
+        let offset = property(node, "start_offset").and_then(|value| value.parse::<i64>().ok());
+        lifetime_proto::SemanticNodeMetadata {
+            id: node.id.clone(), label: node.label.clone(),
+            kind: property(node, "syntax_kind").unwrap_or_else(|| node.kind.clone()),
+            owner: property(node, "owner_function_id")
+                .or_else(|| property(node, "function_id")).unwrap_or_default(),
+            r#type: property(node, "type").unwrap_or_default(),
+            offset: offset.unwrap_or_default(), has_offset: offset.is_some(),
+        }
+    }).collect::<Vec<_>>();
+
     lifetime_proto::PreparedFunction {
         id: input.id,
         nodes: prepared_nodes,
@@ -903,6 +925,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         parameters: input.parameters,
         calls,
         returns,
+        metadata,
     }
 }
 

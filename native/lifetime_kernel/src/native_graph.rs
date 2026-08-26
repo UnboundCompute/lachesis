@@ -705,6 +705,14 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         let entry = functions.entry(owner.clone()).or_insert_with(||
             lifetime_proto::TranslationFunction { id: owner, ..Default::default() });
         if compact_kind(node) == "ParmVarDecl" { entry.parameters.push(node.id.clone()); }
+        if matches!(compact_kind(node), "VarDecl" | "ParmVarDecl" | "variable" | "parameter") {
+            entry.roots.push(lifetime_proto::RootMetadata {
+                id: node.id.clone(),
+                label: node.label.clone(),
+                owner: compact_owner(node).unwrap_or_default(),
+                r#type: compact_property(node, "type").unwrap_or("").to_owned(),
+            });
+        }
     }
     for entry in functions.values_mut() {
         if let Some(function) = nodes.get(&entry.id) {

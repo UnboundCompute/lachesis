@@ -277,6 +277,7 @@ def build_native_F(store, lang="c", *, return_graph=False):
                 value["prov"] = "param" if value["var"] in params else "local"
             returns.append(value)
         recs[name] = {
+            "function_id": function_id,
             "name": name, "file": item.file or None,
             "line": item.start_line if item.has_start_line else None,
             "externally_visible": item.externally_visible,
@@ -284,6 +285,10 @@ def build_native_F(store, lang="c", *, return_graph=False):
             "assigns": assigns, "returns": returns, "callees": callees,
             "body_node_count": len(getattr(item, "nodes", ())),
             "cfg": None,
+            "root_metadata": {
+                item.id: (item.label, item.owner, item.type)
+                for item in getattr(item, "roots", ())
+            },
         }
 
     reverse_callers = defaultdict(set)

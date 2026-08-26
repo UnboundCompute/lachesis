@@ -75,6 +75,57 @@ _OP_VERB = {
 _SUBOBJECT = ("->", ".", "[", "*")
 
 
+class _NativeSemanticSubstrate:
+    """Small metadata view backed by Rust-prepared function records.
+
+    Native Pass 2 already has the CFG anchors and operation roots needed by
+    emission. This view supplies the handful of label/type/offset lookups the
+    existing emitter uses without decoding the complete structural sidecar.
+    """
+    def __init__(self, functions, cfgs):
+        self.idx = self
+        self._nodes = {}
+        for record in functions.values():
+            for root_id, metadata in record.get("root_metadata", {}).items():
+                label, owner, type_name = metadata
+                self._nodes.setdefault(root_id, {
+                    "id": root_id, "label": label, "kind": "variable",
+                    "properties": {"owner_function_id": owner, "type": type_name},
+                })
+        for cfg in cfgs.values():
+            for node_id, metadata in cfg.get("metadata", {}).items():
+                label, kind, owner, type_name, offset = metadata
+                self._nodes[node_id] = {
+                    "id": node_id, "label": label, "kind": kind,
+                    "properties": {"owner_function_id": owner, "type": type_name,
+                                   "start_offset": offset},
+                }
+
+    def nodes_of_kind(self, *kinds):
+        return [node for node in self._nodes.values()
+                if node.get("kind") in kinds or
+                (node.get("kind") == "ParmVarDecl" and "parameter" in kinds) or
+                (node.get("kind") == "VarDecl" and "variable" in kinds)]
+
+    def label(self, node_id):
+        node = self._nodes.get(str(node_id))
+        return node.get("label") if node else str(node_id)
+
+    def props(self, node_id):
+        node = self._nodes.get(str(node_id))
+        return dict(node.get("properties") or {}) if node else {}
+
+    def kind(self, node_id):
+        node = self._nodes.get(str(node_id))
+        return node.get("kind", "") if node else ""
+
+    def offset(self, node_id):
+        return int(self.props(node_id).get("start_offset") or 0)
+
+    def warm_owned(self, _owners):
+        return self
+
+
 def _readable_root(sub, root: str, scope=None) -> str:
     """Render an AccessPath root (``decl:<id>`` / ``param``) as a stable, readable base.
 
@@ -1142,17 +1193,24 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
     obj_summaries = (summaries if summaries is not None else
                      analyze_object_lifetimes(
                          store, functions, sub_succ, lang=lang, graph=graph).summaries)
-    sub = cached_substrate(analysis_index)
+    native_metadata = bool(cfgs) and all(
+        "operations" in item and "metadata" in item for item in cfgs.values())
+    sub = (_NativeSemanticSubstrate(functions, cfgs)
+           if native_metadata else cached_substrate(analysis_index))
     norm = normalizer(lang)
     sink_catalog = atropos.sink_catalog(lang)
     by_name = {}
-    for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
-        if _props(node).get("declaration_only"):
-            continue
-        name = node.get("label")
-        if name in functions and name not in by_name:
-            by_name[name] = node["id"]
-    sub.warm_owned(by_name.values())
+    if native_metadata:
+        by_name = {name: record.get("function_id", name)
+                   for name, record in functions.items()}
+    else:
+        for node in analysis_index.nodes_of_kind("function", "method", "constructor"):
+            if _props(node).get("declaration_only"):
+                continue
+            name = node.get("label")
+            if name in functions and name not in by_name:
+                by_name[name] = node["id"]
+        sub.warm_owned(by_name.values())
     # Return-origin emission and aggregate-copy fallback lookups need a local
     # declaration by (owner, label).  Build that index once; querying the complete
     # variable/parameter relation inside every call site made call-heavy graphs pay
@@ -1681,12 +1739,15 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
                             kind="call", return_to=exit_node,
                             guard=_call_guard_proofs(call),
                             binding=_call_bindings(sub, call, functions.get(callee, {}).get("params", ())),
-                            provenance=_seam_provenance(
-                                sub, call, functions.get(callee, {}).get("params", ()),
-                                (state_artifacts or {}).get(caller), anchor,
-                                nodes_by_fragment.get(callee, ()),
-                                caller_function_id=by_name.get(caller),
-                                continuation=continuation))
+                            provenance=(()
+                                        if native_metadata else
+                                        _seam_provenance(
+                                            sub, call,
+                                            functions.get(callee, {}).get("params", ()),
+                                            (state_artifacts or {}).get(caller), anchor,
+                                            nodes_by_fragment.get(callee, ()),
+                                            caller_function_id=by_name.get(caller),
+                                            continuation=continuation)))
             result.add_edge(exit_node, f"{caller}:{continuation}")
             for callee_exit in result.fragments[callee].exits:
                 return_binding = list(_return_bindings(

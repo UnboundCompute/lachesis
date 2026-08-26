@@ -210,6 +210,7 @@ message PreparedFunction {
   // the calls beside the prepared CFG avoids a second Kùzu walk in Python.
   repeated FunctionCall calls = 6;
   repeated FunctionReturn returns = 7;
+  repeated SemanticNodeMetadata metadata = 8;
 }
 message PrepareResult { repeated PreparedFunction functions = 1; }
 message PreparedFunctionResult {
@@ -233,8 +234,25 @@ message TranslationFunction {
   bool has_start_line = 8;
   bool externally_visible = 9;
   repeated string parameter_names = 10;
+  repeated RootMetadata roots = 11;
+}
+message RootMetadata {
+  string id = 1;
+  string label = 2;
+  string owner = 3;
+  string type = 4;
 }
 message TranslationResult { repeated TranslationFunction functions = 1; }
+
+message SemanticNodeMetadata {
+  string id = 1;
+  string label = 2;
+  string kind = 3;
+  string owner = 4;
+  string type = 5;
+  sint64 offset = 6;
+  bool has_offset = 7;
+}
 
 // Native Pass-2 source/coverage planning.  The planner consumes the compact
 // translation facts directly; it does not reopen Kùzu or materialize Python F
