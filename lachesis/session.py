@@ -336,8 +336,10 @@ class Analysis:
 
         from lachesis.planner.unbounded_copy import _REGION_EDGE_KINDS
 
+        materialize_started = perf_counter()
         region_edges = list(index.edges_of_kind(*_REGION_EDGE_KINDS))
         edges.extend(region_edges)
+        region_done = perf_counter()
         needed = {edge.get("source") for edge in region_edges}
         needed.update(edge.get("target") for edge in region_edges)
 
@@ -373,18 +375,38 @@ class Analysis:
                     work.append(source)
                 if source:
                     needed.add(source)
+        cone_done = perf_counter()
 
         # Fetch only endpoints absent from the narrow Atropos projection.  Kùzu's
         # batch warmer turns this into a small number of primary-key probes rather
         # than one query per record.
         missing = needed.difference(nodes)
-        warmer = getattr(index, "_warm_nodes", None)
-        if missing and warmer is not None:
-            warmer(missing)
-        for node_id in missing:
-            node = index.nodes.get(node_id)
-            if node is not None:
-                nodes[node_id] = node
+        # Cone endpoints are used by the structural evidence walkers for their
+        # identity, kind, label, and source span.  The Atropos projection already
+        # carries the full property tails for every candidate call/value node;
+        # inflating another 90k Kùzu property blobs here only to read those header
+        # fields cost ~18s on libxml2.  Promoted headers are exact for this use and
+        # avoid that allocation/decompression entirely.
+        headers = getattr(index, "node_headers", None)
+        if missing and headers is not None:
+            for node in headers(missing):
+                nodes[node["id"]] = node
+        else:
+            warmer = getattr(index, "_warm_nodes", None)
+            if missing and warmer is not None:
+                warmer(missing)
+            for node_id in missing:
+                node = index.nodes.get(node_id)
+                if node is not None:
+                    nodes[node_id] = node
+        if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
+            print(
+                "[lachesis pass2] structural phases: regions=%.3fs cone=%.3fs "
+                "warm=%.3fs region_edges=%d cone_nodes=%d missing=%d"
+                % (region_done - materialize_started, cone_done - region_done,
+                   perf_counter() - cone_done, len(region_edges), len(seen),
+                   len(missing)),
+                file=sys.stderr, flush=True)
         return {"nodes": list(nodes.values()), "edges": edges}
 
     def _enrich_and_merge(self, *, deadline: Deadline | None = None,
