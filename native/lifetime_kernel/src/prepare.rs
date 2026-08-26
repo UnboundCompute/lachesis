@@ -1003,13 +1003,14 @@ fn solve_prepared_function(
                  x == lifetime_proto::operation::Kind::Clobber as i32)
     });
     if !has_lifetime_transition {
+        let prepared = include_prepared.then(|| slim_prepared(function, false));
         return Ok(lifetime_proto::PreparedFunctionResult {
             id,
             result: Some(lifetime_proto::Result {
                 exit_state: Some(lifetime_proto::Snapshot::default()),
                 ..Default::default()
             }),
-            prepared: if include_prepared { Some(function) } else { None },
+            prepared,
         });
     }
     let operations = function.operations.iter().cloned()
@@ -1026,9 +1027,25 @@ fn solve_prepared_function(
     } else {
         crate::solve_graph(&function.nodes, &successors, &operations, initial, 32)
     };
+    let prepared = include_prepared.then(|| slim_prepared(function, true));
     Ok(lifetime_proto::PreparedFunctionResult {
         id,
         result: Some(crate::proto_result(solved)),
-        prepared: if include_prepared { Some(function) } else { None },
+        prepared,
     })
+}
+
+/// The Python adapter consumes only the prepared CFG and operation stream.
+/// Calls/returns/parameters are preparation inputs, not result metadata, and
+/// retaining them in every returned function duplicated a large portion of the
+/// request while crossing the binary boundary.
+fn slim_prepared(mut function: lifetime_proto::PreparedFunction,
+                 keep_operations: bool) -> lifetime_proto::PreparedFunction {
+    function.calls.clear();
+    function.returns.clear();
+    function.parameters.clear();
+    if !keep_operations {
+        function.operations.clear();
+    }
+    function
 }
