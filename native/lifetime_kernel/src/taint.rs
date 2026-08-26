@@ -184,7 +184,10 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         }
     }
 
-    let mut emitted = HashSet::new();
+    // A context-specific transition is a distinct fact even when its endpoints
+    // match another flow.  Collapsing on only (source, target) loses call-stack
+    // evidence and changes the query-visible graph.
+    let mut emitted: HashSet<(u32, u32, Option<String>)> = HashSet::new();
     for source in source_records {
         let initial = State { value: source.value, contexts: Vec::new() };
         let mut queue = VecDeque::from([initial.clone()]);
@@ -193,11 +196,11 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let mut predecessor: HashMap<State, State> = HashMap::new();
         let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
             .map(|record| (record.value, record)).collect();
-        let mut reaches = Vec::new();
+        let mut reaches: FxHashMap<u32, State> = FxHashMap::default();
         while let Some(state) = queue.pop_front() {
             if seen.len() > MAX_STATES_PER_SOURCE { break; }
             if state != initial && sink_by_value.contains_key(&state.value) {
-                reaches.push(state.clone());
+                reaches.entry(state.value).or_insert_with(|| state.clone());
             }
             for (target, transition, reason, context_id) in adjacency.get(&state.value).into_iter().flatten() {
                 let mut contexts = state.contexts.clone();
@@ -215,17 +218,21 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                     predecessor.insert(next.clone(), state.clone());
                     queue.push_back(next);
                 }
-                let key = (state.value, *target);
+                let key = (state.value, *target, context_id.clone());
                 if emitted.insert(key) {
                     let source_name = graph.id(state.value).to_owned();
                     let target_name = graph.id(*target).to_owned();
                     let fallback = vec![source_name.clone(), target_name.clone()];
-                    output_edges.push(edge("TAINT_FLOWS_TO", &source_name, &target_name,
-                        fact(evidence.get(&key).unwrap_or(&fallback), "high")));
+                    let mut properties = fact(evidence.get(&(state.value, *target)).unwrap_or(&fallback), "high");
+                    properties.push(pass2::text_field("transition", transition));
+                    if let Some(context) = context_id {
+                        properties.push(pass2::text_field("context_id", context));
+                    }
+                    output_edges.push(edge("TAINT_FLOWS_TO", &source_name, &target_name, properties));
                 }
             }
         }
-        for sink_state in reaches {
+        for sink_state in reaches.into_values() {
             let Some(sink) = sink_by_value.get(&sink_state.value) else { continue; };
             let mut witness = vec![sink_state.value];
             let mut cursor = sink_state;
