@@ -223,19 +223,21 @@ def main():
     elif "LACHESIS_LIFETIME_WORKERS" not in os.environ:
         os.environ["LACHESIS_LIFETIME_WORKERS"] = str(min(4, os.cpu_count() or 1))
 
-    # Keep the CLI on the same entrypoint as MCP. Calling match_all directly here used
-    # to bypass object identity and silently report legacy name-keyed results.
+    # Keep the CLI on the native semantic entrypoint. Rust owns graph preparation;
+    # Python only renders the compact result.
     from lachesis.flow.pipeline import run_pass
     from lachesis.nav.graph_store import GraphStore
     bundle = run_pass(GraphStore.load(args.graph), lang=args.lang)
-    skels, leads = bundle["skeletons"], bundle["leads"]
+    leads = bundle["leads"]
+    semantic = bundle.get("semantic_graph")
+    semantic_count = len(semantic.nodes) if semantic is not None else 0
 
     if args.out:
         with open(args.out, "w") as fh:
             json.dump(leads, fh, indent=2)
 
-    engine = bundle.get("lifetime", {}).get("active", "legacy")
-    print(f"matched {len(leads)} lead(s) over {len(skels)} skeleton(s) "
+    engine = bundle.get("lifetime", {}).get("active", "rust")
+    print(f"matched {len(leads)} lead(s) over {semantic_count} semantic node(s) "
           f"(lifetime={engine})"
           + (f" -> {args.out}" if args.out else "") + "\n")
     # single-node leads, source-rooted first (the maximal stitched flows)

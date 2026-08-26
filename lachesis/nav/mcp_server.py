@@ -1643,6 +1643,20 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_pass":
         bundle = c.flow_bundle
+        semantic = bundle.get("semantic_graph")
+        payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        return _emit(name, {
+            "move": "flow_pass",
+            "counts": {
+                "semantic_nodes": len(payload.get("nodes") or {}),
+                "semantic_edges": sum(len(edges) for edges in
+                                      (payload.get("edges") or {}).values()),
+                "leads": len(bundle.get("leads") or ()),
+            },
+            "semantic_graph": payload,
+            "leads": bundle.get("leads") or (),
+            "lifetime": bundle.get("lifetime", {}),
+        }, fmt, offset, limit)
         summaries, F = bundle["summaries"], bundle["F"]
         fn = args.get("function")
         names = [fn] if fn else sorted(summaries)
@@ -1709,6 +1723,23 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
         bundle = c.flow_bundle
+        semantic = bundle.get("semantic_graph")
+        payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        fn = args.get("function")
+        leads = [lead for lead in bundle.get("leads") or ()
+                 if not fn or lead.get("entry") == fn]
+        return _emit(name, {
+            "move": "flow_skeleton",
+            "counts": {
+                "semantic_nodes": len(payload.get("nodes") or {}),
+                "semantic_edges": sum(len(edges) for edges in
+                                      (payload.get("edges") or {}).values()),
+                "leads": len(bundle.get("leads") or ()),
+            },
+            "semantic_graph": payload,
+            "leads": leads,
+            "lifetime": bundle.get("lifetime", {}),
+        }, fmt, offset, limit)
         all_skels, leads = bundle["skeletons"], bundle["leads"]
         kind, fn = args.get("kind"), args.get("function")
         skels = all_skels
