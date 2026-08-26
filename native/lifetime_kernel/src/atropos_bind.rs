@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use hashbrown::HashMap;
 use prost::Message;
 
@@ -446,34 +446,12 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
     Ok(Index { language: language.map(str::to_owned), source: Some(path.display().to_string()), callsites })
 }
 
-fn load_models_path(root: &Path) -> Result<Vec<Model>, String> {
-    let mut paths = Vec::<PathBuf>::new();
-    fn visit(path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
-        for entry in fs::read_dir(path).map_err(|error| format!("cannot read catalog: {error}"))? {
-            let entry = entry.map_err(|error| format!("cannot read catalog entry: {error}"))?;
-            let path = entry.path();
-            if path.is_dir() { visit(&path, paths)?; }
-            else if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                paths.push(path);
-            }
-        }
-        Ok(())
-    }
-    visit(root, &mut paths)?;
-    paths.sort();
-    let mut models = Vec::new();
-    for path in paths {
-        let bytes = fs::read(&path).map_err(|error| format!("cannot read catalog {path:?}: {error}"))?;
-        let document: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("invalid catalog {path:?}: {error}"))?;
-        let entries = document.get("entries").and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("catalog {path:?} has no entries"))?;
-        for entry in entries {
-            models.push(serde_json::from_value(entry.clone())
-                .map_err(|error| format!("invalid catalog model {path:?}: {error}"))?);
-        }
-    }
-    Ok(models)
+fn load_models_path(path: &Path) -> Result<Vec<Model>, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read binary catalog {path:?}: {error}"))?;
+    let request = crate::atropos_proto::Request::decode(bytes.as_slice())
+        .map_err(|error| format!("invalid binary catalog {path:?}: {error}"))?;
+    Ok(from_proto(request).0)
 }
 
 pub(crate) fn bind_path(input: &Path, catalog: &Path, output: &Path) -> Result<(), String> {

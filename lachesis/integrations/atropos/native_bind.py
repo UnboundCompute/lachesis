@@ -40,6 +40,31 @@ def available() -> bool:
     return _load() is not None
 
 
+def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike[str]) -> None:
+    """Compile the authored Atropos JSON catalog to the runtime protobuf sidecar.
+
+    This is a setup/build operation. The Pass-2 native runtime consumes only the
+    resulting protobuf and never parses JSON.
+    """
+    from .models import load_models
+    request = atropos_pb2.Request()
+    for model in load_models(Path(root)):
+        encoded = request.models.add(
+            id=model.get("id") or "", language=model.get("language") or "",
+            method=model.get("method") or "", package=model.get("package") or "",
+            receiver_type=model.get("type") or "",
+            access_path=model.get("access_path") or "", role=model.get("role") or "",
+        )
+        if model.get("arity") is not None:
+            encoded.arity = int(model["arity"])
+            encoded.has_arity = True
+    target = os.fspath(output_path)
+    temporary = target + f".tmp.{os.getpid()}"
+    with open(temporary, "wb") as stream:
+        stream.write(request.SerializeToString())
+    os.replace(temporary, target)
+
+
 def bind_path(input_path: str | os.PathLike[str], catalog_path: str | os.PathLike[str],
               output_path: str | os.PathLike[str]) -> None:
     """Bind a framed Pass-1 substrate without constructing a Python callsite index.
