@@ -1445,7 +1445,11 @@ fn parse_unit(
             argument_ptrs.len() as c_int,
             ptr::null_mut(),
             0,
-            CXTranslationUnit_DetailedPreprocessingRecord,
+            // Include dependencies are collected through clang_getInclusions
+            // above and macro declarations are recovered from source text. The
+            // detailed preprocessor cursor record would retain every directive
+            // and expansion in each TU without adding facts to this frontend.
+            0,
             &mut translation_unit,
         );
         if error != CXError_Success || translation_unit.is_null() {
