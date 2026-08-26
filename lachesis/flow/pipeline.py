@@ -268,7 +268,13 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     # supplies reach/presence sink-flow observations on the production path.
     # Shadow and legacy retain the complete compatibility summary.
     native_summaries = None
-    if object_requested and os.environ.get("LACHESIS_NATIVE_SUMMARIES") == "1":
+    # The native semantic path owns the lifetime preparation/solve stage.  It is
+    # therefore also able to provide the compact reach summaries; running the
+    # Python summary composer here would recreate the same call/parameter work
+    # before Rust prepares the substrate again.
+    if object_requested and (
+            os.environ.get("LACHESIS_NATIVE_SUMMARIES") == "1"
+            or os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1"):
         from .native_translate import build_native_summaries
         native_summaries = build_native_summaries(store, lang=lang)
     summaries = (native_summaries if native_summaries is not None else
@@ -296,8 +302,35 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
             name: [callee for callee in succ.get(name, ()) if callee in object_functions]
             for name in object_functions
         }
+        native_semantic = None
+        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+            from .native_translate import build_native_semantic_graph
+            # Rust's path-only semantic entry point prepares, solves, and emits
+            # the compact event graph in one pass.  Do this before the legacy
+            # object analyzer so the native mode does not pay for both engines.
+            native_semantic = build_native_semantic_graph(store, lang=lang)
+
         from .emit import _native_object_substrate
-        if _native_object_substrate(analysis_graph):
+        if native_semantic is not None:
+            # The compact native graph is the authoritative result for this
+            # opt-in lane.  There is deliberately no Python lifetime fallback
+            # here: if Rust cannot produce the graph, the code below falls back
+            # to the established compatibility path instead.
+            object_result = ObjectLifetimeResult(
+                (), {}, {
+                    "backend": "rust-semantic",
+                    "analyzed": len(object_functions),
+                    "unsafe_functions": [],
+                    "seed_unsafe_functions": [],
+                    "unsafe_object_flow": {},
+                    "unplaced": 0,
+                    "unplaced_functions": {},
+                    "capped": [],
+                    "widenings": 0,
+                    "transfers": 0,
+                    "total_seconds": 0.0,
+                }, {})
+        elif _native_object_substrate(analysis_graph):
             object_result = analyze_object_lifetimes(
                 store, object_functions, object_succ, lang=lang, graph=analysis_graph,
                 workers=workers, deadline=deadline)
@@ -326,10 +359,6 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         # passing the whole-program plan here would mark functions absent from the
         # skeleton as covered and make Pass 3's convergence claim unsound.
         semantic_coverage = CoverageScheduler(object_functions, object_succ).plan()
-        native_semantic = None
-        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
-            from .native_translate import build_native_semantic_graph
-            native_semantic = build_native_semantic_graph(store, lang=lang)
         # Keep the fragment store on the loaded graph session so repeated Pass 3
         # requests can reuse covered semantic regions.  The store key fingerprints
         # rebuilt summaries, so this is safe across fresh F dictionaries as long as
