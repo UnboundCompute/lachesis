@@ -1,13 +1,9 @@
 """Fold the Atropos taint catalog onto an already-built graph.
 
 This is the one entry point a host (the query CLI, the MCP server, a test) calls
-to turn a plain enriched graph into a *taint-aware* one using the Atropos models.
-It is the composition of the seam's three engine-neutral steps -- project the
-graph to the neutral symbol index (:func:`canonical_index`), let the catalog bind
-its models against that index, and stamp each resolved fact back onto the exact
-node (:class:`AtroposOverlay`). By default it also runs the core value-flow
-completion the C frontend needs (:class:`CCallResultDataflow`); catalog-only
-consumers such as the candidate registry disable that step.
+to turn a plain graph into a *taint-aware* one using the Atropos models. Rust owns
+the binary graph projection and catalog matching; this module only exposes the
+native result to existing Python consumers.
 
 It preserves the repository boundary in both directions. The engine never takes a
 hard dependency on Atropos: the catalog and its binder are *located* at runtime
@@ -27,7 +23,6 @@ from time import perf_counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from lachesis.integrations.atropos import canonical_index
 from lachesis.integrations.atropos.overlay import (
     AtroposOverlay, stamps_from_report)
 
@@ -94,11 +89,6 @@ def atropos_enrich(
     counts, how many role nodes were stamped -- so a host can surface it and a
     silent no-op (no Atropos, nothing bound) is never mistaken for coverage.
     """
-    from lachesis.core.overlays.registry import OverlayRegistry
-    from lachesis.core.overlays.c_call_dataflow import CCallResultDataflow
-    from lachesis.core.overlays.c_out_param_dataflow import COutParamWriteback
-    from lachesis.core.overlays.c_return_dataflow import CReturnToCallsite
-
     root = locate_atropos(atropos_root)
     if root is None:
         return graph, {"applied": False, "reason": "atropos-not-found"}
@@ -119,7 +109,6 @@ def atropos_enrich(
 
     stamps: List[dict] = []
     per_language: Dict[str, Any] = {}
-    projection = None
     native_path_report = None
     native_path_output = None
     if symbol_index_source is not None:
@@ -216,132 +205,16 @@ def atropos_enrich(
                 "languages": languages, "per_language": per_language,
                 "stamps": len(stamps), "role_nodes": role_nodes,
             }
-    if symbol_index_source is not None:
-        projection_fn = getattr(symbol_index_source, "atropos_projection", None)
-        if projection_fn is not None:
-            started = perf_counter()
-            projection = projection_fn()
-            _phase_timing(
-                f"Kuzu projection ({len(projection.get('nodes', ())) if projection else 0:,} "
-                f"nodes, {len(projection.get('edges', ())) if projection else 0:,} edges)",
-                started,
-            )
-    canonical_projection = None
-    for language in languages:
-        lang_models = [m for m in models if m.get("language") == language]
-        if not lang_models:
-            continue
-        # The graph projection is language-neutral: canonical_index's language argument
-        # only stamps the output envelope, while the calls/edges scan is identical for
-        # every catalog language. Build that million-node/two-million-edge projection
-        # once and share its immutable callsite lists across the per-language binders.
-        if canonical_projection is None:
-            started = perf_counter()
-            canonical_projection = canonical_index(
-                projection if projection is not None else graph,
-                language=language, source="lachesis",
-            )
-            _phase_timing(
-                f"canonical projection ({len(canonical_projection['callsites']):,} callsites)",
-                started,
-            )
-        index = {**canonical_projection, "language": language}
-        from lachesis.integrations.atropos.native_bind import bind_all as native_bind_all
-        started = perf_counter()
-        report = native_bind_all(lang_models, index)
-        _phase_timing(f"Rust bind {language}", started)
-        stamps.extend(stamps_from_report(report, models_by_id))
-        counts: Dict[str, int] = {}
-        unbound: List[dict] = []
-        for row in report.get("results", []):
-            status = row.get("status", "unknown")
-            counts[status] = counts.get(status, 0) + 1
-            if status != "bound":
-                # Keep the exact model that failed to attach so the tool can *show*
-                # every sink the catalog knows, not just a headcount of misses. This
-                # is the worklist for strengthening the Atropos knowledge base.
-                unbound.append({
-                    "model_id": row.get("model_id"), "method": row.get("method"),
-                    "access_path": row.get("access_path"), "role": row.get("role"),
-                    # The catalog kind of the model that failed to attach, so a
-                    # per-family constructor can scope its unbound-sink frontier to
-                    # exactly its own kinds rather than the whole global roster.
-                    "kind": (models_by_id.get(row.get("model_id")) or {}).get("kind"),
-                    "status": status, "detail": row.get("detail"),
-                })
-        per_language[language] = {
-            "callsites": len(index["callsites"]),
-            "bind": counts,
-            "unbound": unbound,
-        }
-
-    if compact_structural and not complete_dataflow:
-        # Structural binding is additive: the catalog contributes only role nodes,
-        # taint edges, and summary flow edges.  Every endpoint came from this
-        # bounded neutral callsite projection, so validate against that projection
-        # rather than constructing a million-entry GraphIndex and copying/sorting
-        # the entire base graph just to append a tiny delta.
-        known_node_ids = set()
-        for callsite in (canonical_projection or {}).get("callsites", ()):
-            known_node_ids.add(callsite.get("id"))
-            known_node_ids.add(callsite.get("call_value_id"))
-            known_node_ids.add(callsite.get("receiver_value_id"))
-            known_node_ids.update(callsite.get("arg_value_ids") or ())
-        known_node_ids.discard(None)
-        delta = AtroposOverlay(stamps).delta_for_node_ids(known_node_ids)
-        if isinstance(graph.get("nodes"), list):
-            graph["nodes"].extend(delta.nodes)
-        else:
-            graph["nodes"] = [*graph.get("nodes", ()), *delta.nodes]
-        if isinstance(graph.get("edges"), list):
-            graph["edges"].extend(delta.edges)
-        else:
-            graph["edges"] = [*graph.get("edges", ()), *delta.edges]
-        role_nodes: Dict[str, int] = {}
-        for node in delta.nodes:
+    if native_path_report is None:
+        raise RuntimeError("Atropos binding requires a fresh binary Pass-1 sidecar and the native Rust binder")
+    # Native Rust owns catalog matching. This projection only exposes its additive
+    # stamps to an existing Python SDK graph view; it does not re-run matching.
+    enriched = AtroposOverlay(stamps).enrich(graph)
+    role_nodes: Dict[str, int] = {}
+    for node in enriched.get("nodes", ()):
+        if node.get("properties", {}).get("fact_origin") == "atropos-model":
             kind = node.get("kind", "?")
             role_nodes[kind] = role_nodes.get(kind, 0) + 1
-        return graph, {
-            "applied": True,
-            "atropos_root": str(root),
-            "languages": languages,
-            "per_language": per_language,
-            "stamps": len(stamps),
-            "role_nodes": role_nodes,
-        }
-
-    registry = OverlayRegistry()
-    if "c" in languages and complete_dataflow:
-        # The C frontend links a call result to the variable it initializes by AST
-        # only; without this the return-value sources/summaries can never flow.
-        registry.register(CCallResultDataflow())
-        # An argument the catalog marks as a *source* is an out-parameter the call
-        # fills; the frontend wires only variable->use, so that write would strand
-        # on the argument node. Flow it back into the buffer's other uses.
-        out_param_sources = [
-            s["value_id"] for s in stamps
-            if s.get("role") == "source" and "value_id" in s
-            and str(s.get("access_path") or "").startswith("Argument[")
-        ]
-        registry.register(COutParamWriteback(out_param_sources))
-        # The frontend records what a function returns and what each callsite
-        # invokes, but never links them, so a source obtained inside a wrapper
-        # dies at its return. Flow every returned value to its callers' results.
-        registry.register(CReturnToCallsite())
-        # NB: the opt-in field-sensitive reaching-def tier (REACHING_DEF) is folded
-        # by the canonical dataflow-tier builder (pipeline.enrich_graph), not here --
-        # the taint tool reaches it via ensure_dataflow_tier before this fold, so
-        # registering it again would double the edges.
-    registry.register(AtroposOverlay(stamps))
-    enriched = registry.enrich(graph)
-
-    stamped = [n for n in enriched["nodes"]
-               if n.get("properties", {}).get("fact_origin") == "atropos-model"]
-    role_nodes: Dict[str, int] = {}
-    for node in stamped:
-        kind = node.get("kind", "?")
-        role_nodes[kind] = role_nodes.get(kind, 0) + 1
-
     return enriched, {
         "applied": True,
         "atropos_root": str(root),
