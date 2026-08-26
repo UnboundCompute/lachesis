@@ -58,7 +58,11 @@ class CandidateRegistry:
         if constructor not in self._specs:
             raise KeyError(f"unknown candidate constructor: {constructor}")
         if constructor not in self._results:
-            self._ensure_typed_structural()
+            # Lifecycle constructors consume the compact semantic event sidecar
+            # only. Do not inflate the 113MB typed structural cache for a
+            # temporal query; structural families still materialize it lazily.
+            if self._specs[constructor].metadata.get("domain") != "lifecycle":
+                self._ensure_typed_structural()
             self._ensure_native_semantic()
             impl = self._specs[constructor].implementation(self.graph, self.bind_summary)
             self._results[constructor] = impl.enumerate()
@@ -82,8 +86,13 @@ class CandidateRegistry:
             return
         from ..flow.native_translate import load_native_semantic_graph_sidecar
 
-        native = load_native_semantic_graph_sidecar(
+        from ..flow.native_translate import load_native_semantic_events_sidecar
+
+        native = load_native_semantic_events_sidecar(
             semantic["native_sidecar"], self.graph.get("language") or "c")
+        if native is None:
+            native = load_native_semantic_graph_sidecar(
+                semantic["native_sidecar"], self.graph.get("language") or "c")
         if native is None:
             return
         payload = native.to_dict()

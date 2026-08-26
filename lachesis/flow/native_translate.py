@@ -528,6 +528,21 @@ def ensure_native_semantic_sidecar(store):
     output_path = native_semantic_sidecar_path(store)
     if not output_path.is_file():
         semantic_path(input_path, output_path)
+    events_path = native_semantic_events_path(output_path)
+    if not events_path.is_file():
+        # Older full semantic caches predate the event-only publication. Re-run
+        # once into a temporary result so Rust can publish the compact sibling;
+        # keep the existing full cache intact for advanced queries.
+        temporary = Path(f"{output_path}.events-migrate.{os.getpid()}")
+        try:
+            semantic_path(input_path, temporary)
+            generated = native_semantic_events_path(temporary)
+            os.replace(generated, events_path)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
     return output_path if output_path.is_file() else None
 
 
@@ -540,6 +555,36 @@ def load_native_semantic_graph_sidecar(path, lang="c"):
     except (OSError, ValueError):
         return None
     return _decode_native_semantic_result(result, lang)
+
+
+def native_semantic_events_path(path) -> Path:
+    """Return the event-only sidecar emitted beside the full semantic graph."""
+    return Path(f"{path}.events.pb")
+
+
+def load_native_semantic_events_sidecar(path, lang="c"):
+    """Load only operation-derived nodes needed by temporal candidate queries."""
+    from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
+    try:
+        result = lifetime_pb2.NativeSemanticResult()
+        result.ParseFromString(native_semantic_events_path(path).read_bytes())
+    except (OSError, ValueError):
+        return None
+    graph = SkeletonGraph(language=lang)
+    for function in result.functions:
+        for node in function.nodes:
+            if not node.event_kind:
+                continue
+            kind = getattr(EventKind, node.event_kind, node.event_kind)
+            obj = (ObjRef(node.object_root, tuple(node.object_selectors),
+                          node.generation or "g0") if node.object_root else None)
+            event = Event(kind, obj=obj, base=obj, path="*" if obj else None,
+                          line=node.line if node.has_line else None)
+            graph.add_node(node.id, event, fragment=function.id,
+                           owner_function_id=function.id, native_anchor=node.anchor)
+    if not result.complete:
+        graph.coverage["converged"] = False
+    return graph
 
 
 def _decode_native_semantic_result(result, lang):
