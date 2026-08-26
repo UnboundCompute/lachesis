@@ -50,6 +50,16 @@ pub enum Fact {
     Unknown,
 }
 
+type FactMask = u8;
+
+#[inline]
+fn fact_bit(fact: Fact) -> FactMask { 1 << fact as u8 }
+
+fn fact_values(mask: FactMask) -> Vec<Fact> {
+    [Fact::Allocated, Fact::Freed, Fact::Null, Fact::Unknown].into_iter()
+        .filter(|fact| mask & fact_bit(*fact) != 0).collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Kind {
     Alloc,
@@ -97,7 +107,7 @@ pub enum Effect {
 #[derive(Clone, Debug, Default)]
 pub struct State {
     pub env: HashMap<String, String>,
-    pub facts: HashMap<String, HashSet<Fact>>,
+    pub facts: HashMap<String, FactMask>,
     pub slots: HashMap<(String, String), String>,
     pub trace: Vec<Effect>,
     pub freed_paths: HashMap<Path, String>,
@@ -137,9 +147,7 @@ impl State {
         let mut env: Vec<_> = self.env.iter().map(|(root, oid)| (root.clone(), oid.clone())).collect();
         env.sort_by(|left, right| left.0.cmp(&right.0));
         let mut facts: Vec<_> = self.facts.iter().map(|(oid, values)| {
-            let mut values: Vec<_> = values.iter().copied().collect();
-            values.sort_by_key(|value| *value as u8);
-            (oid.clone(), values)
+            (oid.clone(), fact_values(*values))
         }).collect();
         facts.sort_by(|left, right| left.0.cmp(&right.0));
         let mut slots: Vec<_> = self.slots.iter().map(|((base, selector), oid)| {
@@ -217,7 +225,7 @@ impl State {
             selectors: path.selectors.clone(),
         });
         self.env.insert(path.root, oid.clone());
-        self.facts.entry(oid).or_default().insert(Fact::Unknown);
+        *self.facts.entry(oid).or_default() |= fact_bit(Fact::Unknown);
     }
 
     fn resolve(&mut self, path: &Path, create: bool) -> Option<String> {
@@ -228,7 +236,7 @@ impl State {
                 root: path.root.clone(),
             });
             self.env.insert(path.root.clone(), fresh.clone());
-            self.facts.entry(fresh.clone()).or_default().insert(Fact::Unknown);
+            *self.facts.entry(fresh.clone()).or_default() |= fact_bit(Fact::Unknown);
             oid = Some(fresh);
         }
         for selector in &path.selectors {
@@ -254,7 +262,7 @@ impl State {
                     }
                 });
                 self.slots.insert(key, fresh.clone());
-                self.facts.entry(fresh.clone()).or_default().insert(Fact::Unknown);
+                *self.facts.entry(fresh.clone()).or_default() |= fact_bit(Fact::Unknown);
                 fresh
             } else {
                 return None;
@@ -275,9 +283,8 @@ impl State {
     }
 
     fn merge_object(&mut self, destination: &str, source: &str) {
-        let source_facts = self.facts.get(source).cloned()
-            .unwrap_or_else(|| [Fact::Unknown].into_iter().collect());
-        self.facts.entry(destination.to_owned()).or_default().extend(source_facts);
+        let source_facts = self.facts.get(source).copied().unwrap_or_else(|| fact_bit(Fact::Unknown));
+        *self.facts.entry(destination.to_owned()).or_default() |= source_facts;
         for oid in self.env.values_mut() {
             if oid == source { *oid = destination.to_owned(); }
         }
@@ -343,7 +350,7 @@ impl State {
             target: target.clone(),
         });
         self.age(&recent, &summary);
-        self.facts.insert(recent.clone(), [fact].into_iter().collect());
+        self.facts.insert(recent.clone(), fact_bit(fact));
         self.bind(target, recent);
     }
 
@@ -354,14 +361,14 @@ impl State {
         if target.selectors.len() > 0 && parse_param(&oid).is_some() {
             self.freed_paths.insert(target.clone(), oid.clone());
         }
-        let facts = self.facts.entry(oid.clone()).or_insert_with(|| [Fact::Unknown].into_iter().collect());
+        let facts = self.facts.entry(oid.clone()).or_insert(fact_bit(Fact::Unknown));
         let weak = oid.split('|').nth(1) == Some("summary");
-        if facts.contains(&Fact::Freed) && !weak {
+        if *facts & fact_bit(Fact::Freed) != 0 && !weak {
             findings.double_free.push((op.line, target.clone(), op.node.clone()));
         }
-        if *facts != [Fact::Null].into_iter().collect::<HashSet<_>>() {
-            if weak { facts.insert(Fact::Freed); }
-            else { *facts = [Fact::Freed].into_iter().collect(); }
+        if *facts != fact_bit(Fact::Null) {
+            if weak { *facts |= fact_bit(Fact::Freed); }
+            else { *facts = fact_bit(Fact::Freed); }
         }
     }
 
@@ -400,7 +407,7 @@ impl State {
                 let Some(oid) = self.resolve(&mut target_path, false) else { return };
                 self.record_param(Kind::Use, &oid);
                 if op.access_is_return() { self.record_return(&oid); }
-                if self.facts.get(&oid).is_some_and(|facts| facts.contains(&Fact::Freed)) {
+                if self.facts.get(&oid).is_some_and(|facts| *facts & fact_bit(Fact::Freed) != 0) {
                     findings.use_after_free.push((op.line, target.clone(), op.node.clone()));
                 }
             }
@@ -957,11 +964,7 @@ fn state_fingerprint(state: &State) -> u64 {
     let mut env: Vec<_> = state.env.iter().collect();
     env.sort_by(|left, right| left.0.cmp(right.0));
     env.hash(&mut hasher);
-    let mut facts: Vec<_> = state.facts.iter().map(|(object, values)| {
-        let mut values: Vec<_> = values.iter().copied().collect();
-        values.sort_by_key(|value| *value as u8);
-        (object, values)
-    }).collect();
+    let mut facts: Vec<_> = state.facts.iter().map(|(object, values)| (object, values)).collect();
     facts.sort_by(|left, right| left.0.cmp(right.0));
     facts.hash(&mut hasher);
     let mut slots: Vec<_> = state.slots.iter().collect();
@@ -977,13 +980,13 @@ fn state_fingerprint(state: &State) -> u64 {
 fn attach_joined(states: &[State], node: &str, new_oid: String,
                  signature: Vec<Option<String>>, joined: &mut State,
                  queued: &mut Vec<(String, Vec<Option<String>>)>) {
-    let mut facts = HashSet::new();
+    let mut facts = 0u8;
     for (state, old_oid) in states.iter().zip(signature.iter()) {
         if let Some(old_oid) = old_oid {
-            facts.extend(state.facts.get(old_oid).cloned()
-                .unwrap_or_else(|| [Fact::Unknown].into_iter().collect()));
+            facts |= state.facts.get(old_oid).copied()
+                .unwrap_or_else(|| fact_bit(Fact::Unknown));
         } else {
-            facts.insert(Fact::Unknown);
+            facts |= fact_bit(Fact::Unknown);
         }
     }
     joined.facts.insert(new_oid.clone(), facts);
@@ -1124,8 +1127,8 @@ fn stable_join_states(states: &[State], node: &str) -> State {
     }
     for (index, state) in states.iter().enumerate() {
         for (old, stable) in &maps[index] {
-            joined.facts.entry(stable.clone()).or_default().extend(
-                state.facts.get(old).cloned().unwrap_or_default());
+            *joined.facts.entry(stable.clone()).or_default() |=
+                state.facts.get(old).copied().unwrap_or_default();
             joined.objects.entry(stable.clone()).or_insert_with(|| ObjectMeta::Phi {
                 tag: "stable".into(), node: node.into(), index: 0,
             });
