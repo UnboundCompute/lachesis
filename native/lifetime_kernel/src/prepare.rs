@@ -51,8 +51,11 @@ fn path(node: Option<&str>) -> Option<Path> {
         .map(|value| Path::root(format!("decl:{value}")))
 }
 
-struct GraphView {
-    nodes: HashMap<String, lifetime_proto::GraphNode>,
+struct GraphView<'a> {
+    // The input owns the protobuf nodes for the duration of preparation.  Keep
+    // typed borrowed records here instead of cloning every node and its property
+    // vector into a second graph-sized allocation.
+    nodes: HashMap<String, &'a lifetime_proto::GraphNode>,
     children: HashMap<String, Vec<String>>,
     roles: HashMap<(String, String), Vec<String>>,
     parent: HashMap<String, String>,
@@ -60,15 +63,16 @@ struct GraphView {
     initializers: HashMap<String, String>,
 }
 
-impl GraphView {
-    fn new(input: &lifetime_proto::FunctionInput) -> Self {
-        let nodes = input.nodes.iter().cloned().map(|node| (node.id.clone(), node)).collect();
+impl<'a> GraphView<'a> {
+    fn new(nodes_input: &'a [lifetime_proto::GraphNode],
+           edges_input: &[lifetime_proto::GraphEdge]) -> Self {
+        let nodes = nodes_input.iter().map(|node| (node.id.clone(), node)).collect();
         let mut children = HashMap::new();
         let mut parent = HashMap::new();
         let mut roles = HashMap::new();
         let mut refers = HashMap::new();
         let mut initializers = HashMap::new();
-        for edge in &input.edges {
+        for edge in edges_input {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
                     children.entry(edge.source.clone()).or_insert_with(Vec::new).push(edge.target.clone());
@@ -83,7 +87,9 @@ impl GraphView {
         Self { nodes, children, roles, parent, refers, initializers }
     }
 
-    fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> { self.nodes.get(id) }
+    fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> {
+        self.nodes.get(id).copied()
+    }
 
     fn kind(&self, id: &str) -> &str {
         self.node(id).map(|node| text_property(node, "syntax_kind").unwrap_or(node.kind.as_str())).unwrap_or("")
@@ -646,7 +652,7 @@ fn next_generation(value: &str) -> String {
 /// deliberately avoids CFG synthesis and operation extraction.
 pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
     for input in &mut request.functions {
-        let graph = GraphView::new(input);
+        let graph = GraphView::new(&input.nodes, &input.edges);
         for call in &mut input.calls {
             for argument in &mut call.arguments {
                 argument.expression = graph.label(&argument.node).to_owned();
@@ -690,9 +696,9 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
 }
 
 fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::PreparedFunction {
-    let graph = GraphView::new(&input);
     let mut nodes = input.nodes;
     nodes.sort_by_key(|node| property(node, "start_offset").and_then(|value| value.parse::<i64>().ok()).unwrap_or(i64::MAX));
+    let graph = GraphView::new(&nodes, &input.edges);
     let node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
     let node_set = node_ids.iter().cloned().collect::<HashSet<_>>();
 
