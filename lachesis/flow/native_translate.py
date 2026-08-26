@@ -521,12 +521,14 @@ def build_native_semantic_graph(store, lang="c"):
             continue
         node_ids = {node.id for node in function.nodes}
         for node in function.nodes:
-            kind = getattr(EventKind, node.event_kind, node.event_kind)
-            obj = (ObjRef(node.object_root, tuple(node.object_selectors),
-                          node.generation or "g0") if node.object_root else None)
-            event = Event(kind, obj=obj, base=obj,
-                          path="*" if obj is not None else None,
-                          line=node.line if node.has_line else None)
+            event = None
+            if node.event_kind:
+                kind = getattr(EventKind, node.event_kind, node.event_kind)
+                obj = (ObjRef(node.object_root, tuple(node.object_selectors),
+                              node.generation or "g0") if node.object_root else None)
+                event = Event(kind, obj=obj, base=obj,
+                              path="*" if obj is not None else None,
+                              line=node.line if node.has_line else None)
             graph.add_node(node.id, event, fragment=function.id,
                            owner_function_id=function.id, native_anchor=node.anchor)
         for edge in function.edges:

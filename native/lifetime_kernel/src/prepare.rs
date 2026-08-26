@@ -1298,6 +1298,53 @@ pub(crate) fn semantic_request(
         let id = function.id.clone();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
+        // Preserve the prepared CFG topology even when an anchor has no
+        // lifetime operation.  These empty-event nodes are the compact native
+        // equivalent of the Python semantic graph's control-flow substrate.
+        for anchor in &function.nodes {
+            let node_id = format!("native:{}:anchor:{}", id, anchor);
+            by_anchor.entry(anchor.clone()).or_default().push(node_id.clone());
+            nodes.push(lifetime_proto::NativeSemanticNode {
+                id: node_id,
+                function: id.clone(),
+                event_kind: String::new(),
+                object_root: String::new(),
+                object_selectors: Vec::new(),
+                generation: String::new(),
+                line: 0,
+                has_line: false,
+                anchor: anchor.clone(),
+            });
+        }
+        let mut incoming_counts: HashMap<String, usize> = HashMap::new();
+        for successor in &function.successors {
+            for target in &successor.targets {
+                *incoming_counts.entry(target.clone()).or_default() += 1;
+            }
+        }
+        for anchor in &function.nodes {
+            let outgoing = function.successors.iter()
+                .find(|item| item.node == *anchor)
+                .map(|item| item.targets.len()).unwrap_or(0);
+            let mut markers = Vec::new();
+            if outgoing > 1 { markers.push("BRANCH"); }
+            if incoming_counts.get(anchor).copied().unwrap_or(0) > 1 {
+                markers.push("MERGE");
+            }
+            if function.loop_nodes.iter().any(|item| item == anchor) {
+                markers.push("LOOP");
+            }
+            for (ordinal, kind) in markers.into_iter().enumerate() {
+                let node_id = format!("native:{}:marker:{}:{}", id, anchor, ordinal);
+                by_anchor.entry(anchor.clone()).or_default().push(node_id.clone());
+                nodes.push(lifetime_proto::NativeSemanticNode {
+                    id: node_id, function: id.clone(), event_kind: kind.into(),
+                    object_root: String::new(), object_selectors: Vec::new(),
+                    generation: String::new(), line: 0, has_line: false,
+                    anchor: anchor.clone(),
+                });
+            }
+        }
         for (index, raw) in function.operations.iter().cloned().enumerate() {
             let operation = crate::proto_operation(raw)?;
             let path = operation.target.as_ref();
