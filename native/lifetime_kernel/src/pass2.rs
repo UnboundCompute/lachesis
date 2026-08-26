@@ -11,6 +11,7 @@ use std::path::Path;
 use hashbrown::HashMap;
 use prost::Message;
 use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 
 use crate::graph_proto;
 
@@ -36,6 +37,8 @@ impl Symbols {
     pub(crate) fn get(&self, symbol: u32) -> &str {
         self.values.get(symbol as usize).map(String::as_str).unwrap_or("")
     }
+
+    fn find(&self, value: &str) -> Option<u32> { self.lookup.get(value).copied() }
 }
 
 pub(crate) struct Node {
@@ -61,6 +64,11 @@ pub(crate) struct Graph {
     pub(crate) incoming: Vec<Vec<usize>>,
 }
 
+pub(crate) struct Delta {
+    pub(crate) nodes: Vec<graph_proto::NodeRecord>,
+    pub(crate) edges: Vec<graph_proto::EdgeRecord>,
+}
+
 impl Graph {
     pub(crate) fn kind(&self, symbol: u32) -> &str { self.symbols.get(symbol) }
 
@@ -74,6 +82,129 @@ impl Graph {
         node.properties.iter().find_map(|field| {
             (field.key == key).then(|| field.value.as_ref()).flatten()
         })
+    }
+
+    pub(crate) fn symbol(&self, value: &str) -> Option<u32> { self.symbols.find(value) }
+
+    pub(crate) fn id(&self, symbol: u32) -> &str { self.symbols.get(symbol) }
+
+    pub(crate) fn node_index(&self, id: &str) -> Option<usize> {
+        self.symbol(id).and_then(|symbol| self.node_by_id.get(&symbol).copied())
+    }
+
+    pub(crate) fn edge_kind(&self, edge: &Edge) -> String {
+        let kind = self.kind(edge.kind);
+        if kind != "EXPANDS_TO" { return kind.to_owned(); }
+        self.edge_property_text(edge, "via").unwrap_or("EXPANDS_TO").to_owned()
+    }
+
+    pub(crate) fn edge_property_text<'a>(&self, edge: &'a Edge, key: &str) -> Option<&'a str> {
+        edge.properties.iter().find_map(|field| {
+            if field.key != key { return None; }
+            match field.value.as_ref()?.kind.as_ref()? {
+                graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+                _ => None,
+            }
+        })
+    }
+
+    pub(crate) fn node_property_text<'a>(&self, node: &'a Node, key: &str) -> Option<&'a str> {
+        self.node_property(node, key).and_then(|value| match value.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn node_property_i64(&self, node: &Node, key: &str) -> Option<i64> {
+        self.node_property(node, key).and_then(|value| match value.kind.as_ref()? {
+            graph_proto::value::Kind::Integer(value) => Some(*value),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn node_property_bool(&self, node: &Node, key: &str) -> Option<bool> {
+        self.node_property(node, key).and_then(|value| match value.kind.as_ref()? {
+            graph_proto::value::Kind::Boolean(value) => Some(*value),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn absorb(&mut self, delta: Delta) -> Result<(), String> {
+        for record in delta.nodes {
+            let id = self.symbols.intern(record.id);
+            if let Some(existing) = self.node_by_id.get(&id).copied() {
+                let node = &self.nodes[existing];
+                if self.kind(node.kind) != record.kind || node.label != record.label {
+                    return Err(format!("conflicting native Pass-2 node {}", self.id(id)));
+                }
+                continue;
+            }
+            let node = Node {
+                id,
+                kind: self.symbols.intern(record.kind),
+                label: record.label,
+                properties: record.properties,
+            };
+            self.node_by_id.insert(id, self.nodes.len());
+            self.nodes.push(node);
+            self.outgoing.push(Vec::new());
+            self.incoming.push(Vec::new());
+        }
+        for record in delta.edges {
+            let edge = Edge {
+                kind: self.symbols.intern(record.kind),
+                source: self.symbols.intern(record.source),
+                target: self.symbols.intern(record.target),
+                properties: record.properties,
+            };
+            let index = self.edges.len();
+            if let Some(source) = self.node_by_id.get(&edge.source).copied() {
+                self.outgoing[source].push(index);
+            }
+            if let Some(target) = self.node_by_id.get(&edge.target).copied() {
+                self.incoming[target].push(index);
+            }
+            self.edges.push(edge);
+        }
+        Ok(())
+    }
+}
+
+/// Stable IDs intentionally match `lachesis.core.identities.stable_id` for the
+/// string-only parts used by native overlays.
+pub(crate) fn stable_id(namespace: &str, kind: &str, parts: &[&str]) -> String {
+    let raw = parts.join("\0");
+    let mut hasher = Sha256::new();
+    hasher.update(format!("v2\0core\0{namespace}\0{kind}\0{raw}").as_bytes());
+    let digest = hasher.finalize();
+    let hex = digest.iter().take(10).map(|byte| format!("{byte:02x}")).collect::<String>();
+    format!("v2:core:{namespace}:{kind}:{hex}")
+}
+
+pub(crate) fn text_field(key: &str, value: impl Into<String>) -> graph_proto::Field {
+    graph_proto::Field {
+        key: key.to_owned(),
+        value: Some(graph_proto::Value {
+            kind: Some(graph_proto::value::Kind::Text(value.into())),
+        }),
+    }
+}
+
+pub(crate) fn integer_field(key: &str, value: i64) -> graph_proto::Field {
+    graph_proto::Field {
+        key: key.to_owned(),
+        value: Some(graph_proto::Value {
+            kind: Some(graph_proto::value::Kind::Integer(value)),
+        }),
+    }
+}
+
+pub(crate) fn bool_field(key: &str, value: bool) -> graph_proto::Field {
+    graph_proto::Field {
+        key: key.to_owned(),
+        value: Some(graph_proto::Value {
+            kind: Some(graph_proto::value::Kind::Boolean(value)),
+        }),
     }
 }
 
