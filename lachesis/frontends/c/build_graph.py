@@ -1099,11 +1099,21 @@ def main() -> int:
                 )
             graph.edge("DEPENDS_ON", file_ids[path], file_ids[target], directive="#include")
 
-    # Parse headers independently as compiler roots. This retains their exact
-    # offsets; Clang otherwise reports included declarations using header-local
-    # offsets but only the including-file provenance.
+    # Parse translation units and only uncovered headers as compiler roots. A
+    # header included by a TU is already present in that TU's AST; parsing it a
+    # second time as a standalone root only recreates the same declarations and
+    # burns another full preprocessing/JSON pass. Keep standalone roots for
+    # orphan headers because no TU can provide their declarations.
+    included_headers = {
+        target for target in dependency_targets.values()
+        if target is not None and target.suffix.lower() == ".h"
+    }
+    ast_roots = translation_units + [
+        path for path in files
+        if path.suffix.lower() == ".h" and path not in included_headers
+    ]
     for path, result in run_clang_over(
-        files, source_dir, "-Xclang", "-ast-dump=json", "-fsyntax-only",
+        ast_roots, source_dir, "-Xclang", "-ast-dump=json", "-fsyntax-only",
         "-Wno-everything", file_flags_of=compile_commands,
         label="ast",
     ):
