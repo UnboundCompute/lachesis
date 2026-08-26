@@ -513,53 +513,6 @@ def _write_complete_pass2_input(target, nodes, edges, *, manifest=None):
     _write_framed_sidecar(target, ".pass2-input-", header, nodes, edges)
 
 
-def _publish_translation_from_substrate(target, manifest, *, native_facts=False):
-    """Publish the compact translation cache and, when requested, Rust facts."""
-    target = Path(target)
-    substrate = substrate_cache_path(target)
-    seed_kinds = {
-        "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
-        "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
-        "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl", "FunctionDef",
-        "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
-        "MethodDeclaration", "MethodDefinition", "Constructor", "call", "Call",
-        "CallExpression", "construct", "NewExpression", "Return", "ReturnStatement",
-        "return", "parameter", "allocation", "release", "realloc",
-    }
-    seed_nodes = []
-    edges = []
-    for payload in read_frames(substrate):
-        if not payload:
-            continue
-        if payload[0:1] == b"N":
-            node = _CompactNode_from_payload(payload[1:])
-            if (node.properties.get("syntax_kind") or node.kind) in seed_kinds:
-                seed_nodes.append(node)
-        elif payload[0:1] == b"E":
-            edges.append(_CompactEdge_from_payload(payload[1:]))
-
-    def all_nodes():
-        for payload in read_frames(substrate):
-            if payload and payload[0:1] == b"N":
-                yield _CompactNode_from_payload(payload[1:])
-
-    nodes, edges = _translation_records(seed_nodes, edges, node_source=all_nodes)
-    common = {"store_version": manifest.get("version"),
-              "core_content_hash": manifest.get("core_content_hash"),
-              "source_content_hash": manifest.get("source_content_hash"),
-              "build_fingerprint": manifest.get("build_fingerprint")}
-    _write_framed_sidecar(
-        translation_cache_path(target), ".pass2-translation-",
-        {"format": "lachesis-pass2-translation", "version": _CACHE_VERSION,
-         "edge_count": len(edges), "node_count": len(nodes), **common}, nodes, edges)
-    facts_path = translation_facts_path(target)
-    if native_facts:
-        from lachesis.flow.native_lifetime import write_translation_facts_path
-        write_translation_facts_path(substrate, facts_path)
-    else:
-        _write_translation_facts(facts_path, _translation_facts(nodes, edges))
-
-
 def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                                  keep_node=None, prune=None):
     """Publish Pass-1 caches from a replayable shard reader.
@@ -576,7 +529,7 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
     # translation/facts projection.  A custom keep predicate is deliberately
     # excluded until its semantics have a native representation.
     raw_paths = getattr(reader, "raw_shard_paths", lambda: ())()
-    if (len(raw_paths) == 1 and raw_paths[0][0] == "clang-c"
+    if (len(raw_paths) == 1 and raw_paths[0][0].startswith("clang-c")
             and keep_node is None and prune is not None):
         from lachesis.flow.native_lifetime import project_pass1_shard
         target = Path(graph_path)
@@ -584,7 +537,11 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
             raw_paths[0][1], raw_paths[0][2], pass2_input_cache_path(target),
             substrate_cache_path(target), manifest, prune=bool(prune),
         )
-        _publish_translation_from_substrate(target, manifest, native_facts=True)
+        # Rust owns the binary translation projection as well.  The Python
+        # process only passes paths and does not reconstruct the substrate.
+        from lachesis.flow.native_lifetime import write_translation_facts_path
+        write_translation_facts_path(
+            substrate_cache_path(target), translation_facts_path(target))
         return
     if keep_node is None and prune is not None:
         keep_node = lambda node: not (prune and node.get("kind") in {"token", "source-span"})
