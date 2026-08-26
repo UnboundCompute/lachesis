@@ -69,10 +69,15 @@ fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<
             "type" |
             "primary_target_id" |
             "callee" |
+            "callee_name" |
+            "callee_form" |
             "receiver" |
+            "target_id" |
+            "value_id" |
             "is_alloc" |
             "is_release" |
             "is_realloc" |
+            "release_method" |
             "is_aggregate_copy")
             || (retain_owner && matches!(field.key.as_str(),
                 "owner_function_id" | "function_id"));
@@ -164,6 +169,20 @@ fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
     scalar(node, "owner_function_id").or_else(|| scalar(node, "function_id"))
 }
 
+fn function_kind(kind: &str) -> bool {
+    matches!(kind, "function" | "method" | "constructor" | "FunctionDecl"
+        | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl"
+        | "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration"
+        | "ArrowFunction" | "MethodDeclaration" | "MethodDefinition"
+        | "Constructor")
+}
+
+fn call_kind(kind: &str) -> bool {
+    matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
+        | "call" | "Call" | "CallExpression" | "construct" | "NewExpression"
+        | "allocation" | "release" | "realloc")
+}
+
 /// Convert the complete framed substrate to the existing native preparation
 /// contract. This is deliberately one conversion inside Rust; Python never
 /// creates FunctionInput/FunctionCall records for this path.
@@ -196,14 +215,21 @@ fn sidecar_to_request_with_selection(
     let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(
         input, selected_ids, |item| {
             let item_id = item.id.clone();
-            let Some(function) = owner(&item) else { return };
-            if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+            let function = if function_kind(&syntax) {
+                Some(item.id.clone())
+            } else {
+                owner(&item)
+            };
+            let Some(function) = function else { return };
+            if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
-            if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
+            if matches!(syntax.as_str(), "ParmVarDecl" | "parameter" | "arg") {
+                entry.parameters.push(item.id.clone());
+            }
             entry.nodes.push(node(&item, retain_owner));
-            if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
+            if call_kind(&syntax) {
                 call_nodes.push((function, item_id));
             }
         },
@@ -226,14 +252,19 @@ fn sidecar_to_request_with_selection(
             callee: input_scalar(&item, "primary_target_id")
                 .and_then(|target| function_names.get(&target).cloned())
                 .or_else(|| input_scalar(&item, "callee"))
+                .or_else(|| input_scalar(&item, "callee_name"))
+                .or_else(|| input_scalar(&item, "release_method"))
                 .unwrap_or_else(|| item.label.clone()),
             assigned: String::new(),
             receiver: input_scalar(&item, "receiver").unwrap_or_default(),
             line: input_scalar(&item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
             has_line: input_scalar(&item, "start_line").is_some(),
-            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true"),
-            is_release: input_scalar(&item, "is_release").as_deref() == Some("true"),
-            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true"),
+            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true")
+                || input_scalar(&item, "syntax_kind").as_deref() == Some("allocation"),
+            is_release: input_scalar(&item, "is_release").as_deref() == Some("true")
+                || input_scalar(&item, "syntax_kind").as_deref() == Some("release"),
+            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true")
+                || input_scalar(&item, "syntax_kind").as_deref() == Some("realloc"),
             is_source: false,
             is_aggregate_copy: input_scalar(&item, "is_aggregate_copy").as_deref() == Some("true"),
             arguments: Vec::new(),
@@ -241,6 +272,10 @@ fn sidecar_to_request_with_selection(
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
+        if let Some(assigned) = input_scalar(&item, "target_id")
+            .or_else(|| input_scalar(&item, "value_id")) {
+            call.assigned = assigned;
+        }
         let parent = parents.get(&item.id).and_then(|id| node_lookup.get(id.as_str()).copied());
         if let Some(parent) = parent {
             let parent_kind = input_scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
@@ -538,11 +573,10 @@ fn scan_lifetime_metadata_reader<R: Read>(
                     owners.insert(item.id.clone(), function);
                 }
                 let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
-                if matches!(syntax.as_str(), "function" | "method" | "constructor"
-                    | "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
+                if function_kind(&syntax) {
                     function_names.insert(item.id.clone(), item.label.clone());
                 }
-                if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
+                if call_kind(&syntax) {
                     call_ids.insert(item.id.clone());
                 }
                 on_node(item);

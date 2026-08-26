@@ -55,6 +55,10 @@ _SUBSTRATE_NODE_KINDS = frozenset({
     "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
     "cfg-exit", "cfg-merge", "cfg-condition", "function", "method", "constructor",
     "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
+    "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
+    "MethodDeclaration", "MethodDefinition", "Call", "CallExpression", "construct",
+    "NewExpression", "Return", "ReturnStatement", "return", "allocation", "release",
+    "realloc", "parameter", "arg",
 })
 _SUBSTRATE_PROPERTY_KEYS = frozenset({
     "absolute_file", "end_line", "end_offset", "file", "function_id",
@@ -65,6 +69,8 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
     # during Pass 1; retaining them in the binary substrate lets Rust consume
     # the graph without asking Python to rebuild per-function call records.
     "callee", "form", "method_name", "primary_target_id",
+    "callee_name", "callee_form", "argument_count", "release_method", "release_name",
+    "release_line", "target_id", "value_id",
     "receiver_member_id", "resolution", "allocation_kind", "allocated_type",
     "control_kind", "is_alloc", "is_release", "is_realloc", "is_aggregate_copy",
     "declaration_only", "storage_class", "owner_id",
@@ -229,8 +235,12 @@ def _translation_facts(nodes, records):
             return base[0], selectors
         return None
 
-    function_kinds = {"function", "method", "constructor", "FunctionDecl",
-                      "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl"}
+    function_kinds = {
+        "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
+        "CXXConstructorDecl", "CXXDestructorDecl", "FunctionDef", "AsyncFunctionDef",
+        "FunctionDeclaration", "ArrowFunction", "MethodDeclaration", "MethodDefinition",
+        "Constructor",
+    }
     function_names = {node["id"]: node.get("label", "") for node in nodes
                       if syntax(node["id"]) in function_kinds}
     function_ids = set(function_names)
@@ -243,7 +253,13 @@ def _translation_facts(nodes, records):
     functions = {}
     return_nodes = defaultdict(list)
     for node in nodes:
+        node_syntax = syntax(node["id"])
         owner = props(node).get("owner_function_id") or props(node).get("function_id")
+        # Top-level functions in the non-C frontends own their declaration node.
+        # Make that ownership explicit so Rust can prepare them without a Python
+        # F projection.
+        if node_syntax in function_kinds:
+            owner = node["id"]
         if not owner:
             continue
         item = functions.setdefault(owner, lifetime_pb2.TranslationFunction(id=owner))
@@ -255,15 +271,18 @@ def _translation_facts(nodes, records):
                 item.start_line = int(props(function).get("start_line") or 0)
                 item.has_start_line = True
             item.externally_visible = props(function).get("storage_class") != "static"
-        if syntax(node["id"]) == "ParmVarDecl":
+        if node_syntax in {"ParmVarDecl", "parameter", "arg"}:
             item.parameters.append(node["id"])
-        if syntax(node["id"]) == "ReturnStmt":
+        if node_syntax in {"ReturnStmt", "Return", "ReturnStatement", "return"}:
             return_nodes[owner].append(node)
     for item in functions.values():
         item.parameters.sort(key=lambda node_id: int(props(by_id[node_id]).get("start_offset") or 2**63 - 1))
         item.parameter_names.extend(root_label(node_id) for node_id in item.parameters)
 
-    call_kinds = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}
+    call_kinds = {
+        "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "call", "Call",
+        "CallExpression", "construct", "NewExpression",
+    }
     for node in nodes:
         node_id = node["id"]
         if syntax(node_id) not in call_kinds:
@@ -273,8 +292,9 @@ def _translation_facts(nodes, records):
         item = functions.get(owner)
         if item is None:
             continue
-        target = node_props.get("primary_target_id")
-        callee = function_names.get(target) or node_props.get("callee") or node.get("label", "")
+        target = node_props.get("primary_target_id") or node_props.get("target_id")
+        callee = (function_names.get(target) or node_props.get("callee") or
+                  node_props.get("callee_name") or node.get("label", ""))
         call = lifetime_pb2.FunctionCall(
             node=node_id, callee=callee, receiver=node_props.get("receiver", ""),
             line=int(node_props.get("start_line") or 0), has_line="start_line" in node_props,
@@ -284,7 +304,8 @@ def _translation_facts(nodes, records):
             is_aggregate_copy=node_props.get("is_aggregate_copy") is True,
         )
         parent_id = parents.get(node_id)
-        if parent_id and syntax(parent_id) == "BinaryOperator" and props(by_id[parent_id]).get("operator") == "=":
+        if (parent_id and syntax(parent_id) in {"BinaryOperator", "AssignmentExpression"}
+                and props(by_id[parent_id]).get("operator", "=") == "="):
             call.assigned = next((target for target, role in children.get(parent_id, ())
                                   if role == "LEFT_OPERAND"), "")
         if not call.assigned:
@@ -323,10 +344,11 @@ def _translation_facts(nodes, records):
             if syntax(peeled) in call_kinds:
                 call_node = by_id[peeled]
                 call_props = props(call_node)
-                target = call_props.get("primary_target_id")
+                target = call_props.get("primary_target_id") or call_props.get("target_id")
                 item.returns.append(lifetime_pb2.FunctionReturn(
                     kind="call", callee=function_names.get(target) or
-                    call_props.get("callee") or call_node.get("label", ""),
+                    call_props.get("callee") or call_props.get("callee_name") or
+                    call_node.get("label", ""),
                     line=int(line_props.get("start_line") or 0), has_line="start_line" in line_props))
             else:
                 return_path = path(child)
@@ -353,11 +375,18 @@ def _translation_records(nodes, records, *, node_source=None):
         "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
         "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
         "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl",
+        "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
+        "MethodDeclaration", "MethodDefinition", "Constructor", "call", "Call",
+        "CallExpression", "construct", "NewExpression", "Return", "ReturnStatement",
+        "return", "parameter", "allocation", "release", "realloc",
     }
     seed_nodes = [node for node in nodes if syntax(node) in seed_kinds]
     call_ids = {node["id"] for node in seed_nodes
-                if syntax(node) in {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}}
-    return_ids = {node["id"] for node in seed_nodes if syntax(node) == "ReturnStmt"}
+                if syntax(node) in {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr",
+                                    "call", "Call", "CallExpression", "construct",
+                                    "NewExpression"}}
+    return_ids = {node["id"] for node in seed_nodes
+                  if syntax(node) in {"ReturnStmt", "Return", "ReturnStatement", "return"}}
     relevant = call_ids | return_ids
     for _ in range(2):
         for edge in records:
@@ -458,6 +487,10 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
             "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
             "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
             "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl",
+            "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
+            "MethodDeclaration", "MethodDefinition", "Constructor", "call", "Call",
+            "CallExpression", "construct", "NewExpression", "Return", "ReturnStatement",
+            "return", "parameter", "allocation", "release", "realloc",
         }
 
         try:
