@@ -271,6 +271,73 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             if exits.is_empty() { exits = condition_stream.last().cloned().into_iter().collect(); }
             (condition_stream.first().cloned().or_else(|| exits.first().cloned()), exits)
+        } else if kind == "SwitchStmt" {
+            // A switch dispatches to every case/default entry. The generic
+            // statement path would serialize all case bodies into one chain,
+            // making a large opcode switch look like one giant sequential
+            // transfer on every loop iteration.
+            let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned()
+                .or_else(|| children.iter().find(|child| graph.kind(child) != "CompoundStmt").cloned());
+            let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned()
+                .or_else(|| children.iter().find(|child| graph.kind(child) == "CompoundStmt").cloned());
+            let mut condition_stream = Vec::new();
+            if let Some(condition) = condition {
+                expression_stream(graph, &condition, owned, &mut condition_stream, &mut HashSet::new(), 0);
+                append_chain(successors, &condition_stream);
+            }
+            let body_result = body.as_ref()
+                .map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1))
+                .unwrap_or((None, Vec::new()));
+            let case_nodes = body.as_ref().map(|body| {
+                graph.children.get(body).cloned().unwrap_or_default()
+                    .into_iter().filter(|child| owned.contains(child)
+                        && matches!(graph.kind(child).as_str(), "CaseStmt" | "DefaultStmt"))
+                    .collect::<Vec<_>>()
+            }).unwrap_or_default();
+            let mut case_entries = Vec::new();
+            for case in &case_nodes {
+                let (entry, _) = emit(graph, owned, case, successors, memo, in_progress, depth + 1);
+                if let Some(entry) = entry { case_entries.push(entry); }
+            }
+            if let Some(condition_exit) = condition_stream.last() {
+                for entry in &case_entries {
+                    successors.entry(condition_exit.clone()).or_default().push(entry.clone());
+                }
+            }
+            let has_default = case_nodes.iter().any(|case| graph.kind(case) == "DefaultStmt");
+            let mut exits = body_result.1;
+            if !has_default { exits.extend(condition_stream.last().cloned()); }
+            (condition_stream.first().cloned().or(body_result.0), exits)
+        } else if matches!(kind.as_str(), "CaseStmt" | "DefaultStmt") {
+            // Case bodies contain nested statements, not just expressions.
+            // Preserve fallthrough only when the case's final child has an
+            // exit; a break/return therefore terminates that case chain.
+            let mut units: Vec<(String, Vec<String>)> = Vec::new();
+            let mut sorted = children;
+            sorted.sort_by_key(|child| graph.offset(child));
+            for child in sorted {
+                if is_statement(graph.kind(&child).as_str()) {
+                    let (entry, exits) = emit(graph, owned, &child, successors, memo, in_progress, depth + 1);
+                    if let Some(entry) = entry { units.push((entry, exits)); }
+                } else {
+                    let mut stream = Vec::new();
+                    expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0);
+                    if let Some(entry) = stream.first().cloned() {
+                        let exits = stream.last().cloned().into_iter().collect();
+                        append_chain(successors, &stream);
+                        units.push((entry, exits));
+                    }
+                }
+            }
+            let Some((first, mut exits)) = units.first().cloned() else { return (None, Vec::new()) };
+            for (entry, next_exits) in units.into_iter().skip(1) {
+                for previous in &exits { successors.entry(previous.clone()).or_default().push(entry.clone()); }
+                exits = next_exits;
+            }
+            (Some(first), exits)
+        } else if kind == "BreakStmt" || kind == "ContinueStmt" {
+            successors.entry(id.to_owned()).or_default();
+            (Some(id.to_owned()), Vec::new())
         } else if kind == "ForStmt" {
             let body = graph.roles.get(&(id.to_owned(), "LOOP_BODY".to_owned())).and_then(|items| items.first()).cloned();
             let condition = graph.roles.get(&(id.to_owned(), "CONDITION".to_owned())).and_then(|items| items.first()).cloned();
