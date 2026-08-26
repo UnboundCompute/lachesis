@@ -355,6 +355,47 @@ fn framed_record(reader: &mut BufReader<File>) -> Result<Option<Vec<u8>>, String
     Ok(Some(payload))
 }
 
+// The Pass-1 stream carries large property lists on almost every record, while
+// catalog binding needs only the top-level kind (and the id for language
+// detection) before deciding whether a record is relevant.  Read those small
+// protobuf fields without asking prost to allocate/decode the property list.
+fn read_varint(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes.get(*offset)?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 { return Some(value); }
+    }
+    None
+}
+
+fn string_field<'a>(bytes: &'a [u8], wanted: u32) -> Option<&'a str> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let key = read_varint(bytes, &mut offset)?;
+        let field = (key >> 3) as u32;
+        let wire = key & 7;
+        if field == wanted && wire == 2 {
+            let length = usize::try_from(read_varint(bytes, &mut offset)?).ok()?;
+            let end = offset.checked_add(length)?;
+            return std::str::from_utf8(bytes.get(offset..end)?).ok();
+        }
+        match wire {
+            0 => { read_varint(bytes, &mut offset)?; }
+            1 => offset = offset.checked_add(8)?,
+            2 => {
+                let length = usize::try_from(read_varint(bytes, &mut offset)?).ok()?;
+                offset = offset.checked_add(length)?;
+            }
+            5 => offset = offset.checked_add(4)?,
+            _ => return None,
+        }
+        if offset > bytes.len() { return None; }
+    }
+    None
+}
+
 /// Build the neutral Atropos index directly from the complete Pass-1 stream.
 ///
 /// Only call nodes, argument nodes, and HAS_ARGUMENT edges are retained. The
@@ -373,11 +414,10 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
         let tag = payload.remove(0);
         match tag {
             b'N' => {
-                let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
-                    .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
-                let node_language = if node.id.contains(":clang-c:") { Some("c") }
-                    else if node.id.contains(":cpython-ast:") { Some("python") }
-                    else if node.id.contains(":typescript-compiler-api:") { Some("typescript") }
+                let node_id = string_field(payload.as_slice(), 1).unwrap_or("");
+                let node_language = if node_id.contains(":clang-c:") { Some("c") }
+                    else if node_id.contains(":cpython-ast:") { Some("python") }
+                    else if node_id.contains(":typescript-compiler-api:") { Some("typescript") }
                     else { None };
                 if let Some(current) = node_language {
                     if let Some(previous) = language {
@@ -386,18 +426,26 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
                         language = Some(current);
                     }
                 }
-                if node.kind == "call" || node.kind == "construct" {
-                    calls.push(node);
-                } else if node.kind == "argument" {
+                let kind = string_field(payload.as_slice(), 2).unwrap_or("");
+                if kind == "call" || kind == "construct" || kind == "argument" {
+                    let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
+                        .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
+                    if kind == "call" || kind == "construct" {
+                        calls.push(node);
+                    } else {
                     let call = property(&node, "callsite_id");
                     let position = property(&node, "position")
                         .and_then(|value| value.parse().ok()).unwrap_or(0);
                     if let Some(call) = call {
                         arguments.entry(call).or_default().push((position, node.id));
                     }
+                    }
                 }
             }
             b'E' => {
+                if string_field(payload.as_slice(), 1) != Some("HAS_ARGUMENT") {
+                    continue;
+                }
                 let edge = crate::graph_proto::EdgeRecord::decode(payload.as_slice())
                     .map_err(|error| format!("invalid Pass-1 edge: {error}"))?;
                 if edge.kind == "HAS_ARGUMENT" {
