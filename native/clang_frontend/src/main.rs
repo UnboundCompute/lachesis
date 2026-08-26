@@ -434,6 +434,43 @@ extern "C" fn collect_callee_reference(
     CXChildVisit_Recurse
 }
 
+unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
+    let direct = clang_getCursorReferenced(cursor);
+    let mut probe = ReferenceProbe { cursor: None };
+    if clang_is_null(direct) != 0 {
+        clang_visitChildren(
+            cursor,
+            collect_callee_reference,
+            &mut probe as *mut ReferenceProbe as *mut c_void,
+        );
+    }
+    let referenced = if clang_is_null(direct) == 0 {
+        direct
+    } else {
+        probe.cursor.unwrap_or_default()
+    };
+    if clang_is_null(referenced) != 0 {
+        return None;
+    }
+    let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
+    if target_kind != "FunctionDecl" {
+        return None;
+    }
+    let target_name = cx_string(clang_getCursorSpelling(referenced));
+    let (raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+    let target_file = emitter.canonical_file(raw_file);
+    if target_file.is_empty() {
+        return None;
+    }
+    Some(stable_id(
+        "function",
+        &target_file,
+        target_offset,
+        target_end,
+        &target_name,
+    ))
+}
+
 unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
@@ -617,6 +654,15 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                     properties: vec![field("position", integer(position as i64))],
                     source_tier: tier.clone(), relationship_class: "HAS_ARGUMENT".to_owned(),
                 })?;
+                if let Some(argument_cursor) = children.cursors.get(position + 1) {
+                    if let Some(callback_id) = function_reference_id(*argument_cursor, emitter) {
+                        emitter.edge(graph::EdgeRecord {
+                            kind: "PASSES_CALLBACK".to_owned(), source: id.clone(), target: callback_id,
+                            properties: vec![field("position", integer(position as i64))],
+                            source_tier: tier.clone(), relationship_class: "PASSES_CALLBACK".to_owned(),
+                        })?;
+                    }
+                }
                 if let Some(parameter_id) = target_parameters.get(position) {
                     emitter.edge(graph::EdgeRecord {
                         kind: "ARGUMENT_BINDS_PARAMETER".to_owned(), source: argument_id.clone(), target: parameter_id.clone(),
@@ -670,14 +716,22 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     }
 
     if syntax_kind == "CallExpr" {
-        if let (Some(owner_id), Some(target_id)) = (owner_id, call_target) {
+        if let (Some(owner_id), Some(target_id)) = (owner_id.clone(), call_target) {
             emitter.edge(graph::EdgeRecord {
                 kind: "CALLS".to_owned(), source: owner_id, target: target_id,
                 properties: Vec::new(), source_tier: "T1".to_owned(),
                 relationship_class: "CALLS".to_owned(),
             })?;
         }
-    } else if syntax_kind == "DeclRefExpr" {
+    } else if matches!(syntax_kind.as_str(), "ImplicitCastExpr" | "ParenExpr") {
+        if let Some(child_id) = child_ids_for_value_preserving(cursor, emitter) {
+            emitter.edge(graph::EdgeRecord {
+                kind: "VALUE_FLOWS_TO".to_owned(), source: child_id, target: id.clone(),
+                properties: vec![field("reason", text("value-preserving-expression"))],
+                source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
+            })?;
+        }
+    } else if matches!(syntax_kind.as_str(), "DeclRefExpr" | "MemberRefExpr" | "MemberRef") {
         let referenced = clang_getCursorReferenced(cursor);
         if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
@@ -689,7 +743,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                 "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                 _ => None,
             };
-            if let (Some(id_kind), Some(_owner_id)) = (id_kind, owner_id) {
+            if let (Some(id_kind), Some(_owner_id)) = (id_kind, owner_id.as_ref()) {
                 let target_id = stable_id(id_kind, &target_file, target_offset, target_end, &target_name);
                 emitter.edge(graph::EdgeRecord {
                     kind: "REFERS_TO".to_owned(), source: id.clone(), target: target_id.clone(),
@@ -737,7 +791,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     }
 
     if syntax_kind == "FunctionDecl"
-        && parent_kind == "TranslationUnitDecl"
+        && owner_id.is_none()
         && clang_isCursorDefinition(cursor) != 0
         && clang_getCursorLinkage(cursor) != CXLinkage_Internal
         && clang_getCursorLinkage(cursor) != CXLinkage_NoLinkage
@@ -751,6 +805,19 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         }
     }
     Ok(())
+}
+
+unsafe fn child_ids_for_value_preserving(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
+    let mut children = ChildProbe { cursors: Vec::new() };
+    clang_visitChildren(
+        cursor,
+        collect_direct_child,
+        &mut children as *mut ChildProbe as *mut c_void,
+    );
+    children
+        .cursors
+        .first()
+        .and_then(|child| cursor_graph_id(*child, emitter))
 }
 
 unsafe fn cursor_graph_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
