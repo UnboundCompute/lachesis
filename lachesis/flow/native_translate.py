@@ -509,7 +509,7 @@ def build_native_semantic_graph(store, lang="c"):
     input_path = pass2_input_cache_path(base)
     if not input_path.is_file():
         return None
-    output_path = Path(f"{base}.pass3.semantic.pb")
+    output_path = native_semantic_sidecar_path(store)
     result = semantic_path(input_path, output_path) if not output_path.is_file() else None
     if result is None:
         from .native_lifetime import lifetime_pb2
@@ -540,3 +540,10 @@ def build_native_semantic_graph(store, lang="c"):
     if not result.complete:
         graph.coverage["converged"] = False
     return graph
+
+
+def native_semantic_sidecar_path(store) -> Path | None:
+    """Return the compact Rust semantic sidecar location for ``store``."""
+    base = (getattr(store.index, "_pass3_cache_base", None)
+            or getattr(store.index, "_db_dir", None))
+    return Path(f"{base}.pass3.semantic.pb") if base else None
