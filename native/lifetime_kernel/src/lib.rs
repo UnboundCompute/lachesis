@@ -56,9 +56,9 @@ fn absorb_native_delta(
     graph.absorb(delta)
 }
 
-/// Internal native-chain runner used while the remaining parity overlays are
-/// being ported.  It is deliberately not exposed to the Python CLI yet: the
-/// production launcher must not publish a sidecar that omits an overlay.
+/// Native-chain runner for the binary Pass-2 path.  The ordering mirrors the
+/// canonical Python registry so each later overlay observes the preceding
+/// additive facts.
 fn run_native_overlay_chain(
     input: &std::path::Path, output: &std::path::Path,
 ) -> Result<(usize, usize), String> {
@@ -69,17 +69,17 @@ fn run_native_overlay_chain(
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = branch_history::enrich(&mut graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    let delta = module_initialization::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    let delta = property_effects::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
-    let delta = heap::enrich(&mut graph);
-    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = dispatch::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = dynamic_behavior::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = interprocedural::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = heap::enrich(&mut graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = module_initialization::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = property_effects::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = async_events::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
