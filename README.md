@@ -93,9 +93,10 @@ Pass-1 output without rebuilding the frontends. The optional `--stream-shards DI
 form remains available when the intermediate shard directory must be retained.
 Independent frontend subprocesses are run concurrently during the streaming build;
 their shard sets are then projected together by Rust, preserving cross-language edges
-without reconstructing a graph-sized Python object. On the reference full-core libxml2
-build, the current cold measurement is 32.64 seconds and approximately 1.09 GB peak RSS
-(C/C++, Python, and TypeScript/JavaScript; no swap). The Rust publisher writes
+without reconstructing a graph-sized Python object. On the reference pruned core libxml2
+build, the current cold measurement is 28.73 seconds and approximately 0.85 GiB peak RSS
+(C/C++, Python, and TypeScript/JavaScript; no swap; 406,952 nodes / 656,691 edges).
+The Rust publisher writes
 `<store>.pass2.input.pb`, `<store>.pass2.facts.pb`, and `<store>.pass3.substrate.pb`.
 When the native binary inputs are present, `enrich` hands their paths directly to
 the Rust Pass-2 engine and retains only its compact event sidecar; it does not
