@@ -1700,6 +1700,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     edge_path_lists = collections.defaultdict(list)
     edge_row_counts = collections.defaultdict(int)
     batch_rows = _stream_batch_rows()
+    # Node batches are deliberately small because their wide promoted schema is
+    # the materialization RSS driver.  Edges have a narrower schema and are already
+    # partitioned on disk, so a larger in-memory batch reduces Arrow/Parquet call
+    # overhead without multiplying the node working set.
+    edge_batch_rows = 10_000
 
     def flush_edge_partition(kind: str) -> None:
         writer = edge_writers.pop(kind, None)
@@ -1808,7 +1813,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             hash_part(edge.get("target"))
         batch.append(edge)
         kept_edge_count += 1
-        if len(batch) >= batch_rows:
+        if len(batch) >= edge_batch_rows:
             load_edges(batch)
             batch.clear()
     if batch:
