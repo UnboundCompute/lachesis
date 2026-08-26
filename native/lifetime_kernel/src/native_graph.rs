@@ -196,15 +196,6 @@ fn sidecar_to_request_with_selection(
         .filter(|item| item.kind == "AST_CHILD" && call_ids.contains(&item.target))
         .map(|item| (item.target.clone(), item.source.clone()))
         .collect();
-    for edges in edges_by_source.values() {
-        for item in edges {
-            let source_owner = owners.get(&item.source);
-            let target_owner = owners.get(&item.target);
-            let Some(function) = source_owner.or(target_owner) else { continue };
-            let Some(entry) = functions.get_mut(function) else { continue };
-            entry.edges.push(lifetime_edge(item));
-        }
-    }
     // Calls are part of the graph contract, not a Python-side projection.  The
     // frontend has already persisted the canonical lifecycle classification;
     // Rust only links arguments and assignment destinations using AST edges.
@@ -274,6 +265,19 @@ fn sidecar_to_request_with_selection(
     for (function, call) in built_calls {
         if let Some(entry) = functions.get_mut(&function) {
             entry.calls.push(call);
+        }
+    }
+    // Materialize the final protobuf edge vectors only after call extraction
+    // has finished.  Keeping both CompactEdge and GraphEdge representations
+    // alive across this phase duplicates the entire edge set at the peak.
+    // Consuming the temporary map releases each compact edge as it is moved.
+    for (_, edges) in edges_by_source {
+        for item in edges {
+            let source_owner = owners.get(&item.source);
+            let target_owner = owners.get(&item.target);
+            let Some(function) = source_owner.or(target_owner) else { continue };
+            let Some(entry) = functions.get_mut(function) else { continue };
+            entry.edges.push(lifetime_edge(&item));
         }
     }
     // Build the first native interprocedural summary lattice.  These effects
