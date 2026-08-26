@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import tempfile
+import time
 from typing import Callable, Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
@@ -165,11 +167,23 @@ def run_frontend(
     roots: Optional[Sequence[str]] = None,
     keep_node: Optional[Callable[[dict], bool]] = None,
 ) -> FrontendSnapshot:
+    started = time.perf_counter()
+
+    def report(snapshot: FrontendSnapshot) -> FrontendSnapshot:
+        if os.environ.get("LACHESIS_TIMINGS") == "1":
+            print(
+                "[lachesis timing] frontend %s: %.3fs (%d nodes, %d edges)"
+                % (frontend.frontend_id, time.perf_counter() - started,
+                   len(snapshot.nodes), len(snapshot.edges)),
+                file=sys.stderr, flush=True,
+            )
+        return snapshot
+
     if _in_process_applies(frontend, output_dir):
         snapshot = frontend.in_process(source_dir, roots)
         _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"),
                        keep_node=keep_node)
-        return snapshot
+        return report(snapshot)
     temporary = None
     if output_dir is None:
         temporary = tempfile.TemporaryDirectory(prefix="lachesis-frontend-")
@@ -206,7 +220,7 @@ def run_frontend(
             )
         else:
             snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)
-        return snapshot
+        return report(snapshot)
     except subprocess.TimeoutExpired as error:
         raise ContractError(
             f"frontend {frontend.frontend_id} exceeded {timeout_seconds}s"

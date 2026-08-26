@@ -61,7 +61,7 @@ fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<
         // second allocation for every scalar field before preparation starts.
         // Keep this allow-list in sync with text_property/integer_property in
         // prepare.rs and the call extraction in native_graph.rs.
-        if !matches!(field.key.as_str(),
+        let retained = matches!(field.key.as_str(),
             "syntax_kind" |
             "start_offset" |
             "start_line" |
@@ -73,9 +73,10 @@ fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<
             "is_alloc" |
             "is_release" |
             "is_realloc" |
-            "is_aggregate_copy"
-        ) && !(retain_owner && matches!(field.key.as_str(),
-            "owner_function_id" | "function_id")) {
+            "is_aggregate_copy")
+            || (retain_owner && matches!(field.key.as_str(),
+                "owner_function_id" | "function_id"));
+        if !retained {
             return None;
         }
         let value = field.value.as_ref()?.kind.as_ref()?;
