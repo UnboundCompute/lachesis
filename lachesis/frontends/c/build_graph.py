@@ -682,12 +682,22 @@ class Graph:
             # separator components across translation units. Normalize before the
             # memo lookup so those spellings do not repeat realpath/content-hash
             # work for every AST node.
-            file_key = os.path.normcase(os.path.normpath(absolute_file))
-            cached = RESOLVED_FILES.get(file_key)
+            # AST nodes normally carry the exact same ``str(Path)`` spelling as
+            # their compiler-root file node.  Hit that form first: normalizing a
+            # path for every one of hundreds of thousands of nodes is needless
+            # Python/string work.  The normalized lookup remains for included
+            # paths that arrive with a different spelling.
+            cached = RESOLVED_FILES.get(absolute_file)
             if cached is None:
-                absolute = Path(absolute_file).resolve()
-                cached = (str(absolute), content_hash(absolute))
-                RESOLVED_FILES[file_key] = cached
+                file_key = os.path.normcase(os.path.normpath(absolute_file))
+                cached = RESOLVED_FILES.get(file_key)
+                if cached is None:
+                    absolute = Path(absolute_file).resolve()
+                    cached = (str(absolute), content_hash(absolute))
+                    RESOLVED_FILES[file_key] = cached
+                # Cache the original spelling as well so subsequent AST nodes
+                # from this path take the cheap direct branch.
+                RESOLVED_FILES[absolute_file] = cached
             resolved_file, resolved_hash = cached
             canonical.update({
                 "frontend_id": FRONTEND_ID,
