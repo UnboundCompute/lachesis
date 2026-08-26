@@ -79,20 +79,15 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
 }
 
 fn position(graph: &Graph, node: &pass2::Node) -> (i64, i64) {
-    (
-        graph.node_property_i64(node, "start_offset").unwrap_or(i64::MAX),
-        graph.node_property_i64(node, "end_offset").unwrap_or(i64::MAX),
-    )
+    graph.node_position(node)
 }
 
 fn node_control_kind<'a>(graph: &'a Graph, node: &'a pass2::Node) -> &'a str {
-    graph.node_property_text(node, "control_kind").unwrap_or("")
+    graph.node_control_kind(node)
 }
 
 fn owned_by(graph: &Graph, node: &pass2::Node) -> Option<u32> {
-    graph.node_property_text(node, "owner_function_id")
-        .or_else(|| graph.node_property_text(node, "function_id"))
-        .and_then(|value| graph.symbol(value))
+    graph.node_owner(node)
 }
 
 pub(crate) fn enrich(graph: &Graph) -> Delta {
@@ -136,7 +131,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                                ast_children: &FxHashMap<u32, Vec<(u32, Vec<graph_proto::Field>)>>|
      -> Vec<u32> {
         let in_block = graph.node_by_id.get(&node_id).is_some_and(|index|
-            graph.node_property_text(&graph.nodes[*index], "control_kind") == Some("block"));
+            graph.node_control_kind(&graph.nodes[*index]) == "block");
         let mut result: Vec<u32> = ast_children.get(&node_id).into_iter().flatten()
             .filter_map(|(child, _)| {
                 let child_node = graph.node_by_id.get(child).map(|index| &graph.nodes[*index])?;

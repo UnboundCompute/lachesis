@@ -107,6 +107,14 @@ pub(crate) struct Node {
     pub(crate) properties: Vec<graph_proto::Field>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct NodeMeta {
+    pub(crate) start_offset: i64,
+    pub(crate) end_offset: i64,
+    pub(crate) owner: Option<u32>,
+    pub(crate) control_kind: Option<u32>,
+}
+
 pub(crate) struct Edge {
     pub(crate) kind: u32,
     /// Semantic kind is resolved once at ingest (not once per traversal).
@@ -124,6 +132,10 @@ pub(crate) struct Graph {
     pub(crate) node_by_id: FxHashMap<u32, usize>,
     pub(crate) outgoing: Vec<Vec<usize>>,
     pub(crate) incoming: Vec<Vec<usize>>,
+    /// Frequently queried structural fields, indexed by node position.  The
+    /// original property vectors remain available to overlays that need richer
+    /// fields, but control-flow no longer rescans them during every sort/walk.
+    pub(crate) node_meta: Vec<NodeMeta>,
     /// Candidate edge indexes by triple.  Properties are compared only when a
     /// triple collides, matching composition's first-wins/different-properties
     /// behavior without serializing every edge during ingestion.
@@ -141,6 +153,23 @@ impl Graph {
 
     pub(crate) fn node_kind(&self, index: usize) -> &str {
         self.nodes.get(index).map_or("", |node| self.kind(node.kind))
+    }
+
+    pub(crate) fn node_position(&self, node: &Node) -> (i64, i64) {
+        self.node_by_id.get(&node.id).and_then(|index| self.node_meta.get(*index))
+            .map(|meta| (meta.start_offset, meta.end_offset))
+            .unwrap_or((i64::MAX, i64::MAX))
+    }
+
+    pub(crate) fn node_control_kind(&self, node: &Node) -> &str {
+        self.node_by_id.get(&node.id).and_then(|index| self.node_meta.get(*index))
+            .and_then(|meta| meta.control_kind)
+            .map(|symbol| self.kind(symbol)).unwrap_or("")
+    }
+
+    pub(crate) fn node_owner(&self, node: &Node) -> Option<u32> {
+        self.node_by_id.get(&node.id).and_then(|index| self.node_meta.get(*index))
+            .and_then(|meta| meta.owner)
     }
 
     pub(crate) fn node_property<'a>(
@@ -347,7 +376,7 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
 }
 
 fn finish_graph(
-    symbols: Symbols, nodes: Vec<Node>, edges: Vec<Edge>, core_content_hash: String,
+    mut symbols: Symbols, nodes: Vec<Node>, edges: Vec<Edge>, core_content_hash: String,
 ) -> Result<Graph, String> {
     let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
     for (index, node) in nodes.iter().enumerate() { node_by_id.insert(node.id, index); }
@@ -361,7 +390,33 @@ fn finish_graph(
     for (index, edge) in edges.iter().enumerate() {
         edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
     }
-    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
+    let node_meta = nodes.iter().map(|node| {
+        let text = |key: &str| node.properties.iter().find_map(|field| {
+            if field.key != key { return None; }
+            match field.value.as_ref()?.kind.as_ref()? {
+                graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+                _ => None,
+            }
+        });
+        let integer = |key: &str| node.properties.iter().find_map(|field| {
+            if field.key != key { return None; }
+            match field.value.as_ref()?.kind.as_ref()? {
+                graph_proto::value::Kind::Integer(value) => Some(*value),
+                _ => None,
+            }
+        });
+        let owner = text("owner_function_id").or_else(|| text("function_id"))
+            .and_then(|value| symbols.find(value));
+        let control_kind = text("control_kind").map(|value| symbols.intern(value.to_owned()));
+        NodeMeta {
+            start_offset: integer("start_offset").unwrap_or(i64::MAX),
+            end_offset: integer("end_offset").unwrap_or(i64::MAX),
+            owner,
+            control_kind,
+        }
+    }).collect();
+    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing, incoming,
+               node_meta, edge_lookup })
 }
 
 fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
@@ -425,25 +480,7 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
         }
     }
 
-    let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
-    for (index, node) in nodes.iter().enumerate() {
-        node_by_id.insert(node.id, index);
-    }
-    let mut outgoing = vec![Vec::new(); nodes.len()];
-    let mut incoming = vec![Vec::new(); nodes.len()];
-    for (index, edge) in edges.iter().enumerate() {
-        if let Some(source) = node_by_id.get(&edge.source) {
-            outgoing[*source].push(index);
-        }
-        if let Some(target) = node_by_id.get(&edge.target) {
-            incoming[*target].push(index);
-        }
-    }
-    let mut edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
-    for (index, edge) in edges.iter().enumerate() {
-        edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
-    }
-    Ok(Graph { core_content_hash: String::new(), symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
+    finish_graph(symbols, nodes, edges, String::new())
 }
 
 pub(crate) fn publish_dataflow_stream(
