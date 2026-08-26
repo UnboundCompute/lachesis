@@ -3,7 +3,7 @@
 //! This is intentionally independent of Kùzu.  Pass 1 has already emitted the
 //! call/parameter facts needed by these two deterministic graph algorithms.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::lifetime_proto;
 
@@ -12,18 +12,31 @@ const SEP: &str = "\u{1f}";
 fn key2(a: &str, b: &str) -> String { format!("{a}{SEP}{b}") }
 fn key3(a: &str, b: &str, c: &str) -> String { format!("{a}{SEP}{b}{SEP}{c}") }
 
+fn expression_root(expression: &str) -> String {
+    let mut value = expression.trim();
+    while let Some(rest) = value.strip_prefix(['*', '&']) { value = rest.trim_start(); }
+    let end = value.char_indices().find_map(|(index, ch)|
+        (!((ch == '_') || ch.is_ascii_alphanumeric())).then_some(index)).unwrap_or(value.len());
+    let root = &value[..end];
+    if root.is_empty() || root.chars().next().is_some_and(|ch| ch.is_ascii_digit()) { String::new() } else { root.to_owned() }
+}
+
+fn argument_root(argument: &lifetime_proto::FunctionArgument) -> String {
+    let base = if !argument.root_name.is_empty() { argument.root_name.clone() }
+        else if !argument.root.is_empty() { argument.root.trim_start_matches("decl:").to_owned() }
+        else { expression_root(&argument.expression) };
+    if base.is_empty() { return base; }
+    format!("{}{}", base, argument.selectors.join(""))
+}
+
 pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto::NativePlanResult {
     let raw_functions = request.translation.unwrap_or_default().functions;
-    let mut name_counts: HashMap<String, usize> = HashMap::new();
-    for item in &raw_functions {
-        let name = if item.name.is_empty() { &item.id } else { &item.name };
-        if !name.is_empty() { *name_counts.entry(name.clone()).or_default() += 1; }
-    }
+    let mut seen_names: HashSet<String> = HashSet::new();
     let functions: BTreeMap<String, lifetime_proto::TranslationFunction> = raw_functions
         .into_iter().filter_map(|item| {
             let base = if item.name.is_empty() { item.id.clone() } else { item.name.clone() };
             if base.is_empty() { return None; }
-            let name = if name_counts[&base] == 1 { base } else { format!("{}@{}", base, item.id) };
+            let name = if seen_names.insert(base.clone()) { base } else { format!("{}@{}", base, item.id) };
             Some((name, item))
         }).collect();
     // Calls carry the source-level callee spelling.  Resolve it only when the
@@ -33,7 +46,7 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
     let mut by_source_name: HashMap<String, String> = HashMap::new();
     for (name, item) in &functions {
         let base = if item.name.is_empty() { item.id.clone() } else { item.name.clone() };
-        if name_counts.get(&base) == Some(&1) { by_source_name.insert(base, name.clone()); }
+        by_source_name.entry(base).or_insert_with(|| name.clone());
     }
     let source_catalog: HashMap<String, String> = request.sources.into_iter()
         .map(|entry| (entry.name, if entry.kind.is_empty() { "external-input".into() } else { entry.kind }))
@@ -56,7 +69,7 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
                 callers.entry(internal_callee.clone()).or_default().insert(name.clone());
                 let mut formal_to_actual = Vec::new();
                 for arg in &call.arguments {
-                    let actual = if !arg.root_name.is_empty() { arg.root_name.clone() } else { arg.root.clone() };
+                    let actual = argument_root(arg);
                     if !actual.is_empty() && (arg.position as usize) < functions[internal_callee].parameter_names.len() {
                         formal_to_actual.push(key2(&functions[internal_callee].parameter_names[arg.position as usize], &actual));
                     }
@@ -71,7 +84,7 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
             if !call.assigned_name.is_empty() { roots.insert(call.assigned_name.clone()); }
             let mut arguments = Vec::new();
             for arg in &call.arguments {
-                let root = if !arg.root_name.is_empty() { arg.root_name.clone() } else { arg.root.clone() };
+                let root = argument_root(arg);
                 if !root.is_empty() { roots.insert(root); }
                 arguments.push(arg.position.to_string());
             }
@@ -84,6 +97,26 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         }
         callees.entry(name.clone()).or_default();
         callers.entry(name.clone()).or_default();
+    }
+    // Match CoverageScheduler's callback normalization: a callback formal can
+    // carry a function-valued actual root even when the direct call graph only
+    // records the callback parameter.  This edge affects source cones and must
+    // be present before launch roots are computed.
+    for (caller, item) in &functions {
+        for call in &item.calls {
+            let Some(callee) = by_source_name.get(&call.callee) else { continue };
+            let Some(callee_item) = functions.get(callee) else { continue };
+            for argument in &call.arguments {
+                let actual = argument_root(argument);
+                let actual = if actual.is_empty() { argument.expression.clone() } else { actual };
+                let actual = actual.trim_start_matches(['&', '*']).to_owned();
+                if (argument.position as usize) < callee_item.parameter_names.len()
+                    && functions.contains_key(&actual) && actual != *callee {
+                    callees.entry(caller.clone()).or_default().insert(actual.clone());
+                    callers.entry(actual).or_default().insert(caller.clone());
+                }
+            }
+        }
     }
 
     // Source launches are catalogued callsites; callerless functions are the
@@ -124,7 +157,7 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
                 let Some(callee_item) = functions.get(internal_callee) else { continue };
                 let caller_roots = influenced.get(caller).cloned().unwrap_or_default();
                 for arg in &call.arguments {
-                    let actual = if !arg.root_name.is_empty() { arg.root_name.clone() } else { arg.root.clone() };
+                    let actual = argument_root(arg);
                     if caller_roots.contains(&actual) && (arg.position as usize) < callee_item.parameter_names.len() {
                         let formal = callee_item.parameter_names[arg.position as usize].clone();
                         if influenced.entry(internal_callee.clone()).or_default().insert(formal) { changed = true; }
@@ -183,9 +216,10 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         for source in &sources {
             let selected: BTreeSet<String> = forward.get(source).into_iter().flat_map(|set| set.intersection(&backward)).cloned().collect();
             for function in &selected { region_functions.insert(function.clone()); state_keys.push(key2(function, source)); }
-            let contexts: Vec<String> = result_functions.iter().find(|item| &item.name == source)
+            let mut contexts: Vec<String> = result_functions.iter().find(|item| &item.name == source)
                 .map(|item| item.source_sites.iter().map(|site| if site.node.is_empty() { format!("{}@{}", site.callee, site.line) } else { site.node.clone() }).collect())
-                .unwrap_or_else(|| vec!["__entry__".into()]);
+                .unwrap_or_default();
+            if contexts.is_empty() { contexts.push("__entry__".into()); }
             for context in contexts { for function in &selected { context_keys.push(key3(function, source, &context)); } }
         }
         regions.push(lifetime_proto::NativeCoverageRegion { target: target.clone(), sources, functions: region_functions.into_iter().collect(), state_keys, context_keys });

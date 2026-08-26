@@ -6,6 +6,8 @@
 //! every transfer while preserving the existing analysis semantics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::slice;
 use std::sync::Arc;
 use prost::Message;
@@ -853,16 +855,46 @@ impl Operation {
 }
 
 fn deduplicate_shared(states: Vec<Arc<State>>) -> Vec<Arc<State>> {
-    let mut unique = Vec::with_capacity(states.len());
-    'candidate: for state in states {
-        if unique.iter().any(|existing: &Arc<State>| {
-            existing.as_ref().semantically_equal(state.as_ref())
-        }) {
-            continue 'candidate;
+    let mut unique: Vec<Arc<State>> = Vec::with_capacity(states.len());
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for state in states {
+        let fingerprint = state_fingerprint(state.as_ref());
+        let duplicate = buckets.get(&fingerprint).into_iter().flatten().any(|index| {
+            unique[*index].as_ref().semantically_equal(state.as_ref())
+        });
+        if !duplicate {
+            let index = unique.len();
+            unique.push(state);
+            buckets.entry(fingerprint).or_default().push(index);
         }
-        unique.push(state);
     }
     unique
+}
+
+/// Hash exactly the fields used by `semantically_equal`.  The hash is computed
+/// once per post-transfer deduplication batch, never after each operation.  A
+/// bucket still performs the exact equality check, so this is an optimization
+/// only and cannot alter abstract-state semantics.
+fn state_fingerprint(state: &State) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut env: Vec<_> = state.env.iter().collect();
+    env.sort_by(|left, right| left.0.cmp(right.0));
+    env.hash(&mut hasher);
+    let mut facts: Vec<_> = state.facts.iter().map(|(object, values)| {
+        let mut values: Vec<_> = values.iter().copied().collect();
+        values.sort_by_key(|value| *value as u8);
+        (object, values)
+    }).collect();
+    facts.sort_by(|left, right| left.0.cmp(right.0));
+    facts.hash(&mut hasher);
+    let mut slots: Vec<_> = state.slots.iter().collect();
+    slots.sort_by(|left, right| left.0.cmp(right.0));
+    slots.hash(&mut hasher);
+    state.trace.hash(&mut hasher);
+    let mut freed: Vec<_> = state.freed_paths.iter().collect();
+    freed.sort_by(|left, right| path_name(left.0).cmp(&path_name(right.0)));
+    freed.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn attach_joined(states: &[State], node: &str, new_oid: String,
