@@ -1200,6 +1200,37 @@ pub unsafe extern "C" fn lachesis_lifetime_temporal_path(
     }
 }
 
+/// Build a compact Rust-owned semantic event graph from the framed substrate.
+/// Only event nodes and control-flow edges are written to the output sidecar.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native semantic path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path).to_str()
+            .map_err(|error| format!("invalid semantic input path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid semantic output path: {error}"))?;
+        let bytes = fs::read(input)
+            .map_err(|error| format!("cannot read semantic substrate: {error}"))?;
+        let request = native_graph::sidecar_to_request(&bytes)?;
+        let result = prepare::semantic_request(request)?;
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, result)
+            .map_err(|error| format!("cannot write semantic result: {error}"))?;
+        fs::rename(&temporary, output)
+            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native semantic path error: {error}"); 1 }
+    }
+}
+
 /// Plan source launches, formal/actual seams, and coverage regions directly
 /// from compact translation facts and catalog entries.
 #[no_mangle]

@@ -357,3 +357,34 @@ message NativeTemporalFunction {
 message NativeTemporalResult {
   repeated NativeTemporalFunction functions = 1;
 }
+
+// Compact event graph consumed by the query/matcher layer.  It carries only
+// semantic events and control-flow relations; AST/CPG nodes and abstract
+// solver snapshots stay native.
+message NativeSemanticNode {
+  string id = 1;
+  string function = 2;
+  string event_kind = 3;
+  string object_root = 4;
+  repeated string object_selectors = 5;
+  string generation = 6;
+  sint64 line = 7;
+  bool has_line = 8;
+  string anchor = 9;
+}
+message NativeSemanticEdge {
+  string source = 1;
+  string target = 2;
+  string kind = 3;
+}
+message NativeSemanticFunction {
+  string id = 1;
+  string entry = 2;
+  repeated string exits = 3;
+  repeated NativeSemanticNode nodes = 4;
+  repeated NativeSemanticEdge edges = 5;
+}
+message NativeSemanticResult {
+  repeated NativeSemanticFunction functions = 1;
+  bool complete = 2;
+}

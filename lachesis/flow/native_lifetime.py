@@ -433,6 +433,24 @@ def temporal_path(input_path: str | os.PathLike[str],
         raise RuntimeError(f"native temporal analysis failed with status {status}")
 
 
+def semantic_path(input_path: str | os.PathLike[str],
+                  output_path: str | os.PathLike[str]):
+    """Build the compact Rust-owned semantic event graph sidecar."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = library.lachesis_lifetime_semantic_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(os.fsencode(os.fspath(input_path)),
+                      os.fsencode(os.fspath(output_path)))
+    if status != 0:
+        raise RuntimeError(f"native semantic graph failed with status {status}")
+    result = lifetime_pb2.NativeSemanticResult()
+    result.ParseFromString(Path(output_path).read_bytes())
+    return result
+
+
 def prepare_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
     """Prepare selected functions without running the lifetime fixpoint."""
     library = _load()

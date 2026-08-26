@@ -1249,6 +1249,109 @@ pub(crate) fn temporal_request(
     Ok(output)
 }
 
+fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
+    match kind {
+        crate::Kind::Alloc => "ORIGIN",
+        crate::Kind::Free => "RELEASE",
+        crate::Kind::Realloc => "INVALIDATE",
+        crate::Kind::Copy => "DERIVE",
+        crate::Kind::Use => match access {
+            "pass" => "PASS_VALUE",
+            "compare" => "COMPARE_VALUE",
+            "return" | "return-stack" => "RETURN_VALUE",
+            "pointer-arithmetic" => "POINTER_ARITHMETIC",
+            _ => "READ_STORAGE",
+        },
+        crate::Kind::Clobber => match access {
+            "uninitialized" => "UNINITIALIZED",
+            "return-null" => "RETURN_VALUE",
+            "source" => "ORIGIN",
+            _ => "DERIVE",
+        },
+        crate::Kind::Summary => "DERIVE",
+    }
+}
+
+fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Operation,
+                 path: Option<&crate::Path>, generation: &str) -> lifetime_proto::NativeSemanticNode {
+    lifetime_proto::NativeSemanticNode {
+        id,
+        function: function.to_owned(),
+        event_kind: kind.to_owned(),
+        object_root: path.map(|value| value.root.clone()).unwrap_or_default(),
+        object_selectors: path.map(|value| value.selectors.clone()).unwrap_or_default(),
+        generation: generation.to_owned(),
+        line: operation.line.unwrap_or_default(),
+        has_line: operation.line.is_some(),
+        anchor: operation.node.clone(),
+    }
+}
+
+/// Emit the compact event graph consumed by the semantic query layer.  This
+/// deliberately carries operation-derived events and CFG relations only; the
+/// original AST and solver snapshots never cross the native boundary.
+pub(crate) fn semantic_request(
+    request: lifetime_proto::PrepareRequest,
+) -> Result<Vec<u8>, String> {
+    let prepared = prepare_functions(request.functions)?;
+    let functions = prepared.into_iter().map(|function| {
+        let id = function.id.clone();
+        let mut nodes = Vec::new();
+        let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
+        for (index, raw) in function.operations.iter().cloned().enumerate() {
+            let operation = crate::proto_operation(raw)?;
+            let path = operation.target.as_ref();
+            let generation = operation.generation.as_deref().unwrap_or("g0");
+            let kinds: Vec<&str> = match operation.kind {
+                crate::Kind::Alloc => vec!["ALLOC_ATTEMPT", "ORIGIN"],
+                crate::Kind::Realloc => vec!["REALLOC_ATTEMPT", "INVALIDATE", "ORIGIN"],
+                crate::Kind::Clobber if operation.access == "return-null" =>
+                    vec!["RETURN_VALUE", "RETURN"],
+                _ => vec![semantic_event_kind(operation.kind, &operation.access)],
+            };
+            for (ordinal, kind) in kinds.into_iter().enumerate() {
+                let node_id = format!("native:{}:{}:{}:{}", id, operation.node, index, ordinal);
+                let event = semantic_node(node_id.clone(), &id, kind, &operation, path, generation);
+                by_anchor.entry(operation.node.clone()).or_default().push(node_id);
+                nodes.push(event);
+            }
+        }
+        let mut edges = Vec::new();
+        for successor in &function.successors {
+            let Some(source_nodes) = by_anchor.get(&successor.node) else { continue };
+            let source = source_nodes.last().cloned().unwrap_or_default();
+            for target_anchor in &successor.targets {
+                if let Some(target_nodes) = by_anchor.get(target_anchor) {
+                    if let Some(target) = target_nodes.first() {
+                        edges.push(lifetime_proto::NativeSemanticEdge {
+                            source: source.clone(), target: target.clone(), kind: "normal".into(),
+                        });
+                    }
+                }
+            }
+        }
+        for node_ids in by_anchor.values() {
+            for pair in node_ids.windows(2) {
+                edges.push(lifetime_proto::NativeSemanticEdge {
+                    source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(),
+                });
+            }
+        }
+        let entry = function.nodes.iter().find_map(|node| by_anchor.get(node)
+            .and_then(|ids| ids.first()).cloned()).unwrap_or_default();
+        let exits = function.nodes.iter().filter(|node|
+            function.successors.iter().any(|item| item.node == **node && item.targets.is_empty())
+                || function.successors.iter().all(|item| item.node != **node))
+            .filter_map(|node| by_anchor.get(node).and_then(|ids| ids.last()).cloned())
+            .collect();
+        Ok(lifetime_proto::NativeSemanticFunction { id, entry, exits, nodes, edges })
+    }).collect::<Result<Vec<_>, String>>()?;
+    let mut output = Vec::new();
+    lifetime_proto::NativeSemanticResult { functions, complete: true }
+        .encode(&mut output).map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
 fn prepare_functions(
     functions: Vec<lifetime_proto::FunctionInput>,
 ) -> Result<Vec<lifetime_proto::PreparedFunction>, String> {
