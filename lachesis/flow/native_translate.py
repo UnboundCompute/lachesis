@@ -516,6 +516,25 @@ def build_native_semantic_graph(store, lang="c"):
     return _decode_native_semantic_result(result, lang)
 
 
+def native_semantic_capable(store, languages=None) -> bool:
+    """Whether this store has the complete binary inputs for native Pass 2.
+
+    This is a capability check, not a feature switch.  Fresh native Pass-1
+    stores carry translation facts and the path-only substrate; older stores
+    fall back to the compatibility Python pipeline.  Keeping the check here
+    makes the production decision identical for the CLI and SDK callers.
+    """
+    index = getattr(store, "index", None)
+    base = (getattr(index, "_pass3_cache_base", None)
+            or getattr(index, "_db_dir", None))
+    if not base:
+        return False
+    if languages is not None and set(languages) - {"c"}:
+        return False
+    return (translation_facts_path(base).is_file()
+            and pass2_input_cache_path(base).is_file())
+
+
 def ensure_native_semantic_sidecar(store):
     """Create the Rust semantic sidecar without decoding it in Python."""
     base = (getattr(store.index, "_pass3_cache_base", None)

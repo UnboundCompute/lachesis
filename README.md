@@ -91,6 +91,10 @@ The core-only build also avoids token/proof compiler passes whose output is remo
 are persisted as protobuf sidecars, so `lachesis enrich graph.kuzu` consumes the same
 Pass-1 output without rebuilding the frontends. The optional `--stream-shards DIR`
 form remains available when the intermediate shard directory must be retained.
+When the native binary inputs are present, `enrich` hands their paths directly to
+the Rust Pass-2 engine and retains only its compact event sidecar; it does not
+rebuild the whole Pass-1 graph as Python objects. Older stores without these
+sidecars use the compatibility path.
 
 **Library** — a warm session: open (or build) once, ask many times, nothing recomputed
 between questions.

@@ -399,35 +399,14 @@ class Analysis:
         from lachesis.planner.temporal_obligation import merge_semantic_nodes
 
         stamped, summary = self._structural_bind()
-        # Experimental native temporal seam.  Rust owns substrate decoding and
-        # lifetime solving; only compact findings are retained in the bind
-        # sidecar.  Keep this disabled until its candidate coverage is proven
-        # equivalent to the semantic graph path.
-        if os.environ.get("LACHESIS_NATIVE_TEMPORAL") == "1":
-            from lachesis.flow.native_translate import build_native_temporal
-            native = build_native_temporal(self.store)
-            if native is not None:
-                stamped["native_temporal"] = {
-                    "functions": [{
-                        "id": item.id,
-                        "findings": [{
-                            "function": finding.function,
-                            "pattern": finding.pattern,
-                            "path": {
-                                "root": finding.path.root if finding.path else "",
-                                "selectors": list(finding.path.selectors) if finding.path else [],
-                            },
-                            "line": finding.line if finding.has_line else None,
-                            "node": finding.node,
-                        } for finding in item.findings],
-                        "transfers": item.transfers,
-                        "widenings": item.widenings,
-                        "capped": item.capped,
-                    } for item in native.functions],
-                }
-                complete = not any(item.capped for item in native.functions)
-                return stamped, summary, complete
-        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+        # Fresh native Pass-1 stores already have the complete binary substrate
+        # required by Rust's path-only semantic stage.  Use it by capability,
+        # without an environment flag, and retain the old path for stores built
+        # before the native sidecars existed.
+        from lachesis.flow.native_translate import native_semantic_capable
+        native_semantic = native_semantic_capable(
+            self.store, languages=summary.get("languages"))
+        if native_semantic or os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
             from lachesis.flow.native_translate import ensure_native_semantic_sidecar
             sidecar = ensure_native_semantic_sidecar(self.store)
             if sidecar is not None:
@@ -452,7 +431,7 @@ class Analysis:
         # one result.  The catalog language list is a list of model families,
         # not a request to rerun that whole-graph flow once per language.  Keep
         # the per-language loop for the compatibility renderer only.
-        languages = (("c",) if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1"
+        languages = (("c",) if native_semantic
                      else (summary.get("languages") or ("c",)))
         for language in languages:
             flow_started = perf_counter()
@@ -468,7 +447,7 @@ class Analysis:
                 complete = False
             semantic = flow.get("semantic_graph")
             if semantic is not None:
-                if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+                if native_semantic:
                     native_semantic_graph = semantic
                 else:
                     merge_semantic_nodes(semantic_nodes, semantic, language)
