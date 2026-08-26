@@ -48,6 +48,30 @@ fn scalar(node: &graph_proto::NodeRecord, key: &str) -> Option<String> {
 
 fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::ScalarProperty> {
     node.properties.iter().filter_map(|field| {
+        // The lifetime preparer only consumes these substrate attributes.  Do
+        // not copy the rest of the frontend's arbitrary property bag into the
+        // graph-sized native request: on large inputs that otherwise creates a
+        // second allocation for every scalar field before preparation starts.
+        // Keep this allow-list in sync with text_property/integer_property in
+        // prepare.rs and the call extraction in native_graph.rs.
+        if !matches!(field.key.as_str(),
+            "syntax_kind" |
+            "start_offset" |
+            "start_line" |
+            "operator" |
+            "type" |
+            "owner_function_id" |
+            "function_id" |
+            "primary_target_id" |
+            "callee" |
+            "receiver" |
+            "is_alloc" |
+            "is_release" |
+            "is_realloc" |
+            "is_aggregate_copy"
+        ) {
+            return None;
+        }
         let value = field.value.as_ref()?.kind.as_ref()?;
         let value = match value {
             graph_proto::value::Kind::Text(value) =>
