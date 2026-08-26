@@ -120,35 +120,27 @@ pub(crate) fn sidecar_to_request_selected(
 fn sidecar_to_request_with_selection(
     input: &[u8], selected_ids: Option<&HashSet<String>>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    let (owners, function_names, call_ids, edges_by_source) =
-        scan_lifetime_metadata(input, selected_ids)?;
+    let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
+    let mut call_nodes: Vec<(String, String)> = Vec::new();
+    let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(
+        input, selected_ids, |item| {
+            let item_id = item.id.clone();
+            let Some(function) = owner(&item) else { return };
+            if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
+            let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+            let entry = functions.entry(function.clone()).or_insert_with(||
+                lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
+            if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
+            entry.nodes.push(node(&item));
+            if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
+                call_nodes.push((function, item_id));
+            }
+        },
+    )?;
     let parents: HashMap<String, String> = edges_by_source.values().flatten()
         .filter(|item| item.kind == "AST_CHILD" && call_ids.contains(&item.target))
         .map(|item| (item.target.clone(), item.source.clone()))
         .collect();
-    let parent_ids: HashSet<String> = parents.values().cloned().collect();
-    let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
-    let mut call_nodes: Vec<(String, lifetime_proto::GraphNode)> = Vec::new();
-    let mut parent_nodes: HashMap<String, lifetime_proto::GraphNode> = HashMap::new();
-    scan_lifetime_nodes(input, |item| {
-        let item_id = item.id.clone();
-        if let Some(function) = owner(&item) {
-            if selected_ids.is_some_and(|selected| !selected.contains(&function)) {
-                return;
-            }
-            let entry = functions.entry(function.clone()).or_insert_with(||
-                lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
-            let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
-            if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
-            entry.nodes.push(node(&item));
-            if call_ids.contains(&item_id) {
-                call_nodes.push((function, node(&item)));
-            }
-        }
-        if parent_ids.contains(&item_id) {
-            parent_nodes.insert(item_id, node(&item));
-        }
-    })?;
     for edges in edges_by_source.values() {
         for item in edges {
             let source_owner = owners.get(&item.source);
@@ -161,8 +153,12 @@ fn sidecar_to_request_with_selection(
     // Calls are part of the graph contract, not a Python-side projection.  The
     // frontend has already persisted the canonical lifecycle classification;
     // Rust only links arguments and assignment destinations using AST edges.
-    for (function, item) in call_nodes {
-        let Some(entry) = functions.get_mut(&function) else { continue };
+    let node_lookup: HashMap<&str, &lifetime_proto::GraphNode> = functions.values()
+        .flat_map(|input| input.nodes.iter().map(|item| (item.id.as_str(), item)))
+        .collect();
+    let mut built_calls = Vec::with_capacity(call_nodes.len());
+    for (function, item_id) in call_nodes {
+        let Some(item) = node_lookup.get(item_id.as_str()).copied() else { continue };
         let mut call = lifetime_proto::FunctionCall {
             node: item.id.clone(),
             callee: input_scalar(&item, "primary_target_id")
@@ -183,7 +179,7 @@ fn sidecar_to_request_with_selection(
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
-        let parent = parents.get(&item.id).and_then(|id| parent_nodes.get(id));
+        let parent = parents.get(&item.id).and_then(|id| node_lookup.get(id.as_str()).copied());
         if let Some(parent) = parent {
             let parent_kind = input_scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
             if parent_kind == "BinaryOperator" && input_scalar(parent, "operator").as_deref() == Some("=") {
@@ -217,7 +213,12 @@ fn sidecar_to_request_with_selection(
         }).collect::<Vec<_>>();
         arguments.sort_by_key(|argument| argument.position);
         call.arguments = arguments;
-        entry.calls.push(call);
+        built_calls.push((function, call));
+    }
+    for (function, call) in built_calls {
+        if let Some(entry) = functions.get_mut(&function) {
+            entry.calls.push(call);
+        }
     }
     // Build the first native interprocedural summary lattice.  These effects
     // are deliberately expressed in formal-parameter positions, which is the
@@ -406,27 +407,10 @@ fn lifetime_edge(edge: &CompactEdge) -> lifetime_proto::GraphEdge {
     }
 }
 
-fn scan_lifetime_nodes<F>(input: &[u8], mut on_node: F) -> Result<(), String>
-where
-    F: FnMut(graph_proto::NodeRecord),
-{
-    let mut offset = 0;
-    let header = frame(input, &mut offset)?;
-    let _: graph_proto::Document = graph_proto::Document::decode(header)
-        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    while offset < input.len() {
-        let payload = frame(input, &mut offset)?;
-        if payload.first() == Some(&b'N') {
-            on_node(graph_proto::NodeRecord::decode(&payload[1..])
-                .map_err(|error| format!("invalid graph node frame: {error}"))?);
-        }
-    }
-    Ok(())
-}
-
 fn scan_lifetime_metadata(
     input: &[u8],
     selected_ids: Option<&HashSet<String>>,
+    mut on_node: impl FnMut(graph_proto::NodeRecord),
 ) -> Result<(
     HashMap<String, String>,
     HashMap<String, String>,
@@ -457,8 +441,9 @@ fn scan_lifetime_metadata(
                     function_names.insert(item.id.clone(), item.label.clone());
                 }
                 if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
-                    call_ids.insert(item.id);
+                    call_ids.insert(item.id.clone());
                 }
+                on_node(item);
             }
             b'E' => {
                 let item = graph_proto::EdgeRecord::decode(&payload[1..])
