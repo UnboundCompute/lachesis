@@ -1,7 +1,7 @@
 use clang_sys::*;
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
@@ -53,6 +53,17 @@ fn stable_id(kind: &str, file: &str, offset: u32, end: u32, spelling: &str) -> S
     format!("v2:frontend:clang-c:{kind}:{}", &hex[..20])
 }
 
+fn stable_id_parts(kind: &str, parts: &[String]) -> String {
+    let raw = parts.join("\0");
+    let mut digest = Sha256::new();
+    digest.update(b"v2\0frontend\0clang-c\0");
+    digest.update(kind.as_bytes());
+    digest.update(b"\0");
+    digest.update(raw.as_bytes());
+    let hex = format!("{:x}", digest.finalize());
+    format!("v2:frontend:clang-c:{kind}:{}", &hex[..20])
+}
+
 unsafe fn cx_string(value: CXString) -> String {
     let pointer = clang_getCString(value);
     let result = if pointer.is_null() {
@@ -74,7 +85,12 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32) {
     let filename = if file.is_null() {
         String::new()
     } else {
-        cx_string(clang_getFileName(file))
+        let raw = cx_string(clang_getFileName(file));
+        PathBuf::from(&raw)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(raw))
+            .to_string_lossy()
+            .into_owned()
     };
 
     let extent = clang_getCursorExtent(cursor);
@@ -100,6 +116,8 @@ struct Emitter {
     edge_ids: HashSet<(String, String, String)>,
     node_count: u64,
     edge_count: u64,
+    file_ids: HashMap<String, String>,
+    root_files: HashSet<String>,
 }
 
 impl Emitter {
@@ -123,6 +141,42 @@ impl Emitter {
     }
 }
 
+fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
+    let absolute = Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path));
+    let absolute_text = absolute.to_string_lossy().into_owned();
+    let display = Path::new(&absolute_text)
+        .strip_prefix(source_dir)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| absolute_text.clone());
+    let bytes = fs::read(&absolute).unwrap_or_default();
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    let content_hash = format!("{:x}", digest.finalize());
+    let lines = bytes.iter().filter(|byte| **byte == b'\n').count() as i64
+        + if !bytes.is_empty() && !bytes.ends_with(b"\n") { 1 } else { 0 };
+    let id = stable_id_parts("file", &[absolute_text.clone()]);
+    emitter.file_ids.insert(absolute_text.clone(), id.clone());
+    emitter.node(graph::NodeRecord {
+        id,
+        kind: "file".to_owned(),
+        label: display.clone(),
+        properties: vec![
+            field("file", text(&display)),
+            field("absolute_file", text(&absolute_text)),
+            field("content_hash", text(&content_hash)),
+            field("lines", integer(lines)),
+            field("language", text("c")),
+            field("provenance", text("project-root")),
+            field("is_external", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
+            field("is_system", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
+            field("included_because", text("project-root")),
+        ],
+        tier: "T0".to_owned(),
+    })
+}
+
 extern "C" fn visit(cursor: CXCursor, parent: CXCursor, data: CXClientData) -> CXChildVisitResult {
     unsafe {
         let emitter = &mut *(data as *mut Emitter);
@@ -135,46 +189,156 @@ extern "C" fn visit(cursor: CXCursor, parent: CXCursor, data: CXClientData) -> C
 }
 
 unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
-    let kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
+    let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
     let (file, line, column, offset, end_offset) = cursor_file(cursor);
-    if file.is_empty() {
+    if file.is_empty() || (!emitter.root_files.is_empty() && !emitter.root_files.contains(&file)) {
         return Ok(());
     }
-    let id = stable_id(&kind, &file, offset, end_offset, &spelling);
-    let properties = vec![
+
+    let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
+        "FunctionDecl" => Some("function"),
+        "RecordDecl" => Some("record"),
+        "EnumDecl" => Some("enum"),
+        "TypedefDecl" => Some("type"),
+        "ParmVarDecl" => Some("parameter"),
+        "VarDecl" => Some("variable"),
+        "FieldDecl" => Some("property"),
+        "EnumConstantDecl" => Some("constant"),
+        _ => None,
+    } {
+        let id_kind = if matches!(syntax_kind.as_str(), "ParmVarDecl" | "VarDecl" | "FieldDecl" | "EnumConstantDecl") {
+            "value"
+        } else {
+            mapped_kind
+        };
+        (
+            mapped_kind.to_owned(),
+            if id_kind == "value" { "T2" } else { "T1" }.to_owned(),
+            stable_id(id_kind, &file, offset, end_offset, &spelling),
+        )
+    } else if syntax_kind == "CallExpr"
+        || syntax_kind.ends_with("Stmt")
+        || syntax_kind.ends_with("Expr")
+        || syntax_kind.ends_with("Operator")
+        || matches!(syntax_kind.as_str(), "IntegerLiteral" | "StringLiteral" | "CharacterLiteral")
+    {
+        (
+            if syntax_kind == "CallExpr" { "call" } else if syntax_kind.ends_with("Stmt") { "statement" } else { "expression" }.to_owned(),
+            "T3".to_owned(),
+            stable_id("body", &file, offset, end_offset, &syntax_kind),
+        )
+    } else {
+        return Ok(());
+    };
+
+    let type_spelling = cx_string(clang_getTypeSpelling(clang_getCursorType(cursor)));
+    let mut properties = vec![
         field("file", text(&file)),
         field("absolute_file", text(&file)),
         field("start_offset", integer(offset as i64)),
         field("end_offset", integer(end_offset as i64)),
         field("start_line", integer(line as i64)),
         field("start_column", integer(column as i64)),
-        field("syntax_kind", text(&kind)),
+        field("syntax_kind", text(&syntax_kind)),
+        field("type", text(&type_spelling)),
     ];
+    if syntax_kind == "CallExpr" {
+        let referenced = clang_getCursorReferenced(cursor);
+        if clang_is_null(referenced) == 0 {
+            let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
+            let target_name = cx_string(clang_getCursorSpelling(referenced));
+            let (target_file, _, _, target_offset, target_end) = cursor_file(referenced);
+            if !target_file.is_empty() {
+                let target_id_kind = match target_kind.as_str() {
+                    "FunctionDecl" => Some("function"),
+                    "VarDecl" | "ParmVarDecl" | "FieldDecl" => Some("value"),
+                    _ => None,
+                };
+                if let Some(target_id_kind) = target_id_kind {
+                    let target_id = stable_id(target_id_kind, &target_file, target_offset, target_end, &target_name);
+                    properties.push(field("callee", text(&target_name)));
+                    properties.push(field("primary_target_id", text(&target_id)));
+                    properties.push(field("resolution", text("exact")));
+                    emitter.edge(graph::EdgeRecord {
+                        kind: "INVOKES".to_owned(),
+                        source: id.clone(),
+                        target: target_id,
+                        properties: Vec::new(),
+                        source_tier: tier.clone(),
+                        relationship_class: "INVOKES".to_owned(),
+                    })?;
+                }
+            }
+        }
+    }
     emitter.node(graph::NodeRecord {
         id: id.clone(),
-        kind: kind.clone(),
-        label: if spelling.is_empty() { kind.clone() } else { spelling },
+        kind: node_kind.clone(),
+        label: if spelling.is_empty() { syntax_kind.clone() } else { spelling },
         properties,
-        tier: "T1".to_owned(),
+        tier: tier.clone(),
     })?;
 
-    let parent_file = cursor_file(parent).0;
-    if !parent_file.is_empty() {
-        let parent_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(parent)));
-        let parent_spelling = cx_string(clang_getCursorSpelling(parent));
-        let (_, _, _, parent_offset, parent_end) = cursor_file(parent);
-        let parent_id = stable_id(&parent_kind, &parent_file, parent_offset, parent_end, &parent_spelling);
+    let (parent_file, _parent_line, _parent_column, parent_offset, parent_end) = cursor_file(parent);
+    let parent_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(parent)));
+    let parent_spelling = cx_string(clang_getCursorSpelling(parent));
+    if let Some((_parent_kind, parent_tier, parent_id)) = cursor_identity(
+        &parent_kind, &parent_file, parent_offset, parent_end, &parent_spelling,
+    ) {
+        let edge_kind = if node_kind == "function" || node_kind == "record" || node_kind == "enum" || node_kind == "type" {
+            "DECLARES"
+        } else if node_kind == "parameter" || node_kind == "variable" || node_kind == "property" || node_kind == "constant" {
+            "DECLARES_VALUE"
+        } else if tier == "T3" && parent_tier == "T1" {
+            "CONTAINS_BODY"
+        } else {
+            "AST_CHILD"
+        };
         emitter.edge(graph::EdgeRecord {
-            kind: "AST_CHILD".to_owned(),
+            kind: edge_kind.to_owned(),
             source: parent_id,
             target: id,
             properties: Vec::new(),
-            source_tier: "T1".to_owned(),
-            relationship_class: "AST_CHILD".to_owned(),
+            source_tier: parent_tier,
+            relationship_class: edge_kind.to_owned(),
+        })?;
+    } else if let Some(file_id) = emitter.file_ids.get(&file) {
+        let edge_kind = if tier == "T3" { "CONTAINS_BODY" } else if node_kind == "parameter" || node_kind == "variable" || node_kind == "property" || node_kind == "constant" { "DECLARES_VALUE" } else { "DECLARES" };
+        emitter.edge(graph::EdgeRecord {
+            kind: edge_kind.to_owned(), source: file_id.clone(), target: id,
+            properties: Vec::new(), source_tier: "T0".to_owned(), relationship_class: edge_kind.to_owned(),
         })?;
     }
     Ok(())
+}
+
+unsafe fn clang_is_null(cursor: CXCursor) -> c_int {
+    (clang_sys::clang_equalCursors(cursor, clang_sys::clang_getNullCursor()) != 0) as c_int
+}
+
+fn cursor_identity(
+    syntax_kind: &str, file: &str, offset: u32, end_offset: u32, spelling: &str,
+) -> Option<(String, String, String)> {
+    if file.is_empty() {
+        return None;
+    }
+    let (kind, tier, id_kind) = match syntax_kind {
+        "FunctionDecl" => ("function", "T1", "function"),
+        "RecordDecl" => ("record", "T1", "record"),
+        "EnumDecl" => ("enum", "T1", "enum"),
+        "TypedefDecl" => ("type", "T1", "type"),
+        "ParmVarDecl" => ("parameter", "T2", "value"),
+        "VarDecl" => ("variable", "T2", "value"),
+        "FieldDecl" => ("property", "T2", "value"),
+        "EnumConstantDecl" => ("constant", "T2", "value"),
+        "CallExpr" => ("call", "T3", "body"),
+        value if value.ends_with("Stmt") => ("statement", "T3", "body"),
+        value if value.ends_with("Expr") || value.ends_with("Operator") => ("expression", "T3", "body"),
+        "IntegerLiteral" | "StringLiteral" | "CharacterLiteral" => ("expression", "T3", "body"),
+        _ => return None,
+    };
+    Some((kind.to_owned(), tier.to_owned(), stable_id(id_kind, file, offset, end_offset, spelling)))
 }
 
 fn write_manifests(output: &Path, frontend_id: &str, node_count: u64, edge_count: u64) -> io::Result<()> {
@@ -277,7 +441,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             edge_ids: HashSet::new(),
             node_count: 0,
             edge_count: 0,
+            file_ids: HashMap::new(),
+            root_files: HashSet::new(),
         };
+        if let Some(request) = request.as_ref() {
+            emitter.root_files.extend(request.translation_units.iter().map(|unit| {
+                PathBuf::from(&unit.path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&unit.path))
+                    .to_string_lossy()
+                    .into_owned()
+            }));
+            for unit in &request.translation_units {
+                let path = PathBuf::from(&unit.path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&unit.path));
+                let path_text = path.to_string_lossy().into_owned();
+                emit_file_node(&mut emitter, &path_text, &request.source_dir)?;
+            }
+        } else {
+            let path = PathBuf::from(&arguments[1])
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
+            let path_text = path.to_string_lossy().into_owned();
+            emitter.root_files.insert(path_text.clone());
+            let source_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy();
+            emit_file_node(&mut emitter, &path_text, &source_dir)?;
+        }
         if let Some(request) = request {
             if request.translation_units.is_empty() {
                 clang_disposeIndex(index);
