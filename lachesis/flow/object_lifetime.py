@@ -926,7 +926,7 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
     does not rebuild graph nodes, CFGs, calls, or operations in Python.
     """
     from lachesis.nav.dataflow.substrate import substrate_cache_path
-    from .native_lifetime import (decode_prepared_result, prepared_operations,
+    from .native_lifetime import (decode_prepared_result_light, prepared_operations,
                                   solve_selected_graph_pb)
 
     base = (getattr(analysis_index, "_pass3_cache_base", None)
@@ -980,7 +980,10 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
         if item is None or item.prepared is None or item.result is None:
             cfg_failures[name] = "native-no-result"
             continue
-        summary, analysis = decode_prepared_result(item)
+        # Whole-graph native results contain millions of abstract-state snapshots.
+        # The native metadata emitter does not consume them, so do not reconstruct
+        # those snapshots as Python objects here; retain only findings and counters.
+        summary, analysis = decode_prepared_result_light(item)
         summaries[name] = summary
         artifacts[name] = analysis
         # Rust has already prepared the complete local operation stream for

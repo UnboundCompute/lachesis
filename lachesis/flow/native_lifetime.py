@@ -417,6 +417,35 @@ def decode_prepared_result(item: lifetime_pb2.PreparedFunctionResult):
     return _decode_result(item.result, prepared.nodes, operations)
 
 
+def decode_prepared_result_light(item: lifetime_pb2.PreparedFunctionResult):
+    """Decode only findings/counters for the native whole-graph production path.
+
+    The native result also contains every abstract-state snapshot.  Rebuilding those
+    snapshots as Python ``AbstractState`` objects defeats the binary boundary and can
+    multiply memory on large graphs.  Native metadata emission does not consume those
+    snapshots, so keep the full decoder available for the linear compatibility path
+    and use this bounded decoder for whole-graph results.
+    """
+    prepared = item.prepared
+    operations = prepared_operations(prepared)
+    result = item.result
+    node_ids = set(prepared.nodes)
+    placed = {operation for operation in operations if operation.node in node_ids}
+    unplaced = tuple(operation for operation in operations if operation not in placed)
+    analysis = AnalysisResult(
+        findings={Finding(
+            finding.pattern, finding.line if finding.has_line else None,
+            AccessPath(finding.path.root, tuple(finding.path.selectors)), finding.node,
+        ) for finding in result.findings if finding.path is not None},
+        exit_states=(),
+        unplaced=unplaced,
+        transfers=int(result.transfers),
+        widenings=int(result.widenings),
+        capped=bool(result.capped),
+    )
+    return (), analysis
+
+
 def prepare_and_solve_pb(functions) -> dict[str, lifetime_pb2.Result]:
     """Run native preparation and lifetime solving in one binary call."""
     request = lifetime_pb2.PrepareRequest()
@@ -639,7 +668,8 @@ def _decode_result(result, nodes, operations):
     exit_states = tuple(_snapshot_message(snapshot, memo) for snapshot in result.exit_states)
     exit_state = (exit_states[0] if exit_states else
                   _snapshot_message(result.exit_state, memo))
-    placed = {operation for operation in operations if operation.node in set(nodes)}
+    node_ids = set(nodes)
+    placed = {operation for operation in operations if operation.node in node_ids}
     unplaced = tuple(operation for operation in operations if operation not in placed)
     analysis = AnalysisResult(
         findings={Finding(
