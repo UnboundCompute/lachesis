@@ -366,7 +366,8 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
     let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
     let mut arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut has_arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    let mut language = None;
+    let mut language: Option<&str> = None;
+    let mut mixed_languages = false;
     while let Some(mut payload) = framed_record(&mut reader)? {
         if payload.is_empty() { continue; }
         let tag = payload.remove(0);
@@ -374,11 +375,16 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             b'N' => {
                 let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
                     .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
-                if language.is_none() {
-                    language = if node.id.contains(":clang-c:") { Some("c") }
-                        else if node.id.contains(":cpython-ast:") { Some("python") }
-                        else if node.id.contains(":typescript-compiler-api:") { Some("typescript") }
-                        else { None };
+                let node_language = if node.id.contains(":clang-c:") { Some("c") }
+                    else if node.id.contains(":cpython-ast:") { Some("python") }
+                    else if node.id.contains(":typescript-compiler-api:") { Some("typescript") }
+                    else { None };
+                if let Some(current) = node_language {
+                    if let Some(previous) = language {
+                        mixed_languages |= previous != current;
+                    } else if !mixed_languages {
+                        language = Some(current);
+                    }
                 }
                 if node.kind == "call" || node.kind == "construct" {
                     calls.push(node);
@@ -443,7 +449,8 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             arg_value_ids: args.into_iter().map(|(_, id)| id).collect(),
         })
     }).collect();
-    Ok(Index { language: language.map(str::to_owned), source: Some(path.display().to_string()), callsites })
+    Ok(Index { language: if mixed_languages { None } else { language.map(str::to_owned) },
+              source: Some(path.display().to_string()), callsites })
 }
 
 fn load_models_path(path: &Path) -> Result<Vec<Model>, String> {

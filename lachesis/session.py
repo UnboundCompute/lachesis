@@ -247,7 +247,8 @@ class Analysis:
             # 0.1s standalone adapter call into ~30s on the cold full-graph path.
             projection = projection_fn()
             compact, summary = atropos_enrich(
-                projection, complete_dataflow=False, compact_structural=True,
+                projection, complete_dataflow=False,
+                symbol_index_source=index, compact_structural=True,
             )
             delta_nodes = [
                 node for node in compact.get("nodes", ())

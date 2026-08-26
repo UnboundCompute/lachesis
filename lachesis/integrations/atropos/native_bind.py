@@ -66,7 +66,7 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
 
 
 def bind_path(input_path: str | os.PathLike[str], catalog_path: str | os.PathLike[str],
-              output_path: str | os.PathLike[str]) -> None:
+              output_path: str | os.PathLike[str]) -> dict[str, Any]:
     """Bind a framed Pass-1 substrate without constructing a Python callsite index.
 
     This is the path-only boundary used by the native Pass-2 engine. Rust scans the
@@ -83,57 +83,13 @@ def bind_path(input_path: str | os.PathLike[str], catalog_path: str | os.PathLik
                       os.fsencode(os.fspath(output_path)))
     if status != 0:
         raise RuntimeError(f"native Atropos path bind failed with status {status}")
+    report = atropos_pb2.Report()
+    report.ParseFromString(Path(output_path).read_bytes())
+    return _report_dict(report)
 
 
-def bind_all(models: list[dict[str, Any]], index: dict[str, Any]) -> dict[str, Any]:
-    """Bind models with Rust over typed protobuf; no JSON crosses the ABI."""
-    library = _load()
-    if library is None:
-        candidates = ", ".join(str(path) for path in _library_candidates())
-        raise RuntimeError(
-            "Rust Atropos binder is unavailable; build native/lifetime_kernel "
-            f"or set LACHESIS_NATIVE_ATROPOS_LIB (checked: {candidates})"
-        )
-    request = atropos_pb2.Request()
-    for model in models:
-        encoded = request.models.add()
-        encoded.id = model.get("id") or ""
-        encoded.language = model.get("language") or ""
-        encoded.method = model.get("method") or ""
-        encoded.package = model.get("package") or ""
-        encoded.receiver_type = model.get("type") or ""
-        if model.get("arity") is not None:
-            encoded.arity = int(model["arity"])
-            encoded.has_arity = True
-        encoded.access_path = model.get("access_path") or ""
-        encoded.role = model.get("role") or ""
-    request.index.language = index.get("language") or ""
-    request.index.source = index.get("source") or ""
-    for callsite in index.get("callsites", ()):
-        encoded = request.index.callsites.add(id=callsite.get("id") or "")
-        callee = callsite.get("callee") or {}
-        encoded.callee.name = callee.get("name") or ""
-        encoded.callee.module = callee.get("module") or ""
-        encoded.callee.receiver_type = callee.get("receiver_type") or ""
-        if callee.get("arity") is not None:
-            encoded.callee.arity = int(callee["arity"])
-            encoded.callee.has_arity = True
-        encoded.call_value_id = callsite.get("call_value_id") or ""
-        encoded.receiver_value_id = callsite.get("receiver_value_id") or ""
-        encoded.arg_value_ids.extend(callsite.get("arg_value_ids") or ())
-    payload = request.SerializeToString()
-    request_buffer = ctypes.create_string_buffer(payload)
-    output_length = ctypes.c_size_t()
-    pointer = library.lachesis_atropos_bind_pb(
-        ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
-        ctypes.byref(output_length))
-    if not pointer or not output_length.value:
-        raise RuntimeError("native Atropos binder returned a null pointer")
-    try:
-        report = atropos_pb2.Report()
-        report.ParseFromString(ctypes.string_at(pointer, output_length.value))
-    finally:
-        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+def _report_dict(report) -> dict[str, Any]:
+    """Project a decoded native report without reconstructing its input index."""
     summary = report.summary
     result = {
         "format": report.format, "version": report.version,
@@ -186,3 +142,55 @@ def bind_all(models: list[dict[str, Any]], index: dict[str, Any]) -> dict[str, A
             converted["detail"] = row.detail
         result["results"].append(converted)
     return result
+
+
+def bind_all(models: list[dict[str, Any]], index: dict[str, Any]) -> dict[str, Any]:
+    """Bind models with Rust over typed protobuf; no JSON crosses the ABI."""
+    library = _load()
+    if library is None:
+        candidates = ", ".join(str(path) for path in _library_candidates())
+        raise RuntimeError(
+            "Rust Atropos binder is unavailable; build native/lifetime_kernel "
+            f"or set LACHESIS_NATIVE_ATROPOS_LIB (checked: {candidates})"
+        )
+    request = atropos_pb2.Request()
+    for model in models:
+        encoded = request.models.add()
+        encoded.id = model.get("id") or ""
+        encoded.language = model.get("language") or ""
+        encoded.method = model.get("method") or ""
+        encoded.package = model.get("package") or ""
+        encoded.receiver_type = model.get("type") or ""
+        if model.get("arity") is not None:
+            encoded.arity = int(model["arity"])
+            encoded.has_arity = True
+        encoded.access_path = model.get("access_path") or ""
+        encoded.role = model.get("role") or ""
+    request.index.language = index.get("language") or ""
+    request.index.source = index.get("source") or ""
+    for callsite in index.get("callsites", ()):
+        encoded = request.index.callsites.add(id=callsite.get("id") or "")
+        callee = callsite.get("callee") or {}
+        encoded.callee.name = callee.get("name") or ""
+        encoded.callee.module = callee.get("module") or ""
+        encoded.callee.receiver_type = callee.get("receiver_type") or ""
+        if callee.get("arity") is not None:
+            encoded.callee.arity = int(callee["arity"])
+            encoded.callee.has_arity = True
+        encoded.call_value_id = callsite.get("call_value_id") or ""
+        encoded.receiver_value_id = callsite.get("receiver_value_id") or ""
+        encoded.arg_value_ids.extend(callsite.get("arg_value_ids") or ())
+    payload = request.SerializeToString()
+    request_buffer = ctypes.create_string_buffer(payload)
+    output_length = ctypes.c_size_t()
+    pointer = library.lachesis_atropos_bind_pb(
+        ctypes.cast(request_buffer, ctypes.c_void_p), len(payload),
+        ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native Atropos binder returned a null pointer")
+    try:
+        report = atropos_pb2.Report()
+        report.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return _report_dict(report)
