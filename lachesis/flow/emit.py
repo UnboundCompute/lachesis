@@ -1240,8 +1240,10 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
         # Native graph composition uses explicit seam edges for known callees.  Do not
         # flatten their SUMMARY effects into the caller as a second release/use stream;
         # that would manufacture double-frees when the callee fragment is also traversed.
-        operations = extract_operations(
-            sub, norm, fid, functions[name], functions, obj_summaries, cfg)
+        operations = cfg.get("operations")
+        if operations is None:
+            operations = extract_operations(
+                sub, norm, fid, functions[name], functions, obj_summaries, cfg)
         operation_generations, realloc_generations = _operation_generations(
             sub, operations, cfg)
         loop_nodes = _loop_nodes(cfg)
