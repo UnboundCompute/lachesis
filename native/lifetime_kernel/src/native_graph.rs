@@ -5,13 +5,29 @@
 //! records directly and constructs the function inputs in native memory.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Cursor, Read};
+use std::path::Path;
 use hashbrown::{HashMap, HashSet};
+use memmap2::{Mmap, MmapOptions};
 
 use prost::Message;
 
 use crate::{graph_proto, lifetime_proto};
 
 const FRAME_HEADER: usize = 4;
+
+/// Map the immutable Pass-1 substrate instead of reading a second full byte
+/// buffer.  The parser still materializes the compact native request it needs,
+/// but the raw protobuf stream is demand-paged and can be reclaimed by the OS.
+pub(crate) fn map_path(path: impl AsRef<Path>) -> Result<Mmap, String> {
+    let file = File::open(path.as_ref())
+        .map_err(|error| format!("cannot open native graph substrate: {error}"))?;
+    // SAFETY: Pass-1 sidecars are immutable inputs for the duration of a native
+    // call. The file handle remains owned by the mapping until it is dropped.
+    unsafe { MmapOptions::new().map(&file) }
+        .map_err(|error| format!("cannot map native graph substrate: {error}"))
+}
 
 fn scalar(node: &graph_proto::NodeRecord, key: &str) -> Option<String> {
     node.properties.iter().find_map(|field| {
@@ -97,6 +113,20 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     let payload = &input[*offset..*offset + length];
     *offset += length;
     Ok(payload)
+}
+
+fn stream_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
+    let mut header = [0u8; FRAME_HEADER];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(format!("cannot read graph sidecar frame header: {error}")),
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)
+        .map_err(|error| format!("truncated graph sidecar frame: {error}"))?;
+    Ok(Some(payload))
 }
 
 fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
@@ -234,6 +264,14 @@ fn sidecar_to_request_with_selection(
     let mut summary_effects: HashMap<String, Vec<(u32, Vec<String>)>> = HashMap::new();
     for (id, input) in &functions {
         let Some(name) = names_by_input_id.get(id) else { continue };
+        // Most functions do not directly release/reallocate a parameter.  Do
+        // not build three temporary AST indexes for those functions; their
+        // summary is known to be empty until a callee summary can flow into
+        // them in the fixed point below.
+        if !input.calls.iter().any(|call| call.is_release || call.is_realloc) {
+            summary_effects.insert(name.clone(), Vec::new());
+            continue;
+        }
         let refs: HashMap<String, String> = input.edges.iter()
             .filter(|edge| edge.kind == "REFERS_TO")
             .map(|edge| (edge.source.clone(), edge.target.clone()))
@@ -262,6 +300,11 @@ fn sidecar_to_request_with_selection(
         let mut changed = false;
         for input in functions.values() {
             let Some(name) = names_by_input_id.get(&input.id) else { continue };
+            // Avoid reconstructing per-function AST indexes unless at least
+            // one call currently has a non-empty callee summary to propagate.
+            if !input.calls.iter().any(|call| {
+                summary_effects.get(&call.callee).is_some_and(|effects| !effects.is_empty())
+            }) { continue; }
             let refs: HashMap<String, String> = input.edges.iter()
                 .filter(|edge| edge.kind == "REFERS_TO")
                 .map(|edge| (edge.source.clone(), edge.target.clone()))
@@ -419,16 +462,29 @@ fn scan_lifetime_metadata(
     HashSet<String>,
     HashMap<String, Vec<CompactEdge>>,
 ), String> {
-    let mut owners = HashMap::new();
-    let mut function_names = HashMap::new();
-    let mut call_ids = HashSet::new();
-    let mut edges_by_source: HashMap<String, Vec<CompactEdge>> = HashMap::new();
     let mut offset = 0;
     let header = frame(input, &mut offset)?;
     let _: graph_proto::Document = graph_proto::Document::decode(header)
         .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    while offset < input.len() {
-        let payload = frame(input, &mut offset)?;
+    let mut reader = Cursor::new(&input[offset..]);
+    scan_lifetime_metadata_reader(&mut reader, selected_ids, &mut on_node)
+}
+
+fn scan_lifetime_metadata_reader<R: Read>(
+    reader: &mut R,
+    selected_ids: Option<&HashSet<String>>,
+    on_node: &mut impl FnMut(graph_proto::NodeRecord),
+) -> Result<(
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashSet<String>,
+    HashMap<String, Vec<CompactEdge>>,
+), String> {
+    let mut owners = HashMap::new();
+    let mut function_names = HashMap::new();
+    let mut call_ids = HashSet::new();
+    let mut edges_by_source: HashMap<String, Vec<CompactEdge>> = HashMap::new();
+    while let Some(payload) = stream_frame(reader)? {
         if payload.is_empty() { continue; }
         match payload[0] {
             b'N' => {

@@ -951,7 +951,7 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_path(
         }
         let path = CStr::from_ptr(input_path)
             .to_str().map_err(|error| format!("invalid native graph path: {error}"))?;
-        let bytes = fs::read(path).map_err(|error| format!("cannot read native graph substrate: {error}"))?;
+        let bytes = native_graph::map_path(path)?;
         native_graph::sidecar_to_translation(&bytes)
     })();
     let mut payload = result.unwrap_or_else(|error| {
@@ -977,7 +977,7 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_path(
         }
         let path = CStr::from_ptr(input_path)
             .to_str().map_err(|error| format!("invalid native graph path: {error}"))?;
-        let bytes = fs::read(path).map_err(|error| format!("cannot read native graph substrate: {error}"))?;
+        let bytes = native_graph::map_path(path)?;
         let request = native_graph::sidecar_to_request(&bytes)?;
         prepare::solve_request(request)
     })();
@@ -1183,9 +1183,8 @@ pub unsafe extern "C" fn lachesis_lifetime_temporal_path(
             .map_err(|error| format!("invalid temporal input path: {error}"))?;
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid temporal output path: {error}"))?;
-        let request = native_graph::sidecar_to_request(
-            &fs::read(input).map_err(|error| format!("cannot read temporal substrate: {error}"))?,
-        )?;
+        let bytes = native_graph::map_path(input)?;
+        let request = native_graph::sidecar_to_request(&bytes)?;
         let bytes = prepare::temporal_request(request)?;
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, bytes)
@@ -1214,8 +1213,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             .map_err(|error| format!("invalid semantic input path: {error}"))?;
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid semantic output path: {error}"))?;
-        let bytes = fs::read(input)
-            .map_err(|error| format!("cannot read semantic substrate: {error}"))?;
+        let bytes = native_graph::map_path(input)?;
         let request = native_graph::sidecar_to_request(&bytes)?;
         let result = prepare::semantic_request(request)?;
         let temporary = format!("{output}.tmp.{}", std::process::id());
