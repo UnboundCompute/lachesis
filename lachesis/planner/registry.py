@@ -58,9 +58,26 @@ class CandidateRegistry:
         if constructor not in self._specs:
             raise KeyError(f"unknown candidate constructor: {constructor}")
         if constructor not in self._results:
+            self._ensure_native_semantic()
             impl = self._specs[constructor].implementation(self.graph, self.bind_summary)
             self._results[constructor] = impl.enumerate()
         return self._results[constructor]
+
+    def _ensure_native_semantic(self) -> None:
+        """Expand a native semantic sidecar once for all temporal constructors."""
+        semantic = self.graph.get("semantic_graph") or {}
+        if not isinstance(semantic, dict) or not semantic.get("native_sidecar"):
+            return
+        from ..flow.native_translate import load_native_semantic_graph_sidecar
+
+        native = load_native_semantic_graph_sidecar(
+            semantic["native_sidecar"], self.graph.get("language") or "c")
+        if native is None:
+            return
+        payload = native.to_dict()
+        materialized = {"nodes": payload.get("nodes", {})}
+        materialized["coverage"] = semantic.get("coverage") or native.coverage
+        self.graph["semantic_graph"] = materialized
 
     def selected(self, *, constructor: str | None = None,
                  domain: str | None = None, language: str | None = None) -> list[str]:
