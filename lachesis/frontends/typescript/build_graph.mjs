@@ -218,11 +218,51 @@ function compilerOptions() {
 }
 
 // Discovery is owned by the Python driver: when it hands us an explicit root set
-// (via LACHESIS_ROOTS_FILE — test files already excluded there), compile exactly that
+// (via the binary protobuf root set named by LACHESIS_ROOTS_FILE — test files
+// already excluded there), compile exactly that
 // list instead of re-walking, so the walker can't re-introduce what was filtered out.
 function readRoots(rootsFile) {
+  // The runner hands all frontends a framed-binary contract.  This tiny decoder
+  // covers FrontendRoots (field 1: version, field 2: repeated UTF-8 path) and
+  // avoids adding a protobuf runtime dependency to the TypeScript frontend.
+  const payload = fs.readFileSync(rootsFile);
+  let offset = 0;
+  let formatVersion = 0;
+  const paths = [];
+  const readVarint = () => {
+    let value = 0n;
+    let shift = 0n;
+    while (offset < payload.length) {
+      const byte = payload[offset++];
+      value |= BigInt(byte & 0x7f) << shift;
+      if (!(byte & 0x80)) return value;
+      shift += 7n;
+    }
+    throw new Error(`truncated binary frontend roots: ${rootsFile}`);
+  };
+  while (offset < payload.length) {
+    const tag = Number(readVarint());
+    const field = tag >> 3;
+    const wireType = tag & 7;
+    if (field === 1 && wireType === 0) {
+      formatVersion = Number(readVarint());
+    } else if (field === 2 && wireType === 2) {
+      const length = Number(readVarint());
+      const end = offset + length;
+      if (end > payload.length) throw new Error(`truncated binary frontend roots: ${rootsFile}`);
+      paths.push(payload.subarray(offset, end).toString("utf8"));
+      offset = end;
+    } else if (wireType === 0) {
+      readVarint();
+    } else if (wireType === 2) {
+      offset += Number(readVarint());
+    } else {
+      throw new Error(`unsupported frontend roots protobuf field: ${field}`);
+    }
+  }
+  if (formatVersion !== 2) throw new Error(`unsupported frontend roots format: ${formatVersion}`);
   const names = [];
-  for (const line of fs.readFileSync(rootsFile, "utf8").split("\n")) {
+  for (const line of paths) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const absolute = normalize(trimmed);

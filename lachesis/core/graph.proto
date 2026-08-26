@@ -89,6 +89,13 @@ message NativeTranslationUnit {
   repeated string arguments = 2;
 }
 
+// Binary root-set handoff used by every frontend subprocess. The environment
+// variable names the file for compatibility, but its contents are protobuf.
+message FrontendRoots {
+  uint32 format_version = 1;
+  repeated string paths = 2;
+}
+
 message DataflowOverlay {
   string overlay_id = 1;
   string source = 2;

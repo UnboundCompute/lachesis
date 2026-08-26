@@ -21,6 +21,7 @@ if __package__ in (None, ""):  # invoked as a bare script path, not with -m
 
 from .declarations import DeclarationWalk
 from lachesis.core.graph_wire import encode_document, write_tier
+from lachesis.core import graph_pb2
 from .emit import (
     CONTRACT_VERSION, FRONTEND_ID, LANGUAGE, TIERS, Graph, SourceFile, stable_id,
 )
@@ -60,14 +61,19 @@ def select_roots(lines: Iterable[str]) -> List[Path]:
 def read_roots(roots_file: str) -> List[Path]:
     """Ingest exactly the discovery-provided root list.
 
-    lachesis/core/runner.py writes LACHESIS_ROOTS_FILE after it has already pruned
+    lachesis/core/runner.py writes a binary protobuf root set to LACHESIS_ROOTS_FILE
+    after it has already pruned
     vendor directories and excluded tests, so honoring it means this frontend
     inherits that one discovery instead of re-walking and re-introducing what was
     filtered out.
     """
     try:
-        lines = Path(roots_file).read_text(encoding="utf-8").splitlines()
-    except OSError:
+        message = graph_pb2.FrontendRoots()
+        message.ParseFromString(Path(roots_file).read_bytes())
+        if message.format_version != 2:
+            return []
+        lines = message.paths
+    except (OSError, ValueError):
         return []
     return select_roots(lines)
 

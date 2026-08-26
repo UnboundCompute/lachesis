@@ -30,9 +30,11 @@ except ImportError:  # … or imported as a package module.
 
 try:
     from lachesis.core.graph_wire import encode_document, write_tier
+    from lachesis.core import graph_pb2
 except ModuleNotFoundError:  # direct script execution from the frontend directory
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from lachesis.core.graph_wire import encode_document, write_tier
+    from lachesis.core import graph_pb2
 
 
 CONTRACT_VERSION = 2
@@ -108,7 +110,8 @@ def compact(value: object, limit: int = 300) -> str:
 def read_roots(roots_file: str) -> List[Path]:
     """Ingest exactly the discovery-provided root list.
 
-    The Python driver (lachesis/core/runner.py) writes LACHESIS_ROOTS_FILE after it
+    The Python driver (lachesis/core/runner.py) writes a binary protobuf file named
+    by LACHESIS_ROOTS_FILE after it
     has already pruned vendor directories and excluded tests via
     lachesis.nav.symbol_index.is_test_path.  Honoring it means the C frontend inherits that
     single discovery instead of re-walking the tree and re-introducing what was
@@ -116,8 +119,12 @@ def read_roots(roots_file: str) -> List[Path]:
     """
     roots: List[Path] = []
     try:
-        lines = Path(roots_file).read_text(encoding="utf-8").splitlines()
-    except OSError:
+        message = graph_pb2.FrontendRoots()
+        message.ParseFromString(Path(roots_file).read_bytes())
+        if message.format_version != 2:
+            return roots
+        lines = message.paths
+    except (OSError, ValueError):
         return roots
     for line in lines:
         trimmed = line.strip()
@@ -131,7 +138,8 @@ def read_roots(roots_file: str) -> List[Path]:
 
 def walk(source_dir: Path) -> List[Path]:
     # Discovery owns file selection: when the driver hands us an explicit root set
-    # (LACHESIS_ROOTS_FILE — vendor/test files already excluded), ingest exactly that
+    # (LACHESIS_ROOTS_FILE — a binary protobuf root set with vendor/test files already
+    # excluded), ingest exactly that
     # list so the walker can't re-introduce what was filtered out.  Absent the env
     # var (standalone CLI run), fall back to a full source-tree walk.
     roots_file = os.environ.get("LACHESIS_ROOTS_FILE")
