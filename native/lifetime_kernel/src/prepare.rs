@@ -1194,6 +1194,45 @@ pub(crate) fn prepare_and_solve_request_with_metadata(
     solve_prepared_functions(prepared, true)
 }
 
+/// Solve a graph request while retaining only temporal findings and solver
+/// counters.  The normal prepare/solve ABI intentionally returns snapshots
+/// because the semantic emitter consumes them; the path-only temporal ABI does
+/// not need that representation and must never make Python reconstruct it.
+pub(crate) fn temporal_request(
+    request: lifetime_proto::PrepareRequest,
+) -> Result<Vec<u8>, String> {
+    let prepared = prepare_functions(request.functions)?;
+    let results = prepared.into_par_iter()
+        .map(|function| {
+            let id = function.id.clone();
+            let solved = solve_prepared_function(function, false)?;
+            let result = solved.result.unwrap_or_default();
+            let findings = result.findings.into_iter().map(|finding| {
+                lifetime_proto::NativeTemporalFinding {
+                    function: id.clone(),
+                    pattern: finding.pattern,
+                    path: finding.path,
+                    line: finding.line,
+                    has_line: finding.has_line,
+                    node: finding.node,
+                }
+            }).collect();
+            Ok(lifetime_proto::NativeTemporalFunction {
+                id,
+                findings,
+                transfers: result.transfers,
+                widenings: result.widenings,
+                capped: result.capped,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut output = Vec::new();
+    lifetime_proto::NativeTemporalResult { functions: results }
+        .encode(&mut output)
+        .map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
 fn prepare_functions(
     functions: Vec<lifetime_proto::FunctionInput>,
 ) -> Result<Vec<lifetime_proto::PreparedFunction>, String> {

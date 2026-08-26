@@ -335,3 +335,25 @@ message NativeSummaryFunction {
   repeated NativeSinkParam sink_params = 4;
 }
 message NativeSummaryResult { repeated NativeSummaryFunction functions = 1; }
+
+// Compact temporal output.  The full solver result contains point/post/exit
+// snapshots for semantic graph construction; callers that only need temporal
+// findings must not deserialize those graph-sized snapshots in Python.
+message NativeTemporalFinding {
+  string function = 1;
+  string pattern = 2;
+  Path path = 3;
+  sint64 line = 4;
+  bool has_line = 5;
+  string node = 6;
+}
+message NativeTemporalFunction {
+  string id = 1;
+  repeated NativeTemporalFinding findings = 2;
+  uint64 transfers = 3;
+  uint64 widenings = 4;
+  bool capped = 5;
+}
+message NativeTemporalResult {
+  repeated NativeTemporalFunction functions = 1;
+}

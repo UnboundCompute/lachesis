@@ -418,6 +418,21 @@ def summaries_path(facts_path: str | os.PathLike[str],
     return result
 
 
+def temporal_path(input_path: str | os.PathLike[str],
+                  output_path: str | os.PathLike[str]) -> None:
+    """Run Rust temporal analysis from a substrate path into a compact sidecar."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = library.lachesis_lifetime_temporal_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(os.fsencode(os.fspath(input_path)),
+                      os.fsencode(os.fspath(output_path)))
+    if status != 0:
+        raise RuntimeError(f"native temporal analysis failed with status {status}")
+
+
 def prepare_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
     """Prepare selected functions without running the lifetime fixpoint."""
     library = _load()

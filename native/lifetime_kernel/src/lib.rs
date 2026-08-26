@@ -1145,6 +1145,38 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
     }
 }
 
+/// Run the native temporal solver directly from a framed Pass-1 substrate and
+/// publish only compact findings.  Catalog binding remains a separate input
+/// because temporal state is independent of sink-model selection.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_temporal_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native temporal path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path).to_str()
+            .map_err(|error| format!("invalid temporal input path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid temporal output path: {error}"))?;
+        let request = native_graph::sidecar_to_request(
+            &fs::read(input).map_err(|error| format!("cannot read temporal substrate: {error}"))?,
+        )?;
+        let bytes = prepare::temporal_request(request)?;
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, bytes)
+            .map_err(|error| format!("cannot write temporal result: {error}"))?;
+        fs::rename(&temporary, output)
+            .map_err(|error| format!("cannot publish temporal result: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native temporal path error: {error}"); 1 }
+    }
+}
+
 /// Plan source launches, formal/actual seams, and coverage regions directly
 /// from compact translation facts and catalog entries.
 #[no_mangle]

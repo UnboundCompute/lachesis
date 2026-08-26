@@ -17,7 +17,7 @@ from . import atropos
 from .coverage import CoveragePlan, CoverageRegion, CoverageScheduler
 from .normalize import normalizer
 from .source_discovery import SourceDiscovery, SourceSite, SeamBinding, discover_sources
-from .native_lifetime import plan_pass2_pb, plan_path, translate_graph_pb
+from .native_lifetime import plan_pass2_pb, plan_path, summaries_path, translate_graph_pb
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import (
@@ -419,3 +419,54 @@ def build_native_F(store, lang="c", *, return_graph=False):
     except AttributeError:
         pass
     return (functions, succ, graph) if return_graph else (functions, succ)
+
+
+def build_native_summaries(store, lang="c"):
+    """Return the compact native reach summaries when binary inputs are available.
+
+    This adapter is deliberately separate from ``build_native_F``: callers can
+    compare the native summary domain with Python before enabling it, without
+    changing translation selection or silently weakening coverage.
+    """
+    base = (getattr(store.index, "_pass3_cache_base", None)
+            or getattr(store.index, "_db_dir", None))
+    if not base:
+        return None
+    facts = translation_facts_path(base)
+    root = __import__("lachesis.integrations.atropos.enrich", fromlist=["locate_atropos"])
+    root = root.locate_atropos()
+    if not facts.is_file() or root is None:
+        return None
+    catalog = _compiled_catalog(root, base)
+    output = tempfile.NamedTemporaryFile(prefix="lachesis-summary-", suffix=".pb", delete=False)
+    output.close()
+    try:
+        result = summaries_path(facts, catalog, output.name)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        try:
+            os.unlink(output.name)
+        except OSError:
+            pass
+    summaries = {}
+    for item in result.functions:
+        sink_params = defaultdict(list)
+        for record in item.sink_params:
+            sink_params[record.parameter].append({
+                "sink": record.sink, "guards": list(record.guards),
+                "guarded": record.guarded,
+            })
+        summaries[item.name] = {
+            "name": item.name, "params": tuple(item.parameters),
+            "taxonomy": "UDF", "sink_flows": [{
+                "sink": record.sink, "value": record.value, "root": record.root,
+                "provenance": record.provenance, "guards": list(record.guards),
+                "guarded": record.guarded, "site_guarded": record.site_guarded,
+                "via": record.via,
+            } for record in item.sink_flows],
+            "sink_params": dict(sink_params), "typestate": {},
+            "param_typestate": {}, "frees_params": {}, "returns": "value",
+            "returns_param": None, "returns_dangling": False,
+        }
+    return summaries

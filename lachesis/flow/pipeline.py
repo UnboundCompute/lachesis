@@ -267,7 +267,12 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     # Native object mode owns lifetime summaries.  The Python composer only
     # supplies reach/presence sink-flow observations on the production path.
     # Shadow and legacy retain the complete compatibility summary.
-    summaries = _summaries_for(F, succ, reach_only=object_requested)
+    native_summaries = None
+    if object_requested and os.environ.get("LACHESIS_NATIVE_SUMMARIES") == "1":
+        from .native_translate import build_native_summaries
+        native_summaries = build_native_summaries(store, lang=lang)
+    summaries = (native_summaries if native_summaries is not None else
+                 _summaries_for(F, succ, reach_only=object_requested))
     legacy_summaries_done = perf_counter()
     _emit("summaries")
     if _expired():
