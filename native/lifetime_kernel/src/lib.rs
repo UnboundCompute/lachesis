@@ -39,6 +39,7 @@ mod interprocedural;
 mod branch_history;
 mod module_initialization;
 mod property_effects;
+mod heap;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -71,6 +72,8 @@ fn run_native_overlay_chain(
     let delta = module_initialization::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = property_effects::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
+    let delta = heap::enrich(&mut graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
     let delta = dispatch::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut nodes, &mut edges)?;
