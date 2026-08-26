@@ -64,6 +64,10 @@ pub(crate) struct Graph {
     pub(crate) node_by_id: FxHashMap<u32, usize>,
     pub(crate) outgoing: Vec<Vec<usize>>,
     pub(crate) incoming: Vec<Vec<usize>>,
+    /// Candidate edge indexes by triple.  Properties are compared only when a
+    /// triple collides, matching composition's first-wins/different-properties
+    /// behavior without serializing every edge during ingestion.
+    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>>,
 }
 
 pub(crate) struct Delta {
@@ -159,6 +163,11 @@ impl Graph {
                 target: self.symbols.intern(record.target),
                 properties: record.properties,
             };
+            let triple = (edge.kind, edge.source, edge.target);
+            let duplicate = self.edge_lookup.get(&triple).into_iter().flatten().any(|index| {
+                self.edges[*index].properties == edge.properties
+            });
+            if duplicate { continue; }
             let index = self.edges.len();
             if let Some(source) = self.node_by_id.get(&edge.source).copied() {
                 self.outgoing[source].push(index);
@@ -167,6 +176,7 @@ impl Graph {
                 self.incoming[target].push(index);
             }
             self.edges.push(edge);
+            self.edge_lookup.entry(triple).or_default().push(index);
         }
         Ok(())
     }
@@ -274,7 +284,11 @@ fn finish_graph(
         if let Some(source) = node_by_id.get(&edge.source) { outgoing[*source].push(index); }
         if let Some(target) = node_by_id.get(&edge.target) { incoming[*target].push(index); }
     }
-    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming })
+    let mut edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
+    for (index, edge) in edges.iter().enumerate() {
+        edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
+    }
+    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
 }
 
 fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
@@ -357,7 +371,11 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
             incoming[*target].push(index);
         }
     }
-    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming })
+    let mut edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
+    for (index, edge) in edges.iter().enumerate() {
+        edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
+    }
+    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming, edge_lookup })
 }
 
 pub(crate) fn publish_dataflow_stream(
