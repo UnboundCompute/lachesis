@@ -406,17 +406,21 @@ class Analysis:
         from lachesis.flow.native_translate import native_semantic_capable
         native_semantic = native_semantic_capable(
             self.store, languages=summary.get("languages"))
+        native_sidecar = None
         if native_semantic or os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
             from lachesis.flow.native_translate import ensure_native_semantic_sidecar
-            sidecar = ensure_native_semantic_sidecar(self.store)
-            if sidecar is not None:
-                # The semantic graph is already a Rust-owned binary artifact.
-                # Do not route it through run_pass just to reconstruct Python
-                # nodes that the bind command never queries.
+            native_sidecar = ensure_native_semantic_sidecar(self.store)
+            if native_sidecar is not None:
+                # For a C-only store the semantic graph is already a Rust-owned
+                # binary artifact. Do not route it through run_pass just to
+                # reconstruct Python nodes that the bind command never queries.
+                # Mixed stores continue below for their non-C languages.
                 stamped["semantic_graph"] = {
-                    "native_sidecar": str(sidecar),
+                    "native_sidecar": str(native_sidecar),
                     "coverage": {"converged": True},
                 }
+                if set(summary.get("languages") or {"c"}) <= {"c"}:
+                    return stamped, summary, True
                 return stamped, summary, True
         # Temporal families observe semantic operations (release, origin, dereference) that are
         # not catalog role nodes in the base CPG. Reuse the same cached Pass 3 graph the flow
@@ -431,9 +435,10 @@ class Analysis:
         # one result.  The catalog language list is a list of model families,
         # not a request to rerun that whole-graph flow once per language.  Keep
         # the per-language loop for the compatibility renderer only.
-        languages = (("c",) if native_semantic
-                     else (summary.get("languages") or ("c",)))
+        languages = summary.get("languages") or ("c",)
         for language in languages:
+            if language == "c" and native_sidecar is not None:
+                continue
             flow_started = perf_counter()
             flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline,
                                       workers=workers,
@@ -447,16 +452,14 @@ class Analysis:
                 complete = False
             semantic = flow.get("semantic_graph")
             if semantic is not None:
-                if native_semantic:
-                    native_semantic_graph = semantic
-                else:
-                    merge_semantic_nodes(semantic_nodes, semantic, language)
+                merge_semantic_nodes(semantic_nodes, semantic, language)
                 semantic_coverages.append(dict(semantic.coverage or {}))
-        if native_semantic_graph is not None:
+        if native_sidecar is not None:
             from lachesis.flow.native_translate import native_semantic_sidecar_path
             sidecar = native_semantic_sidecar_path(self.store)
             stamped["semantic_graph"] = {
                 "native_sidecar": str(sidecar) if sidecar else "",
+                "nodes": semantic_nodes,
             }
             if semantic_coverages:
                 stamped["semantic_graph"]["coverage"] = {

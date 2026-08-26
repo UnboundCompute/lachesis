@@ -529,8 +529,6 @@ def native_semantic_capable(store, languages=None) -> bool:
             or getattr(index, "_db_dir", None))
     if not base:
         return False
-    if languages is not None and set(languages) - {"c"}:
-        return False
     return (translation_facts_path(base).is_file()
             and pass2_input_cache_path(base).is_file())
 
