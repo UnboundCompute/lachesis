@@ -454,12 +454,14 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
             pass
         raise
 
-    translation_nodes, translation_edges = _translation_records(
-        substrate_nodes, substrate_edges)
     common = {"store_version": manifest.get("version"),
               "core_content_hash": manifest.get("core_content_hash"),
               "source_content_hash": manifest.get("source_content_hash"),
               "build_fingerprint": manifest.get("build_fingerprint")}
+    # Publish the complete Pass-3 substrate before narrowing the shared lists
+    # below for the compact translation projection.  The translation filter
+    # intentionally reuses these list objects to reduce peak RSS, so ordering is
+    # significant: Pass 3 must retain the full substrate contract.
     _write_framed_sidecar(
         substrate_cache_path(target), ".pass3-substrate-",
         {"format": "lachesis-pass3-substrate", "version": _CACHE_VERSION,
@@ -467,6 +469,8 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
          "member_count": sum(1 for node in substrate_nodes
                               if (node.get("properties") or {}).get("syntax_kind") == "MemberExpr"),
          **common}, substrate_nodes, substrate_edges)
+    translation_nodes, translation_edges = _translation_records(
+        substrate_nodes, substrate_edges)
     _write_framed_sidecar(
         translation_cache_path(target), ".pass2-translation-",
         {"format": "lachesis-pass2-translation", "version": _CACHE_VERSION,
