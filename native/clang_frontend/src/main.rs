@@ -147,6 +147,7 @@ struct Emitter {
     function_definitions: FxHashMap<String, FxHashSet<String>>,
     function_declarations: FxHashMap<String, FxHashSet<String>>,
     function_parameters: FxHashMap<String, Vec<String>>,
+    usr_ids: FxHashMap<String, String>,
     path_cache: FxHashMap<String, String>,
 }
 
@@ -217,6 +218,27 @@ impl Emitter {
         self.edge_count += 1;
         Ok(())
     }
+}
+
+unsafe fn cursor_usr(cursor: CXCursor) -> String {
+    cx_string(clang_getCursorUSR(cursor))
+}
+
+unsafe fn resolved_declaration_id(
+    cursor: CXCursor,
+    id_kind: &str,
+    file: &str,
+    offset: u32,
+    end_offset: u32,
+    spelling: &str,
+    emitter: &Emitter,
+) -> String {
+    let usr = cursor_usr(cursor);
+    emitter
+        .usr_ids
+        .get(&usr)
+        .cloned()
+        .unwrap_or_else(|| stable_id(id_kind, file, offset, end_offset, spelling))
 }
 
 fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
@@ -483,12 +505,9 @@ unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opti
     if target_file.is_empty() {
         return None;
     }
-    Some(stable_id(
-        "function",
-        &target_file,
-        target_offset,
-        target_end,
-        &target_name,
+    Some(resolved_declaration_id(
+        referenced, "function", &target_file, target_offset, target_end,
+        &target_name, emitter,
     ))
 }
 
@@ -524,7 +543,10 @@ unsafe fn referenced_target_id(cursor: CXCursor, emitter: &mut Emitter) -> Optio
     }
     Some((
         target_kind,
-        stable_id(id_kind, &target_file, target_offset, target_end, &target_name),
+        resolved_declaration_id(
+            referenced, id_kind, &target_file, target_offset, target_end,
+            &target_name, emitter,
+        ),
     ))
 }
 
@@ -552,8 +574,9 @@ unsafe fn parameter_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opt
     if target_file.is_empty() {
         return None;
     }
-    Some(stable_id(
-        "value", &target_file, target_offset, target_end, &target_name,
+    Some(resolved_declaration_id(
+        referenced, "value", &target_file, target_offset, target_end,
+        &target_name, emitter,
     ))
 }
 
@@ -635,6 +658,25 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         field("type", text(&type_spelling)),
     ];
     let owner_id = function_owner(cursor, emitter);
+    if matches!(
+        syntax_kind.as_str(),
+        "FunctionDecl"
+            | "RecordDecl"
+            | "StructDecl"
+            | "UnionDecl"
+            | "EnumDecl"
+            | "TypedefDecl"
+            | "ParmVarDecl"
+            | "ParmDecl"
+            | "VarDecl"
+            | "FieldDecl"
+            | "EnumConstantDecl"
+    ) {
+        let usr = cursor_usr(cursor);
+        if !usr.is_empty() {
+            emitter.usr_ids.entry(usr).or_insert_with(|| id.clone());
+        }
+    }
     if let Some(owner_id) = &owner_id {
         properties.push(field("owner_function_id", text(owner_id)));
     }
@@ -665,7 +707,10 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                     _ => None,
                 };
                 if let Some(target_id_kind) = target_id_kind {
-                    let target_id = stable_id(target_id_kind, &target_file, target_offset, target_end, &target_name);
+                    let target_id = resolved_declaration_id(
+                        referenced, target_id_kind, &target_file, target_offset,
+                        target_end, &target_name, emitter,
+                    );
                     properties.push(field("callee", text(&target_name)));
                     if target_kind == "FieldDecl" {
                         properties.push(field("receiver_member_id", text(&target_id)));
@@ -892,7 +937,10 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                 _ => None,
             };
             if let (Some(id_kind), Some(_owner_id)) = (id_kind, owner_id.as_ref()) {
-                let target_id = stable_id(id_kind, &target_file, target_offset, target_end, &target_name);
+                let target_id = resolved_declaration_id(
+                    referenced, id_kind, &target_file, target_offset, target_end,
+                    &target_name, emitter,
+                );
                 emitter.edge(graph::EdgeRecord {
                     kind: "REFERS_TO".to_owned(), source: id.clone(), target: target_id.clone(),
                     properties: Vec::new(), source_tier: tier.clone(), relationship_class: "REFERS_TO".to_owned(),
@@ -1466,6 +1514,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             function_definitions: FxHashMap::default(),
             function_declarations: FxHashMap::default(),
             function_parameters: FxHashMap::default(),
+            usr_ids: FxHashMap::default(),
             path_cache: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
