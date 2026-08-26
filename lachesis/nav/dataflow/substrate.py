@@ -123,9 +123,8 @@ class _CompactEdge:
 
 
 def _CompactNode_from_payload(payload):
-    node = decode_node(payload)
-    return _CompactNode(node.get("id"), node.get("kind"), node.get("label"),
-                        node.get("properties") or {})
+    message, properties = _native_node_projection(payload)
+    return _CompactNode(message.id, message.kind, message.label, properties)
 
 
 def _scalar_graph_value(value):
@@ -184,9 +183,8 @@ def _native_edge_projection(payload):
 
 
 def _CompactEdge_from_payload(payload):
-    edge = decode_edge(payload)
-    return _CompactEdge(edge.get("source"), edge.get("target"), edge.get("kind"),
-                        edge.get("properties") or {})
+    message, properties = _native_edge_projection(payload)
+    return _CompactEdge(message.source, message.target, message.kind, properties)
 
 
 def substrate_cache_path(graph_path):
