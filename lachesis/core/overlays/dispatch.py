@@ -42,6 +42,8 @@ class DynamicDispatch:
         ast_children: dict[str, list[tuple[str, dict]]] = defaultdict(list)
         references: dict[str, set[str]] = defaultdict(set)
         read_by_evidence: dict[str, list[str]] = defaultdict(list)
+        bindings_by_parameter: dict[str, list[str]] = defaultdict(list)
+        callbacks_by_argument: dict[str, set[str]] = defaultdict(set)
 
         def add_edge(kind: str, source: str, target: str, evidence: list[str], **properties) -> None:
             if not source or not target or source == target:
@@ -86,6 +88,10 @@ class DynamicDispatch:
                 references[edge["source"]].add(edge["target"])
             elif kind == "READ_EVIDENCED_BY":
                 read_by_evidence[edge["target"]].append(edge["source"])
+            elif kind == "ARGUMENT_BINDS_PARAMETER":
+                bindings_by_parameter[edge["target"]].append(edge["source"])
+            elif kind == "PASSES_CALLBACK":
+                callbacks_by_argument[edge["source"]].add(edge["target"])
 
         # Propagate callable targets through the identity graph with a worklist.
         # The previous fixed-point loop rescanned every identity edge once per
@@ -142,15 +148,6 @@ class DynamicDispatch:
                         queue.append(child)
             descendant_cache[root_id] = result
             return result
-
-        bindings_by_parameter: dict[str, list[str]] = defaultdict(list)
-        callbacks_by_argument: dict[str, set[str]] = defaultdict(set)
-        for edge in graph.get("edges", []):
-            kind = index.semantic_edge_kind(edge)
-            if kind == "ARGUMENT_BINDS_PARAMETER":
-                bindings_by_parameter[edge["target"]].append(edge["source"])
-            elif kind == "PASSES_CALLBACK":
-                callbacks_by_argument[edge["source"]].add(edge["target"])
 
         for call in index.nodes_of_kind("call", "construct"):
             call_id = call["id"]
