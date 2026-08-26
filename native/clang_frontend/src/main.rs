@@ -1115,6 +1115,41 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
+    let source_dir = if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+    };
+    let roots_file = env::var_os("LACHESIS_ROOTS_FILE");
+    if let Some(roots_file) = roots_file {
+        let payload = fs::read(roots_file)?;
+        let roots = graph::FrontendRoots::decode(payload.as_slice())?;
+        if roots.format_version == SHARD_FORMAT_VERSION {
+            let mut files: Vec<PathBuf> = roots
+                .paths
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| {
+                    matches!(path.extension().and_then(|extension| extension.to_str()),
+                             Some("c" | "h"))
+                        && path.is_file()
+                })
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .collect();
+            files.sort();
+            files.dedup();
+            return Ok((source_dir, files));
+        }
+    }
+    let files = if input.is_dir() {
+        source_files(input)?
+    } else {
+        vec![input.to_path_buf()]
+    };
+    Ok((source_dir, files))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // clang-sys's `runtime` feature keeps libclang out of the process until
     // the frontend is actually used.  Loading it here also makes the binary
@@ -1180,11 +1215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let input = PathBuf::from(&arguments[1])
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
-            let (source_dir, files) = if input.is_dir() {
-                (input.clone(), source_files(&input)?)
-            } else {
-                (input.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(), vec![input])
-            };
+            let (source_dir, files) = selected_files(&input)?;
             if files.is_empty() {
                 clang_disposeIndex(index);
                 return Err(format!("no C or header roots found under {}", source_dir.display()).into());
@@ -1209,7 +1240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let input = PathBuf::from(&arguments[1])
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
-            let files = if input.is_dir() { source_files(&input)? } else { vec![input] };
+            let (_source_dir, files) = selected_files(&input)?;
             let mut clang_arguments = Vec::new();
             if let Some(separator) = arguments.iter().position(|argument| argument == "--") {
                 clang_arguments.extend(arguments[separator + 1..].iter().cloned());
