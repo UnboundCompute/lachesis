@@ -146,7 +146,10 @@ def command_candidates(args: argparse.Namespace) -> int:
     temporal = not args.no_temporal
     with Progress(enabled=not args.json) as progress:
         progress.phase("loading graph")
-        analysis = _open(args)
+        # Candidate binding consumes the cached bind/event sidecars and the
+        # structural view lazily. Do not eagerly build the four graph-sized
+        # navigation maps before the selected constructor is known.
+        analysis = _open(args, defer_maps=True)
         progress.phase("binding catalog" + (" + temporal skeleton" if temporal else ""))
         if args.census:
             result = analysis.census(args.constructor, temporal=temporal,
