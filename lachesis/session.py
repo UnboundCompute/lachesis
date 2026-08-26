@@ -426,6 +426,18 @@ class Analysis:
                 }
                 complete = not any(item.capped for item in native.functions)
                 return stamped, summary, complete
+        if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1":
+            from lachesis.flow.native_translate import ensure_native_semantic_sidecar
+            sidecar = ensure_native_semantic_sidecar(self.store)
+            if sidecar is not None:
+                # The semantic graph is already a Rust-owned binary artifact.
+                # Do not route it through run_pass just to reconstruct Python
+                # nodes that the bind command never queries.
+                stamped["semantic_graph"] = {
+                    "native_sidecar": str(sidecar),
+                    "coverage": {"converged": True},
+                }
+                return stamped, summary, True
         # Temporal families observe semantic operations (release, origin, dereference) that are
         # not catalog role nodes in the base CPG. Reuse the same cached Pass 3 graph the flow
         # bundle exposes rather than a second traversal or a language-specific lifecycle

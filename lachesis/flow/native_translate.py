@@ -516,6 +516,21 @@ def build_native_semantic_graph(store, lang="c"):
     return _decode_native_semantic_result(result, lang)
 
 
+def ensure_native_semantic_sidecar(store):
+    """Create the Rust semantic sidecar without decoding it in Python."""
+    base = (getattr(store.index, "_pass3_cache_base", None)
+            or getattr(store.index, "_db_dir", None))
+    if not base:
+        return None
+    input_path = pass2_input_cache_path(base)
+    if not input_path.is_file():
+        return None
+    output_path = native_semantic_sidecar_path(store)
+    if not output_path.is_file():
+        semantic_path(input_path, output_path)
+    return output_path if output_path.is_file() else None
+
+
 def load_native_semantic_graph_sidecar(path, lang="c"):
     """Decode a native semantic sidecar for a query that needs its nodes."""
     from .native_lifetime import lifetime_pb2
