@@ -1205,16 +1205,32 @@ pub(crate) fn temporal_request(
     let results = prepared.into_par_iter()
         .map(|function| {
             let id = function.id.clone();
-            let solved = solve_prepared_function(function, false)?;
-            let result = solved.result.unwrap_or_default();
-            let findings = result.findings.into_iter().map(|finding| {
+            let operations = function.operations.iter().cloned()
+                .map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
+            let successors = function.successors.iter()
+                .map(|entry| (entry.node.clone(), entry.targets.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut initial = crate::State::default();
+            for (position, root) in function.parameters.iter().enumerate() {
+                initial.seed_parameter(crate::Path::root(format!("decl:{root}")), position as u32);
+            }
+            let result = if let Some(order) = crate::linear_cfg_order(&function.nodes, &successors) {
+                crate::solve_linear_findings(&order, &operations, initial)
+            } else {
+                crate::solve_graph_findings(&function.nodes, &successors, &operations, initial, 32)
+            };
+            let findings = result.findings.double_free.into_iter()
+                .map(|(line, path, node)| ("double-free", line, path, node))
+                .chain(result.findings.use_after_free.into_iter()
+                    .map(|(line, path, node)| ("use-after-free", line, path, node)))
+                .map(|(pattern, line, path, node)| {
                 lifetime_proto::NativeTemporalFinding {
                     function: id.clone(),
-                    pattern: finding.pattern,
-                    path: finding.path,
-                    line: finding.line,
-                    has_line: finding.has_line,
-                    node: finding.node,
+                    pattern: pattern.into(),
+                    path: Some(lifetime_proto::Path { root: path.root, selectors: path.selectors }),
+                    line: line.unwrap_or_default(),
+                    has_line: line.is_some(),
+                    node,
                 }
             }).collect();
             Ok(lifetime_proto::NativeTemporalFunction {

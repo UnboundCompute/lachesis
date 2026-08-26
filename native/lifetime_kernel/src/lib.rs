@@ -582,6 +582,29 @@ pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State
     }
 }
 
+/// Straight-line lifetime solving for callers that only need findings.  Do
+/// not retain point/post/exit snapshots for the compact temporal sidecar.
+pub fn solve_linear_findings(nodes: &[String], operations: &[Operation], mut state: State)
+    -> LinearResult {
+    let mut at: HashMap<String, Vec<&Operation>> = HashMap::new();
+    for operation in operations {
+        at.entry(operation.node.clone()).or_default().push(operation);
+    }
+    let mut findings = Findings::default();
+    let mut transfers = 0;
+    for node in nodes {
+        for operation in at.get(node).into_iter().flatten() {
+            state.apply(operation, &mut findings);
+            transfers += 1;
+        }
+    }
+    LinearResult {
+        point_states: Vec::new(), post_states: Vec::new(),
+        exit_state: State::default().snapshot(), exit_states: Vec::new(),
+        findings, transfers, widenings: 0, capped: false,
+    }
+}
+
 /// Return the unique acyclic CFG path when every node has at most one
 /// successor.  Such a function needs no worklist or state deduplication: each
 /// state has exactly one next location, so the linear transfer is equivalent.
@@ -1504,6 +1527,21 @@ fn stable_join_states(states: &[State], node: &str) -> State {
 pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
                    operations: &[Operation], initial: State,
                    max_disjuncts: usize) -> LinearResult {
+    solve_graph_mode(nodes, successors, operations, initial, max_disjuncts, true)
+}
+
+/// Graph lifetime solving without retaining semantic snapshots.  The worklist
+/// still computes the same abstract states and findings; only the projection
+/// needed by the Python semantic emitter is omitted.
+pub fn solve_graph_findings(nodes: &[String], successors: &HashMap<String, Vec<String>>,
+                            operations: &[Operation], initial: State,
+                            max_disjuncts: usize) -> LinearResult {
+    solve_graph_mode(nodes, successors, operations, initial, max_disjuncts, false)
+}
+
+fn solve_graph_mode(nodes: &[String], successors: &HashMap<String, Vec<String>>,
+                    operations: &[Operation], initial: State,
+                    max_disjuncts: usize, retain_snapshots: bool) -> LinearResult {
     let mut at: HashMap<String, Vec<Operation>> = HashMap::new();
     for operation in operations {
         at.entry(operation.node.clone()).or_default().push(operation.clone());
@@ -1654,30 +1692,32 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     // Snapshots are only consumed after convergence, so materializing them inside
     // the loop needlessly cloned the same large abstract states over and over.
     // Reconstruct the final point/post view once from the converged incoming map.
-    for node in nodes.iter().filter(|node| tracked_nodes.contains(*node)) {
-        let current = incoming.get(node).map(Vec::as_slice).unwrap_or(&[]);
-        point_snapshots.insert(
-            node.clone(),
-            current.iter().map(|state| state.compact_snapshot()).collect(),
-        );
-        let mut post = current.iter().cloned().collect::<Vec<_>>();
-        let mut ignored_findings = Findings::default();
-        for operation in at.get(node).into_iter().flatten() {
-            let mut next = Vec::with_capacity(post.len());
-            for shared in post {
-                let state = Arc::try_unwrap(shared)
-                    .unwrap_or_else(|shared| (*shared).clone());
-                next.extend(state.apply_variants(operation, &mut ignored_findings)
-                    .into_iter().map(Arc::new));
+    if retain_snapshots {
+        for node in nodes.iter().filter(|node| tracked_nodes.contains(*node)) {
+            let current = incoming.get(node).map(Vec::as_slice).unwrap_or(&[]);
+            point_snapshots.insert(
+                node.clone(),
+                current.iter().map(|state| state.compact_snapshot()).collect(),
+            );
+            let mut post = current.iter().cloned().collect::<Vec<_>>();
+            let mut ignored_findings = Findings::default();
+            for operation in at.get(node).into_iter().flatten() {
+                let mut next = Vec::with_capacity(post.len());
+                for shared in post {
+                    let state = Arc::try_unwrap(shared)
+                        .unwrap_or_else(|shared| (*shared).clone());
+                    next.extend(state.apply_variants(operation, &mut ignored_findings)
+                        .into_iter().map(Arc::new));
+                }
+                post = deduplicate_shared(next);
             }
-            post = deduplicate_shared(next);
-        }
-        post_snapshots.insert(
-            node.clone(),
-            post.iter().map(|state| state.compact_snapshot()).collect(),
-        );
-        if successors.get(node).is_none_or(Vec::is_empty) {
-            exit_snapshots.extend(post.iter().map(|state| state.snapshot()));
+            post_snapshots.insert(
+                node.clone(),
+                post.iter().map(|state| state.compact_snapshot()).collect(),
+            );
+            if successors.get(node).is_none_or(Vec::is_empty) {
+                exit_snapshots.extend(post.iter().map(|state| state.snapshot()));
+            }
         }
     }
 
