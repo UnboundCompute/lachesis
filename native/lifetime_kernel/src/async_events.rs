@@ -61,7 +61,7 @@ fn edge(kind: &str, source: &str, target: &str, mut properties: Vec<graph_proto:
 }
 
 fn event_id(category: &str, receiver: Option<&str>, name: &str) -> String {
-    pass2::stable_id("core", "async-events", &["async-event", category,
+    pass2::stable_id("core", "async-events", "async-event", &[category,
         receiver.unwrap_or("global"), name])
 }
 

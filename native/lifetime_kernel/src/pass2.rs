@@ -174,13 +174,13 @@ impl Graph {
 
 /// Stable IDs intentionally match `lachesis.core.identities.stable_id` for the
 /// string-only parts used by native overlays.
-pub(crate) fn stable_id(namespace: &str, kind: &str, parts: &[&str]) -> String {
+pub(crate) fn stable_id(owner: &str, namespace: &str, kind: &str, parts: &[&str]) -> String {
     let raw = parts.join("\0");
     let mut hasher = Sha256::new();
-    hasher.update(format!("v2\0core\0{namespace}\0{kind}\0{raw}").as_bytes());
+    hasher.update(format!("v2\0{owner}\0{namespace}\0{kind}\0{raw}").as_bytes());
     let digest = hasher.finalize();
     let hex = digest.iter().take(10).map(|byte| format!("{byte:02x}")).collect::<String>();
-    format!("v2:core:{namespace}:{kind}:{hex}")
+    format!("v2:{owner}:{namespace}:{kind}:{hex}")
 }
 
 pub(crate) fn text_field(key: &str, value: impl Into<String>) -> graph_proto::Field {

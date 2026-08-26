@@ -90,7 +90,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let call_id = graph.id(call.id).to_owned();
         for target in contextual_targets {
             let target_id = target.map(|id| graph.id(id).to_owned());
-            let context_id = pass2::stable_id("core", "interprocedural-contexts", &["call-context", &call_id, target_id.as_deref().unwrap_or("unresolved")]);
+            let context_id = pass2::stable_id("core", "interprocedural-contexts", "call-context", &[&call_id, target_id.as_deref().unwrap_or("unresolved")]);
             if !emitted.insert(context_id.clone()) { continue; }
             let confidence = if target_id.is_some() { "exact" } else { "unresolved" };
             let mut evidence = vec![call_id.clone()]; if let Some(id) = &target_id { evidence.push(id.clone()); }
@@ -106,7 +106,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 if let Some(target) = target { if text(parameter, "owner_function_id").and_then(|id| graph.symbol(id)) != Some(target) { continue; } }
                 let argument_id = binding.source;
                 let argument_text = graph.id(argument_id).to_owned(); let parameter_text = graph.id(parameter_id).to_owned();
-                let binding_id = pass2::stable_id("core", "interprocedural-contexts", &["context-parameter", &context_id, &argument_text, &parameter_text]);
+                let binding_id = pass2::stable_id("core", "interprocedural-contexts", "context-parameter", &[&context_id, &argument_text, &parameter_text]);
                 let binding_evidence = vec![call_id.clone(), argument_text.clone(), parameter_text.clone()];
                 let binding_fact = fact(&binding_evidence, "exact");
                 let mut properties = [binding_fact.clone(), vec![pass2::text_field("context_id", &context_id), pass2::text_field("callsite_id", &call_id), pass2::text_field("argument_id", &argument_text), pass2::text_field("parameter_id", &parameter_text)]].concat();
@@ -122,7 +122,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             }
             let Some(call_value) = text(call, "value_id").and_then(|id| graph.symbol(id)) else { continue };
             let call_value_text = graph.id(call_value).to_owned();
-            let return_id = pass2::stable_id("core", "interprocedural-contexts", &["context-return", &context_id, &call_value_text]);
+            let return_id = pass2::stable_id("core", "interprocedural-contexts", "context-return", &[&context_id, &call_value_text]);
             let mut return_evidence = vec![call_id.clone(), call_value_text.clone()];
             return_evidence.extend(target.and_then(|id| returns_by_function.get(&id)).into_iter().flatten().map(|id| graph.id(*id).to_owned()));
             let return_fact = fact(&return_evidence, confidence);

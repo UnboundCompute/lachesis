@@ -190,8 +190,8 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let function = &graph.nodes[function_index];
         let function_id = function.id;
         let function_name = graph.id(function.id).to_owned();
-        let entry_id = pass2::stable_id("control-flow", "cfg-entry", &[&function_name]);
-        let exit_id = pass2::stable_id("control-flow", "cfg-exit", &[&function_name]);
+        let entry_id = pass2::stable_id("core", "control-flow", "cfg-entry", &[&function_name]);
+        let exit_id = pass2::stable_id("core", "control-flow", "cfg-exit", &[&function_name]);
         let function_label = function.label.clone();
         let mut entry_properties = fact(&[function_name.clone()], "exact");
         entry_properties.push(pass2::text_field("function_id", function_name.clone()));
@@ -261,9 +261,9 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 .unwrap_or(*statement_id);
             let statement_name = graph.id(*statement_id).to_owned();
             let condition_name = graph.id(condition_target).to_owned();
-            let condition_id = pass2::stable_id("control-flow", "cfg-condition",
+            let condition_id = pass2::stable_id("core", "control-flow", "cfg-condition",
                 &[&function_name, &statement_name, &condition_name]);
-            let merge_id = pass2::stable_id("control-flow", "cfg-merge",
+            let merge_id = pass2::stable_id("core", "control-flow", "cfg-merge",
                 &[&function_name, &statement_name]);
             let evidence = vec![statement_name.clone(), condition_name.clone()];
             nodes.push(node(condition_id.clone(), "cfg-condition".to_owned(),

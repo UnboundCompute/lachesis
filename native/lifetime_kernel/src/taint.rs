@@ -156,7 +156,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             if kind == "source" { source_records.push(record); } else { sink_records.push(record); }
         }
         for (subtype, confidence) in roles(node, "source") {
-            let source_id = pass2::stable_id("taint-propagation", "source", &[graph.id(node.id), &subtype]);
+            let source_id = pass2::stable_id("core", "taint-propagation", "source", &[graph.id(node.id), &subtype]);
             let value = node.id;
             let label = format!("source:{}", node.label);
             let mut properties = fact(&[graph.id(node.id).to_owned()], &confidence);
@@ -170,7 +170,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 confidence: confidence.clone(), subtype: subtype.clone(), label: label.clone() });
         }
         for (subtype, confidence) in roles(node, "sink") {
-            let sink_id = pass2::stable_id("taint-propagation", "sink", &[graph.id(node.id), &subtype]);
+            let sink_id = pass2::stable_id("core", "taint-propagation", "sink", &[graph.id(node.id), &subtype]);
             let label = format!("sink:{}", node.label);
             let mut properties = fact(&[graph.id(node.id).to_owned()], &confidence);
             properties.push(pass2::text_field("value_id", graph.id(node.id)));
@@ -236,7 +236,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             witness.reverse();
             let source_name = graph.id(source.value).to_owned();
             let sink_name = sink.node.clone();
-            let reach_id = pass2::stable_id("taint-propagation", "taint-reach", &[&source_name, &sink_name]);
+            let reach_id = pass2::stable_id("core", "taint-propagation", "taint-reach", &[&source_name, &sink_name]);
             let witness_ids: Vec<String> = witness.iter().map(|value| graph.id(*value).to_owned()).collect();
             let mut properties = fact(&witness_ids, &source.confidence);
             properties.push(pass2::text_field("source_id", &source.node));

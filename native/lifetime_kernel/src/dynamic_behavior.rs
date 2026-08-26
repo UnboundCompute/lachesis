@@ -92,7 +92,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         if resolved || explicit_by_site.contains_key(&item.id) { continue; }
 
         let call_id = graph.id(item.id).to_owned();
-        let behavior_id = pass2::stable_id("core", "dynamic-behavior", &["unresolved-call", &call_id]);
+        let behavior_id = pass2::stable_id("core", "dynamic-behavior", "dynamic-behavior", &["unresolved-call", &call_id]);
         let properties = vec![
             pass2::text_field("fact_origin", "core-inference"),
             pass2::text_field("confidence", "unresolved"),
@@ -130,7 +130,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let site_text = site_id.map(|id| graph.id(id).to_owned());
         let mut evidence = vec![behavior_text.clone()];
         if let Some(site) = &site_text { evidence.push(site.clone()); }
-        let boundary_id = pass2::stable_id("core", "dynamic-behavior", &["boundary", &behavior_text]);
+        let boundary_id = pass2::stable_id("core", "dynamic-behavior", "boundary", &[&behavior_text]);
         let boundary_fact = fact(&evidence, confidence);
         nodes.push(node(boundary_id.clone(), "boundary", format!("dynamic:{behavior_kind}"), vec![
             pass2::text_field("fact_origin", "core-inference"),
@@ -157,7 +157,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     for (site_id, behavior_text) in generated_by_site {
         let site_text = graph.id(site_id).to_owned();
         let evidence = vec![behavior_text.clone(), site_text.clone()];
-        let boundary_id = pass2::stable_id("core", "dynamic-behavior", &["boundary", &behavior_text]);
+        let boundary_id = pass2::stable_id("core", "dynamic-behavior", "boundary", &[&behavior_text]);
         let boundary_fact = fact(&evidence, "unresolved");
         nodes.push(node(boundary_id.clone(), "boundary", "dynamic:unresolved-call".to_owned(), vec![
             pass2::text_field("fact_origin", "core-inference"),

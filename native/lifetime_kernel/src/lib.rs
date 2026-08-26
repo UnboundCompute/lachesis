@@ -1478,6 +1478,14 @@ fn parse_param(value: &str) -> Option<(u32, Vec<String>)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_overlay_ids_match_v2_identity_layout() {
+        assert_eq!(
+            pass2::stable_id("core", "dynamic-behavior", "dynamic-behavior", &["unresolved-call", "call-1"]),
+            "v2:core:dynamic-behavior:dynamic-behavior:b54e24b565df5a12f534",
+        );
+    }
+
     fn op(kind: Kind, target: Path, site: &str) -> Operation {
         Operation { kind, node: site.into(), target: Some(target), source: None, site: site.into(), line: Some(1), is_null: false, access: "deref".into(), generation: None, fresh_generation: None, alternatives: Vec::new() }
     }
