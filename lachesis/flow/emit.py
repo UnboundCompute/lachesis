@@ -1272,7 +1272,20 @@ def build_semantic_graph(store, F, succ, lang="c", graph=None, *, summaries=None
 
     for name, fid in by_name.items():
         cfg = (cfgs or {}).get(name)
+        # Native transfer-capped functions retain their compact records for
+        # diagnostics, but their partial state must not be stitched into the
+        # production semantic graph.  Pipeline fallback handles their lifetime
+        # findings conservatively.
+        if cfg is not None and cfg.get("native_capped"):
+            continue
         if cfg is None:
+            # A native result can legitimately omit a function whose
+            # preparation failed.  The lightweight metadata view is not a
+            # complete ReachingDef substrate, so do not route that miss into
+            # the legacy analyzer; object_lifetime has already recorded the
+            # function as unsafe for the compatibility fallback.
+            if native_metadata:
+                continue
             cfg = ReachingDef(sub).analyze(fid, reaching_defs=False)
         if not cfg or cfg.get("bailed"):
             continue

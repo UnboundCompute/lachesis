@@ -999,12 +999,20 @@ def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
                           node.offset if node.has_offset else 0)
                 for node in item.prepared.metadata
             },
+            "native_capped": bool(analysis.capped),
         }
         total_transfers += analysis.transfers
         total_widenings += analysis.widenings
         if analysis.capped:
             capped.append(name)
+            # A capped result is a partial abstract interpretation.  Do not
+            # publish its findings as if they were complete; retain the
+            # prepared metadata for the native emitter, but route this
+            # function through the conservative compatibility fallback.
+            cfg_failures[name] = "transfer-cap"
         best = {}
+        if analysis.capped:
+            continue
         for finding in sorted(analysis.findings):
             root_id = finding.path.root.removeprefix("decl:")
             root = root_labels.get(root_id, root_id)

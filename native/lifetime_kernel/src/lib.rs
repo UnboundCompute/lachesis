@@ -1188,13 +1188,15 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     let mut transfers = 0u64;
     let mut widenings = 0u64;
     let cap = max_disjuncts.max(1);
-    // Match the existing Python analyzer's bounded fixpoint budget.  This is
-    // an analysis-work guard for pathological loop/alias graphs, not a wall
-    // clock limit; capped results are surfaced to the caller as unsafe.
-    let transfer_cap = std::env::var("LACHESIS_DIAGNOSTIC_TRANSFER_CAP")
+    // Keep pathological loop/alias graphs from monopolizing the native batch.
+    // This is an analysis-work guard, not a wall-clock limit.  The native
+    // setting has a production-specific name; retain the diagnostic variable
+    // as a compatibility override for focused experiments.
+    let transfer_cap = std::env::var("LACHESIS_NATIVE_TRANSFER_CAP")
+        .or_else(|_| std::env::var("LACHESIS_DIAGNOSTIC_TRANSFER_CAP"))
         .ok().and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| 10_000u64.max(nodes.len() as u64 * 500));
+        .unwrap_or(10_000u64);
     while transfers < transfer_cap {
         let Some(node) = queue.pop_front() else { break };
         queued.remove(&node);
