@@ -123,6 +123,21 @@ def _call_path(symbol: str, sidecar_path: str | os.PathLike[str], response_type,
     return result
 
 
+def write_translation_facts_path(sidecar_path: str | os.PathLike[str],
+                                 output_path: str | os.PathLike[str]) -> None:
+    """Have Rust write TranslationResult protobuf facts without Python parsing."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = library.lachesis_lifetime_translate_graph_write_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(ctypes.c_char_p(os.fsencode(os.fspath(sidecar_path))),
+                      ctypes.c_char_p(os.fsencode(os.fspath(output_path))))
+    if status != 0:
+        raise RuntimeError("native whole-graph translation facts write failed")
+
+
 def prepare_pb_request(functions, request=None) -> bytes:
     """Encode raw function graph records into the native binary request."""
 

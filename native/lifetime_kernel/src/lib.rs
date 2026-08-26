@@ -965,6 +965,41 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_path(
     pointer
 }
 
+/// Translate a framed Pass-3 substrate and write the protobuf facts directly
+/// to a path.  This keeps the facts artifact binary end-to-end: the Python
+/// launcher supplies paths and receives only a status code.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_translate_graph_write_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native graph translation path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path)
+            .to_str().map_err(|error| format!("invalid input path: {error}"))?;
+        let output = CStr::from_ptr(output_path)
+            .to_str().map_err(|error| format!("invalid output path: {error}"))?;
+        let bytes = native_graph::map_path(input)?;
+        let payload = native_graph::sidecar_to_translation(&bytes)?;
+        let output_path = std::path::Path::new(output);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let temporary = output_path.with_extension(format!(
+            "{}.tmp-{}", output_path.extension().and_then(|value| value.to_str()).unwrap_or("pb"),
+            std::process::id(),
+        ));
+        fs::write(&temporary, payload).map_err(|error| error.to_string())?;
+        fs::rename(&temporary, output_path).map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native graph translation write error: {error}"); 1 }
+    }
+}
+
 /// Path-based ABI for whole-graph preparation.  The substrate is opened only
 /// by Rust and the prepared protobuf is returned through the existing allocator
 /// contract until the complete sidecar-writing engine replaces this boundary.
