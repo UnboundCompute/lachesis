@@ -145,10 +145,13 @@ def atropos_enrich(
                     native_path_report = bind_path(native_input, catalog_path,
                                                    native_path_output)
                 except (OSError, RuntimeError, ValueError) as error:
-                    native_path_report = None
-                    if os.environ.get("LACHESIS_ATROPOS_TIMINGS") == "1":
-                        print(f"[lachesis atropos] native path bind fallback: {error}",
-                              file=sys.stderr, flush=True)
+                    # A Pass-1 binary input is the current store contract. Do
+                    # not silently re-enter the old Python canonical-index
+                    # binder if the native implementation fails: that creates
+                    # two production paths and hides native regressions.
+                    raise RuntimeError(
+                        f"native catalog binding failed for {native_input}: {error}"
+                    ) from error
                 finally:
                     if native_path_output is not None:
                         try:
