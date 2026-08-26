@@ -94,10 +94,20 @@ class ShardReader:
         yield from (decode_node(payload, properties=not headers_only)
                     for payload in read_frames(path))
 
+    def raw_nodes(self) -> Iterator[bytes]:
+        """Yield the original protobuf node payloads without a dict round-trip."""
+        path = self.directory / str(self.manifest["nodes_file"])
+        yield from read_frames(path)
+
     def edges(self, *, headers_only: bool = False) -> Iterator[dict]:
         path = self.directory / str(self.manifest["edges_file"])
         yield from (decode_edge(payload, properties=not headers_only)
                     for payload in read_frames(path))
+
+    def raw_edges(self) -> Iterator[bytes]:
+        """Yield the original protobuf edge payloads without a dict round-trip."""
+        path = self.directory / str(self.manifest["edges_file"])
+        yield from read_frames(path)
 
 
 class ShardSetReader:
@@ -138,9 +148,17 @@ class ShardSetReader:
         for shard in self._shards():
             yield from shard.nodes(headers_only=headers_only)
 
+    def raw_nodes(self) -> Iterator[bytes]:
+        for shard in self._shards():
+            yield from shard.raw_nodes()
+
     def edges(self, *, headers_only: bool = False) -> Iterator[dict]:
         for shard in self._shards():
             yield from shard.edges(headers_only=headers_only)
+
+    def raw_edges(self) -> Iterator[bytes]:
+        for shard in self._shards():
+            yield from shard.raw_edges()
 
 
 class CompositeShardReader:
@@ -154,10 +172,16 @@ class CompositeShardReader:
             reader.nodes(headers_only=headers_only) for reader in self.readers
         )
 
+    def raw_nodes(self) -> Iterator[bytes]:
+        yield from chain.from_iterable(reader.raw_nodes() for reader in self.readers)
+
     def edges(self, *, headers_only: bool = False) -> Iterator[dict]:
         yield from chain.from_iterable(
             reader.edges(headers_only=headers_only) for reader in self.readers
         )
+
+    def raw_edges(self) -> Iterator[bytes]:
+        yield from chain.from_iterable(reader.raw_edges() for reader in self.readers)
 
 
 class ShardSetWriter:

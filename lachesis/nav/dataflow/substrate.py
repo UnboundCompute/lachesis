@@ -478,12 +478,25 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                   stage_nodes.open("wb") as node_stage,
                   stage_edges.open("wb") as edge_stage):
                 write_frame(pass2, encode_document(pass2_header))
-                for node in reader.nodes():
+                raw_nodes = getattr(reader, "raw_nodes", None)
+                node_stream = (raw_nodes() if raw_nodes is not None else
+                               ((None, node) for node in reader.nodes()))
+                for item in node_stream:
+                    if raw_nodes is not None:
+                        payload = item
+                        node = decode_node(payload)
+                    else:
+                        payload, node = item
                     if keep_node is not None and not keep_node(node):
                         continue
                     node_id = node.get("id")
                     kept_ids.add(node_id)
-                    write_frame(pass2, b"N" + encode_node(node))
+                    # Shard payloads already use the canonical NodeRecord wire
+                    # format.  Copy them directly into the complete Pass-2
+                    # stream; the decoded dict remains available for pruning and
+                    # the compact Pass-3 projection below.
+                    write_frame(pass2, b"N" +
+                                (payload if payload is not None else encode_node(node)))
                     props = node.get("properties") or {}
                     syntax_kind = props.get("syntax_kind") or node.get("kind")
                     if syntax_kind not in _SUBSTRATE_NODE_KINDS:
@@ -501,11 +514,20 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                     if syntax_kind in translation_seed_kinds:
                         translation_seed_nodes.append(compact)
 
-                for edge in reader.edges():
+                raw_edges = getattr(reader, "raw_edges", None)
+                edge_stream = (raw_edges() if raw_edges is not None else
+                               ((None, edge) for edge in reader.edges()))
+                for item in edge_stream:
+                    if raw_edges is not None:
+                        payload = item
+                        edge = decode_edge(payload)
+                    else:
+                        payload, edge = item
                     if (edge.get("source") not in kept_ids
                             or edge.get("target") not in kept_ids):
                         continue
-                    write_frame(pass2, b"E" + encode_edge(edge))
+                    write_frame(pass2, b"E" +
+                                (payload if payload is not None else encode_edge(edge)))
                     props = edge.get("properties") or {}
                     kind = (props.get("semantic_kind") or edge.get("semantic_kind")
                             or edge.get("kind"))
