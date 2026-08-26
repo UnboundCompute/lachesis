@@ -243,6 +243,11 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         field("syntax_kind", text(&syntax_kind)),
         field("type", text(&type_spelling)),
     ];
+    let owner_id = function_owner(cursor);
+    if let Some(owner_id) = &owner_id {
+        properties.push(field("owner_function_id", text(owner_id)));
+    }
+    let mut call_target = None;
     if syntax_kind == "CallExpr" {
         let referenced = clang_getCursorReferenced(cursor);
         if clang_is_null(referenced) == 0 {
@@ -260,6 +265,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                     properties.push(field("callee", text(&target_name)));
                     properties.push(field("primary_target_id", text(&target_id)));
                     properties.push(field("resolution", text("exact")));
+                    call_target = Some(target_id.clone());
                     emitter.edge(graph::EdgeRecord {
                         kind: "INVOKES".to_owned(),
                         source: id.clone(),
@@ -279,6 +285,40 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         properties,
         tier: tier.clone(),
     })?;
+
+    if syntax_kind == "CallExpr" {
+        if let (Some(owner_id), Some(target_id)) = (owner_id, call_target) {
+            emitter.edge(graph::EdgeRecord {
+                kind: "CALLS".to_owned(), source: owner_id, target: target_id,
+                properties: Vec::new(), source_tier: "T1".to_owned(),
+                relationship_class: "CALLS".to_owned(),
+            })?;
+        }
+    } else if syntax_kind == "DeclRefExpr" {
+        let referenced = clang_getCursorReferenced(cursor);
+        if clang_is_null(referenced) == 0 {
+            let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
+            let target_name = cx_string(clang_getCursorSpelling(referenced));
+            let (target_file, _, _, target_offset, target_end) = cursor_file(referenced);
+            let id_kind = match target_kind.as_str() {
+                "FunctionDecl" => Some("function"),
+                "VarDecl" | "ParmVarDecl" | "FieldDecl" => Some("value"),
+                _ => None,
+            };
+            if let (Some(id_kind), Some(_owner_id)) = (id_kind, owner_id) {
+                let target_id = stable_id(id_kind, &target_file, target_offset, target_end, &target_name);
+                emitter.edge(graph::EdgeRecord {
+                    kind: "REFERS_TO".to_owned(), source: id.clone(), target: target_id.clone(),
+                    properties: Vec::new(), source_tier: tier.clone(), relationship_class: "REFERS_TO".to_owned(),
+                })?;
+                emitter.edge(graph::EdgeRecord {
+                    kind: "VALUE_FLOWS_TO".to_owned(), source: target_id, target: id.clone(),
+                    properties: vec![field("reason", text("read"))], source_tier: tier.clone(),
+                    relationship_class: "VALUE_FLOWS_TO".to_owned(),
+                })?;
+            }
+        }
+    }
 
     let (parent_file, _parent_line, _parent_column, parent_offset, parent_end) = cursor_file(parent);
     let parent_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(parent)));
@@ -311,6 +351,27 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         })?;
     }
     Ok(())
+}
+
+unsafe fn function_owner(cursor: CXCursor) -> Option<String> {
+    let mut current = clang_getCursorSemanticParent(cursor);
+    for _ in 0..32 {
+        let (file, _, _, offset, end_offset) = cursor_file(current);
+        if file.is_empty() || clang_is_null(current) != 0 {
+            return None;
+        }
+        let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(current)));
+        let spelling = cx_string(clang_getCursorSpelling(current));
+        if syntax_kind == "FunctionDecl" {
+            return Some(stable_id("function", &file, offset, end_offset, &spelling));
+        }
+        let next = clang_getCursorSemanticParent(current);
+        if clang_is_null(next) != 0 {
+            return None;
+        }
+        current = next;
+    }
+    None
 }
 
 unsafe fn clang_is_null(cursor: CXCursor) -> c_int {
