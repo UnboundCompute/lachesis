@@ -7,6 +7,7 @@ edition = "2021"
 clang-sys = { version = "1.8", features = ["runtime", "clang_17_0"] }
 prost = "0.13"
 sha2 = "0.10"
+rustc-hash = "2"
 
 [build-dependencies]
 prost-build = "0.13"

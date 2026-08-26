@@ -1,7 +1,6 @@
 use clang_sys::*;
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
@@ -9,6 +8,7 @@ use std::io::{self, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 mod graph {
     include!(concat!(env!("OUT_DIR"), "/lachesis.graph.rs"));
@@ -120,12 +120,12 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32) {
 struct Emitter {
     nodes: File,
     edges: File,
-    node_ids: HashSet<String>,
-    edge_ids: HashSet<(String, String, String)>,
+    node_ids: FxHashSet<String>,
+    edge_ids: FxHashSet<(String, String, String)>,
     node_count: u64,
     edge_count: u64,
-    file_ids: HashMap<String, String>,
-    root_files: HashSet<String>,
+    file_ids: FxHashMap<String, String>,
+    root_files: FxHashSet<String>,
 }
 
 impl Emitter {
@@ -583,12 +583,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut emitter = Emitter {
             nodes: File::create(shard.join("nodes.pb"))?,
             edges: File::create(shard.join("edges.pb"))?,
-            node_ids: HashSet::new(),
-            edge_ids: HashSet::new(),
+            node_ids: FxHashSet::default(),
+            edge_ids: FxHashSet::default(),
             node_count: 0,
             edge_count: 0,
-            file_ids: HashMap::new(),
-            root_files: HashSet::new(),
+            file_ids: FxHashMap::default(),
+            root_files: FxHashSet::default(),
         };
         if let Some(request) = request.as_ref() {
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
