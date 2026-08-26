@@ -40,6 +40,8 @@ _CALLISH = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "BinaryOpera
 
 _CACHE_VERSION = 4
 _CACHE_SUFFIX = ".pass3.substrate.pb"
+_PASS2_INPUT_VERSION = 1
+_PASS2_INPUT_SUFFIX = ".pass2.input.pb"
 _TRANSLATION_CACHE_SUFFIX = ".pass2.translation.pb"
 _TRANSLATION_FACTS_SUFFIX = ".pass2.facts.pb"
 _SUBSTRATE_NODE_KINDS = frozenset({
@@ -70,6 +72,11 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
 
 def substrate_cache_path(graph_path):
     return Path(str(graph_path).rstrip("/") + _CACHE_SUFFIX)
+
+
+def pass2_input_cache_path(graph_path):
+    """Complete typed Pass-2 input emitted beside a Pass-1 store."""
+    return Path(str(graph_path).rstrip("/") + _PASS2_INPUT_SUFFIX)
 
 
 def translation_cache_path(graph_path):
@@ -336,6 +343,29 @@ def _write_framed_sidecar(target, prefix, header, nodes, edges):
         raise
 
 
+def _write_complete_pass2_input(target, nodes, edges, *, manifest=None):
+    """Write the lossless typed graph consumed by the native Pass-2 engine.
+
+    The lifetime substrate above is deliberately filtered and remains useful for
+    Pass 3.  The native Pass-2 engine needs the complete canonical node/edge
+    vocabulary, including nested properties and model roles, so it gets a separate
+    framed protobuf stream.  No Python graph reconstruction is required when the
+    engine reads it.
+    """
+    manifest = manifest or {}
+    header = {
+        "format": "lachesis-pass2-input",
+        "version": _PASS2_INPUT_VERSION,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "store_version": manifest.get("version"),
+        "core_content_hash": manifest.get("core_content_hash"),
+        "source_content_hash": manifest.get("source_content_hash"),
+        "build_fingerprint": manifest.get("build_fingerprint"),
+    }
+    _write_framed_sidecar(target, ".pass2-input-", header, nodes, edges)
+
+
 def _write_translation_facts(target, result):
     fd, temp_name = tempfile.mkstemp(prefix=".pass2-facts-", dir=str(target.parent))
     try:
@@ -413,6 +443,15 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     }
     target = substrate_cache_path(graph_path)
     _write_framed_sidecar(target, ".pass3-substrate-", header, cached_nodes, records)
+
+    # This lossless stream is the future single input to Rust Pass 2.  Keep it
+    # separate from the intentionally narrow Pass-3 substrate until the native
+    # engine is fully wired; both are generated from the same immutable Pass-1
+    # graph and are keyed by the same manifest.
+    _write_complete_pass2_input(
+        pass2_input_cache_path(graph_path), nodes, graph.get("edges", ()),
+        manifest=manifest,
+    )
 
     translation_nodes, translation_edges = _translation_records(cached_nodes, records)
     translation_header = {
