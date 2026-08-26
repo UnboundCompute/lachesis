@@ -17,6 +17,14 @@ use crate::{graph_proto, lifetime_proto};
 
 const FRAME_HEADER: usize = 4;
 
+// These are the only edge relations consumed by prepare_function.  The Pass-2
+// input is intentionally lossless for other native consumers, but retaining
+// unrelated overlays in every FunctionInput needlessly duplicates millions of
+// edge endpoints before temporal solving starts.
+fn retain_lifetime_edge(kind: &str) -> bool {
+    matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT")
+}
+
 /// Map the immutable Pass-1 substrate instead of reading a second full byte
 /// buffer.  The parser still materializes the compact native request it needs,
 /// but the raw protobuf stream is demand-paged and can be reclaimed by the OS.
@@ -534,6 +542,7 @@ fn scan_lifetime_metadata_reader<R: Read>(
             b'E' => {
                 let item = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph edge frame: {error}"))?;
+                if !retain_lifetime_edge(item.kind.as_str()) { continue; }
                 if let Some(selected) = selected_ids {
                     let source_selected = owners.get(&item.source)
                         .is_some_and(|owner| selected.contains(owner));
