@@ -565,6 +565,24 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     if file.is_empty() || (!emitter.root_files.is_empty() && !emitter.root_files.contains(&file)) {
         return Ok(());
     }
+    if syntax_kind == "InclusionDirective" {
+        let included = clang_getIncludedFile(cursor);
+        if !included.is_null() {
+            let included_raw = cx_string(clang_getFileName(included));
+            let included_file = emitter.canonical_file(included_raw);
+            if let (Some(source_id), Some(target_id)) = (
+                emitter.file_ids.get(&file).cloned(),
+                emitter.file_ids.get(&included_file).cloned(),
+            ) {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "DEPENDS_ON".to_owned(), source: source_id, target: target_id,
+                    properties: vec![field("directive", text("#include"))],
+                    source_tier: "T0".to_owned(), relationship_class: "DEPENDS_ON".to_owned(),
+                })?;
+            }
+        }
+        return Ok(());
+    }
 
     let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
         "FunctionDecl" => Some("function"),
