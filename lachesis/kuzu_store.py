@@ -100,6 +100,16 @@ PROMOTED_NODE_PROPS = (
     "frontend_id", "frontend_tier", "language", "compiler_node_id",
     "start_column", "end_column",
 )
+# The protobuf node encoder used to rescan every node's repeated property list once
+# per promoted column.  ``unit`` is an alias of ``file`` in the storage contract, so
+# keep both output positions in the lookup entry and fill all promoted cells in one
+# pass over the fields.
+_PROMOTED_FIELD_TARGETS: dict[str, tuple[int, ...]] = {}
+for _promoted_index, _promoted_name in enumerate(PROMOTED_NODE_PROPS):
+    _field_name = "file" if _promoted_name == "unit" else _promoted_name
+    _PROMOTED_FIELD_TARGETS[_field_name] = (
+        *_PROMOTED_FIELD_TARGETS.get(_field_name, ()), _promoted_index,
+    )
 _INT_COLUMNS = frozenset({
     "start_line", "end_line", "start_offset", "end_offset",
     "start_column", "end_column",
@@ -1186,9 +1196,23 @@ def _node_table_proto(nodes, *, elide: bool, codec: PropsCodec,
         data["id"].append(encode_id(node.id, codes))
         data["kind"].append(node.kind or None)
         data["label"].append(node.label or None)
-        for prop in PROMOTED_NODE_PROPS:
+        promoted = [None] * len(PROMOTED_NODE_PROPS)
+        seen = 0
+        for field in fields:
+            targets = _PROMOTED_FIELD_TARGETS.get(field.key)
+            if targets is None:
+                continue
+            value = _proto_value(field)
+            for target in targets:
+                bit = 1 << target
+                # Match _proto_promoted_value's first-field-wins behavior,
+                # including when that first value is an explicit protobuf null.
+                if not seen & bit:
+                    promoted[target] = value
+                    seen |= bit
+        for promoted_index, prop in enumerate(PROMOTED_NODE_PROPS):
             data[prop].append(_coded_cell(
-                prop, _proto_promoted_value(fields, prop), codes))
+                prop, promoted[promoted_index], codes))
         data["props"].append(codec.blob_fields(
             index_offset, fields, elide, _COLUMN_KEYS))
         index_offset += 1
