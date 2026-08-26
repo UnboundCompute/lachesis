@@ -87,7 +87,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         if !matches!(graph.kind(item.kind), "call" | "construct") { continue; }
         let call_index = match graph.node_by_id.get(&item.id).copied() { Some(v) => v, None => continue };
         let resolved = graph.outgoing[call_index].iter().any(|edge_index| {
-            matches!(graph.edge_kind(&graph.edges[*edge_index]).as_str(), "INVOKES" | "MAY_INVOKE")
+            matches!(graph.edge_kind(&graph.edges[*edge_index]), "INVOKES" | "MAY_INVOKE")
         });
         if resolved || explicit_by_site.contains_key(&item.id) { continue; }
 

@@ -63,7 +63,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         }
     }
     for (edge_index, item) in graph.edges.iter().enumerate() {
-        match graph.edge_kind(item).as_str() {
+        match graph.edge_kind(item) {
             "RETURNS_VALUE" => { returns_by_function.entry(item.target).or_default().push(item.source); }
             "ARGUMENT_BINDS_PARAMETER" => {
                 if let Some(argument) = graph.node_by_id.get(&item.source).map(|index| &graph.nodes[*index]) {
@@ -84,7 +84,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         if !matches!(graph.kind(call.kind), "call" | "construct") { continue; }
         let targets: Vec<u32> = graph.outgoing[graph.node_by_id[&call.id]].iter().filter_map(|edge_index| {
             let item = &graph.edges[*edge_index];
-            (matches!(graph.edge_kind(item).as_str(), "INVOKES" | "MAY_INVOKE") && graph.node_by_id.contains_key(&item.target)).then_some(item.target)
+            (matches!(graph.edge_kind(item), "INVOKES" | "MAY_INVOKE") && graph.node_by_id.contains_key(&item.target)).then_some(item.target)
         }).collect::<HashSet<_>>().into_iter().collect();
         let contextual_targets = if targets.is_empty() { vec![None] } else { targets.into_iter().map(Some).collect() };
         let call_id = graph.id(call.id).to_owned();

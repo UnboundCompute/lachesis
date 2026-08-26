@@ -88,7 +88,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     }
     for item in &graph.edges {
         let kind = graph.edge_kind(item);
-        match kind.as_str() {
+        match kind {
             "OVERRIDES" | "IMPLEMENTS_MEMBER" | "IMPLEMENTED_BY" => {
                 if CALLABLE_KINDS.iter().any(|kind| graph.node_index(graph.id(item.source))
                     .is_some_and(|index| graph.node_kind(index) == *kind)) &&
@@ -155,7 +155,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let call_id = node.id;
         for edge_index in graph.outgoing.get(graph.node_by_id.get(&call_id).copied().unwrap_or(usize::MAX)).into_iter().flatten() {
             let existing = &graph.edges[*edge_index];
-            if !["INVOKES", "MAY_INVOKE"].contains(&graph.edge_kind(existing).as_str()) { continue; }
+            if !["INVOKES", "MAY_INVOKE"].contains(&graph.edge_kind(existing)) { continue; }
             for implementation in implementations.get(&existing.target).into_iter().flatten() {
                 if emitted.insert((call_id, *implementation)) {
                     let source = graph.id(call_id).to_owned(); let target = graph.id(*implementation).to_owned();
@@ -232,7 +232,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let call_id = node.id;
         let has_existing = graph.outgoing.get(graph.node_by_id.get(&call_id).copied().unwrap_or(usize::MAX))
             .into_iter().flatten().any(|edge_index| {
-                ["INVOKES", "MAY_INVOKE"].contains(&graph.edge_kind(&graph.edges[*edge_index]).as_str())
+                ["INVOKES", "MAY_INVOKE"].contains(&graph.edge_kind(&graph.edges[*edge_index]))
             });
         if has_existing || emitted.iter().any(|(source, _)| *source == call_id) { continue; }
         let name = graph.node_property_text(node, "method_name")

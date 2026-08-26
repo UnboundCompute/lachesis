@@ -93,8 +93,8 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     let mut evidence: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
     for item in &graph.edges {
         let kind = graph.edge_kind(item);
-        if !FLOW_KINDS.contains(&kind.as_str()) { continue; }
-        let transition = kind.clone();
+        if !FLOW_KINDS.contains(&kind) { continue; }
+        let transition = kind.to_owned();
         let reason = graph.edge_property_text(item, "reason").map(str::to_owned);
         let context_id = graph.edge_property_text(item, "context_id").map(str::to_owned);
         adjacency.entry(item.source).or_default().push((item.target, transition, reason, context_id));

@@ -91,7 +91,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         }
     }
     for item in &graph.edges {
-        match graph.edge_kind(item).as_str() {
+        match graph.edge_kind(item) {
             "AST_CHILD" => { ast_parent.insert(item.target, item.source); }
             "CFG_NEXT" | "TRUE_BRANCH" | "FALSE_BRANCH" | "SWITCH_CASE" => {
                 cfg_successors.entry(item.source).or_default().push(item.target);

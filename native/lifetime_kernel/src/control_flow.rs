@@ -109,7 +109,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let kind = graph.edge_kind(item);
         let Some(source) = graph.symbols.find(graph.id(item.source)) else { continue };
         let Some(target) = graph.symbols.find(graph.id(item.target)) else { continue };
-        match kind.as_str() {
+        match kind {
             "AST_CHILD" => {
                 ast_children.entry(source).or_default().push((target, item.properties.clone()));
                 ast_parent.insert(target, source);

@@ -52,6 +52,8 @@ pub(crate) struct Node {
 
 pub(crate) struct Edge {
     pub(crate) kind: u32,
+    /// Semantic kind is resolved once at ingest (not once per traversal).
+    pub(crate) semantic_kind: u32,
     pub(crate) source: u32,
     pub(crate) target: u32,
     pub(crate) properties: Vec<graph_proto::Field>,
@@ -98,11 +100,7 @@ impl Graph {
         self.symbol(id).and_then(|symbol| self.node_by_id.get(&symbol).copied())
     }
 
-    pub(crate) fn edge_kind(&self, edge: &Edge) -> String {
-        let kind = self.kind(edge.kind);
-        if kind != "EXPANDS_TO" { return kind.to_owned(); }
-        self.edge_property_text(edge, "via").unwrap_or("EXPANDS_TO").to_owned()
-    }
+    pub(crate) fn edge_kind(&self, edge: &Edge) -> &str { self.kind(edge.semantic_kind) }
 
     pub(crate) fn edge_property_text<'a>(&self, edge: &'a Edge, key: &str) -> Option<&'a str> {
         edge.properties.iter().find_map(|field| {
@@ -157,12 +155,7 @@ impl Graph {
             self.incoming.push(Vec::new());
         }
         for record in delta.edges {
-            let edge = Edge {
-                kind: self.symbols.intern(record.kind),
-                source: self.symbols.intern(record.source),
-                target: self.symbols.intern(record.target),
-                properties: record.properties,
-            };
+            let edge = make_edge(&mut self.symbols, record.kind, record.source, record.target, record.properties);
             let triple = (edge.kind, edge.source, edge.target);
             let duplicate = self.edge_lookup.get(&triple).into_iter().flatten().any(|index| {
                 self.edges[*index].properties == edge.properties
@@ -180,6 +173,23 @@ impl Graph {
         }
         Ok(())
     }
+}
+
+fn make_edge(
+    symbols: &mut Symbols, kind: String, source: String, target: String,
+    properties: Vec<graph_proto::Field>,
+) -> Edge {
+    let raw_kind = symbols.intern(kind);
+    let semantic_kind = if symbols.get(raw_kind) == "EXPANDS_TO" {
+        properties.iter().find_map(|field| {
+            (field.key == "via").then(|| field.value.as_ref()).flatten().and_then(|value| match value.kind.as_ref()? {
+                graph_proto::value::Kind::Text(value) => Some(symbols.intern(value.clone())),
+                _ => None,
+            })
+        }).unwrap_or(raw_kind)
+    } else { raw_kind };
+    Edge { kind: raw_kind, semantic_kind, source: symbols.intern(source),
+        target: symbols.intern(target), properties }
 }
 
 /// Stable IDs intentionally match `lachesis.core.identities.stable_id` for the
@@ -262,10 +272,7 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid Pass-2 edge frame: {error}"))?;
-                edges.push(Edge {
-                    kind: symbols.intern(record.kind), source: symbols.intern(record.source),
-                    target: symbols.intern(record.target), properties: record.properties,
-                });
+                edges.push(make_edge(&mut symbols, record.kind, record.source, record.target, record.properties));
             }
             _ => return Err("unknown Pass-2 input record prefix".to_owned()),
         }
@@ -346,12 +353,7 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid Pass-2 edge frame: {error}"))?;
-                edges.push(Edge {
-                    kind: symbols.intern(record.kind),
-                    source: symbols.intern(record.source),
-                    target: symbols.intern(record.target),
-                    properties: record.properties,
-                });
+                edges.push(make_edge(&mut symbols, record.kind, record.source, record.target, record.properties));
             }
             _ => return Err("unknown Pass-2 input record prefix".to_owned()),
         }
