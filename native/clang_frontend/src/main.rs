@@ -128,6 +128,8 @@ struct Emitter {
     root_files: FxHashSet<String>,
     slot_bindings: FxHashMap<String, FxHashSet<String>>,
     function_ids: FxHashMap<String, FxHashSet<String>>,
+    function_definitions: FxHashMap<String, FxHashSet<String>>,
+    function_declarations: FxHashMap<String, FxHashSet<String>>,
 }
 
 impl Emitter {
@@ -136,10 +138,25 @@ impl Emitter {
             return Ok(());
         }
         if record.kind == "function" {
+            let declaration_only = record.properties.iter().find_map(|property| {
+                if property.key != "declaration_only" {
+                    return None;
+                }
+                match property.value.as_ref()?.kind.as_ref()? {
+                    graph::value::Kind::Boolean(value) => Some(*value),
+                    _ => None,
+                }
+            }).unwrap_or(false);
             self.function_ids
                 .entry(record.label.clone())
                 .or_default()
                 .insert(record.id.clone());
+            let index = if declaration_only {
+                &mut self.function_declarations
+            } else {
+                &mut self.function_definitions
+            };
+            index.entry(record.label.clone()).or_default().insert(record.id.clone());
         }
         frame(&mut self.nodes, &record.encode_to_vec())?;
         self.node_count += 1;
@@ -155,6 +172,35 @@ impl Emitter {
         self.edge_count += 1;
         Ok(())
     }
+}
+
+fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
+    let definitions: Vec<(String, String)> = emitter
+        .function_definitions
+        .iter()
+        .filter_map(|(name, ids)| {
+            if ids.len() == 1 { Some((name.clone(), ids.iter().next()?.clone())) } else { None }
+        })
+        .collect();
+    for (name, definition) in definitions {
+        let declarations: Vec<String> = emitter
+            .function_declarations
+            .get(&name)
+            .into_iter()
+            .flat_map(|ids| ids.iter().cloned())
+            .collect();
+        for declaration in declarations {
+            if declaration == definition {
+                continue;
+            }
+            emitter.edge(graph::EdgeRecord {
+                kind: "REFERS_TO".to_owned(), source: declaration, target: definition.clone(),
+                properties: vec![field("reason", text("prototype-of"))], source_tier: "T1".to_owned(),
+                relationship_class: "REFERS_TO".to_owned(),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
@@ -727,6 +773,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             root_files: FxHashSet::default(),
             slot_bindings: FxHashMap::default(),
             function_ids: FxHashMap::default(),
+            function_definitions: FxHashMap::default(),
+            function_declarations: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
@@ -773,6 +821,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             parse_unit(index, &unit, &mut emitter)?;
         }
+        emit_cross_tu_links(&mut emitter)?;
         emitter.nodes.flush()?;
         emitter.edges.flush()?;
         let node_count = emitter.node_count;
