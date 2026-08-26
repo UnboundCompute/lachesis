@@ -51,6 +51,7 @@ from lachesis.nav.dataflow.substrate import Substrate, cached_substrate
 from . import atropos, skeleton_ir as ir
 from .normalize import normalizer
 from .patterns import evaluator_for
+from .order import is_cyclic, tarjan_scc
 from .object_lifetime import (APBuilder, _argument_path, _path,
                                analyze_object_lifetimes, extract_operations, _props)
 from .object_state import AccessPath, OpKind
@@ -428,31 +429,16 @@ def _loop_nodes(cfg):
                     if target in nodes)
         for node in nodes
     }
-    reverse = defaultdict(set)
-    for source, targets in successors.items():
-        for target in targets:
-            reverse[target].add(source)
-
-    def walk(start, adjacency):
-        seen, pending = set(), [start]
-        while pending:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            pending.extend(adjacency.get(current, ()))
-        return seen
-
+    # A node belongs to a loop precisely when it is part of a cyclic strongly
+    # connected component.  The previous implementation called a forward and
+    # reverse reachability walk for every CFG edge, which repeated most of the
+    # function graph O(E) times and became dominant on loop-heavy functions.
+    # Tarjan is linear in the CFG size and gives the same cycle region without
+    # depending on source order or frontend loop spelling.
     result = set()
-    for source, targets in successors.items():
-        for target in targets:
-            # Any edge whose target can reach its source is a back edge in the
-            # structural sense, independent of frontend node ordering.
-            if target not in nodes or source not in nodes:
-                continue
-            if source not in walk(target, successors):
-                continue
-            result.update(walk(target, successors) & walk(source, reverse))
+    for component in tarjan_scc(tuple(nodes), successors):
+        if is_cyclic(component, successors):
+            result.update(component)
     return result
 
 
