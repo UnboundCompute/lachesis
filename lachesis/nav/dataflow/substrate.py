@@ -24,7 +24,7 @@ from lachesis.core.graph_wire import (
     encode_document, encode_edge, encode_node,
     read_frames, write_frame,
 )
-from lachesis.core import lifetime_pb2
+from lachesis.core import graph_pb2, lifetime_pb2
 
 from lachesis.timeit import timeit
 
@@ -126,6 +126,61 @@ def _CompactNode_from_payload(payload):
     node = decode_node(payload)
     return _CompactNode(node.get("id"), node.get("kind"), node.get("label"),
                         node.get("properties") or {})
+
+
+def _scalar_graph_value(value):
+    """Return the scalar value used by the compact projection, or ``None``.
+
+    Native shards already contain typed protobuf records.  The old streaming
+    publisher decoded every nested property into Python lists/dicts before
+    throwing almost all of them away.  Keep this deliberately scalar: the
+    Pass-3 substrate contract only retains scalar fields and the complete
+    Pass-2 stream copies the original payload unchanged.
+    """
+    if value is None:
+        return None
+    kind = value.WhichOneof("kind")
+    if kind == "text":
+        return value.text
+    if kind == "integer":
+        return value.integer
+    if kind == "real":
+        return value.real
+    if kind == "boolean":
+        return value.boolean
+    if kind == "null_value":
+        return None
+    return None
+
+
+def _native_node_projection(payload):
+    """Decode only the native-node fields needed while publishing sidecars."""
+    message = graph_pb2.NodeRecord()
+    message.ParseFromString(payload)
+    wanted = _SUBSTRATE_PROPERTY_KEYS
+    properties = {
+        field.key: value
+        for field in message.properties
+        if field.key in wanted
+        for value in (_scalar_graph_value(field.value),)
+        if value is not None
+    }
+    return message, properties
+
+
+def _native_edge_projection(payload):
+    """Decode only endpoint/kind and compact edge properties from a native edge."""
+    message = graph_pb2.EdgeRecord()
+    message.ParseFromString(payload)
+    wanted = {"semantic_kind", "role", "position", "reason"}
+    properties = {
+        field.key: value
+        for field in message.properties
+        if field.key in wanted
+        for value in (_scalar_graph_value(field.value),)
+        if value is not None
+    }
+    return message, properties
 
 
 def _CompactEdge_from_payload(payload):
@@ -512,14 +567,26 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                   stage_edges.open("wb") as edge_stage):
                 write_frame(pass2, encode_document(pass2_header))
                 raw_nodes = getattr(reader, "raw_nodes", None)
-                node_stream = (raw_nodes() if raw_nodes is not None else
-                               ((None, node) for node in reader.nodes()))
+                if raw_nodes is not None:
+                    # Native shards are already typed protobuf.  Decode only the
+                    # scalar projection needed for Pass 3; the complete Pass-2
+                    # record is copied byte-for-byte after its type tag.
+                    node_stream = (
+                        (payload, *_native_node_projection(payload))
+                        for payload in raw_nodes()
+                    )
+                else:
+                    node_stream = ((None, node, None) for node in reader.nodes())
                 for item in node_stream:
                     if raw_nodes is not None:
-                        payload = item
-                        node = decode_node(payload)
+                        payload, node_message, native_properties = item
+                        node = {
+                            "id": node_message.id, "kind": node_message.kind,
+                            "label": node_message.label,
+                            "properties": native_properties,
+                        }
                     else:
-                        payload, node = item
+                        payload, node, _ = item
                     if keep_node is not None and not keep_node(node):
                         continue
                     node_id = node.get("id")
@@ -548,14 +615,24 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                         translation_seed_nodes.append(compact)
 
                 raw_edges = getattr(reader, "raw_edges", None)
-                edge_stream = (raw_edges() if raw_edges is not None else
-                               ((None, edge) for edge in reader.edges()))
+                if raw_edges is not None:
+                    edge_stream = (
+                        (payload, *_native_edge_projection(payload))
+                        for payload in raw_edges()
+                    )
+                else:
+                    edge_stream = ((None, edge, None) for edge in reader.edges())
                 for item in edge_stream:
                     if raw_edges is not None:
-                        payload = item
-                        edge = decode_edge(payload)
+                        payload, edge_message, native_properties = item
+                        edge = {
+                            "kind": edge_message.kind,
+                            "source": edge_message.source,
+                            "target": edge_message.target,
+                            "properties": native_properties,
+                        }
                     else:
-                        payload, edge = item
+                        payload, edge, _ = item
                     if (edge.get("source") not in kept_ids
                             or edge.get("target") not in kept_ids):
                         continue
