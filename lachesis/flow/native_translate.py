@@ -183,6 +183,8 @@ def _native_plan(functions, prepared, source_catalog, *, facts_path=None,
 
 def build_native_F(store, lang="c", *, return_graph=False):
     index = store.index
+    base = (getattr(index, "_pass3_cache_base", None)
+            or getattr(index, "_db_dir", None))
     prepared = _native_prepared(index)
     if prepared is None:
         return None
