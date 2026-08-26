@@ -958,9 +958,28 @@ fn solve_prepared_functions(
     const LARGE_FUNCTION_NODES: usize = 2_000;
     let (large, small): (Vec<_>, Vec<_>) = prepared.into_iter()
         .partition(|function| function.nodes.len() > LARGE_FUNCTION_NODES);
-    let mut results = small.into_par_iter()
-        .map(|function| solve_prepared_function(function, include_prepared))
-        .collect::<Result<Vec<_>, _>>()?;
+    let worker_count = std::env::var("LACHESIS_LIFETIME_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let mut results = match worker_count {
+        Some(1) => small.into_iter()
+            .map(|function| solve_prepared_function(function, include_prepared))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(count) => {
+            let solve_small = || small.into_par_iter()
+                .map(|function| solve_prepared_function(function, include_prepared))
+                .collect::<Result<Vec<_>, _>>();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(count)
+                .build()
+                .map_err(|error| format!("cannot create lifetime worker pool: {error}"))?
+                .install(solve_small)?
+        }
+        None => small.into_par_iter()
+            .map(|function| solve_prepared_function(function, include_prepared))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     for function in large {
         results.push(solve_prepared_function(function, include_prepared)?);
     }

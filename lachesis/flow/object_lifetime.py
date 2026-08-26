@@ -918,7 +918,7 @@ class ObjectLifetimeResult:
     cfgs: dict[str, dict] = field(default_factory=dict)
 
 
-def _native_whole_graph_lifetimes(analysis_index, functions):
+def _native_whole_graph_lifetimes(analysis_index, functions, *, workers=None):
     """Run the complete binary-substrate lifetime path inside Rust.
 
     This is intentionally opt-in while differential parity is being closed.  The
@@ -943,7 +943,19 @@ def _native_whole_graph_lifetimes(analysis_index, functions):
         if name in functions and name not in by_name:
             by_name[name] = node["id"]
     selected_ids = set(by_name.values())
-    native = solve_selected_graph_pb(sidecar, selected_ids)
+    # The native small-function pool is intentionally configured at the FFI
+    # boundary so the public ``workers`` knob controls Rust as well as the
+    # Python fallback.  Preserve the caller's environment for embedded users.
+    previous_workers = os.environ.get("LACHESIS_LIFETIME_WORKERS")
+    if workers is not None:
+        os.environ["LACHESIS_LIFETIME_WORKERS"] = str(max(1, int(workers)))
+    try:
+        native = solve_selected_graph_pb(sidecar, selected_ids)
+    finally:
+        if previous_workers is None:
+            os.environ.pop("LACHESIS_LIFETIME_WORKERS", None)
+        else:
+            os.environ["LACHESIS_LIFETIME_WORKERS"] = previous_workers
     sub = cached_substrate(analysis_index)
     summaries = {}
     artifacts = {}
@@ -1035,7 +1047,8 @@ def analyze_object_lifetimes(store, functions, call_successors, *, lang="c", gra
                 or getattr(analysis_index, "_db_dir", None))
         native_whole_graph = bool(base and translation_facts_path(base).is_file())
     if native_whole_graph:
-        native_result = _native_whole_graph_lifetimes(analysis_index, functions)
+        native_result = _native_whole_graph_lifetimes(
+            analysis_index, functions, workers=workers)
         if native_result is not None:
             return native_result
     norm = normalizer(lang)
