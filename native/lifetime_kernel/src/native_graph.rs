@@ -17,10 +17,9 @@ use crate::{graph_proto, lifetime_proto};
 
 const FRAME_HEADER: usize = 4;
 
-// These are the only edge relations consumed by prepare_function.  The Pass-2
-// input is intentionally lossless for other native consumers, but retaining
-// unrelated overlays in every FunctionInput needlessly duplicates millions of
-// edge endpoints before temporal solving starts.
+// Temporal preparation only consumes these relations.  The complete Pass-2
+// sidecar remains lossless; filtering here prevents unrelated overlay edges
+// from being duplicated into every native FunctionInput.
 fn retain_lifetime_edge(kind: &str) -> bool {
     matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT")
 }
@@ -54,7 +53,7 @@ fn scalar(node: &graph_proto::NodeRecord, key: &str) -> Option<String> {
     })
 }
 
-fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::ScalarProperty> {
+fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<lifetime_proto::ScalarProperty> {
     node.properties.iter().filter_map(|field| {
         // The lifetime preparer only consumes these substrate attributes.  Do
         // not copy the rest of the frontend's arbitrary property bag into the
@@ -68,8 +67,6 @@ fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::Scal
             "start_line" |
             "operator" |
             "type" |
-            "owner_function_id" |
-            "function_id" |
             "primary_target_id" |
             "callee" |
             "receiver" |
@@ -77,7 +74,8 @@ fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::Scal
             "is_release" |
             "is_realloc" |
             "is_aggregate_copy"
-        ) {
+        ) && !(retain_owner && matches!(field.key.as_str(),
+            "owner_function_id" | "function_id")) {
             return None;
         }
         let value = field.value.as_ref()?.kind.as_ref()?;
@@ -94,12 +92,12 @@ fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::Scal
     }).collect()
 }
 
-fn node(node: &graph_proto::NodeRecord) -> lifetime_proto::GraphNode {
+fn node(node: &graph_proto::NodeRecord, retain_owner: bool) -> lifetime_proto::GraphNode {
     lifetime_proto::GraphNode {
         id: node.id.clone(),
         kind: node.kind.clone(),
         label: node.label.clone(),
-        properties: scalar_properties(node),
+        properties: scalar_properties(node, retain_owner),
     }
 }
 
@@ -171,17 +169,26 @@ fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
 pub(crate) fn sidecar_to_request(
     input: &[u8],
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, None)
+    sidecar_to_request_with_selection(input, None, true)
+}
+
+/// Temporal solving has already grouped each node into its owning function,
+/// so owner properties would be redundant in its per-node records.  Keep them
+/// for the semantic emitter, which still reads them when publishing events.
+pub(crate) fn sidecar_to_temporal_request(
+    input: &[u8],
+) -> Result<lifetime_proto::PrepareRequest, String> {
+    sidecar_to_request_with_selection(input, None, false)
 }
 
 pub(crate) fn sidecar_to_request_selected(
     input: &[u8], selected_ids: &HashSet<String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, Some(selected_ids))
+    sidecar_to_request_with_selection(input, Some(selected_ids), true)
 }
 
 fn sidecar_to_request_with_selection(
-    input: &[u8], selected_ids: Option<&HashSet<String>>,
+    input: &[u8], selected_ids: Option<&HashSet<String>>, retain_owner: bool,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
@@ -194,7 +201,7 @@ fn sidecar_to_request_with_selection(
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
             if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
-            entry.nodes.push(node(&item));
+            entry.nodes.push(node(&item, retain_owner));
             if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
                 call_nodes.push((function, item_id));
             }

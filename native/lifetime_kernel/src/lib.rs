@@ -1184,7 +1184,7 @@ pub unsafe extern "C" fn lachesis_lifetime_temporal_path(
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid temporal output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let request = native_graph::sidecar_to_request(&bytes)?;
+        let request = native_graph::sidecar_to_temporal_request(&bytes)?;
         let bytes = prepare::temporal_request(request)?;
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, bytes)
