@@ -389,6 +389,13 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     if let Some(owner_id) = &owner_id {
         properties.push(field("owner_function_id", text(owner_id)));
     }
+    if syntax_kind == "FunctionDecl" {
+        let has_definition = clang_isCursorDefinition(cursor) != 0;
+        properties.push(field("declaration_only", graph::Value {
+            kind: Some(graph::value::Kind::Boolean(!has_definition)),
+        }));
+        properties.push(field("form", text("function")));
+    }
     let mut call_target = None;
     if syntax_kind == "CallExpr" {
         let direct = clang_getCursorReferenced(cursor);
@@ -533,7 +540,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         emitter.edge(graph::EdgeRecord {
             kind: edge_kind.to_owned(),
             source: parent_id,
-            target: id,
+            target: id.clone(),
             properties: Vec::new(),
             source_tier: parent_tier,
             relationship_class: edge_kind.to_owned(),
@@ -541,11 +548,30 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     } else if let Some(file_id) = emitter.file_ids.get(&file) {
         let edge_kind = if tier == "T3" { "CONTAINS_BODY" } else if node_kind == "parameter" || node_kind == "variable" || node_kind == "property" || node_kind == "constant" { "DECLARES_VALUE" } else { "DECLARES" };
         emitter.edge(graph::EdgeRecord {
-            kind: edge_kind.to_owned(), source: file_id.clone(), target: id,
+            kind: edge_kind.to_owned(), source: file_id.clone(), target: id.clone(),
             properties: Vec::new(), source_tier: "T0".to_owned(), relationship_class: edge_kind.to_owned(),
         })?;
     }
+
+    if syntax_kind == "FunctionDecl"
+        && parent_kind == "TranslationUnitDecl"
+        && clang_isCursorDefinition(cursor) != 0
+        && clang_getCursorLinkage(cursor) != CXLinkage_Internal
+        && clang_getCursorLinkage(cursor) != CXLinkage_NoLinkage
+    {
+        if let Some(file_id) = emitter.file_ids.get(&file) {
+            emitter.edge(graph::EdgeRecord {
+                kind: "EXPORTS".to_owned(), source: file_id.clone(), target: id.clone(),
+                properties: vec![field("name", text(&label_for_cursor(cursor)))],
+                source_tier: "T0".to_owned(), relationship_class: "EXPORTS".to_owned(),
+            })?;
+        }
+    }
     Ok(())
+}
+
+unsafe fn label_for_cursor(cursor: CXCursor) -> String {
+    cx_string(clang_getCursorSpelling(cursor))
 }
 
 unsafe fn function_owner(cursor: CXCursor) -> Option<String> {
