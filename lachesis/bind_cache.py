@@ -26,11 +26,15 @@ import os
 import tempfile
 from contextlib import contextmanager
 
-from lachesis.core.graph_wire import decode_document, encode_document
+from lachesis.core import graph_pb2
+from lachesis.core.graph_wire import (
+    decode_document, decode_edge, decode_node, encode_document, _edge_message,
+    _node_message,
+)
 
 # Bump when the persisted shape changes in a way an old file would misdescribe. The header
 # match turns a bump into a clean miss (recompute) rather than a decode against stale layout.
-BIND_VERSION = 1
+BIND_VERSION = 2
 
 # Never let the sidecar dominate the time it saves: above this, the bind is used but not
 # written, because decoding a multi-gigabyte blob can rival recomputing the bind outright.
@@ -86,6 +90,51 @@ def _header_matches(document: dict, header: dict) -> bool:
             and document.get("options") == header["options"])
 
 
+def _document_message(value: dict) -> graph_pb2.Document:
+    message = graph_pb2.Document()
+    message.ParseFromString(encode_document(value))
+    return message
+
+
+def _document_value(message: graph_pb2.Document) -> dict:
+    return decode_document(message.SerializeToString())
+
+
+def _encode_typed(payload: dict) -> bytes:
+    stamped = payload["stamped"]
+    message = graph_pb2.BindCache(
+        format_version=1,
+        header=_document_message({key: payload[key]
+                                  for key in ("version", "core_content_hash", "options")}),
+        stamped_meta=_document_message({key: value for key, value in stamped.items()
+                                        if key not in {"nodes", "edges"}}),
+        summary=_document_message(payload["summary"]),
+    )
+    property_cache = {}
+    for node in stamped.get("nodes", ()):
+        message.nodes.add().CopyFrom(
+            _node_message(node, _property_cache=property_cache))
+    for edge in stamped.get("edges", ()):
+        message.edges.add().CopyFrom(
+            _edge_message(edge, _property_cache=property_cache))
+    return message.SerializeToString()
+
+
+def _decode_typed(blob: bytes) -> dict:
+    message = graph_pb2.BindCache()
+    message.ParseFromString(blob)
+    if message.format_version != 1:
+        raise ValueError("unsupported typed bind cache format")
+    header = _document_value(message.header)
+    stamped = _document_value(message.stamped_meta)
+    stamped["nodes"] = [decode_node(node.SerializeToString())
+                        for node in message.nodes]
+    stamped["edges"] = [decode_edge(edge.SerializeToString())
+                        for edge in message.edges]
+    return {**header, "stamped": stamped,
+            "summary": _document_value(message.summary)}
+
+
 def _graph_path(store) -> str | None:
     path = getattr(store, "graph_path", None)
     return path or None
@@ -112,9 +161,12 @@ def load(store) -> tuple[dict, dict] | None:
     except OSError:
         return None
     try:
-        document = decode_document(blob)
+        document = _decode_typed(blob)
     except (ValueError, TypeError):
-        return None
+        try:
+            document = decode_document(blob)
+        except (ValueError, TypeError):
+            return None
     if not _header_matches(document, header):
         return None
     stamped, summary = document.get("stamped"), document.get("summary")
@@ -143,7 +195,7 @@ def store(store, stamped: dict, summary: dict) -> None:
     payload["stamped"] = stamped
     payload["summary"] = summary
     try:
-        blob = encode_document(payload)
+        blob = _encode_typed(payload)
     except (TypeError, ValueError):
         return
     if len(blob) > _max_bytes():
