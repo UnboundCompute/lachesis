@@ -1343,7 +1343,7 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
 /// original AST and solver snapshots never cross the native boundary.
 pub(crate) fn semantic_request(
     request: lifetime_proto::PrepareRequest,
-) -> Result<Vec<u8>, String> {
+) -> Result<lifetime_proto::NativeSemanticResult, String> {
     let prepared = prepare_functions(request.functions)?;
     let functions = prepared.into_iter().map(|function| {
         let id = function.id.clone();
@@ -1457,10 +1457,7 @@ pub(crate) fn semantic_request(
             .collect();
         Ok(lifetime_proto::NativeSemanticFunction { id, entry, exits, nodes, edges })
     }).collect::<Result<Vec<_>, String>>()?;
-    let mut output = Vec::new();
-    lifetime_proto::NativeSemanticResult { functions, complete: true }
-        .encode(&mut output).map_err(|error| error.to_string())?;
-    Ok(output)
+    Ok(lifetime_proto::NativeSemanticResult { functions, complete: true })
 }
 
 fn prepare_functions(

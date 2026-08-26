@@ -1215,12 +1215,16 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             .map_err(|error| format!("invalid semantic output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
         let request = native_graph::sidecar_to_request(&bytes)?;
-        let result = prepare::semantic_request(request)?;
+        let full = prepare::semantic_request(request)?;
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
-        let full = lifetime_proto::NativeSemanticResult::decode(result.as_slice())
-            .map_err(|error| format!("invalid native semantic result: {error}"))?;
+        let result = full.encode_to_vec();
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, result)
+            .map_err(|error| format!("cannot write semantic result: {error}"))?;
+        fs::rename(&temporary, output)
+            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
         let events = lifetime_proto::NativeSemanticResult {
             functions: full.functions.into_iter().map(|mut function| {
                 function.nodes.retain(|node| !node.event_kind.is_empty());
@@ -1231,11 +1235,6 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             }).collect(),
             complete: full.complete,
         }.encode_to_vec();
-        let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, result)
-            .map_err(|error| format!("cannot write semantic result: {error}"))?;
-        fs::rename(&temporary, output)
-            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
         let events_output = format!("{output}.events.pb");
         let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
         fs::write(&events_temporary, events)
