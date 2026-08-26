@@ -1574,4 +1574,13 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
     os.replace(db_dir, target_db_dir)
     timing("publish store")
+    # Streaming builds intentionally never retain the composed graph, but Pass 2
+    # and Pass 3 still require the immutable Pass-1 sidecars produced by the
+    # ordinary writer.  Replay the shard files to publish them without rebuilding
+    # the full graph in Python.
+    from lachesis.nav.dataflow.substrate import write_streaming_pass1_caches
+    write_streaming_pass1_caches(
+        shard_reader, target_db_dir, manifest=payload,
+        keep_node=lambda node: not (prune and node.get("kind") in PRUNE_NODE_KINDS),
+    )
     return target_db_dir

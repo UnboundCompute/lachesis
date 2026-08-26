@@ -366,6 +366,97 @@ def _write_complete_pass2_input(target, nodes, edges, *, manifest=None):
     _write_framed_sidecar(target, ".pass2-input-", header, nodes, edges)
 
 
+def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
+                                 keep_node=None):
+    """Publish Pass-1 caches from a replayable shard reader.
+
+    The complete Pass-2 input is copied record-by-record.  Only the narrower
+    Pass-3/translation subset is retained briefly, so streaming Kùzu builds keep
+    their bounded-memory property while preserving the normal Pass-1 ABI.
+    """
+    manifest = dict(manifest or {})
+    kept_ids = set()
+    substrate_nodes = []
+    for node in reader.nodes():
+        if keep_node is not None and not keep_node(node):
+            continue
+        kept_ids.add(node.get("id"))
+        props = node.get("properties") or {}
+        syntax_kind = props.get("syntax_kind") or node.get("kind")
+        if syntax_kind in _SUBSTRATE_NODE_KINDS:
+            substrate_nodes.append({
+                "id": node.get("id"), "kind": node.get("kind"),
+                "label": node.get("label"),
+                "properties": {
+                    key: value for key, value in props.items()
+                    if key in _SUBSTRATE_PROPERTY_KEYS
+                    and isinstance(value, (str, int, float, bool, type(None)))
+                },
+            })
+
+    substrate_edges = []
+    for edge in reader.edges():
+        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+            continue
+        props = edge.get("properties") or {}
+        kind = (props.get("semantic_kind") or edge.get("semantic_kind")
+                or edge.get("kind"))
+        if kind == "AST_CHILD":
+            props = {key: props[key] for key in ("role", "position") if key in props}
+        elif kind in {"REFERS_TO", "CFG_NEXT"}:
+            props = {}
+        elif kind == "VALUE_FLOWS_TO" and props.get("reason") == "initializer":
+            props = {"reason": "initializer"}
+        else:
+            continue
+        substrate_edges.append({"source": edge.get("source"),
+                                "target": edge.get("target"), "kind": kind,
+                                "properties": props})
+
+    def stored_nodes():
+        for node in reader.nodes():
+            if keep_node is None or keep_node(node):
+                yield node
+
+    def stored_edges():
+        for edge in reader.edges():
+            if edge.get("source") in kept_ids and edge.get("target") in kept_ids:
+                yield edge
+
+    target = Path(graph_path)
+    _write_framed_sidecar(
+        pass2_input_cache_path(target), ".pass2-input-",
+        {"format": "lachesis-pass2-input", "version": _PASS2_INPUT_VERSION,
+         "node_count": int(manifest.get("node_count", 0)),
+         "edge_count": int(manifest.get("edge_count", 0)),
+         "store_version": manifest.get("version"),
+         "core_content_hash": manifest.get("core_content_hash"),
+         "source_content_hash": manifest.get("source_content_hash"),
+         "build_fingerprint": manifest.get("build_fingerprint")},
+        stored_nodes(), stored_edges())
+
+    translation_nodes, translation_edges = _translation_records(
+        substrate_nodes, substrate_edges)
+    common = {"store_version": manifest.get("version"),
+              "core_content_hash": manifest.get("core_content_hash"),
+              "source_content_hash": manifest.get("source_content_hash"),
+              "build_fingerprint": manifest.get("build_fingerprint")}
+    _write_framed_sidecar(
+        substrate_cache_path(target), ".pass3-substrate-",
+        {"format": "lachesis-pass3-substrate", "version": _CACHE_VERSION,
+         "edge_count": len(substrate_edges), "node_count": len(substrate_nodes),
+         "member_count": sum(1 for node in substrate_nodes
+                              if (node.get("properties") or {}).get("syntax_kind") == "MemberExpr"),
+         **common}, substrate_nodes, substrate_edges)
+    _write_framed_sidecar(
+        translation_cache_path(target), ".pass2-translation-",
+        {"format": "lachesis-pass2-translation", "version": _CACHE_VERSION,
+         "edge_count": len(translation_edges), "node_count": len(translation_nodes),
+         **common}, translation_nodes, translation_edges)
+    _write_translation_facts(translation_facts_path(target),
+                             _translation_facts(translation_nodes, translation_edges))
+
+
 def _write_translation_facts(target, result):
     fd, temp_name = tempfile.mkstemp(prefix=".pass2-facts-", dir=str(target.parent))
     try:
