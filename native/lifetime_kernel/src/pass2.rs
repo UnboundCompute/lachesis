@@ -6,7 +6,7 @@
 //! while protobuf properties remain typed for overlay-specific accessors.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use hashbrown::HashMap;
@@ -228,9 +228,82 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
 }
 
 pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
-    let input = fs::read(path.as_ref())
-        .map_err(|error| format!("cannot read Pass-2 input: {error}"))?;
-    read_bytes(&input)
+    let file = File::open(path.as_ref())
+        .map_err(|error| format!("cannot open Pass-2 input: {error}"))?;
+    let mut input = BufReader::with_capacity(1024 * 1024, file);
+    let header = read_stream_frame(&mut input)?;
+    let _: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
+        .map_err(|error| format!("invalid Pass-2 input header: {error}"))?;
+
+    let mut symbols = Symbols::default();
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    while let Some(payload) = read_optional_stream_frame(&mut input)? {
+        if payload.is_empty() { continue; }
+        match payload[0] {
+            b'N' => {
+                let record = graph_proto::NodeRecord::decode(&payload[1..])
+                    .map_err(|error| format!("invalid Pass-2 node frame: {error}"))?;
+                nodes.push(Node {
+                    id: symbols.intern(record.id), kind: symbols.intern(record.kind),
+                    label: record.label, properties: record.properties,
+                });
+            }
+            b'E' => {
+                let record = graph_proto::EdgeRecord::decode(&payload[1..])
+                    .map_err(|error| format!("invalid Pass-2 edge frame: {error}"))?;
+                edges.push(Edge {
+                    kind: symbols.intern(record.kind), source: symbols.intern(record.source),
+                    target: symbols.intern(record.target), properties: record.properties,
+                });
+            }
+            _ => return Err("unknown Pass-2 input record prefix".to_owned()),
+        }
+    }
+    finish_graph(symbols, nodes, edges)
+}
+
+fn finish_graph(
+    symbols: Symbols, nodes: Vec<Node>, edges: Vec<Edge>,
+) -> Result<Graph, String> {
+    let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
+    for (index, node) in nodes.iter().enumerate() { node_by_id.insert(node.id, index); }
+    let mut outgoing = vec![Vec::new(); nodes.len()];
+    let mut incoming = vec![Vec::new(); nodes.len()];
+    for (index, edge) in edges.iter().enumerate() {
+        if let Some(source) = node_by_id.get(&edge.source) { outgoing[*source].push(index); }
+        if let Some(target) = node_by_id.get(&edge.target) { incoming[*target].push(index); }
+    }
+    Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming })
+}
+
+fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
+    let mut header = [0u8; FRAME_HEADER];
+    reader.read_exact(&mut header)
+        .map_err(|error| format!("cannot read Pass-2 frame header: {error}"))?;
+    let length = u32::from_be_bytes(header) as usize;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)
+        .map_err(|error| format!("cannot read Pass-2 frame: {error}"))?;
+    Ok(payload)
+}
+
+fn read_optional_stream_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
+    let mut header = [0u8; FRAME_HEADER];
+    let mut read = 0;
+    while read < FRAME_HEADER {
+        match reader.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) => return Err("truncated Pass-2 input frame header".to_owned()),
+            Ok(count) => read += count,
+            Err(error) => return Err(format!("cannot read Pass-2 frame header: {error}")),
+        }
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)
+        .map_err(|error| format!("cannot read Pass-2 frame: {error}"))?;
+    Ok(Some(payload))
 }
 
 pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
