@@ -1142,15 +1142,17 @@ def main() -> int:
     def eligible(node: dict, inherited_included: bool) -> bool:
         return not (inherited_included or _has_include_origin(node))
 
-    # Filled while the declaration walk unwinds.  At that point every child
-    # FieldDecl has already been assigned its graph id, so record layouts can be
-    # harvested without a second complete AST traversal.
+    # Record declarations are collected in the original preorder during the
+    # declaration walk.  Their layouts are harvested after that walk, once all
+    # child FieldDecls have graph ids, without a second complete AST traversal.
     record_fields_by_type: Dict[str, List[Tuple[Optional[str], Optional[str]]]] = {}
 
     # Declaration pass.
     def declarations(node: dict, path: Path, owner: Optional[str] = None, included: bool = False) -> None:
         is_included = not eligible(node, included)
         kind = node.get("kind", "")
+        if kind == "RecordDecl":
+            record_nodes.append(node)
         current_owner = owner
         if not node.get("isImplicit") and not is_included and kind in ENTITY_KINDS:
             entity_kind = ENTITY_KINDS[kind]
@@ -1207,8 +1209,6 @@ def main() -> int:
                 graph.edge("EXPORTS", file_ids[path], value_id, name=name)
         for child in node.get("inner", []):
             declarations(child, path, current_owner, is_included)
-        if kind == "RecordDecl":
-            collect_record_fields_node(node)
 
     # Indirect-dispatch binding pre-pass. Function pointers reach their targets
     # through ops-struct slots (`.read = ext4_file_read`) and pointer variables
@@ -1393,7 +1393,10 @@ def main() -> int:
     # (it includes its own headers), so the three fuse safely into a single reload.
     # The body pass below reloads each TU once more; peak memory stays at one TU.
     for path, ast in asts:
+        record_nodes: List[dict] = []
         declarations(ast, path)
+        for record_node in record_nodes:
+            collect_record_fields_node(record_node)
         collect_bindings(ast)
 
     # Canonical slot index: map each materialised field node to its TU-stable
