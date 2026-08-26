@@ -31,6 +31,7 @@ mod native_graph;
 mod planner;
 mod pass2;
 mod control_flow;
+mod dispatch;
 
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
