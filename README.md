@@ -78,21 +78,19 @@ lachesis analyze graph.kuzu --summary         # pass 3 — the leads, rolled up 
 lachesis explain graph.kuzu tree.c:1487       # one call: the whole evidence chain for a site
 ```
 
-For a large mixed-language tree, use the bounded Pass-1 build form. It streams each
-frontend shard into Kùzu instead of composing the complete graph in Python, and emits
-the binary Pass-2 and Pass-3 sidecars beside the store for subsequent analysis:
+Pass 1 is bounded by default for core-only builds: each frontend shard streams directly
+into Kùzu instead of composing the complete graph in Python, and the binary Pass-2 and
+Pass-3 sidecars are emitted beside the store:
 
 ```bash
-LACHESIS_EMIT_TOKENS=0 LACHESIS_EMIT_PROOFS=0 \
-lachesis build ./my-project graph.kuzu --prune \
-  --stream-shards ./graph-shards --timeout 3600
+lachesis build ./my-project graph.kuzu --prune --timeout 3600
 ```
 
-The streaming build is core-only at the Kùzu boundary; it does not mean the later
-passes are unavailable. The complete Pass-2 input, compact translation facts, and
-Pass-3 substrate are persisted as protobuf sidecars, so `lachesis enrich graph.kuzu`
-can consume the same Pass-1 output without rebuilding the frontends. Keep the shard
-directory until those sidecars have been verified or copied.
+The core-only build also avoids token/proof compiler passes whose output is removed by
+`--prune`. The complete Pass-2 input, compact translation facts, and Pass-3 substrate
+are persisted as protobuf sidecars, so `lachesis enrich graph.kuzu` consumes the same
+Pass-1 output without rebuilding the frontends. The optional `--stream-shards DIR`
+form remains available when the intermediate shard directory must be retained.
 
 **Library** — a warm session: open (or build) once, ask many times, nothing recomputed
 between questions.
@@ -281,12 +279,14 @@ git clone https://github.com/UnboundCompute/lachesis && cd lachesis
 python -m pip install --upgrade pip     # editable installs need pip >= 21.3
 python -m pip install -e ".[dev]"       # builder, nav, MCP server, tests
 npm ci                                   # install the locked TypeScript compiler dependency
+cargo build --release --manifest-path native/clang_frontend/Cargo.toml
 ```
 
 Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library.
-Node 20+ must be on your PATH for the TS frontend; without `clang`, C files are skipped
-while every other language still builds. Run the frontend parity gate CI uses with
-`make check`. Semantic `concept_search` is optional and separate — opt in with
+Node 20+ must be on your PATH for the TS frontend. In a source checkout, the C frontend
+automatically uses the release Rust binary above; without that binary it uses the
+portable Clang frontend. Run the frontend parity gate CI uses with `make check`.
+Semantic `concept_search` is optional and separate — opt in with
 `pip install -e ".[concept-search]"`, then `lachesis concept-model download`.
 
 ## Where to go next
