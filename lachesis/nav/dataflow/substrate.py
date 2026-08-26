@@ -70,6 +70,51 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
 })
 
 
+class _CompactNode:
+    """Small temporary node record used while publishing streamed sidecars.
+
+    These records never escape this module.  Supporting the two mapping methods
+    used by the protobuf encoder and translation helpers lets the streamed path
+    avoid a dict allocation for every retained substrate node.
+    """
+    __slots__ = ("id", "kind", "label", "properties")
+
+    def __init__(self, node_id, kind, label, properties):
+        self.id = node_id
+        self.kind = kind
+        self.label = label
+        self.properties = properties
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError as error:
+            raise KeyError(key) from error
+
+
+class _CompactEdge:
+    """Small temporary edge record matching the local mapping seam."""
+    __slots__ = ("source", "target", "kind", "properties")
+
+    def __init__(self, source, target, kind, properties):
+        self.source = source
+        self.target = target
+        self.kind = kind
+        self.properties = properties
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError as error:
+            raise KeyError(key) from error
+
+
 def substrate_cache_path(graph_path):
     return Path(str(graph_path).rstrip("/") + _CACHE_SUFFIX)
 
@@ -412,15 +457,12 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                 props = node.get("properties") or {}
                 syntax_kind = props.get("syntax_kind") or node.get("kind")
                 if syntax_kind in _SUBSTRATE_NODE_KINDS:
-                    substrate_nodes.append({
-                        "id": node.get("id"), "kind": node.get("kind"),
-                        "label": node.get("label"),
-                        "properties": {
+                    substrate_nodes.append(_CompactNode(
+                        node.get("id"), node.get("kind"), node.get("label"), {
                             key: value for key, value in props.items()
                             if key in _SUBSTRATE_PROPERTY_KEYS
                             and isinstance(value, (str, int, float, bool, type(None)))
-                        },
-                    })
+                        }))
 
             for edge in reader.edges():
                 if (edge.get("source") not in kept_ids
@@ -439,9 +481,8 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                     props = {"reason": "initializer"}
                 else:
                     continue
-                substrate_edges.append({"source": edge.get("source"),
-                                        "target": edge.get("target"), "kind": kind,
-                                        "properties": props})
+                substrate_edges.append(_CompactEdge(
+                    edge.get("source"), edge.get("target"), kind, props))
         os.replace(pass2_temp, pass2_target)
     except BaseException:
         try:
