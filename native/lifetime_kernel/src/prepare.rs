@@ -1021,7 +1021,11 @@ fn solve_prepared_function(
     for (position, root) in function.parameters.iter().enumerate() {
         initial.seed_parameter(Path::root(format!("decl:{root}")), position as u32);
     }
-    let solved = crate::solve_graph(&function.nodes, &successors, &operations, initial, 32);
+    let solved = if let Some(order) = crate::linear_cfg_order(&function.nodes, &successors) {
+        crate::solve_linear(&order, &operations, initial)
+    } else {
+        crate::solve_graph(&function.nodes, &successors, &operations, initial, 32)
+    };
     Ok(lifetime_proto::PreparedFunctionResult {
         id,
         result: Some(crate::proto_result(solved)),

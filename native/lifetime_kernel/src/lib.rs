@@ -412,17 +412,28 @@ impl State {
 /// recognizes this shape; this function exists so the bridge can move the common case
 /// without crossing the FFI boundary for every operation or snapshot.
 pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State) -> LinearResult {
-    let mut point_states = Vec::with_capacity(nodes.len());
-    let mut post_states = Vec::with_capacity(nodes.len());
+    let mut at: HashMap<String, Vec<&Operation>> = HashMap::new();
+    for operation in operations {
+        at.entry(operation.node.clone()).or_default().push(operation);
+    }
+    let mut tracked = at.keys().cloned().collect::<HashSet<_>>();
+    if let Some(first) = nodes.first() { tracked.insert(first.clone()); }
+    if let Some(last) = nodes.last() { tracked.insert(last.clone()); }
+    let mut point_states = Vec::with_capacity(tracked.len());
+    let mut post_states = Vec::with_capacity(tracked.len());
     let mut findings = Findings::default();
     let mut transfers = 0;
     for node in nodes {
-        point_states.push((node.clone(), vec![state.snapshot()]));
-        for operation in operations.iter().filter(|operation| operation.node == *node) {
+        if tracked.contains(node) {
+            point_states.push((node.clone(), vec![state.snapshot()]));
+        }
+        for operation in at.get(node).into_iter().flatten() {
             state.apply(operation, &mut findings);
             transfers += 1;
         }
-        post_states.push((node.clone(), vec![state.snapshot()]));
+        if tracked.contains(node) {
+            post_states.push((node.clone(), vec![state.snapshot()]));
+        }
     }
     let exit_state = state.snapshot();
     LinearResult {
@@ -435,6 +446,29 @@ pub fn solve_linear(nodes: &[String], operations: &[Operation], mut state: State
         widenings: 0,
         capped: false,
     }
+}
+
+/// Return the unique acyclic CFG path when every node has at most one
+/// successor.  Such a function needs no worklist or state deduplication: each
+/// state has exactly one next location, so the linear transfer is equivalent.
+pub fn linear_cfg_order(nodes: &[String], successors: &HashMap<String, Vec<String>>)
+    -> Option<Vec<String>> {
+    let first = nodes.first()?.clone();
+    let known: HashSet<String> = nodes.iter().cloned().collect();
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut seen = HashSet::new();
+    let mut current = first;
+    loop {
+        if !known.contains(&current) || !seen.insert(current.clone()) {
+            return None;
+        }
+        order.push(current.clone());
+        let next = successors.get(&current).map(Vec::as_slice).unwrap_or(&[]);
+        if next.is_empty() { break; }
+        if next.len() != 1 { return None; }
+        current = next[0].clone();
+    }
+    (order.len() == nodes.len()).then_some(order)
 }
 
 fn proto_path(path: lifetime_proto::Path) -> Path {
@@ -1232,6 +1266,29 @@ mod tests {
         assert_eq!(result.post_states.len(), 2);
         assert_eq!(result.transfers, 2);
         assert!(result.findings.double_free.is_empty());
+    }
+
+    #[test]
+    fn linear_cfg_order_rejects_branches_and_cycles() {
+        let nodes = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let successors = HashMap::from([
+            ("a".into(), vec!["b".into()]),
+            ("b".into(), vec!["c".into()]),
+            ("c".into(), Vec::new()),
+        ]);
+        assert_eq!(linear_cfg_order(&nodes, &successors), Some(nodes.clone()));
+        let branch = HashMap::from([
+            ("a".into(), vec!["b".into(), "c".into()]),
+            ("b".into(), Vec::new()),
+            ("c".into(), Vec::new()),
+        ]);
+        assert_eq!(linear_cfg_order(&nodes, &branch), None);
+        let cycle = HashMap::from([
+            ("a".into(), vec!["b".into()]),
+            ("b".into(), vec!["a".into()]),
+            ("c".into(), Vec::new()),
+        ]);
+        assert_eq!(linear_cfg_order(&nodes, &cycle), None);
     }
 
     #[test]
