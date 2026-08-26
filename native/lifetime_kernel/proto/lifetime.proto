@@ -235,3 +235,55 @@ message TranslationFunction {
   repeated string parameter_names = 10;
 }
 message TranslationResult { repeated TranslationFunction functions = 1; }
+
+// Native Pass-2 source/coverage planning.  The planner consumes the compact
+// translation facts directly; it does not reopen Kùzu or materialize Python F
+// records.  Catalog entries are data so the same engine works for every
+// frontend/language.
+message SourceCatalogEntry { string name = 1; string kind = 2; }
+message NativePlanRequest {
+  TranslationResult translation = 1;
+  repeated SourceCatalogEntry sources = 2;
+}
+message NativeSourceSite {
+  string function = 1;
+  string node = 2;
+  string callee = 3;
+  sint64 line = 4;
+  bool has_line = 5;
+  repeated string arguments = 6;
+  repeated string influenced_roots = 7;
+  string kind = 8;
+}
+message NativeSeamBinding {
+  string caller = 1;
+  string callee = 2;
+  string call_node = 3;
+  repeated string formal_to_actual = 4;
+  string return_to = 5;
+}
+message NativePlanFunction {
+  string name = 1;
+  repeated string callees = 2;
+  repeated string callers = 3;
+  repeated NativeSourceSite source_sites = 4;
+  repeated string launch_nodes = 5;
+  string launch_provenance = 6;
+  repeated string provenance = 7;
+  repeated string influenced_roots = 8;
+  bool reachable = 9;
+}
+message NativeCoverageRegion {
+  string target = 1;
+  repeated string sources = 2;
+  repeated string functions = 3;
+  repeated string state_keys = 4;   // flattened function,source pairs
+  repeated string context_keys = 5; // flattened function,source,context triples
+}
+message NativePlanResult {
+  repeated NativePlanFunction functions = 1;
+  repeated NativeSeamBinding bindings = 2;
+  repeated NativeCoverageRegion regions = 3;
+  repeated string covered_functions = 4;
+  repeated string uncovered_functions = 5;
+}

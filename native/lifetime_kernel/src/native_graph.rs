@@ -108,7 +108,20 @@ fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
 pub(crate) fn sidecar_to_request(
     input: &[u8],
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(input)?;
+    sidecar_to_request_with_selection(input, None)
+}
+
+pub(crate) fn sidecar_to_request_selected(
+    input: &[u8], selected_ids: &HashSet<String>,
+) -> Result<lifetime_proto::PrepareRequest, String> {
+    sidecar_to_request_with_selection(input, Some(selected_ids))
+}
+
+fn sidecar_to_request_with_selection(
+    input: &[u8], selected_ids: Option<&HashSet<String>>,
+) -> Result<lifetime_proto::PrepareRequest, String> {
+    let (owners, function_names, call_ids, edges_by_source) =
+        scan_lifetime_metadata(input, selected_ids)?;
     let parents: HashMap<String, String> = edges_by_source.values().flatten()
         .filter(|item| item.kind == "AST_CHILD" && call_ids.contains(&item.target))
         .map(|item| (item.target.clone(), item.source.clone()))
@@ -120,6 +133,9 @@ pub(crate) fn sidecar_to_request(
     scan_lifetime_nodes(input, |item| {
         let item_id = item.id.clone();
         if let Some(function) = owner(&item) {
+            if selected_ids.is_some_and(|selected| !selected.contains(&function)) {
+                return;
+            }
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
             let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
@@ -410,6 +426,7 @@ where
 
 fn scan_lifetime_metadata(
     input: &[u8],
+    selected_ids: Option<&HashSet<String>>,
 ) -> Result<(
     HashMap<String, String>,
     HashMap<String, String>,
@@ -446,6 +463,13 @@ fn scan_lifetime_metadata(
             b'E' => {
                 let item = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph edge frame: {error}"))?;
+                if let Some(selected) = selected_ids {
+                    let source_selected = owners.get(&item.source)
+                        .is_some_and(|owner| selected.contains(owner));
+                    let target_selected = owners.get(&item.target)
+                        .is_some_and(|owner| selected.contains(owner));
+                    if !source_selected && !target_selected { continue; }
+                }
                 edges_by_source.entry(item.source.clone()).or_default().push(compact_edge(item));
             }
             _ => return Err("unknown graph sidecar record prefix".to_owned()),

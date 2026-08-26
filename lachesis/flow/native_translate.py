@@ -8,12 +8,13 @@ its recall is compared with :func:`translate.build_F`.
 from __future__ import annotations
 
 from collections import defaultdict
+import os
 
 from . import atropos
-from .coverage import CoverageScheduler
+from .coverage import CoveragePlan, CoverageRegion, CoverageScheduler
 from .normalize import normalizer
-from .source_discovery import discover_sources
-from .native_lifetime import translate_graph_pb
+from .source_discovery import SourceDiscovery, SourceSite, SeamBinding, discover_sources
+from .native_lifetime import plan_pass2_pb, translate_graph_pb
 from .translate import _expression_root, _guard_info, _header_node, _span
 from lachesis.planner.unbounded_copy import BranchRegions
 from lachesis.nav.dataflow.substrate import (
@@ -86,6 +87,54 @@ def _native_prepared(index):
     prepared = translate_graph_pb(sidecar)
     index._native_translation = prepared
     return prepared
+
+
+def _native_plan(functions, prepared, source_catalog):
+    """Adapt the native plan protobuf to the existing Python envelope."""
+    result = plan_pass2_pb(prepared, source_catalog)
+    by_name = {item.name: item for item in result.functions}
+    discovery_sites = []
+    launch_nodes = {}
+    launch_provenance = {}
+    provenance = {}
+    reachable = set()
+    influenced = {}
+    for name, record in functions.items():
+        item = by_name.get(name)
+        if item is None:
+            continue
+        for site in item.source_sites:
+            discovery_sites.append(SourceSite(
+                name, site.node or None, site.callee or None,
+                site.line if site.has_line else None,
+                tuple(site.arguments), tuple(site.influenced_roots),
+                site.kind or "external-input"))
+        if item.launch_nodes:
+            launch_nodes[name] = tuple(item.launch_nodes)
+        if item.launch_provenance:
+            launch_provenance[name] = item.launch_provenance
+        provenance[name] = tuple(item.provenance)
+        influenced[name] = tuple(item.influenced_roots)
+        if item.reachable:
+            reachable.add(name)
+    bindings = tuple(
+        SeamBinding(item.caller, item.callee, item.call_node or None,
+                    tuple(value.split("\x1f", 1) for value in item.formal_to_actual),
+                    item.return_to or None)
+        for item in result.bindings)
+    discovery = SourceDiscovery(
+        tuple(discovery_sites), bindings, launch_nodes, launch_provenance,
+        provenance, reachable, influenced)
+    regions = []
+    for item in result.regions:
+        state_keys = tuple(tuple(value.split("\x1f")) for value in item.state_keys)
+        context_keys = tuple(tuple(value.split("\x1f")) for value in item.context_keys)
+        regions.append(CoverageRegion(item.target, tuple(item.sources),
+                                      tuple(item.functions), state_keys,
+                                      context_keys))
+    coverage = CoveragePlan(tuple(regions), frozenset(result.covered_functions),
+                            frozenset(result.uncovered_functions))
+    return discovery, coverage
 
 
 def build_native_F(store, lang="c", *, return_graph=False):
@@ -275,8 +324,24 @@ def build_native_F(store, lang="c", *, return_graph=False):
         }
     succ = {name: [callee for callee in record["udf_callees"] if callee in functions]
             for name, record in functions.items()}
-    discovery = discover_sources(functions, succ, atropos.source_catalog(lang))
-    coverage = CoverageScheduler(functions, succ).plan()
+    # The compact facts already contain the complete call graph and source
+    # roots.  Keep source discovery and coverage planning in the same Rust
+    # process as translation; Python only adapts the typed result for legacy
+    # consumers below.
+    try:
+        # Keep the new planner behind an explicit flag until its duplicate
+        # symbol and source-root parity suite is complete.  The ABI is live and
+        # benchmarkable, but a native planner must not silently alter findings.
+        if os.environ.get("LACHESIS_NATIVE_PLAN") != "1":
+            raise RuntimeError("native planner parity gate is disabled")
+        discovery, coverage = _native_plan(
+            functions, prepared, atropos.source_catalog(lang))
+    except RuntimeError:
+        # Older development builds may not expose the planner symbol yet.  The
+        # native translation result remains usable while the compatibility path
+        # keeps existing callers functional.
+        discovery = discover_sources(functions, succ, atropos.source_catalog(lang))
+        coverage = CoverageScheduler(functions, succ).plan()
     coverage_by_target = {region.target: region for region in coverage.regions}
     for name, record in functions.items():
         record["source_sites"] = [{"node": site.node, "callee": site.callee,

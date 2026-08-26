@@ -22,6 +22,7 @@ mod graph_proto {
 }
 mod prepare;
 mod native_graph;
+mod planner;
 
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
@@ -740,6 +741,31 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_pb(
     pointer
 }
 
+/// Plan source launches, formal/actual seams, and coverage regions directly
+/// from compact translation facts and catalog entries.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_plan_pb(
+    input: *const u8, length: usize, output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        let request = lifetime_proto::NativePlanRequest::decode(bytes)
+            .map_err(|error| format!("invalid native plan protobuf: {error}"))?;
+        let mut output = Vec::new();
+        planner::plan(request).encode(&mut output)
+            .map_err(|error| error.to_string())?;
+        Ok::<Vec<u8>, String>(output)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native Pass-2 planning error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
 /// Read the complete framed substrate and run native preparation plus solving
 /// without returning through Python between the two phases.
 #[no_mangle]
@@ -779,12 +805,41 @@ pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_solve_selected_pb(
         let selected_ids: HashSet<String> = selected.functions.into_iter()
             .map(|function| function.id)
             .collect();
-        let mut request = native_graph::sidecar_to_request(bytes)?;
-        request.functions.retain(|function| selected_ids.contains(&function.id));
+        let request = native_graph::sidecar_to_request_selected(bytes, &selected_ids)?;
         prepare::prepare_and_solve_request_with_metadata(request)
     })();
     let mut payload = result.unwrap_or_else(|error| {
         eprintln!("native selected graph prepare/solve error: {error}");
+        Vec::new()
+    });
+    if !output_length.is_null() { *output_length = payload.len(); }
+    let pointer = payload.as_mut_ptr();
+    std::mem::forget(payload);
+    pointer
+}
+
+/// Prepare only the selected function slice.  This diagnostic/production
+/// boundary keeps graph preparation measurable independently from fixpoint
+/// solving and avoids retaining unselected edges.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_prepare_graph_selected_pb(
+    input: *const u8, length: usize,
+    selection: *const u8, selection_length: usize,
+    output_length: *mut usize,
+) -> *mut u8 {
+    let result = (|| {
+        let bytes = slice::from_raw_parts(input, length);
+        let selected_bytes = slice::from_raw_parts(selection, selection_length);
+        let selected = lifetime_proto::PrepareRequest::decode(selected_bytes)
+            .map_err(|error| format!("invalid lifetime selection protobuf: {error}"))?;
+        let selected_ids: HashSet<String> = selected.functions.into_iter()
+            .map(|function| function.id)
+            .collect();
+        let request = native_graph::sidecar_to_request_selected(bytes, &selected_ids)?;
+        prepare::solve_request(request)
+    })();
+    let mut payload = result.unwrap_or_else(|error| {
+        eprintln!("native selected graph preparation error: {error}");
         Vec::new()
     });
     if !output_length.is_null() { *output_length = payload.len(); }
@@ -841,7 +896,7 @@ fn join_states(states: &[State], node: &str) -> State {
         .collect();
     roots.sort();
     roots.dedup();
-    let mut signatures: HashMap<String, String> = HashMap::new();
+    let mut signatures: HashMap<(String, Vec<Option<String>>), String> = HashMap::new();
     let mut queued: Vec<(String, Vec<Option<String>>)> = Vec::new();
     let mut seen = HashSet::new();
     let mut phi_index = 0usize;
@@ -852,11 +907,14 @@ fn join_states(states: &[State], node: &str) -> State {
         {
             return signature[0].clone().unwrap();
         }
-        let key = format!("{}|{}", tag, signature.iter().map(|item| item.as_deref().unwrap_or("<none>")).collect::<Vec<_>>().join(";"));
+        let key = (tag.to_owned(), signature.to_vec());
         if let Some(existing) = signatures.get(&key) {
             return existing.clone();
         }
-        let value = format!("phi|{}|{}", tag, phi_index);
+        // Keep the merge node in the synthetic identity, matching the Python
+        // domain's (tag, node, ordinal) phi key.  Omitting it aliases unrelated
+        // joins and causes later loop signatures to churn instead of converging.
+        let value = format!("phi|{}|{}|{}", tag, node, phi_index);
         phi_index += 1;
         signatures.insert(key, value.clone());
         value
@@ -951,7 +1009,12 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
     let mut transfers = 0u64;
     let mut widenings = 0u64;
     let cap = max_disjuncts.max(1);
-    while let Some(node) = queue.pop_front() {
+    // Match the existing Python analyzer's bounded fixpoint budget.  This is
+    // an analysis-work guard for pathological loop/alias graphs, not a wall
+    // clock limit; capped results are surfaced to the caller as unsafe.
+    let transfer_cap = 10_000u64.max(nodes.len() as u64 * 500);
+    while transfers < transfer_cap {
+        let Some(node) = queue.pop_front() else { break };
         queued.remove(&node);
         let mut current = incoming.get_mut(&node).map(std::mem::take).unwrap_or_default();
         if tracked_nodes.contains(&node) {
@@ -994,11 +1057,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             let should_widen = target.len() + new_items.len() > cap
                 || widened.contains(successor);
             let (replacement, changed) = if should_widen {
+                let previous = (target.len() == 1).then(|| target[0].clone());
                 target.append(&mut new_items);
                 let candidates = target.iter().map(|state| (**state).clone()).collect::<Vec<_>>();
                 let merged = join_states(&candidates, successor);
-                let changed = target.len() != 1
-                    || !target.first().is_some_and(|old| old.as_ref().semantically_equal(&merged));
+                let changed = previous.is_none_or(|old| !old.as_ref().semantically_equal(&merged));
                 widened.insert(successor.clone());
                 widenings += 1;
                 (vec![Arc::new(merged)], changed)
@@ -1026,11 +1089,11 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             let should_widen = target.len() + new_items.len() > cap
                 || widened.contains(successor);
             let (replacement, changed) = if should_widen {
+                let previous = (target.len() == 1).then(|| target[0].clone());
                 let mut candidates = target.iter().map(|state| (**state).clone()).collect::<Vec<_>>();
                 candidates.extend(new_items.iter().map(|state| (**state).clone()));
                 let merged = join_states(&candidates, successor);
-                let changed = target.len() != 1
-                    || !target.first().is_some_and(|old| old.as_ref().semantically_equal(&merged));
+                let changed = previous.is_none_or(|old| !old.as_ref().semantically_equal(&merged));
                 widened.insert(successor.clone());
                 widenings += 1;
                 (vec![Arc::new(merged)], changed)

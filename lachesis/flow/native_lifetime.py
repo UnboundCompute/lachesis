@@ -249,6 +249,43 @@ def translate_graph_pb(sidecar_path: str | os.PathLike[str]):
     return {function.id: function for function in result.functions}
 
 
+def plan_pass2_pb(functions, source_catalog):
+    """Run native source discovery and coverage planning over translation facts.
+
+    ``functions`` is the compact ``TranslationFunction`` mapping already loaded
+    by Pass 2.  Only protobuf crosses this boundary; no Python F records or JSON
+    graph representation is sent to Rust.
+    """
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    request = lifetime_pb2.NativePlanRequest()
+    request.translation.functions.extend(functions.values())
+    for name, spec in source_catalog.items():
+        entry = request.sources.add(name=str(name))
+        if isinstance(spec, dict):
+            entry.kind = str(spec.get("kind") or "external-input")
+        else:
+            entry.kind = "external-input"
+    payload = request.SerializeToString()
+    buffer = ctypes.create_string_buffer(payload)
+    function = library.lachesis_lifetime_plan_pb
+    function.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                         ctypes.POINTER(ctypes.c_size_t)]
+    function.restype = ctypes.c_void_p
+    output_length = ctypes.c_size_t()
+    pointer = function(ctypes.cast(buffer, ctypes.c_void_p), len(payload),
+                       ctypes.byref(output_length))
+    if not pointer or not output_length.value:
+        raise RuntimeError("native Pass-2 planning returned no result")
+    try:
+        result = lifetime_pb2.NativePlanResult()
+        result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+    finally:
+        library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+    return result
+
+
 def prepare_graph_solve_pb(sidecar_path: str | os.PathLike[str]):
     """Run the complete binary-substrate preparation/solve path in Rust."""
     result = _call_sidecar("lachesis_lifetime_prepare_graph_solve_pb", sidecar_path,
@@ -290,6 +327,47 @@ def solve_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
                 raise RuntimeError("native selected lifetime solve returned no result")
             try:
                 result = lifetime_pb2.PrepareSolveResult()
+                result.ParseFromString(ctypes.string_at(pointer, output_length.value))
+            finally:
+                library.lachesis_lifetime_free_bytes(pointer, output_length.value)
+            return {function.id: function for function in result.functions}
+    finally:
+        os.close(descriptor)
+
+
+def prepare_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
+    """Prepare selected functions without running the lifetime fixpoint."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    prepare = library.lachesis_lifetime_prepare_graph_selected_pb
+    prepare.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                        ctypes.c_void_p, ctypes.c_size_t,
+                        ctypes.POINTER(ctypes.c_size_t)]
+    prepare.restype = ctypes.c_void_p
+    selection = lifetime_pb2.PrepareRequest()
+    for function_id in function_ids:
+        selection.functions.add(id=str(function_id))
+    selection_payload = selection.SerializeToString()
+    selection_buffer = ctypes.create_string_buffer(selection_payload)
+    path = os.fspath(sidecar_path)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        length = os.fstat(descriptor).st_size
+        if length <= 0:
+            raise RuntimeError("selected lifetime preparation received an empty sidecar")
+        with mmap.mmap(descriptor, length, access=mmap.ACCESS_COPY) as mapped:
+            view = ctypes.c_char.from_buffer(mapped)
+            output_length = ctypes.c_size_t()
+            pointer = prepare(
+                ctypes.c_void_p(ctypes.addressof(view)), length,
+                ctypes.cast(selection_buffer, ctypes.c_void_p), len(selection_payload),
+                ctypes.byref(output_length))
+            del view
+            if not pointer or not output_length.value:
+                raise RuntimeError("native selected lifetime preparation returned no result")
+            try:
+                result = lifetime_pb2.PrepareResult()
                 result.ParseFromString(ctypes.string_at(pointer, output_length.value))
             finally:
                 library.lachesis_lifetime_free_bytes(pointer, output_length.value)
