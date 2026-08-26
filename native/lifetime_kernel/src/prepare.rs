@@ -1201,7 +1201,13 @@ pub(crate) fn prepare_and_solve_request_with_metadata(
 pub(crate) fn temporal_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<Vec<u8>, String> {
+    let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
+    let started = std::time::Instant::now();
     let prepared = prepare_functions(request.functions)?;
+    if timing_enabled {
+        eprintln!("[lachesis native temporal] prepare: {:.3}s ({} functions)",
+            started.elapsed().as_secs_f64(), prepared.len());
+    }
     let results = prepared.into_par_iter()
         .map(|function| {
             let id = function.id.clone();
@@ -1242,10 +1248,18 @@ pub(crate) fn temporal_request(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if timing_enabled {
+        eprintln!("[lachesis native temporal] solve: {:.3}s ({} functions)",
+            started.elapsed().as_secs_f64(), results.len());
+    }
     let mut output = Vec::new();
     lifetime_proto::NativeTemporalResult { functions: results }
         .encode(&mut output)
         .map_err(|error| error.to_string())?;
+    if timing_enabled {
+        eprintln!("[lachesis native temporal] encode: {:.3}s ({} bytes)",
+            started.elapsed().as_secs_f64(), output.len());
+    }
     Ok(output)
 }
 
