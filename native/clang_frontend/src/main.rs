@@ -114,12 +114,7 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32
     let filename = if file.is_null() {
         String::new()
     } else {
-        let raw = cx_string(clang_getFileName(file));
-        PathBuf::from(&raw)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(raw))
-            .to_string_lossy()
-            .into_owned()
+        cx_string(clang_getFileName(file))
     };
 
     let extent = clang_getCursorExtent(cursor);
@@ -152,9 +147,26 @@ struct Emitter {
     function_definitions: FxHashMap<String, FxHashSet<String>>,
     function_declarations: FxHashMap<String, FxHashSet<String>>,
     function_parameters: FxHashMap<String, Vec<String>>,
+    path_cache: FxHashMap<String, String>,
 }
 
 impl Emitter {
+    fn canonical_file(&mut self, raw: String) -> String {
+        if raw.is_empty() {
+            return raw;
+        }
+        if let Some(cached) = self.path_cache.get(&raw) {
+            return cached.clone();
+        }
+        let canonical = PathBuf::from(&raw)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&raw))
+            .to_string_lossy()
+            .into_owned();
+        self.path_cache.insert(raw, canonical.clone());
+        canonical
+    }
+
     fn node(&mut self, record: graph::NodeRecord) -> io::Result<()> {
         if !self.node_ids.insert(id_key(&record.id)) {
             return Ok(());
@@ -425,7 +437,8 @@ extern "C" fn collect_callee_reference(
 unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
-    let (file, line, column, offset, end_offset, end_line, end_column) = cursor_file(cursor);
+    let (raw_file, line, column, offset, end_offset, end_line, end_column) = cursor_file(cursor);
+    let file = emitter.canonical_file(raw_file);
     if file.is_empty() || (!emitter.root_files.is_empty() && !emitter.root_files.contains(&file)) {
         return Ok(());
     }
@@ -480,7 +493,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         field("syntax_kind", text(&syntax_kind)),
         field("type", text(&type_spelling)),
     ];
-    let owner_id = function_owner(cursor);
+    let owner_id = function_owner(cursor, emitter);
     if let Some(owner_id) = &owner_id {
         properties.push(field("owner_function_id", text(owner_id)));
     }
@@ -502,7 +515,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
-            let (target_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+            let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+            let target_file = emitter.canonical_file(target_raw_file);
             if !target_file.is_empty() {
                 let target_id_kind = match target_kind.as_str() {
                     "FunctionDecl" => Some("function"),
@@ -586,7 +600,11 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     if tier == "T3" || syntax_kind == "VarDecl" {
         let mut children = ChildProbe { cursors: Vec::new() };
         clang_visitChildren(cursor, collect_direct_child, &mut children as *mut ChildProbe as *mut c_void);
-        let child_ids: Vec<String> = children.cursors.iter().filter_map(|child| cursor_graph_id(*child)).collect();
+        let child_ids: Vec<String> = children
+            .cursors
+            .iter()
+            .filter_map(|child| cursor_graph_id(*child, emitter))
+            .collect();
         if syntax_kind == "CallExpr" {
             let arguments: Vec<String> = child_ids.iter().skip(1).cloned().collect();
             let target_parameters = call_target.as_ref()
@@ -664,7 +682,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
-            let (target_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+            let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
+            let target_file = emitter.canonical_file(target_raw_file);
             let id_kind = match target_kind.as_str() {
                 "FunctionDecl" => Some("function"),
                 "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
@@ -685,7 +704,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         }
     }
 
-    let (parent_file, _parent_line, _parent_column, parent_offset, parent_end, _, _) = cursor_file(parent);
+    let (parent_raw_file, _parent_line, _parent_column, parent_offset, parent_end, _, _) = cursor_file(parent);
+    let parent_file = emitter.canonical_file(parent_raw_file);
     let parent_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(parent)));
     let parent_spelling = cx_string(clang_getCursorSpelling(parent));
     if let Some((_parent_kind, parent_tier, parent_id)) = cursor_identity(
@@ -733,10 +753,11 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     Ok(())
 }
 
-unsafe fn cursor_graph_id(cursor: CXCursor) -> Option<String> {
+unsafe fn cursor_graph_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
-    let (file, _, _, offset, end_offset, _, _) = cursor_file(cursor);
+    let (raw_file, _, _, offset, end_offset, _, _) = cursor_file(cursor);
+    let file = emitter.canonical_file(raw_file);
     cursor_identity(&syntax_kind, &file, offset, end_offset, &spelling).map(|(_, _, id)| id)
 }
 
@@ -744,10 +765,11 @@ unsafe fn label_for_cursor(cursor: CXCursor) -> String {
     cx_string(clang_getCursorSpelling(cursor))
 }
 
-unsafe fn function_owner(cursor: CXCursor) -> Option<String> {
+unsafe fn function_owner(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
     let mut current = clang_getCursorSemanticParent(cursor);
     for _ in 0..32 {
-        let (file, _, _, offset, end_offset, _, _) = cursor_file(current);
+        let (raw_file, _, _, offset, end_offset, _, _) = cursor_file(current);
+        let file = emitter.canonical_file(raw_file);
         if file.is_empty() || clang_is_null(current) != 0 {
             return None;
         }
@@ -900,6 +922,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             function_definitions: FxHashMap::default(),
             function_declarations: FxHashMap::default(),
             function_parameters: FxHashMap::default(),
+            path_cache: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
