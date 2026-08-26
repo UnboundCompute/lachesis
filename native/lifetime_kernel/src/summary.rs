@@ -29,8 +29,9 @@ fn argument_root(argument: &lifetime_proto::FunctionArgument) -> String {
     if root.is_empty() { root } else { format!("{}{}", root, argument.selectors.join("")) }
 }
 
-fn sink_position(access_path: &str) -> Option<u32> {
-    access_path.strip_prefix("Argument[")?.strip_suffix(']')?.parse().ok()
+fn sink_position(access_path: &str) -> Option<Option<u32>> {
+    let value = access_path.strip_prefix("Argument[")?.strip_suffix(']')?;
+    if value == "*" { Some(None) } else { Some(value.parse().ok()) }
 }
 
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -39,10 +40,12 @@ struct Summary {
     params: BTreeSet<(String, String)>,                 // parameter, sink
 }
 
-fn model_sinks(request: &crate::atropos_proto::Request) -> HashMap<String, Vec<u32>> {
-    let mut result: HashMap<String, BTreeSet<u32>> = HashMap::new();
+fn model_sinks(request: &crate::atropos_proto::Request,
+               languages: &BTreeSet<String>) -> HashMap<String, Vec<Option<u32>>> {
+    let mut result: HashMap<String, BTreeSet<Option<u32>>> = HashMap::new();
     for model in &request.models {
         if model.role != "sink" { continue; }
+        if !model.language.is_empty() && !languages.contains(&model.language) { continue; }
         let Some(position) = sink_position(&model.access_path) else { continue };
         let name = if model.package.is_empty() || model.package == "builtins" {
             model.method.clone()
@@ -71,7 +74,17 @@ pub(crate) fn summarize(
     catalog: crate::atropos_proto::Request,
 ) -> lifetime_proto::NativeSummaryResult {
     let (functions, by_base) = function_names(&translation.functions);
-    let sinks = model_sinks(&catalog);
+    let languages: BTreeSet<String> = translation.functions.iter()
+        .filter_map(|function| {
+            let file = function.file.to_ascii_lowercase();
+            if file.ends_with(".c") || file.ends_with(".h") || file.ends_with(".cc")
+                || file.ends_with(".cpp") || file.ends_with(".cxx") { Some("c".into()) }
+            else if file.ends_with(".py") { Some("python".into()) }
+            else if file.ends_with(".js") || file.ends_with(".ts") { Some("javascript".into()) }
+            else { None }
+        }).collect();
+    let languages = if languages.is_empty() { ["c".into()].into_iter().collect() } else { languages };
+    let sinks = model_sinks(&catalog, &languages);
     let mut summaries: BTreeMap<String, Summary> = functions.keys()
         .map(|name| (name.clone(), Summary::default())).collect();
 
@@ -86,14 +99,19 @@ pub(crate) fn summarize(
             for call in &function.calls {
                 if let Some(positions) = sinks.get(&call.callee) {
                     for position in positions {
-                        let Some(argument) = call.arguments.iter()
-                            .find(|argument| argument.position == *position) else { continue };
-                        let root = argument_root(argument);
-                        if root.is_empty() { continue; }
-                        let sink = format!("{}.a{}", call.callee, position);
-                        additions.flows.insert((sink.clone(), root.clone(), root.clone(), "direct".into()));
-                        if parameters.contains(root.as_str()) {
-                            additions.params.insert((root.clone(), sink));
+                        let selected: Vec<&lifetime_proto::FunctionArgument> = match position {
+                            Some(position) => call.arguments.iter()
+                                .filter(|argument| argument.position == *position).collect(),
+                            None => call.arguments.iter().collect(),
+                        };
+                        for argument in selected {
+                            let root = argument_root(argument);
+                            if root.is_empty() { continue; }
+                            let sink = format!("{}.a{}", call.callee, argument.position);
+                            additions.flows.insert((sink.clone(), root.clone(), root.clone(), "direct".into()));
+                            if parameters.contains(root.as_str()) {
+                                additions.params.insert((root.clone(), sink));
+                            }
                         }
                     }
                 }
