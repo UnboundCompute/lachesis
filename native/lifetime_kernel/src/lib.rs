@@ -1083,13 +1083,6 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         let Some(node) = queue.pop_front() else { break };
         queued.remove(&node);
         let mut current = incoming.get_mut(&node).map(std::mem::take).unwrap_or_default();
-        if tracked_nodes.contains(&node) {
-            // Snapshot the point state once this worklist version is selected,
-            // then release the full mutable state after propagation.  Keeping
-            // full State clones in `incoming` for every operation node causes
-            // branch-heavy functions to retain thousands of historical heaps.
-            point_snapshots.insert(node.clone(), current.iter().map(|state| state.snapshot()).collect());
-        }
         for operation in at.get(&node).into_iter().flatten() {
             let mut next = Vec::with_capacity(current.len());
             for shared in current {
@@ -1101,9 +1094,6 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
             current = deduplicate_shared(next);
         }
         transfers += current.len() as u64;
-        if tracked_nodes.contains(&node) {
-            post_snapshots.insert(node.clone(), current.iter().map(|state| state.snapshot()).collect());
-        }
         let outgoing = successors.get(&node).map(Vec::as_slice).unwrap_or(&[]);
         if outgoing.len() == 1 {
             // The common CFG case: no branch means the states have exactly one
@@ -1173,6 +1163,34 @@ pub fn solve_graph(nodes: &[String], successors: &HashMap<String, Vec<String>>,
                 queue.push_back(successor.clone());
             }
         }
+    }
+
+    // Worklist nodes can be revisited many times before a loop reaches a fixpoint.
+    // Snapshots are only consumed after convergence, so materializing them inside
+    // the loop needlessly cloned the same large abstract states over and over.
+    // Reconstruct the final point/post view once from the converged incoming map.
+    for node in nodes.iter().filter(|node| tracked_nodes.contains(*node)) {
+        let current = incoming.get(node).map(Vec::as_slice).unwrap_or(&[]);
+        point_snapshots.insert(
+            node.clone(),
+            current.iter().map(|state| state.snapshot()).collect(),
+        );
+        let mut post = current.iter().cloned().collect::<Vec<_>>();
+        let mut ignored_findings = Findings::default();
+        for operation in at.get(node).into_iter().flatten() {
+            let mut next = Vec::with_capacity(post.len());
+            for shared in post {
+                let state = Arc::try_unwrap(shared)
+                    .unwrap_or_else(|shared| (*shared).clone());
+                next.extend(state.apply_variants(operation, &mut ignored_findings)
+                    .into_iter().map(Arc::new));
+            }
+            post = deduplicate_shared(next);
+        }
+        post_snapshots.insert(
+            node.clone(),
+            post.iter().map(|state| state.snapshot()).collect(),
+        );
     }
 
     let point_states = nodes.iter().filter_map(|node| {
