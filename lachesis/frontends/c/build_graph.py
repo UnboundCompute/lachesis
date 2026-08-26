@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -382,6 +383,7 @@ def run_clang_over(
     paths: Iterable[Path], source_dir: Path, *arguments: str,
     file_flags_of: Optional[Dict[Path, List[str]]] = None,
     jobs: Optional[int] = None,
+    label: Optional[str] = None,
 ) -> Iterator[Tuple[Path, subprocess.CompletedProcess]]:
     """Run one clang invocation per path, several at a time, yielding in ``paths`` order.
 
@@ -401,10 +403,26 @@ def run_clang_over(
     paths = list(paths)
     flags = file_flags_of or {}
     jobs = jobs or clang_jobs(len(paths))
+    timing_enabled = os.environ.get("LACHESIS_TIMINGS") == "1"
+    timing_started = time.perf_counter()
+    completed_count = 0
+
+    def report() -> None:
+        if timing_enabled:
+            print(
+                "[lachesis timing] clang %s: %.3fs (%d/%d files, jobs=%d)"
+                % (label or "pass", time.perf_counter() - timing_started,
+                   completed_count, len(paths), jobs),
+                file=sys.stderr, flush=True,
+            )
+
     if jobs <= 1 or len(paths) <= 1:
         for path in paths:
-            yield path, run_clang(source_dir, path, *arguments,
-                                  file_flags=flags.get(path))
+            result = run_clang(source_dir, path, *arguments,
+                               file_flags=flags.get(path))
+            completed_count += 1
+            yield path, result
+        report()
         return
     upcoming = iter(paths)
     pending: deque = deque()
@@ -424,9 +442,11 @@ def run_clang_over(
         while pending:
             path, future = pending.popleft()
             result = future.result()
+            completed_count += 1
             # refill only after one result is retired, so the window stays at `jobs`
             submit_next()
             yield path, result
+    report()
 
 
 def source_text(path: Path, cache: Dict[Path, str]) -> str:
@@ -987,7 +1007,8 @@ def main() -> int:
 
     # Compiler dependency extraction makes framework/header ownership explicit.
     for path, dependency in run_clang_over(translation_units, source_dir, "-MM",
-                                           file_flags_of=compile_commands):
+                                           file_flags_of=compile_commands,
+                                           label="dependencies"):
         flattened = dependency.stdout.replace("\\\n", " ")
         dependencies = flattened.split(":", 1)[1].split() if ":" in flattened else []
         for raw in dependencies:
@@ -1023,6 +1044,7 @@ def main() -> int:
     for path, result in run_clang_over(
         files, source_dir, "-Xclang", "-ast-dump=json", "-fsyntax-only",
         "-Wno-everything", file_flags_of=compile_commands,
+        label="ast",
     ):
         # Clang emits a COMPLETE AST on stdout even when it exits nonzero from
         # residual (cross-config) diagnostics — routine for real kernel TUs, which
@@ -1724,6 +1746,7 @@ def main() -> int:
     for path, result in run_clang_over(
         files if tokens_wanted else [], source_dir, "-Xclang", "-dump-tokens",
         "-fsyntax-only", "-Wno-everything", file_flags_of=compile_commands,
+        label="tokens",
     ):
         previous = None
         for line in result.stderr.splitlines():
@@ -1761,6 +1784,7 @@ def main() -> int:
     for path, result in run_clang_over(
         [path for path in files if path in file_ids], source_dir, "-E", "-dD",
         file_flags_of=compile_commands,
+        label="macros",
     ):
         if result.returncode != 0:
             continue
