@@ -32,17 +32,6 @@ fn role(value: &str) -> Option<Role> {
     })
 }
 
-fn property(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
-    node.properties.iter().find_map(|item| {
-        if item.key != key { return None; }
-        item.value.as_ref().map(|value| match value {
-            lifetime_proto::scalar_property::Value::Text(value) => value.clone(),
-            lifetime_proto::scalar_property::Value::Integer(value) => value.to_string(),
-            lifetime_proto::scalar_property::Value::Boolean(value) => value.to_string(),
-        })
-    })
-}
-
 fn text_property<'a>(node: &'a lifetime_proto::GraphNode, key: &str) -> Option<&'a str> {
     node.properties.iter().find_map(|item| {
         if item.key != key { return None; }
@@ -216,7 +205,7 @@ impl<'a> GraphView<'a> {
             "ArraySubscriptExpr" => {
                 let children = self.children_of(&id)?;
                 let base_id = children.iter().find(|child| {
-                    self.node(child).and_then(|node| property(node, "type"))
+                    self.node(child).and_then(|node| text_property(node, "type")).map(str::to_owned)
                         .is_some_and(|value| value.contains('*') || value.contains('['))
                 }).or_else(|| children.first())?;
                 let mut base = self.access_path(base_id, depth + 1)?;
@@ -730,7 +719,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
         for node in &graph.nodes {
             let node_id = node.id.as_str();
             if graph.kind(node_id) != "ReturnStmt" { continue; }
-            let line = property(node, "start_line").and_then(|value| value.parse().ok());
+            let line = integer_property(node, "start_line");
             let Some(child) = graph.children_of(node_id).into_iter().flatten()
                 .min_by_key(|child| graph.offset(child)) else { continue };
             let peeled = graph.peel((*child).to_owned());
@@ -755,7 +744,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
 
 fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::PreparedFunction {
     let mut nodes = input.nodes;
-    nodes.sort_by_key(|node| property(node, "start_offset").and_then(|value| value.parse::<i64>().ok()).unwrap_or(i64::MAX));
+    nodes.sort_by_key(|node| integer_property(node, "start_offset").unwrap_or(i64::MAX));
     let graph = GraphView::new(&nodes, &input.edges);
     let node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
     let node_set = node_ids.iter().cloned().collect::<HashSet<_>>();
@@ -810,7 +799,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             let rhs = ordered.get(1).or_else(|| ordered.first());
             let lhs = ordered.first();
             if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
-                let line = graph.node(node_id).and_then(|node| property(node, "start_line")).and_then(|value| value.parse().ok());
+                let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
                 if let Some(target) = graph.deref_base(lhs) {
                     operations.push(raw_operation(Kind::Use, node_id, Some(target), graph.access_path(rhs, 0), line, false, "write"));
                 }
@@ -838,7 +827,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 }
             }
         } else if kind == "VarDecl" && graph.is_pointer(node_id) {
-            let line = graph.node(node_id).and_then(|node| property(node, "start_line")).and_then(|value| value.parse().ok());
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
             let target = path(Some(node_id));
             if let Some(initializer) = graph.initializer_of(node_id) {
                 let initializer = graph.peel(initializer.to_owned());
@@ -867,7 +856,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         if !assignment_lhs {
             if let Some(base) = graph.deref_base(node_id) {
                 operations.push(raw_operation(Kind::Use, node_id, Some(base), None,
-                    graph.node(node_id).and_then(|node| property(node, "start_line")).and_then(|value| value.parse().ok()),
+                    graph.node(node_id).and_then(|node| integer_property(node, "start_line")),
                     false, "deref"));
             }
         }
@@ -954,7 +943,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for node in &graph.nodes {
         let node_id = node.id.as_str();
         if graph.kind(node_id) != "ReturnStmt" { continue; }
-        let line = property(node, "start_line").and_then(|value| value.parse().ok());
+        let line = integer_property(node, "start_line");
         let child = graph.children_of(node_id).into_iter().flatten()
             .min_by_key(|child| graph.offset(child));
         let Some(child) = child else { continue };
@@ -1108,7 +1097,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     }
     let loop_nodes = cyclic_nodes(&prepared_nodes, &successor_map);
     let offsets: HashMap<String, i64> = nodes.iter().filter_map(|node| {
-        property(node, "start_offset").and_then(|value| value.parse().ok())
+        integer_property(node, "start_offset")
             .map(|offset| (node.id.clone(), offset))
     }).collect();
     assign_generations(&mut operations, &prepared_nodes, &successor_map, &offsets);
@@ -1131,13 +1120,13 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         }
     }
     let metadata = nodes.iter().filter(|node| metadata_ids.contains(&node.id)).map(|node| {
-        let offset = property(node, "start_offset").and_then(|value| value.parse::<i64>().ok());
+        let offset = integer_property(node, "start_offset");
         lifetime_proto::SemanticNodeMetadata {
             id: node.id.clone(), label: node.label.clone(),
-            kind: property(node, "syntax_kind").unwrap_or_else(|| node.kind.clone()),
-            owner: property(node, "owner_function_id")
-                .or_else(|| property(node, "function_id")).unwrap_or_default(),
-            r#type: property(node, "type").unwrap_or_default(),
+            kind: text_property(node, "syntax_kind").map(str::to_owned).unwrap_or_else(|| node.kind.clone()),
+            owner: text_property(node, "owner_function_id")
+                .or_else(|| text_property(node, "function_id")).unwrap_or_default().to_owned(),
+            r#type: text_property(node, "type").unwrap_or_default().to_owned(),
             offset: offset.unwrap_or_default(), has_offset: offset.is_some(),
         }
     }).collect::<Vec<_>>();
