@@ -398,6 +398,26 @@ def plan_path(facts_path: str | os.PathLike[str],
     return result
 
 
+def summaries_path(facts_path: str | os.PathLike[str],
+                   catalog_path: str | os.PathLike[str],
+                   output_path: str | os.PathLike[str]):
+    """Compose reach-only summaries from binary sidecars in Rust."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = library.lachesis_lifetime_summaries_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(os.fsencode(os.fspath(facts_path)),
+                      os.fsencode(os.fspath(catalog_path)),
+                      os.fsencode(os.fspath(output_path)))
+    if status != 0:
+        raise RuntimeError(f"native binary summaries failed with status {status}")
+    result = lifetime_pb2.NativeSummaryResult()
+    result.ParseFromString(Path(output_path).read_bytes())
+    return result
+
+
 def prepare_selected_graph_pb(sidecar_path: str | os.PathLike[str], function_ids):
     """Prepare selected functions without running the lifetime fixpoint."""
     library = _load()

@@ -308,3 +308,30 @@ message NativePlanResult {
   repeated string covered_functions = 4;
   repeated string uncovered_functions = 5;
 }
+
+// Compact interprocedural reach summaries. These are the summary fields used
+// by the semantic/Atropos reach matcher; lifetime typestate remains in the
+// native object solver and does not need to cross this boundary.
+message NativeSinkFlow {
+  string sink = 1;
+  string value = 2;
+  string root = 3;
+  string provenance = 4;
+  repeated string guards = 5;
+  bool guarded = 6;
+  bool site_guarded = 7;
+  string via = 8;
+}
+message NativeSinkParam {
+  string parameter = 1;
+  string sink = 2;
+  repeated string guards = 3;
+  bool guarded = 4;
+}
+message NativeSummaryFunction {
+  string name = 1;
+  repeated string parameters = 2;
+  repeated NativeSinkFlow sink_flows = 3;
+  repeated NativeSinkParam sink_params = 4;
+}
+message NativeSummaryResult { repeated NativeSummaryFunction functions = 1; }

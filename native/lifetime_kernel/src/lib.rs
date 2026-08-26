@@ -40,6 +40,7 @@ mod branch_history;
 mod module_initialization;
 mod property_effects;
 mod heap;
+mod summary;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -1105,6 +1106,42 @@ pub unsafe extern "C" fn lachesis_lifetime_plan_path(
     match result {
         Ok(()) => 0,
         Err(error) => { eprintln!("native planner path error: {error}"); 1 }
+    }
+}
+
+/// Compose reach-only interprocedural summaries from binary translation facts.
+/// The result is a compact protobuf sidecar; no Python F records are created.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
+    facts_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if facts_path.is_null() || catalog_path.is_null() || output_path.is_null() {
+            return Err("native summary path is null".to_owned());
+        }
+        let facts = CStr::from_ptr(facts_path).to_str()
+            .map_err(|error| format!("invalid facts path: {error}"))?;
+        let catalog = CStr::from_ptr(catalog_path).to_str()
+            .map_err(|error| format!("invalid catalog path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid output path: {error}"))?;
+        let translation = lifetime_proto::TranslationResult::decode(
+            fs::read(facts).map_err(|error| format!("cannot read translation facts: {error}"))?.as_slice()
+        ).map_err(|error| format!("invalid translation facts: {error}"))?;
+        let catalog = atropos_proto::Request::decode(
+            fs::read(catalog).map_err(|error| format!("cannot read binary catalog: {error}"))?.as_slice()
+        ).map_err(|error| format!("invalid binary catalog: {error}"))?;
+        let result = summary::summarize(translation, catalog);
+        let mut bytes = Vec::new();
+        result.encode(&mut bytes).map_err(|error| format!("cannot encode summaries: {error}"))?;
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, bytes).map_err(|error| format!("cannot write summaries: {error}"))?;
+        fs::rename(&temporary, output).map_err(|error| format!("cannot publish summaries: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native summary path error: {error}"); 1 }
     }
 }
 
