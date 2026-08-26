@@ -571,12 +571,12 @@ class PropsCodec:
         self._texts = texts
 
     def blob(self, index: int, properties: dict, elide: bool,
-             drop: frozenset = frozenset()) -> bytes:
+             drop: frozenset = frozenset()) -> Optional[bytes]:
         """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
         if not text:
-            return b""
+            return None
         if len(text) <= 512:
             cached = self._cache.get(text)
             if cached is not None:
@@ -1251,7 +1251,7 @@ def _load_index_bulk(conn, table_name: str, columns: tuple, rows: list, *,
 
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
 
-def _blob_param(blob: bytes) -> str:
+def _blob_param(blob: Optional[bytes]) -> Optional[str]:
     """A ``props`` blob as something a Cypher parameter can actually carry.
 
     Kùzu 0.11.3 binds no Python type to ``BLOB``: ``bytes`` and ``bytearray`` both come
@@ -1260,6 +1260,8 @@ def _blob_param(blob: bytes) -> str:
     path needs this; the bulk path hands Kùzu an Arrow binary column and never binds a
     parameter at all.
     """
+    if not blob:
+        return None
     return "".join("\\x%02X" % byte for byte in blob)
 
 def _load_nodes_rowwise(conn, nodes: list[dict], *, elide: bool,
