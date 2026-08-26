@@ -26,7 +26,7 @@ pub(crate) struct Symbols {
 }
 
 impl Symbols {
-    fn intern(&mut self, value: String) -> u32 {
+    pub(crate) fn intern(&mut self, value: String) -> u32 {
         if let Some(symbol) = self.lookup.get(&value) {
             return *symbol;
         }
