@@ -69,12 +69,13 @@ LACHESIS_TIMINGS=1 LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
   --stream-shards /tmp/project-shards --prune
 ```
 
-`--stream-shards` is currently incompatible with `--enrich`; dataflow partition streaming
-is the next integration step. The resulting store is explicitly marked core-only, so
-`GraphStore`/the GitHub Action builds the dataflow tier on its first security query rather
-than silently skipping enrichment. Additive derived records are cached in a compact
-internal `<store>.dataflow.pb` sidecar; JSON is reserved for user-facing output. A full
-`.enriched` Kùzu cache remains the fallback for overlays that mutate core records.
+`--stream-shards` is a Pass-1/core-only Kùzu build, but it also emits the immutable binary
+inputs required by later passes: `<store>.pass2.input.pb`, `<store>.pass2.translation.pb`,
+`<store>.pass2.facts.pb`, and `<store>.pass3.substrate.pb`. Run `lachesis enrich <store>`
+after the build to consume those sidecars without rerunning the frontends. Additive
+Pass-2 records remain in the compact internal `<store>.dataflow.pb` sidecar; JSON is
+reserved for user-facing output. A full `.enriched` Kùzu cache remains the fallback for
+overlays that mutate core records.
 
 ## TypeScript monorepos
 

@@ -78,6 +78,22 @@ lachesis analyze graph.kuzu --summary         # pass 3 — the leads, rolled up 
 lachesis explain graph.kuzu tree.c:1487       # one call: the whole evidence chain for a site
 ```
 
+For a large mixed-language tree, use the bounded Pass-1 build form. It streams each
+frontend shard into Kùzu instead of composing the complete graph in Python, and emits
+the binary Pass-2 and Pass-3 sidecars beside the store for subsequent analysis:
+
+```bash
+LACHESIS_EMIT_TOKENS=0 LACHESIS_EMIT_PROOFS=0 \
+lachesis build ./my-project graph.kuzu --prune \
+  --stream-shards ./graph-shards --timeout 3600
+```
+
+The streaming build is core-only at the Kùzu boundary; it does not mean the later
+passes are unavailable. The complete Pass-2 input, compact translation facts, and
+Pass-3 substrate are persisted as protobuf sidecars, so `lachesis enrich graph.kuzu`
+can consume the same Pass-1 output without rebuilding the frontends. Keep the shard
+directory until those sidecars have been verified or copied.
+
 **Library** — a warm session: open (or build) once, ask many times, nothing recomputed
 between questions.
 

@@ -74,6 +74,7 @@ or source revisions. Record those changes alongside the result.
 
 | Date | Revision | Workload | Build s | Enrichment s | Kùzu s | Nodes | Edges | Peak GiB | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
+| 2026-08-26 | `228f6f8` | Full libxml2, streamed Pass-1, `--prune` | 268.40 | — | 66.19 | 979,768 | 2,065,561 | ~3.17 | Apple Silicon; 3 frontends serialized; Pass-2/Pass-3 protobuf sidecars emitted; no swap. Sidecar publication was ~85.6s of the build. |
 | 2026-08-20 | `d841e61` | Linux `net` | 191* | — | — | 1,833,812 | 3,507,808 | 4.34* | Direct C frontend; full bundle validated. |
 | 2026-08-20 | `d841e61` | Linux `fs` | >421* | — | — | — | — | >4.77* | Safety-stopped before completion; next scale boundary. |
 | 2026-08-20 | `ad44b90` | Linux `net` CLI + `--enrich` | >160* | — | — | — | — | >5.30* | Frontend child exceeded safety cap before composition; pass 2 not measured. |
