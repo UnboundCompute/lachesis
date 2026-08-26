@@ -151,6 +151,7 @@ struct Emitter {
     function_ids: FxHashMap<String, FxHashSet<String>>,
     function_definitions: FxHashMap<String, FxHashSet<String>>,
     function_declarations: FxHashMap<String, FxHashSet<String>>,
+    function_parameters: FxHashMap<String, Vec<String>>,
 }
 
 impl Emitter {
@@ -178,6 +179,17 @@ impl Emitter {
                 &mut self.function_definitions
             };
             index.entry(record.label.clone()).or_default().insert(record.id.clone());
+        }
+        if record.kind == "parameter" {
+            if let Some(owner) = record.properties.iter().find_map(|property| {
+                if property.key != "owner_function_id" { return None; }
+                match property.value.as_ref()?.kind.as_ref()? {
+                    graph::value::Kind::Text(value) => Some(value.clone()),
+                    _ => None,
+                }
+            }) {
+                self.function_parameters.entry(owner).or_default().push(record.id.clone());
+            }
         }
         frame(&mut self.nodes, &record.encode_to_vec())?;
         self.node_count += 1;
@@ -352,6 +364,19 @@ struct ReferenceProbe {
     cursor: Option<CXCursor>,
 }
 
+struct ChildProbe {
+    cursors: Vec<CXCursor>,
+}
+
+extern "C" fn collect_direct_child(
+    cursor: CXCursor,
+    _parent: CXCursor,
+    data: CXClientData,
+) -> CXChildVisitResult {
+    unsafe { (&mut *(data as *mut ChildProbe)).cursors.push(cursor); }
+    CXChildVisit_Continue
+}
+
 struct BindingProbe {
     fields: Vec<String>,
     functions: Vec<String>,
@@ -442,6 +467,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     };
 
     let type_spelling = cx_string(clang_getTypeSpelling(clang_getCursorType(cursor)));
+    let operator = spelling.clone();
     let mut properties = vec![
         field("file", text(&file)),
         field("absolute_file", text(&file)),
@@ -557,6 +583,74 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         }
     }
 
+    if tier == "T3" || syntax_kind == "VarDecl" {
+        let mut children = ChildProbe { cursors: Vec::new() };
+        clang_visitChildren(cursor, collect_direct_child, &mut children as *mut ChildProbe as *mut c_void);
+        let child_ids: Vec<String> = children.cursors.iter().filter_map(|child| cursor_graph_id(*child)).collect();
+        if syntax_kind == "CallExpr" {
+            let arguments: Vec<String> = child_ids.iter().skip(1).cloned().collect();
+            let target_parameters = call_target.as_ref()
+                .and_then(|target| emitter.function_parameters.get(target))
+                .cloned()
+                .unwrap_or_default();
+            for (position, argument_id) in arguments.iter().enumerate() {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "HAS_ARGUMENT".to_owned(), source: id.clone(), target: argument_id.clone(),
+                    properties: vec![field("position", integer(position as i64))],
+                    source_tier: tier.clone(), relationship_class: "HAS_ARGUMENT".to_owned(),
+                })?;
+                if let Some(parameter_id) = target_parameters.get(position) {
+                    emitter.edge(graph::EdgeRecord {
+                        kind: "ARGUMENT_BINDS_PARAMETER".to_owned(), source: argument_id.clone(), target: parameter_id.clone(),
+                        properties: vec![field("position", integer(position as i64)), field("callsite", text(&id))],
+                        source_tier: tier.clone(), relationship_class: "ARGUMENT_BINDS_PARAMETER".to_owned(),
+                    })?;
+                    emitter.edge(graph::EdgeRecord {
+                        kind: "VALUE_FLOWS_TO".to_owned(), source: argument_id.clone(), target: parameter_id.clone(),
+                        properties: vec![field("reason", text("call-argument")), field("callsite", text(&id))],
+                        source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
+                    })?;
+                }
+            }
+        } else if syntax_kind == "ReturnStmt" {
+            if let (Some(value_id), Some(owner)) = (child_ids.first(), owner_id.clone()) {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "RETURNS_VALUE".to_owned(), source: value_id.clone(), target: owner,
+                    properties: Vec::new(), source_tier: tier.clone(), relationship_class: "RETURNS_VALUE".to_owned(),
+                })?;
+            }
+        } else if matches!(syntax_kind.as_str(), "BinaryOperator" | "CompoundAssignOperator")
+            && matches!(operator.as_str(), "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=")
+            && children.cursors.len() >= 2 {
+            let left = child_ids.first().cloned();
+            let right = child_ids.get(1).cloned();
+            if let (Some(left), Some(right)) = (left, right) {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "VALUE_FLOWS_TO".to_owned(), source: right.clone(), target: left.clone(),
+                    properties: vec![field("reason", text("assignment"))],
+                    source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
+                })?;
+            }
+        } else if matches!(syntax_kind.as_str(), "UnaryOperator" | "ConditionalOperator") || syntax_kind == "BinaryOperator" && !child_ids.is_empty() {
+            let operand_start = if syntax_kind == "ConditionalOperator" { 1 } else { 0 };
+            for operand in child_ids.iter().skip(operand_start) {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "VALUE_FLOWS_TO".to_owned(), source: operand.clone(), target: id.clone(),
+                    properties: vec![field("reason", text("arithmetic-operand"))],
+                    source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
+                })?;
+            }
+        } else if syntax_kind == "VarDecl" {
+            if let (Some(initializer), Some(variable)) = (child_ids.last(), Some(id.clone())) {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "VALUE_FLOWS_TO".to_owned(), source: initializer.clone(), target: variable,
+                    properties: vec![field("reason", text("initializer"))],
+                    source_tier: "T2".to_owned(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
+                })?;
+            }
+        }
+    }
+
     if syntax_kind == "CallExpr" {
         if let (Some(owner_id), Some(target_id)) = (owner_id, call_target) {
             emitter.edge(graph::EdgeRecord {
@@ -637,6 +731,13 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         }
     }
     Ok(())
+}
+
+unsafe fn cursor_graph_id(cursor: CXCursor) -> Option<String> {
+    let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
+    let spelling = cx_string(clang_getCursorSpelling(cursor));
+    let (file, _, _, offset, end_offset, _, _) = cursor_file(cursor);
+    cursor_identity(&syntax_kind, &file, offset, end_offset, &spelling).map(|(_, _, id)| id)
 }
 
 unsafe fn label_for_cursor(cursor: CXCursor) -> String {
@@ -798,6 +899,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             function_ids: FxHashMap::default(),
             function_definitions: FxHashMap::default(),
             function_declarations: FxHashMap::default(),
+            function_parameters: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
