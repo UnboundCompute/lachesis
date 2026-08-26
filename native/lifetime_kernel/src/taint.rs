@@ -89,14 +89,15 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
 }
 
 pub(crate) fn enrich(graph: &Graph) -> Delta {
-    let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>)>> = FxHashMap::default();
+    let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>, Option<String>)>> = FxHashMap::default();
     let mut evidence: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
     for item in &graph.edges {
         let kind = graph.edge_kind(item);
         if !FLOW_KINDS.contains(&kind.as_str()) { continue; }
         let transition = kind.clone();
+        let reason = graph.edge_property_text(item, "reason").map(str::to_owned);
         let context_id = graph.edge_property_text(item, "context_id").map(str::to_owned);
-        adjacency.entry(item.source).or_default().push((item.target, transition, context_id));
+        adjacency.entry(item.source).or_default().push((item.target, transition, reason, context_id));
         evidence.entry((item.source, item.target)).or_insert_with(|| vec![
             graph.id(item.source).to_owned(), graph.id(item.target).to_owned(),
         ]);
@@ -121,7 +122,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let Some(result) = call_result.get(call) else { continue; };
         for argument in arguments {
             adjacency.entry(*argument).or_default()
-                .push((*result, "CALL_PASSTHROUGH".to_owned(), None));
+                .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None));
             evidence.entry((*argument, *result)).or_insert_with(|| vec![
                 graph.id(*argument).to_owned(), graph.id(*call).to_owned(), graph.id(*result).to_owned(),
             ]);
@@ -133,7 +134,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             .and_then(|value| graph.symbol(value)) else { continue; };
         let Some(result) = call_result.get(&node.id) else { continue; };
         adjacency.entry(receiver).or_default()
-            .push((*result, "CALL_PASSTHROUGH".to_owned(), None));
+            .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None));
         evidence.entry((receiver, *result)).or_insert_with(|| vec![
             graph.id(receiver).to_owned(), graph.id(node.id).to_owned(), graph.id(*result).to_owned(),
         ]);
@@ -198,13 +199,13 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             if state != initial && sink_by_value.contains_key(&state.value) {
                 reaches.push(state.clone());
             }
-            for (target, transition, context_id) in adjacency.get(&state.value).into_iter().flatten() {
+            for (target, transition, reason, context_id) in adjacency.get(&state.value).into_iter().flatten() {
                 let mut contexts = state.contexts.clone();
-                if transition == "context-parameter" {
+                if reason.as_deref() == Some("context-parameter") {
                     let Some(context) = context_id.as_ref() else { continue; };
                     if contexts.len() >= 12 { continue; }
                     contexts.push(context.clone());
-                } else if transition == "context-return" {
+                } else if reason.as_deref() == Some("context-return") {
                     let Some(context) = context_id.as_ref() else { continue; };
                     if contexts.last() != Some(context) { continue; }
                     contexts.pop();

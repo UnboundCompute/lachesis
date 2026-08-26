@@ -5,7 +5,8 @@
 //! reconstructs these records.  IDs and relationship kinds are interned once,
 //! while protobuf properties remain typed for overlay-specific accessors.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 
 use hashbrown::HashMap;
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::graph_proto;
 
 const FRAME_HEADER: usize = 4;
+const DATAFLOW_STREAM_MAGIC: &[u8] = b"LACHESIS-DATAFLOW-STREAM\0";
 
 #[derive(Default)]
 pub(crate) struct Symbols {
@@ -283,6 +285,56 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
         }
     }
     Ok(Graph { symbols, nodes, edges, node_by_id, outgoing, incoming })
+}
+
+pub(crate) fn publish_dataflow_stream(
+    path: impl AsRef<Path>, source: &str, core_content_hash: &str,
+    nodes: &[graph_proto::NodeRecord], edges: &[graph_proto::EdgeRecord],
+) -> Result<(), String> {
+    let path = path.as_ref();
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = directory.join(format!(".pass2-native-{}", std::process::id()));
+    let result = (|| {
+        let mut output = File::create(&temporary)
+            .map_err(|error| format!("cannot create native Pass-2 sidecar: {error}"))?;
+        output.write_all(DATAFLOW_STREAM_MAGIC)
+            .map_err(|error| format!("cannot write native Pass-2 sidecar: {error}"))?;
+        let header = graph_proto::DataflowOverlay {
+            overlay_id: "dataflow".to_owned(), source: source.to_owned(), version: 1,
+            core_content_hash: core_content_hash.to_owned(),
+            derived_nodes: Vec::new(), derived_edges: Vec::new(),
+        };
+        write_frame(&mut output, &header.encode_to_vec())?;
+        for node in nodes {
+            let payload = node.encode_to_vec();
+            write_record_frame(&mut output, b'N', &payload)?;
+        }
+        for edge in edges {
+            let payload = edge.encode_to_vec();
+            write_record_frame(&mut output, b'E', &payload)?;
+        }
+        output.flush().map_err(|error| format!("cannot flush native Pass-2 sidecar: {error}"))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("cannot publish native Pass-2 sidecar: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
+}
+
+fn write_record_frame(output: &mut File, prefix: u8, payload: &[u8]) -> Result<(), String> {
+    let mut record = Vec::with_capacity(payload.len() + 1);
+    record.push(prefix);
+    record.extend_from_slice(payload);
+    write_frame(output, &record)
+}
+
+fn write_frame(output: &mut File, payload: &[u8]) -> Result<(), String> {
+    let length = u32::try_from(payload.len())
+        .map_err(|_| "native Pass-2 sidecar frame is too large".to_owned())?;
+    output.write_all(&length.to_be_bytes())
+        .and_then(|_| output.write_all(payload))
+        .map_err(|error| format!("cannot write native Pass-2 sidecar frame: {error}"))
 }
 
 /// Keep this accessor in the graph core so future overlays do not each grow a
