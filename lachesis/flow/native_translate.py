@@ -500,8 +500,6 @@ def build_native_temporal(store):
 
 def build_native_semantic_graph(store, lang="c"):
     """Decode the compact Rust event graph into the query graph only."""
-    from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
-
     base = (getattr(store.index, "_pass3_cache_base", None)
             or getattr(store.index, "_db_dir", None))
     if not base:
@@ -515,6 +513,23 @@ def build_native_semantic_graph(store, lang="c"):
         from .native_lifetime import lifetime_pb2
         result = lifetime_pb2.NativeSemanticResult()
         result.ParseFromString(output_path.read_bytes())
+    return _decode_native_semantic_result(result, lang)
+
+
+def load_native_semantic_graph_sidecar(path, lang="c"):
+    """Decode a native semantic sidecar for a query that needs its nodes."""
+    from .native_lifetime import lifetime_pb2
+    try:
+        result = lifetime_pb2.NativeSemanticResult()
+        result.ParseFromString(Path(path).read_bytes())
+    except (OSError, ValueError):
+        return None
+    return _decode_native_semantic_result(result, lang)
+
+
+def _decode_native_semantic_result(result, lang):
+    from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
+
     graph = SkeletonGraph(language=lang)
     for function in result.functions:
         if not function.nodes:

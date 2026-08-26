@@ -223,11 +223,6 @@ class Analysis:
                 # read as fewer bugs, not as an incomplete run. Drop it and report structural
                 # families only -- honest under-coverage beats a misleadingly thin temporal set.
                 stamped.pop("semantic_graph", None)
-        # Native semantic binds persist a sidecar reference rather than the
-        # hundreds-of-megabytes Python expansion.  Materialize it only for the
-        # in-process registry; a fresh process follows the same lazy path after
-        # loading the compact bind document.
-        self._materialize_native_semantic(stamped)
         return {
             "registry": default_candidate_registry(stamped, summary),
             "stamped": stamped,
@@ -235,25 +230,6 @@ class Analysis:
             "temporal_evaluated": complete,
             "partial": temporal and not complete,
         }
-
-    def _materialize_native_semantic(self, stamped: dict) -> None:
-        reference = stamped.get("semantic_graph")
-        if not isinstance(reference, dict) or not reference.get("native_sidecar"):
-            return
-        from lachesis.flow.native_translate import build_native_semantic_graph
-        from lachesis.planner.temporal_obligation import merge_semantic_nodes
-
-        graph = build_native_semantic_graph(self.store)
-        if graph is None:
-            # Keep the reference intact: a missing sidecar is an incomplete
-            # native cache, not an empty temporal result.
-            return
-        nodes = {}
-        merge_semantic_nodes(nodes, graph, graph.language or "c")
-        materialized = {"nodes": nodes}
-        if reference.get("coverage"):
-            materialized["coverage"] = reference["coverage"]
-        stamped["semantic_graph"] = materialized
 
     def _structural_bind(self) -> tuple[dict, dict]:
         """The catalog bind alone: fast, and forces no dataflow tier. This is the fast path's

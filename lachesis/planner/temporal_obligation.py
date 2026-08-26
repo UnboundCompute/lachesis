@@ -73,6 +73,20 @@ class TemporalLifecycle:
         # publication without coupling it to the C frontend.
         semantic = graph.get("semantic_graph") or {}
         self.language = graph.get("language")
+        if (isinstance(semantic, dict) and semantic.get("native_sidecar")
+                and not semantic.get("nodes")):
+            # Native Pass 2 persists the Rust protobuf sidecar by reference.
+            # Expand it only when a temporal constructor is actually queried;
+            # ``enrich`` itself must not parse a 300MB semantic graph merely to
+            # build an unused registry.
+            from ..flow.native_translate import load_native_semantic_graph_sidecar
+            native = load_native_semantic_graph_sidecar(
+                semantic["native_sidecar"], self.language or "c")
+            if native is not None:
+                semantic = {
+                    "nodes": native.to_dict().get("nodes", {}),
+                    "coverage": semantic.get("coverage") or native.coverage,
+                }
         self.coverage = {}
         if isinstance(semantic, dict):
             self.language = self.language or semantic.get("language")
