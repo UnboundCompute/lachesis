@@ -83,7 +83,7 @@ unsafe fn cx_string(value: CXString) -> String {
     result
 }
 
-unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32) {
+unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32) {
     let location = clang_getCursorLocation(cursor);
     let mut file = ptr::null_mut();
     let mut line = 0;
@@ -114,7 +114,7 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32) {
         &mut end_column,
         &mut end_offset,
     );
-    (filename, line, column, offset, end_offset)
+    (filename, line, column, offset, end_offset, end_line, end_column)
 }
 
 struct Emitter {
@@ -379,7 +379,7 @@ extern "C" fn collect_callee_reference(
 unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
-    let (file, line, column, offset, end_offset) = cursor_file(cursor);
+    let (file, line, column, offset, end_offset, end_line, end_column) = cursor_file(cursor);
     if file.is_empty() || (!emitter.root_files.is_empty() && !emitter.root_files.contains(&file)) {
         return Ok(());
     }
@@ -428,6 +428,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         field("end_offset", integer(end_offset as i64)),
         field("start_line", integer(line as i64)),
         field("start_column", integer(column as i64)),
+        field("end_line", integer(end_line as i64)),
+        field("end_column", integer(end_column as i64)),
         field("syntax_kind", text(&syntax_kind)),
         field("type", text(&type_spelling)),
     ];
@@ -453,7 +455,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
-            let (target_file, _, _, target_offset, target_end) = cursor_file(referenced);
+            let (target_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
             if !target_file.is_empty() {
                 let target_id_kind = match target_kind.as_str() {
                     "FunctionDecl" => Some("function"),
@@ -547,7 +549,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
-            let (target_file, _, _, target_offset, target_end) = cursor_file(referenced);
+            let (target_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
             let id_kind = match target_kind.as_str() {
                 "FunctionDecl" => Some("function"),
                 "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
@@ -568,7 +570,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         }
     }
 
-    let (parent_file, _parent_line, _parent_column, parent_offset, parent_end) = cursor_file(parent);
+    let (parent_file, _parent_line, _parent_column, parent_offset, parent_end, _, _) = cursor_file(parent);
     let parent_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(parent)));
     let parent_spelling = cx_string(clang_getCursorSpelling(parent));
     if let Some((_parent_kind, parent_tier, parent_id)) = cursor_identity(
@@ -623,7 +625,7 @@ unsafe fn label_for_cursor(cursor: CXCursor) -> String {
 unsafe fn function_owner(cursor: CXCursor) -> Option<String> {
     let mut current = clang_getCursorSemanticParent(cursor);
     for _ in 0..32 {
-        let (file, _, _, offset, end_offset) = cursor_file(current);
+        let (file, _, _, offset, end_offset, _, _) = cursor_file(current);
         if file.is_empty() || clang_is_null(current) != 0 {
             return None;
         }
