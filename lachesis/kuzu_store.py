@@ -1394,6 +1394,15 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                               dir=os.path.dirname(target_db_dir))
 
     kept_ids: set[str] = set()
+    # Streaming stores need a cache key before their Pass-1 sidecars are
+    # published. Hash retained record identity in deterministic shard order
+    # without building a graph-sized sort buffer.
+    core_digest = hashlib.sha256()
+
+    def hash_part(value) -> None:
+        core_digest.update(str(value or "").encode("utf-8"))
+        core_digest.update(b"\0")
+
     node_units: dict[str, str] = {}
     prefixes: set[str] = set()
     # Index candidates are spilled while the large node/edge streams are loaded.
@@ -1409,6 +1418,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         node_id = node["id"]
         props = node.get("properties") or {}
         kept_ids.add(node_id)
+        hash_part(node_id)
         if props.get("file"):
             node_units[node_id] = props["file"]
         for value in (node_id, props.get("compiler_node_id")):
@@ -1430,6 +1440,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         # are necessarily retained nodes, and their prefixes were collected above;
         # scanning both endpoint strings again here was millions of redundant regex
         # matches on the large Linux graph.
+        if edge.get("source") in kept_ids and edge.get("target") in kept_ids:
+            hash_part(edge.get("kind"))
+            hash_part(edge.get("source"))
+            hash_part(edge.get("target"))
     timing("scan headers and edge endpoints")
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
@@ -1569,6 +1583,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         "streamed": True, "enriched": False, "pruned": bool(prune),
         PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
     })
+    payload["core_content_hash"] = core_digest.hexdigest()
     _write_store_manifest(db_dir, payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
