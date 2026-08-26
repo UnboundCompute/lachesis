@@ -1345,8 +1345,21 @@ pub(crate) fn semantic_request(
                 });
             }
         }
+        let plain_call_nodes: HashSet<&str> = function.calls.iter()
+            .filter(|call| !call.is_alloc && !call.is_release && !call.is_realloc
+                && !call.is_source && !call.is_aggregate_copy)
+            .map(|call| call.node.as_str()).collect();
         for (index, raw) in function.operations.iter().cloned().enumerate() {
             let operation = crate::proto_operation(raw)?;
+            // Passing an argument to an ordinary call is not a dereference
+            // event.  The preparation layer uses the same Use operation kind
+            // for its conservative value-flow fallback, but the semantic
+            // graph must not turn every call argument into a storage read.
+            if operation.kind == crate::Kind::Use
+                && operation.access == "deref"
+                && plain_call_nodes.contains(operation.node.as_str()) {
+                continue;
+            }
             let path = operation.target.as_ref();
             let generation = operation.generation.as_deref().unwrap_or("g0");
             let kinds: Vec<&str> = match operation.kind {
