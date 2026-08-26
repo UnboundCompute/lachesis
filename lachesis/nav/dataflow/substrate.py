@@ -314,14 +314,20 @@ def _translation_records(nodes, records):
             elif kind == "VALUE_FLOWS_TO" and source in call_ids:
                 relevant.add(target)
     node_ids = {node["id"] for node in seed_nodes} | relevant
-    kept_nodes = [node for node in nodes if node["id"] in node_ids]
-    kept_edges = [edge for edge in records if (
+    # Reuse the caller-owned lists.  On a large streamed build these lists hold
+    # most of the Pass-3 substrate; returning freshly allocated lists here keeps
+    # the complete substrate and the compact translation projection alive at the
+    # same time and needlessly raises peak RSS.  Slice assignment retains the
+    # existing list objects while dropping the records that translation does not
+    # need before facts are assembled.
+    nodes[:] = (node for node in nodes if node["id"] in node_ids)
+    records[:] = (edge for edge in records if (
         (edge["kind"] == "AST_CHILD" and
          (edge["source"] in relevant or edge["target"] in relevant)) or
         (edge["kind"] == "REFERS_TO" and edge["source"] in relevant) or
         (edge["kind"] == "VALUE_FLOWS_TO" and edge["source"] in call_ids)
-    )]
-    return kept_nodes, kept_edges
+    ))
+    return nodes, records
 
 
 def _write_framed_sidecar(target, prefix, header, nodes, edges):
