@@ -46,7 +46,7 @@ def merge_records(dst, sink, guards):
     dst.append({"sink": sink, "guards": gsorted, "guarded": len(gsorted) > 0})
 
 
-def summarize_one(name, F, summaries):
+def summarize_one(name, F, summaries, *, reach_only=False):
     """Compute F's complete summary from the substrate + callee summaries already ready.
 
     Produces:
@@ -120,6 +120,26 @@ def summarize_one(name, F, summaries):
                 if (gparam in gsum["frees_params"] and oroot in params
                         and _freed_identity(a) == a.get("root")):
                     frees[oroot] = f"via:{callee}"
+
+    # Object mode has a separate native lifetime summary engine.  The legacy
+    # summary is still needed there for reach/presence sink observations, but
+    # rebuilding every typestate stream would duplicate the dominant work.
+    # Keep this return after sink composition so interprocedural reach facts are
+    # identical to the complete summary path.
+    if reach_only:
+        return {
+            "name": name,
+            "params": fn["params"],
+            "taxonomy": fn["taxonomy"],
+            "sink_flows": sink_flows,
+            "sink_params": sink_params,
+            "typestate": {},
+            "param_typestate": {},
+            "frees_params": {},
+            "returns": "value",
+            "returns_param": None,
+            "returns_dangling": False,
+        }
 
     # direct frees on a parameter (from the event stream)
     for ev in fn["events"]:
@@ -305,12 +325,13 @@ def summarize_one(name, F, summaries):
     }
 
 
-def run(F, schedule):
+def run(F, schedule, *, reach_only=False):
     summaries = {}
     for group in schedule:
         members = group["members"]
         if not group["cyclic"]:
-            summaries[members[0]] = summarize_one(members[0], F, summaries)
+            summaries[members[0]] = summarize_one(
+                members[0], F, summaries, reach_only=reach_only)
             continue
         # fixpoint for a recursive group: seed empty, iterate until stable
         for m in members:
@@ -321,7 +342,7 @@ def run(F, schedule):
         for _ in range(len(members) + 3):
             snapshot = json.dumps({m: summaries[m] for m in members}, sort_keys=True)
             for m in members:
-                summaries[m] = summarize_one(m, F, summaries)
+                summaries[m] = summarize_one(m, F, summaries, reach_only=reach_only)
             if json.dumps({m: summaries[m] for m in members}, sort_keys=True) == snapshot:
                 break
     return summaries

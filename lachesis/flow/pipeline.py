@@ -264,7 +264,10 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
     _emit("projection")
     if _expired():
         return _timed_out_return("summaries", F=F, succ=succ, coverage=coverage)
-    summaries = _summaries_for(F, succ)
+    # Native object mode owns lifetime summaries.  The Python composer only
+    # supplies reach/presence sink-flow observations on the production path.
+    # Shadow and legacy retain the complete compatibility summary.
+    summaries = _summaries_for(F, succ, reach_only=object_requested)
     legacy_summaries_done = perf_counter()
     _emit("summaries")
     if _expired():
@@ -377,6 +380,11 @@ def run_pass(store, lang="c", lifetime_engine=None, *,
         # (seed-unsafe); propagation-only-unsafe functions keep their object leads and are
         # filtered per-object by the object-flow map. Legacy fallback covers seed-unsafe.
         seed_unsafe = set(diagnostics.get("seed_unsafe_functions", unsafe))
+        if seed_unsafe and requested == "object":
+            # Only failed native functions need the compatibility typestate
+            # renderer.  Pay for the complete Python summaries lazily, after
+            # the native semantic graph has already been built.
+            summaries = _summaries_for(F, succ)
         if requested == "shadow":
             # Shadow mode is an explicit differential, so it must materialize
             # the legacy stream even when object analysis has no fallback

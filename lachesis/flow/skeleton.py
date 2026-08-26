@@ -247,8 +247,13 @@ def render_text(skel):
 
 
 @timeit
-def _summaries_for(F, succ):
-    """Run traverse + bottom-up summarise over the whole graph (same as walk.py)."""
+def _summaries_for(F, succ, *, reach_only=False):
+    """Run traverse + bottom-up summarise over the whole graph.
+
+    ``reach_only`` is the object-mode projection: it preserves the complete
+    sink-flow composition but omits legacy lifetime streams, which are already
+    produced by the native object engine.
+    """
     import random
     order = sorted(F.keys())
     random.Random(0).shuffle(order)
@@ -258,7 +263,8 @@ def _summaries_for(F, succ):
         members = [t["name"] for t in trace]
         for comp in tarjan_scc(members, succ):
             if not is_cyclic(comp, succ):
-                summaries[comp[0]] = summarize_one(comp[0], F, summaries)
+                summaries[comp[0]] = summarize_one(
+                    comp[0], F, summaries, reach_only=reach_only)
                 continue
             for m in comp:
                 summaries[m] = {"name": m, "params": F[m]["params"], "taxonomy": F[m]["taxonomy"],
@@ -272,7 +278,8 @@ def _summaries_for(F, succ):
                 # entire recursive group on every fixpoint iteration.
                 before = {m: summaries[m] for m in comp}
                 for m in comp:
-                    summaries[m] = summarize_one(m, F, summaries)
+                    summaries[m] = summarize_one(
+                        m, F, summaries, reach_only=reach_only)
                 if {m: summaries[m] for m in comp} == before:
                     break
     return summaries
