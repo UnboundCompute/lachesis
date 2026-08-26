@@ -84,40 +84,51 @@ class _NativeSemanticSubstrate:
     """
     def __init__(self, functions, cfgs):
         self.idx = self
+        # Keep the native metadata compact.  Expanding every prepared CFG
+        # anchor into a Python dict here largely recreated the per-node memory
+        # overhead that this path is intended to avoid.  The emitter only
+        # needs dict-shaped records when it asks for declarations by kind; the
+        # scalar lookups below can stay tuple-backed.
+        # (label, kind, owner, type, offset)
         self._nodes = {}
         for record in functions.values():
             for root_id, metadata in record.get("root_metadata", {}).items():
                 label, owner, type_name = metadata
-                self._nodes.setdefault(root_id, {
-                    "id": root_id, "label": label, "kind": "variable",
-                    "properties": {"owner_function_id": owner, "type": type_name},
-                })
+                self._nodes.setdefault(
+                    root_id, (label, "variable", owner, type_name, 0))
         for cfg in cfgs.values():
             for node_id, metadata in cfg.get("metadata", {}).items():
                 label, kind, owner, type_name, offset = metadata
-                self._nodes[node_id] = {
-                    "id": node_id, "label": label, "kind": kind,
-                    "properties": {"owner_function_id": owner, "type": type_name,
-                                   "start_offset": offset},
-                }
+                self._nodes[node_id] = (label, kind, owner, type_name, offset)
 
     def nodes_of_kind(self, *kinds):
-        return [node for node in self._nodes.values()
-                if node.get("kind") in kinds or
-                (node.get("kind") == "ParmVarDecl" and "parameter" in kinds) or
-                (node.get("kind") == "VarDecl" and "variable" in kinds)]
+        result = []
+        for node_id, (label, kind, owner, type_name, offset) in self._nodes.items():
+            if not (kind in kinds or
+                    (kind == "ParmVarDecl" and "parameter" in kinds) or
+                    (kind == "VarDecl" and "variable" in kinds)):
+                continue
+            result.append({
+                "id": node_id, "label": label, "kind": kind,
+                "properties": {"owner_function_id": owner, "type": type_name,
+                               "start_offset": offset},
+            })
+        return result
 
     def label(self, node_id):
         node = self._nodes.get(str(node_id))
-        return node.get("label") if node else str(node_id)
+        return node[0] if node else str(node_id)
 
     def props(self, node_id):
         node = self._nodes.get(str(node_id))
-        return dict(node.get("properties") or {}) if node else {}
+        if node is None:
+            return {}
+        return {"owner_function_id": node[2], "type": node[3],
+                "start_offset": node[4]}
 
     def kind(self, node_id):
         node = self._nodes.get(str(node_id))
-        return node.get("kind", "") if node else ""
+        return node[1] if node else ""
 
     def offset(self, node_id):
         return int(self.props(node_id).get("start_offset") or 0)
