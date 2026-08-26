@@ -177,7 +177,9 @@ def atropos_enrich(
                         "detail": row.get("detail"),
                     })
             per_language[language] = {
-                "callsites": 0, "bind": counts, "unbound": unbound,
+                "callsites": sum(node.get("kind") in {"call", "construct"}
+                                  for node in graph.get("nodes", ())),
+                "bind": counts, "unbound": unbound,
             }
         if compact_structural and not complete_dataflow:
             known_node_ids = {node.get("id") for node in graph.get("nodes", ())}
