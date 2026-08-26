@@ -116,7 +116,7 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     return FrontendSpec(
         frontend_id="clang-c",
         languages=("c",),
-        extensions=(".c", ".h"),
+        extensions=(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"),
         command=command,
         working_directory=str(root),
         priority=20,

@@ -1477,7 +1477,7 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
                 continue;
             }
             if matches!(path.extension().and_then(|extension| extension.to_str()),
-                        Some("c" | "h")) {
+                        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp")) {
                 files.push(path);
             }
         }
@@ -1518,7 +1518,7 @@ fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
                 .map(PathBuf::from)
                 .filter(|path| {
                     matches!(path.extension().and_then(|extension| extension.to_str()),
-                             Some("c" | "h"))
+                             Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp"))
                         && path.is_file()
                 })
                 .map(|path| path.canonicalize().unwrap_or(path))
