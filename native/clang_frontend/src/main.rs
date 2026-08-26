@@ -126,12 +126,20 @@ struct Emitter {
     edge_count: u64,
     file_ids: FxHashMap<String, String>,
     root_files: FxHashSet<String>,
+    slot_bindings: FxHashMap<String, FxHashSet<String>>,
+    function_ids: FxHashMap<String, FxHashSet<String>>,
 }
 
 impl Emitter {
     fn node(&mut self, record: graph::NodeRecord) -> io::Result<()> {
         if !self.node_ids.insert(record.id.clone()) {
             return Ok(());
+        }
+        if record.kind == "function" {
+            self.function_ids
+                .entry(record.label.clone())
+                .or_default()
+                .insert(record.id.clone());
         }
         frame(&mut self.nodes, &record.encode_to_vec())?;
         self.node_count += 1;
@@ -273,6 +281,55 @@ extern "C" fn visit(cursor: CXCursor, parent: CXCursor, data: CXClientData) -> C
     CXChildVisit_Recurse
 }
 
+struct ReferenceProbe {
+    cursor: Option<CXCursor>,
+}
+
+struct BindingProbe {
+    fields: Vec<String>,
+    functions: Vec<String>,
+}
+
+extern "C" fn collect_binding_reference(
+    cursor: CXCursor,
+    _parent: CXCursor,
+    data: CXClientData,
+) -> CXChildVisitResult {
+    unsafe {
+        let probe = &mut *(data as *mut BindingProbe);
+        let kind = clang_getCursorKind(cursor);
+        if kind == CXCursor_MemberRef || kind == CXCursor_MemberRefExpr || kind == CXCursor_DeclRefExpr {
+            let referenced = clang_getCursorReferenced(cursor);
+            if clang_is_null(referenced) == 0 {
+                let referenced_kind = clang_getCursorKind(referenced);
+                let name = cx_string(clang_getCursorSpelling(referenced));
+                if referenced_kind == CXCursor_FieldDecl {
+                    probe.fields.push(name);
+                } else if referenced_kind == CXCursor_FunctionDecl {
+                    probe.functions.push(name);
+                }
+            }
+        }
+    }
+    CXChildVisit_Recurse
+}
+
+extern "C" fn collect_callee_reference(
+    cursor: CXCursor,
+    _parent: CXCursor,
+    data: CXClientData,
+) -> CXChildVisitResult {
+    unsafe {
+        let probe = &mut *(data as *mut ReferenceProbe);
+        let kind = clang_getCursorKind(cursor);
+        if kind == CXCursor_DeclRefExpr || kind == CXCursor_MemberRef || kind == CXCursor_MemberRefExpr {
+            probe.cursor = Some(cursor);
+            return CXChildVisit_Break;
+        }
+    }
+    CXChildVisit_Recurse
+}
+
 unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
@@ -334,7 +391,12 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     }
     let mut call_target = None;
     if syntax_kind == "CallExpr" {
-        let referenced = clang_getCursorReferenced(cursor);
+        let direct = clang_getCursorReferenced(cursor);
+        let mut probe = ReferenceProbe { cursor: None };
+        if clang_is_null(direct) != 0 {
+            clang_visitChildren(cursor, collect_callee_reference, &mut probe as *mut ReferenceProbe as *mut c_void);
+        }
+        let referenced = if clang_is_null(direct) == 0 { direct } else { probe.cursor.unwrap_or_default() };
         if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
@@ -348,17 +410,37 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                 if let Some(target_id_kind) = target_id_kind {
                     let target_id = stable_id(target_id_kind, &target_file, target_offset, target_end, &target_name);
                     properties.push(field("callee", text(&target_name)));
-                    properties.push(field("primary_target_id", text(&target_id)));
-                    properties.push(field("resolution", text("exact")));
-                    call_target = Some(target_id.clone());
-                    emitter.edge(graph::EdgeRecord {
-                        kind: "INVOKES".to_owned(),
-                        source: id.clone(),
-                        target: target_id,
-                        properties: Vec::new(),
-                        source_tier: tier.clone(),
-                        relationship_class: "INVOKES".to_owned(),
-                    })?;
+                    if target_kind == "FieldDecl" {
+                        properties.push(field("receiver_member_id", text(&target_id)));
+                        properties.push(field("resolution", text("function-pointer")));
+                        emitter.edge(graph::EdgeRecord {
+                            kind: "READS_CALLEE".to_owned(), source: id.clone(), target: target_id,
+                            properties: Vec::new(), source_tier: tier.clone(),
+                            relationship_class: "READS_CALLEE".to_owned(),
+                        })?;
+                        let targets: Vec<String> = emitter
+                            .slot_bindings
+                            .get(&target_name)
+                            .into_iter()
+                            .flat_map(|ids| ids.iter().cloned())
+                            .collect();
+                        for target in targets {
+                            emitter.edge(graph::EdgeRecord {
+                                kind: "MAY_INVOKE".to_owned(), source: id.clone(), target,
+                                properties: vec![field("resolution", text("binding"))],
+                                source_tier: tier.clone(), relationship_class: "MAY_INVOKE".to_owned(),
+                            })?;
+                        }
+                    } else if target_kind == "FunctionDecl" {
+                        properties.push(field("primary_target_id", text(&target_id)));
+                        properties.push(field("resolution", text("exact")));
+                        call_target = Some(target_id.clone());
+                        emitter.edge(graph::EdgeRecord {
+                            kind: "INVOKES".to_owned(), source: id.clone(), target: target_id,
+                            properties: Vec::new(), source_tier: tier.clone(),
+                            relationship_class: "INVOKES".to_owned(),
+                        })?;
+                    }
                 }
             }
         }
@@ -370,6 +452,34 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         properties,
         tier: tier.clone(),
     })?;
+
+    if syntax_kind == "VarDecl" {
+        let mut probe = BindingProbe { fields: Vec::new(), functions: Vec::new() };
+        clang_visitChildren(cursor, collect_binding_reference, &mut probe as *mut BindingProbe as *mut c_void);
+        if !probe.fields.is_empty() && !probe.functions.is_empty() {
+            let function_ids: Vec<String> = probe
+                .functions
+                .iter()
+                .flat_map(|name| emitter.function_ids.get(name).into_iter().flat_map(|ids| ids.iter().cloned()))
+                .collect();
+            for field_name in &probe.fields {
+                let targets = {
+                    let slots = emitter.slot_bindings.entry(field_name.clone()).or_default();
+                    for target in &function_ids {
+                        slots.insert(target.clone());
+                    }
+                    slots.iter().cloned().collect::<Vec<_>>()
+                };
+                for target in targets {
+                    emitter.edge(graph::EdgeRecord {
+                        kind: "MAY_INVOKE".to_owned(), source: id.clone(), target,
+                        properties: vec![field("resolution", text("registration")), field("slot", text(field_name))],
+                        source_tier: tier.clone(), relationship_class: "MAY_INVOKE".to_owned(),
+                    })?;
+                }
+            }
+        }
+    }
 
     if syntax_kind == "CallExpr" {
         if let (Some(owner_id), Some(target_id)) = (owner_id, call_target) {
@@ -589,6 +699,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             edge_count: 0,
             file_ids: FxHashMap::default(),
             root_files: FxHashSet::default(),
+            slot_bindings: FxHashMap::default(),
+            function_ids: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
