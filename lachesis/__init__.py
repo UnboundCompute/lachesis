@@ -3,7 +3,6 @@
 from .pipeline import (
     combine_graphs,
     run_project,
-    semantic_snapshot_graph,
     snapshot_graph,
     source_inventory,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "LeadSet",
     "combine_graphs",
     "run_project",
-    "semantic_snapshot_graph",
     "snapshot_graph",
     "source_inventory",
     "write_kuzu_graph",
