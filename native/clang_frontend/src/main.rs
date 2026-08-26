@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -475,6 +475,49 @@ extern "C" fn collect_parameter_reference(
         }
     }
     CXChildVisit_Recurse
+}
+
+extern "C" fn collect_inclusion(
+    included_file: CXFile,
+    inclusion_stack: *mut CXSourceLocation,
+    include_len: c_uint,
+    data: CXClientData,
+) {
+    unsafe {
+        let emitter = &mut *(data as *mut Emitter);
+        if included_file.is_null() || inclusion_stack.is_null() || include_len == 0 {
+            return;
+        }
+        let included_path = emitter.canonical_file(cx_string(clang_getFileName(included_file)));
+        let mut source_file = ptr::null_mut();
+        clang_getFileLocation(
+            *inclusion_stack.add((include_len - 1) as usize),
+            &mut source_file,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        if source_file.is_null() {
+            return;
+        }
+        let source_path = emitter.canonical_file(cx_string(clang_getFileName(source_file)));
+        let (Some(source), Some(target)) = (
+            emitter.file_ids.get(&source_path).cloned(),
+            emitter.file_ids.get(&included_path).cloned(),
+        ) else {
+            return;
+        };
+        if let Err(error) = emitter.edge(graph::EdgeRecord {
+            kind: "DEPENDS_ON".to_owned(),
+            source,
+            target,
+            properties: vec![field("directive", text("#include"))],
+            source_tier: "T0".to_owned(),
+            relationship_class: "DEPENDS_ON".to_owned(),
+        }) {
+            eprintln!("native clang inclusion emission failed: {error}");
+        }
+    }
 }
 
 unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
@@ -1397,6 +1440,11 @@ fn parse_unit(
             return Err(format!("clang_parseTranslationUnit2 failed for {}: {error}", unit.path).into());
         }
         let root = clang_getTranslationUnitCursor(translation_unit);
+        clang_getInclusions(
+            translation_unit,
+            collect_inclusion,
+            emitter as *mut Emitter as *mut c_void,
+        );
         // libclang returns the number of visited children here, not a success
         // status; zero is valid for an empty or diagnostic-only translation unit.
         clang_visitChildren(root, visit, emitter as *mut Emitter as *mut c_void);
