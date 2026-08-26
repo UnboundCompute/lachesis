@@ -1075,7 +1075,12 @@ fn cursor_identity(
         "IntegerLiteral" | "StringLiteral" | "CharacterLiteral" => ("expression", "T3", "body"),
         _ => return None,
     };
-    Some((kind.to_owned(), tier.to_owned(), stable_id(id_kind, file, offset, end_offset, spelling)))
+    let identity = if id_kind == "body" { syntax_kind } else { spelling };
+    Some((
+        kind.to_owned(),
+        tier.to_owned(),
+        stable_id(id_kind, file, offset, end_offset, identity),
+    ))
 }
 
 fn write_manifests(output: &Path, frontend_id: &str, node_count: u64, edge_count: u64) -> io::Result<()> {
