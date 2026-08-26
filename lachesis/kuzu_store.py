@@ -58,8 +58,10 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from lachesis.core.graph_wire import (
-    decode_document, decode_node, encode_document, encode_node, read_frames, write_frame,
+    decode_document, decode_edge, decode_node, encode_document, encode_node, read_frames,
+    write_frame,
 )
+from lachesis.core import graph_pb2
 from lachesis.indices import (
     CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
     build_decl_and_callsite_index, exported_ids, index_rows,
@@ -526,6 +528,69 @@ def _props_text(properties: dict, elide: bool,
     return encode_document(properties)
 
 
+def _proto_value(field):
+    """Read the scalar values used by promoted columns without making a dict.
+
+    The streamed store writer only needs scalar promoted properties.  Keeping this
+    small conversion here lets the bulk path retain protobuf messages and avoid the
+    general graph-wire ``Value`` -> Python object reconstruction for every record.
+    """
+    kind = field.value.WhichOneof("kind")
+    if kind == "text":
+        return field.value.text
+    if kind == "integer":
+        return field.value.integer
+    if kind == "real":
+        return field.value.real
+    if kind == "boolean":
+        return field.value.boolean
+    if kind == "binary":
+        return bytes(field.value.binary)
+    if kind == "null_value":
+        return None
+    # Promoted columns are scalar by contract.  Returning None for a malformed or
+    # non-scalar value preserves the same SQL-NULL fallback as _cell; the complete
+    # value remains authoritative in the props tail.
+    return None
+
+
+def _proto_promoted_value(fields, prop: str):
+    if prop == "unit":
+        prop = "file"
+    for field in fields:
+        if field.key == prop:
+            return _proto_value(field)
+    return None
+
+
+def _proto_default_constant(field) -> bool:
+    if field.key in ("fact_origin", "confidence"):
+        return field.value.WhichOneof("kind") == "text" and (
+            (field.key == "fact_origin" and field.value.text == "compiler")
+            or (field.key == "confidence" and field.value.text == "exact")
+        )
+    return field.key == "evidence_ids" and field.value.WhichOneof("kind") == "list" \
+        and not field.value.list.values
+
+
+def _proto_props_text(fields, elide: bool,
+                     drop: frozenset = frozenset()) -> bytes:
+    """Encode a protobuf field slice directly as the store's Document tail."""
+    kept = []
+    for field in fields:
+        if elide and _proto_default_constant(field):
+            continue
+        if field.key in drop and _column_faithful(field.key, _proto_value(field)):
+            continue
+        kept.append(field)
+    if not kept:
+        return b""
+    message = graph_pb2.Document(format_version=1)
+    for field in kept:
+        message.fields.fields.add().CopyFrom(field)
+    return message.SerializeToString()
+
+
 class PropsCodec:
     """Deflates one `props` tail per row, against the store's shared dictionary.
 
@@ -575,6 +640,25 @@ class PropsCodec:
         """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
+        if not text:
+            return None
+        if len(text) <= 512:
+            cached = self._cache.get(text)
+            if cached is not None:
+                return cached
+        if self._prototype is None:
+            result = zlib.compress(text, _PROPS_ZLIB_LEVEL)
+        else:
+            obj = self._prototype.copy()
+            result = obj.compress(text) + obj.flush()
+        if len(text) <= 512 and len(self._cache) < 4096:
+            self._cache[text] = result
+        return result
+
+    def blob_fields(self, index: int, fields, elide: bool,
+                    drop: frozenset = frozenset()) -> Optional[bytes]:
+        """The direct-protobuf equivalent of :meth:`blob`."""
+        text = _proto_props_text(fields, elide, drop)
         if not text:
             return None
         if len(text) <= 512:
@@ -1088,6 +1172,29 @@ def _node_table(nodes: list[dict], *, elide: bool, codec: PropsCodec,
                      for c in columns})
 
 
+def _node_table_proto(nodes, *, elide: bool, codec: PropsCodec,
+                      id_codes: Optional[dict] = None, index_offset: int = 0):
+    """Build a node table from parsed NodeRecord messages, without graph dicts."""
+    if not nodes:
+        return None
+    columns = ["id", "kind", "label", *PROMOTED_NODE_PROPS, "props"]
+    data: dict[str, list] = {c: [] for c in columns}
+    codes = id_codes or {}
+    for node in nodes:
+        fields = node.properties
+        data["id"].append(encode_id(node.id, codes))
+        data["kind"].append(node.kind or None)
+        data["label"].append(node.label or None)
+        for prop in PROMOTED_NODE_PROPS:
+            data[prop].append(_coded_cell(
+                prop, _proto_promoted_value(fields, prop), codes))
+        data["props"].append(codec.blob_fields(
+            index_offset, fields, elide, _COLUMN_KEYS))
+        index_offset += 1
+    return pa.table({c: pa.array([_cell(c, v) for v in data[c]], type=_arrow_type(c))
+                     for c in columns})
+
+
 def _load_nodes_bulk(conn, nodes: list[dict], *, elide: bool, stage_dir: str,
                      codec: PropsCodec, id_codes: Optional[dict] = None) -> None:
     for offset in range(0, len(nodes), STREAM_EDGE_COPY_PARTITION_ROWS):
@@ -1156,6 +1263,61 @@ def _edge_tables(edges: list[dict], *, elide: bool, node_units: dict,
             "props": pa.array(cold["props"], pa.binary()),
         })
         tables["EDGE"] = table
+    return tables
+
+
+def _edge_tables_proto(edges, *, elide: bool, node_units: dict,
+                       codec: PropsCodec, id_codes: Optional[dict] = None,
+                       index_offset: int = 0) -> dict:
+    """Build relation tables directly from parsed EdgeRecord messages."""
+    hot: dict[str, dict[str, list]] = {
+        kind: {"src": [], "tgt": [], "unit": [], "props": []}
+        for kind in HOT_REL_KINDS
+    }
+    cold: dict[str, list] = {"src": [], "tgt": [], "kind": [], "sem": [],
+                             "unit": [], "props": []}
+    codes = id_codes or {}
+    for edge in edges:
+        kind = edge.kind or None
+        fields = edge.properties
+        file_value = _proto_promoted_value(fields, "file")
+        unit = file_value or node_units.get(edge.source)
+        stored = codec.blob_fields(index_offset, fields, elide)
+        index_offset += 1
+        src, tgt = encode_id(edge.source, codes), encode_id(edge.target, codes)
+        if kind in _HOT_SET:
+            bucket = hot[kind]
+            bucket["src"].append(src)
+            bucket["tgt"].append(tgt)
+            bucket["unit"].append(unit)
+            bucket["props"].append(stored)
+        else:
+            semantic = kind
+            if kind == "EXPANDS_TO":
+                semantic = _proto_promoted_value(fields, "via") or "EXPANDS_TO"
+            cold["src"].append(src)
+            cold["tgt"].append(tgt)
+            cold["kind"].append(kind)
+            cold["sem"].append(semantic)
+            cold["unit"].append(unit)
+            cold["props"].append(stored)
+
+    tables = {}
+    for kind, bucket in hot.items():
+        if not bucket["src"]:
+            continue
+        tables[kind] = pa.table({
+            "src": _str_col(bucket["src"]), "tgt": _str_col(bucket["tgt"]),
+            "unit": _str_col(bucket["unit"]),
+            "props": pa.array(bucket["props"], pa.binary()),
+        })
+    if cold["src"]:
+        tables["EDGE"] = pa.table({
+            "src": _str_col(cold["src"]), "tgt": _str_col(cold["tgt"]),
+            "kind": _str_col(cold["kind"]), "sem": _str_col(cold["sem"]),
+            "unit": _str_col(cold["unit"]),
+            "props": pa.array(cold["props"], pa.binary()),
+        })
     return tables
 
 
@@ -1420,39 +1582,75 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # after the graph tables are complete.
     index_stage = tempfile.NamedTemporaryFile(mode="wb", prefix="lachesis-index-",
                                                delete=False)
-    for node in shard_reader.nodes(headers_only=True):
-        kind = node.get("kind")
-        if prune and kind in PRUNE_NODE_KINDS:
-            continue
-        node_id = node["id"]
-        props = node.get("properties") or {}
-        kept_ids.add(node_id)
-        hash_part(node_id)
-        if props.get("file"):
-            node_units[node_id] = props["file"]
-        for value in (node_id, props.get("compiler_node_id")):
-            match = _ID_SHAPE.match(value) if isinstance(value, str) else None
-            if match:
-                prefixes.add(match.group(1))
-        if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
-            write_frame(index_stage, encode_node(node))
+    binary_shards = callable(getattr(shard_reader, "raw_nodes", None))
+    if binary_shards:
+        for payload in shard_reader.raw_nodes():
+            node = graph_pb2.NodeRecord()
+            node.ParseFromString(payload)
+            kind = node.kind
+            if prune and kind in PRUNE_NODE_KINDS:
+                continue
+            node_id = node.id
+            kept_ids.add(node_id)
+            hash_part(node_id)
+            file_value = _proto_promoted_value(node.properties, "file")
+            compiler_id = _proto_promoted_value(node.properties, "compiler_node_id")
+            if file_value:
+                node_units[node_id] = file_value
+            for value in (node_id, compiler_id):
+                match = _ID_SHAPE.match(value) if isinstance(value, str) else None
+                if match:
+                    prefixes.add(match.group(1))
+            if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
+                write_frame(index_stage, payload)
+    else:
+        for node in shard_reader.nodes(headers_only=True):
+            kind = node.get("kind")
+            if prune and kind in PRUNE_NODE_KINDS:
+                continue
+            node_id = node["id"]
+            props = node.get("properties") or {}
+            kept_ids.add(node_id)
+            hash_part(node_id)
+            if props.get("file"):
+                node_units[node_id] = props["file"]
+            for value in (node_id, props.get("compiler_node_id")):
+                match = _ID_SHAPE.match(value) if isinstance(value, str) else None
+                if match:
+                    prefixes.add(match.group(1))
+            if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
+                write_frame(index_stage, encode_node(node))
 
     exported: set[str] = set()
     unresolved_count = 0
-    for edge in shard_reader.edges(headers_only=True):
-        if edge.get("kind") == "EXPORTS" and edge.get("target"):
-            exported.add(edge["target"])
-        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
-            unresolved_count += 1
-        # Streamed stores do not carry deferred edges: the second pass drops every
-        # edge whose endpoints were pruned or absent. Therefore retained endpoints
-        # are necessarily retained nodes, and their prefixes were collected above;
-        # scanning both endpoint strings again here was millions of redundant regex
-        # matches on the large Linux graph.
-        if edge.get("source") in kept_ids and edge.get("target") in kept_ids:
-            hash_part(edge.get("kind"))
-            hash_part(edge.get("source"))
-            hash_part(edge.get("target"))
+    binary_edges = callable(getattr(shard_reader, "raw_edges", None))
+    if binary_edges:
+        for payload in shard_reader.raw_edges():
+            edge = graph_pb2.EdgeRecord()
+            edge.ParseFromString(payload)
+            if edge.kind == "EXPORTS" and edge.target:
+                exported.add(edge.target)
+            if edge.source not in kept_ids or edge.target not in kept_ids:
+                unresolved_count += 1
+            if edge.source in kept_ids and edge.target in kept_ids:
+                hash_part(edge.kind)
+                hash_part(edge.source)
+                hash_part(edge.target)
+    else:
+        for edge in shard_reader.edges(headers_only=True):
+            if edge.get("kind") == "EXPORTS" and edge.get("target"):
+                exported.add(edge["target"])
+            if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+                unresolved_count += 1
+            # Streamed stores do not carry deferred edges: the second pass drops every
+            # edge whose endpoints were pruned or absent. Therefore retained endpoints
+            # are necessarily retained nodes, and their prefixes were collected above;
+            # scanning both endpoint strings again here was millions of redundant regex
+            # matches on the large Linux graph.
+            if edge.get("source") in kept_ids and edge.get("target") in kept_ids:
+                hash_part(edge.get("kind"))
+                hash_part(edge.get("source"))
+                hash_part(edge.get("target"))
     timing("scan headers and edge endpoints")
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
@@ -1497,19 +1695,27 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             return
         if bulk:
             nonlocal node_writer, node_path
-            table = _node_table(batch, elide=True, codec=codec, id_codes=id_codes)
+            if isinstance(batch[0], graph_pb2.NodeRecord):
+                table = _node_table_proto(batch, elide=True, codec=codec,
+                                          id_codes=id_codes)
+            else:
+                table = _node_table(batch, elide=True, codec=codec, id_codes=id_codes)
             if node_writer is None:
                 node_path = os.path.join(stage.name, "node.parquet")
                 node_writer = pq.ParquetWriter(node_path, table.schema)
             node_writer.write_table(table)
         else:
+            if isinstance(batch[0], graph_pb2.NodeRecord):
+                batch = [decode_node(node.SerializeToString()) for node in batch]
             _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
 
     def load_edges(batch: list[dict]) -> None:
         if not batch:
             return
         if bulk:
-            for kind, table in _edge_tables(
+            table_builder = (_edge_tables_proto if isinstance(
+                batch[0], graph_pb2.EdgeRecord) else _edge_tables)
+            for kind, table in table_builder(
                 batch, elide=True, node_units=node_units,
                 codec=codec, id_codes=id_codes,
             ).items():
@@ -1525,13 +1731,23 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 if edge_row_counts[kind] >= STREAM_EDGE_COPY_PARTITION_ROWS:
                     flush_edge_partition(kind)
         else:
+            if isinstance(batch[0], graph_pb2.EdgeRecord):
+                batch = [decode_edge(edge.SerializeToString()) for edge in batch]
             _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
                                 codec=codec, id_codes=id_codes)
 
-    batch: list[dict] = []
-    for node in shard_reader.nodes():
-        if prune and node.get("kind") in PRUNE_NODE_KINDS:
-            continue
+    batch = []
+    node_records = shard_reader.raw_nodes() if binary_shards else shard_reader.nodes()
+    for item in node_records:
+        if binary_shards:
+            node = graph_pb2.NodeRecord()
+            node.ParseFromString(item)
+            if prune and node.kind in PRUNE_NODE_KINDS:
+                continue
+        else:
+            node = item
+            if prune and node.get("kind") in PRUNE_NODE_KINDS:
+                continue
         batch.append(node)
         if len(batch) >= batch_rows:
             load_nodes(batch)
@@ -1545,9 +1761,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
 
     batch = []
     kept_edge_count = 0
-    for edge in shard_reader.edges():
-        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
-            continue
+    edge_records = shard_reader.raw_edges() if binary_edges else shard_reader.edges()
+    for item in edge_records:
+        if binary_edges:
+            edge = graph_pb2.EdgeRecord()
+            edge.ParseFromString(item)
+            if edge.source not in kept_ids or edge.target not in kept_ids:
+                continue
+        else:
+            edge = item
+            if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+                continue
         batch.append(edge)
         kept_edge_count += 1
         if len(batch) >= batch_rows:
