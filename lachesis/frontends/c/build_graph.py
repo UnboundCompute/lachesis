@@ -412,7 +412,7 @@ def run_clang_over(
             line = (
                 "[lachesis timing] clang %s: %.3fs (%d/%d files, jobs=%d)"
                 % (label or "pass", time.perf_counter() - timing_started,
-                   completed_count, len(paths), jobs),
+                   completed_count, len(paths), jobs)
             )
             print(line, file=sys.stderr, flush=True)
             timing_path = os.environ.get("LACHESIS_TIMINGS_FILE")
