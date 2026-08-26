@@ -617,7 +617,15 @@ fn assign_generations(
 ) {
     let node_index: HashMap<&str, usize> = nodes.iter().enumerate()
         .map(|(index, node)| (node.as_str(), index)).collect();
-    let all: HashSet<usize> = (0..nodes.len()).collect();
+    // Keep the exact iterative dominator equations, but represent each set as
+    // packed machine words.  The previous HashSet representation performed a
+    // hash lookup for every candidate edge on every fixed-point pass.
+    let words = nodes.len().div_ceil(usize::BITS as usize);
+    let mut all = vec![usize::MAX; words];
+    if let Some(last) = all.last_mut() {
+        let used = nodes.len() % usize::BITS as usize;
+        if used != 0 { *last = (1usize << used) - 1; }
+    }
     let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (source, targets) in successors {
         let Some(&source_index) = node_index.get(source.as_str()) else { continue };
@@ -630,18 +638,23 @@ fn assign_generations(
     let entry = nodes.first().and_then(|node| node_index.get(node.as_str()).copied());
     let mut dominators = vec![all.clone(); nodes.len()];
     if let Some(entry) = entry {
-        dominators[entry] = HashSet::from([entry]);
+        dominators[entry].fill(0);
+        dominators[entry][entry / usize::BITS as usize] |= 1usize << (entry % usize::BITS as usize);
         let mut changed = true;
         while changed {
             changed = false;
             for index in 0..nodes.len() {
                 if index == entry { continue; }
                 let candidate = if predecessors[index].is_empty() {
-                    HashSet::from([index])
+                    let mut only = vec![0; words];
+                    only[index / usize::BITS as usize] |= 1usize << (index % usize::BITS as usize);
+                    only
                 } else {
                     let mut meet = all.clone();
-                    for parent in &predecessors[index] { meet.retain(|item| dominators[*parent].contains(item)); }
-                    meet.insert(index);
+                    for parent in &predecessors[index] {
+                        for (word, value) in meet.iter_mut().zip(&dominators[*parent]) { *word &= *value; }
+                    }
+                    meet[index / usize::BITS as usize] |= 1usize << (index % usize::BITS as usize);
                     meet
                 };
                 if candidate != dominators[index] { dominators[index] = candidate; changed = true; }
@@ -651,7 +664,9 @@ fn assign_generations(
     let dominates = |left: &str, right: &str| -> bool {
         if left == right { return true; }
         match (node_index.get(left), node_index.get(right)) {
-            (Some(&left), Some(&right)) => dominators[right].contains(&left),
+            (Some(&left), Some(&right)) => dominators[right]
+                .get(left / usize::BITS as usize)
+                .is_some_and(|word| word & (1usize << (left % usize::BITS as usize)) != 0),
             _ => false,
         }
     };
