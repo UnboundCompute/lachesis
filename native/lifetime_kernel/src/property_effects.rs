@@ -19,14 +19,23 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
 pub(crate) fn enrich(graph: &Graph) -> Delta {
     let effects: Vec<&pass2::Edge> = graph.edges.iter().filter(|item| graph.edge_kind(item) == "WRITES_PARAMETER_PROPERTY").collect();
     if effects.is_empty() { return Delta { nodes: vec![], edges: vec![] }; }
+    // Index calls by their resolved summary target once.  The previous loop
+    // rescanned every call/construct node for every property-effect edge,
+    // turning a sparse relation into effects * calls work on large graphs.
+    let mut calls_by_target: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, call) in graph.nodes.iter().enumerate() {
+        if !matches!(graph.kind(call.kind), "call" | "construct") { continue; }
+        let Some(target) = text(graph, call, "primary_target_id").and_then(|id| graph.symbol(id)) else { continue };
+        calls_by_target.entry(target).or_default().push(index);
+    }
     let mut nodes = Vec::new(); let mut edges = Vec::new(); let mut emitted_locations = HashSet::new(); let mut locations: HashMap<(u32, u32), (String, u32)> = HashMap::new();
     for effect in effects {
         let Some(receiver_position) = edge_integer(effect, "receiver_position").and_then(|value| usize::try_from(value).ok()) else { continue };
         let Some(value_position) = edge_integer(effect, "value_position").and_then(|value| usize::try_from(value).ok()) else { continue };
         let Some(effect_source) = graph.node_by_id.get(&effect.source).map(|index| &graph.nodes[*index]) else { continue };
         let property_id = effect.target;
-        for call in graph.nodes.iter().filter(|node| matches!(graph.kind(node.kind), "call" | "construct")) {
-            if text(graph, call, "primary_target_id").and_then(|id| graph.symbol(id)) != Some(effect.source) { continue; }
+        for call_index in calls_by_target.get(&effect.source).into_iter().flatten() {
+            let call = &graph.nodes[*call_index];
             let values = list_text(graph, call, "argument_value_ids"); if receiver_position >= values.len() || value_position >= values.len() { continue; }
             let Some(receiver_id) = graph.symbol(&values[receiver_position]) else { continue }; let Some(value_id) = graph.symbol(&values[value_position]) else { continue };
             let call_text = graph.id(call.id).to_owned(); let receiver_text = graph.id(receiver_id).to_owned(); let value_text = graph.id(value_id).to_owned(); let property_text = graph.id(property_id).to_owned(); let effect_text = graph.id(effect.source).to_owned();
