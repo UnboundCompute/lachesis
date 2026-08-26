@@ -1058,6 +1058,56 @@ pub unsafe extern "C" fn lachesis_atropos_bind_path(
     }
 }
 
+/// Run native source discovery and coverage planning from binary sidecars.
+/// The catalog file is the compiled Atropos `Request` protobuf; only source
+/// entries are projected into the planner's compact input in Rust.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_plan_path(
+    facts_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if facts_path.is_null() || catalog_path.is_null() || output_path.is_null() {
+            return Err("native planner path is null".to_owned());
+        }
+        let facts = CStr::from_ptr(facts_path).to_str()
+            .map_err(|error| format!("invalid facts path: {error}"))?;
+        let catalog = CStr::from_ptr(catalog_path).to_str()
+            .map_err(|error| format!("invalid catalog path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid output path: {error}"))?;
+        let translation = lifetime_proto::TranslationResult::decode(
+            fs::read(facts).map_err(|error| format!("cannot read translation facts: {error}"))?.as_slice()
+        ).map_err(|error| format!("invalid translation facts: {error}"))?;
+        let catalog_request = atropos_proto::Request::decode(
+            fs::read(catalog).map_err(|error| format!("cannot read binary catalog: {error}"))?.as_slice()
+        ).map_err(|error| format!("invalid binary catalog: {error}"))?;
+        let source_entries = catalog_request.models.into_iter()
+            .filter(|model| model.role == "source")
+            .map(|model| lifetime_proto::SourceCatalogEntry {
+                name: if model.package.is_empty() || model.package == "builtins" {
+                    model.method
+                } else {
+                    format!("{}.{}", model.package, model.method)
+                },
+                kind: model.role,
+            }).collect();
+        let request = lifetime_proto::NativePlanRequest {
+            translation: Some(translation), sources: source_entries,
+        };
+        let result = planner::plan(request);
+        let mut bytes = Vec::new();
+        result.encode(&mut bytes).map_err(|error| format!("cannot encode plan: {error}"))?;
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, bytes).map_err(|error| format!("cannot write plan: {error}"))?;
+        fs::rename(&temporary, output).map_err(|error| format!("cannot publish plan: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native planner path error: {error}"); 1 }
+    }
+}
+
 /// Plan source launches, formal/actual seams, and coverage regions directly
 /// from compact translation facts and catalog entries.
 #[no_mangle]
