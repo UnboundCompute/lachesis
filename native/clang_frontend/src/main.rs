@@ -1425,6 +1425,41 @@ fn write_frontend_bundle(
     Ok((node_count, emitted_edges))
 }
 
+/// The streaming runner consumes the framed shard directly.  It still needs the
+/// small frontend manifest, but it does not need the tier bundle: producing that
+/// bundle would decode and re-encode every node and edge a second time only for
+/// the runner to discard it in `_stream_bundle_to_shard`.
+fn write_stream_manifest(
+    output: &Path, frontend_id: &str, node_count: u64, edge_count: u64,
+) -> io::Result<()> {
+    let manifest = graph::Document {
+        format_version: 1,
+        fields: Some(graph::ObjectValue {
+            fields: vec![
+                field("version", integer(2)),
+                field("frontend_contract_version", integer(2)),
+                field("frontend_id", text(frontend_id)),
+                field("generator", text(frontend_id)),
+                field("languages", text_list(vec!["c".to_owned()])),
+                field("lexical_tokens", graph::Value {
+                    kind: Some(graph::value::Kind::Boolean(false)),
+                }),
+                field("capabilities", object(vec![
+                    field("lexical", text("none")),
+                    field("syntax", text("partial")),
+                    field("symbols", text("partial")),
+                    field("types", text("partial")),
+                    field("calls", text("partial")),
+                    field("direct_data_flow", text("partial")),
+                ])),
+                field("node_count", integer(node_count as i64)),
+                field("edge_count", integer(edge_count as i64)),
+            ],
+        }),
+    };
+    fs::write(output.join("manifest.pb"), manifest.encode_to_vec())
+}
+
 fn parse_unit(
     index: CXIndex,
     unit: &graph::NativeTranslationUnit,
@@ -1742,7 +1777,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let edge_count = emitter.edge_count;
         clang_disposeIndex(index);
         write_manifests(&shard, "clang-c-native", node_count, edge_count)?;
-        write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count)?;
+        if env::var_os("LACHESIS_SHARD_ROOT").is_some() {
+            write_stream_manifest(&output, "clang-c", node_count, edge_count)?;
+        } else {
+            write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count)?;
+        }
         println!("native clang emitted {node_count} nodes and {edge_count} edges to {}", output.display());
     }
     Ok(())
