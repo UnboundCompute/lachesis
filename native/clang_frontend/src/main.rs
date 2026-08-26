@@ -42,6 +42,14 @@ fn field(key: &str, value: graph::Value) -> graph::Field {
     }
 }
 
+fn text_list(values: impl IntoIterator<Item = String>) -> graph::Value {
+    graph::Value {
+        kind: Some(graph::value::Kind::List(graph::ListValue {
+            values: values.into_iter().map(|value| text(&value)).collect(),
+        })),
+    }
+}
+
 fn stable_id(kind: &str, file: &str, offset: u32, end: u32, spelling: &str) -> String {
     let raw = format!("{file}\0{offset}\0{end}\0{spelling}");
     let mut digest = Sha256::new();
@@ -175,6 +183,83 @@ fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Re
         ],
         tier: "T0".to_owned(),
     })
+}
+
+fn emit_macros_for_file(emitter: &mut Emitter, path: &str) -> io::Result<()> {
+    let bytes = fs::read(path).unwrap_or_default();
+    let source = String::from_utf8_lossy(&bytes);
+    let file_id = match emitter.file_ids.get(path) {
+        Some(id) => id.clone(),
+        None => return Ok(()),
+    };
+    let mut line_offset = 0u32;
+    for line in source.split_inclusive('\n') {
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let leading = without_newline.len() - without_newline.trim_start().len();
+        let definition = without_newline[leading..].strip_prefix("#define");
+        if let Some(definition) = definition {
+            let definition = definition.trim_start();
+            let name_end = definition
+                .find(|character: char| !(character == '_' || character.is_ascii_alphanumeric()))
+                .unwrap_or(definition.len());
+            if name_end == 0 {
+                line_offset = line_offset.saturating_add(line.len() as u32);
+                continue;
+            }
+            let name = &definition[..name_end];
+            let mut rest = &definition[name_end..];
+            let mut parameters = Vec::new();
+            let form = if rest.starts_with('(') {
+                if let Some(close) = rest.find(')') {
+                    parameters.extend(
+                        rest[1..close]
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned),
+                    );
+                    rest = &rest[close + 1..];
+                    "function-like"
+                } else {
+                    "object-like"
+                }
+            } else {
+                "object-like"
+            };
+            let body = rest.trim().to_owned();
+            let macro_id = stable_id_parts(
+                "macro",
+                &[path.to_owned(), line_offset.to_string(), name.to_owned()],
+            );
+            let signature = if form == "function-like" {
+                format!("{}({})", name, parameters.join(", "))
+            } else {
+                name.to_owned()
+            };
+            let end_column = without_newline.len().max(1) as i64;
+            emitter.node(graph::NodeRecord {
+                id: macro_id.clone(), kind: "macro".to_owned(), label: name.to_owned(),
+                properties: vec![
+                    field("file", text(path)), field("absolute_file", text(path)),
+                    field("start_offset", integer(line_offset as i64)),
+                    field("end_offset", integer(line_offset as i64 + without_newline.len() as i64)),
+                    field("start_line", integer(source[..line_offset as usize].bytes().filter(|b| *b == b'\n').count() as i64 + 1)),
+                    field("start_column", integer(leading as i64 + 1)),
+                    field("end_line", integer(source[..line_offset as usize].bytes().filter(|b| *b == b'\n').count() as i64 + 1)),
+                    field("end_column", integer(end_column)), field("syntax_kind", text("macro")),
+                    field("form", text(form)), field("parameters", text_list(parameters)),
+                    field("body", text(&body)), field("signature", text(&signature)),
+                ], tier: "T1".to_owned(),
+            })?;
+            emitter.edge(graph::EdgeRecord {
+                kind: "DECLARES".to_owned(), source: file_id.clone(), target: macro_id,
+                properties: Vec::new(), source_tier: "T0".to_owned(),
+                relationship_class: "DECLARES".to_owned(),
+            })?;
+        }
+        line_offset = line_offset.saturating_add(line.len() as u32);
+    }
+    Ok(())
 }
 
 extern "C" fn visit(cursor: CXCursor, parent: CXCursor, data: CXClientData) -> CXChildVisitResult {
@@ -519,6 +604,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|_| PathBuf::from(&unit.path));
                 let path_text = path.to_string_lossy().into_owned();
                 emit_file_node(&mut emitter, &path_text, &request.source_dir)?;
+                emit_macros_for_file(&mut emitter, &path_text)?;
             }
         } else {
             let path = PathBuf::from(&arguments[1])
@@ -528,6 +614,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             emitter.root_files.insert(path_text.clone());
             let source_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy();
             emit_file_node(&mut emitter, &path_text, &source_dir)?;
+            emit_macros_for_file(&mut emitter, &path_text)?;
         }
         if let Some(request) = request {
             if request.translation_units.is_empty() {
