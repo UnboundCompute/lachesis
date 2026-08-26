@@ -41,6 +41,7 @@ mod module_initialization;
 mod property_effects;
 mod heap;
 mod summary;
+mod sidecar_project;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -1053,6 +1054,48 @@ pub unsafe extern "C" fn lachesis_pass2_run_path(
     match result {
         Ok(()) => 0,
         Err(error) => { eprintln!("native Pass-2 error: {error}"); 1 }
+    }
+}
+
+/// Project one native Pass-1 shard into the complete Pass-2 input and compact
+/// Pass-3 substrate.  Only paths and scalar metadata cross the ABI; Rust owns
+/// protobuf decoding, filtering, framing, and atomic publication.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_pass1_project_shard(
+    nodes_path: *const c_char,
+    edges_path: *const c_char,
+    pass2_output: *const c_char,
+    pass3_output: *const c_char,
+    store_version: *const c_char,
+    core_content_hash: *const c_char,
+    source_content_hash: *const c_char,
+    build_fingerprint: *const c_char,
+    prune: i32,
+) -> i32 {
+    let result = (|| {
+        let paths = [nodes_path, edges_path, pass2_output, pass3_output]
+            .into_iter().map(|path| {
+                if path.is_null() { return Err("native Pass-1 projector path is null".to_owned()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 projector path: {error}"))
+            }).collect::<Result<Vec<_>, _>>()?;
+        let metadata = [store_version, core_content_hash, source_content_hash, build_fingerprint]
+            .into_iter().map(|path| {
+                if path.is_null() { return Ok(String::new()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 metadata: {error}"))
+            }).collect::<Result<Vec<_>, String>>()?;
+        sidecar_project::project_shard(
+            std::path::Path::new(&paths[0]), std::path::Path::new(&paths[1]),
+            std::path::Path::new(&paths[2]), std::path::Path::new(&paths[3]),
+            &metadata[0], &metadata[1], &metadata[2], &metadata[3], prune != 0,
+        )
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native Pass-1 projector error: {error}"); 1 }
     }
 }
 

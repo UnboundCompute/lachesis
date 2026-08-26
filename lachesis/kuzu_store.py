@@ -1609,6 +1609,6 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     from lachesis.nav.dataflow.substrate import write_streaming_pass1_caches
     write_streaming_pass1_caches(
         shard_reader, target_db_dir, manifest=payload,
-        keep_node=lambda node: not (prune and node.get("kind") in PRUNE_NODE_KINDS),
+        prune=prune,
     )
     return target_db_dir

@@ -378,6 +378,41 @@ def run_pass2_path(input_path: str | os.PathLike[str], output_path: str | os.Pat
         raise RuntimeError(f"native Pass-2 runner failed with status {status}")
 
 
+def project_pass1_shard(
+    nodes_path: str | os.PathLike[str],
+    edges_path: str | os.PathLike[str],
+    pass2_output: str | os.PathLike[str],
+    pass3_output: str | os.PathLike[str],
+    manifest: dict[str, Any],
+    *,
+    prune: bool = False,
+) -> None:
+    """Publish native Pass-1 sidecars without Python record reconstruction."""
+    library = _load()
+    if library is None:
+        raise RuntimeError("native lifetime library is unavailable")
+    function = library.lachesis_pass1_project_shard
+    function.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+
+    def encoded(value: Any) -> bytes:
+        return os.fsencode(str(value or ""))
+
+    status = function(
+        encoded(nodes_path), encoded(edges_path), encoded(pass2_output),
+        encoded(pass3_output), encoded(manifest.get("version")),
+        encoded(manifest.get("core_content_hash")),
+        encoded(manifest.get("source_content_hash")),
+        encoded(manifest.get("build_fingerprint")), int(bool(prune)),
+    )
+    if status != 0:
+        raise RuntimeError(f"native Pass-1 shard projector failed with status {status}")
+
+
 def plan_path(facts_path: str | os.PathLike[str],
               catalog_path: str | os.PathLike[str],
               output_path: str | os.PathLike[str]):

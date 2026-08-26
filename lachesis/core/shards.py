@@ -110,6 +110,12 @@ class ShardReader:
         path = self.directory / str(self.manifest["edges_file"])
         yield from read_frames(path)
 
+    def raw_shard_paths(self):
+        """Return the immutable framed files for native path-based consumers."""
+        return ((self.manifest["frontend_id"],
+                 self.directory / str(self.manifest["nodes_file"]),
+                 self.directory / str(self.manifest["edges_file"])),)
+
 
 class ShardSetReader:
     """Read a completed shard-set manifest in deterministic shard order."""
@@ -161,6 +167,12 @@ class ShardSetReader:
         for shard in self._shards():
             yield from shard.raw_edges()
 
+    def raw_shard_paths(self):
+        paths = []
+        for shard in self._shards():
+            paths.extend(shard.raw_shard_paths())
+        return tuple(paths)
+
 
 class CompositeShardReader:
     """Stream several frontend shard sets as one canonical source."""
@@ -183,6 +195,12 @@ class CompositeShardReader:
 
     def raw_edges(self) -> Iterator[bytes]:
         yield from chain.from_iterable(reader.raw_edges() for reader in self.readers)
+
+    def raw_shard_paths(self):
+        paths = []
+        for reader in self.readers:
+            paths.extend(reader.raw_shard_paths())
+        return tuple(paths)
 
 
 class ShardSetWriter:
