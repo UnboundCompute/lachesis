@@ -1373,6 +1373,21 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn automatic_include_arguments(files: &[PathBuf]) -> Vec<String> {
+    let mut directories = FxHashSet::default();
+    for path in files {
+        if let Some(parent) = path.parent() {
+            directories.insert(parent.to_path_buf());
+        }
+    }
+    let mut directories: Vec<PathBuf> = directories.into_iter().collect();
+    directories.sort();
+    directories
+        .into_iter()
+        .flat_map(|directory| ["-I".to_owned(), directory.to_string_lossy().into_owned()])
+        .collect()
+}
+
 fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     let source_dir = if input.is_dir() {
         input.to_path_buf()
@@ -1502,6 +1517,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut clang_arguments = Vec::new();
             if let Some(separator) = arguments.iter().position(|argument| argument == "--") {
                 clang_arguments.extend(arguments[separator + 1..].iter().cloned());
+            }
+            if clang_arguments.is_empty() {
+                // A directory invocation has no compile database at this native
+                // boundary. Make project-local includes resolvable without asking
+                // Python to inspect or translate any source/configuration data.
+                clang_arguments = automatic_include_arguments(&files);
             }
             for source in files {
                 let unit = graph::NativeTranslationUnit {
