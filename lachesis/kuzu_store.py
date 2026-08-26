@@ -1642,34 +1642,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     exported: set[str] = set()
     unresolved_count = 0
     binary_edges = callable(getattr(shard_reader, "raw_edges", None))
-    if binary_edges:
-        for payload in shard_reader.raw_edges():
-            edge = graph_pb2.EdgeRecord()
-            edge.ParseFromString(payload)
-            if edge.kind == "EXPORTS" and edge.target:
-                exported.add(edge.target)
-            if edge.source not in kept_ids or edge.target not in kept_ids:
-                unresolved_count += 1
-            if edge.source in kept_ids and edge.target in kept_ids:
-                hash_part(edge.kind)
-                hash_part(edge.source)
-                hash_part(edge.target)
-    else:
-        for edge in shard_reader.edges(headers_only=True):
-            if edge.get("kind") == "EXPORTS" and edge.get("target"):
-                exported.add(edge["target"])
-            if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
-                unresolved_count += 1
-            # Streamed stores do not carry deferred edges: the second pass drops every
-            # edge whose endpoints were pruned or absent. Therefore retained endpoints
-            # are necessarily retained nodes, and their prefixes were collected above;
-            # scanning both endpoint strings again here was millions of redundant regex
-            # matches on the large Linux graph.
-            if edge.get("source") in kept_ids and edge.get("target") in kept_ids:
-                hash_part(edge.get("kind"))
-                hash_part(edge.get("source"))
-                hash_part(edge.get("target"))
-    timing("scan headers and edge endpoints")
+    # Edge ownership, digesting, export collection, and Kùzu ingestion all need
+    # the same endpoint decision.  Keep that decision in the real load below;
+    # the old implementation decoded every edge once here and once again for
+    # COPY, which was pure work (and a full extra protobuf traversal) on Linux.
+    timing("scan headers")
     id_codes = {prefix: _prefix_code(i) for i, prefix in enumerate(sorted(prefixes))}
 
     # Streamed materialization is explicitly the bounded-memory path. Keep a
@@ -1787,12 +1764,24 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         if binary_edges:
             edge = graph_pb2.EdgeRecord()
             edge.ParseFromString(item)
+            if edge.kind == "EXPORTS" and edge.target:
+                exported.add(edge.target)
             if edge.source not in kept_ids or edge.target not in kept_ids:
+                unresolved_count += 1
                 continue
+            hash_part(edge.kind)
+            hash_part(edge.source)
+            hash_part(edge.target)
         else:
             edge = item
+            if edge.get("kind") == "EXPORTS" and edge.get("target"):
+                exported.add(edge["target"])
             if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
+                unresolved_count += 1
                 continue
+            hash_part(edge.get("kind"))
+            hash_part(edge.get("source"))
+            hash_part(edge.get("target"))
         batch.append(edge)
         kept_edge_count += 1
         if len(batch) >= batch_rows:
