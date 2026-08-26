@@ -71,6 +71,8 @@ pub struct Operation {
     pub line: Option<i64>,
     pub is_null: bool,
     pub access: String,
+    pub generation: Option<String>,
+    pub fresh_generation: Option<String>,
     pub alternatives: Vec<Vec<Operation>>,
 }
 
@@ -539,6 +541,8 @@ pub(crate) fn proto_operation(operation: lifetime_proto::Operation) -> Result<Op
         line: operation.has_line.then_some(operation.line),
         is_null: operation.is_null,
         access: operation.access,
+        generation: (!operation.generation.is_empty()).then_some(operation.generation),
+        fresh_generation: (!operation.fresh_generation.is_empty()).then_some(operation.fresh_generation),
         alternatives,
     })
 }
@@ -560,6 +564,8 @@ pub(crate) fn proto_operation_message(operation: Operation) -> lifetime_proto::O
         has_line: operation.line.is_some(),
         is_null: operation.is_null,
         access: operation.access,
+        generation: operation.generation.unwrap_or_default(),
+        fresh_generation: operation.fresh_generation.unwrap_or_default(),
         alternatives: operation.alternatives.into_iter().map(|effects| {
             lifetime_proto::Alternative {
                 effects: effects.into_iter().map(proto_operation_message).collect(),
@@ -1369,7 +1375,7 @@ mod tests {
     use super::*;
 
     fn op(kind: Kind, target: Path, site: &str) -> Operation {
-        Operation { kind, node: site.into(), target: Some(target), source: None, site: site.into(), line: Some(1), is_null: false, access: "deref".into(), alternatives: Vec::new() }
+        Operation { kind, node: site.into(), target: Some(target), source: None, site: site.into(), line: Some(1), is_null: false, access: "deref".into(), generation: None, fresh_generation: None, alternatives: Vec::new() }
     }
 
     #[test]

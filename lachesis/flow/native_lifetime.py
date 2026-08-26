@@ -399,6 +399,8 @@ def _operation_message(message, ordinal=0):
         source=_path_message(message.source), site=message.site or message.node,
         line=message.line if message.has_line else None, is_null=message.is_null,
         ordinal=ordinal, alternatives=alternatives, access=message.access or "deref",
+        generation=message.generation or None,
+        fresh_generation=message.fresh_generation or None,
     )
 
 

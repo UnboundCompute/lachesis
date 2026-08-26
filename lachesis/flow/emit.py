@@ -332,6 +332,14 @@ def _operation_generations(sub, operations, cfg=None):
     without inventing a path-sensitive generation set in the frozen graph.
     Loop re-entry remains an explicit matcher widening event.
     """
+    # Rust preparation has the complete CFG and operation stream already.  A
+    # native generation on every targeted operation means the expensive Python
+    # dominator fixed point below is unnecessary on the production path.
+    if operations and all(op.target is None or op.generation for op in operations):
+        return ({op: op.generation or "g0" for op in operations},
+                {op: op.fresh_generation for op in operations
+                 if op.fresh_generation})
+
     generations = {}
     fresh = {}
     ordered = sorted(

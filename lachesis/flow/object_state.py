@@ -68,6 +68,10 @@ class Operation:
     alternatives: tuple[tuple["Operation", ...], ...] = ()
     # Access form for the frozen skeleton split: dereference, pointer-value pass, or return.
     access: str = "deref"
+    # Native preparation may publish dominance-aware generations.  ``None``
+    # keeps compatibility with operations produced by the Python fallback.
+    generation: str | None = None
+    fresh_generation: str | None = None
 
 
 @dataclass(frozen=True, order=True)

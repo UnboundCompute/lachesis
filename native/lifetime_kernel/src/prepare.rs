@@ -472,6 +472,8 @@ fn operation(kind: Kind, node: &str, target: Option<Path>, source: Option<Path>,
         line: call.has_line.then_some(call.line),
         is_null: false,
         access: "deref".to_owned(),
+        generation: None,
+        fresh_generation: None,
         alternatives: Vec::new(),
     }
 }
@@ -486,6 +488,8 @@ fn raw_operation(kind: Kind, node: &str, target: Option<Path>, source: Option<Pa
         line,
         is_null,
         access: access.to_owned(),
+        generation: None,
+        fresh_generation: None,
         alternatives: Vec::new(),
     }
 }
@@ -532,6 +536,89 @@ fn cyclic_nodes(nodes: &[String], successors: &HashMap<String, Vec<String>>) -> 
     result.sort();
     result.dedup();
     result
+}
+
+fn assign_generations(
+    operations: &mut [Operation], nodes: &[String], successors: &HashMap<String, Vec<String>>,
+    offsets: &HashMap<String, i64>,
+) {
+    let node_index: HashMap<&str, usize> = nodes.iter().enumerate()
+        .map(|(index, node)| (node.as_str(), index)).collect();
+    let all: HashSet<usize> = (0..nodes.len()).collect();
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (source, targets) in successors {
+        let Some(&source_index) = node_index.get(source.as_str()) else { continue };
+        for target in targets {
+            if let Some(&target_index) = node_index.get(target.as_str()) {
+                predecessors[target_index].push(source_index);
+            }
+        }
+    }
+    let entry = nodes.first().and_then(|node| node_index.get(node.as_str()).copied());
+    let mut dominators = vec![all.clone(); nodes.len()];
+    if let Some(entry) = entry {
+        dominators[entry] = HashSet::from([entry]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for index in 0..nodes.len() {
+                if index == entry { continue; }
+                let candidate = if predecessors[index].is_empty() {
+                    HashSet::from([index])
+                } else {
+                    let mut meet = all.clone();
+                    for parent in &predecessors[index] { meet.retain(|item| dominators[*parent].contains(item)); }
+                    meet.insert(index);
+                    meet
+                };
+                if candidate != dominators[index] { dominators[index] = candidate; changed = true; }
+            }
+        }
+    }
+    let dominates = |left: &str, right: &str| -> bool {
+        if left == right { return true; }
+        match (node_index.get(left), node_index.get(right)) {
+            (Some(&left), Some(&right)) => dominators[right].contains(&left),
+            _ => false,
+        }
+    };
+    let mut order: Vec<usize> = (0..operations.len()).collect();
+    order.sort_by_key(|index| {
+        let operation = &operations[*index];
+        (operation.target.as_ref().and_then(|_| offsets.get(&operation.node).copied()).unwrap_or(i64::MAX),
+         operation.line.unwrap_or(i64::MAX), operation.node.clone(), *index)
+    });
+    let mut history: HashMap<Path, Vec<(usize, String, String)>> = HashMap::new();
+    for (position, index) in order.into_iter().enumerate() {
+        let Some(target) = operations[index].target.clone() else { continue };
+        let key = target.clone();
+        let prior = history.get(&key).into_iter().flatten()
+            .filter(|(old_position, old_node, _)| *old_position < position && dominates(old_node, &operations[index].node))
+            .max_by_key(|(_, _, generation)| generation.strip_prefix('g').and_then(|value| value.parse::<u32>().ok()).unwrap_or(0))
+            .map(|(_, _, generation)| generation.clone());
+        let current = prior.clone().unwrap_or_else(|| "g0".into());
+        let kind = operations[index].kind;
+        if matches!(kind, Kind::Alloc) {
+            let generation = if prior.is_some() { next_generation(&current) } else { "g0".into() };
+            operations[index].generation = Some(generation.clone());
+            history.entry(key).or_default().push((position, operations[index].node.clone(), generation));
+        } else if matches!(kind, Kind::Realloc) {
+            operations[index].generation = Some(current.clone());
+            let fresh = next_generation(&current);
+            operations[index].fresh_generation = Some(fresh.clone());
+            history.entry(key).or_default().push((position, operations[index].node.clone(), fresh));
+        } else {
+            operations[index].generation = Some(current);
+            if matches!(kind, Kind::Clobber) {
+                history.entry(key).or_default().push((position, operations[index].node.clone(), operations[index].generation.clone().unwrap()));
+            }
+        }
+    }
+}
+
+fn next_generation(value: &str) -> String {
+    value.strip_prefix('g').and_then(|item| item.parse::<u32>().ok())
+        .map(|number| format!("g{}", number + 1)).unwrap_or_else(|| "g1".into())
 }
 
 /// Add only the access-path facts needed by the compact translation ABI. This
@@ -932,6 +1019,11 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         }
     }
     let loop_nodes = cyclic_nodes(&prepared_nodes, &successor_map);
+    let offsets: HashMap<String, i64> = nodes.iter().filter_map(|node| {
+        property(node, "start_offset").and_then(|value| value.parse().ok())
+            .map(|offset| (node.id.clone(), offset))
+    }).collect();
+    assign_generations(&mut operations, &prepared_nodes, &successor_map, &offsets);
     let mut successors = successor_map.into_iter().map(|(node, mut targets)| {
         targets.sort();
         targets.dedup();

@@ -28,6 +28,8 @@ message Operation {
   bool is_null = 8;
   string access = 9;
   repeated Alternative alternatives = 10;
+  string generation = 11;
+  string fresh_generation = 12;
 }
 
 message Alternative { repeated Operation effects = 1; }
