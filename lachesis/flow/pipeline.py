@@ -14,7 +14,7 @@ from .native_translate import build_native_semantic_graph
 from .semantic_graph import match_graph
 
 
-_DEFAULT_LIFETIME_ENGINE = "object"
+_DEFAULT_LIFETIME_ENGINE = "rust"
 
 
 def run_pass(store, lang="c", lifetime_engine=None, *, workers=None,
@@ -49,7 +49,7 @@ def run_pass(store, lang="c", lifetime_engine=None, *, workers=None,
         "leads": leads,
         "lifetime": {
             "requested": requested,
-            "active": "object",
+            "active": "rust",
             "available": True,
             "timed_out": False,
             "diagnostics": {
