@@ -1142,6 +1142,11 @@ def main() -> int:
     def eligible(node: dict, inherited_included: bool) -> bool:
         return not (inherited_included or _has_include_origin(node))
 
+    # Filled while the declaration walk unwinds.  At that point every child
+    # FieldDecl has already been assigned its graph id, so record layouts can be
+    # harvested without a second complete AST traversal.
+    record_fields_by_type: Dict[str, List[Tuple[Optional[str], Optional[str]]]] = {}
+
     # Declaration pass.
     def declarations(node: dict, path: Path, owner: Optional[str] = None, included: bool = False) -> None:
         is_included = not eligible(node, included)
@@ -1202,6 +1207,8 @@ def main() -> int:
                 graph.edge("EXPORTS", file_ids[path], value_id, name=name)
         for child in node.get("inner", []):
             declarations(child, path, current_owner, is_included)
+        if kind == "RecordDecl":
+            collect_record_fields_node(node)
 
     # Indirect-dispatch binding pre-pass. Function pointers reach their targets
     # through ops-struct slots (`.read = ext4_file_read`) and pointer variables
@@ -1209,9 +1216,7 @@ def main() -> int:
     # resolve those bindings here so the call pass can attach MAY_INVOKE to the
     # dispatch call-site (parity with the TS frontend). Genuinely unresolved
     # pointers keep their READS_CALLEE slot edge — the indirection is never dropped.
-    record_fields_by_type: Dict[str, List[Tuple[Optional[str], Optional[str]]]] = {}
-
-    def collect_record_fields(node: dict) -> None:
+    def collect_record_fields_node(node: dict) -> None:
         if node.get("kind") == "RecordDecl" and node.get("name") and node.get("tagUsed"):
             key = f'{node["tagUsed"]} {node["name"]}'
             # Each slot is (field name, field node-id). The name is always present;
@@ -1235,8 +1240,6 @@ def main() -> int:
                 ]
             elif harvested or existing is None:
                 record_fields_by_type[key] = harvested
-        for child in node.get("inner", []):
-            collect_record_fields(child)
 
     def normalize_type(text: str) -> str:
         for qualifier in ("const ", "volatile ", "restrict ", "_Atomic "):
@@ -1391,7 +1394,6 @@ def main() -> int:
     # The body pass below reloads each TU once more; peak memory stays at one TU.
     for path, ast in asts:
         declarations(ast, path)
-        collect_record_fields(ast)
         collect_bindings(ast)
 
     # Canonical slot index: map each materialised field node to its TU-stable
