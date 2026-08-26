@@ -377,63 +377,76 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
     manifest = dict(manifest or {})
     kept_ids = set()
     substrate_nodes = []
-    for node in reader.nodes():
-        if keep_node is not None and not keep_node(node):
-            continue
-        kept_ids.add(node.get("id"))
-        props = node.get("properties") or {}
-        syntax_kind = props.get("syntax_kind") or node.get("kind")
-        if syntax_kind in _SUBSTRATE_NODE_KINDS:
-            substrate_nodes.append({
-                "id": node.get("id"), "kind": node.get("kind"),
-                "label": node.get("label"),
-                "properties": {
-                    key: value for key, value in props.items()
-                    if key in _SUBSTRATE_PROPERTY_KEYS
-                    and isinstance(value, (str, int, float, bool, type(None)))
-                },
-            })
-
-    substrate_edges = []
-    for edge in reader.edges():
-        if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
-            continue
-        props = edge.get("properties") or {}
-        kind = (props.get("semantic_kind") or edge.get("semantic_kind")
-                or edge.get("kind"))
-        if kind == "AST_CHILD":
-            props = {key: props[key] for key in ("role", "position") if key in props}
-        elif kind in {"REFERS_TO", "CFG_NEXT"}:
-            props = {}
-        elif kind == "VALUE_FLOWS_TO" and props.get("reason") == "initializer":
-            props = {"reason": "initializer"}
-        else:
-            continue
-        substrate_edges.append({"source": edge.get("source"),
-                                "target": edge.get("target"), "kind": kind,
-                                "properties": props})
-
-    def stored_nodes():
-        for node in reader.nodes():
-            if keep_node is None or keep_node(node):
-                yield node
-
-    def stored_edges():
-        for edge in reader.edges():
-            if edge.get("source") in kept_ids and edge.get("target") in kept_ids:
-                yield edge
-
     target = Path(graph_path)
-    _write_framed_sidecar(
-        pass2_input_cache_path(target), ".pass2-input-",
-        {"format": "lachesis-pass2-input", "version": _PASS2_INPUT_VERSION,
-         "node_count": int(manifest.get("node_count", 0)),
-         "edge_count": int(manifest.get("edge_count", 0)),
-         "store_version": manifest.get("version"),
-         "core_content_hash": manifest.get("core_content_hash"),
-         "source_content_hash": manifest.get("source_content_hash"),
-         "build_fingerprint": manifest.get("build_fingerprint")},
-        stored_nodes(), stored_edges())
+    pass2_target = pass2_input_cache_path(target)
+    fd, pass2_temp = tempfile.mkstemp(
+        prefix=".pass2-input-", dir=str(pass2_target.parent))
+    substrate_edges = []
+    try:
+        # The complete Pass-2 header is known from the store manifest.  Open the
+        # output before scanning nodes so the replayable shard stream only needs
+        # one node pass and one edge pass; the old implementation scanned both
+        # streams a second time for the complete sidecar.
+        pass2_header = {
+            "format": "lachesis-pass2-input", "version": _PASS2_INPUT_VERSION,
+            "node_count": int(manifest.get("node_count", 0)),
+            "edge_count": int(manifest.get("edge_count", 0)),
+            "store_version": manifest.get("version"),
+            "core_content_hash": manifest.get("core_content_hash"),
+            "source_content_hash": manifest.get("source_content_hash"),
+            "build_fingerprint": manifest.get("build_fingerprint"),
+        }
+        with os.fdopen(fd, "wb") as pass2:
+            write_frame(pass2, encode_document(pass2_header))
+            for node in reader.nodes():
+                if keep_node is not None and not keep_node(node):
+                    continue
+                kept_ids.add(node.get("id"))
+                write_frame(pass2, b"N" + encode_node(node))
+                props = node.get("properties") or {}
+                syntax_kind = props.get("syntax_kind") or node.get("kind")
+                if syntax_kind in _SUBSTRATE_NODE_KINDS:
+                    substrate_nodes.append({
+                        "id": node.get("id"), "kind": node.get("kind"),
+                        "label": node.get("label"),
+                        "properties": {
+                            key: value for key, value in props.items()
+                            if key in _SUBSTRATE_PROPERTY_KEYS
+                            and isinstance(value, (str, int, float, bool, type(None)))
+                        },
+                    })
+
+            for edge in reader.edges():
+                if (edge.get("source") not in kept_ids
+                        or edge.get("target") not in kept_ids):
+                    continue
+                write_frame(pass2, b"E" + encode_edge(edge))
+                props = edge.get("properties") or {}
+                kind = (props.get("semantic_kind") or edge.get("semantic_kind")
+                        or edge.get("kind"))
+                if kind == "AST_CHILD":
+                    props = {key: props[key]
+                             for key in ("role", "position") if key in props}
+                elif kind in {"REFERS_TO", "CFG_NEXT"}:
+                    props = {}
+                elif kind == "VALUE_FLOWS_TO" and props.get("reason") == "initializer":
+                    props = {"reason": "initializer"}
+                else:
+                    continue
+                substrate_edges.append({"source": edge.get("source"),
+                                        "target": edge.get("target"), "kind": kind,
+                                        "properties": props})
+        os.replace(pass2_temp, pass2_target)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(pass2_temp)
+        except OSError:
+            pass
+        raise
 
     translation_nodes, translation_edges = _translation_records(
         substrate_nodes, substrate_edges)
