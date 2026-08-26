@@ -91,6 +91,12 @@ def _native_prepared(index):
 
 def _native_plan(functions, prepared, source_catalog):
     """Adapt the native plan protobuf to the existing Python envelope."""
+    def _argument_position(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
     result = plan_pass2_pb(prepared, source_catalog)
     by_name = {item.name: item for item in result.functions}
     discovery_sites = []
@@ -107,7 +113,8 @@ def _native_plan(functions, prepared, source_catalog):
             discovery_sites.append(SourceSite(
                 name, site.node or None, site.callee or None,
                 site.line if site.has_line else None,
-                tuple(site.arguments), tuple(site.influenced_roots),
+                tuple(_argument_position(value) for value in site.arguments),
+                tuple(site.influenced_roots),
                 site.kind or "external-input"))
         if item.launch_nodes:
             launch_nodes[name] = tuple(item.launch_nodes)
@@ -329,11 +336,11 @@ def build_native_F(store, lang="c", *, return_graph=False):
     # process as translation; Python only adapts the typed result for legacy
     # consumers below.
     try:
-        # Keep the new planner behind an explicit flag until its duplicate
-        # symbol and source-root parity suite is complete.  The ABI is live and
-        # benchmarkable, but a native planner must not silently alter findings.
-        if os.environ.get("LACHESIS_NATIVE_PLAN") != "1":
-            raise RuntimeError("native planner parity gate is disabled")
+        # The native planner is now the default: full libxml2 parity covers
+        # duplicate symbols, source sites, reachability, and influence roots.
+        # Set this escape hatch only when diagnosing an older native library.
+        if os.environ.get("LACHESIS_NATIVE_PLAN") == "0":
+            raise RuntimeError("native planner explicitly disabled")
         discovery, coverage = _native_plan(
             functions, prepared, atropos.source_catalog(lang))
     except RuntimeError:

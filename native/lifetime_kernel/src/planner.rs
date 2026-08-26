@@ -29,6 +29,16 @@ fn argument_root(argument: &lifetime_proto::FunctionArgument) -> String {
     format!("{}{}", base, argument.selectors.join(""))
 }
 
+fn assigned_root(call: &lifetime_proto::FunctionCall) -> String {
+    if !call.assigned_name.is_empty() {
+        format!("{}{}", call.assigned_name, call.assigned_selectors.join(""))
+    } else {
+        // Python's F projection falls back to the assignment expression node
+        // when the frontend cannot publish a declaration/root label.
+        call.assigned.clone()
+    }
+}
+
 pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto::NativePlanResult {
     let raw_functions = request.translation.unwrap_or_default().functions;
     let mut seen_names: HashSet<String> = HashSet::new();
@@ -76,17 +86,20 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
                 }
                 bindings.push(lifetime_proto::NativeSeamBinding {
                     caller: name.clone(), callee: internal_callee.clone(), call_node: call.node.clone(),
-                    formal_to_actual, return_to: call.assigned_name.clone(),
+                    formal_to_actual, return_to: assigned_root(call),
                 });
             }
             let Some(kind) = source_catalog.get(&callee) else { continue };
             let mut roots = BTreeSet::new();
-            if !call.assigned_name.is_empty() { roots.insert(call.assigned_name.clone()); }
+            let assigned = assigned_root(call);
+            if !assigned.is_empty() { roots.insert(assigned); }
             let mut arguments = Vec::new();
             for arg in &call.arguments {
                 let root = argument_root(arg);
-                if !root.is_empty() { roots.insert(root); }
-                arguments.push(arg.position.to_string());
+                if !root.is_empty() {
+                    roots.insert(root);
+                    arguments.push(arg.position.to_string());
+                }
             }
             influenced.entry(name.clone()).or_default().extend(roots.iter().cloned());
             sites.entry(name.clone()).or_default().push(lifetime_proto::NativeSourceSite {
@@ -98,10 +111,11 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         callees.entry(name.clone()).or_default();
         callers.entry(name.clone()).or_default();
     }
-    // Match CoverageScheduler's callback normalization: a callback formal can
-    // carry a function-valued actual root even when the direct call graph only
-    // records the callback parameter.  This edge affects source cones and must
-    // be present before launch roots are computed.
+    // CoverageScheduler additionally follows function-valued callback
+    // arguments. Keep that normalization in a separate graph: source
+    // discovery's legacy reachability intentionally uses only direct calls.
+    let mut coverage_callees = callees.clone();
+    let mut coverage_callers = callers.clone();
     for (caller, item) in &functions {
         for call in &item.calls {
             let Some(callee) = by_source_name.get(&call.callee) else { continue };
@@ -112,13 +126,12 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
                 let actual = actual.trim_start_matches(['&', '*']).to_owned();
                 if (argument.position as usize) < callee_item.parameter_names.len()
                     && functions.contains_key(&actual) && actual != *callee {
-                    callees.entry(caller.clone()).or_default().insert(actual.clone());
-                    callers.entry(actual).or_default().insert(caller.clone());
+                    coverage_callees.entry(caller.clone()).or_default().insert(actual.clone());
+                    coverage_callers.entry(actual).or_default().insert(caller.clone());
                 }
             }
         }
     }
-
     // Source launches are catalogued callsites; callerless functions are the
     // deterministic structural fallback used by the Python implementation.
     let mut launches: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
@@ -163,8 +176,9 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
                         if influenced.entry(internal_callee.clone()).or_default().insert(formal) { changed = true; }
                     }
                 }
-                if !call.assigned_name.is_empty() && !influenced[internal_callee].is_empty()
-                    && influenced.entry(caller.clone()).or_default().insert(call.assigned_name.clone()) { changed = true; }
+                let assigned = assigned_root(call);
+                if !assigned.is_empty() && !influenced[internal_callee].is_empty()
+                    && influenced.entry(caller.clone()).or_default().insert(assigned) { changed = true; }
             }
         }
     }
@@ -185,14 +199,15 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
     }
 
     let source_functions: BTreeSet<String> = result_functions.iter()
-        .filter(|item| !item.source_sites.is_empty() || item.callers.is_empty())
+        .filter(|item| !item.source_sites.is_empty()
+            || coverage_callers.get(&item.name).is_none_or(BTreeSet::is_empty))
         .map(|item| item.name.clone()).collect();
     let mut forward: HashMap<String, BTreeSet<String>> = HashMap::new();
     for source in &source_functions {
         let mut seen = BTreeSet::from([source.clone()]);
         let mut work = vec![source.clone()];
         while let Some(current) = work.pop() {
-            for next in &callees[&current] {
+            for next in &coverage_callees[&current] {
                 if seen.insert(next.clone()) { work.push(next.clone()); }
             }
         }
@@ -204,7 +219,7 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         let mut backward: BTreeSet<String> = BTreeSet::from([target.clone()]);
         let mut work = vec![target.clone()];
         while let Some(current) = work.pop() {
-            for caller in &callers[&current] {
+            for caller in &coverage_callers[&current] {
                 if backward.insert(caller.clone()) { work.push(caller.clone()); }
             }
         }
