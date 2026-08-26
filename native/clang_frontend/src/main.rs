@@ -204,35 +204,20 @@ fn write_manifests(output: &Path, frontend_id: &str, node_count: u64, edge_count
     fs::write(output.parent().unwrap_or(output).join("shards.pb"), set.encode_to_vec())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // clang-sys's `runtime` feature keeps libclang out of the process until
-    // the frontend is actually used.  Loading it here also makes the binary
-    // self-contained from the Python caller's perspective: Python passes
-    // paths and compiler arguments, while Rust owns parsing and protobuf I/O.
-    clang_sys::load().map_err(|error| format!("load libclang: {error}"))?;
-    let arguments: Vec<String> = env::args().collect();
-    if arguments.len() < 3 {
-        eprintln!("usage: lachesis-clang-frontend SOURCE OUTPUT_DIR [-- clang-args ...]");
-        std::process::exit(2);
-    }
-    let source = PathBuf::from(&arguments[1]);
-    let output = PathBuf::from(&arguments[2]);
-    let shard = output.join("shard-0");
-    fs::create_dir_all(&shard)?;
-    let mut clang_args = Vec::new();
-    if let Some(separator) = arguments.iter().position(|argument| argument == "--") {
-        clang_args.extend(arguments[separator + 1..].iter().map(|argument| {
-            CString::new(argument.as_str()).expect("clang argument contains NUL")
-        }));
-    }
-    let source_c = CString::new(source.to_string_lossy().as_bytes())?;
+fn parse_unit(
+    index: CXIndex,
+    unit: &graph::NativeTranslationUnit,
+    emitter: &mut Emitter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_c = CString::new(unit.path.as_bytes())?;
+    let clang_args: Vec<CString> = unit
+        .arguments
+        .iter()
+        .map(|argument| CString::new(argument.as_str()))
+        .collect::<Result<_, _>>()?;
     let argument_ptrs: Vec<*const c_char> = clang_args.iter().map(|argument| argument.as_ptr()).collect();
 
     unsafe {
-        let index = clang_createIndex(0, 0);
-        if index.is_null() {
-            return Err("clang_createIndex failed".into());
-        }
         let mut translation_unit = ptr::null_mut();
         let error = clang_parseTranslationUnit2(
             index,
@@ -245,8 +230,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut translation_unit,
         );
         if error != CXError_Success || translation_unit.is_null() {
-            clang_disposeIndex(index);
-            return Err(format!("clang_parseTranslationUnit2 failed: {error}").into());
+            return Err(format!("clang_parseTranslationUnit2 failed for {}: {error}", unit.path).into());
+        }
+        let root = clang_getTranslationUnitCursor(translation_unit);
+        // libclang returns the number of visited children here, not a success
+        // status; zero is valid for an empty or diagnostic-only translation unit.
+        clang_visitChildren(root, visit, emitter as *mut Emitter as *mut c_void);
+        clang_disposeTranslationUnit(translation_unit);
+    }
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // clang-sys's `runtime` feature keeps libclang out of the process until
+    // the frontend is actually used.  Loading it here also makes the binary
+    // self-contained from the Python caller's perspective: Python passes
+    // paths and compiler arguments, while Rust owns parsing and protobuf I/O.
+    clang_sys::load().map_err(|error| format!("load libclang: {error}"))?;
+    let arguments: Vec<String> = env::args().collect();
+    if arguments.len() < 3 {
+        eprintln!("usage: lachesis-clang-frontend SOURCE OUTPUT_DIR [-- clang-args ...]");
+        eprintln!("   or: lachesis-clang-frontend --request REQUEST.pb OUTPUT_DIR");
+        std::process::exit(2);
+    }
+    let request = if arguments[1] == "--request" {
+        if arguments.len() < 4 {
+            return Err("--request requires REQUEST.pb and OUTPUT_DIR".into());
+        }
+        Some(graph::NativeFrontendRequest::decode(fs::read(&arguments[2])?.as_slice())?)
+    } else {
+        None
+    };
+    let output = PathBuf::from(if request.is_some() { &arguments[3] } else { &arguments[2] });
+    let shard = output.join("shard-0");
+    fs::create_dir_all(&shard)?;
+
+    unsafe {
+        let index = clang_createIndex(0, 0);
+        if index.is_null() {
+            return Err("clang_createIndex failed".into());
         }
         let mut emitter = Emitter {
             nodes: File::create(shard.join("nodes.pb"))?,
@@ -256,13 +278,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_count: 0,
             edge_count: 0,
         };
-        let root = clang_getTranslationUnitCursor(translation_unit);
-        clang_visitChildren(root, visit, &mut emitter as *mut Emitter as *mut c_void);
+        if let Some(request) = request {
+            if request.translation_units.is_empty() {
+                clang_disposeIndex(index);
+                return Err("native frontend request contains no translation units".into());
+            }
+            for unit in &request.translation_units {
+                parse_unit(index, unit, &mut emitter)?;
+            }
+        } else {
+            let source = PathBuf::from(&arguments[1]);
+            let mut unit = graph::NativeTranslationUnit {
+                path: source.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+            };
+            if let Some(separator) = arguments.iter().position(|argument| argument == "--") {
+                unit.arguments.extend(arguments[separator + 1..].iter().cloned());
+            }
+            parse_unit(index, &unit, &mut emitter)?;
+        }
         emitter.nodes.flush()?;
         emitter.edges.flush()?;
         let node_count = emitter.node_count;
         let edge_count = emitter.edge_count;
-        clang_disposeTranslationUnit(translation_unit);
         clang_disposeIndex(index);
         write_manifests(&shard, "clang-c-native", node_count, edge_count)?;
         println!("native clang emitted {node_count} nodes and {edge_count} edges to {}", output.display());
