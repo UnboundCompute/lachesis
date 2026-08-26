@@ -411,7 +411,14 @@ class Analysis:
         semantic_nodes: dict = {}
         semantic_coverages: list = []
         complete = True
-        for language in summary.get("languages") or ("c",):
+        # The native semantic sidecar is language-neutral: Rust scans the
+        # complete Pass-1 substrate once and emits all function fragments in
+        # one result.  The catalog language list is a list of model families,
+        # not a request to rerun that whole-graph flow once per language.  Keep
+        # the per-language loop for the compatibility renderer only.
+        languages = (("c",) if os.environ.get("LACHESIS_NATIVE_SEMANTIC") == "1"
+                     else (summary.get("languages") or ("c",)))
+        for language in languages:
             flow_started = perf_counter()
             flow = (self._flow_bundle(engine=None, lang="c", deadline=deadline,
                                       workers=workers,
