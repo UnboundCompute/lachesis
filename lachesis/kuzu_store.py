@@ -518,6 +518,11 @@ def _props_text(properties: dict, elide: bool,
             if not (elide and _is_default_constant(k, v))
             and not (k in drop and _column_faithful(k, v))
         }
+    # The reader already maps an empty BLOB to an empty property map. Avoid
+    # allocating and compressing a protobuf envelope for the overwhelmingly
+    # common no-tail case (especially structural edges).
+    if not properties:
+        return b""
     return encode_document(properties)
 
 
@@ -570,6 +575,8 @@ class PropsCodec:
         """The `props` blob for row `index`: its tail, as deflated protobuf bytes."""
         text = (self._texts[index] if self._texts is not None
                 else _props_text(properties, elide, drop))
+        if not text:
+            return b""
         if len(text) <= 512:
             cached = self._cache.get(text)
             if cached is not None:
