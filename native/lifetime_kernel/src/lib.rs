@@ -35,6 +35,7 @@ mod dispatch;
 mod taint;
 mod dynamic_behavior;
 mod async_events;
+mod interprocedural;
 
 mod atropos_proto {
     include!(concat!(env!("OUT_DIR"), "/lachesis.atropos.rs"));
