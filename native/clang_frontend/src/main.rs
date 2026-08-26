@@ -959,7 +959,19 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                 relationship_class: "CALLS".to_owned(),
             })?;
         }
-    } else if matches!(syntax_kind.as_str(), "ImplicitCastExpr" | "ParenExpr") {
+    } else if matches!(
+        syntax_kind.as_str(),
+        "ImplicitCastExpr"
+            | "CStyleCastExpr"
+            | "CXXStaticCastExpr"
+            | "CXXReinterpretCastExpr"
+            | "CXXConstCastExpr"
+            | "CXXFunctionalCastExpr"
+            | "ParenExpr"
+            | "ExprWithCleanups"
+            | "MaterializeTemporaryExpr"
+            | "ConstantExpr"
+    ) {
         if let Some(child_id) = child_ids_for_value_preserving(cursor, emitter) {
             emitter.edge(graph::EdgeRecord {
                 kind: "VALUE_FLOWS_TO".to_owned(), source: child_id, target: id.clone(),
