@@ -35,11 +35,22 @@ impl ObjectKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StateKey {
     node: usize,
+    bindings: Vec<(u32, u32)>,
     released: Vec<u32>,
     origins: Vec<u32>,
     nulls: Vec<u32>,
     uninitialized: Vec<u32>,
     pointer_arithmetic: Vec<u32>,
+}
+
+fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
+    let mut seen = HashSet::new();
+    while seen.insert(value) {
+        let Some((_, target)) = bindings.iter().find(|(source, _)| *source == value)
+        else { break };
+        value = *target;
+    }
+    value
 }
 
 fn add_finding(
@@ -89,7 +100,15 @@ fn match_function(
     let mut object_ids: HashMap<ObjectKey, u32> = HashMap::new();
     let mut objects = Vec::new();
     for node in &function.nodes {
-        if let Some(object) = ObjectKey::from_node(node) {
+        for object in [
+            ObjectKey::from_node(node),
+            (!node.value_root.is_empty()).then(|| ObjectKey {
+                root: node.value_root.clone(),
+                selectors: node.value_selectors.clone(),
+                generation: if node.generation.is_empty() { "g0".to_owned() }
+                            else { node.generation.clone() },
+            }),
+        ].into_iter().flatten() {
             if !object_ids.contains_key(&object) {
                 let id = objects.len() as u32;
                 object_ids.insert(object.clone(), id);
@@ -100,6 +119,7 @@ fn match_function(
 
     let mut queue = VecDeque::from([(
         entry,
+        Vec::<(u32, u32)>::new(),
         Vec::<u32>::new(),
         Vec::<u32>::new(),
         Vec::<u32>::new(),
@@ -113,10 +133,12 @@ fn match_function(
     // This is a work bound for one function, not a wall-clock hard stop.
     const MAX_STATES: usize = 1_000_000;
 
-    while let Some((index, mut released, mut origins, mut nulls,
+    while let Some((index, mut bindings, mut released, mut origins, mut nulls,
                     mut uninitialized, mut pointer_arithmetic)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
+        bindings.sort_unstable();
+        bindings.dedup();
         released.sort_unstable();
         released.dedup();
         origins.sort_unstable();
@@ -128,15 +150,27 @@ fn match_function(
         pointer_arithmetic.sort_unstable();
         pointer_arithmetic.dedup();
         let state = StateKey {
-            node: index, released: released.clone(), origins: origins.clone(),
+            node: index, bindings: bindings.clone(), released: released.clone(), origins: origins.clone(),
             nulls: nulls.clone(), uninitialized: uninitialized.clone(),
             pointer_arithmetic: pointer_arithmetic.clone(),
         };
         if !seen.insert(state) { continue; }
         let node = &function.nodes[index];
-        let object_id = ObjectKey::from_node(node)
+        let raw_object_id = ObjectKey::from_node(node)
             .and_then(|object| object_ids.get(&object).copied());
+        let object_id = raw_object_id.map(|value| canonical(value, &bindings));
+        let value_id = if node.value_root.is_empty() { None } else {
+            object_ids.get(&ObjectKey {
+                root: node.value_root.clone(), selectors: node.value_selectors.clone(),
+                generation: if node.generation.is_empty() { "g0".to_owned() }
+                            else { node.generation.clone() },
+            }).copied().map(|value| canonical(value, &bindings))
+        };
         match node.event_kind.as_str() {
+            "DERIVE" => if let (Some(target), Some(value)) = (raw_object_id, value_id) {
+                bindings.retain(|(source, _)| *source != target);
+                bindings.push((target, value));
+            },
             "ORIGIN" => if let Some(object) = object_id {
                 released.retain(|item| *item != object);
                 nulls.retain(|item| *item != object);
@@ -206,7 +240,7 @@ fn match_function(
             }
         }
         for target in &outgoing[index] {
-            queue.push_back((*target, released.clone(), origins.clone(), nulls.clone(),
+            queue.push_back((*target, bindings.clone(), released.clone(), origins.clone(), nulls.clone(),
                              uninitialized.clone(), pointer_arithmetic.clone()));
         }
     }
@@ -238,7 +272,8 @@ mod tests {
             event_kind: event_kind.to_owned(), object_root: "p".to_owned(),
             object_selectors: Vec::new(), generation: "g0".to_owned(),
             line, has_line: true, anchor: id.to_owned(), stack_local: false,
-            is_null: false, access: String::new(),
+            is_null: false, access: String::new(), value_root: String::new(),
+            value_selectors: Vec::new(),
         }
     }
 
@@ -290,5 +325,24 @@ mod tests {
             complete: true,
         });
         assert!(result.functions[0].findings.iter().all(|finding| finding.pattern != "double-free"));
+    }
+
+    #[test]
+    fn follows_a_derived_alias_after_release() {
+        let mut derive = node("d", "DERIVE", 2);
+        derive.object_root = "alias".to_owned();
+        derive.value_root = "p".to_owned();
+        let mut use_alias = node("u", "READ_STORAGE", 4);
+        use_alias.object_root = "alias".to_owned();
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             derive,
+                                             node("r", "RELEASE", 3),
+                                             use_alias])],
+            complete: true,
+        });
+        assert_eq!(result.functions[0].findings.len(), 1);
+        assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
+        assert_eq!(result.functions[0].findings[0].line, 4);
     }
 }

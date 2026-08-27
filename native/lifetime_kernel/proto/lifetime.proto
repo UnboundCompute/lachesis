@@ -374,6 +374,11 @@ message NativeSemanticNode {
   bool stack_local = 10;
   bool is_null = 11;
   string access = 12;
+  // The source identity is required for native alias/derive propagation.  It
+  // stays in the binary sidecar so the matcher never reconstructs Python
+  // ObjectIds for copied values.
+  string value_root = 13;
+  repeated string value_selectors = 14;
 }
 message NativeSemanticEdge {
   string source = 1;
