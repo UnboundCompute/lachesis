@@ -1565,7 +1565,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             .map(pass2::read_taint_evidence_path)
             .transpose()?;
         let mut full = prepare::semantic_request(request)?;
-        if let Some(source_evidence) = source_evidence {
+        if let Some(source_evidence) = source_evidence.as_ref() {
             for function in &mut full.functions {
                 for node in &mut function.nodes {
                     // The presence of the binary taint sidecar is the
@@ -1598,7 +1598,8 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             let translation = lifetime_proto::TranslationResult::decode(
                 translation_bytes.as_slice(),
             ).map_err(|error| format!("invalid native translation facts: {error}"))?;
-            let summaries = summary::summarize(translation.clone(), catalog.clone());
+            let summaries = summary::summarize_with_evidence(
+                translation.clone(), catalog.clone(), source_evidence.as_ref());
             full.skeletons.extend(reach::build(&translation, &summaries, catalog));
         }
         // Temporal candidate enumeration only needs operation-derived event

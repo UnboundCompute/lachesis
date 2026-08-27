@@ -61,6 +61,7 @@ fn sink_token(
         control: flow.control.clone(), guards: flow.guard_predicates.iter().map(|value|
             lifetime_proto::GuardProof { kind: "PREDICATE".into(), value: value.clone() }).collect(),
         guard_status: flow.guard_status.clone(),
+        source_witness_nodes: flow.source_witness_nodes.clone(),
         ..Default::default()
     }
 }

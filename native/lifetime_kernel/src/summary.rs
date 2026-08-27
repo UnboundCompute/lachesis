@@ -77,6 +77,14 @@ pub(crate) fn summarize(
     translation: lifetime_proto::TranslationResult,
     catalog: crate::atropos_proto::Request,
 ) -> lifetime_proto::NativeSummaryResult {
+    summarize_with_evidence(translation, catalog, None)
+}
+
+pub(crate) fn summarize_with_evidence(
+    translation: lifetime_proto::TranslationResult,
+    catalog: crate::atropos_proto::Request,
+    evidence: Option<&HashMap<String, Vec<String>>>,
+) -> lifetime_proto::NativeSummaryResult {
     let (functions, by_base) = function_names(&translation.functions);
     let languages: BTreeSet<String> = translation.functions.iter()
         .filter_map(|function| (!function.language.is_empty()).then(|| function.language.clone()))
@@ -147,8 +155,9 @@ pub(crate) fn summarize(
             let call = item.calls.iter().find(|call| call.callee == callee
                 && call.arguments.iter().any(|argument|
                     argument.position == position && argument_root(argument) == root));
+            let witness = evidence.and_then(|items| items.get(&root)).cloned().unwrap_or_default();
             lifetime_proto::NativeSinkFlow {
-                sink, value, root, provenance: "local".into(), guards: Vec::new(),
+                sink, value, root, provenance: if witness.is_empty() { "local".into() } else { "source".into() },
                 guarded: call.is_some_and(|call| !call.control.is_empty()
                     || !call.guard_predicates.is_empty()),
                 site_guarded: call.is_some_and(|call| !call.control.is_empty()
@@ -161,6 +170,7 @@ pub(crate) fn summarize(
                 control: call.map(|call| call.control.clone()).unwrap_or_default(),
                 guard_status: call.map(|call| call.guard_status.clone()).unwrap_or_default(),
                 guard_predicates: call.map(|call| call.guard_predicates.clone()).unwrap_or_default(),
+                source_witness_nodes: witness,
                 ..Default::default()
             }
         }).collect::<Vec<_>>();

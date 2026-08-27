@@ -348,6 +348,7 @@ message NativeSinkFlow {
   repeated string control = 14;
   string guard_status = 15;
   repeated string guard_predicates = 16;
+  repeated string source_witness_nodes = 17;
 }
 message NativeSinkParam {
   string parameter = 1;
