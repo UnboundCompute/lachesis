@@ -1469,10 +1469,14 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // Python queries never parse the large anchor/control-flow payload.
         let result = full.encode_to_vec();
         let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, result)
+        fs::write(&temporary, &result)
             .map_err(|error| format!("cannot write semantic result: {error}"))?;
         fs::rename(&temporary, output)
             .map_err(|error| format!("cannot publish semantic result: {error}"))?;
+        // The full sidecar is already durable. Release its encoded byte
+        // buffer before building the compact event projection so peak memory
+        // is not graph + full bytes + event bytes at once.
+        drop(result);
         let events = lifetime_proto::NativeSemanticResult {
             functions: full.functions.into_iter()
                 .filter_map(compact_event_function).collect(),
