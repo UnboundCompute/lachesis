@@ -375,6 +375,63 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
     finish_graph(symbols, nodes, edges, core_content_hash)
 }
 
+fn text_property<'a>(properties: &'a [graph_proto::Field], key: &str) -> Option<&'a str> {
+    properties.iter().find_map(|field| {
+        (field.key == key).then_some(field.value.as_ref())
+            .flatten()
+            .and_then(|value| match value.kind.as_ref()? {
+                graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+                _ => None,
+            })
+    })
+}
+
+fn text_list_property(properties: &[graph_proto::Field], key: &str) -> Vec<String> {
+    properties.iter().find_map(|field| {
+        if field.key != key { return None; }
+        let value = field.value.as_ref()?.kind.as_ref()?;
+        let graph_proto::value::Kind::List(list) = value else { return None; };
+        Some(list.values.iter().filter_map(|item| match item.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.clone()),
+            _ => None,
+        }).collect())
+    }).unwrap_or_default()
+}
+
+/// Read only the already-computed native taint witnesses from a Pass-2
+/// overlay.  The semantic pass uses this compact index to attach source
+/// provenance to event findings; it never reconstructs the graph or invokes a
+/// second taint analysis.
+pub(crate) fn read_taint_evidence_path(
+    path: impl AsRef<Path>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let file = File::open(path.as_ref())
+        .map_err(|error| format!("cannot open Pass-2 evidence sidecar: {error}"))?;
+    let mut input = BufReader::with_capacity(1024 * 1024, file);
+    let mut magic = vec![0u8; DATAFLOW_STREAM_MAGIC.len()];
+    input.read_exact(&mut magic)
+        .map_err(|error| format!("cannot read Pass-2 evidence header: {error}"))?;
+    if magic != DATAFLOW_STREAM_MAGIC {
+        return Err("invalid Pass-2 evidence sidecar magic".to_owned());
+    }
+    let header = read_stream_frame(&mut input)?;
+    let _: graph_proto::DataflowOverlay = graph_proto::DataflowOverlay::decode(header.as_slice())
+        .map_err(|error| format!("invalid Pass-2 evidence envelope: {error}"))?;
+    let mut result = HashMap::new();
+    while let Some(payload) = read_optional_stream_frame(&mut input)? {
+        if payload.first() != Some(&b'N') { continue; }
+        let node = graph_proto::NodeRecord::decode(&payload[1..])
+            .map_err(|error| format!("invalid Pass-2 evidence node: {error}"))?;
+        if node.kind != "taint-reach" { continue; }
+        let Some(sink) = text_property(&node.properties, "sink_id") else { continue; };
+        let witness = text_list_property(&node.properties, "witness_ids");
+        if !witness.is_empty() {
+            result.entry(sink.to_owned()).or_insert(witness);
+        }
+    }
+    Ok(result)
+}
+
 fn finish_graph(
     mut symbols: Symbols, nodes: Vec<Node>, edges: Vec<Edge>, core_content_hash: String,
 ) -> Result<Graph, String> {

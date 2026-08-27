@@ -81,6 +81,9 @@ def native_match_leads(result) -> list[dict[str, Any]]:
             rendered = path.root if path is not None else "unknown"
             if path is not None and path.selectors:
                 rendered += "".join(path.selectors)
+            witness = (list(finding.source_witness_nodes)
+                       if finding.source_witness_nodes
+                       else list(finding.witness_nodes))
             lead = {
                 "pattern": finding.pattern,
                 "object": rendered,
@@ -90,9 +93,13 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 "value": rendered,
                 "var": rendered,
                 "at": finding.node,
-                "witness": list(finding.witness_nodes),
-                "witness_complete": finding.witness_complete,
+                "witness": witness,
+                "witness_complete": finding.witness_complete and bool(witness),
             }
+            if finding.source_witness_nodes:
+                lead["source_witness"] = list(finding.source_witness_nodes)
+            if finding.HasField("source_reachable"):
+                lead["source_reachable"] = finding.source_reachable
             pattern_id = flow_pattern_id(finding.pattern)
             if pattern_id:
                 lead["pattern_id"] = pattern_id

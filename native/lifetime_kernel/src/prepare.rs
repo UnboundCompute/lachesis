@@ -1585,6 +1585,8 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
         access: operation.access.clone(),
         value_root: operation.source.as_ref().map(|value| value.root.clone()).unwrap_or_default(),
         value_selectors: operation.source.as_ref().map(|value| value.selectors.clone()).unwrap_or_default(),
+        source_witness_nodes: Vec::new(),
+        source_reachable: None,
     }
 }
 
@@ -1639,6 +1641,8 @@ pub(crate) fn semantic_request(
                 access: String::new(),
                 value_root: String::new(),
                 value_selectors: Vec::new(),
+                source_witness_nodes: Vec::new(),
+                source_reachable: None,
             });
         }
         let mut incoming_counts: HashMap<String, usize> = HashMap::new();
@@ -1669,6 +1673,7 @@ pub(crate) fn semantic_request(
                     anchor: anchor.clone(),
                     stack_local: false, is_null: false, access: String::new(),
                     value_root: String::new(), value_selectors: Vec::new(),
+                    source_witness_nodes: Vec::new(), source_reachable: None,
                 });
             }
         }

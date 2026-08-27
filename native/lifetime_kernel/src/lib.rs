@@ -226,6 +226,7 @@ fn compact_event_function(
         line: 0, has_line: false, anchor: String::new(), stack_local: false,
         is_null: false, access: String::new(), value_root: String::new(),
         value_selectors: Vec::new(),
+        source_witness_nodes: Vec::new(), source_reachable: None,
     });
     function.nodes.push(lifetime_proto::NativeSemanticNode {
         id: exit.clone(), function: function.id.clone(), event_kind: String::new(),
@@ -233,6 +234,7 @@ fn compact_event_function(
         line: 0, has_line: false, anchor: String::new(), stack_local: false,
         is_null: false, access: String::new(), value_root: String::new(),
         value_selectors: Vec::new(),
+        source_witness_nodes: Vec::new(), source_reachable: None,
     });
     function.edges = projected_edges;
     function.entry = entry;
@@ -1509,7 +1511,26 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             native_graph::lifecycle_roles(&catalog)
         };
         let request = native_graph::sidecar_to_request_with_roles(&bytes, &roles)?;
-        let full = prepare::semantic_request(request)?;
+        // Pass 2 publishes taint witnesses in the sibling binary overlay.  Use
+        // the same graph path convention as the Python store, but keep the
+        // lookup and decoding native so semantic findings receive computed
+        // provenance without rebuilding Python graph objects.
+        let source_evidence = input.strip_suffix(".pass2.input.pb")
+            .map(|base| format!("{base}.dataflow.pb"))
+            .filter(|path| std::path::Path::new(path).is_file())
+            .map(pass2::read_taint_evidence_path)
+            .transpose()?;
+        let mut full = prepare::semantic_request(request)?;
+        if let Some(source_evidence) = source_evidence {
+            for function in &mut full.functions {
+                for node in &mut function.nodes {
+                    if let Some(witness) = source_evidence.get(&node.anchor) {
+                        node.source_witness_nodes = witness.clone();
+                        node.source_reachable = Some(true);
+                    }
+                }
+            }
+        }
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.

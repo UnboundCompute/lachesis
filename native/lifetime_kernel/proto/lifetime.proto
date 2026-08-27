@@ -351,6 +351,8 @@ message NativeTemporalFinding {
   // not present an object identity as if it were a provenance trace.
   repeated string witness_nodes = 7;
   bool witness_complete = 8;
+  repeated string source_witness_nodes = 9;
+  optional bool source_reachable = 10;
 }
 message NativeTemporalFunction {
   string id = 1;
@@ -384,6 +386,8 @@ message NativeSemanticNode {
   // ObjectIds for copied values.
   string value_root = 13;
   repeated string value_selectors = 14;
+  repeated string source_witness_nodes = 15;
+  optional bool source_reachable = 16;
 }
 message NativeSemanticEdge {
   string source = 1;

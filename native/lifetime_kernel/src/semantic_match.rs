@@ -117,6 +117,11 @@ fn add_finding(
 ) {
     let line = if node.has_line { node.line } else { 0 };
     let key = (function.to_owned(), pattern.to_owned(), node.id.clone(), line);
+    let witness = if node.source_witness_nodes.is_empty() {
+        witness_nodes
+    } else {
+        node.source_witness_nodes.as_slice()
+    };
     output.entry(key).or_insert_with(|| lifetime_proto::NativeTemporalFinding {
         function: function.to_owned(),
         pattern: pattern.to_owned(),
@@ -127,8 +132,10 @@ fn add_finding(
         line,
         has_line: node.has_line,
         node: node.id.clone(),
-        witness_nodes: witness_nodes.to_vec(),
-        witness_complete: !witness_nodes.is_empty(),
+        witness_nodes: witness.to_vec(),
+        witness_complete: !witness.is_empty(),
+        source_witness_nodes: node.source_witness_nodes.clone(),
+        source_reachable: node.source_reachable,
     });
 }
 
@@ -456,6 +463,7 @@ mod tests {
             line, has_line: true, anchor: id.to_owned(), stack_local: false,
             is_null: false, access: String::new(), value_root: String::new(),
             value_selectors: Vec::new(),
+            source_witness_nodes: Vec::new(), source_reachable: None,
         }
     }
 
