@@ -63,6 +63,7 @@ fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<
             "start_line" |
             "operator" |
             "type" |
+            "language" |
             "primary_target_id" |
             "callee" |
             "callee_name" |
@@ -333,41 +334,17 @@ fn translation_return_kind(kind: &str) -> bool {
     matches!(kind, "ReturnStmt" | "Return" | "ReturnStatement" | "return")
 }
 
-fn frontend_languages(function_id: &str, file: Option<&str>) -> &'static [&'static str] {
-    if function_id.contains(":clang-c:") || function_id.contains(":clang-c-native:")
-        || function_id.contains(":clang-cpp:") {
-        match file.and_then(|path| Path::new(path).extension()).and_then(|ext| ext.to_str()) {
-            Some("cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx") => &["cpp"],
-            Some("c" | "h") => &["c"],
-            // A compiler request can legitimately contain a mixed/extensionless
-            // root.  Keep both catalog namespaces eligible in that case.
-            _ => &["c", "cpp"],
-        }
-    } else if function_id.contains(":cpython-ast:") {
-        &["python"]
-    } else if function_id.contains(":typescript-compiler-api:") {
-        // The shared TypeScript compiler frontend handles both extensions. The
-        // lifecycle vocabulary is intentionally the same for this pair.
-        &["typescript", "javascript"]
-    } else {
-        &[]
-    }
-}
-
 fn lifecycle_role<'a>(
-    roles: &'a HashMap<(String, String), String>, function_id: &str,
-    file: Option<&str>, callee: &str,
+    roles: &'a HashMap<(String, String), String>, language: Option<&str>, callee: &str,
 ) -> Option<&'a str> {
-    frontend_languages(function_id, file).iter().find_map(|language| {
-        roles.get(&(language.to_string(), callee.to_owned())).map(String::as_str)
-    }).or_else(|| {
+    language.and_then(|language| roles.get(&(language.to_owned(), callee.to_owned())))
+        .map(String::as_str).or_else(|| {
         // Qualified managed-language methods are also emitted with their
         // surface-qualified name by the compiler frontends. For a bare method,
         // consult the catalog's method vocabulary as a fallback.
         let method = callee.rsplit('.').next().unwrap_or(callee);
-        frontend_languages(function_id, file).iter().find_map(|language| {
-            roles.get(&(language.to_string(), method.to_owned())).map(String::as_str)
-        })
+        language.and_then(|language|
+            roles.get(&(language.to_owned(), method.to_owned())).map(String::as_str))
     })
 }
 
@@ -485,9 +462,7 @@ fn sidecar_to_request_inner(
             .any(|edge| resolve_decl(&edge.target, &refs, &children, &mut HashSet::new())
                 .is_some_and(|target| release_value_ids.contains(&target)));
         if indirect_release { call.is_release = true; }
-        let function_file = node_lookup.get(function.as_str())
-            .and_then(|node| input_text(node, "file"));
-        if let Some(role) = lifecycle_role(roles, &function, function_file, &call.callee) {
+        if let Some(role) = lifecycle_role(roles, input_text(&item, "language"), &call.callee) {
             match role {
                 "alloc" | "acquire" => call.is_alloc = true,
                 "release" => call.is_release = true,

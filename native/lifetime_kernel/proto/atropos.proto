@@ -22,6 +22,7 @@ message Callee {
   string receiver_type = 3;
   int64 arity = 4;
   bool has_arity = 5;
+  string language = 6;
 }
 message Callsite {
   string id = 1;

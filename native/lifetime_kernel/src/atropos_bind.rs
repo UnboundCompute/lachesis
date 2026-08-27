@@ -55,6 +55,7 @@ pub struct Callee {
     pub module: Option<String>,
     pub receiver_type: Option<String>,
     pub arity: Option<i64>,
+    pub language: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,7 +216,9 @@ fn resolve(kind: &str, index: Option<usize>, callsite: &Callsite)
 
 fn bind_model(model: &Model, index: &Index) -> ResultRow {
     let callsites: Vec<&Callsite> = index.callsites.iter()
-        .filter(|_| index.language.is_none() || model.language == index.language)
+        .filter(|callsite| model.language.as_ref().is_none_or(|language| {
+            callsite.callee.language.as_ref().or(index.language.as_ref()) == Some(language)
+        }))
         .filter(|callsite| matches(model, &callsite.callee))
         .collect();
     let base = || ResultRow {
@@ -414,19 +417,11 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
         let tag = payload.remove(0);
         match tag {
             b'N' => {
-                let node_id = string_field(payload.as_slice(), 1).unwrap_or("");
                 let kind = string_field(payload.as_slice(), 2).unwrap_or("");
                 if kind == "call" || kind == "construct" || kind == "argument" {
                     let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
                         .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
-                    let node_language = property(&node, "language").and_then(|value| match value.as_str() {
-                        "c" | "cpp" | "python" | "typescript" | "javascript" => Some(value),
-                        _ => None,
-                    }).or_else(|| if node_id.contains(":clang-cpp:") { Some("cpp".into()) }
-                        else if node_id.contains(":clang-c:") { Some("c".into()) }
-                        else if node_id.contains(":cpython-ast:") { Some("python".into()) }
-                        else if node_id.contains(":typescript-compiler-api:") { Some("typescript".into()) }
-                        else { None });
+                let node_language = property(&node, "language");
                     if let Some(current) = node_language.as_deref() {
                         if let Some(previous) = language.as_deref() {
                             mixed_languages |= previous != current;
@@ -485,6 +480,7 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
         let module = property(&node, "module").or_else(|| receiver.as_deref()
             .filter(|value| simple_identifier(value)).map(str::to_owned));
         let receiver_type = property(&node, "receiver_type");
+        let node_language = property(&node, "language");
         let call_value_id = property(&node, "value_id").or_else(|| Some(node.id.clone()));
         let receiver_value_id = property(&node, "receiver_value_id");
         let mut args = arguments.remove(&node.id)
@@ -495,6 +491,7 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             callee: Callee {
                 name, module, receiver_type,
                 arity: Some(args.len() as i64),
+                language: node_language,
             },
             call_value_id,
             receiver_value_id,
@@ -546,6 +543,7 @@ fn from_proto(request: crate::atropos_proto::Request) -> (Vec<Model>, Index) {
                 name: callee.name, module: optional_string(callee.module),
                 receiver_type: optional_string(callee.receiver_type),
                 arity: callee.has_arity.then_some(callee.arity),
+                language: optional_string(callee.language),
             },
             call_value_id: optional_string(callsite.call_value_id),
             receiver_value_id: optional_string(callsite.receiver_value_id),
