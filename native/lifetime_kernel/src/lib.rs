@@ -67,6 +67,114 @@ fn report_native_phase(
     }
 }
 
+/// Project a semantic function onto its event nodes while preserving CFG
+/// reachability through removed anchor nodes.  The event sidecar is used by
+/// the matcher, so dropping the anchors must not drop branch/order semantics.
+fn compact_event_function(
+    mut function: lifetime_proto::NativeSemanticFunction,
+) -> Option<lifetime_proto::NativeSemanticFunction> {
+    let full_entry = function.entry.clone();
+    let full_exits = function.exits.clone();
+    let full_edges = function.edges.clone();
+    let event_ids: HashSet<String> = function.nodes.iter()
+        .filter(|node| !node.event_kind.is_empty())
+        .map(|node| node.id.clone())
+        .collect();
+    if event_ids.is_empty() { return None; }
+    function.nodes.retain(|node| event_ids.contains(&node.id));
+
+    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
+    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in full_edges {
+        outgoing.entry(edge.source.clone()).or_default().push(edge.target.clone());
+        incoming.entry(edge.target).or_default().push(edge.source);
+    }
+
+    // Walk through non-event anchors until the next event(s).  Each event is
+    // expanded independently, so loops are bounded by the visited set and
+    // branch arms remain separate in the projected graph.
+    let walk = |start: &str, graph: &HashMap<String, Vec<String>>| {
+        let mut pending = vec![start.to_owned()];
+        let mut visited = HashSet::new();
+        let mut found = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) { continue; }
+            for target in graph.get(&current).into_iter().flatten() {
+                if event_ids.contains(target) {
+                    found.insert(target.clone());
+                } else {
+                    pending.push(target.clone());
+                }
+            }
+        }
+        found
+    };
+
+    let mut projected = Vec::new();
+    for source in &event_ids {
+        for target in walk(source, &outgoing) {
+            if source != &target {
+                projected.push(lifetime_proto::NativeSemanticEdge {
+                    source: source.clone(), target, kind: "normal".to_owned(),
+                });
+            }
+        }
+    }
+    projected.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
+    projected.dedup_by(|left, right| left.source == right.source && left.target == right.target);
+
+    let mut entry_events = if event_ids.contains(&full_entry) {
+        vec![full_entry]
+    } else {
+        walk(&full_entry, &outgoing).into_iter().collect()
+    };
+    entry_events.sort();
+    let mut exit_events = HashSet::new();
+    for exit in &full_exits {
+        if event_ids.contains(exit) {
+            exit_events.insert(exit.clone());
+        } else {
+            exit_events.extend(walk(exit, &incoming));
+        }
+    }
+    if exit_events.is_empty() {
+        let has_outgoing: HashSet<&str> = projected.iter()
+            .map(|edge| edge.source.as_str()).collect();
+        exit_events.extend(event_ids.iter()
+            .filter(|id| !has_outgoing.contains(id.as_str())).cloned());
+    }
+
+    let entry = format!("native:{}:event-entry", function.id);
+    let exit = format!("native:{}:event-exit", function.id);
+    function.nodes.push(lifetime_proto::NativeSemanticNode {
+        id: entry.clone(), function: function.id.clone(), event_kind: String::new(),
+        object_root: String::new(), object_selectors: Vec::new(), generation: String::new(),
+        line: 0, has_line: false, anchor: String::new(), stack_local: false,
+        is_null: false, access: String::new(), value_root: String::new(),
+        value_selectors: Vec::new(),
+    });
+    function.nodes.push(lifetime_proto::NativeSemanticNode {
+        id: exit.clone(), function: function.id.clone(), event_kind: String::new(),
+        object_root: String::new(), object_selectors: Vec::new(), generation: String::new(),
+        line: 0, has_line: false, anchor: String::new(), stack_local: false,
+        is_null: false, access: String::new(), value_root: String::new(),
+        value_selectors: Vec::new(),
+    });
+    projected.extend(entry_events.into_iter().map(|target| lifetime_proto::NativeSemanticEdge {
+        source: entry.clone(), target, kind: "normal".to_owned(),
+    }));
+    let mut exit_events: Vec<_> = exit_events.into_iter().collect();
+    exit_events.sort();
+    projected.extend(exit_events.into_iter().map(|source| lifetime_proto::NativeSemanticEdge {
+        source, target: exit.clone(), kind: "normal".to_owned(),
+    }));
+    projected.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
+    function.edges = projected;
+    function.entry = entry;
+    function.exits = vec![exit];
+    Some(function)
+}
+
 /// Native-chain runner for the binary Pass-2 path.  The ordering mirrors the
 /// canonical Python registry so each later overlay observes the preceding
 /// additive facts.
@@ -1366,23 +1474,8 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         fs::rename(&temporary, output)
             .map_err(|error| format!("cannot publish semantic result: {error}"))?;
         let events = lifetime_proto::NativeSemanticResult {
-            functions: full.functions.into_iter().filter_map(|mut function| {
-                function.nodes.retain(|node| !node.event_kind.is_empty());
-                if function.nodes.is_empty() {
-                    return None;
-                }
-                {
-                    let event_ids: HashSet<&str> = function.nodes.iter()
-                        .map(|node| node.id.as_str()).collect();
-                    function.edges.retain(|edge| event_ids.contains(edge.source.as_str())
-                        && event_ids.contains(edge.target.as_str()));
-                    if !event_ids.contains(function.entry.as_str()) {
-                        function.entry.clear();
-                    }
-                    function.exits.retain(|exit| event_ids.contains(exit.as_str()));
-                }
-                Some(function)
-            }).collect(),
+            functions: full.functions.into_iter()
+                .filter_map(compact_event_function).collect(),
             complete: full.complete,
         }.encode_to_vec();
         let events_output = format!("{output}.events.pb");
