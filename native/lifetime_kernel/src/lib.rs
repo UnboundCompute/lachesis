@@ -576,6 +576,23 @@ impl State {
         }
     }
 
+    fn is_summary_object(&self, oid: &str) -> bool {
+        fn visit(state: &State, oid: &str, seen: &mut HashSet<String>) -> bool {
+            if !seen.insert(oid.to_owned()) { return false; }
+            if oid.split('|').nth(1) == Some("summary") { return true; }
+            match state.objects.get(oid) {
+                Some(ObjectMeta::Param { selectors, .. }) =>
+                    selectors.iter().any(|selector| selector == "<?>") ,
+                Some(ObjectMeta::Allocation { target, .. }) =>
+                    target.selectors.iter().any(|selector| selector == "<?>") ,
+                Some(ObjectMeta::UnknownSlot { base, selector }) =>
+                    selector == "<?>" || visit(state, base, seen),
+                _ => false,
+            }
+        }
+        visit(self, oid, &mut HashSet::new())
+    }
+
     fn age(&mut self, recent: &str, summary: &str) {
         if !self.facts.contains_key(recent) { return; }
         self.merge_object(summary, recent);
@@ -644,8 +661,8 @@ impl State {
         if target.selectors.len() > 0 && parse_param(&oid).is_some() {
             self.freed_paths.insert(target.clone(), oid.clone());
         }
+        let weak = self.is_summary_object(&oid);
         let facts = self.facts.entry(oid.clone()).or_insert(fact_bit(Fact::Unknown));
-        let weak = oid.split('|').nth(1) == Some("summary");
         if *facts & fact_bit(Fact::Freed) != 0 && !weak {
             findings.double_free.push((op.line, target.clone(), op.node.clone()));
         }
@@ -690,7 +707,8 @@ impl State {
                 let Some(oid) = self.resolve(&mut target_path, false) else { return };
                 self.record_param(Kind::Use, &oid);
                 if op.access_is_return() { self.record_return(&oid); }
-                if self.facts.get(&oid).is_some_and(|facts| *facts & fact_bit(Fact::Freed) != 0) {
+                if !self.is_summary_object(&oid)
+                    && self.facts.get(&oid).is_some_and(|facts| *facts & fact_bit(Fact::Freed) != 0) {
                     findings.use_after_free.push((op.line, target.clone(), op.node.clone()));
                 }
             }
@@ -2217,6 +2235,19 @@ mod tests {
         state.apply(&op(Kind::Use, path, "use"), &mut findings);
         assert_eq!(findings.use_after_free.len(), 1);
         assert!(state.trace.contains(&Effect::Param { kind: Kind::Free, position: 0, selectors: vec![] }));
+    }
+
+    #[test]
+    fn unknown_index_parameter_is_a_weak_summary_object() {
+        let mut state = State::default();
+        let path = Path { root: "p".into(), selectors: vec!["<?>".into()] };
+        state.seed_parameter(path.clone(), 0);
+        let mut findings = Findings::default();
+        state.apply(&op(Kind::Free, path.clone(), "free-1"), &mut findings);
+        state.apply(&op(Kind::Free, path.clone(), "free-2"), &mut findings);
+        state.apply(&op(Kind::Use, path, "use"), &mut findings);
+        assert!(findings.double_free.is_empty());
+        assert!(findings.use_after_free.is_empty());
     }
 
     #[test]
