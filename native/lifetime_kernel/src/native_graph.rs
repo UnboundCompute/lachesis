@@ -269,6 +269,7 @@ fn owner_ref<'a>(node: &'a graph_proto::NodeRecord) -> Option<&'a str> {
 fn function_kind(kind: &str) -> bool {
     matches!(kind, "function" | "method" | "constructor" | "FunctionDecl"
         | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl"
+        | "ConversionFunction" | "FunctionTemplateDecl" | "CXXDeductionGuide"
         | "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration"
         | "ArrowFunction" | "MethodDeclaration" | "MethodDefinition"
         | "Constructor")

@@ -326,7 +326,8 @@ fn language_for_path(path: &str) -> &'static str {
 fn is_function_syntax(kind: &str) -> bool {
     matches!(kind,
         "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
-        "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl")
+        "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl" |
+        "CXXDeductionGuide")
 }
 
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
@@ -765,6 +766,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         syntax_kind.as_str(),
         "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl"
             | "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl"
+            | "CXXDeductionGuide"
             | "RecordDecl"
             | "StructDecl"
             | "UnionDecl"
