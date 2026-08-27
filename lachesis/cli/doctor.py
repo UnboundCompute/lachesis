@@ -105,6 +105,36 @@ def check_kuzu() -> Check:
                      "python -m pip install --force-reinstall lachesis-cpg")
 
 
+def check_native_kernel() -> Check:
+    """Verify that the one analysis kernel used by every scan can be loaded."""
+    try:
+        from lachesis.flow.native_lifetime import _library_candidates, available
+        candidates = _library_candidates()
+    except Exception as error:  # pragma: no cover - defensive doctor path
+        return Check("native-kernel", False, f"could not inspect native runtime: {error}",
+                     "reinstall lachesis-cpg")
+    existing = [path for path in candidates if path.is_file()]
+    if not existing:
+        return Check(
+            "native-kernel", False,
+            "Rust analysis kernel is not installed",
+            "install a platform wheel: python -m pip install --upgrade lachesis-cpg",
+        )
+    try:
+        loaded = available()
+    except Exception as error:  # pragma: no cover - platform loader diagnostics
+        loaded = False
+        detail = f"cannot load {existing[0]}: {error}"
+    else:
+        detail = f"loaded from {existing[0]}" if loaded else f"cannot load {existing[0]}"
+    if loaded:
+        return Check("native-kernel", True, detail)
+    return Check(
+        "native-kernel", False, detail,
+        "reinstall the platform wheel or run cargo build --release in native/lifetime_kernel",
+    )
+
+
 def check_cache() -> Check:
     from lachesis.cache import cache_root
     root = cache_root()
@@ -157,6 +187,7 @@ def full_report() -> list[Check]:
               f"{sys.version.split()[0]} at {sys.executable}",
               "lachesis needs Python 3.10 or newer"),
         check_kuzu(),
+        check_native_kernel(),
         check_vendored_typescript(),
         # Neither tool is required in general — only for a tree that contains those
         # languages — so a machine without them is still a working install.
