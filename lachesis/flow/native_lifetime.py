@@ -189,13 +189,15 @@ def summaries_path(facts_path, catalog_path, output_path):
     return result
 
 
-def write_semantic_path(input_path, output_path) -> None:
+def write_semantic_path(input_path, output_path, catalog_path=None) -> None:
     """Publish the Rust semantic sidecars without decoding them in Python."""
     library = _require_library()
     function = library.lachesis_lifetime_semantic_path
-    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
     function.restype = ctypes.c_int
-    status = function(_encoded(input_path), _encoded(output_path))
+    status = function(_encoded(input_path),
+                      _encoded(catalog_path) if catalog_path is not None else None,
+                      _encoded(output_path))
     if status != 0:
         raise RuntimeError(f"native semantic graph failed with status {status}")
 

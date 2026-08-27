@@ -118,7 +118,7 @@ def native_match_leads(result) -> list[dict[str, Any]]:
     return leads
 
 
-def ensure_native_semantic_sidecar(store):
+def ensure_native_semantic_sidecar(store, catalog_path=None):
     """Publish the Rust semantic sidecar without materializing the graph in Python."""
     base = _base(store)
     if not base or not pass2_input_cache_path(base).is_file():
@@ -129,7 +129,7 @@ def ensure_native_semantic_sidecar(store):
         # The Rust path publishes both the full semantic sidecar and its
         # compact event sibling in one invocation.  Do not immediately invoke
         # it a second time below on a cold cache.
-        write_semantic_path(input_path, output_path)
+        write_semantic_path(input_path, output_path, catalog_path)
     else:
         events_path = Path(f"{output_path}.events.pb")
         if not _sidecar_stale(events_path, input_path, output_path):
@@ -137,7 +137,7 @@ def ensure_native_semantic_sidecar(store):
         # Regenerate through Rust so the event-only sibling is published atomically.
         temporary = Path(f"{output_path}.events-migrate.{os.getpid()}.pb")
         try:
-            write_semantic_path(input_path, temporary)
+            write_semantic_path(input_path, temporary, catalog_path)
             generated = Path(f"{temporary}.events.pb")
             os.replace(generated, events_path)
         finally:

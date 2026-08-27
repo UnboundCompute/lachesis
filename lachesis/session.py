@@ -504,7 +504,9 @@ class Analysis:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import ensure_native_semantic_sidecar
-        native_sidecar = ensure_native_semantic_sidecar(self.store)
+        native_sidecar = ensure_native_semantic_sidecar(
+            self.store, summary.get("catalog_path"),
+        )
         stamped["semantic_graph"] = {
             "native_sidecar": str(native_sidecar),
             "coverage": {"converged": True},

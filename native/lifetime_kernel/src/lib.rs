@@ -1485,7 +1485,7 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
 /// Only event nodes and control-flow edges are written to the output sidecar.
 #[no_mangle]
 pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
-    input_path: *const c_char, output_path: *const c_char,
+    input_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
 ) -> i32 {
     let result = (|| {
         if input_path.is_null() || output_path.is_null() {
@@ -1496,7 +1496,19 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid semantic output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let request = native_graph::sidecar_to_request(&bytes)?;
+        let roles = if catalog_path.is_null() {
+            HashMap::new()
+        } else {
+            let catalog = CStr::from_ptr(catalog_path).to_str()
+                .map_err(|error| format!("invalid lifecycle catalog path: {error}"))?;
+            let catalog = atropos_proto::Request::decode(
+                fs::read(catalog)
+                    .map_err(|error| format!("cannot read binary lifecycle catalog: {error}"))?
+                    .as_slice(),
+            ).map_err(|error| format!("invalid binary lifecycle catalog: {error}"))?;
+            native_graph::lifecycle_roles(&catalog)
+        };
+        let request = native_graph::sidecar_to_request_with_roles(&bytes, &roles)?;
         let full = prepare::semantic_request(request)?;
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so

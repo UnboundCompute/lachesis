@@ -17,6 +17,7 @@ def compiled_catalog(root: str | os.PathLike[str], base: str | os.PathLike[str])
     runtime receives the resulting protobuf path and never parses JSON.
     """
     models_root = Path(root) / "models"
+    lifecycle_path = Path(root) / "detection" / "lifecycle-roles.json"
     fingerprint = hashlib.sha256()
     for path in sorted(models_root.rglob("*.json")):
         try:
@@ -24,6 +25,14 @@ def compiled_catalog(root: str | os.PathLike[str], base: str | os.PathLike[str])
         except OSError:
             continue
         fingerprint.update(str(path).encode())
+        fingerprint.update(str(stat.st_mtime_ns).encode())
+        fingerprint.update(str(stat.st_size).encode())
+    try:
+        stat = lifecycle_path.stat()
+    except OSError:
+        pass
+    else:
+        fingerprint.update(str(lifecycle_path).encode())
         fingerprint.update(str(stat.st_mtime_ns).encode())
         fingerprint.update(str(stat.st_size).encode())
     target = Path(f"{base}.atropos.{fingerprint.hexdigest()[:16]}.catalog.pb")
@@ -74,6 +83,7 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
     resulting protobuf and never parses JSON.
     """
     from .models import load_models
+    root = Path(root)
     request = atropos_pb2.Request()
     for model in load_models(Path(root)):
         encoded = request.models.add(
@@ -85,6 +95,30 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
         if model.get("arity") is not None:
             encoded.arity = int(model["arity"])
             encoded.has_arity = True
+    # Lifecycle roles are compiled into the same protobuf catalog.  This is a
+    # build/setup concern: the native analysis path consumes only this binary
+    # artifact and never opens the authored catalog files.
+    lifecycle_path = root.parent / "detection" / "lifecycle-roles.json"
+    try:
+        import json
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        lifecycle = {}
+    role_sections = {
+        "alloc": "lifecycle.alloc",
+        "dealloc": "lifecycle.release",
+        "realloc": "lifecycle.realloc",
+        "acquire_methods": "lifecycle.acquire",
+        "release_methods": "lifecycle.release",
+        "release_qualified": "lifecycle.release",
+    }
+    for section, role in role_sections.items():
+        for language, names in (lifecycle.get(section) or {}).items():
+            for method in names or ():
+                request.models.add(
+                    id=f"{role}:{language}:{method}", language=str(language),
+                    method=str(method), role=role,
+                )
     target = os.fspath(output_path)
     temporary = target + f".tmp.{os.getpid()}"
     with open(temporary, "wb") as stream:

@@ -191,23 +191,69 @@ fn translation_return_kind(kind: &str) -> bool {
     matches!(kind, "ReturnStmt" | "Return" | "ReturnStatement" | "return")
 }
 
+fn frontend_languages(function_id: &str) -> &'static [&'static str] {
+    if function_id.contains(":clang-c:") {
+        &["c"]
+    } else if function_id.contains(":cpython-ast:") {
+        &["python"]
+    } else if function_id.contains(":typescript-compiler-api:") {
+        // The shared TypeScript compiler frontend handles both extensions. The
+        // lifecycle vocabulary is intentionally the same for this pair.
+        &["typescript", "javascript"]
+    } else {
+        &[]
+    }
+}
+
+fn lifecycle_role<'a>(
+    roles: &'a HashMap<(String, String), String>, function_id: &str, callee: &str,
+) -> Option<&'a str> {
+    frontend_languages(function_id).iter().find_map(|language| {
+        roles.get(&(language.to_string(), callee.to_owned())).map(String::as_str)
+    }).or_else(|| {
+        // Qualified managed-language methods are also emitted with their
+        // surface-qualified name by the compiler frontends. For a bare method,
+        // consult the catalog's method vocabulary as a fallback.
+        let method = callee.rsplit('.').next().unwrap_or(callee);
+        frontend_languages(function_id).iter().find_map(|language| {
+            roles.get(&(language.to_string(), method.to_owned())).map(String::as_str)
+        })
+    })
+}
+
+pub(crate) fn lifecycle_roles(
+    catalog: &crate::atropos_proto::Request,
+) -> HashMap<(String, String), String> {
+    catalog.models.iter().filter_map(|model| {
+        let role = model.role.strip_prefix("lifecycle.")?;
+        Some(((model.language.clone(), model.method.clone()), role.to_owned()))
+    }).collect()
+}
+
 /// Convert the complete framed substrate to the existing native preparation
 /// contract. This is deliberately one conversion inside Rust; Python never
 /// creates FunctionInput/FunctionCall records for this path.
 pub(crate) fn sidecar_to_request(
     input: &[u8],
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, None, true)
+    sidecar_to_request_inner(input, None, true, &HashMap::new())
+}
+
+pub(crate) fn sidecar_to_request_with_roles(
+    input: &[u8], roles: &HashMap<(String, String), String>,
+) -> Result<lifetime_proto::PrepareRequest, String> {
+    sidecar_to_request_inner(input, None, true, roles)
 }
 
 pub(crate) fn sidecar_to_request_selected(
     input: &[u8], selected_ids: &HashSet<String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, Some(selected_ids), true)
+    sidecar_to_request_inner(input, Some(selected_ids), true, &HashMap::new())
 }
 
-fn sidecar_to_request_with_selection(
+fn sidecar_to_request_inner(
     input: &[u8], selected_ids: Option<&HashSet<String>>, retain_owner: bool,
+    roles: &HashMap<(String, String), String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
@@ -271,6 +317,14 @@ fn sidecar_to_request_with_selection(
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
+        if let Some(role) = lifecycle_role(roles, &function, &call.callee) {
+            match role {
+                "alloc" | "acquire" => call.is_alloc = true,
+                "release" => call.is_release = true,
+                "realloc" => call.is_realloc = true,
+                _ => {}
+            }
+        }
         if let Some(assigned) = input_text(&item, "target_id")
             .or_else(|| input_text(&item, "value_id")) {
             call.assigned = assigned.to_owned();
