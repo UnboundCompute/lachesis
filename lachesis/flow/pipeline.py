@@ -37,7 +37,7 @@ def run_pass(store, lang="mixed", *, workers=None,
     semantic_sidecar = ensure_native_semantic_sidecar(store, native_catalog_path(store))
     if progress is not None:
         progress("native matching", perf_counter() - started)
-    match_result = build_native_match_result(semantic_sidecar)
+    match_result = build_native_match_result(semantic_sidecar, native_catalog_path(store))
     leads = native_match_leads(match_result)
     finished = perf_counter()
     return {

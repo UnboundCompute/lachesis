@@ -1626,6 +1626,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
 #[no_mangle]
 pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
     input_path: *const c_char, output_path: *const c_char,
+    catalog_path: *const c_char,
 ) -> i32 {
     let result = (|| {
         if input_path.is_null() || output_path.is_null() {
@@ -1635,10 +1636,22 @@ pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
             .map_err(|error| format!("invalid semantic matcher input path: {error}"))?;
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid semantic matcher output path: {error}"))?;
+        let catalog = if catalog_path.is_null() {
+            None
+        } else {
+            let path = CStr::from_ptr(catalog_path).to_str()
+                .map_err(|error| format!("invalid binary pattern catalog path: {error}"))?;
+            atropos_proto::Request::decode(
+                fs::read(path)
+                    .map_err(|error| format!("cannot read binary pattern catalog: {error}"))?
+                    .as_slice(),
+            ).map_err(|error| format!("invalid binary pattern catalog: {error}"))?.pattern_catalog
+        };
         let mapped = native_graph::map_path(input)?;
         let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
             .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
-        let matched = semantic_match::match_result(result).encode_to_vec();
+        let matched = semantic_match::match_result_with_catalog(result, catalog.as_ref())
+            .encode_to_vec();
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, matched)
             .map_err(|error| format!("cannot write native match result: {error}"))?;

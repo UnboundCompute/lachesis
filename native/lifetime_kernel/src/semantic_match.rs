@@ -541,6 +541,30 @@ pub(crate) fn match_result(
     }
 }
 
+/// Apply the executable Atropos pattern set after native state matching.
+///
+/// The transfer engine intentionally discovers generic semantic facts (for
+/// example a release followed by a dereference).  Atropos owns which of those
+/// facts are enabled for the installation.  Keeping that selection in the
+/// compiled protobuf catalog prevents the Rust engine from growing a second,
+/// product-specific pattern registry.
+pub(crate) fn match_result_with_catalog(
+    result: lifetime_proto::NativeSemanticResult,
+    catalog: Option<&crate::atropos_proto::PatternCatalog>,
+) -> lifetime_proto::NativeTemporalResult {
+    let mut matched = match_result(result);
+    let Some(catalog) = catalog else { return matched; };
+    let enabled: HashSet<&str> = catalog.patterns.iter()
+        .filter_map(|pattern| (!pattern.matcher_pattern.is_empty())
+            .then_some(pattern.matcher_pattern.as_str()))
+        .collect();
+    if enabled.is_empty() { return matched; }
+    for function in &mut matched.functions {
+        function.findings.retain(|finding| enabled.contains(finding.pattern.as_str()));
+    }
+    matched
+}
+
 fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
     -> lifetime_proto::NativeTemporalResult
 {

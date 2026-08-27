@@ -75,7 +75,8 @@ def _sidecar_stale(output: Path, *inputs: Path) -> bool:
         return True
 
 
-def build_native_match_result(semantic_path: str | os.PathLike[str]):
+def build_native_match_result(semantic_path: str | os.PathLike[str],
+                              catalog_path: str | os.PathLike[str] | None = None):
     """Build or load the Rust-owned final matcher result."""
     source = Path(semantic_path)
     event_source = native_semantic_events_path(source)
@@ -83,7 +84,7 @@ def build_native_match_result(semantic_path: str | os.PathLike[str]):
         source = event_source
     output = native_match_sidecar_path(source)
     if _sidecar_stale(output, source):
-        match_semantic_path(source, output)
+        match_semantic_path(source, output, catalog_path)
     try:
         result = lifetime_pb2.NativeTemporalResult()
         result.ParseFromString(output.read_bytes())
