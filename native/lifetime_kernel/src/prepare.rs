@@ -375,6 +375,46 @@ fn append_chain(successors: &mut HashMap<String, Vec<String>>, nodes: &[String])
     }
 }
 
+fn guard_value(graph: &GraphView<'_>, node: &str) -> Option<String> {
+    let path = graph.access_path(node, 0)?;
+    let mut value = path.root.trim_start_matches("decl:").to_owned();
+    value.push_str(&path.selectors.join(""));
+    (!value.is_empty()).then(|| format!("{value}#g0"))
+}
+
+fn branch_guards(graph: &GraphView<'_>, source: &str, branch: &str)
+    -> Vec<lifetime_proto::GuardProof>
+{
+    let children = graph.children_of(source).unwrap_or(&[]);
+    let operator = match graph.operator(source) {
+        "" => graph.label(source),
+        value => value,
+    };
+    let proof = |kind: &str, value: Option<String>| value.map(|value|
+        lifetime_proto::GuardProof { kind: kind.to_owned(), value }).into_iter().collect();
+    let invert = branch == "FALSE_BRANCH";
+    if matches!(operator, "==" | "!=") {
+        let null_child = children.iter().find(|child| graph.is_null(child)).copied();
+        let value_child = children.iter().find(|child| Some(**child) != null_child)
+            .and_then(|child| guard_value(graph, child));
+        if null_child.is_some() {
+            let is_null = operator == "==";
+            let is_null = if invert { !is_null } else { is_null };
+            return proof(if is_null { "ISNULL" } else { "NONNULL" }, value_child);
+        }
+    }
+    if operator == "!" {
+        let value = children.first().and_then(|child| guard_value(graph, child));
+        return proof(if invert { "NONNULL" } else { "ISNULL" }, value);
+    }
+    // A bare pointer condition has the same nullability meaning as `p != 0`.
+    if children.is_empty() {
+        let value = guard_value(graph, source);
+        return proof(if invert { "ISNULL" } else { "NONNULL" }, value);
+    }
+    Vec::new()
+}
+
 fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<String>, HashMap<String, Vec<String>>)> {
     let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
         graph.parent_of(node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
@@ -1466,10 +1506,23 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             .map(|offset| (node.id.clone(), offset))
     }).collect();
     assign_generations(&mut operations, &prepared_nodes, &successor_map, &offsets);
+    let mut guard_map: HashMap<(String, String), Vec<lifetime_proto::GuardProof>> = HashMap::new();
+    for edge in &input.edges {
+        if matches!(edge.kind.as_str(), "TRUE_BRANCH" | "FALSE_BRANCH") {
+            let proofs = branch_guards(&graph, &edge.source, &edge.kind);
+            if !proofs.is_empty() {
+                guard_map.insert((edge.source.clone(), edge.target.clone()), proofs);
+            }
+        }
+    }
     let mut successors = successor_map.into_iter().map(|(node, mut targets)| {
         targets.sort();
         targets.dedup();
-        lifetime_proto::Successors { node, targets }
+        let guarded_targets = targets.iter().filter_map(|target| {
+            guard_map.get(&(node.clone(), target.clone())).map(|guards|
+                lifetime_proto::GuardedTarget { target: target.clone(), guards: guards.clone() })
+        }).collect();
+        lifetime_proto::Successors { node, targets, guarded_targets }
     }).collect::<Vec<_>>();
     successors.sort_by(|left, right| left.node.cmp(&right.node));
     operations.sort_by_key(|item| (item.line.unwrap_or(i64::MAX), item.node.clone(), item.kind as u8));
@@ -1734,6 +1787,9 @@ pub(crate) fn semantic_request(
                     if let Some(target) = target_nodes.first() {
                         edges.push(lifetime_proto::NativeSemanticEdge {
                             source: source.clone(), target: target.clone(), kind: "normal".into(),
+                            guards: successor.guarded_targets.iter()
+                                .find(|item| item.target == *target_anchor)
+                                .map(|item| item.guards.clone()).unwrap_or_default(),
                         });
                     }
                 }
@@ -1742,7 +1798,7 @@ pub(crate) fn semantic_request(
         for node_ids in by_anchor.values() {
             for pair in node_ids.windows(2) {
                 edges.push(lifetime_proto::NativeSemanticEdge {
-                    source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(),
+                    source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(), guards: Vec::new(),
                 });
             }
         }
@@ -1751,13 +1807,13 @@ pub(crate) fn semantic_request(
         // outcomes then continue through the original CFG successors.
         for (attempt, failure, anchor) in realloc_failures {
             edges.push(lifetime_proto::NativeSemanticEdge {
-                source: attempt, target: failure.clone(), kind: "realloc-failure".into(),
+                source: attempt, target: failure.clone(), kind: "realloc-failure".into(), guards: Vec::new(),
             });
             if let Some(successors) = function.successors.iter().find(|item| item.node == anchor) {
                 for target_anchor in &successors.targets {
                     if let Some(target) = by_anchor.get(target_anchor).and_then(|items| items.first()) {
                         edges.push(lifetime_proto::NativeSemanticEdge {
-                            source: failure.clone(), target: target.clone(), kind: "normal".into(),
+                            source: failure.clone(), target: target.clone(), kind: "normal".into(), guards: Vec::new(),
                         });
                     }
                 }

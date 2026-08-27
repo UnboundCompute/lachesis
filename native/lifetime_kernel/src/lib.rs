@@ -197,18 +197,19 @@ fn compact_event_function(
             source: node_ids[source].clone(),
             target: node_ids[target].clone(),
             kind: "normal".to_owned(),
+            guards: Vec::new(),
         }
     }).collect();
     projected_edges.reserve(entry_events.len() + exit_events.len());
     for target in entry_events {
         projected_edges.push(lifetime_proto::NativeSemanticEdge {
-            source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(),
+            source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(), guards: Vec::new(),
         });
     }
     for source in exit_events {
         projected_edges.push(lifetime_proto::NativeSemanticEdge {
             source: node_ids[source].clone(),
-            target: exit.clone(), kind: "normal".to_owned(),
+            target: exit.clone(), kind: "normal".to_owned(), guards: Vec::new(),
         });
     }
     projected_edges.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));

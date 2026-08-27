@@ -41,6 +41,7 @@ struct StateKey {
     released: MarkSet,
     origins: MarkSet,
     nulls: MarkSet,
+    nonnull: MarkSet,
     uninitialized: MarkSet,
     pointer_arithmetic: MarkSet,
     escaped: MarkSet,
@@ -136,6 +137,8 @@ fn add_finding(
         witness_complete: !witness.is_empty(),
         source_witness_nodes: node.source_witness_nodes.clone(),
         source_reachable: node.source_reachable,
+        guards: Vec::new(),
+        guarded: false,
     });
 }
 
@@ -194,9 +197,11 @@ fn match_function(
         by_id.insert(node.id.as_str(), index);
     }
     let mut outgoing = vec![Vec::new(); function.nodes.len()];
+    let mut guarded_outgoing = vec![Vec::new(); function.nodes.len()];
     for edge in &function.edges {
         if let (Some(source), Some(target)) = (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str())) {
             outgoing[*source].push(*target);
+            guarded_outgoing[*source].push((*target, edge.guards.clone()));
         }
     }
     let entry = by_id.get(function.entry.as_str()).copied().unwrap_or(0);
@@ -240,7 +245,7 @@ fn match_function(
     let mut queue = VecDeque::from([(
         entry,
         Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
-        empty.clone(), empty.clone(), empty.clone(), empty,
+        empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
@@ -250,7 +255,7 @@ fn match_function(
     const MAX_STATES: usize = 1_000_000;
 
     while let Some((index, mut bindings, mut released, mut origins, mut nulls,
-                    mut uninitialized, mut pointer_arithmetic, mut escaped,
+                    mut nonnull, mut uninitialized, mut pointer_arithmetic, mut escaped,
                     mut realloc_lost)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
@@ -258,7 +263,7 @@ fn match_function(
         bindings.dedup();
         let state = StateKey {
             node: index, bindings: bindings.clone(), released: released.clone(), origins: origins.clone(),
-            nulls: nulls.clone(), uninitialized: uninitialized.clone(),
+            nulls: nulls.clone(), nonnull: nonnull.clone(), uninitialized: uninitialized.clone(),
             pointer_arithmetic: pointer_arithmetic.clone(), escaped: escaped.clone(),
             realloc_lost: realloc_lost.clone(),
         };
@@ -280,6 +285,7 @@ fn match_function(
             "ORIGIN" => if let Some(object) = object_id {
                 released.remove(object);
                 nulls.remove(object);
+                nonnull.remove(object);
                 uninitialized.remove(object);
                 escaped.remove(object);
                 realloc_lost.remove(object);
@@ -363,6 +369,7 @@ fn match_function(
             },
             "WRITE_STORAGE_NULL" => if let Some(object) = object_id {
                 nulls.insert(object);
+                nonnull.remove(object);
             },
             "UNINITIALIZED" => if let Some(object) = object_id {
                 uninitialized.insert(object);
@@ -390,10 +397,36 @@ fn match_function(
                 }
             }
         }
-        for target in &outgoing[index] {
-            queue.push_back((*target, bindings.clone(), released.clone(), origins.clone(), nulls.clone(),
-                             uninitialized.clone(), pointer_arithmetic.clone(), escaped.clone(),
-                             realloc_lost.clone()));
+        for (target, guards) in &guarded_outgoing[index] {
+            let mut next_nulls = nulls.clone();
+            let mut next_nonnull = nonnull.clone();
+            let mut contradiction = false;
+            for guard in guards {
+                let Some((root, generation)) = guard.value.split_once('#') else { continue };
+                let root = root.strip_prefix("decl:").unwrap_or(root);
+                let Some(object) = objects.iter().position(|item|
+                    item.root.strip_prefix("decl:").unwrap_or(&item.root) == root
+                        && item.generation == generation).map(|id| id as u32)
+                else { continue };
+                match guard.kind.as_str() {
+                    "ISNULL" => {
+                        if next_nonnull.contains(object) { contradiction = true; break; }
+                        next_nulls.insert(object);
+                        next_nonnull.remove(object);
+                    }
+                    "NONNULL" => {
+                        if next_nulls.contains(object) { contradiction = true; break; }
+                        next_nonnull.insert(object);
+                        next_nulls.remove(object);
+                    }
+                    _ => {}
+                }
+            }
+            if !contradiction {
+                queue.push_back((*target, bindings.clone(), released.clone(), origins.clone(), next_nulls,
+                                 next_nonnull, uninitialized.clone(), pointer_arithmetic.clone(),
+                                 escaped.clone(), realloc_lost.clone()));
+            }
         }
     }
 
@@ -472,7 +505,7 @@ mod tests {
     {
         let ids: Vec<String> = nodes.iter().map(|item| item.id.clone()).collect();
         let edges = ids.windows(2).map(|pair| lifetime_proto::NativeSemanticEdge {
-            source: pair[0].clone(), target: pair[1].clone(), kind: "normal".to_owned(),
+            source: pair[0].clone(), target: pair[1].clone(), kind: "normal".to_owned(), guards: Vec::new(),
         }).collect();
         lifetime_proto::NativeSemanticFunction {
             id: "f".to_owned(), entry: ids[0].clone(), exits: vec![ids[ids.len() - 1].clone()],
@@ -541,6 +574,27 @@ mod tests {
         let result = match_result(lifetime_proto::NativeSemanticResult {
             functions: vec![function(vec![node("n", "WRITE_STORAGE_NULL", 1),
                                              node("r", "RELEASE", 2)])],
+            complete: true,
+        });
+        assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn contradictory_nonnull_guard_prunes_null_release_path() {
+        let nodes = vec![node("n", "WRITE_STORAGE_NULL", 1), node("r", "RELEASE", 2)];
+        let edges = vec![lifetime_proto::NativeSemanticEdge {
+            source: "n".to_owned(),
+            target: "r".to_owned(),
+            kind: "normal".to_owned(),
+            guards: vec![lifetime_proto::GuardProof {
+                kind: "NONNULL".to_owned(), value: "p#g0".to_owned(),
+            }],
+        }];
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![lifetime_proto::NativeSemanticFunction {
+                id: "f".to_owned(), entry: "n".to_owned(), exits: vec!["r".to_owned()],
+                nodes, edges, language: "c".to_owned(),
+            }],
             complete: true,
         });
         assert!(result.functions[0].findings.is_empty());
