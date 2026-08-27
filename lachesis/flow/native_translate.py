@@ -91,6 +91,8 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 "var": rendered,
                 "at": finding.node,
                 "pattern_id": flow_pattern_id(finding.pattern) or finding.pattern,
+                "witness": list(finding.witness_nodes),
+                "witness_complete": finding.witness_complete,
             })
     return leads
 

@@ -346,6 +346,11 @@ message NativeTemporalFinding {
   sint64 line = 4;
   bool has_line = 5;
   string node = 6;
+  // Computed CFG witness from the function entry to the finding node.  This
+  // is deliberately separate from the object path above: the matcher must
+  // not present an object identity as if it were a provenance trace.
+  repeated string witness_nodes = 7;
+  bool witness_complete = 8;
 }
 message NativeTemporalFunction {
   string id = 1;
