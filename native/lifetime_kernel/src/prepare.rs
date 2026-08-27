@@ -70,6 +70,7 @@ struct GraphView<'a> {
     parent: HashMap<&'a str, &'a str>,
     refers: HashMap<&'a str, &'a str>,
     initializers: HashMap<&'a str, &'a str>,
+    control: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
 }
 
 impl<'a> GraphView<'a> {
@@ -83,6 +84,7 @@ impl<'a> GraphView<'a> {
         let mut roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>> = HashMap::new();
         let mut refers = HashMap::new();
         let mut initializers = HashMap::new();
+        let mut control: HashMap<&'a str, Vec<(&'a str, &'a str)>> = HashMap::new();
         for edge in edges_input {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
@@ -98,6 +100,13 @@ impl<'a> GraphView<'a> {
                 "REFERS_TO" => { refers.insert(edge.source.as_str(), edge.target.as_str()); }
                 "VALUE_FLOWS_TO" => {
                     initializers.insert(edge.target.as_str(), edge.source.as_str());
+                }
+                "CONDITION" | "TRUE_BRANCH" | "FALSE_BRANCH" | "LOOP_TRUE" |
+                "LOOP_BACK" | "SWITCH_CASE" | "EXCEPTION_BRANCH" | "TRY_BODY" |
+                "RUNS_FINALLY" | "BREAKS_TO" | "CONTINUES_TO" | "ITERATES" |
+                "SHORT_CIRCUIT_LEFT" | "SHORT_CIRCUIT_RIGHT" => {
+                    control.entry(edge.source.as_str()).or_default()
+                        .push((edge.kind.as_str(), edge.target.as_str()));
                 }
                 _ => {}
             }
@@ -125,7 +134,7 @@ impl<'a> GraphView<'a> {
             child_targets.extend(children);
             child_offsets.push(child_targets.len());
         }
-        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers }
+        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers, control }
     }
 
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> {
@@ -152,6 +161,13 @@ impl<'a> GraphView<'a> {
     }
 
     fn initializer_of(&self, id: &str) -> Option<&'a str> { self.initializers.get(id).copied() }
+
+    fn control_targets(&self, id: &str, kind: &str) -> Vec<&'a str> {
+        self.control.get(id).into_iter().flatten()
+            .filter(|(edge_kind, _)| *edge_kind == kind)
+            .map(|(_, target)| *target)
+            .collect()
+    }
 
     fn kind(&self, id: &str) -> &str {
         self.node(id).map(|node| text_property(node, "syntax_kind").unwrap_or(node.kind.as_str())).unwrap_or("")
@@ -323,7 +339,10 @@ fn is_statement(kind: &str) -> bool {
         "cfg-entry" | "cfg-exit" | "cfg-merge" | "cfg-condition" |
         "statement" | "Return" | "ReturnStatement" | "return" |
         "Block" | "ExpressionStatement" | "IfStatement" | "ForStatement" |
-        "WhileStatement" | "TryStatement" | "WithStatement")
+        "WhileStatement" | "TryStatement" | "WithStatement" |
+        "If" | "For" | "AsyncFor" | "While" | "Try" | "Match" |
+        "Raise" | "Break" | "Continue" | "Assign" | "AnnAssign" |
+        "AugAssign" | "Expr" | "Pass")
 }
 
 fn is_return_kind(kind: &str) -> bool {
@@ -421,8 +440,9 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
                 exits = next_exits;
             }
             (first, exits)
-        } else if kind == "IfStmt" {
+        } else if matches!(kind, "IfStmt" | "If") {
             let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
+                .or_else(|| graph.control_targets(id, "CONDITION").into_iter().next().map(str::to_owned))
                 .or_else(|| children.iter().min_by_key(|child| graph.offset(child)).cloned());
             let mut condition_stream = Vec::new();
             if let Some(condition) = condition {
@@ -431,7 +451,11 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             let mut branches = Vec::new();
             for role in ["TRUE_BRANCH", "FALSE_BRANCH"] {
-                if let Some(branch) = graph.role_children(id, role).and_then(|items| items.first()) {
+                let branch = graph.role_children(id, role).and_then(|items| items.first()).copied()
+                    .or_else(|| condition_stream.last().and_then(|condition| {
+                        graph.control_targets(condition, role).into_iter().next()
+                    }));
+                if let Some(branch) = branch {
                     branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
                 }
             }
@@ -512,6 +536,39 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         } else if kind == "BreakStmt" || kind == "ContinueStmt" {
             successors.entry(id.to_owned()).or_default();
             (Some(id.to_owned()), Vec::new())
+        } else if matches!(kind, "For" | "AsyncFor") {
+            // Python's normalized frontend publishes iterator/body control
+            // edges rather than a Clang-style CONDITION node. Preserve the
+            // same loop topology: iterator -> body -> iterator, with the
+            // explicit FALSE_BRANCH/else arm left as the finite exit.
+            let iterator = children.iter().find(|child| {
+                !matches!(graph.kind(child), "statement" | "expression")
+                    || graph.offset(child) <= graph.offset(id)
+            }).cloned().or_else(|| children.first().cloned());
+            let mut iterator_stream = Vec::new();
+            if let Some(iterator) = iterator {
+                expression_stream(graph, &iterator, owned, &mut iterator_stream,
+                    &mut HashSet::new(), 0);
+                append_chain(successors, &iterator_stream);
+            }
+            let body = iterator_stream.last().and_then(|iterator| {
+                graph.control_targets(iterator, "ITERATES").into_iter().next()
+            }).or_else(|| graph.control_targets(id, "LOOP_BODY").into_iter().next());
+            let body_result = body.map(|node| emit(graph, owned, node, successors,
+                memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
+            if let (Some(iterator), Some(body_entry)) = (iterator_stream.last(), body_result.0.clone()) {
+                successors.entry(iterator.clone()).or_default().push(body_entry);
+            }
+            if let Some(iterator) = iterator_stream.first() {
+                for exit in &body_result.1 {
+                    successors.entry(exit.clone()).or_default().push(iterator.clone());
+                }
+            }
+            let mut exits = graph.control_targets(
+                iterator_stream.last().map(String::as_str).unwrap_or(id), "FALSE_BRANCH")
+                .into_iter().map(str::to_owned).collect::<Vec<_>>();
+            if exits.is_empty() { exits = iterator_stream.last().cloned().into_iter().collect(); }
+            (iterator_stream.first().cloned().or(body_result.0), exits)
         } else if kind == "ForStmt" {
             let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned());
             let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
@@ -545,9 +602,11 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             let entry = init_result.0.or(condition_result.0).or(body_result.0);
             (entry, condition_result.1.into_iter().chain(body_result.1).collect())
-        } else if matches!(kind, "WhileStmt" | "DoStmt") {
+        } else if matches!(kind, "WhileStmt" | "DoStmt" | "While") {
             let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
-            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned());
+            let condition = condition.or_else(|| graph.control_targets(id, "CONDITION").into_iter().next().map(str::to_owned));
+            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned())
+                .or_else(|| condition.as_deref().and_then(|condition| graph.control_targets(condition, "LOOP_TRUE").into_iter().next().map(str::to_owned)));
             let mut condition_stream = Vec::new();
             if let Some(condition) = condition.as_ref() { expression_stream(graph, condition, owned, &mut condition_stream, &mut HashSet::new(), 0); append_chain(successors, &condition_stream); }
             let body_result = body.as_ref().map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));

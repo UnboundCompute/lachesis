@@ -20,7 +20,11 @@ const FRAME_HEADER: usize = 4;
 // sidecar remains lossless; filtering here prevents unrelated overlay edges
 // from being duplicated into every native FunctionInput.
 fn retain_lifetime_edge(kind: &str) -> bool {
-    matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT" | "HAS_ARGUMENT")
+    matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT" | "HAS_ARGUMENT"
+        | "CONDITION" | "TRUE_BRANCH" | "FALSE_BRANCH" | "LOOP_TRUE" | "LOOP_BACK"
+        | "SWITCH_CASE" | "EXCEPTION_BRANCH" | "TRY_BODY" | "RUNS_FINALLY"
+        | "BREAKS_TO" | "CONTINUES_TO" | "ITERATES" | "SHORT_CIRCUIT_LEFT"
+        | "SHORT_CIRCUIT_RIGHT")
 }
 
 /// Map the immutable Pass-1 substrate instead of reading a second full byte
