@@ -49,3 +49,6 @@ lachesis/frontends/typescript/vendor/
 # Local secrets (PyPI token, etc.) -- never commit
 .env
 .env.*
+
+*.pb
+*.kuzu

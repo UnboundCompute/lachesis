@@ -74,6 +74,10 @@ or source revisions. Record those changes alongside the result.
 
 | Date | Revision | Workload | Build s | Enrichment s | Kùzu s | Nodes | Edges | Peak GiB | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
+| 2026-08-27 | working tree | Full libxml2 pruned streamed core, 10k edge batches | 27.66 | — | 15.06 | 406,952 | 656,691 | ~1.03 | Cold Apple Silicon run; C/Python/TypeScript frontends overlapped; tokens/proofs disabled; zero swaps. Nodes stayed at 2k batches, edges at 10k; exact sidecars and counts preserved. |
+| 2026-08-27 | `c834830` | Full libxml2 pruned streamed core | 28.73 | — | 15.80 | 406,952 | 656,691 | ~0.85 | Cold Apple Silicon run; C/Python/TypeScript frontends overlapped; tokens/proofs disabled; zero swaps. Node protobuf projection scans each repeated property list once; Pass-2 input, facts, and Pass-3 substrate sidecars emitted. |
+| 2026-08-26 | `3b87981` | Full libxml2, corrected streamed Pass-1, `--prune` | 250.29 | — | 67.62 | 979,768 | 2,065,566 | ~3.01 | Apple Silicon; 3 frontends serialized; tokens/proofs disabled; zero swaps. Includes one fewer AST traversal, cached macro spans, and cached frontend file metadata. Pass-2/Pass-3 sidecars emitted and freshly consumed by native Pass 2 in 14.44s (4.51GiB peak RSS). |
+| 2026-08-26 | `228f6f8` | Full libxml2, streamed Pass-1, `--prune` | 268.40 | — | 66.19 | 979,768 | 2,065,561 | ~3.17 | Apple Silicon; 3 frontends serialized; Pass-2/Pass-3 protobuf sidecars emitted; no swap. Sidecar publication was ~85.6s of the build. |
 | 2026-08-20 | `d841e61` | Linux `net` | 191* | — | — | 1,833,812 | 3,507,808 | 4.34* | Direct C frontend; full bundle validated. |
 | 2026-08-20 | `d841e61` | Linux `fs` | >421* | — | — | — | — | >4.77* | Safety-stopped before completion; next scale boundary. |
 | 2026-08-20 | `ad44b90` | Linux `net` CLI + `--enrich` | >160* | — | — | — | — | >5.30* | Frontend child exceeded safety cap before composition; pass 2 not measured. |

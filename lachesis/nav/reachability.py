@@ -37,8 +37,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lachesis.core.overlays.taint import FLOW_EDGE_KINDS
 from lachesis.nav.graph_store import GraphStore
+
+
+# Native Pass 2 emits these canonical value-flow relationships. Keep the query
+# vocabulary local to navigation; the removed Python taint overlay is no longer
+# the owner of this contract.
+FLOW_EDGE_KINDS = frozenset({
+    "DEFINES", "VALUE_FLOWS_TO", "READS_FROM", "PROPERTY_READ",
+    "ALIASES", "ALIASES_VALUE", "PHI_INPUT", "BRANCH_READS_FROM",
+    "BRANCH_PREVIOUS", "POINTS_TO", "WRITES_HEAP", "READS_HEAP",
+    "DYNAMIC_INPUT", "REACHING_DEF",
+})
 
 # Same fail-open valve as taint.py, but per *query* (one seed) instead of per source.
 MAX_STATES = 200_000

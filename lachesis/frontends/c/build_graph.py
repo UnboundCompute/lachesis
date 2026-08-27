@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,9 +30,11 @@ except ImportError:  # … or imported as a package module.
 
 try:
     from lachesis.core.graph_wire import encode_document, write_tier
+    from lachesis.core import graph_pb2
 except ModuleNotFoundError:  # direct script execution from the frontend directory
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from lachesis.core.graph_wire import encode_document, write_tier
+    from lachesis.core import graph_pb2
 
 
 CONTRACT_VERSION = 2
@@ -107,7 +110,8 @@ def compact(value: object, limit: int = 300) -> str:
 def read_roots(roots_file: str) -> List[Path]:
     """Ingest exactly the discovery-provided root list.
 
-    The Python driver (lachesis/core/runner.py) writes LACHESIS_ROOTS_FILE after it
+    The Python driver (lachesis/core/runner.py) writes a binary protobuf file named
+    by LACHESIS_ROOTS_FILE after it
     has already pruned vendor directories and excluded tests via
     lachesis.nav.symbol_index.is_test_path.  Honoring it means the C frontend inherits that
     single discovery instead of re-walking the tree and re-introducing what was
@@ -115,8 +119,12 @@ def read_roots(roots_file: str) -> List[Path]:
     """
     roots: List[Path] = []
     try:
-        lines = Path(roots_file).read_text(encoding="utf-8").splitlines()
-    except OSError:
+        message = graph_pb2.FrontendRoots()
+        message.ParseFromString(Path(roots_file).read_bytes())
+        if message.format_version != 2:
+            return roots
+        lines = message.paths
+    except (OSError, ValueError):
         return roots
     for line in lines:
         trimmed = line.strip()
@@ -130,7 +138,8 @@ def read_roots(roots_file: str) -> List[Path]:
 
 def walk(source_dir: Path) -> List[Path]:
     # Discovery owns file selection: when the driver hands us an explicit root set
-    # (LACHESIS_ROOTS_FILE — vendor/test files already excluded), ingest exactly that
+    # (LACHESIS_ROOTS_FILE — a binary protobuf root set with vendor/test files already
+    # excluded), ingest exactly that
     # list so the walker can't re-introduce what was filtered out.  Absent the env
     # var (standalone CLI run), fall back to a full source-tree walk.
     roots_file = os.environ.get("LACHESIS_ROOTS_FILE")
@@ -382,6 +391,7 @@ def run_clang_over(
     paths: Iterable[Path], source_dir: Path, *arguments: str,
     file_flags_of: Optional[Dict[Path, List[str]]] = None,
     jobs: Optional[int] = None,
+    label: Optional[str] = None,
 ) -> Iterator[Tuple[Path, subprocess.CompletedProcess]]:
     """Run one clang invocation per path, several at a time, yielding in ``paths`` order.
 
@@ -401,10 +411,30 @@ def run_clang_over(
     paths = list(paths)
     flags = file_flags_of or {}
     jobs = jobs or clang_jobs(len(paths))
+    timing_enabled = os.environ.get("LACHESIS_TIMINGS") == "1"
+    timing_started = time.perf_counter()
+    completed_count = 0
+
+    def report() -> None:
+        if timing_enabled:
+            line = (
+                "[lachesis timing] clang %s: %.3fs (%d/%d files, jobs=%d)"
+                % (label or "pass", time.perf_counter() - timing_started,
+                   completed_count, len(paths), jobs)
+            )
+            print(line, file=sys.stderr, flush=True)
+            timing_path = os.environ.get("LACHESIS_TIMINGS_FILE")
+            if timing_path:
+                with open(timing_path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+
     if jobs <= 1 or len(paths) <= 1:
         for path in paths:
-            yield path, run_clang(source_dir, path, *arguments,
-                                  file_flags=flags.get(path))
+            result = run_clang(source_dir, path, *arguments,
+                               file_flags=flags.get(path))
+            completed_count += 1
+            yield path, result
+        report()
         return
     upcoming = iter(paths)
     pending: deque = deque()
@@ -424,9 +454,11 @@ def run_clang_over(
         while pending:
             path, future = pending.popleft()
             result = future.result()
+            completed_count += 1
             # refill only after one result is retired, so the window stays at `jobs`
             submit_next()
             yield path, result
+    report()
 
 
 def source_text(path: Path, cache: Dict[Path, str]) -> str:
@@ -508,6 +540,31 @@ def token_source_length(token_text: str) -> int:
         return len(token_text.encode("utf-8").decode("unicode_escape"))
     except (UnicodeDecodeError, UnicodeEncodeError):
         return len(token_text)
+
+
+def has_macro_definition(text: str) -> bool:
+    """Whether a source file contains a local ``#define`` directive.
+
+    The macro pass asks Clang to preprocess each root, but ``parse_macro_definitions``
+    keeps only definitions whose origin is that root.  A root without a local
+    directive therefore cannot emit a macro record; definitions from included files
+    are recovered when those files are visited as roots.  This deliberately accepts
+    both ``#define`` and ``# define`` spellings and only uses a conservative
+    line-start check, so a false positive costs one subprocess while a false negative
+    is impossible for a normal preprocessor directive.
+    """
+    for line in text.splitlines():
+        directive = line.lstrip()
+        if not directive.startswith("#"):
+            continue
+        directive = directive[1:].lstrip()
+        if directive.startswith("define") and (
+            len(directive) == len("define")
+            or not (directive[len("define")].isalnum()
+                    or directive[len("define")] == "_")
+        ):
+            return True
+    return False
 
 
 def parse_clang_token(line: str) -> Optional[Tuple[str, str, Path, int, int]]:
@@ -601,18 +658,32 @@ def position_from_line(
     ``read_body`` shows the whole ``#define``."""
     text = source_text(path, texts)
     starts = line_starts(path, text, line_starts_cache)
-    lines = text.splitlines()
     index = max(0, min(line, len(starts)) - 1)
     start = starts[index]
     last = index
-    while last < len(lines) and lines[last].endswith("\\"):
+    # Do not call ``splitlines`` here: macro recovery invokes this once per
+    # definition, and splitting the complete source for every macro turns a
+    # header-heavy tree into repeated whole-file scans and allocations.  The
+    # line-offset table is already cached, so inspect only the physical lines
+    # participating in this definition.
+    while last < len(starts):
+        line_end = text.find("\n", starts[last])
+        if line_end < 0:
+            line_end = len(text)
+        if not text[starts[last]:line_end].endswith("\\"):
+            break
         last += 1
     end = starts[last + 1] - 1 if last + 1 < len(starts) else len(text)
+    end_line = last + 1
+    final_line_end = text.find("\n", starts[last])
+    if final_line_end < 0:
+        final_line_end = len(text)
+    end_column = final_line_end - starts[last] + 1
     return {
         "file": str(path), "absolute_file": str(path),
         "start_offset": start, "end_offset": max(start, end),
         "start_line": index + 1, "start_column": 1,
-        "end_line": last + 1, "end_column": len(lines[last]) + 1 if last < len(lines) else 1,
+        "end_line": end_line, "end_column": end_column,
     }
 
 
@@ -644,12 +715,22 @@ class Graph:
             # separator components across translation units. Normalize before the
             # memo lookup so those spellings do not repeat realpath/content-hash
             # work for every AST node.
-            file_key = os.path.normcase(os.path.normpath(absolute_file))
-            cached = RESOLVED_FILES.get(file_key)
+            # AST nodes normally carry the exact same ``str(Path)`` spelling as
+            # their compiler-root file node.  Hit that form first: normalizing a
+            # path for every one of hundreds of thousands of nodes is needless
+            # Python/string work.  The normalized lookup remains for included
+            # paths that arrive with a different spelling.
+            cached = RESOLVED_FILES.get(absolute_file)
             if cached is None:
-                absolute = Path(absolute_file).resolve()
-                cached = (str(absolute), content_hash(absolute))
-                RESOLVED_FILES[file_key] = cached
+                file_key = os.path.normcase(os.path.normpath(absolute_file))
+                cached = RESOLVED_FILES.get(file_key)
+                if cached is None:
+                    absolute = Path(absolute_file).resolve()
+                    cached = (str(absolute), content_hash(absolute))
+                    RESOLVED_FILES[file_key] = cached
+                # Cache the original spelling as well so subsequent AST nodes
+                # from this path take the cheap direct branch.
+                RESOLVED_FILES[absolute_file] = cached
             resolved_file, resolved_hash = cached
             canonical.update({
                 "frontend_id": FRONTEND_ID,
@@ -987,7 +1068,8 @@ def main() -> int:
 
     # Compiler dependency extraction makes framework/header ownership explicit.
     for path, dependency in run_clang_over(translation_units, source_dir, "-MM",
-                                           file_flags_of=compile_commands):
+                                           file_flags_of=compile_commands,
+                                           label="dependencies"):
         flattened = dependency.stdout.replace("\\\n", " ")
         dependencies = flattened.split(":", 1)[1].split() if ":" in flattened else []
         for raw in dependencies:
@@ -1017,12 +1099,23 @@ def main() -> int:
                 )
             graph.edge("DEPENDS_ON", file_ids[path], file_ids[target], directive="#include")
 
-    # Parse headers independently as compiler roots. This retains their exact
-    # offsets; Clang otherwise reports included declarations using header-local
-    # offsets but only the including-file provenance.
+    # Parse translation units and only uncovered headers as compiler roots. A
+    # header included by a TU is already present in that TU's AST; parsing it a
+    # second time as a standalone root only recreates the same declarations and
+    # burns another full preprocessing/JSON pass. Keep standalone roots for
+    # orphan headers because no TU can provide their declarations.
+    included_headers = {
+        target for target in dependency_targets.values()
+        if target is not None and target.suffix.lower() == ".h"
+    }
+    ast_roots = translation_units + [
+        path for path in files
+        if path.suffix.lower() == ".h" and path not in included_headers
+    ]
     for path, result in run_clang_over(
-        files, source_dir, "-Xclang", "-ast-dump=json", "-fsyntax-only",
+        ast_roots, source_dir, "-Xclang", "-ast-dump=json", "-fsyntax-only",
         "-Wno-everything", file_flags_of=compile_commands,
+        label="ast",
     ):
         # Clang emits a COMPLETE AST on stdout even when it exits nonzero from
         # residual (cross-config) diagnostics — routine for real kernel TUs, which
@@ -1102,10 +1195,17 @@ def main() -> int:
     def eligible(node: dict, inherited_included: bool) -> bool:
         return not (inherited_included or _has_include_origin(node))
 
+    # Record declarations are collected in the original preorder during the
+    # declaration walk.  Their layouts are harvested after that walk, once all
+    # child FieldDecls have graph ids, without a second complete AST traversal.
+    record_fields_by_type: Dict[str, List[Tuple[Optional[str], Optional[str]]]] = {}
+
     # Declaration pass.
     def declarations(node: dict, path: Path, owner: Optional[str] = None, included: bool = False) -> None:
         is_included = not eligible(node, included)
         kind = node.get("kind", "")
+        if kind == "RecordDecl":
+            record_nodes.append(node)
         current_owner = owner
         if not node.get("isImplicit") and not is_included and kind in ENTITY_KINDS:
             entity_kind = ENTITY_KINDS[kind]
@@ -1169,9 +1269,7 @@ def main() -> int:
     # resolve those bindings here so the call pass can attach MAY_INVOKE to the
     # dispatch call-site (parity with the TS frontend). Genuinely unresolved
     # pointers keep their READS_CALLEE slot edge — the indirection is never dropped.
-    record_fields_by_type: Dict[str, List[Tuple[Optional[str], Optional[str]]]] = {}
-
-    def collect_record_fields(node: dict) -> None:
+    def collect_record_fields_node(node: dict) -> None:
         if node.get("kind") == "RecordDecl" and node.get("name") and node.get("tagUsed"):
             key = f'{node["tagUsed"]} {node["name"]}'
             # Each slot is (field name, field node-id). The name is always present;
@@ -1195,8 +1293,6 @@ def main() -> int:
                 ]
             elif harvested or existing is None:
                 record_fields_by_type[key] = harvested
-        for child in node.get("inner", []):
-            collect_record_fields(child)
 
     def normalize_type(text: str) -> str:
         for qualifier in ("const ", "volatile ", "restrict ", "_Atomic "):
@@ -1350,8 +1446,10 @@ def main() -> int:
     # (it includes its own headers), so the three fuse safely into a single reload.
     # The body pass below reloads each TU once more; peak memory stays at one TU.
     for path, ast in asts:
+        record_nodes: List[dict] = []
         declarations(ast, path)
-        collect_record_fields(ast)
+        for record_node in record_nodes:
+            collect_record_fields_node(record_node)
         collect_bindings(ast)
 
     # Canonical slot index: map each materialised field node to its TU-stable
@@ -1724,6 +1822,7 @@ def main() -> int:
     for path, result in run_clang_over(
         files if tokens_wanted else [], source_dir, "-Xclang", "-dump-tokens",
         "-fsyntax-only", "-Wno-everything", file_flags_of=compile_commands,
+        label="tokens",
     ):
         previous = None
         for line in result.stderr.splitlines():
@@ -1757,10 +1856,19 @@ def main() -> int:
     # Preprocessor macro recovery. The JSON AST is post-preprocessor, so macros
     # are reconstructed from a dedicated -E -dD pass (macros.py) and made
     # addressable. Preprocessing is lexical, so this succeeds even for a file
-    # whose C body failed to parse — its #defines are still real.
+    # whose C body failed to parse — its #defines are still real. A root with no
+    # local #define cannot contribute a macro record: the parser filters included
+    # definitions by origin, and each included project header is itself a root when
+    # it has definitions. Avoid paying for a compiler invocation that can emit
+    # nothing while retaining a conservative source-level check.
+    macro_roots = [
+        path for path in files if path in file_ids
+        and has_macro_definition(source_text(path, texts))
+    ]
     for path, result in run_clang_over(
-        [path for path in files if path in file_ids], source_dir, "-E", "-dD",
+        macro_roots, source_dir, "-E", "-dD",
         file_flags_of=compile_commands,
+        label="macros",
     ):
         if result.returncode != 0:
             continue

@@ -446,8 +446,10 @@ def decode_document(payload: bytes) -> dict[str, Any]:
 def write_frame(handle, payload: bytes) -> None:
     if len(payload) >= 2**32:
         raise ValueError("graph protobuf record exceeds 4 GiB frame limit")
-    handle.write(FRAME.pack(len(payload)))
-    handle.write(payload)
+    # Keep the length prefix and payload in one buffered write.  Large Pass-1
+    # builds emit millions of frames; two Python file-method calls per frame
+    # add measurable interpreter overhead while producing identical bytes.
+    handle.write(FRAME.pack(len(payload)) + payload)
 
 
 def read_frames(path: Path) -> Iterator[bytes]:

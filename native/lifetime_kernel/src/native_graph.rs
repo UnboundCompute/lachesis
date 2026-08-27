@@ -17,6 +17,13 @@ use crate::{graph_proto, lifetime_proto};
 
 const FRAME_HEADER: usize = 4;
 
+// Temporal preparation only consumes these relations.  The complete Pass-2
+// sidecar remains lossless; filtering here prevents unrelated overlay edges
+// from being duplicated into every native FunctionInput.
+fn retain_lifetime_edge(kind: &str) -> bool {
+    matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT")
+}
+
 /// Map the immutable Pass-1 substrate instead of reading a second full byte
 /// buffer.  The parser still materializes the compact native request it needs,
 /// but the raw protobuf stream is demand-paged and can be reclaimed by the OS.
@@ -46,7 +53,7 @@ fn scalar(node: &graph_proto::NodeRecord, key: &str) -> Option<String> {
     })
 }
 
-fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::ScalarProperty> {
+fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<lifetime_proto::ScalarProperty> {
     node.properties.iter().filter_map(|field| {
         // The lifetime preparer only consumes these substrate attributes.  Do
         // not copy the rest of the frontend's arbitrary property bag into the
@@ -54,22 +61,27 @@ fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::Scal
         // second allocation for every scalar field before preparation starts.
         // Keep this allow-list in sync with text_property/integer_property in
         // prepare.rs and the call extraction in native_graph.rs.
-        if !matches!(field.key.as_str(),
+        let retained = matches!(field.key.as_str(),
             "syntax_kind" |
             "start_offset" |
             "start_line" |
             "operator" |
             "type" |
-            "owner_function_id" |
-            "function_id" |
             "primary_target_id" |
             "callee" |
+            "callee_name" |
+            "callee_form" |
             "receiver" |
+            "target_id" |
+            "value_id" |
             "is_alloc" |
             "is_release" |
             "is_realloc" |
-            "is_aggregate_copy"
-        ) {
+            "release_method" |
+            "is_aggregate_copy")
+            || (retain_owner && matches!(field.key.as_str(),
+                "owner_function_id" | "function_id"));
+        if !retained {
             return None;
         }
         let value = field.value.as_ref()?.kind.as_ref()?;
@@ -86,12 +98,12 @@ fn scalar_properties(node: &graph_proto::NodeRecord) -> Vec<lifetime_proto::Scal
     }).collect()
 }
 
-fn node(node: &graph_proto::NodeRecord) -> lifetime_proto::GraphNode {
+fn node(node: &graph_proto::NodeRecord, retain_owner: bool) -> lifetime_proto::GraphNode {
     lifetime_proto::GraphNode {
         id: node.id.clone(),
         kind: node.kind.clone(),
         label: node.label.clone(),
-        properties: scalar_properties(node),
+        properties: scalar_properties(node, retain_owner),
     }
 }
 
@@ -157,37 +169,76 @@ fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
     scalar(node, "owner_function_id").or_else(|| scalar(node, "function_id"))
 }
 
+fn function_kind(kind: &str) -> bool {
+    matches!(kind, "function" | "method" | "constructor" | "FunctionDecl"
+        | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl"
+        | "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration"
+        | "ArrowFunction" | "MethodDeclaration" | "MethodDefinition"
+        | "Constructor")
+}
+
+fn call_kind(kind: &str) -> bool {
+    matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
+        | "call" | "Call" | "CallExpression" | "construct" | "NewExpression"
+        | "allocation" | "release" | "realloc")
+}
+
+fn translation_call_kind(kind: &str) -> bool {
+    matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
+        | "call" | "Call" | "CallExpression" | "construct" | "NewExpression")
+}
+
+fn translation_return_kind(kind: &str) -> bool {
+    matches!(kind, "ReturnStmt" | "Return" | "ReturnStatement" | "return")
+}
+
 /// Convert the complete framed substrate to the existing native preparation
 /// contract. This is deliberately one conversion inside Rust; Python never
 /// creates FunctionInput/FunctionCall records for this path.
 pub(crate) fn sidecar_to_request(
     input: &[u8],
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, None)
+    sidecar_to_request_with_selection(input, None, true)
+}
+
+/// Temporal solving has already grouped each node into its owning function,
+/// so owner properties would be redundant in its per-node records.  Keep them
+/// for the semantic emitter, which still reads them when publishing events.
+pub(crate) fn sidecar_to_temporal_request(
+    input: &[u8],
+) -> Result<lifetime_proto::PrepareRequest, String> {
+    sidecar_to_request_with_selection(input, None, false)
 }
 
 pub(crate) fn sidecar_to_request_selected(
     input: &[u8], selected_ids: &HashSet<String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, Some(selected_ids))
+    sidecar_to_request_with_selection(input, Some(selected_ids), true)
 }
 
 fn sidecar_to_request_with_selection(
-    input: &[u8], selected_ids: Option<&HashSet<String>>,
+    input: &[u8], selected_ids: Option<&HashSet<String>>, retain_owner: bool,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
     let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(
         input, selected_ids, |item| {
             let item_id = item.id.clone();
-            let Some(function) = owner(&item) else { return };
-            if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+            let function = if function_kind(&syntax) {
+                Some(item.id.clone())
+            } else {
+                owner(&item)
+            };
+            let Some(function) = function else { return };
+            if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
-            if syntax == "ParmVarDecl" { entry.parameters.push(item.id.clone()); }
-            entry.nodes.push(node(&item));
-            if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
+            if matches!(syntax.as_str(), "ParmVarDecl" | "parameter" | "arg") {
+                entry.parameters.push(item.id.clone());
+            }
+            entry.nodes.push(node(&item, retain_owner));
+            if call_kind(&syntax) {
                 call_nodes.push((function, item_id));
             }
         },
@@ -210,14 +261,19 @@ fn sidecar_to_request_with_selection(
             callee: input_scalar(&item, "primary_target_id")
                 .and_then(|target| function_names.get(&target).cloned())
                 .or_else(|| input_scalar(&item, "callee"))
+                .or_else(|| input_scalar(&item, "callee_name"))
+                .or_else(|| input_scalar(&item, "release_method"))
                 .unwrap_or_else(|| item.label.clone()),
             assigned: String::new(),
             receiver: input_scalar(&item, "receiver").unwrap_or_default(),
             line: input_scalar(&item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
             has_line: input_scalar(&item, "start_line").is_some(),
-            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true"),
-            is_release: input_scalar(&item, "is_release").as_deref() == Some("true"),
-            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true"),
+            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true")
+                || input_scalar(&item, "syntax_kind").as_deref() == Some("allocation"),
+            is_release: input_scalar(&item, "is_release").as_deref() == Some("true")
+                || input_scalar(&item, "syntax_kind").as_deref() == Some("release"),
+            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true")
+                || input_scalar(&item, "syntax_kind").as_deref() == Some("realloc"),
             is_source: false,
             is_aggregate_copy: input_scalar(&item, "is_aggregate_copy").as_deref() == Some("true"),
             arguments: Vec::new(),
@@ -225,6 +281,10 @@ fn sidecar_to_request_with_selection(
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
+        if let Some(assigned) = input_scalar(&item, "target_id")
+            .or_else(|| input_scalar(&item, "value_id")) {
+            call.assigned = assigned;
+        }
         let parent = parents.get(&item.id).and_then(|id| node_lookup.get(id.as_str()).copied());
         if let Some(parent) = parent {
             let parent_kind = input_scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
@@ -522,11 +582,10 @@ fn scan_lifetime_metadata_reader<R: Read>(
                     owners.insert(item.id.clone(), function);
                 }
                 let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
-                if matches!(syntax.as_str(), "function" | "method" | "constructor"
-                    | "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
+                if function_kind(&syntax) {
                     function_names.insert(item.id.clone(), item.label.clone());
                 }
-                if matches!(syntax.as_str(), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") {
+                if call_kind(&syntax) {
                     call_ids.insert(item.id.clone());
                 }
                 on_node(item);
@@ -534,6 +593,7 @@ fn scan_lifetime_metadata_reader<R: Read>(
             b'E' => {
                 let item = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph edge frame: {error}"))?;
+                if !retain_lifetime_edge(item.kind.as_str()) { continue; }
                 if let Some(selected) = selected_ids {
                     let source_selected = owners.get(&item.source)
                         .is_some_and(|owner| selected.contains(owner));
@@ -695,19 +755,18 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     // purpose of the compact ABI on million-node graphs.
     let mut seed_nodes = HashMap::new();
     scan_compact_records(input, |record| {
-        if matches!(record_kind(&record),
-            "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr" |
-            "ReturnStmt" | "function" | "method" | "constructor" |
-            "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
-            "CXXDestructorDecl" | "ParmVarDecl") {
+        if function_kind(record_kind(&record))
+            || translation_call_kind(record_kind(&record))
+            || translation_return_kind(record_kind(&record))
+            || record_kind(&record) == "ParmVarDecl" {
             let node = compact_node(record);
             seed_nodes.insert(node.id.clone(), node);
         }
     }, |_| {})?;
     let edge_offset = compact_edge_offset(input)?;
-    let call_ids: HashSet<String> = seed_nodes.values().filter(|node| matches!(compact_kind(node),
-        "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr")).map(|node| node.id.clone()).collect();
-    let return_ids: HashSet<String> = seed_nodes.values().filter(|node| compact_kind(node) == "ReturnStmt")
+    let call_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_call_kind(compact_kind(node)))
+        .map(|node| node.id.clone()).collect();
+    let return_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_return_kind(compact_kind(node)))
         .map(|node| node.id.clone()).collect();
     let mut relevant = call_ids.union(&return_ids).cloned().collect::<HashSet<_>>();
     for _ in 0..2 {
@@ -752,27 +811,43 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     let mut parents = HashMap::new();
     let mut refers = HashMap::new();
-    let mut initializers = HashMap::new();
-    for edge in &edges {
+    let mut assignment_left = HashMap::new();
+    let mut initializer_targets = HashMap::new();
+    let mut argument_edges: HashMap<String, Vec<usize>> = HashMap::new();
+    for (edge_index, edge) in edges.iter().enumerate() {
         match edge.kind.as_str() {
             "AST_CHILD" => {
                 children.entry(edge.source.clone()).or_default().push(edge.target.clone());
                 parents.entry(edge.target.clone()).or_insert_with(|| edge.source.clone());
+                if edge.role == "LEFT_OPERAND" {
+                    assignment_left.insert(edge.source.clone(), edge.target.clone());
+                } else if edge.role == "ARGUMENT" {
+                    argument_edges.entry(edge.source.clone()).or_default().push(edge_index);
+                }
             }
             "REFERS_TO" => { refers.insert(edge.source.clone(), edge.target.clone()); }
-            "VALUE_FLOWS_TO" => { initializers.insert(edge.target.clone(), edge.source.clone()); }
+            "VALUE_FLOWS_TO" if edge.reason == "initializer" => {
+                initializer_targets.insert(edge.source.clone(), edge.target.clone());
+            }
             _ => {}
         }
     }
     let function_names: HashMap<String, String> = nodes.values().filter_map(|node| {
-        if matches!(compact_kind(node), "function" | "method" | "constructor" | "FunctionDecl" |
-            "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl") {
+        if function_kind(compact_kind(node)) {
             Some((node.id.clone(), node.label.clone()))
         } else { None }
     }).collect();
     let mut functions: BTreeMap<String, lifetime_proto::TranslationFunction> = BTreeMap::new();
+    let mut nodes_by_owner: HashMap<String, Vec<String>> = HashMap::new();
     for node in nodes.values() {
-        let Some(owner) = compact_owner(node) else { continue };
+        // A declaration-only function owns its declaration node.  This mirrors
+        // the language-neutral Python projection and is required for headers
+        // whose bodies are intentionally absent from the substrate.
+        let owner = compact_owner(node).or_else(|| {
+            function_kind(compact_kind(node)).then_some(node.id.clone())
+        });
+        let Some(owner) = owner else { continue };
+        nodes_by_owner.entry(owner.clone()).or_default().push(node.id.clone());
         let entry = functions.entry(owner.clone()).or_insert_with(||
             lifetime_proto::TranslationFunction { id: owner, ..Default::default() });
         if compact_kind(node) == "ParmVarDecl" { entry.parameters.push(node.id.clone()); }
@@ -804,7 +879,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         entry.parameter_names = entry.parameters.iter().map(|id| compact_path_name(&nodes, id)).collect();
     }
     for node in nodes.values() {
-        if !matches!(compact_kind(node), "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr") { continue; }
+        if !translation_call_kind(compact_kind(node)) { continue; }
         let Some(owner) = compact_owner(node) else { continue };
         let Some(entry) = functions.get_mut(&owner) else { continue };
         let callee = compact_property(node, "primary_target_id")
@@ -826,22 +901,18 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         };
         if let Some(parent) = parents.get(&node.id).and_then(|id| nodes.get(id)) {
             if compact_kind(parent) == "BinaryOperator" && compact_property(parent, "operator") == Some("=") {
-                if let Some(left) = edges.iter().find(|edge| edge.source == parent.id && edge.kind == "AST_CHILD" && edge.role == "LEFT_OPERAND") {
-                    call.assigned = left.target.clone();
-                }
+                call.assigned = assignment_left.get(&parent.id).cloned().unwrap_or_default();
             }
         }
         if call.assigned.is_empty() {
-            if let Some(initializer) = edges.iter().find(|edge| edge.kind == "VALUE_FLOWS_TO" && edge.source == node.id && edge.role == "initializer") {
-                call.assigned = initializer.target.clone();
-            }
+            call.assigned = initializer_targets.get(&node.id).cloned().unwrap_or_default();
         }
         if let Some(path) = compact_path(&nodes, &children, &refers, &call.assigned, 0) {
             call.assigned_name = compact_path_name(&nodes, &path.root);
             call.assigned_root = path.root; call.assigned_selectors = path.selectors;
         }
-        let mut arguments = edges.iter().filter(|edge| edge.kind == "AST_CHILD" && edge.source == node.id && edge.role == "ARGUMENT")
-            .map(|edge| {
+        let mut arguments = argument_edges.get(&node.id).into_iter().flatten()
+            .filter_map(|edge_index| edges.get(*edge_index)).map(|edge| {
                 let path = compact_path(&nodes, &children, &refers, &edge.target, 0);
                 let root_name = path.as_ref().map(|path| compact_path_name(&nodes, &path.root)).unwrap_or_default();
                 lifetime_proto::FunctionArgument {
@@ -857,20 +928,21 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         entry.calls.push(call);
     }
     for entry in functions.values_mut() {
-        let function_nodes: HashSet<String> = nodes.values().filter_map(|node| {
-            (compact_owner(node).as_deref() == Some(entry.id.as_str())).then_some(node.id.clone())
-        }).collect();
-        for node_id in function_nodes {
-            if compact_kind(nodes.get(&node_id).unwrap()) != "ReturnStmt" { continue; }
-            let line = nodes.get(&node_id).and_then(|node| compact_property(node, "start_line"))
+        for node_id in nodes_by_owner.get(&entry.id).into_iter().flatten() {
+            if !translation_return_kind(compact_kind(nodes.get(node_id).unwrap())) { continue; }
+            let line = nodes.get(node_id).and_then(|node| compact_property(node, "start_line"))
                 .and_then(|value| value.parse::<i64>().ok());
-            let Some(child) = children.get(&node_id).and_then(|items| items.first()) else { continue };
-            if call_ids.contains(child) {
-                let callee = nodes.get(child)
+            let Some(child) = children.get(node_id).and_then(|items| items.first()) else { continue };
+            // Return expressions may be wrapped in an implicit cast or
+            // parenthesized node.  Classify the peeled child exactly as the
+            // Python projection does before deciding between call and value.
+            let peeled = compact_peel(&nodes, &children, child.clone());
+            if call_ids.contains(&peeled) {
+                let callee = nodes.get(&peeled)
                     .and_then(|node| compact_property(node, "primary_target_id"))
                     .and_then(|id| function_names.get(id).cloned())
-                    .or_else(|| nodes.get(child).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
-                    .unwrap_or_else(|| nodes.get(child).map(|node| node.label.clone()).unwrap_or_default());
+                    .or_else(|| nodes.get(&peeled).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
+                    .unwrap_or_else(|| nodes.get(&peeled).map(|node| node.label.clone()).unwrap_or_default());
                 entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new() });
             } else if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
                 let root_name = compact_path_name(&nodes, &path.root);

@@ -41,6 +41,7 @@ mod module_initialization;
 mod property_effects;
 mod heap;
 mod summary;
+mod sidecar_project;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -964,6 +965,41 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_path(
     pointer
 }
 
+/// Translate a framed Pass-3 substrate and write the protobuf facts directly
+/// to a path.  This keeps the facts artifact binary end-to-end: the Python
+/// launcher supplies paths and receives only a status code.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_translate_graph_write_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native graph translation path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path)
+            .to_str().map_err(|error| format!("invalid input path: {error}"))?;
+        let output = CStr::from_ptr(output_path)
+            .to_str().map_err(|error| format!("invalid output path: {error}"))?;
+        let bytes = native_graph::map_path(input)?;
+        let payload = native_graph::sidecar_to_translation(&bytes)?;
+        let output_path = std::path::Path::new(output);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let temporary = output_path.with_extension(format!(
+            "{}.tmp-{}", output_path.extension().and_then(|value| value.to_str()).unwrap_or("pb"),
+            std::process::id(),
+        ));
+        fs::write(&temporary, payload).map_err(|error| error.to_string())?;
+        fs::rename(&temporary, output_path).map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native graph translation write error: {error}"); 1 }
+    }
+}
+
 /// Path-based ABI for whole-graph preparation.  The substrate is opened only
 /// by Rust and the prepared protobuf is returned through the existing allocator
 /// contract until the complete sidecar-writing engine replaces this boundary.
@@ -1053,6 +1089,103 @@ pub unsafe extern "C" fn lachesis_pass2_run_path(
     match result {
         Ok(()) => 0,
         Err(error) => { eprintln!("native Pass-2 error: {error}"); 1 }
+    }
+}
+
+/// Project one native Pass-1 shard into the complete Pass-2 input and compact
+/// Pass-3 substrate.  Only paths and scalar metadata cross the ABI; Rust owns
+/// protobuf decoding, filtering, framing, and atomic publication.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_pass1_project_shard(
+    nodes_path: *const c_char,
+    edges_path: *const c_char,
+    pass2_output: *const c_char,
+    pass3_output: *const c_char,
+    store_version: *const c_char,
+    core_content_hash: *const c_char,
+    source_content_hash: *const c_char,
+    build_fingerprint: *const c_char,
+    prune: i32,
+) -> i32 {
+    let result = (|| {
+        let paths = [nodes_path, edges_path, pass2_output, pass3_output]
+            .into_iter().map(|path| {
+                if path.is_null() { return Err("native Pass-1 projector path is null".to_owned()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 projector path: {error}"))
+            }).collect::<Result<Vec<_>, _>>()?;
+        let metadata = [store_version, core_content_hash, source_content_hash, build_fingerprint]
+            .into_iter().map(|path| {
+                if path.is_null() { return Ok(String::new()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 metadata: {error}"))
+            }).collect::<Result<Vec<_>, String>>()?;
+        sidecar_project::project_shard(
+            std::path::Path::new(&paths[0]), std::path::Path::new(&paths[1]),
+            std::path::Path::new(&paths[2]), std::path::Path::new(&paths[3]),
+            &metadata[0], &metadata[1], &metadata[2], &metadata[3], prune != 0,
+        )
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native Pass-1 projector error: {error}"); 1 }
+    }
+}
+
+/// Project several language frontend shards together.  Rust first collects
+/// retained node IDs across all shards, then streams every edge shard, so
+/// cross-language edges are preserved without a Python graph reconstruction.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_pass1_project_shards(
+    shard_set_path: *const c_char,
+    pass2_output: *const c_char,
+    pass3_output: *const c_char,
+    store_version: *const c_char,
+    core_content_hash: *const c_char,
+    source_content_hash: *const c_char,
+    build_fingerprint: *const c_char,
+    prune: i32,
+) -> i32 {
+    let result = (|| {
+        let paths = [shard_set_path, pass2_output, pass3_output]
+            .into_iter().map(|path| {
+                if path.is_null() { return Err("native Pass-1 shard-set path is null".to_owned()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 shard-set path: {error}"))
+            }).collect::<Result<Vec<_>, _>>()?;
+        let metadata = [store_version, core_content_hash, source_content_hash, build_fingerprint]
+            .into_iter().map(|path| {
+                if path.is_null() { return Ok(String::new()); }
+                CStr::from_ptr(path).to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| format!("invalid native Pass-1 metadata: {error}"))
+            }).collect::<Result<Vec<_>, String>>()?;
+        let request = graph_proto::NativeShardSet::decode(
+            fs::read(&paths[0]).map_err(|error| format!("cannot read native shard set: {error}"))?
+                .as_slice(),
+        ).map_err(|error| format!("invalid native shard set: {error}"))?;
+        if request.shards.is_empty() {
+            return Err("native Pass-1 shard set is empty".to_owned());
+        }
+        let shard_paths = request.shards.into_iter().map(|shard| {
+            if shard.nodes_path.is_empty() || shard.edges_path.is_empty() {
+                return Err("native Pass-1 shard has an empty record path".to_owned());
+            }
+            Ok((std::path::PathBuf::from(shard.nodes_path),
+                std::path::PathBuf::from(shard.edges_path)))
+        }).collect::<Result<Vec<_>, String>>()?;
+        sidecar_project::project_shards(
+            &shard_paths, std::path::Path::new(&paths[1]),
+            std::path::Path::new(&paths[2]), &metadata[0], &metadata[1],
+            &metadata[2], &metadata[3], prune != 0,
+        )
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native Pass-1 shard-set projector error: {error}"); 1 }
     }
 }
 
@@ -1184,7 +1317,7 @@ pub unsafe extern "C" fn lachesis_lifetime_temporal_path(
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid temporal output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let request = native_graph::sidecar_to_request(&bytes)?;
+        let request = native_graph::sidecar_to_temporal_request(&bytes)?;
         let bytes = prepare::temporal_request(request)?;
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, bytes)
@@ -1215,12 +1348,16 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             .map_err(|error| format!("invalid semantic output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
         let request = native_graph::sidecar_to_request(&bytes)?;
-        let result = prepare::semantic_request(request)?;
+        let full = prepare::semantic_request(request)?;
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
-        let full = lifetime_proto::NativeSemanticResult::decode(result.as_slice())
-            .map_err(|error| format!("invalid native semantic result: {error}"))?;
+        let result = full.encode_to_vec();
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, result)
+            .map_err(|error| format!("cannot write semantic result: {error}"))?;
+        fs::rename(&temporary, output)
+            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
         let events = lifetime_proto::NativeSemanticResult {
             functions: full.functions.into_iter().map(|mut function| {
                 function.nodes.retain(|node| !node.event_kind.is_empty());
@@ -1231,11 +1368,6 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             }).collect(),
             complete: full.complete,
         }.encode_to_vec();
-        let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, result)
-            .map_err(|error| format!("cannot write semantic result: {error}"))?;
-        fs::rename(&temporary, output)
-            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
         let events_output = format!("{output}.events.pb");
         let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
         fs::write(&events_temporary, events)

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import os
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -194,6 +195,30 @@ def _run() -> None:
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
     compile_enrich = enrich and not args.reduced
+
+    # Core-only builds do not need a materialized Python graph. Keep frontend
+    # records in binary shards and stream them directly into Kùzu to bound RSS.
+    if (
+        not compile_enrich
+        and not args.reduced
+        and not args.incremental
+        and not args.parallel_packages
+        and not args.layered_out
+    ):
+        with tempfile.TemporaryDirectory(prefix="lachesis-stream-") as stream_root:
+            frontend_out = args.frontend_out or os.path.join(stream_root, "frontends")
+            readers, snapshots = run_project_streaming(
+                args.source_dir, stream_root, frontend_out,
+                timeout_seconds=args.timeout,
+            )
+            stored = write_kuzu_shards(
+                CompositeShardReader(readers), args.output_path, snapshots,
+                prune=args.prune,
+            )
+        print(f"Streamed {len(snapshots)} frontends into {stored}")
+        print("Tier: core-only (nav rebuilds the dataflow tier on first use)")
+        return
+
     frontend_out = args.frontend_out
     if frontend_out is None and (args.parallel_packages or args.incremental):
         # These two keep state on disk by construction: the parallel path gives every

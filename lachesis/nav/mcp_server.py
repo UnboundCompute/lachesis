@@ -1643,49 +1643,20 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_pass":
         bundle = c.flow_bundle
-        summaries, F = bundle["summaries"], bundle["F"]
-        fn = args.get("function")
-        names = [fn] if fn else sorted(summaries)
-        if fn and fn not in summaries:
-            return _emit(name, {"move": "flow_pass",
-                                "error": f"no function named {fn!r} in the pass"}, fmt)
-        rows = []
-        for nm in names:
-            s = summaries[nm]
-            flows = []
-            for f in s["sink_flows"]:
-                if not f["guarded"]:
-                    g = "UNGUARDED"
-                elif f.get("site_guarded"):
-                    g = "G[" + ",".join(f["guards"]) + "]"
-                else:
-                    g = "G~[" + ",".join(f["guards"]) + "]"
-                via = "" if f["via"] == "direct" else f"~{f['via']}"
-                val = f["value"] or f["provenance"] or "expr"
-                flows.append(f"{val}->{f['sink']}({g}){via}")
-            life = []
-            for v, evs in s.get("typestate", {}).items():
-                life.append(f"{v}:" + "->".join(e["kind"] for e in evs))
-            for v, evs in s.get("param_typestate", {}).items():
-                life.append(f"param {v}:" + "->".join(e["kind"] for e in evs))
-            rows.append({"name": nm, "taxonomy": s["taxonomy"],
-                         "is_source": F.get(nm, {}).get("is_source", False),
-                         "flows": flows, "lifetime": life,
-                         "frees": sorted(s.get("frees_params", {})),
-                         "returns": s.get("returns", "value")})
-        # Most-informative first: sources, then functions carrying flows, then the rest.
-        rows.sort(key=lambda r: (not r["is_source"], not r["flows"], r["name"]))
-        result = {
+        semantic = bundle.get("semantic_graph")
+        payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        return _emit(name, {
             "move": "flow_pass",
-            "counts": {"functions": len(summaries),
-                       "with_flows": sum(1 for n in summaries if summaries[n]["sink_flows"]),
-                       "sources": sum(1 for n in summaries
-                                      if F.get(n, {}).get("is_source", False)),
-                       "skeletons": len(bundle["skeletons"]), "leads": len(bundle["leads"])},
-            "functions": rows,
+            "counts": {
+                "semantic_nodes": len(payload.get("nodes") or {}),
+                "semantic_edges": sum(len(edges) for edges in
+                                      (payload.get("edges") or {}).values()),
+                "leads": len(bundle.get("leads") or ()),
+            },
+            "semantic_graph": payload,
+            "leads": bundle.get("leads") or (),
             "lifetime": bundle.get("lifetime", {}),
-        }
-        return _emit(name, result, fmt, offset, limit)
+        }, fmt, offset, limit)
     if name == "leads":
         # The warm counterpart to a cold re-run: `flow_bundle` is already materialized and
         # cached on the ctx, so this wraps it in a LeadSet and filters in memory. Same
@@ -1709,39 +1680,23 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
         bundle = c.flow_bundle
-        all_skels, leads = bundle["skeletons"], bundle["leads"]
-        kind, fn = args.get("kind"), args.get("function")
-        skels = all_skels
-        _reach_pats = ("reachability", "relational", "presence")
-        if kind in ("reach", "typestate"):
-            skels = [s for s in skels if s["kind"] == kind]
-            want_reach = kind == "reach"
-            leads = [l for l in leads
-                     if (l.get("pattern") in _reach_pats) == want_reach]
-        if fn:
-            skels = [s for s in skels if s["entry"] == fn]
-            leads = [l for l in leads if l.get("entry") == fn]
-            if not skels and not leads:
-                return _emit(name, {"move": "flow_skeleton",
-                                    "error": f"no flow skeletons for entry {fn!r}"}, fmt)
-        result = {
+        semantic = bundle.get("semantic_graph")
+        payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        fn = args.get("function")
+        leads = [lead for lead in bundle.get("leads") or ()
+                 if not fn or lead.get("entry") == fn]
+        return _emit(name, {
             "move": "flow_skeleton",
-            "counts": {"skeletons": len(all_skels),
-                       "reach": sum(1 for s in all_skels if s["kind"] == "reach"),
-                       "typestate": sum(1 for s in all_skels if s["kind"] == "typestate"),
-                       "leads": len(bundle["leads"])},
+            "counts": {
+                "semantic_nodes": len(payload.get("nodes") or {}),
+                "semantic_edges": sum(len(edges) for edges in
+                                      (payload.get("edges") or {}).values()),
+                "leads": len(bundle.get("leads") or ()),
+            },
+            "semantic_graph": payload,
             "leads": leads,
             "lifetime": bundle.get("lifetime", {}),
-        }
-        # Render skeleton text only when scoped -- the whole-graph stream would be huge.
-        if fn or kind:
-            from lachesis.flow import render_text as render_flow_skeleton
-            result["skeletons"] = [
-                {"entry": s["entry"], "kind": s["kind"], "sink": s.get("sink"),
-                 "var": s.get("var"), "is_source": s["is_source"],
-                 "complete": s.get("complete", True), "text": render_flow_skeleton(s)}
-                for s in sorted(skels, key=lambda x: (not x["is_source"], x["entry"]))]
-        return _emit(name, result, fmt, offset, limit)
+        }, fmt, offset, limit)
     if name == "taint":
         return _emit(name, _taint(c.store, args), fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")

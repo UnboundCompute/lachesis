@@ -168,91 +168,14 @@ def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
     return result
 
 
-def _combined_capabilities(snapshots: Sequence[FrontendSnapshot]) -> dict[str, str]:
-    rank = {"none": 0, "partial": 1, "complete": 2}
-    names = {name for snapshot in snapshots for name in snapshot.capabilities}
-    return {
-        name: max(
-            (snapshot.capability(name) for snapshot in snapshots),
-            key=lambda level: rank[level],
+def _reject_removed_enrich(enrich: bool) -> None:
+    if enrich:
+        raise RuntimeError(
+            "build-time Python enrichment was removed; write the binary Pass-1 "
+            "store first, then run native Pass 2"
         )
-        for name in names
-    }
 
 
-def enrich_graph(
-    graph: CodeGraph, languages: Iterable[str], capabilities: Dict[str, str],
-    observer=None, delta_sink=None,
-) -> CodeGraph:
-    """Fold the four overlay registries over a core graph to produce the dataflow tier.
-
-    Pure and deterministic: ``enriched = f(core_graph, languages, capabilities)``. The
-    package inventory the ecosystem registry needs is derived from the graph, so those
-    two values are the *only* inputs beyond the graph itself — which is exactly why
-    this can run at load time from a core-only store, given a manifest.
-
-    ``observer`` is passed to the three ``OverlayRegistry`` folds so a profiler can see
-    per-overlay cost. It changes nothing about the result.
-    """
-    import os
-
-    from .core.overlays import (
-        default_overlay_registry,
-        default_dataflow_overlay_registry,
-    )
-    from .core.query import GraphIndex
-    from .ecosystems import default_ecosystem_registry
-
-    graph = default_overlay_registry().enrich(graph, observer, delta_sink)
-    # Ecosystem models consume kind/adjacency lookups and package_inventory only;
-    # defer navigation-only label/file/owner buckets, which otherwise retain several
-    # extra references per record during large pass-three enrichments.
-    index = GraphIndex(graph, compact=True)
-    graph = default_ecosystem_registry().enrich(
-        graph, index.package_inventory(), set(languages), capabilities, index,
-        delta_sink,
-    )
-    # The ecosystem index describes the pre-model graph and is no longer consulted;
-    # drop its node/adjacency references before the remaining overlay registries run.
-    del index
-    # Async model facts must be visible to taint, but both folds only need the same
-    # compact index surface. Run them in order through one registry so pass 2 does not
-    # rebuild a graph-sized index and accumulator between the two one-overlay registries.
-    graph = default_dataflow_overlay_registry().enrich(
-        graph, observer, delta_sink,
-    )
-
-    # Opt-in field-sensitive reaching-def tier. Additive and independent (its
-    # applies() is a no-op unless the graph has the C AST + CFG edges), folded here
-    # so the dataflow tier the flow/reaches/sources_of tools read carries the
-    # REACHING_DEF edges -- not only the taint tool's separate atropos fold. Gated
-    # so default builds and non-opted stores are byte-for-byte unchanged.
-    if os.environ.get("LACHESIS_REACHING_DEF"):
-        from .core.overlays.registry import OverlayRegistry
-        from .core.overlays.c_reaching_def import CReachingDef
-        rd_registry = OverlayRegistry()
-        rd_registry.register(CReachingDef())
-        graph = rd_registry.enrich(graph, observer, delta_sink)
-    return graph
-
-
-def enrich_project_graph(
-    graph: CodeGraph, snapshots: Sequence[FrontendSnapshot],
-) -> CodeGraph:
-    """``enrich_graph`` with the languages and capabilities read off the snapshots.
-
-    The public form of what ``run_project(enrich=True)`` does internally, for a caller
-    that needs the core graph and the enriched one as two separate values rather than
-    only the second.
-    """
-    return enrich_graph(
-        graph,
-        {language for snapshot in snapshots for language in snapshot.languages},
-        _combined_capabilities(snapshots),
-    )
-
-
-_enrich_graph = enrich_project_graph
 
 
 def _release_payloads(snapshots: Sequence[FrontendSnapshot]) -> None:
@@ -265,8 +188,8 @@ def _release_payloads(snapshots: Sequence[FrontendSnapshot]) -> None:
 
     Only two things read a snapshot's payload after the combine, both in
     ``manifest_payload``, and both only for its length; ``release`` keeps the lengths.
-    Everything else downstream (``enrich_project_graph``, the CLI reporting) reads
-    ``languages``, ``capabilities`` and ``frontend_id``, which survive untouched.
+    Downstream reporting reads ``languages``, ``capabilities`` and ``frontend_id``,
+    which survive untouched.
     """
     for snapshot in snapshots:
         snapshot.release()
@@ -291,15 +214,16 @@ def run_project(
     *,
     enrich: bool = True,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
-    """Run selected frontends and enrich their canonical facts directly.
+    """Run selected frontends and compose the canonical core graph.
 
     Discovery (``source_inventory``) drops test files by default; the filtered
     per-frontend file list is handed to each frontend as its explicit root set, so a
     frontend that re-walks the tree cannot re-introduce the tests we excluded.
 
-    ``enrich=False`` returns the compact core graph (T0-T3) without the overlay
-    dataflow tier, which the nav layer can rebuild on demand from a store manifest.
-    The default stays ``True`` so every library caller is unaffected."""
+    The removed ``enrich=True`` build-time overlay mode is rejected; native Pass 2
+    runs only after the binary store has been written.
+    """
+    _reject_removed_enrich(enrich)
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
     groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
@@ -323,7 +247,7 @@ def run_project(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
-    return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots
+    return graph, snapshots
 
 
 def run_project_streaming(
@@ -350,13 +274,32 @@ def run_project_streaming(
     previous = os.environ.get("LACHESIS_SHARD_ROOT")
     os.environ["LACHESIS_SHARD_ROOT"] = shard_root
     try:
+        frontend_jobs = []
         for frontend_id in sorted(groups):
             frontend = registry.get(frontend_id)
             frontend_output = os.path.join(output_root, frontend_id)
-            snapshot = run_frontend(
-                frontend, source_dir, frontend_output, timeout_seconds,
-                roots=groups[frontend_id],
+            frontend_jobs.append((frontend_id, frontend, frontend_output,
+                                  groups[frontend_id]))
+
+        def run_frontend_job(job):
+            _frontend_id, frontend, frontend_output, roots = job
+            return run_frontend(
+                frontend, source_dir, frontend_output, timeout_seconds, roots=roots,
             )
+
+        # Frontends are isolated subprocesses and publish disjoint shard sets.  Run
+        # them concurrently so the slowest compiler, rather than the sum of all
+        # compiler times, sets the Pass-1 wall clock.  The Kuzu materializer still
+        # starts only after all snapshots are released, preserving its memory cap.
+        if len(frontend_jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(frontend_jobs)) as pool:
+                frontend_snapshots = list(pool.map(run_frontend_job, frontend_jobs))
+        else:
+            frontend_snapshots = [run_frontend_job(frontend_jobs[0])]
+
+        for (frontend_id, _frontend, _frontend_output, _roots), snapshot in zip(
+                frontend_jobs, frontend_snapshots):
             snapshots.append(snapshot)
             readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
             snapshot.release()
@@ -565,11 +508,13 @@ def run_project_incremental(
     """Like ``run_project`` but reuse a frontend's prior on-disk bundle when none of
     its source files changed, recompiling only the frontends that did.
 
-    The compose + enrich tail is shared verbatim with ``run_project``, so the result
+    The compose tail is shared verbatim with ``run_project``, so the result
     is identical to a full run: a reused snapshot is exactly the bytes a recompile of
-    unchanged files would produce, and ``combine_graphs``/``_enrich_graph`` are
-    deterministic over the same snapshot set. ``output_root`` is required — the reused
-    bundles and the change manifest both live under it."""
+    unchanged files would produce, and ``combine_graphs`` is deterministic over the same
+    snapshot set. ``output_root`` is required — the reused
+    bundles and the change manifest both live under it. Build-time enrichment is removed;
+    callers must run native Pass 2 after writing the binary store."""
+    _reject_removed_enrich(enrich)
     source_dir = os.path.abspath(source_dir)
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry()
@@ -610,9 +555,8 @@ def run_project_incremental(
             f"supported extensions: {', '.join(supported)}"
         )
     graph = combine_graphs(_snapshot_graphs_releasing(snapshots))
-    result = _enrich_graph(graph, snapshots) if enrich else graph
     _write_manifest(manifest_path, manifest)
-    return result, snapshots
+    return graph, snapshots
 
 
 def _job_output_dir(output_root: str, frontend_id: str, package: str) -> str:
@@ -776,6 +720,7 @@ def run_project_parallel(
 
     A single-unit repo takes the serial path and constructs no pool.
     """
+    _reject_removed_enrich(enrich)
     from concurrent.futures import ProcessPoolExecutor
 
     from .packages import detect_packages, split_large_packages
@@ -826,9 +771,4 @@ def run_project_parallel(
         owner_of_file, source_dir,
     )
     _release_payloads(snapshots)
-    return (_enrich_graph(graph, snapshots) if enrich else graph), snapshots, dropped
-
-
-def semantic_snapshot_graph(snapshot: FrontendSnapshot) -> CodeGraph:
-    """Enrich one already-loaded snapshot without a FileInfo round trip."""
-    return _enrich_graph(snapshot_graph(snapshot), [snapshot])
+    return graph, snapshots, dropped

@@ -7,13 +7,12 @@ role nodes plus precise summary flow edges, each attached to the exact value nod
 a model resolved to. It never rewrites an existing node, so folding it costs only
 what the delta is worth and leaves the base graph, its build time, and its size
 untouched. It is meant to run after core value-flow enrichment and before
-``TaintPropagation``, whose vocabulary it speaks.
+the native taint engine, whose vocabulary it speaks.
 
 The overlay does not resolve models and never imports the Atropos binder:
 resolution is the catalog's own contract (a model + a neutral symbol index -> a
 binding report with a per-model status). The engine's only job here is to
-translate each *bound* fact into the graph vocabulary ``TaintPropagation``
-already consumes:
+translate each *bound* fact into the graph vocabulary the native engine consumes:
 
 * a ``kind="source"`` / ``kind="sink"`` node keyed by ``value_id`` (the exact
   resolved node), which taint reads directly; and
@@ -32,7 +31,7 @@ from typing import Any, Dict, Iterable, List
 from lachesis.core.composition import GraphDelta
 from lachesis.core.identities import stable_id
 
-#: Summary edges must be a flow kind TaintPropagation walks (see taint.py).
+#: Summary edges must be a flow kind the native taint engine walks.
 FLOW_KIND = "VALUE_FLOWS_TO"
 
 #: All Atropos facts are stamped under one identity owner/namespace so they can
@@ -91,41 +90,14 @@ class AtroposOverlay:
     def __init__(self, stamps: Iterable[dict]) -> None:
         self._stamps: List[dict] = list(stamps)
 
-    def minimal_index(self, graph: dict):
-        """Build only the index surface this one-overlay fold needs.
-
-        The generic registry index also builds by-kind and incoming adjacency
-        buckets for arbitrary overlays. Atropos only validates node membership
-        and deduplicates outgoing edges from resolved source values, so retaining
-        those unrelated buckets is pure peak-RSS overhead.
-        """
-        from lachesis.core.overlays.registry import _MinimalOverlayIndex
-        sources = {
-            stamp.get("value_id") or stamp.get("from")
-            for stamp in self._stamps
-        }
-        sources.update(stamp.get("from") for stamp in self._stamps
-                       if stamp.get("from") is not None)
-        # A repeated fold may encounter the role edges emitted by an earlier
-        # fold. Include their deterministic role-node sources so the bounded
-        # seed lookup preserves the generic registry's deduplication behavior.
-        for stamp in self._stamps:
-            if stamp.get("role") in ("source", "sink") and stamp.get("value_id"):
-                sources.add(stable_id(
-                    _OWNER, self.overlay_id, stamp["role"],
-                    stamp["model_id"], stamp["value_id"],
-                ))
-        return _MinimalOverlayIndex(graph, sources)
-
     def applies(self, graph: dict, index: Any = None) -> bool:
         # Nothing resolved -> nothing to fold, and the registry then charges the
         # caller nothing for a pass that would add no node.
         return bool(self._stamps)
 
     def enrich(self, graph: dict, index: Any = None) -> GraphDelta:
-        # OverlayRegistry already owns a node map for this graph. Reusing it avoids
-        # allocating a second million-entry set just to validate resolved endpoints.
-        # Keep the standalone fallback for direct overlay callers and tests.
+        # This is a result projection, not an analysis fold. Validate against the
+        # caller's existing node membership without constructing a second index.
         node_ids = (index.nodes if index is not None and hasattr(index, "nodes")
                     else {node["id"] for node in graph.get("nodes", ())})
         return self.delta_for_node_ids(node_ids)

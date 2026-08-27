@@ -14,6 +14,7 @@ literal), which the gen/kill transfer function keys on.
 Pure reader over a GraphStore index; no mutation, no load_graph.
 """
 import os
+import shutil
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -23,7 +24,7 @@ from lachesis.core.graph_wire import (
     encode_document, encode_edge, encode_node,
     read_frames, write_frame,
 )
-from lachesis.core import lifetime_pb2
+from lachesis.core import graph_pb2, lifetime_pb2
 
 from lachesis.timeit import timeit
 
@@ -54,6 +55,10 @@ _SUBSTRATE_NODE_KINDS = frozenset({
     "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
     "cfg-exit", "cfg-merge", "cfg-condition", "function", "method", "constructor",
     "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
+    "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
+    "MethodDeclaration", "MethodDefinition", "Call", "CallExpression", "construct",
+    "NewExpression", "Return", "ReturnStatement", "return", "allocation", "release",
+    "realloc", "parameter", "arg",
 })
 _SUBSTRATE_PROPERTY_KEYS = frozenset({
     "absolute_file", "end_line", "end_offset", "file", "function_id",
@@ -64,10 +69,122 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
     # during Pass 1; retaining them in the binary substrate lets Rust consume
     # the graph without asking Python to rebuild per-function call records.
     "callee", "form", "method_name", "primary_target_id",
+    "callee_name", "callee_form", "argument_count", "release_method", "release_name",
+    "release_line", "target_id", "value_id",
     "receiver_member_id", "resolution", "allocation_kind", "allocated_type",
     "control_kind", "is_alloc", "is_release", "is_realloc", "is_aggregate_copy",
     "declaration_only", "storage_class", "owner_id",
 })
+
+
+class _CompactNode:
+    """Small temporary node record used while publishing streamed sidecars.
+
+    These records never escape this module.  Supporting the two mapping methods
+    used by the protobuf encoder and translation helpers lets the streamed path
+    avoid a dict allocation for every retained substrate node.
+    """
+    __slots__ = ("id", "kind", "label", "properties")
+
+    def __init__(self, node_id, kind, label, properties):
+        self.id = node_id
+        self.kind = kind
+        self.label = label
+        self.properties = properties
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError as error:
+            raise KeyError(key) from error
+
+
+class _CompactEdge:
+    """Small temporary edge record matching the local mapping seam."""
+    __slots__ = ("source", "target", "kind", "properties")
+
+    def __init__(self, source, target, kind, properties):
+        self.source = source
+        self.target = target
+        self.kind = kind
+        self.properties = properties
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError as error:
+            raise KeyError(key) from error
+
+
+def _CompactNode_from_payload(payload):
+    message, properties = _native_node_projection(payload)
+    return _CompactNode(message.id, message.kind, message.label, properties)
+
+
+def _scalar_graph_value(value):
+    """Return the scalar value used by the compact projection, or ``None``.
+
+    Native shards already contain typed protobuf records.  The old streaming
+    publisher decoded every nested property into Python lists/dicts before
+    throwing almost all of them away.  Keep this deliberately scalar: the
+    Pass-3 substrate contract only retains scalar fields and the complete
+    Pass-2 stream copies the original payload unchanged.
+    """
+    if value is None:
+        return None
+    kind = value.WhichOneof("kind")
+    if kind == "text":
+        return value.text
+    if kind == "integer":
+        return value.integer
+    if kind == "real":
+        return value.real
+    if kind == "boolean":
+        return value.boolean
+    if kind == "null_value":
+        return None
+    return None
+
+
+def _native_node_projection(payload):
+    """Decode only the native-node fields needed while publishing sidecars."""
+    message = graph_pb2.NodeRecord()
+    message.ParseFromString(payload)
+    wanted = _SUBSTRATE_PROPERTY_KEYS
+    properties = {
+        field.key: value
+        for field in message.properties
+        if field.key in wanted
+        for value in (_scalar_graph_value(field.value),)
+        if value is not None
+    }
+    return message, properties
+
+
+def _native_edge_projection(payload):
+    """Decode only endpoint/kind and compact edge properties from a native edge."""
+    message = graph_pb2.EdgeRecord()
+    message.ParseFromString(payload)
+    wanted = {"semantic_kind", "role", "position", "reason"}
+    properties = {
+        field.key: value
+        for field in message.properties
+        if field.key in wanted
+        for value in (_scalar_graph_value(field.value),)
+        if value is not None
+    }
+    return message, properties
+
+
+def _CompactEdge_from_payload(payload):
+    message, properties = _native_edge_projection(payload)
+    return _CompactEdge(message.source, message.target, message.kind, properties)
 
 
 def substrate_cache_path(graph_path):
@@ -171,8 +288,12 @@ def _translation_facts(nodes, records):
             return base[0], selectors
         return None
 
-    function_kinds = {"function", "method", "constructor", "FunctionDecl",
-                      "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl"}
+    function_kinds = {
+        "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
+        "CXXConstructorDecl", "CXXDestructorDecl", "FunctionDef", "AsyncFunctionDef",
+        "FunctionDeclaration", "ArrowFunction", "MethodDeclaration", "MethodDefinition",
+        "Constructor",
+    }
     function_names = {node["id"]: node.get("label", "") for node in nodes
                       if syntax(node["id"]) in function_kinds}
     function_ids = set(function_names)
@@ -185,7 +306,13 @@ def _translation_facts(nodes, records):
     functions = {}
     return_nodes = defaultdict(list)
     for node in nodes:
+        node_syntax = syntax(node["id"])
         owner = props(node).get("owner_function_id") or props(node).get("function_id")
+        # Top-level functions in the non-C frontends own their declaration node.
+        # Make that ownership explicit so Rust can prepare them without a Python
+        # F projection.
+        if node_syntax in function_kinds:
+            owner = node["id"]
         if not owner:
             continue
         item = functions.setdefault(owner, lifetime_pb2.TranslationFunction(id=owner))
@@ -197,15 +324,18 @@ def _translation_facts(nodes, records):
                 item.start_line = int(props(function).get("start_line") or 0)
                 item.has_start_line = True
             item.externally_visible = props(function).get("storage_class") != "static"
-        if syntax(node["id"]) == "ParmVarDecl":
+        if node_syntax in {"ParmVarDecl", "parameter", "arg"}:
             item.parameters.append(node["id"])
-        if syntax(node["id"]) == "ReturnStmt":
+        if node_syntax in {"ReturnStmt", "Return", "ReturnStatement", "return"}:
             return_nodes[owner].append(node)
     for item in functions.values():
         item.parameters.sort(key=lambda node_id: int(props(by_id[node_id]).get("start_offset") or 2**63 - 1))
         item.parameter_names.extend(root_label(node_id) for node_id in item.parameters)
 
-    call_kinds = {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}
+    call_kinds = {
+        "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "call", "Call",
+        "CallExpression", "construct", "NewExpression",
+    }
     for node in nodes:
         node_id = node["id"]
         if syntax(node_id) not in call_kinds:
@@ -215,8 +345,9 @@ def _translation_facts(nodes, records):
         item = functions.get(owner)
         if item is None:
             continue
-        target = node_props.get("primary_target_id")
-        callee = function_names.get(target) or node_props.get("callee") or node.get("label", "")
+        target = node_props.get("primary_target_id") or node_props.get("target_id")
+        callee = (function_names.get(target) or node_props.get("callee") or
+                  node_props.get("callee_name") or node.get("label", ""))
         call = lifetime_pb2.FunctionCall(
             node=node_id, callee=callee, receiver=node_props.get("receiver", ""),
             line=int(node_props.get("start_line") or 0), has_line="start_line" in node_props,
@@ -226,7 +357,8 @@ def _translation_facts(nodes, records):
             is_aggregate_copy=node_props.get("is_aggregate_copy") is True,
         )
         parent_id = parents.get(node_id)
-        if parent_id and syntax(parent_id) == "BinaryOperator" and props(by_id[parent_id]).get("operator") == "=":
+        if (parent_id and syntax(parent_id) in {"BinaryOperator", "AssignmentExpression"}
+                and props(by_id[parent_id]).get("operator", "=") == "="):
             call.assigned = next((target for target, role in children.get(parent_id, ())
                                   if role == "LEFT_OPERAND"), "")
         if not call.assigned:
@@ -265,10 +397,11 @@ def _translation_facts(nodes, records):
             if syntax(peeled) in call_kinds:
                 call_node = by_id[peeled]
                 call_props = props(call_node)
-                target = call_props.get("primary_target_id")
+                target = call_props.get("primary_target_id") or call_props.get("target_id")
                 item.returns.append(lifetime_pb2.FunctionReturn(
                     kind="call", callee=function_names.get(target) or
-                    call_props.get("callee") or call_node.get("label", ""),
+                    call_props.get("callee") or call_props.get("callee_name") or
+                    call_node.get("label", ""),
                     line=int(line_props.get("start_line") or 0), has_line="start_line" in line_props))
             else:
                 return_path = path(child)
@@ -280,7 +413,7 @@ def _translation_facts(nodes, records):
     return lifetime_pb2.TranslationResult(functions=[functions[key] for key in sorted(functions)])
 
 
-def _translation_records(nodes, records):
+def _translation_records(nodes, records, *, node_source=None):
     """Return the compact call/return projection used by native Pass 2.
 
     Pass 1 already owns these filtered records while writing the substrate.  Keeping
@@ -295,11 +428,18 @@ def _translation_records(nodes, records):
         "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
         "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
         "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl",
+        "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
+        "MethodDeclaration", "MethodDefinition", "Constructor", "call", "Call",
+        "CallExpression", "construct", "NewExpression", "Return", "ReturnStatement",
+        "return", "parameter", "allocation", "release", "realloc",
     }
     seed_nodes = [node for node in nodes if syntax(node) in seed_kinds]
     call_ids = {node["id"] for node in seed_nodes
-                if syntax(node) in {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr"}}
-    return_ids = {node["id"] for node in seed_nodes if syntax(node) == "ReturnStmt"}
+                if syntax(node) in {"CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr",
+                                    "call", "Call", "CallExpression", "construct",
+                                    "NewExpression"}}
+    return_ids = {node["id"] for node in seed_nodes
+                  if syntax(node) in {"ReturnStmt", "Return", "ReturnStatement", "return"}}
     relevant = call_ids | return_ids
     for _ in range(2):
         for edge in records:
@@ -314,14 +454,21 @@ def _translation_records(nodes, records):
             elif kind == "VALUE_FLOWS_TO" and source in call_ids:
                 relevant.add(target)
     node_ids = {node["id"] for node in seed_nodes} | relevant
-    kept_nodes = [node for node in nodes if node["id"] in node_ids]
-    kept_edges = [edge for edge in records if (
+    # Reuse the caller-owned lists.  On a large streamed build these lists hold
+    # most of the Pass-3 substrate; returning freshly allocated lists here keeps
+    # the complete substrate and the compact translation projection alive at the
+    # same time and needlessly raises peak RSS.  Slice assignment retains the
+    # existing list objects while dropping the records that translation does not
+    # need before facts are assembled.
+    source = node_source() if node_source is not None else nodes
+    nodes[:] = (node for node in source if node["id"] in node_ids)
+    records[:] = (edge for edge in records if (
         (edge["kind"] == "AST_CHILD" and
          (edge["source"] in relevant or edge["target"] in relevant)) or
         (edge["kind"] == "REFERS_TO" and edge["source"] in relevant) or
         (edge["kind"] == "VALUE_FLOWS_TO" and edge["source"] in call_ids)
-    )]
-    return kept_nodes, kept_edges
+    ))
+    return nodes, records
 
 
 def _write_framed_sidecar(target, prefix, header, nodes, edges):
@@ -364,6 +511,230 @@ def _write_complete_pass2_input(target, nodes, edges, *, manifest=None):
         "build_fingerprint": manifest.get("build_fingerprint"),
     }
     _write_framed_sidecar(target, ".pass2-input-", header, nodes, edges)
+
+
+def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
+                                 keep_node=None, prune=None):
+    """Publish Pass-1 caches from a replayable shard reader.
+
+    The complete Pass-2 input is copied record-by-record.  Pass-3 records are
+    staged as framed protobuf on disk; only the seed nodes and relevant edges
+    needed by the compact translation projection are loaded into Python.  This
+    keeps the streamed build's peak independent of the full substrate node count.
+    """
+    manifest = dict(manifest or {})
+    # The native C/C++ frontend emits canonical framed protobuf files.  For a
+    # single native shard, let Rust publish both immutable sidecars directly;
+    # Python only consumes the compact Pass-3 result for the not-yet-migrated
+    # translation/facts projection.  A custom keep predicate is deliberately
+    # excluded until its semantics have a native representation.
+    raw_paths = getattr(reader, "raw_shard_paths", lambda: ())()
+    if raw_paths and keep_node is None and prune is not None:
+        from lachesis.flow.native_lifetime import project_pass1_shards
+        target = Path(graph_path)
+        project_pass1_shards(
+            raw_paths, pass2_input_cache_path(target), substrate_cache_path(target),
+            manifest, prune=bool(prune),
+        )
+        # Rust owns the binary translation projection as well.  The Python
+        # process only passes paths and does not reconstruct the substrate.
+        from lachesis.flow.native_lifetime import write_translation_facts_path
+        write_translation_facts_path(
+            substrate_cache_path(target), translation_facts_path(target))
+        return
+    if keep_node is None and prune is not None:
+        keep_node = lambda node: not (prune and node.get("kind") in {"token", "source-span"})
+    kept_ids = set()
+    target = Path(graph_path)
+    pass2_target = pass2_input_cache_path(target)
+    fd, pass2_temp = tempfile.mkstemp(
+        prefix=".pass2-input-", dir=str(pass2_target.parent))
+    with tempfile.TemporaryDirectory(prefix=".pass1-substrate-",
+                                      dir=str(target.parent)) as stage_dir:
+        stage_nodes = Path(stage_dir) / "nodes.pb"
+        stage_edges = Path(stage_dir) / "edges.pb"
+        substrate_node_count = 0
+        substrate_edge_count = 0
+        member_count = 0
+        translation_seed_nodes = []
+        translation_seed_kinds = {
+            "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "ReturnStmt",
+            "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
+            "CXXConstructorDecl", "CXXDestructorDecl", "ParmVarDecl",
+            "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
+            "MethodDeclaration", "MethodDefinition", "Constructor", "call", "Call",
+            "CallExpression", "construct", "NewExpression", "Return", "ReturnStatement",
+            "return", "parameter", "allocation", "release", "realloc",
+        }
+
+        try:
+        # The complete Pass-2 header is known from the store manifest.  Open the
+        # output before scanning nodes so the replayable shard stream only needs
+        # one node pass and one edge pass; the old implementation scanned both
+        # streams a second time for the complete sidecar.
+            pass2_header = {
+                "format": "lachesis-pass2-input", "version": _PASS2_INPUT_VERSION,
+                "node_count": int(manifest.get("node_count", 0)),
+                "edge_count": int(manifest.get("edge_count", 0)),
+                "store_version": manifest.get("version"),
+                "core_content_hash": manifest.get("core_content_hash"),
+                "source_content_hash": manifest.get("source_content_hash"),
+                "build_fingerprint": manifest.get("build_fingerprint"),
+            }
+            with (os.fdopen(fd, "wb") as pass2,
+                  stage_nodes.open("wb") as node_stage,
+                  stage_edges.open("wb") as edge_stage):
+                write_frame(pass2, encode_document(pass2_header))
+                raw_nodes = getattr(reader, "raw_nodes", None)
+                if raw_nodes is not None:
+                    # Native shards are already typed protobuf.  Decode only the
+                    # scalar projection needed for Pass 3; the complete Pass-2
+                    # record is copied byte-for-byte after its type tag.
+                    node_stream = (
+                        (payload, *_native_node_projection(payload))
+                        for payload in raw_nodes()
+                    )
+                else:
+                    node_stream = ((None, node, None) for node in reader.nodes())
+                for item in node_stream:
+                    if raw_nodes is not None:
+                        payload, node_message, native_properties = item
+                        node = {
+                            "id": node_message.id, "kind": node_message.kind,
+                            "label": node_message.label,
+                            "properties": native_properties,
+                        }
+                    else:
+                        payload, node, _ = item
+                    if keep_node is not None and not keep_node(node):
+                        continue
+                    node_id = node.get("id")
+                    kept_ids.add(node_id)
+                    # Shard payloads already use the canonical NodeRecord wire
+                    # format.  Copy them directly into the complete Pass-2
+                    # stream; the decoded dict remains available for pruning and
+                    # the compact Pass-3 projection below.
+                    write_frame(pass2, b"N" +
+                                (payload if payload is not None else encode_node(node)))
+                    props = node.get("properties") or {}
+                    syntax_kind = props.get("syntax_kind") or node.get("kind")
+                    if syntax_kind not in _SUBSTRATE_NODE_KINDS:
+                        continue
+                    compact = _CompactNode(
+                        node_id, node.get("kind"), node.get("label"), {
+                            key: value for key, value in props.items()
+                            if key in _SUBSTRATE_PROPERTY_KEYS
+                            and isinstance(value, (str, int, float, bool, type(None)))
+                        })
+                    write_frame(node_stage, b"N" + encode_node(compact))
+                    substrate_node_count += 1
+                    if syntax_kind == "MemberExpr":
+                        member_count += 1
+                    if syntax_kind in translation_seed_kinds:
+                        translation_seed_nodes.append(compact)
+
+                raw_edges = getattr(reader, "raw_edges", None)
+                if raw_edges is not None:
+                    edge_stream = (
+                        (payload, *_native_edge_projection(payload))
+                        for payload in raw_edges()
+                    )
+                else:
+                    edge_stream = ((None, edge, None) for edge in reader.edges())
+                for item in edge_stream:
+                    if raw_edges is not None:
+                        payload, edge_message, native_properties = item
+                        edge = {
+                            "kind": edge_message.kind,
+                            "source": edge_message.source,
+                            "target": edge_message.target,
+                            "properties": native_properties,
+                        }
+                    else:
+                        payload, edge, _ = item
+                    if (edge.get("source") not in kept_ids
+                            or edge.get("target") not in kept_ids):
+                        continue
+                    write_frame(pass2, b"E" +
+                                (payload if payload is not None else encode_edge(edge)))
+                    props = edge.get("properties") or {}
+                    kind = (props.get("semantic_kind") or edge.get("semantic_kind")
+                            or edge.get("kind"))
+                    if kind == "AST_CHILD":
+                        props = {key: props[key]
+                                 for key in ("role", "position") if key in props}
+                    elif kind in {"REFERS_TO", "CFG_NEXT"}:
+                        props = {}
+                    elif kind == "VALUE_FLOWS_TO" and props.get("reason") == "initializer":
+                        props = {"reason": "initializer"}
+                    else:
+                        continue
+                    write_frame(edge_stage, b"E" + encode_edge(_CompactEdge(
+                        edge.get("source"), edge.get("target"), kind, props)))
+                    substrate_edge_count += 1
+            os.replace(pass2_temp, pass2_target)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(pass2_temp)
+            except OSError:
+                pass
+            raise
+
+        common = {"store_version": manifest.get("version"),
+                  "core_content_hash": manifest.get("core_content_hash"),
+                  "source_content_hash": manifest.get("source_content_hash"),
+                  "build_fingerprint": manifest.get("build_fingerprint")}
+
+        def copy_staged_sidecar(output, prefix, header):
+            output = Path(output)
+            fd, temporary = tempfile.mkstemp(prefix=prefix, dir=str(output.parent))
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    write_frame(handle, encode_document({"type": "header", **header}))
+                    with stage_nodes.open("rb") as source:
+                        shutil.copyfileobj(source, handle, length=1024 * 1024)
+                    with stage_edges.open("rb") as source:
+                        shutil.copyfileobj(source, handle, length=1024 * 1024)
+                os.replace(temporary, output)
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+
+        copy_staged_sidecar(
+            substrate_cache_path(target), ".pass3-substrate-",
+            {"format": "lachesis-pass3-substrate", "version": _CACHE_VERSION,
+             "edge_count": substrate_edge_count, "node_count": substrate_node_count,
+             "member_count": member_count, **common})
+
+        def staged_nodes():
+            for payload in read_frames(stage_nodes):
+                yield _CompactNode_from_payload(payload[1:])
+
+        def staged_edges():
+            for payload in read_frames(stage_edges):
+                yield _CompactEdge_from_payload(payload[1:])
+
+        translation_edges = list(staged_edges())
+        translation_nodes, translation_edges = _translation_records(
+            translation_seed_nodes, translation_edges, node_source=staged_nodes)
+        _write_framed_sidecar(
+            translation_cache_path(target), ".pass2-translation-",
+            {"format": "lachesis-pass2-translation", "version": _CACHE_VERSION,
+             "edge_count": len(translation_edges), "node_count": len(translation_nodes),
+             **common}, translation_nodes, translation_edges)
+        _write_translation_facts(translation_facts_path(target),
+                                 _translation_facts(translation_nodes, translation_edges))
 
 
 def _write_translation_facts(target, result):

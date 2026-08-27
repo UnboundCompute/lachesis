@@ -96,7 +96,22 @@ class CandidateRegistry:
         if native is None:
             return
         payload = native.to_dict()
-        materialized = {"nodes": payload.get("nodes", {})}
+        materialized_nodes = dict(semantic.get("nodes") or {})
+        native_nodes = payload.get("nodes", {})
+        for node_id, node in native_nodes.items():
+            node_id = str(node_id)
+            if node_id in materialized_nodes:
+                node_id = f"c:{node_id}"
+                suffix = 2
+                while node_id in materialized_nodes:
+                    node_id = f"c:{node_id}:{suffix}"
+                    suffix += 1
+            node = dict(node)
+            metadata = dict(node.get("metadata") or {})
+            metadata.setdefault("language", "c")
+            node["metadata"] = metadata
+            materialized_nodes[node_id] = node
+        materialized = {"nodes": materialized_nodes}
         materialized["coverage"] = semantic.get("coverage") or native.coverage
         self.graph["semantic_graph"] = materialized
 

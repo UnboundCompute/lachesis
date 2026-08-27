@@ -1,24 +1,10 @@
-"""Interprocedural flow pass over the Lachesis graph (the analysis pass).
+"""Native semantic Pass-2/Pass-3 API.
 
-This is the third pass in the pipeline -- after (1) build the graph and (2) enrich it, this
-pass reads the already-built, enriched graph and, without reparsing anything:
-
-  translate  project the graph into a compact per-function IR (F)
-  traverse   cover the whole graph component-by-component (callers up, callees down)
-  order      schedule each component bottom-up (callees before callers)
-  summarize  compose a deterministic, interprocedural per-function summary
-  skeleton   render the summaries into linear, nesting-aware {control|sink|lifecycle}
-             token streams -- the stitched cross-function flow skeleton
-  match      run shape patterns over the skeletons (guard differential + temporal patterns)
-
-Everything downstream of `translate` touches only the IR, never the graph again.
+Rust owns the binary substrate and semantic engine. Python exposes only the compact
+result and matcher; the former F/skeleton/typestate pipeline is not exported.
 """
-from .translate import load_graph, build_F
-from .skeleton import build_skeletons, render_text
-from .match import match_all
 from .semantic_graph import (Event, EventKind, FROZEN_PATTERNS, Fragment, GuardProof, ObjRef,
                              PatternSpec, SkeletonGraph, match_graph)
 
-__all__ = ["load_graph", "build_F", "build_skeletons", "render_text", "match_all",
-           "Event", "EventKind", "Fragment", "GuardProof", "ObjRef", "SkeletonGraph",
+__all__ = ["Event", "EventKind", "Fragment", "GuardProof", "ObjRef", "SkeletonGraph",
            "PatternSpec", "FROZEN_PATTERNS", "match_graph"]

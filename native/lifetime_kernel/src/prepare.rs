@@ -223,6 +223,10 @@ impl<'a> GraphView<'a> {
                 }
                 Some(base)
             }
+            // Python and TypeScript frontends publish normalized binding nodes
+            // rather than Clang declaration expressions. Treat their stable
+            // node identity as the root of the same abstract path domain.
+            "parameter" | "variable" | "binding" | "property-path" => path(Some(&id)),
             _ => None,
         }
     }
@@ -250,7 +254,15 @@ impl<'a> GraphView<'a> {
 }
 
 fn is_statement(kind: &str) -> bool {
-    kind.ends_with("Stmt") || matches!(kind, "cfg-entry" | "cfg-exit" | "cfg-merge" | "cfg-condition")
+    kind.ends_with("Stmt") || matches!(kind,
+        "cfg-entry" | "cfg-exit" | "cfg-merge" | "cfg-condition" |
+        "statement" | "Return" | "ReturnStatement" | "return" |
+        "Block" | "ExpressionStatement" | "IfStatement" | "ForStatement" |
+        "WhileStatement" | "TryStatement" | "WithStatement")
+}
+
+fn is_return_kind(kind: &str) -> bool {
+    matches!(kind, "ReturnStmt" | "Return" | "ReturnStatement" | "return")
 }
 
 fn expression_stream(graph: &GraphView, id: &str, owned: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>, depth: usize) {
@@ -283,7 +295,28 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
     let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
         graph.parent_of(node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
     if roots.is_empty() { roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt").cloned().collect(); }
-    let root = roots.into_iter().min_by_key(|node| graph.offset(node))?;
+    let root = if let Some(root) = roots.into_iter().min_by_key(|node| graph.offset(node)) {
+        root
+    } else {
+        // Normalized non-C frontends may not publish a CompoundStmt. Their
+        // owned body nodes still have stable source offsets, so a linear CFG
+        // is the conservative equivalent for the native temporal solver.
+        let mut body = owned.iter().filter(|node| {
+            !matches!(graph.kind(node), "function" | "method" | "constructor" |
+                "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration" |
+                "ArrowFunction" | "MethodDeclaration" | "MethodDefinition" |
+                "Constructor" | "parameter" | "ParmVarDecl")
+        }).cloned().collect::<Vec<_>>();
+        body.sort_by_key(|node| graph.offset(node));
+        body.first()?;
+        let mut linear = HashMap::new();
+        for pair in body.windows(2) {
+            linear.entry(pair[0].clone()).or_insert_with(Vec::new).push(pair[1].clone());
+        }
+        let mut prepared = body.clone();
+        prepared.dedup();
+        return Some((prepared, linear));
+    };
     let mut successors: HashMap<String, Vec<String>> = HashMap::new();
     let mut memo: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
     let mut in_progress = HashSet::new();
@@ -489,7 +522,8 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
     let entry = entry?;
     let cfg_entry = owned.iter().find(|node| graph.kind(node) == "cfg-entry").cloned();
     let cfg_exit = owned.iter().find(|node| graph.kind(node) == "cfg-exit").cloned();
-    let mut params = owned.iter().filter(|node| graph.kind(node) == "ParmVarDecl").cloned().collect::<Vec<_>>();
+    let mut params = owned.iter().filter(|node| matches!(graph.kind(node),
+        "ParmVarDecl" | "parameter" | "arg")).cloned().collect::<Vec<_>>();
     params.sort_by_key(|node| graph.offset(node));
     if let Some(exit) = cfg_exit.clone() {
         successors.entry(exit.clone()).or_default();
@@ -788,7 +822,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         let synthetic_exit = format!("native-exit:{}", input.id);
         successor_map.entry(synthetic_exit.clone()).or_default();
         cfg_node_set.insert(synthetic_exit.clone());
-        let mut terminals = node_ids.iter().filter(|node| graph.kind(node) == "ReturnStmt")
+        let mut terminals = node_ids.iter().filter(|node| is_return_kind(graph.kind(node)))
             .cloned().collect::<Vec<_>>();
         if let Some(last) = node_ids.last() {
             terminals.push(last.clone());
@@ -957,7 +991,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     let mut returns = Vec::new();
     for node in &graph.nodes {
         let node_id = node.id.as_str();
-        if graph.kind(node_id) != "ReturnStmt" { continue; }
+        if !is_return_kind(graph.kind(node_id)) { continue; }
         let line = integer_property(node, "start_line");
         let child = graph.children_of(node_id).into_iter().flatten()
             .min_by_key(|child| graph.offset(child));
@@ -1011,7 +1045,10 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 "ConditionalOperator" | "MemberExpr" | "ArraySubscriptExpr" |
                 "IntegerLiteral" | "FloatingLiteral" | "StringLiteral" |
                 "CharacterLiteral" | "CXXBoolLiteralExpr" | "ImplicitValueInitExpr" |
-                "GNUNullExpr" | "CXXNullPtrLiteralExpr" | "VarDecl" | "ParmVarDecl")
+                "GNUNullExpr" | "CXXNullPtrLiteralExpr" | "VarDecl" | "ParmVarDecl" |
+                "function" | "method" | "constructor" | "statement" | "expression" |
+                "call" | "Call" | "CallExpression" | "construct" | "NewExpression" |
+                "Return" | "ReturnStatement" | "return")
         }).cloned().collect::<Vec<_>>();
         values.sort();
         values.sort_by_key(|node| graph.offset(node));
@@ -1201,7 +1238,13 @@ pub(crate) fn prepare_and_solve_request_with_metadata(
 pub(crate) fn temporal_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<Vec<u8>, String> {
+    let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
+    let started = std::time::Instant::now();
     let prepared = prepare_functions(request.functions)?;
+    if timing_enabled {
+        eprintln!("[lachesis native temporal] prepare: {:.3}s ({} functions)",
+            started.elapsed().as_secs_f64(), prepared.len());
+    }
     let results = prepared.into_par_iter()
         .map(|function| {
             let id = function.id.clone();
@@ -1242,10 +1285,18 @@ pub(crate) fn temporal_request(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if timing_enabled {
+        eprintln!("[lachesis native temporal] solve: {:.3}s ({} functions)",
+            started.elapsed().as_secs_f64(), results.len());
+    }
     let mut output = Vec::new();
     lifetime_proto::NativeTemporalResult { functions: results }
         .encode(&mut output)
         .map_err(|error| error.to_string())?;
+    if timing_enabled {
+        eprintln!("[lachesis native temporal] encode: {:.3}s ({} bytes)",
+            started.elapsed().as_secs_f64(), output.len());
+    }
     Ok(output)
 }
 
@@ -1292,7 +1343,7 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
 /// original AST and solver snapshots never cross the native boundary.
 pub(crate) fn semantic_request(
     request: lifetime_proto::PrepareRequest,
-) -> Result<Vec<u8>, String> {
+) -> Result<lifetime_proto::NativeSemanticResult, String> {
     let prepared = prepare_functions(request.functions)?;
     let functions = prepared.into_iter().map(|function| {
         let id = function.id.clone();
@@ -1406,10 +1457,7 @@ pub(crate) fn semantic_request(
             .collect();
         Ok(lifetime_proto::NativeSemanticFunction { id, entry, exits, nodes, edges })
     }).collect::<Result<Vec<_>, String>>()?;
-    let mut output = Vec::new();
-    lifetime_proto::NativeSemanticResult { functions, complete: true }
-        .encode(&mut output).map_err(|error| error.to_string())?;
-    Ok(output)
+    Ok(lifetime_proto::NativeSemanticResult { functions, complete: true })
 }
 
 fn prepare_functions(
