@@ -221,7 +221,7 @@ fn sidecar_to_request_with_selection(
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
-    let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(
+    let (owners, function_names, call_ids, edges_by_source, initializer_targets) = scan_lifetime_metadata(
         input, selected_ids, |item| {
             let item_id = item.id.clone();
             let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
@@ -299,8 +299,9 @@ fn sidecar_to_request_with_selection(
         }
         if call.assigned.is_empty() {
             if let Some(initializer) = edges_by_source.get(&item.id).into_iter().flatten().find(|edge| {
-                    edge.kind == "VALUE_FLOWS_TO"
-                        && edge.reason == "initializer"
+                edge.kind == "VALUE_FLOWS_TO"
+                        && initializer_targets.get(&item.id)
+                            .is_some_and(|targets| targets.contains(&edge.target))
                 }) {
                 call.assigned = initializer.target.clone();
             }
@@ -309,7 +310,7 @@ fn sidecar_to_request_with_selection(
             if edge.kind != "AST_CHILD"
                 || edge.role != "ARGUMENT" { return None; }
             Some(lifetime_proto::FunctionArgument {
-                position: edge.position.unwrap_or_default(),
+                position: edge.position as u32,
                 node: edge.target.clone(),
                 root: String::new(),
                 selectors: Vec::new(),
@@ -327,17 +328,16 @@ fn sidecar_to_request_with_selection(
             entry.calls.push(call);
         }
     }
-    // Materialize the final protobuf edge vectors only after call extraction
-    // has finished.  Keeping both CompactEdge and GraphEdge representations
-    // alive across this phase duplicates the entire edge set at the peak.
-    // Consuming the temporary map releases each compact edge as it is moved.
+    // The scan already stores final protobuf edges, so consuming the index
+    // transfers them directly into their owning function without cloning a
+    // second graph-sized edge representation.
     for (_, edges) in edges_by_source {
         for item in edges {
             let source_owner = owners.get(&item.source);
             let target_owner = owners.get(&item.target);
             let Some(function) = source_owner.or(target_owner) else { continue };
             let Some(entry) = functions.get_mut(function) else { continue };
-            entry.edges.push(lifetime_edge(&item));
+            entry.edges.push(item);
         }
     }
     // Build the first native interprocedural summary lattice.  These effects
@@ -518,9 +518,9 @@ fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
     let role = record.properties.iter().find_map(|field| {
         if field.key == "role" { scalar_edge_value(field) } else { None }
     }).unwrap_or_default();
-    let position = record.properties.iter().find_map(|field| {
+    let position: Option<u32> = record.properties.iter().find_map(|field| {
         if field.key != "position" { return None; }
-        scalar_edge_value(field)?.parse().ok()
+        scalar_edge_value(field)?.parse::<u32>().ok()
     });
     let reason = record.properties.iter().find_map(|field| {
         if field.key == "reason" { scalar_edge_value(field) } else { None }
@@ -529,14 +529,21 @@ fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
                   role, reason, position }
 }
 
-fn lifetime_edge(edge: &CompactEdge) -> lifetime_proto::GraphEdge {
+fn input_edge(record: graph_proto::EdgeRecord) -> lifetime_proto::GraphEdge {
+    let role = record.properties.iter().find_map(|field| {
+        if field.key == "role" { scalar_edge_value(field) } else { None }
+    }).unwrap_or_default();
+    let position: Option<i64> = record.properties.iter().find_map(|field| {
+        if field.key != "position" { return None; }
+        scalar_edge_value(field)?.parse::<i64>().ok()
+    });
     lifetime_proto::GraphEdge {
-        kind: edge.kind.clone(),
-        source: edge.source.clone(),
-        target: edge.target.clone(),
-        role: edge.role.clone(),
-        position: edge.position.unwrap_or_default() as i64,
-        has_position: edge.position.is_some(),
+        kind: record.kind,
+        source: record.source,
+        target: record.target,
+        role,
+        position: position.unwrap_or_default() as i64,
+        has_position: position.is_some(),
     }
 }
 
@@ -548,7 +555,8 @@ fn scan_lifetime_metadata(
     HashMap<String, String>,
     HashMap<String, String>,
     HashSet<String>,
-    HashMap<String, Vec<CompactEdge>>,
+    HashMap<String, Vec<lifetime_proto::GraphEdge>>,
+    HashMap<String, HashSet<String>>,
 ), String> {
     let mut offset = 0;
     let header = frame(input, &mut offset)?;
@@ -566,12 +574,14 @@ fn scan_lifetime_metadata_reader<R: Read>(
     HashMap<String, String>,
     HashMap<String, String>,
     HashSet<String>,
-    HashMap<String, Vec<CompactEdge>>,
+    HashMap<String, Vec<lifetime_proto::GraphEdge>>,
+    HashMap<String, HashSet<String>>,
 ), String> {
     let mut owners = HashMap::new();
     let mut function_names = HashMap::new();
     let mut call_ids = HashSet::new();
-    let mut edges_by_source: HashMap<String, Vec<CompactEdge>> = HashMap::new();
+    let mut edges_by_source: HashMap<String, Vec<lifetime_proto::GraphEdge>> = HashMap::new();
+    let mut initializer_targets: HashMap<String, HashSet<String>> = HashMap::new();
     while let Some(payload) = stream_frame(reader)? {
         if payload.is_empty() { continue; }
         match payload[0] {
@@ -601,12 +611,20 @@ fn scan_lifetime_metadata_reader<R: Read>(
                         .is_some_and(|owner| selected.contains(owner));
                     if !source_selected && !target_selected { continue; }
                 }
-                edges_by_source.entry(item.source.clone()).or_default().push(compact_edge(item));
+                let reason = item.properties.iter().find_map(|field| {
+                    if field.key == "reason" { scalar_edge_value(field) } else { None }
+                });
+                if item.kind == "VALUE_FLOWS_TO" && reason.as_deref() == Some("initializer") {
+                    initializer_targets.entry(item.source.clone()).or_default()
+                        .insert(item.target.clone());
+                }
+                let source = item.source.clone();
+                edges_by_source.entry(source).or_default().push(input_edge(item));
             }
             _ => return Err("unknown graph sidecar record prefix".to_owned()),
         }
     }
-    Ok((owners, function_names, call_ids, edges_by_source))
+    Ok((owners, function_names, call_ids, edges_by_source, initializer_targets))
 }
 
 fn compact_property<'a>(node: &'a CompactNode, key: &str) -> Option<&'a str> {
