@@ -1933,7 +1933,8 @@ pub(crate) fn semantic_request(
         }
         if let Some(function) = functions.iter().find(|item| item.id == binding.callee) {
             let node = if seam.seam_kind == "return" {
-                function.nodes.iter().rev().find(|node| !node.event_kind.is_empty())
+                function.nodes.iter().rev().find(|node| node.event_kind == "RETURN_VALUE")
+                    .or_else(|| function.nodes.iter().rev().find(|node| !node.event_kind.is_empty()))
             } else {
                 function.nodes.iter().find(|node| !node.event_kind.is_empty())
             }.or_else(|| function.nodes.first());

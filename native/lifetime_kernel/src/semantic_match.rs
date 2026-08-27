@@ -404,12 +404,12 @@ fn match_function(
                 by_id.get(edge.source.as_str()) == Some(&index)
                     && by_id.get(edge.target.as_str()) == Some(target)
             }) {
+                let object_label = |object: &ObjectKey| {
+                    format!("{}{}", object.root, object.selectors.join(""))
+                };
                 for binding in &edge.bindings {
                     for encoded in &binding.formal_to_actual {
                         let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue };
-                        let object_label = |object: &ObjectKey| {
-                            format!("{}{}", object.root, object.selectors.join(""))
-                        };
                         let source = objects.iter().position(|object|
                             object_label(object) == formal && object.generation == "g0");
                         let target_object = objects.iter().position(|object|
@@ -417,6 +417,18 @@ fn match_function(
                         if let (Some(source), Some(target_object)) = (source, target_object) {
                             next_bindings.push((source as u32, target_object as u32));
                         }
+                    }
+                }
+                if edge.seam_kind == "return" && !edge.return_to.is_empty() {
+                    if let (Some(source), Some(target_object)) = (
+                        node_object_ids[index],
+                        objects.iter().position(|object| object_label(object) == edge.return_to),
+                    ) {
+                        // A returned value is assigned in the caller. Keep
+                        // canonicalization pointed from that caller-side
+                        // destination to the callee-side returned object so
+                        // released/escaped state follows the returned value.
+                        next_bindings.push((target_object as u32, source));
                     }
                 }
             }
@@ -706,6 +718,57 @@ mod tests {
         });
         assert!(result.functions[0].findings.iter().any(|finding|
             finding.pattern == "uaf.deref" && finding.function == "b"),
+            "findings: {:?}", result.functions[0].findings);
+    }
+
+    #[test]
+    fn carries_return_value_identity_back_to_the_caller() {
+        let mut origin = node("a-origin", "ORIGIN", 1);
+        origin.function = "a".into();
+        origin.object_root = "actual".into();
+        let mut release = node("b-release", "RELEASE", 2);
+        release.function = "b".into();
+        release.object_root = "formal".into();
+        let mut returned = node("b-return", "RETURN_VALUE", 3);
+        returned.function = "b".into();
+        returned.object_root = "formal".into();
+        let mut caller_read = node("a-read", "READ_STORAGE", 4);
+        caller_read.function = "a".into();
+        caller_read.object_root = "result".into();
+        let binding = lifetime_proto::NativeSeamBinding {
+            caller: "a".into(), callee: "b".into(), call_node: "call".into(),
+            formal_to_actual: vec!["formal\u{1f}actual".into()], return_to: "result".into(),
+        };
+        let edges = vec![
+            lifetime_proto::NativeSemanticEdge {
+                source: "b-release".into(), target: "b-return".into(), kind: "normal".into(),
+                ..Default::default()
+            },
+            lifetime_proto::NativeSemanticEdge {
+                source: "a-origin".into(), target: "b-release".into(), kind: "seam".into(),
+                seam_kind: "call".into(), callee: "b".into(), bindings: vec![binding.clone()],
+                ..Default::default()
+            },
+            lifetime_proto::NativeSemanticEdge {
+                source: "b-return".into(), target: "a-read".into(), kind: "seam".into(),
+                seam_kind: "return".into(), callee: "a".into(), return_to: "result".into(),
+                bindings: vec![binding], ..Default::default()
+            },
+        ];
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![
+                lifetime_proto::NativeSemanticFunction {
+                    id: "a".into(), entry: "a-origin".into(), exits: vec!["a-read".into()],
+                    nodes: vec![origin, caller_read], edges: Vec::new(), language: "c".into(),
+                },
+                lifetime_proto::NativeSemanticFunction {
+                    id: "b".into(), entry: "b-release".into(), exits: vec!["b-return".into()],
+                    nodes: vec![release, returned], edges: Vec::new(), language: "c".into(),
+                },
+            ], complete: true, seams: edges,
+        });
+        assert!(result.functions[0].findings.iter().any(|finding|
+            finding.pattern == "uaf.deref" && finding.function == "a"),
             "findings: {:?}", result.functions[0].findings);
     }
 
