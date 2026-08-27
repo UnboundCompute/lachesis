@@ -400,6 +400,11 @@ message NativeSemanticEdge {
   string target = 2;
   string kind = 3;
   repeated GuardProof guards = 4;
+  repeated NativeSeamBinding bindings = 5;
+  string seam_kind = 6;
+  string callee = 7;
+  string return_to = 8;
+  string provenance = 9;
 }
 message NativeSemanticFunction {
   string id = 1;
@@ -412,4 +417,5 @@ message NativeSemanticFunction {
 message NativeSemanticResult {
   repeated NativeSemanticFunction functions = 1;
   bool complete = 2;
+  repeated NativeSemanticEdge seams = 3;
 }

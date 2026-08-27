@@ -1668,6 +1668,45 @@ pub(crate) fn semantic_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<lifetime_proto::NativeSemanticResult, String> {
     let prepared = prepare_functions(request.functions)?;
+    let by_id: HashMap<String, usize> = prepared.iter().enumerate()
+        .map(|(index, function)| (function.id.clone(), index)).collect();
+    let mut seams = Vec::new();
+    for caller in &prepared {
+        for call in &caller.calls {
+            let Some(&callee_index) = by_id.get(&call.callee) else { continue };
+            let callee = &prepared[callee_index];
+            let Some(entry_anchor) = callee.nodes.first() else { continue };
+            let formal_to_actual = call.arguments.iter().filter_map(|argument| {
+                let formal = callee.parameters.get(argument.position as usize)?;
+                let actual = if !argument.root_name.is_empty() {
+                    format!("{}{}", argument.root_name, argument.selectors.join(""))
+                } else if !argument.root.is_empty() {
+                    format!("{}{}", argument.root.trim_start_matches("decl:"), argument.selectors.join(""))
+                } else if !argument.expression.is_empty() {
+                    argument.expression.clone()
+                } else {
+                    return None;
+                };
+                Some(format!("{formal}\u{1f}{actual}"))
+            }).collect();
+            let return_to = if !call.assigned_name.is_empty() {
+                format!("{}{}", call.assigned_name, call.assigned_selectors.join(""))
+            } else {
+                call.assigned.clone()
+            };
+            seams.push(lifetime_proto::NativeSemanticEdge {
+                source: format!("native:{}:anchor:{}", caller.id, call.node),
+                target: format!("native:{}:anchor:{}", callee.id, entry_anchor),
+                kind: "seam".into(), guards: Vec::new(),
+                bindings: vec![lifetime_proto::NativeSeamBinding {
+                    caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
+                    formal_to_actual, return_to: return_to.clone(),
+                }],
+                seam_kind: "call".into(), callee: callee.id.clone(),
+                return_to, provenance: "compiler-call".into(),
+            });
+        }
+    }
     let functions = prepared.into_iter().map(|function| {
         let id = function.id.clone();
         let mut nodes = Vec::new();
@@ -1790,6 +1829,8 @@ pub(crate) fn semantic_request(
                             guards: successor.guarded_targets.iter()
                                 .find(|item| item.target == *target_anchor)
                                 .map(|item| item.guards.clone()).unwrap_or_default(),
+                            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+                            return_to: String::new(), provenance: String::new(),
                         });
                     }
                 }
@@ -1799,6 +1840,8 @@ pub(crate) fn semantic_request(
             for pair in node_ids.windows(2) {
                 edges.push(lifetime_proto::NativeSemanticEdge {
                     source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(), guards: Vec::new(),
+                    bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+                    return_to: String::new(), provenance: String::new(),
                 });
             }
         }
@@ -1808,12 +1851,16 @@ pub(crate) fn semantic_request(
         for (attempt, failure, anchor) in realloc_failures {
             edges.push(lifetime_proto::NativeSemanticEdge {
                 source: attempt, target: failure.clone(), kind: "realloc-failure".into(), guards: Vec::new(),
+                bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+                return_to: String::new(), provenance: String::new(),
             });
             if let Some(successors) = function.successors.iter().find(|item| item.node == anchor) {
                 for target_anchor in &successors.targets {
                     if let Some(target) = by_anchor.get(target_anchor).and_then(|items| items.first()) {
                         edges.push(lifetime_proto::NativeSemanticEdge {
                             source: failure.clone(), target: target.clone(), kind: "normal".into(), guards: Vec::new(),
+                            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+                            return_to: String::new(), provenance: String::new(),
                         });
                     }
                 }
@@ -1837,7 +1884,9 @@ pub(crate) fn semantic_request(
             id, entry, exits, nodes, edges, language,
         })
     }).collect::<Result<Vec<_>, String>>()?;
-    Ok(lifetime_proto::NativeSemanticResult { functions, complete: true })
+    seams.sort_by(|left, right| (&left.source, &left.target, &left.callee)
+        .cmp(&(&right.source, &right.target, &right.callee)));
+    Ok(lifetime_proto::NativeSemanticResult { functions, complete: true, seams })
 }
 
 fn prepare_functions(

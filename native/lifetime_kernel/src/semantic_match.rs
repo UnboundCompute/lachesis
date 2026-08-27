@@ -506,6 +506,7 @@ mod tests {
         let ids: Vec<String> = nodes.iter().map(|item| item.id.clone()).collect();
         let edges = ids.windows(2).map(|pair| lifetime_proto::NativeSemanticEdge {
             source: pair[0].clone(), target: pair[1].clone(), kind: "normal".to_owned(), guards: Vec::new(),
+            ..Default::default()
         }).collect();
         lifetime_proto::NativeSemanticFunction {
             id: "f".to_owned(), entry: ids[0].clone(), exits: vec![ids[ids.len() - 1].clone()],
@@ -520,6 +521,7 @@ mod tests {
                                              node("r1", "RELEASE", 2),
                                              node("r2", "RELEASE", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "double-free");
@@ -533,6 +535,7 @@ mod tests {
                                              node("r", "RELEASE", 2),
                                              node("u", "READ_STORAGE", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
@@ -546,6 +549,7 @@ mod tests {
                                              node("i", "INVALIDATE", 2),
                                              node("n", "ORIGIN", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.iter().all(|finding| finding.pattern != "double-free"));
     }
@@ -563,6 +567,7 @@ mod tests {
                                              node("r", "RELEASE", 3),
                                              use_alias])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
@@ -575,6 +580,7 @@ mod tests {
             functions: vec![function(vec![node("n", "WRITE_STORAGE_NULL", 1),
                                              node("r", "RELEASE", 2)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.is_empty());
     }
@@ -589,6 +595,7 @@ mod tests {
             guards: vec![lifetime_proto::GuardProof {
                 kind: "NONNULL".to_owned(), value: "p#g0".to_owned(),
             }],
+            ..Default::default()
         }];
         let result = match_result(lifetime_proto::NativeSemanticResult {
             functions: vec![lifetime_proto::NativeSemanticFunction {
@@ -596,6 +603,7 @@ mod tests {
                 nodes, edges, language: "c".to_owned(),
             }],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.is_empty());
     }
@@ -609,6 +617,7 @@ mod tests {
         let result = match_result(lifetime_proto::NativeSemanticResult {
             functions: vec![function(vec![derive])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "aggregate-copy-alias");
@@ -621,6 +630,7 @@ mod tests {
                                              node("f", "REALLOC_FAILED", 2),
                                              node("x", "", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.iter()
             .any(|finding| finding.pattern == "realloc-failure-leak"));
@@ -632,6 +642,7 @@ mod tests {
             functions: vec![function(vec![node("o", "ORIGIN", 1),
                                              node("e", "ESCAPE", 2)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.is_empty());
     }

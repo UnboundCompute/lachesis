@@ -99,12 +99,14 @@ fn compact_event_function(
     }
     let mut outgoing = vec![Vec::new(); node_count];
     let mut incoming = vec![Vec::new(); node_count];
+    let mut edge_metadata: HashMap<(usize, usize), lifetime_proto::NativeSemanticEdge> = HashMap::new();
     for edge in full_edges {
         let (Some(&source), Some(&target)) =
             (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str()))
         else { continue };
         outgoing[source].push(target);
         incoming[target].push(source);
+        edge_metadata.entry((source, target)).or_insert(edge);
     }
 
     // Walk through non-event anchors until the next event(s).  Each event is
@@ -193,23 +195,26 @@ fn compact_event_function(
     let entry = format!("native:{}:event-entry", function.id);
     let exit = format!("native:{}:event-exit", function.id);
     let mut projected_edges: Vec<_> = projected.iter().map(|&(source, target)| {
-        lifetime_proto::NativeSemanticEdge {
-            source: node_ids[source].clone(),
-            target: node_ids[target].clone(),
-            kind: "normal".to_owned(),
-            guards: Vec::new(),
-        }
+        let mut edge = edge_metadata.remove(&(source, target)).unwrap_or_default();
+        edge.source = node_ids[source].clone();
+        edge.target = node_ids[target].clone();
+        if edge.kind.is_empty() { edge.kind = "normal".to_owned(); }
+        edge
     }).collect();
     projected_edges.reserve(entry_events.len() + exit_events.len());
     for target in entry_events {
         projected_edges.push(lifetime_proto::NativeSemanticEdge {
             source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(), guards: Vec::new(),
+            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+            return_to: String::new(), provenance: String::new(),
         });
     }
     for source in exit_events {
         projected_edges.push(lifetime_proto::NativeSemanticEdge {
             source: node_ids[source].clone(),
             target: exit.clone(), kind: "normal".to_owned(), guards: Vec::new(),
+            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+            return_to: String::new(), provenance: String::new(),
         });
     }
     projected_edges.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
@@ -1562,6 +1567,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             functions: full.functions.into_iter()
                 .filter_map(compact_event_function).collect(),
             complete: full.complete,
+            seams: full.seams,
         }.encode_to_vec();
         let events_output = format!("{output}.events.pb");
         let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
