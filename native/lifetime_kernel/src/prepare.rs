@@ -1658,22 +1658,15 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
     }
 }
 
-fn semantic_language(function: &str) -> String {
-    if function.contains(":cpython-ast:") || function.contains(":python:") {
-        "python".to_owned()
-    } else if function.contains(":typescript-compiler-api:")
-        || function.contains(":typescript:") {
-        "typescript".to_owned()
-    } else if function.contains(":javascript:") {
-        "javascript".to_owned()
-    } else if function.contains(":clang-c:") || function.contains(":clang-c-native:")
-        || function.contains(":clang-cpp:") {
-        // The native Clang frontend may contain C and C++ roots together;
-        // the function ID does not encode the individual source extension.
-        "mixed".to_owned()
-    } else {
-        "mixed".to_owned()
-    }
+fn function_language(function: &lifetime_proto::FunctionInput) -> String {
+    // Language is frontend-owned metadata.  Do not infer it from an opaque
+    // function id or from a filename: ids are allowed to change and a single
+    // substrate may contain several languages.  The native graph adapter
+    // copies this scalar from the compiler record onto the function's nodes.
+    function.nodes.iter()
+        .find_map(|node| text_property(node, "language"))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Emit the compact event graph consumed by the semantic query layer.  This
@@ -1695,6 +1688,9 @@ pub(crate) fn semantic_request(
             function_names.entry(declaration.label.clone()).or_insert_with(|| function.id.clone());
         }
     }
+    let function_languages: HashMap<String, String> = request.functions.iter()
+        .map(|function| (function.id.clone(), function_language(function)))
+        .collect();
     let prepared = prepare_functions(request.functions)?;
     let by_id: HashMap<String, usize> = prepared.iter().enumerate()
         .map(|(index, function)| (function.id.clone(), index)).collect();
@@ -1928,7 +1924,7 @@ pub(crate) fn semantic_request(
             (&left.source, &left.target, &left.kind)
                 .cmp(&(&right.source, &right.target, &right.kind))
         });
-        let language = semantic_language(&id);
+        let language = function_languages.get(&id).cloned().unwrap_or_default();
         Ok(lifetime_proto::NativeSemanticFunction {
             id, entry, exits, nodes, edges, language,
         })
