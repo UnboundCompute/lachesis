@@ -99,13 +99,10 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
     }
 }
 
-fn catalog_language(function: &str) -> Option<&'static str> {
-    if function.contains(":cpython-ast:") { Some("python") }
-    else if function.contains(":typescript-compiler-api:") { Some("typescript") }
-    else if function.contains(":clang-c:") || function.contains(":clang-c-native:") {
-        Some("c")
-    } else if function.contains(":clang-cpp:") { Some("cpp")
-    } else if function.contains(":javascript:") { Some("javascript") } else { None }
+fn catalog_language<'a>(graph: &'a Graph, owner: Option<u32>) -> Option<&'a str> {
+    owner.and_then(|owner| graph.node_by_id.get(&owner).copied())
+        .and_then(|owner| graph.nodes.get(owner))
+        .and_then(|node| graph.node_property_text(node, "language"))
 }
 
 fn model_matches(
@@ -234,7 +231,7 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
         let Some(callee) = graph.node_property_text(call, "callee")
             .or_else(|| graph.node_property_text(call, "method_name"))
             .or_else(|| graph.node_property_text(call, "callee_name")) else { continue };
-        let language = graph.node_owner(call).map(|owner| graph.id(owner)).and_then(catalog_language);
+        let language = catalog_language(graph, graph.node_owner(call));
         let argument_count = arguments.get(&call.id).map(Vec::len);
         let receiver_type = graph.node_property_text(call, "receiver_type")
             .or_else(|| graph.node_property_text(call, "type"));

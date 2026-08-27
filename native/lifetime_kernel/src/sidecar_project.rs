@@ -37,7 +37,7 @@ const SUBSTRATE_PROPERTY_KEYS: &[&str] = &[
     "absolute_file", "end_line", "end_offset", "file", "function_id", "operator",
     "owner_function_id", "receiver", "receiver_id", "receiver_member_id",
     "receiver_symbol_id", "receiver_value", "receiver_value_id", "start_line",
-    "start_offset", "syntax_kind", "type", "callee", "form", "method_name",
+    "start_offset", "syntax_kind", "type", "language", "receiver_type", "callee", "form", "method_name",
     "primary_target_id", "callee_name", "callee_form", "argument_count", "release_method",
     "release_name", "release_line", "target_id", "value_id", "resolution",
     "allocation_kind", "allocated_type", "control_kind", "is_alloc", "is_release",
