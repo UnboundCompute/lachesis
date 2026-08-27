@@ -125,10 +125,13 @@ fn match_function(
                 uninitialized.retain(|item| item != &object);
                 if !origins.contains(&object) { origins.push(object); }
             },
-            "RELEASE" | "INVALIDATE" => if let Some(object) = object {
+            "RELEASE" => if let Some(object) = object {
                 if released.contains(&object) {
                     add_finding(&mut findings, &function.id, "double-free", &object, node);
                 }
+                released.push(object);
+            },
+            "INVALIDATE" => if let Some(object) = object {
                 released.push(object);
             },
             "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object {
@@ -249,5 +252,16 @@ mod tests {
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
         assert_eq!(result.functions[0].findings[0].line, 3);
+    }
+
+    #[test]
+    fn invalidation_is_not_misreported_as_a_second_free() {
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("i", "INVALIDATE", 2),
+                                             node("n", "ORIGIN", 3)])],
+            complete: true,
+        });
+        assert!(result.functions[0].findings.iter().all(|finding| finding.pattern != "double-free"));
     }
 }

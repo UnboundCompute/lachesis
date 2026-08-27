@@ -81,6 +81,16 @@ def build_native_match_result(semantic_path: str | os.PathLike[str]):
 
 def native_match_leads(result) -> list[dict[str, Any]]:
     """Project compact native findings into the public lead record shape."""
+    pattern_ids = {
+        "pointer-arithmetic-before-validation": "mem.pointer-arithmetic.before-validation",
+        "leak": "mem.lifetime.leak",
+        "uninitialized-use": "mem.lifetime.uninitialized-use",
+        "double-free": "mem.lifetime.double-free",
+        "uaf.deref": "mem.lifetime.use-after-free",
+        "use.dangling": "mem.lifetime.use-after-free",
+        "null-deref": "mem.lifetime.null-deref",
+        "use-after-return": "mem.lifetime.use-after-return",
+    }
     leads = []
     for function in result.functions:
         for finding in function.findings:
@@ -99,7 +109,7 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 "value": rendered,
                 "var": rendered,
                 "at": finding.node,
-                "pattern_id": finding.pattern,
+                "pattern_id": pattern_ids.get(finding.pattern, finding.pattern),
                 "evaluator": "typestate",
                 "source_reachable": True,
                 "source_influenced": True,
