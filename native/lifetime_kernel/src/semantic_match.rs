@@ -516,7 +516,9 @@ fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
     let mut edges = Vec::new();
     let mut exits = Vec::new();
     let entry = "native:stitched:event-entry".to_owned();
-    let callee_ids: HashSet<String> = result.seams.iter().map(|edge| edge.callee.clone()).collect();
+    let callee_ids: HashSet<String> = result.seams.iter()
+        .filter(|edge| edge.seam_kind == "call")
+        .map(|edge| edge.callee.clone()).collect();
     for function in result.functions {
         if function.nodes.is_empty() { continue; }
         exits.extend(function.exits.iter().cloned());

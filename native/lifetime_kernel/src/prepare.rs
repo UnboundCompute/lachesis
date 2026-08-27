@@ -1676,7 +1676,7 @@ pub(crate) fn semantic_request(
             let Some(&callee_index) = by_id.get(&call.callee) else { continue };
             let callee = &prepared[callee_index];
             let Some(entry_anchor) = callee.nodes.first() else { continue };
-            let formal_to_actual = call.arguments.iter().filter_map(|argument| {
+            let formal_to_actual: Vec<String> = call.arguments.iter().filter_map(|argument| {
                 let formal = callee.parameters.get(argument.position as usize)?;
                 let actual = if !argument.root_name.is_empty() {
                     format!("{}{}", argument.root_name, argument.selectors.join(""))
@@ -1700,11 +1700,26 @@ pub(crate) fn semantic_request(
                 kind: "seam".into(), guards: Vec::new(),
                 bindings: vec![lifetime_proto::NativeSeamBinding {
                     caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
-                    formal_to_actual, return_to: return_to.clone(),
+                    formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
                 }],
                 seam_kind: "call".into(), callee: callee.id.clone(),
-                return_to, provenance: "compiler-call".into(),
+                return_to: return_to.clone(), provenance: "compiler-call".into(),
             });
+            if let Some(successors) = caller.successors.iter().find(|item| item.node == call.node) {
+                for continuation in &successors.targets {
+                    seams.push(lifetime_proto::NativeSemanticEdge {
+                        source: format!("native:{}:exit", callee.id),
+                        target: format!("native:{}:anchor:{}", caller.id, continuation),
+                        kind: "seam".into(), guards: Vec::new(),
+                        bindings: vec![lifetime_proto::NativeSeamBinding {
+                            caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
+                            formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
+                        }], seam_kind: "return".into(),
+                        callee: caller.id.clone(), return_to: return_to.clone(),
+                        provenance: "compiler-return".into(),
+                    });
+                }
+            }
         }
     }
     let functions = prepared.into_iter().map(|function| {
@@ -1890,18 +1905,40 @@ pub(crate) fn semantic_request(
     // fallback for query-only sidecars.
     for seam in &mut seams {
         let Some(binding) = seam.bindings.first() else { continue };
-        if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
-            let anchor = binding.call_node.as_str();
-            if let Some(node) = function.nodes.iter().find(|node|
-                node.anchor == anchor && !node.event_kind.is_empty())
-                .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
-                seam.source = node.id.clone();
+        if seam.seam_kind == "call" {
+            if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
+                let anchor = binding.call_node.as_str();
+                if let Some(node) = function.nodes.iter().find(|node|
+                    node.anchor == anchor && !node.event_kind.is_empty())
+                    .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
+                    seam.source = node.id.clone();
+                }
             }
         }
         if let Some(function) = functions.iter().find(|item| item.id == binding.callee) {
-            if let Some(node) = function.nodes.iter().find(|node| !node.event_kind.is_empty())
-                .or_else(|| function.nodes.first()) {
-                seam.target = node.id.clone();
+            let node = if seam.seam_kind == "return" {
+                function.nodes.iter().rev().find(|node| !node.event_kind.is_empty())
+            } else {
+                function.nodes.iter().find(|node| !node.event_kind.is_empty())
+            }.or_else(|| function.nodes.first());
+            if let Some(node) = node {
+                if seam.seam_kind == "return" {
+                    seam.source = node.id.clone();
+                } else {
+                    seam.target = node.id.clone();
+                }
+            }
+        }
+        if seam.seam_kind == "return" {
+            let prefix = format!("native:{}:anchor:", binding.caller);
+            if let Some(anchor) = seam.target.strip_prefix(&prefix) {
+                if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
+                    if let Some(node) = function.nodes.iter().find(|node| node.anchor == anchor
+                        && !node.event_kind.is_empty())
+                        .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
+                        seam.target = node.id.clone();
+                    }
+                }
             }
         }
     }
