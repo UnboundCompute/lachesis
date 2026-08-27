@@ -108,9 +108,22 @@ fn catalog_language(function: &str) -> Option<&'static str> {
     } else if function.contains(":javascript:") { Some("javascript") } else { None }
 }
 
-fn model_matches(model: &crate::atropos_proto::Model, language: Option<&str>, callee: &str) -> bool {
+fn model_matches(
+    model: &crate::atropos_proto::Model,
+    language: Option<&str>,
+    callee: &str,
+    argument_count: Option<usize>,
+    receiver_type: Option<&str>,
+) -> bool {
     if !model.language.is_empty() && language != Some(model.language.as_str())
         && !(language == Some("typescript") && model.language == "javascript") { return false; }
+    if model.has_arity && argument_count.is_some_and(|count| count as i64 != model.arity) {
+        return false;
+    }
+    if !model.receiver_type.is_empty()
+        && receiver_type.is_some_and(|value| value != model.receiver_type.as_str()) {
+        return false;
+    }
     if model.package.is_empty() || model.package == "builtins" {
         model.method == callee || callee.rsplit('.').next() == Some(model.method.as_str())
     } else { callee == format!("{}.{}", model.package, model.method) }
@@ -222,8 +235,11 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
             .or_else(|| graph.node_property_text(call, "method_name"))
             .or_else(|| graph.node_property_text(call, "callee_name")) else { continue };
         let language = graph.node_owner(call).map(|owner| graph.id(owner)).and_then(catalog_language);
+        let argument_count = arguments.get(&call.id).map(Vec::len);
+        let receiver_type = graph.node_property_text(call, "receiver_type")
+            .or_else(|| graph.node_property_text(call, "type"));
         for model in &catalog.models {
-            if !model_matches(model, language, callee) { continue; }
+            if !model_matches(model, language, callee, argument_count, receiver_type) { continue; }
             if model.role == "summary" {
                 let mut endpoints = model.access_path.split("->").map(str::trim);
                 let Some(from_endpoint) = endpoints.next() else { continue };
