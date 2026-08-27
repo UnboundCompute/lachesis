@@ -18,6 +18,8 @@ def compiled_catalog(root: str | os.PathLike[str], base: str | os.PathLike[str])
     """
     models_root = Path(root) / "models"
     lifecycle_path = Path(root) / "detection" / "lifecycle-roles.json"
+    flow_patterns_path = Path(root) / "detection" / "flow-patterns.json"
+    evaluators_path = Path(root) / "detection" / "evaluators.json"
     fingerprint = hashlib.sha256()
     for path in sorted(models_root.rglob("*.json")):
         try:
@@ -27,12 +29,12 @@ def compiled_catalog(root: str | os.PathLike[str], base: str | os.PathLike[str])
         fingerprint.update(str(path).encode())
         fingerprint.update(str(stat.st_mtime_ns).encode())
         fingerprint.update(str(stat.st_size).encode())
-    try:
-        stat = lifecycle_path.stat()
-    except OSError:
-        pass
-    else:
-        fingerprint.update(str(lifecycle_path).encode())
+    for path in (lifecycle_path, flow_patterns_path, evaluators_path):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        fingerprint.update(str(path).encode())
         fingerprint.update(str(stat.st_mtime_ns).encode())
         fingerprint.update(str(stat.st_size).encode())
     target = Path(f"{base}.atropos.{fingerprint.hexdigest()[:16]}.catalog.pb")
@@ -101,7 +103,8 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
     # Lifecycle roles are compiled into the same protobuf catalog.  This is a
     # build/setup concern: the native analysis path consumes only this binary
     # artifact and never opens the authored catalog files.
-    lifecycle_path = root.parent / "detection" / "lifecycle-roles.json"
+    detection_root = root.parent / "detection"
+    lifecycle_path = detection_root / "lifecycle-roles.json"
     try:
         import json
         lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
@@ -122,6 +125,46 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
                     id=f"{role}:{language}:{method}", language=str(language),
                     method=str(method), role=role,
                 )
+    # Pass-3 pattern/evaluator data is compiled into the same binary request.
+    # This keeps the runtime path independent of authored JSON while retaining
+    # Atropos as the sole owner of the declarative vocabulary.
+    try:
+        flow_patterns = json.loads(
+            (detection_root / "flow-patterns.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        flow_patterns = {}
+    for item in flow_patterns.get("patterns", ()):
+        matcher = item.get("matcher") or {}
+        pattern = request.pattern_catalog.patterns.add(
+            id=item.get("id") or "",
+            name=item.get("name") or "",
+            tier=int(item.get("tier") or 0),
+            status=item.get("status") or "",
+            shape=item.get("shape") or "",
+            signal=item.get("signal") or "",
+            matcher_pattern=matcher.get("pattern") or "",
+            evaluator=item.get("evaluator") or "",
+        )
+        pattern.cwe.extend(str(value) for value in (item.get("cwe") or ()))
+        pattern.requires.extend(str(value) for value in (item.get("requires") or ()))
+        pattern.matcher_families.extend(str(value) for value in (matcher.get("families") or ()))
+    try:
+        evaluator_doc = json.loads(
+            (detection_root / "evaluators.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        evaluator_doc = {}
+    for name, description in (evaluator_doc.get("evaluators") or {}).items():
+        request.pattern_catalog.evaluators.add(
+            name=str(name), description=str(description))
+    request.pattern_catalog.kind_evaluator.update({
+        str(name): ",".join(str(value) for value in values)
+        if isinstance(values, list) else str(values)
+        for name, values in (evaluator_doc.get("kind_evaluator") or {}).items()
+    })
+    request.pattern_catalog.event_evaluator.update({
+        str(name): str(value)
+        for name, value in (evaluator_doc.get("event_evaluator") or {}).items()
+    })
     target = os.fspath(output_path)
     temporary = target + f".tmp.{os.getpid()}"
     with open(temporary, "wb") as stream:
