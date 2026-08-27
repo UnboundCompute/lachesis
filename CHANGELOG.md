@@ -7,6 +7,20 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.3.1]
+
+Packaging release: Linux arm64 (aarch64) now gets a real prebuilt wheel.
+
+### Added
+
+- **`manylinux_2_28_aarch64` wheel.** The release matrix now builds on a native
+  arm64 Linux runner (`ubuntu-24.04-arm`), so `pip install lachesis-cpg` on Linux
+  arm64 — including Docker containers on Apple Silicon — resolves a prebuilt wheel
+  carrying the native clang frontend and lifetime kernel. Previously Linux arm64
+  had no wheel and fell back to the sdist, which installs without the native C
+  frontend and cannot build C graphs. x86_64 Linux, arm64 macOS, and Windows
+  wheels are unchanged.
+
 ## [0.3.0]
 
 This release introduces a source-rooted semantic flow analysis and a lifetime/typestate
