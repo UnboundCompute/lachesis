@@ -108,7 +108,9 @@ def check_kuzu() -> Check:
 def check_native_kernel() -> Check:
     """Verify that the one analysis kernel used by every scan can be loaded."""
     try:
-        from lachesis.flow.native_lifetime import _library_candidates, available
+        from lachesis.cache import _version
+        from lachesis.flow.native_lifetime import (_library_candidates, available,
+                                                    kernel_version)
         candidates = _library_candidates()
     except Exception as error:  # pragma: no cover - defensive doctor path
         return Check("native-kernel", False, f"could not inspect native runtime: {error}",
@@ -126,7 +128,21 @@ def check_native_kernel() -> Check:
         loaded = False
         detail = f"cannot load {existing[0]}: {error}"
     else:
-        detail = f"loaded from {existing[0]}" if loaded else f"cannot load {existing[0]}"
+        stamp = kernel_version() if loaded else None
+        detail = f"loaded from {existing[0]}"
+        if stamp:
+            detail += f" (kernel {stamp})"
+            if stamp != _version():
+                return Check(
+                    "native-kernel", False,
+                    f"kernel {stamp} does not match package {_version()}",
+                    "reinstall the platform wheel so Python and Rust versions match",
+                    required=False,
+                )
+        elif loaded:
+            detail += " (build stamp unavailable; rebuild the native package)"
+        else:
+            detail = f"cannot load {existing[0]}"
     if loaded:
         return Check("native-kernel", True, detail)
     return Check(

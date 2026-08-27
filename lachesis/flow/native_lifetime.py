@@ -46,6 +46,21 @@ def available() -> bool:
     return _load() is not None
 
 
+def kernel_version() -> str | None:
+    """Return the native build stamp when the loaded kernel publishes one."""
+    library = _load()
+    if library is None:
+        return None
+    try:
+        function = library.lachesis_lifetime_kernel_version
+    except AttributeError:
+        return None
+    function.argtypes = []
+    function.restype = ctypes.c_char_p
+    value = function()
+    return os.fsdecode(value) if value else None
+
+
 def _require_library():
     library = _load()
     if library is None:
