@@ -1,10 +1,9 @@
 //! Native Pass-3 matcher for the compact semantic sidecar.
 //!
 //! This module deliberately works on the protobuf sidecar, not on Python graph
-//! objects.  It is the first native matcher slice: lifecycle event identities
-//! and their intra-function control-flow reachability.  More expressive
-//! catalog/sink facts remain separate until their facts are represented in the
-//! binary semantic contract.
+//! objects.  Lifecycle identities are interned once per function: worklist
+//! states carry `u32` handles rather than cloning root/selector/generation
+//! strings on every CFG transfer.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -31,19 +30,16 @@ impl ObjectKey {
         })
     }
 
-    fn into_path(self) -> lifetime_proto::Path {
-        lifetime_proto::Path { root: self.root, selectors: self.selectors }
-    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StateKey {
     node: usize,
-    released: Vec<ObjectKey>,
-    origins: Vec<ObjectKey>,
-    nulls: Vec<ObjectKey>,
-    uninitialized: Vec<ObjectKey>,
-    pointer_arithmetic: Vec<ObjectKey>,
+    released: Vec<u32>,
+    origins: Vec<u32>,
+    nulls: Vec<u32>,
+    uninitialized: Vec<u32>,
+    pointer_arithmetic: Vec<u32>,
 }
 
 fn add_finding(
@@ -86,13 +82,29 @@ fn match_function(
         .filter_map(|id| by_id.get(id.as_str()).copied())
         .collect();
 
+    // Intern object identities once.  The old representation put five cloned
+    // ObjectKey vectors into every worklist state; on branch-heavy functions
+    // that made state hashing and transfer cloning dominate the actual event
+    // checks.  Handles are local to this function and never cross the ABI.
+    let mut object_ids: HashMap<ObjectKey, u32> = HashMap::new();
+    let mut objects = Vec::new();
+    for node in &function.nodes {
+        if let Some(object) = ObjectKey::from_node(node) {
+            if !object_ids.contains_key(&object) {
+                let id = objects.len() as u32;
+                object_ids.insert(object.clone(), id);
+                objects.push(object);
+            }
+        }
+    }
+
     let mut queue = VecDeque::from([(
         entry,
-        Vec::<ObjectKey>::new(),
-        Vec::<ObjectKey>::new(),
-        Vec::<ObjectKey>::new(),
-        Vec::<ObjectKey>::new(),
-        Vec::<ObjectKey>::new(),
+        Vec::<u32>::new(),
+        Vec::<u32>::new(),
+        Vec::<u32>::new(),
+        Vec::<u32>::new(),
+        Vec::<u32>::new(),
     )]);
     let mut seen = HashSet::new();
     let mut findings = HashMap::new();
@@ -105,11 +117,16 @@ fn match_function(
                     mut uninitialized, mut pointer_arithmetic)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
-        released.sort();
-        origins.sort();
-        nulls.sort();
-        uninitialized.sort();
-        pointer_arithmetic.sort();
+        released.sort_unstable();
+        released.dedup();
+        origins.sort_unstable();
+        origins.dedup();
+        nulls.sort_unstable();
+        nulls.dedup();
+        uninitialized.sort_unstable();
+        uninitialized.dedup();
+        pointer_arithmetic.sort_unstable();
+        pointer_arithmetic.dedup();
         let state = StateKey {
             node: index, released: released.clone(), origins: origins.clone(),
             nulls: nulls.clone(), uninitialized: uninitialized.clone(),
@@ -117,56 +134,65 @@ fn match_function(
         };
         if !seen.insert(state) { continue; }
         let node = &function.nodes[index];
-        let object = ObjectKey::from_node(node);
+        let object_id = ObjectKey::from_node(node)
+            .and_then(|object| object_ids.get(&object).copied());
         match node.event_kind.as_str() {
-            "ORIGIN" => if let Some(object) = object {
-                released.retain(|item| item != &object);
-                nulls.retain(|item| item != &object);
-                uninitialized.retain(|item| item != &object);
+            "ORIGIN" => if let Some(object) = object_id {
+                released.retain(|item| *item != object);
+                nulls.retain(|item| *item != object);
+                uninitialized.retain(|item| *item != object);
                 if !origins.contains(&object) { origins.push(object); }
             },
-            "RELEASE" => if let Some(object) = object {
+            "RELEASE" => if let Some(object) = object_id {
                 if released.contains(&object) {
-                    add_finding(&mut findings, &function.id, "double-free", &object, node);
+                    add_finding(&mut findings, &function.id, "double-free",
+                                &objects[object as usize], node);
                 }
                 released.push(object);
             },
-            "INVALIDATE" => if let Some(object) = object {
+            "INVALIDATE" => if let Some(object) = object_id {
                 released.push(object);
             },
-            "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object {
+            "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object_id {
                 if released.contains(&object) {
-                    add_finding(&mut findings, &function.id, "uaf.deref", &object, node);
+                    add_finding(&mut findings, &function.id, "uaf.deref",
+                                &objects[object as usize], node);
                 }
                 if nulls.contains(&object) {
-                    add_finding(&mut findings, &function.id, "null-deref", &object, node);
+                    add_finding(&mut findings, &function.id, "null-deref",
+                                &objects[object as usize], node);
                 }
                 if uninitialized.contains(&object) {
-                    add_finding(&mut findings, &function.id, "uninitialized-use", &object, node);
+                    add_finding(&mut findings, &function.id, "uninitialized-use",
+                                &objects[object as usize], node);
                 }
                 if pointer_arithmetic.contains(&object) {
                     add_finding(&mut findings, &function.id,
-                                "pointer-arithmetic-before-validation", &object, node);
+                                "pointer-arithmetic-before-validation",
+                                &objects[object as usize], node);
                 }
             },
-            "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object {
+            "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
                 if released.contains(&object) {
-                    add_finding(&mut findings, &function.id, "use.dangling", &object, node);
+                    add_finding(&mut findings, &function.id, "use.dangling",
+                                &objects[object as usize], node);
                 }
                 if uninitialized.contains(&object) {
-                    add_finding(&mut findings, &function.id, "uninitialized-use", &object, node);
+                    add_finding(&mut findings, &function.id, "uninitialized-use",
+                                &objects[object as usize], node);
                 }
                 if node.event_kind == "RETURN_VALUE" && node.stack_local {
-                    add_finding(&mut findings, &function.id, "use-after-return", &object, node);
+                    add_finding(&mut findings, &function.id, "use-after-return",
+                                &objects[object as usize], node);
                 }
             },
-            "WRITE_STORAGE_NULL" => if let Some(object) = object {
+            "WRITE_STORAGE_NULL" => if let Some(object) = object_id {
                 nulls.push(object);
             },
-            "UNINITIALIZED" => if let Some(object) = object {
+            "UNINITIALIZED" => if let Some(object) = object_id {
                 uninitialized.push(object);
             },
-            "POINTER_ARITHMETIC" => if let Some(object) = object {
+            "POINTER_ARITHMETIC" => if let Some(object) = object_id {
                 pointer_arithmetic.push(object);
             },
             _ => {}
@@ -174,7 +200,8 @@ fn match_function(
         if exits.contains(&index) {
             for object in &origins {
                 if !released.contains(object) {
-                    add_finding(&mut findings, &function.id, "leak", object, node);
+                    add_finding(&mut findings, &function.id, "leak",
+                                &objects[*object as usize], node);
                 }
             }
         }
