@@ -192,6 +192,7 @@ struct Emitter {
     function_ids: FxHashMap<String, FxHashSet<String>>,
     function_definitions: FxHashMap<String, FxHashSet<String>>,
     function_declarations: FxHashMap<String, FxHashSet<String>>,
+    function_usrs: FxHashMap<String, String>,
     function_parameters: FxHashMap<String, Vec<String>>,
     usr_ids: FxHashMap<String, String>,
     path_cache: FxHashMap<String, String>,
@@ -288,19 +289,24 @@ unsafe fn resolved_declaration_id(
 }
 
 fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
-    let definitions: Vec<(String, String)> = emitter
-        .function_definitions
-        .iter()
-        .filter_map(|(name, ids)| {
-            if ids.len() == 1 { Some((name.clone(), ids.iter().next()?.clone())) } else { None }
-        })
-        .collect();
-    for (name, definition) in definitions {
-        let declarations: Vec<String> = emitter
-            .function_declarations
-            .get(&name)
-            .into_iter()
-            .flat_map(|ids| ids.iter().cloned())
+    let mut definitions = Vec::new();
+    for (name, ids) in &emitter.function_definitions {
+        for definition in ids {
+            let identity = emitter.function_usrs.get(definition)
+                .map(|usr| ("usr".to_owned(), usr.clone()))
+                .unwrap_or_else(|| ("name".to_owned(), name.clone()));
+            definitions.push((identity, definition.clone()));
+        }
+    }
+    for ((identity_kind, identity), definition) in definitions {
+        let declarations: Vec<String> = emitter.function_declarations.iter()
+            .filter(|(name, ids)| ids.iter().any(|id| {
+                match emitter.function_usrs.get(id) {
+                    Some(usr) => identity_kind == "usr" && usr == &identity,
+                    None => identity_kind == "name" && name.as_str() == identity,
+                }
+            }))
+            .flat_map(|(_, ids)| ids.iter().cloned())
             .collect();
         for declaration in declarations {
             if declaration == definition {
@@ -780,6 +786,9 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     ) {
         let usr = cursor_usr(cursor);
         if !usr.is_empty() {
+            if is_function_syntax(&syntax_kind) {
+                emitter.function_usrs.insert(id.clone(), usr.clone());
+            }
             emitter.usr_ids.entry(usr).or_insert_with(|| id.clone());
         }
     }
@@ -1821,6 +1830,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             function_ids: FxHashMap::default(),
             function_definitions: FxHashMap::default(),
             function_declarations: FxHashMap::default(),
+            function_usrs: FxHashMap::default(),
             function_parameters: FxHashMap::default(),
             usr_ids: FxHashMap::default(),
             path_cache: FxHashMap::default(),
