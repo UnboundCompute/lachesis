@@ -644,6 +644,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_selects_generic_finding_routes() {
+        let result = lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("r", "memory.free", 2),
+                                             node("u", "memory.deref", 3)])],
+            ..Default::default()
+        };
+        let catalog = crate::atropos_proto::PatternCatalog {
+            patterns: vec![crate::atropos_proto::Pattern {
+                matcher_pattern: "uaf.deref".into(), ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let matched = match_result_with_catalog(result, Some(&catalog));
+        assert_eq!(matched.functions[0].findings.len(), 1);
+        assert_eq!(matched.functions[0].findings[0].pattern, "uaf.deref");
+    }
+
+    #[test]
     fn reports_the_effective_guard_on_a_finding() {
         let nodes = vec![node("o", "ORIGIN", 1), node("r1", "RELEASE", 2),
                          node("r2", "RELEASE", 3)];
