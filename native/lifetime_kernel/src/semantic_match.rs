@@ -5,7 +5,8 @@
 //! states carry `u32` handles rather than cloning root/selector/generation
 //! strings on every CFG transfer.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::lifetime_proto;
 
@@ -44,7 +45,7 @@ struct StateKey {
 }
 
 fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while seen.insert(value) {
         let Some((_, target)) = bindings.iter().find(|(source, _)| *source == value)
         else { break };
@@ -78,7 +79,7 @@ fn add_finding(
 fn match_function(
     function: &lifetime_proto::NativeSemanticFunction,
 ) -> lifetime_proto::NativeTemporalFunction {
-    let mut by_id = HashMap::with_capacity(function.nodes.len());
+    let mut by_id = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
     for (index, node) in function.nodes.iter().enumerate() {
         by_id.insert(node.id.as_str(), index);
     }
@@ -97,23 +98,29 @@ fn match_function(
     // ObjectKey vectors into every worklist state; on branch-heavy functions
     // that made state hashing and transfer cloning dominate the actual event
     // checks.  Handles are local to this function and never cross the ABI.
-    let mut object_ids: HashMap<ObjectKey, u32> = HashMap::new();
+    let mut object_ids: HashMap<ObjectKey, u32> = HashMap::default();
     let mut objects = Vec::new();
-    for node in &function.nodes {
-        for object in [
-            ObjectKey::from_node(node),
-            (!node.value_root.is_empty()).then(|| ObjectKey {
-                root: node.value_root.clone(),
-                selectors: node.value_selectors.clone(),
-                generation: if node.generation.is_empty() { "g0".to_owned() }
-                            else { node.generation.clone() },
-            }),
-        ].into_iter().flatten() {
-            if !object_ids.contains_key(&object) {
+    let mut node_object_ids = vec![None; function.nodes.len()];
+    let mut node_value_ids = vec![None; function.nodes.len()];
+    for (index, node) in function.nodes.iter().enumerate() {
+        let value_object = (!node.value_root.is_empty()).then(|| ObjectKey {
+            root: node.value_root.clone(),
+            selectors: node.value_selectors.clone(),
+            generation: if node.generation.is_empty() { "g0".to_owned() }
+                        else { node.generation.clone() },
+        });
+        for (slot, object) in [ObjectKey::from_node(node), value_object].into_iter().enumerate() {
+            let Some(object) = object else { continue };
+            let id = if let Some(id) = object_ids.get(&object) {
+                *id
+            } else {
                 let id = objects.len() as u32;
                 object_ids.insert(object.clone(), id);
                 objects.push(object);
-            }
+                id
+            };
+            if slot == 0 { node_object_ids[index] = Some(id); }
+            else { node_value_ids[index] = Some(id); }
         }
     }
 
@@ -126,8 +133,8 @@ fn match_function(
         Vec::<u32>::new(),
         Vec::<u32>::new(),
     )]);
-    let mut seen = HashSet::new();
-    let mut findings = HashMap::new();
+    let mut seen = HashSet::default();
+    let mut findings = HashMap::default();
     let mut transfers = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
@@ -156,16 +163,9 @@ fn match_function(
         };
         if !seen.insert(state) { continue; }
         let node = &function.nodes[index];
-        let raw_object_id = ObjectKey::from_node(node)
-            .and_then(|object| object_ids.get(&object).copied());
+        let raw_object_id = node_object_ids[index];
         let object_id = raw_object_id.map(|value| canonical(value, &bindings));
-        let value_id = if node.value_root.is_empty() { None } else {
-            object_ids.get(&ObjectKey {
-                root: node.value_root.clone(), selectors: node.value_selectors.clone(),
-                generation: if node.generation.is_empty() { "g0".to_owned() }
-                            else { node.generation.clone() },
-            }).copied().map(|value| canonical(value, &bindings))
-        };
+        let value_id = node_value_ids[index].map(|value| canonical(value, &bindings));
         match node.event_kind.as_str() {
             "DERIVE" => if let (Some(target), Some(value)) = (raw_object_id, value_id) {
                 bindings.retain(|(source, _)| *source != target);
