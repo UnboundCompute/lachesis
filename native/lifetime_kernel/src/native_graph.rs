@@ -20,7 +20,7 @@ const FRAME_HEADER: usize = 4;
 // sidecar remains lossless; filtering here prevents unrelated overlay edges
 // from being duplicated into every native FunctionInput.
 fn retain_lifetime_edge(kind: &str) -> bool {
-    matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT")
+    matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT" | "HAS_ARGUMENT")
 }
 
 /// Map the immutable Pass-1 substrate instead of reading a second full byte
@@ -150,6 +150,14 @@ fn resolve_decl(node: &str, refs: &HashMap<String, String>,
         .find_map(|child| resolve_decl(child, refs, children, seen))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SummaryEffect {
+    kind: i32,
+    position: u32,
+    selectors: Vec<String>,
+    is_return: bool,
+}
+
 fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     if input.len().saturating_sub(*offset) < FRAME_HEADER {
         return Err("truncated graph sidecar frame header".to_owned());
@@ -257,8 +265,13 @@ fn sidecar_to_request_inner(
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
-    let (owners, function_names, call_ids, edges_by_source, initializer_targets) = scan_lifetime_metadata(
-        input, selected_ids, |item| {
+    let release_names: HashSet<String> = roles.iter()
+        .filter(|(_, role)| role.as_str() == "release")
+        .map(|((_, name), _)| name.clone())
+        .collect();
+    let (owners, function_names, call_ids, edges_by_source, initializer_targets,
+         release_value_ids, refs, children) = scan_lifetime_metadata(
+        input, selected_ids, &release_names, |item| {
             let item_id = item.id.clone();
             let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
             let function = if function_kind(&syntax) {
@@ -317,6 +330,16 @@ fn sidecar_to_request_inner(
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
+        // A compiler call may be indirect through a global or local function
+        // pointer. If that pointer's initializer resolves to a catalogued
+        // release primitive, preserve the same lifecycle effect as a direct
+        // call. This is deliberately based on compiler REFERS_TO/AST_CHILD
+        // facts, never on a library-specific symbol name.
+        let indirect_release = edges_by_source.get(&item.id).into_iter().flatten()
+            .filter(|edge| edge.kind == "AST_CHILD" && edge.role != "ARGUMENT")
+            .any(|edge| resolve_decl(&edge.target, &refs, &children, &mut HashSet::new())
+                .is_some_and(|target| release_value_ids.contains(&target)));
+        if indirect_release { call.is_release = true; }
         if let Some(role) = lifecycle_role(roles, &function, &call.callee) {
             match role {
                 "alloc" | "acquire" => call.is_alloc = true,
@@ -350,9 +373,13 @@ fn sidecar_to_request_inner(
                 call.assigned = initializer.target.clone();
             }
         }
+        let explicit_arguments = edges_by_source.get(&item.id).into_iter().flatten()
+            .filter(|edge| edge.kind == "HAS_ARGUMENT"
+                || (edge.kind == "AST_CHILD" && edge.role == "ARGUMENT"))
+            .count();
         let mut arguments = edges_by_source.get(&item.id).into_iter().flatten().filter_map(|edge| {
-            if edge.kind != "AST_CHILD"
-                || edge.role != "ARGUMENT" { return None; }
+            if edge.kind != "HAS_ARGUMENT"
+                && !(edge.kind == "AST_CHILD" && edge.role == "ARGUMENT") { return None; }
             Some(lifetime_proto::FunctionArgument {
                 position: edge.position as u32,
                 node: edge.target.clone(),
@@ -362,6 +389,26 @@ fn sidecar_to_request_inner(
                 root_name: String::new(),
             })
         }).collect::<Vec<_>>();
+        // Some compiler ASTs omit argument roles on CallExpr children.  In
+        // that representation Clang's first direct child is the callee and
+        // the remaining children are arguments in source order.  Recover the
+        // same generic call contract without relying on spelling, language, or
+        // a catalog entry for the callee.
+        if explicit_arguments == 0 {
+            arguments = edges_by_source.get(&item.id).into_iter().flatten()
+                .filter(|edge| edge.kind == "AST_CHILD")
+                .skip(1)
+                .enumerate()
+                .map(|(position, edge)| lifetime_proto::FunctionArgument {
+                    position: position as u32,
+                    node: edge.target.clone(),
+                    root: String::new(),
+                    selectors: Vec::new(),
+                    expression: String::new(),
+                    root_name: String::new(),
+                })
+                .collect();
+        }
         arguments.sort_by_key(|argument| argument.position);
         call.arguments = arguments;
         built_calls.push((function, call));
@@ -393,14 +440,15 @@ fn sidecar_to_request_inner(
     let names_by_input_id: HashMap<String, String> = functions.keys().filter_map(|id| {
         function_names_by_id.get(id).map(|name| (id.clone(), name.clone()))
     }).collect();
-    let mut summary_effects: HashMap<String, Vec<(u32, Vec<String>)>> = HashMap::new();
+    let mut summary_effects: HashMap<String, Vec<SummaryEffect>> = HashMap::new();
     for (id, input) in &functions {
         let Some(name) = names_by_input_id.get(id) else { continue };
         // Most functions do not directly release/reallocate a parameter.  Do
         // not build three temporary AST indexes for those functions; their
         // summary is known to be empty until a callee summary can flow into
         // them in the fixed point below.
-        if !input.calls.iter().any(|call| call.is_release || call.is_realloc) {
+        if !input.calls.iter().any(|call| call.is_release || call.is_realloc)
+            && !input.returns.iter().any(|ret| ret.kind == "var") {
             summary_effects.insert(name.clone(), Vec::new());
             continue;
         }
@@ -414,17 +462,40 @@ fn sidecar_to_request_inner(
         }
         let parameter_positions: HashMap<String, u32> = input.parameters.iter()
             .enumerate().map(|(position, node)| (node.clone(), position as u32)).collect();
-        let mut effects: Vec<(u32, Vec<String>)> = Vec::new();
+        let mut effects: Vec<SummaryEffect> = Vec::new();
         for call in &input.calls {
             if !call.is_release && !call.is_realloc { continue; }
             for argument in &call.arguments {
                 let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
                     &mut HashSet::new()) else { continue };
                 let Some(position) = parameter_positions.get(&declaration) else { continue };
-                if !effects.iter().any(|(existing, selectors)| *existing == *position && selectors.is_empty()) {
-                    effects.push((*position, Vec::new()));
+                if !effects.iter().any(|effect| effect.position == *position
+                    && effect.selectors.is_empty() && !effect.is_return) {
+                    effects.push(SummaryEffect {
+                        kind: lifetime_proto::operation::Kind::Free as i32,
+                        position: *position,
+                        selectors: Vec::new(),
+                        is_return: false,
+                    });
                 }
             }
+        }
+        // A function returning one of its formal pointer values creates the
+        // same caller-visible alias recorded by the Python summary engine.
+        // Keep this generic: the compiler frontend supplies the return root
+        // and selectors; no source spelling or vulnerability is involved.
+        for returned in &input.returns {
+            if returned.kind != "var" { continue; }
+            let Some(declaration) = resolve_decl(&returned.root, &refs, &children,
+                &mut HashSet::new()).or_else(|| Some(returned.root.clone())) else { continue };
+            let Some(position) = parameter_positions.get(&declaration) else { continue };
+            let effect = SummaryEffect {
+                kind: lifetime_proto::operation::Kind::Use as i32,
+                position: *position,
+                selectors: returned.selectors.clone(),
+                is_return: true,
+            };
+            if !effects.contains(&effect) { effects.push(effect); }
         }
         summary_effects.insert(name.clone(), effects);
     }
@@ -450,18 +521,23 @@ fn sidecar_to_request_inner(
             let mut additions = Vec::new();
             for call in &input.calls {
                 let Some(callee_effects) = summary_effects.get(&call.callee) else { continue };
-                for (callee_position, selectors) in callee_effects {
+                for callee_effect in callee_effects {
                     let Some(argument) = call.arguments.iter()
-                        .find(|argument| argument.position == *callee_position) else { continue };
+                        .find(|argument| argument.position == callee_effect.position) else { continue };
                     let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
                         &mut HashSet::new()) else { continue };
                     let Some(position) = parameter_positions.get(&declaration) else { continue };
-                    additions.push((*position, selectors.clone()));
+                    additions.push(SummaryEffect {
+                        kind: callee_effect.kind,
+                        position: *position,
+                        selectors: callee_effect.selectors.clone(),
+                        is_return: callee_effect.is_return,
+                    });
                 }
             }
             let target = summary_effects.get_mut(name).expect("summary entry exists");
             for addition in additions {
-                if !target.iter().any(|existing| *existing == addition) {
+                if !target.contains(&addition) {
                     target.push(addition);
                     changed = true;
                 }
@@ -483,12 +559,12 @@ fn sidecar_to_request_inner(
             });
             let summary = &mut input.summaries[summary_index];
             let mut alternative = lifetime_proto::FunctionSummaryAlternative { effects: Vec::new() };
-            for (position, selectors) in effects {
+            for effect in effects {
                 alternative.effects.push(lifetime_proto::FunctionSummaryEffect {
-                    kind: lifetime_proto::operation::Kind::Free as i32,
-                    position: *position,
-                    selectors: selectors.clone(),
-                    is_return: false,
+                    kind: effect.kind,
+                    position: effect.position,
+                    selectors: effect.selectors.clone(),
+                    is_return: effect.is_return,
                 });
             }
             summary.alternatives.push(alternative);
@@ -594,6 +670,7 @@ fn input_edge(record: graph_proto::EdgeRecord) -> lifetime_proto::GraphEdge {
 fn scan_lifetime_metadata(
     input: &[u8],
     selected_ids: Option<&HashSet<String>>,
+    release_names: &HashSet<String>,
     mut on_node: impl FnMut(graph_proto::NodeRecord),
 ) -> Result<(
     HashMap<String, String>,
@@ -601,6 +678,9 @@ fn scan_lifetime_metadata(
     HashSet<String>,
     HashMap<String, Vec<lifetime_proto::GraphEdge>>,
     HashMap<String, HashSet<String>>,
+    HashSet<String>,
+    HashMap<String, String>,
+    HashMap<String, Vec<String>>,
 ), String> {
     let mut offset = 0;
     let header = frame(input, &mut offset)?;
@@ -612,6 +692,8 @@ fn scan_lifetime_metadata(
     let mut call_ids = HashSet::new();
     let mut edges_by_source: HashMap<String, Vec<lifetime_proto::GraphEdge>> = HashMap::new();
     let mut initializer_targets: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut variable_meta: HashMap<String, (String, String, bool)> = HashMap::new();
+    let mut release_symbol_ids = HashSet::new();
     while offset < input.len() {
         let payload = frame(input, &mut offset)?;
         if payload.is_empty() { continue; }
@@ -623,6 +705,16 @@ fn scan_lifetime_metadata(
                     owners.insert(item.id.clone(), function.to_owned());
                 }
                 let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
+                if matches!(item.kind.as_str(), "variable" | "property") || syntax == "VarDecl" {
+                    variable_meta.insert(item.id.clone(), (
+                        item.label.clone(),
+                        record_text(&item, "type").unwrap_or_default().to_owned(),
+                        owner_ref(&item).is_some(),
+                    ));
+                }
+                if release_names.contains(item.label.as_str()) {
+                    release_symbol_ids.insert(item.id.clone());
+                }
                 if function_kind(&syntax) {
                     function_names.insert(item.id.clone(), item.label.clone());
                 }
@@ -655,7 +747,32 @@ fn scan_lifetime_metadata(
             _ => return Err("unknown graph sidecar record prefix".to_owned()),
         }
     }
-    Ok((owners, function_names, call_ids, edges_by_source, initializer_targets))
+    let refs: HashMap<String, String> = edges_by_source.values().flatten()
+        .filter(|edge| edge.kind == "REFERS_TO")
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges_by_source.values().flatten().filter(|edge| edge.kind == "AST_CHILD") {
+        children.entry(edge.source.clone()).or_default().push(edge.target.clone());
+    }
+    let directly_releasing: HashSet<String> = variable_meta.keys().filter(|variable| {
+        children.get(variable.as_str()).into_iter().flatten().any(|child| {
+            release_symbol_ids.contains(child)
+                || resolve_decl(child, &refs, &children, &mut HashSet::new())
+                    .is_some_and(|target| release_symbol_ids.contains(&target))
+        })
+    }).cloned().collect();
+    let release_signatures: HashSet<(String, String)> = directly_releasing.iter()
+        .filter_map(|id| variable_meta.get(id).filter(|(_, _, owner)| !*owner)
+            .map(|(label, ty, _)| (label.clone(), ty.clone())))
+        .collect();
+    let release_value_ids: HashSet<String> = variable_meta.iter()
+        .filter(|(_, (label, ty, owner))| !*owner
+            && release_signatures.contains(&(label.clone(), ty.clone())))
+        .map(|(id, _)| id.clone())
+        .collect();
+    Ok((owners, function_names, call_ids, edges_by_source, initializer_targets,
+        release_value_ids, refs, children))
 }
 
 fn compact_property<'a>(node: &'a CompactNode, key: &str) -> Option<&'a str> {

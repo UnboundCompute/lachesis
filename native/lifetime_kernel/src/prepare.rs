@@ -170,11 +170,21 @@ impl<'a> GraphView<'a> {
             .is_some_and(|value| value.contains('*') || value.contains('['))
     }
 
+    fn is_null(&self, id: &str) -> bool {
+        let id = self.peel(id.to_owned());
+        matches!(self.kind(&id), "GNUNullExpr" | "CXXNullPtrLiteralExpr")
+            || (self.kind(&id) == "IntegerLiteral"
+                && matches!(self.label(&id).trim(), "0" | "NULL" | "nullptr"))
+    }
+
     fn peel(&self, mut id: String) -> String {
         for _ in 0..12 {
             if matches!(self.kind(&id), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
+                "UnexposedExpr" | "CXXBindTemporaryExpr" | "MaterializeTemporaryExpr" |
+                "ExprWithCleanups" | "ConstantExpr" | "OpaqueValueExpr" |
                 "CXXConstCastExpr" | "CXXStaticCastExpr" | "CXXReinterpretCastExpr" | "CXXFunctionalCastExpr") {
-                if let Some(child) = self.children_of(&id).and_then(|items| items.first()) {
+                if let Some(child) = self.children_of(&id).and_then(|items| items.into_iter()
+                    .find(|child| **child != id.as_str())) {
                     id = (*child).to_owned();
                     continue;
                 }
@@ -855,7 +865,23 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for node_id in &node_ids {
         let kind = graph.kind(node_id);
         let children = graph.children_owned(node_id);
-        if kind == "BinaryOperator" && graph.operator(node_id) == "=" && children.len() >= 2 {
+        if kind == "BinaryOperator" && matches!(graph.operator(node_id), "==" | "!=" | "<" | "<=" | ">" | ">=") {
+            for child in &children {
+                if graph.is_pointer(child) {
+                    if let Some(target) = graph.access_path(child, 0) {
+                        operations.push(raw_operation(
+                            Kind::Use,
+                            node_id,
+                            Some(target),
+                            None,
+                            graph.node(node_id).and_then(|node| integer_property(node, "start_line")),
+                            false,
+                            "compare",
+                        ));
+                    }
+                }
+            }
+        } else if kind == "BinaryOperator" && graph.operator(node_id) == "=" && children.len() >= 2 {
             let mut ordered = children;
             ordered.sort_by_key(|child| graph.offset(child));
             let rhs = ordered.get(1).or_else(|| ordered.first());
@@ -877,7 +903,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                             }
                             else if call.is_source { (Kind::Clobber, None, false) }
                             else { (Kind::Clobber, graph.access_path(&rhs_id, 0), false) }
-                        } else if matches!(graph.kind(&rhs_id), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
+                        } else if graph.is_null(&rhs_id) {
                             (Kind::Clobber, None, true)
                         } else if let Some(source) = graph.access_path(&rhs_id, 0) {
                             (Kind::Copy, Some(source), false)
@@ -898,7 +924,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                     else if call.is_realloc { (Kind::Realloc, None, false) }
                     else if call.is_source { (Kind::Clobber, None, false) }
                     else { (Kind::Copy, graph.access_path(&initializer, 0), false) }
-                } else if matches!(graph.kind(&initializer), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
+                } else if graph.is_null(&initializer) {
                     (Kind::Clobber, None, true)
                 } else if let Some(source) = graph.access_path(&initializer, 0) {
                     (Kind::Copy, Some(source), false)
@@ -965,7 +991,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 aggregate.access = "aggregate-copy".to_owned();
                 operations.push(aggregate);
             }
-        } else if let Some(summary) = summary_by_callee.get(call.callee.as_str()) {
+        } else if let Some(summary) = summary_by_callee.get(call.callee.as_str())
+            .filter(|summary| !summary.alternatives.is_empty()) {
             for alternative in &summary.alternatives {
                 let mut effects = Vec::new();
                 for effect in &alternative.effects {
@@ -998,8 +1025,21 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         } else {
             for argument in &call.arguments {
-                if let Some(target) = path(Some(&argument.node)) {
-                    operations.push(operation(Kind::Use, &call.node, Some(target), None, call));
+                if let Some(target) = graph.access_path(&argument.node, 0)
+                    .or_else(|| path(Some(&argument.node))) {
+                    // Match the generic Python operation contract: an
+                    // argument to an unknown/ordinary callee is a value pass,
+                    // not a proven pointee dereference. The temporal matcher
+                    // can still report a dangling value after a release.
+                    operations.push(raw_operation(
+                        Kind::Use,
+                        &call.node,
+                        Some(target),
+                        None,
+                        call.has_line.then_some(call.line),
+                        false,
+                        "pass",
+                    ));
                 }
             }
         }
@@ -1021,12 +1061,39 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 root_name: String::new(),
             });
         } else if let Some(path) = graph.access_path(&child, 0) {
+            let root_id = path.root.strip_prefix("decl:").unwrap_or(path.root.as_str());
+            let stack_local = graph.node(root_id)
+                .is_some_and(|root| {
+                    graph.kind(root_id) == "VarDecl"
+                        && text_property(root, "owner_function_id") == Some(input.id.as_str())
+                        && (text_property(root, "type").is_some_and(|value| value.contains('['))
+                            || path.selectors.iter().any(|selector| selector == "&"))
+                });
+            operations.push(raw_operation(
+                Kind::Use,
+                node_id,
+                Some(path.clone()),
+                None,
+                line,
+                false,
+                if stack_local { "return-stack" } else { "return" },
+            ));
             returns.push(lifetime_proto::FunctionReturn {
                 kind: "var".to_owned(), callee: String::new(),
                 root: path.root, selectors: path.selectors,
                 line: line.unwrap_or_default(), has_line: line.is_some(),
                 root_name: String::new(),
             });
+        } else if graph.is_null(&peeled) {
+            operations.push(raw_operation(
+                Kind::Clobber,
+                node_id,
+                Some(Path::root("__return__")),
+                None,
+                line,
+                false,
+                "return-null",
+            ));
         }
     }
     returns.sort_by_key(|item| (if item.has_line { item.line } else { i64::MAX }, item.root.clone()));
@@ -1045,6 +1112,30 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             if let Some(initializer) = graph.initializer_of(&item.node) {
                 let initializer = graph.peel(initializer.to_owned());
                 if cfg_node_set.contains(&initializer) { anchor = initializer; }
+            }
+        }
+        if !cfg_node_set.contains(&anchor) {
+            let operation_line = graph.node(&item.node)
+                .and_then(|node| integer_property(node, "start_line"));
+            if let Some(line) = operation_line {
+                if let Some(nearest) = cfg_node_set.iter()
+                    .filter(|candidate| graph.node(candidate)
+                        .and_then(|node| integer_property(node, "start_line")) == Some(line))
+                    .min_by_key(|candidate| graph.offset(candidate).abs_diff(graph.offset(&item.node))) {
+                    anchor = nearest.clone();
+                }
+            }
+        }
+        if !cfg_node_set.contains(&anchor) {
+            // Some compiler ASTs do not persist an AST-parent edge from an
+            // expression to the statement CFG. Attach the operation to the
+            // closest preceding CFG anchor by source offset so control-flow
+            // order remains authoritative without inventing a new path.
+            let operation_offset = graph.offset(&item.node);
+            if let Some(nearest) = cfg_node_set.iter()
+                .filter(|candidate| graph.offset(candidate) <= operation_offset)
+                .max_by_key(|candidate| graph.offset(candidate)) {
+                anchor = nearest.clone();
             }
         }
         if cfg_node_set.contains(&anchor) { item.node = anchor; }
