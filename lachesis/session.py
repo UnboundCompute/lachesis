@@ -58,7 +58,10 @@ class _ProgressAdapter:
         if self.callback is not None:
             self.callback(message, 0.0)
 
-    def done(self) -> None:
+    def done(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def fail(self) -> None:
         return None
 
 # The library defaults ``analyze`` to a wall-clock bound so a single call can never run
