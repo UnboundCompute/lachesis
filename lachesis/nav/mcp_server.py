@@ -1106,8 +1106,8 @@ def _semantic_payload(semantic):
     path = semantic.get("native_sidecar")
     if not path:
         return semantic
-    from lachesis.flow.native_translate import load_native_semantic_graph_sidecar
-    return load_native_semantic_graph_sidecar(path).to_dict()
+    from lachesis.nav.semantic_query import load_semantic_sidecar
+    return load_semantic_sidecar(path).to_dict()
 
 
 def _semantic_lifecycle_report(c, args):

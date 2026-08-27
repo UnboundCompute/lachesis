@@ -139,78 +139,6 @@ def native_match_leads(result) -> list[dict[str, Any]]:
     return leads
 
 
-def _semantic_function_language(function, fallback: str) -> str:
-    """Read the optional native language tag across old/new protobuf bindings."""
-    explicit = getattr(function, "language", "")
-    if explicit:
-        return explicit
-    identifier = getattr(function, "id", "")
-    if ":cpython-ast:" in identifier or ":python:" in identifier:
-        return "python"
-    if ":typescript-compiler-api:" in identifier or ":typescript:" in identifier:
-        return "typescript"
-    if ":javascript:" in identifier:
-        return "javascript"
-    if ":clang-c:" in identifier or ":clang-cpp:" in identifier:
-        return "c"
-    return fallback
-
-
-def _decode_native_semantic_result(result, lang="mixed"):
-    from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
-
-    graph = SkeletonGraph(language=lang)
-    for function in result.functions:
-        if not function.nodes:
-            continue
-        node_ids = {node.id for node in function.nodes}
-        for node in function.nodes:
-            event = None
-            if node.event_kind:
-                kind = getattr(EventKind, node.event_kind, node.event_kind)
-                obj = (ObjRef(node.object_root, tuple(node.object_selectors),
-                              node.generation or "g0")
-                       if node.object_root else None)
-                event = Event(kind, obj=obj, base=obj,
-                              path="*" if obj is not None else None,
-                              line=node.line if node.has_line else None)
-            function_language = _semantic_function_language(function, lang)
-            graph.add_node(node.id, event, fragment=function.id,
-                           owner_function_id=function.id, native_anchor=node.anchor,
-                           language=function_language)
-        for edge in function.edges:
-            if edge.source in node_ids and edge.target in node_ids:
-                graph.add_edge(edge.source, edge.target, kind=edge.kind or "normal")
-        exits = [node for node in function.exits if node in node_ids]
-        graph.add_fragment(
-            function.id,
-            function.entry if function.entry in node_ids else function.nodes[0].id,
-            exits=exits or [function.nodes[-1].id],
-        )
-    if not result.complete:
-        graph.coverage["converged"] = False
-    return graph
-
-
-def build_native_semantic_graph(store, lang="mixed"):
-    """Build or load the Rust semantic graph from the binary Pass-2 substrate."""
-    base = _base(store)
-    if not base:
-        raise RuntimeError("native Pass-3 requires a store-backed binary substrate")
-    input_path = pass2_input_cache_path(base)
-    if not input_path.is_file():
-        raise RuntimeError("native Pass-3 substrate sidecar is missing")
-    output_path = native_semantic_sidecar_path(store)
-    if _sidecar_stale(output_path, input_path):
-        write_semantic_path(input_path, output_path)
-    try:
-        result = lifetime_pb2.NativeSemanticResult()
-        result.ParseFromString(output_path.read_bytes())
-    except (OSError, ValueError) as error:
-        raise RuntimeError("native Pass-3 semantic sidecar is invalid") from error
-    return _decode_native_semantic_result(result, lang)
-
-
 def ensure_native_semantic_sidecar(store):
     """Publish the Rust semantic sidecar without materializing the graph in Python."""
     base = _base(store)
@@ -238,46 +166,5 @@ def ensure_native_semantic_sidecar(store):
     return output_path
 
 
-def load_native_semantic_graph_sidecar(path, lang="mixed"):
-    """Decode a native semantic sidecar for a scoped SDK/query response."""
-    try:
-        result = lifetime_pb2.NativeSemanticResult()
-        result.ParseFromString(Path(path).read_bytes())
-    except (OSError, ValueError) as error:
-        raise RuntimeError("native Pass-3 semantic sidecar is invalid") from error
-    return _decode_native_semantic_result(result, lang)
-
-
 def native_semantic_events_path(path) -> Path:
     return Path(f"{path}.events.pb")
-
-
-def load_native_semantic_events_sidecar(path, lang="mixed"):
-    """Decode only event nodes from the compact Rust sidecar."""
-    from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
-
-    try:
-        result = lifetime_pb2.NativeSemanticResult()
-        result.ParseFromString(native_semantic_events_path(path).read_bytes())
-    except (OSError, ValueError) as error:
-        raise RuntimeError("native Pass-3 event sidecar is invalid") from error
-    graph = SkeletonGraph(language=lang)
-    for function in result.functions:
-        for node in function.nodes:
-            if not node.event_kind:
-                continue
-            kind = getattr(EventKind, node.event_kind, node.event_kind)
-            obj = (ObjRef(node.object_root, tuple(node.object_selectors),
-                          node.generation or "g0")
-                   if node.object_root else None)
-            graph.add_node(
-                node.id,
-                Event(kind, obj=obj, base=obj, path="*" if obj else None,
-                      line=node.line if node.has_line else None),
-                fragment=function.id,
-                owner_function_id=function.id,
-                native_anchor=node.anchor,
-            )
-    if not result.complete:
-        graph.coverage["converged"] = False
-    return graph

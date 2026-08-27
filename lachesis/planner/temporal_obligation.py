@@ -79,8 +79,8 @@ class TemporalLifecycle:
             # Expand it only when a temporal constructor is actually queried;
             # ``enrich`` itself must not parse a 300MB semantic graph merely to
             # build an unused registry.
-            from ..flow.native_translate import load_native_semantic_graph_sidecar
-            native = load_native_semantic_graph_sidecar(
+            from ..nav.semantic_query import load_semantic_sidecar
+            native = load_semantic_sidecar(
                 semantic["native_sidecar"], self.language or "mixed")
             if native is not None:
                 semantic = {

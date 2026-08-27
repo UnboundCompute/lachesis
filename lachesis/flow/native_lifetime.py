@@ -210,14 +210,6 @@ def write_semantic_path(input_path, output_path) -> None:
         raise RuntimeError(f"native semantic graph failed with status {status}")
 
 
-def semantic_path(input_path, output_path):
-    """Publish and decode the semantic result for compatibility callers."""
-    write_semantic_path(input_path, output_path)
-    result = lifetime_pb2.NativeSemanticResult()
-    result.ParseFromString(Path(output_path).read_bytes())
-    return result
-
-
 def match_semantic_path(input_path: str | os.PathLike[str],
                         output_path: str | os.PathLike[str]) -> None:
     """Run the native Pass-3 matcher over a semantic protobuf sidecar.
