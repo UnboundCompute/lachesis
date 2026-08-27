@@ -10,7 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from .native_lifetime import match_semantic_path, semantic_path
+from .native_lifetime import match_semantic_path, write_semantic_path
 from lachesis.core import lifetime_pb2
 from lachesis.nav.dataflow.substrate import (
     pass2_input_cache_path,
@@ -202,7 +202,7 @@ def build_native_semantic_graph(store, lang="mixed"):
         raise RuntimeError("native Pass-3 substrate sidecar is missing")
     output_path = native_semantic_sidecar_path(store)
     if _sidecar_stale(output_path, input_path):
-        semantic_path(input_path, output_path)
+        write_semantic_path(input_path, output_path)
     try:
         result = lifetime_pb2.NativeSemanticResult()
         result.ParseFromString(output_path.read_bytes())
@@ -219,13 +219,13 @@ def ensure_native_semantic_sidecar(store):
     output_path = native_semantic_sidecar_path(store)
     input_path = pass2_input_cache_path(base)
     if _sidecar_stale(output_path, input_path):
-        semantic_path(input_path, output_path)
+        write_semantic_path(input_path, output_path)
     events_path = Path(f"{output_path}.events.pb")
     if _sidecar_stale(events_path, input_path, output_path):
         # Regenerate through Rust so the event-only sibling is published atomically.
         temporary = Path(f"{output_path}.events-migrate.{os.getpid()}.pb")
         try:
-            semantic_path(input_path, temporary)
+            write_semantic_path(input_path, temporary)
             generated = Path(f"{temporary}.events.pb")
             os.replace(generated, events_path)
         finally:
