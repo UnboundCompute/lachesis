@@ -252,10 +252,8 @@ class _Ctx(Analysis):
     def flow_bundle(self):
         """The interprocedural flow pass over the whole graph, computed once and cached.
 
-        Delegates to :meth:`Analysis._flow_bundle` with ``engine=None`` so an operator who
-        runs this server with ``LACHESIS_LIFETIME_ENGINE=legacy`` is not silently forced into
-        object mode -- the env fallback inside ``run_pass`` still wins. The library's
-        ``analyze`` is opinionated (object by default); the server stays neutral on engine.
+        Delegates to the single native Rust flow engine shared with the public library.
+        Engine selection is intentionally not configurable on the MCP surface.
 
         It is *not* neutral on the clock: the pass is bounded by the same default budget the
         library uses (:meth:`Analysis._resolve_deadline`: ``LACHESIS_HARD_STOP`` or 180s), so a
@@ -602,17 +600,21 @@ TOOLS = [
          "unknown_offset": {"type": "integer", "default": 0}},
          "required": ["question"]}},
     {"name": "scan",
-     "description": "Scan the graph for guard-differential investigation capsules: entrypoints "
-                    "that can reach sensitive effects without a recognized dominating guard. "
-                    "Returns ranked questions, not verdicts, plus an exhaustive census showing "
-                    "scanned/skipped entrypoints, suppressed capsules, truncated closures, and "
-                    "the explicit analysis frontier. Results are cached per graph; use "
-                    "entrypoints to bound the initial scan and min_rank/limit for the returned page.",
+     "description": "Return ranked leads from the whole taxonomy by default (lens=all): "
+                    "questions to investigate, never verdicts. Use lens=guard-diff for the "
+                    "entrypoint-to-effect guard view or lens=flow for native object-lifetime "
+                    "leads. Results are bounded and paged; the response includes coverage and "
+                    "whether the requested temporal work completed. The single native engine "
+                    "is selected internally.",
      "inputSchema": {"type": "object", "properties": {
+         "lens": {"type": "string", "enum": ["all", "guard-diff", "flow"],
+                  "default": "all", "description": "lead view; all is the broad default"},
          "entrypoints": {"type": "integer", "default": 0,
                          "description": "scan only the first N entrypoints (0 = all)"},
          "min_rank": {"type": "number", "default": 0.0},
          "limit": {"type": "integer", "default": 20},
+         "hard_stop": {"type": "number", "default": 180,
+                       "description": "temporal budget in seconds; 0 = unbounded"},
          "include_suppressions": {"type": "boolean", "default": False}},
          "required": []}},
     {"name": "wrapper_model",
@@ -1369,7 +1371,36 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
 
     if name == "scan":
-        scan = c.scan_bundle_for(int(args.get("entrypoints", 0)))
+        lens = args.get("lens", "all")
+        if lens not in {"all", "guard-diff", "flow"}:
+            raise ValueError("lens must be one of: all, guard-diff, flow")
+        if lens == "guard-diff":
+            scan = c.scan_bundle_for(int(args.get("entrypoints", 0)))
+        elif lens == "flow":
+            bundle = c._flow_bundle(
+                deadline=c._resolve_deadline(args.get("hard_stop"), None))
+            leads = [lead.to_dict() if hasattr(lead, "to_dict") else lead
+                     for lead in bundle.get("leads") or ()]
+            scan = {
+                "constructor": "native-flow",
+                "queue": leads,
+                "census": bundle.get("coverage") or {},
+                "suppressions": [],
+            }
+        else:
+            result = c.candidates(
+                temporal=True, hard_stop=args.get("hard_stop"), limit=0,
+            )
+            queue = list(result.get("candidates") or ())
+            for group in result.get("groups") or ():
+                queue.extend(group.get("candidates") or ())
+            scan = {
+                "constructor": "all",
+                "queue": queue,
+                "census": result.get("coverage") or {},
+                "suppressions": [],
+                "temporal_evaluated": result.get("temporal_evaluated"),
+            }
         minimum = float(args.get("min_rank", 0.0))
         queue = [capsule for capsule in scan["queue"]
                  if float(capsule.get("rank", 0.0)) >= minimum]
@@ -1383,12 +1414,17 @@ def call_tool(name, args, format=None):
         }
         result = {
             "move": "scan",
+            "lens": lens,
             "constructor": scan["constructor"],
             "census": scan["census"],
-            "queue": page,
+            "leads": page,
             "page": page_meta,
             "min_rank": minimum,
         }
+        # Keep the old key only for the guard-diff lens while clients migrate; the
+        # default and new lenses use the one vocabulary promised by the UX contract.
+        if lens == "guard-diff":
+            result["queue"] = page
         if args.get("include_suppressions"):
             result["suppressions"] = scan["suppressions"]
         return _emit(name, result, fmt, offset, limit)
