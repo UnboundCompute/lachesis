@@ -50,6 +50,13 @@ Graphs are cached under ~/.lachesis/cache and rebuilt when the source changes,
 so the first run of a project is slow and every run after it is not.
 """
 
+_ANSI = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "yellow": "\033[33m",
+}
+
 
 class _RootParser(argparse.ArgumentParser):
     """Keep root help focused on the curated command groups in ``EPILOG``."""
@@ -65,6 +72,14 @@ class _RootParser(argparse.ArgumentParser):
 
 def _stderr(message: str = "") -> None:
     print(message, file=sys.stderr)
+
+
+def _color(text: str, tone: str, mode: str = "auto") -> str:
+    """Apply terminal emphasis without ever putting ANSI escapes in piped data."""
+    enabled = mode == "always" or (
+        mode == "auto" and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    )
+    return f"{_ANSI[tone]}{text}{_ANSI['reset']}" if enabled else text
 
 
 def _report_environment(error) -> int:
@@ -99,6 +114,32 @@ def _native_status() -> str:
     return "missing"
 
 
+# ---------------------------------------------------------------------- completion
+
+def command_completion(args: argparse.Namespace) -> int:
+    """Print a dependency-free completion script for the selected shell."""
+    commands = "scan explain mcp build enrich analyze candidates query plan report communities doctor cache completion"
+    if args.shell == "bash":
+        print(f'''_lachesis_complete() {{
+  local cur="${{COMP_WORDS[COMP_CWORD]}}"
+  local commands="{commands}"
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+  elif [[ "${{COMP_WORDS[1]}}" == "scan" ]]; then
+    COMPREPLY=( $(compgen -W "--lens --limit --min-rank --hard-stop --json --quiet --verbose --color --refresh" -- "$cur") )
+  fi
+}}
+complete -F _lachesis_complete lachesis''')
+    elif args.shell == "zsh":
+        print(f'''#compdef lachesis
+_arguments '1:command:({commands})' '*:option:(--lens --limit --min-rank --hard-stop --json --quiet --verbose --color --refresh)' ''')
+    else:
+        print(f'''complete -c lachesis -f -n "__fish_use_subcommand" -a "{commands}"
+complete -c lachesis -n "__fish_seen_subcommand_from scan" -l lens -a "all guard-diff flow"
+complete -c lachesis -n "__fish_seen_subcommand_from scan" -l json -l quiet -s q -l verbose -s v -l refresh''')
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------- scan
 
 def command_scan(args: argparse.Namespace) -> int:
@@ -113,6 +154,10 @@ def command_scan(args: argparse.Namespace) -> int:
     progress = Progress(enabled=not args.quiet)
     if not args.quiet:
         _stderr(f"lachesis: {source}")
+        if getattr(args, "_bare_invocation", False):
+            _stderr("  scanning ./ — pass a path to scan elsewhere")
+        if args.verbose:
+            _stderr(f"  native-kernel: {_native_status()}")
     try:
         is_graph = source.is_dir() and (
             source.name.endswith(".kuzu")
@@ -187,7 +232,7 @@ def command_scan(args: argparse.Namespace) -> int:
                             f"{lead.get('pattern') or lead.get('constructor') or 'lead'}  "
                             f"{lead.get('entry') or observations.get('callee', '')}:"
                             f"{lead.get('line') or observations.get('line', '')}")
-            print(rendered)
+            print(_color(rendered, "cyan", args.color))
             print()
         if len(shown) < len(queue):
             print(f"... {len(queue) - len(shown)} more; --limit 0 prints them all")
@@ -590,6 +635,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="exit 1 when anything is reported, for CI")
     scan.add_argument("--quiet", "-q", action="store_true",
                       help="findings only, no progress or guidance")
+    scan.add_argument("--verbose", "-v", action="store_true",
+                      help="include native-kernel details in progress output")
+    scan.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                      help="colour human output (default: auto; NO_COLOR disables it)")
     scan.set_defaults(handler=command_scan)
 
     communities = subcommands.add_parser(
@@ -664,6 +713,12 @@ def build_parser() -> argparse.ArgumentParser:
     concept.set_defaults(handler=command_concept_model, model_action="status",
                          model="BAAI/bge-small-en-v1.5", json=False)
 
+    completion = subcommands.add_parser(
+        "completion", help="print shell completion code")
+    completion.add_argument("shell", choices=("bash", "zsh", "fish"),
+                            help="shell to generate completion for")
+    completion.set_defaults(handler=command_completion)
+
     # The reader verbs, each a thin shell over one Analysis method: enrich (pass 2),
     # analyze (pass 3 -> leads), candidates (the registry), explain (the one-shot capsule).
     # These are parsed, not passed through -- they are the ergonomic front door.
@@ -717,7 +772,7 @@ ENGINE_COMMANDS = ("query", "plan")
 KNOWN_COMMANDS = {
     "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
-    "query", "plan",
+    "query", "plan", "completion",
 }
 
 
@@ -743,6 +798,9 @@ def main(argv: list[str] | None = None) -> int:
     # `lachesis scan ./repo`, and a bare invocation scans the current directory.
     if not arguments:
         arguments = ["scan"]
+        bare_invocation = True
+    else:
+        bare_invocation = False
     if arguments and arguments[0] == "index":
         _stderr("lachesis: 'index' was removed; use 'lachesis build <path>' "
                 "or run 'lachesis scan <path>' to index on demand")
@@ -754,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_engine(arguments[0], arguments[1:])
     parser = build_parser()
     args = parser.parse_args(arguments)
+    args._bare_invocation = bare_invocation
     if getattr(args, "version", False):
         from lachesis.cache import _version
         print(f"lachesis {_version()} (native-kernel: {_native_status()})")
