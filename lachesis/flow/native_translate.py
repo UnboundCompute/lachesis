@@ -95,6 +95,9 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 "at": finding.node,
                 "witness": witness,
                 "witness_complete": finding.witness_complete and bool(witness),
+                "guarded": finding.guarded,
+                "guards": [{"kind": guard.kind, "value": guard.value}
+                           for guard in finding.guards],
             }
             if finding.source_witness_nodes:
                 lead["source_witness"] = list(finding.source_witness_nodes)

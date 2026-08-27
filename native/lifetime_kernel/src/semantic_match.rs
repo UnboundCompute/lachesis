@@ -38,6 +38,7 @@ impl ObjectKey {
 struct StateKey {
     node: usize,
     bindings: Vec<(u32, u32)>,
+    guards: Vec<(String, String)>,
     released: MarkSet,
     origins: MarkSet,
     nulls: MarkSet,
@@ -253,9 +254,11 @@ fn match_function(
         entry,
         Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
         empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
+        Vec::<lifetime_proto::GuardProof>::new(),
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
+    let mut guarded_nodes: HashMap<String, Vec<lifetime_proto::GuardProof>> = HashMap::default();
     let mut transfers = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
@@ -263,13 +266,15 @@ fn match_function(
 
     while let Some((index, mut bindings, mut released, mut origins, mut nulls,
                     mut nonnull, mut uninitialized, mut pointer_arithmetic, mut escaped,
-                    mut realloc_lost)) = queue.pop_front() {
+                    mut realloc_lost, path_guards)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
         bindings.sort_unstable();
         bindings.dedup();
         let state = StateKey {
-            node: index, bindings: bindings.clone(), released: released.clone(), origins: origins.clone(),
+            node: index, bindings: bindings.clone(),
+            guards: path_guards.iter().map(|guard| (guard.kind.clone(), guard.value.clone())).collect(),
+            released: released.clone(), origins: origins.clone(),
             nulls: nulls.clone(), nonnull: nonnull.clone(), uninitialized: uninitialized.clone(),
             pointer_arithmetic: pointer_arithmetic.clone(), escaped: escaped.clone(),
             realloc_lost: realloc_lost.clone(),
@@ -277,6 +282,9 @@ fn match_function(
         if !seen.insert(state) { continue; }
         let node = &function.nodes[index];
         let witness = &witnesses[index];
+        if !path_guards.is_empty() {
+            guarded_nodes.entry(node.id.clone()).or_insert_with(|| path_guards.clone());
+        }
         let raw_object_id = node_object_ids[index];
         let object_id = raw_object_id.map(|value| canonical(value, &bindings));
         let value_id = node_value_ids[index].map(|value| canonical(value, &bindings));
@@ -435,6 +443,7 @@ fn match_function(
             }
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
+            let mut next_guards = path_guards.clone();
             let mut contradiction = false;
             for guard in guards {
                 let Some((root, generation)) = guard.value.split_once('#') else { continue };
@@ -456,15 +465,25 @@ fn match_function(
                     }
                     _ => {}
                 }
+                if !next_guards.iter().any(|item|
+                    item.kind == guard.kind && item.value == guard.value) {
+                    next_guards.push(guard.clone());
+                }
             }
             if !contradiction {
                 queue.push_back((*target, next_bindings, released.clone(), origins.clone(), next_nulls,
                                  next_nonnull, uninitialized.clone(), pointer_arithmetic.clone(),
-                                 escaped.clone(), realloc_lost.clone()));
+                                 escaped.clone(), realloc_lost.clone(), next_guards));
             }
         }
     }
 
+    for finding in findings.values_mut() {
+        if let Some(guards) = guarded_nodes.get(&finding.node) {
+            finding.guards = guards.clone();
+            finding.guarded = true;
+        }
+    }
     let mut findings: Vec<_> = findings.into_values().collect();
     findings.sort_by(|left, right| {
         (&left.pattern, &left.node, left.line, left.has_line)
@@ -598,6 +617,35 @@ mod tests {
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "double-free");
         assert_eq!(result.functions[0].findings[0].line, 3);
+    }
+
+    #[test]
+    fn reports_the_effective_guard_on_a_finding() {
+        let nodes = vec![node("o", "ORIGIN", 1), node("r1", "RELEASE", 2),
+                         node("r2", "RELEASE", 3)];
+        let edges = vec![
+            lifetime_proto::NativeSemanticEdge {
+                source: "o".into(), target: "r1".into(), kind: "normal".into(),
+                ..Default::default()
+            },
+            lifetime_proto::NativeSemanticEdge {
+                source: "r1".into(), target: "r2".into(), kind: "normal".into(),
+                guards: vec![lifetime_proto::GuardProof {
+                    kind: "NONNULL".into(), value: "p#g0".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut function = function(nodes);
+        function.edges = edges;
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function], complete: true, ..Default::default()
+        });
+        let finding = result.functions[0].findings.iter()
+            .find(|finding| finding.pattern == "double-free")
+            .expect("guarded double-free finding");
+        assert!(finding.guarded);
+        assert_eq!(finding.guards[0].kind, "NONNULL");
     }
 
     #[test]
