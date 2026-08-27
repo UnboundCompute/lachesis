@@ -2,8 +2,8 @@ PYTHON ?= python3
 
 .PHONY: check parity
 
-## Run the compiler/frontend parity gate used by CI.
+## Run the maintained test suite used by CI.
 check: parity
 
 parity:
-	$(PYTHON) -m pytest lachesis/frontends/checks.py
+	$(PYTHON) -m pytest -q

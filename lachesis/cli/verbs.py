@@ -21,6 +21,28 @@ EXIT_USAGE = 2
 EXIT_FAILURE = 4
 
 
+def _terminal_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the shared human-output controls to a result-bearing verb."""
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="findings only, no progress or guidance")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="include native-kernel details in progress output")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                        help="colour human output (default: auto; NO_COLOR disables it)")
+
+
+def _paint(text: str, tone: str, args: argparse.Namespace) -> str:
+    """Share the CLI's TTY/NO_COLOR policy with lower-level renderers."""
+    from lachesis.cli.main import _color
+    return _color(text, tone, args.color)
+
+
+def _native_note(progress, args: argparse.Namespace) -> None:
+    if args.verbose:
+        from lachesis.cli.main import _native_status
+        progress.note(f"native-kernel: {_native_status()}")
+
+
 def progress_to(progress) -> "callable":
     """Adapt a CLI :class:`~lachesis.cli.progress.Progress` to the library's ``ProgressFn``.
 
@@ -54,7 +76,8 @@ def command_enrich(args: argparse.Namespace) -> int:
     ``.bind.pb``), so later ``analyze``/``candidates``/``explain`` on a fresh process are warm."""
     from lachesis.cli.progress import Progress
 
-    with Progress(enabled=not args.json) as progress:
+    with Progress(enabled=not args.json and not args.quiet) as progress:
+        _native_note(progress, args)
         progress.phase("loading graph")
         # Pass 2 materializes the complete graph itself; defer navigation-only maps
         # until the temporal bind enters Pass 3, avoiding another graph-sized set of
@@ -66,7 +89,7 @@ def command_enrich(args: argparse.Namespace) -> int:
     if args.json:
         return _dump(report)
     tier = "present" if report["dataflow_tier"] else "not built (in-memory or unsupported)"
-    print(f"dataflow tier: {tier}")
+    print(_paint(f"dataflow tier: {tier}", "cyan", args))
     print(f"  {report['dataflow_sidecar']}  "
           f"({'written' if report['dataflow_written'] else 'absent'})")
     print(f"catalog bind:  {report['bind_sidecar']}  "
@@ -83,9 +106,10 @@ def command_analyze(args: argparse.Namespace) -> int:
     """Pass 3: run the flow pass and query its leads. In memory by default; ``-o`` persists."""
     from lachesis.cli.progress import Progress
 
-    with Progress(enabled=not args.json) as progress:
+    with Progress(enabled=not args.json and not args.quiet) as progress:
+        _native_note(progress, args)
         analysis = _open(args, progress=progress_to(progress))
-        leads = analysis.analyze(engine=args.engine, hard_stop=args.hard_stop,
+        leads = analysis.analyze(hard_stop=args.hard_stop,
                                  workers=args.lifetime_workers)
 
     # --summary is the rollup alone; it wins over any filter so `analyze --summary` always
@@ -103,14 +127,15 @@ def command_analyze(args: argparse.Namespace) -> int:
     if args.out:
         path = view.to_json(args.out)
     if args.json:
-        result = {"summary": leads.summary(), "leads": list(view)}
+        result = {"summary": leads.summary(),
+                  "leads": [lead.to_dict() for lead in view]}
         if args.out:
             result["written"] = args.out
         return _dump(result)
 
     summary = leads.summary()
-    print(f"{summary['total']} leads  (engine={summary['engine']}, "
-          f"timed_out={summary['timed_out']})")
+    print(_paint(f"{summary['total']} leads  (timed_out={summary['timed_out']})",
+                 "cyan", args))
     if summary["timed_out"]:
         # An empty or thin result over a partial run is not "clean" -- say so, and name the
         # fix. Stopping before object analysis means setup (the dataflow tier) alone spent the
@@ -144,7 +169,8 @@ def command_candidates(args: argparse.Namespace) -> int:
     from lachesis.cli.progress import Progress
 
     temporal = not args.no_temporal
-    with Progress(enabled=not args.json) as progress:
+    with Progress(enabled=not args.json and not args.quiet) as progress:
+        _native_note(progress, args)
         progress.phase("loading graph")
         # Candidate binding consumes the cached bind/event sidecars and the
         # structural view lazily. Do not eagerly build the four graph-sized
@@ -161,16 +187,17 @@ def command_candidates(args: argparse.Namespace) -> int:
                 limit=args.limit, detail=args.detail)
     if args.json:
         return _dump(result)
-    _render_candidates(result, census=args.census)
+    _render_candidates(result, census=args.census, args=args)
     return EXIT_OK
 
 
-def _render_candidates(result: dict, *, census: bool) -> None:
+def _render_candidates(result: dict, *, census: bool, args: argparse.Namespace) -> None:
     evaluated = result.get("temporal_evaluated")
     if census:
         constructors = result.get("constructors", [])
         total = sum(c.get("census", {}).get("enumerated", 0) for c in constructors)
-        print(f"{len(constructors)} constructors, {total} candidates enumerated")
+        print(_paint(f"{len(constructors)} constructors, {total} leads enumerated",
+                     "cyan", args))
         for entry in constructors:
             meta, cen = entry.get("metadata", {}), entry.get("census", {})
             count = cen.get("enumerated", 0)
@@ -180,7 +207,8 @@ def _render_candidates(result: dict, *, census: bool) -> None:
         groups = result.get("groups") or [result]
         rows = [row for group in groups for row in group.get("candidates", [])]
         rows.sort(key=lambda r: r.get("rank") or 0.0, reverse=True)
-        print(f"{len(rows)} candidates (rank orders attention; it never filters)")
+        print(_paint(f"{len(rows)} leads (rank orders attention; it never filters)",
+                     "cyan", args))
         for row in rows[:60]:
             obs = row.get("observations", {})
             where = f"{obs.get('file')}:{obs.get('line')}" if obs.get("file") else ""
@@ -201,7 +229,8 @@ def command_explain(args: argparse.Namespace) -> int:
     from lachesis.cli.progress import Progress
 
     temporal = not args.no_temporal
-    with Progress(enabled=not args.json) as progress:
+    with Progress(enabled=not args.json and not args.quiet) as progress:
+        _native_note(progress, args)
         progress.phase("loading graph")
         analysis = _open(args)
         progress.phase("composing explanation")
@@ -218,17 +247,18 @@ def command_explain(args: argparse.Namespace) -> int:
             result = analysis.explain(target, temporal=temporal, hard_stop=args.hard_stop)
     if args.json:
         return _dump(result)
-    return _render_explain(result)
+    return _render_explain(result, args)
 
 
-def _render_explain(result: dict) -> int:
+def _render_explain(result: dict, args: argparse.Namespace) -> int:
     if "error" in result:
         print(result["error"], file=_stderr_stream())
         if result.get("note"):
             print(f"  note: {result['note']}", file=_stderr_stream())
         return EXIT_FAILURE
     sink = result.get("sink", {})
-    print(f"{result['candidate_id']}  [{result['constructor']}]  rank={result.get('rank')}")
+    print(_paint(f"{result['candidate_id']}  [{result['constructor']}]  "
+                 f"rank={result.get('rank')}", "cyan", args))
     print(f"  obligation : {result.get('obligation')}")
     print(f"  sink       : {sink.get('callee')} at {sink.get('file')}:{sink.get('line')}")
     if sink.get("site"):
@@ -296,6 +326,7 @@ def add_reader_verbs(subcommands) -> None:
                         help="object-summary worker processes (default: 2; use 1 for lower "
                              "memory/heat)")
     enrich.add_argument("--json", action="store_true", help="emit the report as JSON")
+    _terminal_flags(enrich)
     enrich.set_defaults(handler=command_enrich)
 
     analyze = subcommands.add_parser(
@@ -308,7 +339,6 @@ def add_reader_verbs(subcommands) -> None:
     analyze.add_argument("--function", help="show only leads in this function")
     analyze.add_argument("--at", metavar="FILE[:LINE|:LO-HI]",
                          help="locate leads by source position")
-    analyze.add_argument("--engine", default="object", help="lifetime engine (default: object)")
     analyze.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
                          dest="hard_stop", help="wall-clock budget (0 = unbounded)")
     analyze.add_argument("--lifetime-workers", type=int, default=2, metavar="N",
@@ -316,6 +346,7 @@ def add_reader_verbs(subcommands) -> None:
                               "memory/heat)")
     analyze.add_argument("-o", "--out", metavar="PATH", help="persist the (filtered) leads as JSON")
     analyze.add_argument("--json", action="store_true", help="emit the result as JSON")
+    _terminal_flags(analyze)
     analyze.set_defaults(handler=command_analyze)
 
     candidates = subcommands.add_parser(
@@ -334,6 +365,7 @@ def add_reader_verbs(subcommands) -> None:
     candidates.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
                             dest="hard_stop", help="wall-clock budget for the temporal families")
     candidates.add_argument("--json", action="store_true", help="emit the result as JSON")
+    _terminal_flags(candidates)
     candidates.set_defaults(handler=command_candidates)
 
     explain = subcommands.add_parser(
@@ -346,4 +378,5 @@ def add_reader_verbs(subcommands) -> None:
     explain.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
                          dest="hard_stop", help="wall-clock budget for the temporal families")
     explain.add_argument("--json", action="store_true", help="emit the capsule as JSON")
+    _terminal_flags(explain)
     explain.set_defaults(handler=command_explain)

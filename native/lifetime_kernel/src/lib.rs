@@ -807,6 +807,12 @@ pub(crate) fn proto_result(result: LinearResult) -> lifetime_proto::Result {
 /// Binary protobuf lifetime ABI. Both request and response stay typed binary data;
 /// JSON is not involved in the internal solver boundary.
 #[no_mangle]
+pub extern "C" fn lachesis_lifetime_kernel_version() -> *const c_char {
+    // A static NUL-terminated stamp keeps the diagnostic ABI allocation-free.
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lachesis_lifetime_solve_pb(
     input: *const u8, length: usize, output_length: *mut usize,
 ) -> *mut u8 {

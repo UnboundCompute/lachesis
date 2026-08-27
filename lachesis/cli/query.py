@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -53,24 +52,11 @@ def load_graph(path: str) -> tuple[dict, dict]:
     from lachesis.nav.graph_store import GraphStore
     from lachesis.nav.kuzu_index import materialize_graph
 
-    ephemeral = os.environ.get("LACHESIS_QUERY_EPHEMERAL_ENRICH") == "1"
-    store = GraphStore.load(path, defer_maps=ephemeral)
-    if ephemeral \
-            and not store.dataflow_ready:
-        # A batch query (the GitHub Action's SARIF export) needs the enriched graph
-        # only for this process and does not benefit from writing a second graph-sized
-        # Kùzu cache. Keep the normal persistent-cache path for local/repeated queries.
-        from lachesis.kuzu_store import (
-            manifest_capabilities, manifest_languages, read_store_manifest,
-        )
-        from lachesis.pipeline import enrich_graph
-        manifest = read_store_manifest(path)
-        core = materialize_graph(store.index, restore_defaults=False)
-        graph = enrich_graph(core, manifest_languages(manifest),
-                             manifest_capabilities(manifest))
-    else:
-        store.ensure_dataflow_tier()
-        graph = materialize_graph(store.index)
+    store = GraphStore.load(path)
+    # A query must observe the same native binary dataflow sidecar as every other
+    # surface. The removed Python enrichment fallback is intentionally not available.
+    store.ensure_dataflow_tier()
+    graph = materialize_graph(store.index)
     manifest = read_store_manifest(path)
     frontend_capabilities = {
         item["frontend_id"]: item.get("capabilities", {})

@@ -91,10 +91,12 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
 
 def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     root = _workspace_root(workspace_root)
+    packaged_binary = root / "lachesis" / "_native" / "lachesis-clang-frontend"
     native_binary = next(
         (
             candidate
             for candidate in (
+                packaged_binary,
                 root / "native" / "clang_frontend" / "target" / "release"
                 / "lachesis-clang-frontend",
                 root / "native" / "clang_frontend" / "target" / "debug"

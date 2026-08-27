@@ -17,7 +17,7 @@ from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuz
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
-from lachesis.pipeline import (enrich_project_graph, run_project,
+from lachesis.pipeline import (run_project,
                                run_project_incremental, run_project_parallel,
                                run_project_streaming, run_project_streaming_parallel,
                                source_content_hash,
@@ -36,7 +36,7 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _run() -> None:
+def _run(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("source_dir")
@@ -134,7 +134,7 @@ def _run() -> None:
         "--stream-shards", metavar="DIR", default=None,
         help="stream core-only frontend shards directly into Kùzu",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.output_flag is not None:
         args.output_path = args.output_flag
     if args.parallel_packages and args.incremental:
@@ -146,6 +146,10 @@ def _run() -> None:
         parser.error("--stream-shards currently supports core-only stores")
     if args.stream_shards and args.incremental:
         parser.error("--stream-shards cannot combine with incremental builds")
+    if args.enrich:
+        parser.error("build-time enrichment was removed; run `lachesis enrich` after build")
+    if args.reduced or args.layered_out:
+        parser.error("--reduced/--layered-out are not available in the native-only build path")
     if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
         parser.error("streamed package shards are serialized; use --max-workers 1")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
@@ -185,7 +189,7 @@ def _run() -> None:
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
-    enrich = args.enrich or bool(args.layered_out) or args.reduced
+    enrich = False
     # --prune deletes the pure-lexical nodes on the way into the store, so asking a
     # frontend for them is work whose entire output is discarded a step later. Telling
     # the frontends up front turns that into work not done: for C the token stream costs
@@ -194,7 +198,7 @@ def _run() -> None:
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
-    compile_enrich = enrich and not args.reduced
+    compile_enrich = False
 
     # Core-only builds do not need a materialized Python graph. Keep frontend
     # records in binary shards and stream them directly into Kùzu to bound RSS.
@@ -297,7 +301,7 @@ def _run() -> None:
     print("Node kinds: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     # stdout is block-buffered when piped to a file, so a long build that is killed (or a
     # `| tee log` capture) loses every line it "printed". Line-buffer so progress reaches
     # the file as it happens and a kill never swallows the tail. Guarded: some wrapped
@@ -307,7 +311,7 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
     try:
-        _run()
+        _run(argv)
     except KeyboardInterrupt:
         print("lachesis build: interrupted", file=sys.stderr)
         return 130

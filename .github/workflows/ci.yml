@@ -94,6 +94,9 @@ jobs:
           python3 tools/vendor_typescript.py
           python3 tools/vendor_typescript.py --check
 
+      - name: Build and stage the native artifacts
+        run: python3 tools/stage_native.py --build
+
       - name: Anchor release timestamps
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 

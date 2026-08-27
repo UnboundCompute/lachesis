@@ -203,11 +203,11 @@ class ComprehensionTests(unittest.TestCase):
             mcp_server._PROFILE = "all"
             mcp_server._DEFAULT_FORMAT = "json"
             answer = json.loads(mcp_server.call_tool(
-                "scan", {"entrypoints": 2, "min_rank": 0.5,
+                "scan", {"lens": "guard-diff", "entrypoints": 2, "min_rank": 0.5,
                           "limit": 1, "include_suppressions": True},
                 format="json"))
             self.assertEqual("scan", answer["move"])
-            self.assertEqual(["high"], [row["id"] for row in answer["queue"]])
+            self.assertEqual(["high"], [row["id"] for row in answer["leads"]])
             self.assertEqual(1, answer["page"]["total"])
             self.assertEqual(2, answer["census"]["entrypoints_skipped"])
             self.assertEqual([{"id": "kept"}], answer["suppressions"])

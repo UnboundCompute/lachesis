@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""The planner command line: a graph in, a ranked investigation queue out.
+"""The planner command line: a graph in, a ranked set of investigation leads out.
 
   lachesis plan graph.kuzu
   lachesis plan graph.kuzu --limit 20
-  lachesis plan graph.kuzu --json > queue.json
+  lachesis plan graph.kuzu --json > leads.json
 
 The census line is printed to stderr on every run, including the JSON one, because
-the counts are how a reader tells a short queue from a truncated scan. A suppressed
+the counts are how a reader tells a short result from a truncated scan. A suppressed
 candidate is reported, not hidden: "44 suppressed" is the claim that 44 questions were
 answered without an agent, and it is only worth anything if it is auditable, which is
 what ``--suppressions`` prints.
@@ -37,10 +37,10 @@ def _nonnegative_int(value: str) -> int:
 
 
 def _census_line(census: dict) -> str:
-    return (f"{census['candidates']} candidate(s) from "
+    return (f"{census['candidates']} leads from "
             f"{census['entrypoints_scanned']}/{census['entrypoints_total']} "
             f"entrypoint(s): {census['suppressed']} suppressed, "
-            f"{census['queued']} queued"
+            f"{census['queued']} ranked"
             + (f", {census['entrypoints_skipped']} entrypoint(s) not scanned"
                if census["entrypoints_skipped"] else "")
             + (f", {census['closures_truncated']} closure(s) truncated"

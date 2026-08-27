@@ -79,6 +79,7 @@ include-package-data = false
 # The capsule schema is the artifact an external consumer validates against, and the
 # golden capsule is what the planner's own suite checks the serializer round-trips.
 "lachesis.planner" = ["*.json", "fixtures/*.json", "fixtures/project/*"]
+"lachesis" = ["py.typed", "_native/*"]
 
 # Never ship interpreter caches in release artifacts.  Fixture trees are included
 # intentionally for frontend/runtime behavior, but their local `__pycache__`
