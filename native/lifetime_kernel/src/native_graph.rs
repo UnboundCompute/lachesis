@@ -474,15 +474,6 @@ fn sidecar_to_request_inner(
     let mut summary_effects: HashMap<String, Vec<SummaryEffect>> = HashMap::new();
     for (id, input) in &functions {
         let Some(name) = names_by_input_id.get(id) else { continue };
-        // Most functions do not directly release/reallocate a parameter.  Do
-        // not build three temporary AST indexes for those functions; their
-        // summary is known to be empty until a callee summary can flow into
-        // them in the fixed point below.
-        if !input.calls.iter().any(|call| call.is_release || call.is_realloc)
-            && !input.returns.iter().any(|ret| ret.kind == "var") {
-            summary_effects.insert(name.clone(), Vec::new());
-            continue;
-        }
         let refs: HashMap<String, String> = input.edges.iter()
             .filter(|edge| edge.kind == "REFERS_TO")
             .map(|edge| (edge.source.clone(), edge.target.clone()))
@@ -493,6 +484,23 @@ fn sidecar_to_request_inner(
         }
         let parameter_positions: HashMap<String, u32> = input.parameters.iter()
             .enumerate().map(|(position, node)| (node.clone(), position as u32)).collect();
+        let has_parameter_pass = input.calls.iter().any(|call| {
+            !call.is_release && !call.is_realloc && !call.is_alloc
+                && !call.is_aggregate_copy && call.arguments.iter().any(|argument| {
+                    resolve_decl(&argument.node, &refs, &children, &mut HashSet::new())
+                        .is_some_and(|declaration| parameter_positions.contains_key(&declaration))
+                })
+        });
+        // Most functions do not directly release/reallocate a parameter.  Do
+        // not build three temporary AST indexes for those functions; their
+        // summary is known to be empty until a callee summary can flow into
+        // them in the fixed point below.
+        if !input.calls.iter().any(|call| call.is_release || call.is_realloc)
+            && !input.returns.iter().any(|ret| ret.kind == "var")
+            && !has_parameter_pass {
+            summary_effects.insert(name.clone(), Vec::new());
+            continue;
+        }
         let mut effects: Vec<SummaryEffect> = Vec::new();
         for call in &input.calls {
             if !call.is_release && !call.is_realloc { continue; }
@@ -509,6 +517,26 @@ fn sidecar_to_request_inner(
                         is_return: false,
                     });
                 }
+            }
+        }
+        // Unknown/ordinary calls observe pointer arguments. This is the
+        // Joern-style taint seam used by the Python engine and lets that
+        // observation propagate through callers as a formal-parameter effect.
+        for call in &input.calls {
+            if call.is_release || call.is_realloc || call.is_alloc || call.is_aggregate_copy {
+                continue;
+            }
+            for argument in &call.arguments {
+                let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
+                    &mut HashSet::new()) else { continue };
+                let Some(position) = parameter_positions.get(&declaration) else { continue };
+                let effect = SummaryEffect {
+                    kind: lifetime_proto::operation::Kind::Use as i32,
+                    position: *position,
+                    selectors: argument.selectors.clone(),
+                    is_return: false,
+                };
+                if !effects.contains(&effect) { effects.push(effect); }
             }
         }
         // A function returning one of its formal pointer values creates the
