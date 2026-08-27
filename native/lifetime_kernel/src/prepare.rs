@@ -1976,7 +1976,7 @@ pub(crate) fn semantic_request(
     seams.sort_by(|left, right| (&left.source, &left.target, &left.callee)
         .cmp(&(&right.source, &right.target, &right.callee)));
     Ok(lifetime_proto::NativeSemanticResult {
-        functions, complete: true, seams, regions: Vec::new(),
+        functions, complete: true, seams, regions: Vec::new(), skeletons: Vec::new(),
     })
 }
 

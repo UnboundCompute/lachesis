@@ -432,9 +432,34 @@ message NativeSourceRegion {
   repeated string functions = 3;
   repeated string contexts = 4;
 }
+message NativeSkeletonToken {
+  string kind = 1;
+  string function = 2;
+  string node = 3;
+  string family = 4;
+  string object_root = 5;
+  repeated string object_selectors = 6;
+  sint64 line = 7;
+  bool has_line = 8;
+  uint32 depth = 9;
+  bool guarded = 10;
+  repeated GuardProof guards = 11;
+  optional bool source_reachable = 12;
+  repeated string source_witness_nodes = 13;
+}
+message NativeFlowSkeleton {
+  string kind = 1;
+  string entry = 2;
+  string source_function = 3;
+  string context = 4;
+  bool complete = 5;
+  repeated NativeSkeletonToken tokens = 6;
+  repeated NativeSemanticEdge edges = 7;
+}
 message NativeSemanticResult {
   repeated NativeSemanticFunction functions = 1;
   bool complete = 2;
   repeated NativeSemanticEdge seams = 3;
   repeated NativeSourceRegion regions = 4;
+  repeated NativeFlowSkeleton skeletons = 5;
 }
