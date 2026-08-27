@@ -150,6 +150,31 @@ fn resolve_decl(node: &str, refs: &HashMap<String, String>,
         .find_map(|child| resolve_decl(child, refs, children, seen))
 }
 
+fn assigned_target_from_value(
+    start: &str,
+    edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
+    nodes: &HashMap<&str, &lifetime_proto::GraphNode>,
+) -> Option<String> {
+    let mut pending = vec![start.to_owned()];
+    let mut seen = HashSet::new();
+    while let Some(source) = pending.pop() {
+        if !seen.insert(source.clone()) { continue; }
+        for edge in edges.get(&source).into_iter().flatten()
+            .filter(|edge| edge.kind == "VALUE_FLOWS_TO") {
+            if nodes.get(edge.target.as_str()).is_some_and(|node| {
+                matches!(input_text(node, "syntax_kind"), Some("write") | Some("definition"))
+            }) {
+                if let Some(target) = nodes.get(edge.target.as_str())
+                    .and_then(|node| input_text(node, "target_id")) {
+                    return Some(target.to_owned());
+                }
+            }
+            pending.push(edge.target.clone());
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SummaryEffect {
     kind: i32,
@@ -363,6 +388,11 @@ fn sidecar_to_request_inner(
                     }) {
                     call.assigned = left.target.clone();
                 }
+            }
+        }
+        if call.assigned.is_empty() {
+            if let Some(assigned) = assigned_target_from_value(&item.id, &edges_by_source, &node_lookup) {
+                call.assigned = assigned;
             }
         }
         if call.assigned.is_empty() {

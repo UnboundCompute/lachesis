@@ -96,7 +96,9 @@ impl<'a> GraphView<'a> {
                     }
                 }
                 "REFERS_TO" => { refers.insert(edge.source.as_str(), edge.target.as_str()); }
-                "VALUE_FLOWS_TO" => { initializers.insert(edge.target.as_str(), edge.source.as_str()); }
+                "VALUE_FLOWS_TO" => {
+                    initializers.insert(edge.target.as_str(), edge.source.as_str());
+                }
                 _ => {}
             }
         }
@@ -179,6 +181,8 @@ impl<'a> GraphView<'a> {
         matches!(self.kind(&id), "GNUNullExpr" | "CXXNullPtrLiteralExpr")
             || (self.kind(&id) == "IntegerLiteral"
                 && matches!(self.label(&id).trim(), "0" | "NULL" | "nullptr"))
+            || (self.kind(&id) == "value"
+                && matches!(self.label(&id).trim(), "None" | "null" | "NULL"))
     }
 
     fn pointer_arithmetic_source(&self, id: &str) -> Option<Path> {
@@ -1157,7 +1161,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 line: line.unwrap_or_default(), has_line: line.is_some(),
                 root_name: String::new(),
             });
-        } else if let Some(path) = graph.access_path(&child, 0) {
+        } else if let Some(path) = graph.value_path(child, 0)
+            .or_else(|| graph.access_path(&child, 0)) {
             let root_id = path.root.strip_prefix("decl:").unwrap_or(path.root.as_str());
             let stack_local = graph.node(root_id)
                 .is_some_and(|root| {
