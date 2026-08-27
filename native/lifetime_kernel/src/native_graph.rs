@@ -200,15 +200,6 @@ pub(crate) fn sidecar_to_request(
     sidecar_to_request_with_selection(input, None, true)
 }
 
-/// Temporal solving has already grouped each node into its owning function,
-/// so owner properties would be redundant in its per-node records.  Keep them
-/// for the semantic emitter, which still reads them when publishing events.
-pub(crate) fn sidecar_to_temporal_request(
-    input: &[u8],
-) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, None, false)
-}
-
 pub(crate) fn sidecar_to_request_selected(
     input: &[u8], selected_ids: &HashSet<String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
