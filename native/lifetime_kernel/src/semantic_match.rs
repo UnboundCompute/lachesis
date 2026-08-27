@@ -170,6 +170,10 @@ fn match_function(
             "DERIVE" => if let (Some(target), Some(value)) = (raw_object_id, value_id) {
                 bindings.retain(|(source, _)| *source != target);
                 bindings.push((target, value));
+                if node.access == "aggregate-copy" {
+                    add_finding(&mut findings, &function.id, "aggregate-copy-alias",
+                                &objects[target as usize], node);
+                }
             },
             "ORIGIN" => if let Some(object) = object_id {
                 released.retain(|item| *item != object);
@@ -359,5 +363,19 @@ mod tests {
             complete: true,
         });
         assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn records_aggregate_copy_aliases() {
+        let mut derive = node("copy", "DERIVE", 7);
+        derive.object_root = "destination".to_owned();
+        derive.value_root = "source".to_owned();
+        derive.access = "aggregate-copy".to_owned();
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![derive])],
+            complete: true,
+        });
+        assert_eq!(result.functions[0].findings.len(), 1);
+        assert_eq!(result.functions[0].findings[0].pattern, "aggregate-copy-alias");
     }
 }

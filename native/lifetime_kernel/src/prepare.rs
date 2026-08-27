@@ -947,7 +947,10 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         } else if call.is_aggregate_copy {
             if let (Some(destination), Some(source)) = (argument(0), argument(1)) {
-                operations.push(operation(Kind::Copy, &call.node, Some(destination), Some(source), call));
+                let mut aggregate = operation(
+                    Kind::Copy, &call.node, Some(destination), Some(source), call);
+                aggregate.access = "aggregate-copy".to_owned();
+                operations.push(aggregate);
             }
         } else if let Some(summary) = summary_by_callee.get(call.callee.as_str()) {
             for alternative in &summary.alternatives {
