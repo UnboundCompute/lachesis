@@ -225,4 +225,53 @@ mod tests {
         assert_eq!(skeletons[0].tokens[2].family, "memory.free");
         assert_eq!(skeletons[0].edges.len(), 1);
     }
+
+    #[test]
+    fn follows_call_and_matching_return_instead_of_concatenating_functions() {
+        let source = lifetime_proto::NativeSemanticFunction {
+            id: "source".into(), entry: "s0".into(),
+            nodes: vec![
+                lifetime_proto::NativeSemanticNode { id: "s0".into(), function: "source".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticNode { id: "s1".into(), function: "source".into(), event_kind: "memory.deref".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticNode { id: "s2".into(), function: "source".into(), ..Default::default() },
+            ],
+            edges: vec![
+                lifetime_proto::NativeSemanticEdge { source: "s0".into(), target: "s1".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticEdge { source: "s1".into(), target: "s2".into(), ..Default::default() },
+            ], ..Default::default()
+        };
+        let callee = lifetime_proto::NativeSemanticFunction {
+            id: "callee".into(), entry: "c0".into(),
+            nodes: vec![
+                lifetime_proto::NativeSemanticNode { id: "c0".into(), function: "callee".into(), event_kind: "ORIGIN".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticNode { id: "c1".into(), function: "callee".into(), event_kind: "memory.free".into(), ..Default::default() },
+            ],
+            edges: vec![lifetime_proto::NativeSemanticEdge {
+                source: "c0".into(), target: "c1".into(), ..Default::default()
+            }], ..Default::default()
+        };
+        let result = lifetime_proto::NativeSemanticResult {
+            functions: vec![source, callee],
+            seams: vec![
+                lifetime_proto::NativeSemanticEdge {
+                    source: "s1".into(), target: "c0".into(), kind: "call".into(),
+                    seam_kind: "call".into(), callee: "callee".into(), return_to: "s2".into(), ..Default::default()
+                },
+                lifetime_proto::NativeSemanticEdge {
+                    source: "c1".into(), target: "s2".into(), kind: "return".into(),
+                    seam_kind: "return".into(), callee: "callee".into(), return_to: "s2".into(), ..Default::default()
+                },
+            ],
+            regions: vec![lifetime_proto::NativeSourceRegion {
+                source_function: "source".into(), source_nodes: vec!["s0".into()],
+                functions: vec!["source".into(), "callee".into()], contexts: vec!["ctx".into()], ..Default::default()
+            }], ..Default::default()
+        };
+        let skeletons = build(&result);
+        let kinds: Vec<_> = skeletons[0].tokens.iter().map(|token| token.kind.as_str()).collect();
+        assert!(kinds.windows(2).any(|pair| pair == ["enter", "event"]));
+        assert!(skeletons[0].tokens.iter().any(|token| token.kind == "exit" && token.function == "callee"));
+        assert_eq!(skeletons[0].context, "ctx");
+        assert!(skeletons[0].complete);
+    }
 }
