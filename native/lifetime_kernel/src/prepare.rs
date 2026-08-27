@@ -470,7 +470,36 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             if exits.is_empty() { exits = condition_stream.last().cloned().into_iter().collect(); }
             (condition_stream.first().cloned().or_else(|| exits.first().cloned()), exits)
-        } else if kind == "SwitchStmt" {
+        } else if matches!(kind, "Try" | "TryStatement") {
+            // Managed-language frontends publish exception control directly
+            // (TRY_BODY/EXCEPTION_BRANCH/RUNS_FINALLY). Preserve those edges
+            // instead of flattening a try block into source order.
+            let attempted = graph.control_targets(id, "TRY_BODY").into_iter().next()
+                .or_else(|| children.iter().find(|child| is_statement(graph.kind(child))).map(String::as_str));
+            let body_result = attempted.map(|node| emit(graph, owned, node, successors,
+                memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
+            let attempted_anchor = body_result.0.as_deref().or(attempted).unwrap_or(id);
+            let handlers = graph.control_targets(attempted_anchor, "EXCEPTION_BRANCH");
+            let handlers = if handlers.is_empty() { graph.control_targets(id, "EXCEPTION_BRANCH") } else { handlers };
+            let mut exits = Vec::new();
+            for handler in &handlers {
+                let result = emit(graph, owned, handler, successors, memo, in_progress, depth + 1);
+                if let Some(entry) = result.0 {
+                    successors.entry(attempted_anchor.to_owned()).or_default().push(entry);
+                }
+                exits.extend(result.1);
+            }
+            exits.extend(body_result.1);
+            let finally = graph.control_targets(attempted_anchor, "RUNS_FINALLY");
+            let finally = if finally.is_empty() { graph.control_targets(id, "RUNS_FINALLY") } else { finally };
+            if let Some(finally) = finally.first() {
+                let result = emit(graph, owned, finally, successors, memo, in_progress, depth + 1);
+                for exit in &exits { successors.entry(exit.clone()).or_default().push((*finally).to_owned()); }
+                exits = result.1;
+                if exits.is_empty() { exits.push((*finally).to_owned()); }
+            }
+            (body_result.0.or_else(|| handlers.first().map(|node| (*node).to_owned())), exits)
+        } else if matches!(kind, "SwitchStmt" | "Match") {
             // A switch dispatches to every case/default entry. The generic
             // statement path would serialize all case bodies into one chain,
             // making a large opcode switch look like one giant sequential
@@ -487,24 +516,30 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let body_result = body.as_ref()
                 .map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1))
                 .unwrap_or((None, Vec::new()));
-            let case_nodes = body.as_ref().map(|body| {
+            let mut case_nodes = body.as_ref().map(|body| {
                 graph.children_owned(body)
                     .into_iter().filter(|child| owned.contains(child)
                         && matches!(graph.kind(child), "CaseStmt" | "DefaultStmt"))
                     .collect::<Vec<_>>()
             }).unwrap_or_default();
+            if case_nodes.is_empty() {
+                let source = condition_stream.last().map(String::as_str).unwrap_or(id);
+                case_nodes = graph.control_targets(source, "SWITCH_CASE")
+                    .into_iter().map(str::to_owned).collect();
+            }
             let mut case_entries = Vec::new();
             for case in &case_nodes {
-                let (entry, _) = emit(graph, owned, case, successors, memo, in_progress, depth + 1);
-                if let Some(entry) = entry { case_entries.push(entry); }
+                let (entry, exits) = emit(graph, owned, case, successors, memo, in_progress, depth + 1);
+                if let Some(entry) = entry { case_entries.push((entry, exits)); }
             }
             if let Some(condition_exit) = condition_stream.last() {
-                for entry in &case_entries {
+                for (entry, _) in &case_entries {
                     successors.entry(condition_exit.clone()).or_default().push(entry.clone());
                 }
             }
             let has_default = case_nodes.iter().any(|case| graph.kind(case) == "DefaultStmt");
             let mut exits = body_result.1;
+            exits.extend(case_entries.into_iter().flat_map(|(_, branch_exits)| branch_exits));
             if !has_default { exits.extend(condition_stream.last().cloned()); }
             (condition_stream.first().cloned().or(body_result.0), exits)
         } else if matches!(kind, "CaseStmt" | "DefaultStmt") {
