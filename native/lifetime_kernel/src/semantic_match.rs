@@ -763,7 +763,7 @@ mod tests {
                     }], language: "c".into(),
                 },
             ],
-            complete: true, seams: vec![seam],
+            complete: true, seams: vec![seam], ..Default::default()
         });
         assert!(result.functions[0].findings.iter().any(|finding|
             finding.pattern == "uaf.deref" && finding.function == "b"),
@@ -814,7 +814,7 @@ mod tests {
                     id: "b".into(), entry: "b-release".into(), exits: vec!["b-return".into()],
                     nodes: vec![release, returned], edges: Vec::new(), language: "c".into(),
                 },
-            ], complete: true, seams: edges,
+            ], complete: true, seams: edges, ..Default::default()
         });
         assert!(result.functions[0].findings.iter().any(|finding|
             finding.pattern == "uaf.deref" && finding.function == "a"),

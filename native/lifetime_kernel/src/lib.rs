@@ -44,6 +44,7 @@ mod heap;
 mod summary;
 mod sidecar_project;
 mod semantic_match;
+mod claus;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -1578,6 +1579,10 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
                 }
             }
         }
+        // Claus source selection is part of the binary semantic artifact.  The
+        // subsequent skeleton builder consumes these stable regions and can
+        // reuse a completed function/source/context fragment.
+        full.regions = claus::pick_regions(&full);
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
@@ -1596,6 +1601,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
                 .filter_map(compact_event_function).collect(),
             complete: full.complete,
             seams: full.seams,
+            regions: full.regions,
         }.encode_to_vec();
         let events_output = format!("{output}.events.pb");
         let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
