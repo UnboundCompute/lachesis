@@ -200,6 +200,16 @@ impl Graph {
         })
     }
 
+    pub(crate) fn edge_property_i64(&self, edge: &Edge, key: &str) -> Option<i64> {
+        edge.properties.iter().find_map(|field| {
+            if field.key != key { return None; }
+            match field.value.as_ref()?.kind.as_ref()? {
+                graph_proto::value::Kind::Integer(value) => Some(*value),
+                _ => None,
+            }
+        })
+    }
+
     pub(crate) fn node_property_text<'a>(&self, node: &'a Node, key: &str) -> Option<&'a str> {
         self.node_property(node, key).and_then(|value| match value.kind.as_ref()? {
             graph_proto::value::Kind::Text(value) => Some(value.as_str()),

@@ -105,10 +105,24 @@ fn model_matches(model: &crate::atropos_proto::Model, language: Option<&str>, ca
 }
 
 fn endpoint_values(endpoint: &str, call: &pass2::Node,
-                   arguments: &HashMap<u32, Vec<(u32, u32)>>, graph: &Graph) -> Vec<u32> {
+                   arguments: &HashMap<u32, Vec<(u32, u32)>>,
+                   call_results: &HashMap<u32, Vec<u32>>, graph: &Graph) -> Vec<u32> {
     if endpoint == "ReturnValue" {
-        return graph.node_property_text(call, "value_id").and_then(|value| graph.symbol(value))
-            .into_iter().collect();
+        if let Some(value) = graph.node_property_text(call, "value_id")
+            .and_then(|value| graph.symbol(value)) {
+            return vec![value];
+        }
+        // A call node is the language-neutral result identity when the
+        // frontend does not materialize a dedicated value_id.  The existing
+        // call->initializer flow carries it into a local declaration, while
+        // the return-to-callsite rule carries it across a resolved wrapper.
+        let mut values = vec![call.id];
+        if let Some(results) = call_results.get(&call.id) {
+            values.extend(results.iter().copied());
+        }
+        values.sort_unstable();
+        values.dedup();
+        return values;
     }
     if endpoint == "Receiver" {
         return graph.node_property_text(call, "receiver_value_id").and_then(|value| graph.symbol(value))
@@ -124,6 +138,30 @@ fn endpoint_values(endpoint: &str, call: &pass2::Node,
         .filter_map(|(index, node)| (*index == position).then_some(*node)).collect()
 }
 
+fn referenced_variables(graph: &Graph, start: u32) -> Vec<u32> {
+    let mut queue = VecDeque::from([start]);
+    let mut seen = HashSet::new();
+    seen.insert(start);
+    let mut variables = Vec::new();
+    while let Some(current) = queue.pop_front() {
+        let Some(index) = graph.node_by_id.get(&current).copied() else { continue };
+        for edge_index in &graph.outgoing[index] {
+            let edge = &graph.edges[*edge_index];
+            match graph.edge_kind(edge) {
+                "AST_CHILD" => {
+                    if seen.insert(edge.target) { queue.push_back(edge.target); }
+                }
+                "REFERS_TO" if graph.node_by_id.get(&edge.target).is_some_and(|target|
+                    graph.node_kind(*target) == "variable") => variables.push(edge.target),
+                _ => {}
+            }
+        }
+    }
+    variables.sort_unstable();
+    variables.dedup();
+    variables
+}
+
 /// Apply declarative Atropos source/sink rows to compiler call/argument facts.
 /// The catalog is a binary protobuf by this point; no authored JSON is read.
 pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Request) -> Delta {
@@ -135,6 +173,34 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
         let position = graph.node_property_i64(node, "position")
             .and_then(|value| u32::try_from(value).ok()).unwrap_or(0);
         arguments.entry(callsite).or_default().push((position, node.id));
+    }
+    // The compact Pass-1 projection represents the same call arguments as
+    // HAS_ARGUMENT edges.  Prefer/merge that lossless edge form so catalog
+    // models remain independent of whether a frontend materializes explicit
+    // argument nodes.
+    for edge in &graph.edges {
+        if graph.edge_kind(edge) != "HAS_ARGUMENT" { continue; }
+        let Some(position) = graph.edge_property_i64(edge, "position")
+            .and_then(|value| u32::try_from(value).ok()) else { continue };
+        arguments.entry(edge.source).or_default().push((position, edge.target));
+    }
+    for values in arguments.values_mut() {
+        values.sort_unstable();
+        values.dedup();
+    }
+    let mut call_results: HashMap<u32, Vec<u32>> = HashMap::new();
+    for edge in &graph.edges {
+        if graph.edge_kind(edge) != "VALUE_FLOWS_TO"
+            || graph.edge_property_text(edge, "reason") != Some("initializer") {
+            continue;
+        }
+        if graph.node_by_id.contains_key(&edge.source) {
+            call_results.entry(edge.source).or_default().push(edge.target);
+        }
+    }
+    for values in call_results.values_mut() {
+        values.sort_unstable();
+        values.dedup();
     }
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -150,8 +216,8 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
                 let mut endpoints = model.access_path.split("->").map(str::trim);
                 let Some(from_endpoint) = endpoints.next() else { continue };
                 let Some(to_endpoint) = endpoints.next() else { continue };
-                let from_values = endpoint_values(from_endpoint, call, &arguments, graph);
-                let to_values = endpoint_values(to_endpoint, call, &arguments, graph);
+                let from_values = endpoint_values(from_endpoint, call, &arguments, &call_results, graph);
+                let to_values = endpoint_values(to_endpoint, call, &arguments, &call_results, graph);
                 let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
                 for from in from_values {
                     for to in &to_values {
@@ -165,7 +231,7 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
                 continue;
             }
             if !matches!(model.role.as_str(), "source" | "sink") { continue; }
-            let values = endpoint_values(model.access_path.trim(), call, &arguments, graph);
+            let values = endpoint_values(model.access_path.trim(), call, &arguments, &call_results, graph);
             let role = model.role.as_str();
             let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
             let kind = if role == "source" { "source" } else { "sink" };
@@ -200,6 +266,34 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         evidence.entry((item.source, item.target)).or_insert_with(|| vec![
             graph.id(item.source).to_owned(), graph.id(item.target).to_owned(),
         ]);
+    }
+
+    // Port the old C return-value overlay generically.  A resolved function
+    // return and a resolved callsite share the function endpoint; the value
+    // returned by the callee therefore reaches the caller's call node.  This
+    // is a structural fact and applies equally to every frontend that emits
+    // these neutral edge kinds.
+    let mut returns_by_function: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut calls_by_function: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for item in &graph.edges {
+        match graph.edge_kind(item) {
+            "RETURNS_VALUE" => returns_by_function.entry(item.target).or_default().push(item.source),
+            "INVOKES" => calls_by_function.entry(item.target).or_default().push(item.source),
+            _ => {}
+        }
+    }
+    for (function, returned_values) in returns_by_function {
+        let Some(calls) = calls_by_function.get(&function) else { continue };
+        for returned in returned_values {
+            for call in calls {
+                adjacency.entry(returned).or_default()
+                    .push((*call, "VALUE_FLOWS_TO".to_owned(),
+                           Some("c-return-to-callsite".to_owned()), None));
+                evidence.entry((returned, *call)).or_insert_with(|| vec![
+                    graph.id(returned).to_owned(), graph.id(*call).to_owned(),
+                ]);
+            }
+        }
     }
 
     let mut arguments_by_call: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -280,6 +374,34 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 fact(&[graph.id(node.id).to_owned()], &confidence)));
             sink_records.push(RoleRecord { node: sink_id, value: node.id,
                 confidence, subtype, label });
+        }
+    }
+
+    // Port the old out-parameter writeback overlay.  Only values that the
+    // Atropos catalog actually marked as source arguments are reversed.  The
+    // endpoint can be an AST wrapper, so resolve its descendant reference to
+    // the variable structurally rather than relying on a function/API name.
+    for source in &source_records {
+        for variable in referenced_variables(graph, source.value) {
+            adjacency.entry(source.value).or_default()
+                .push((variable, "VALUE_FLOWS_TO".to_owned(),
+                       Some("c-out-param-writeback".to_owned()), None));
+            evidence.entry((source.value, variable)).or_insert_with(|| vec![
+                graph.id(source.value).to_owned(), graph.id(variable).to_owned(),
+            ]);
+        }
+    }
+    // The same structural aliases are needed on the sink side when a call
+    // argument is an AST wrapper around a reference.  This keeps the source
+    // variable connected to the exact catalog sink endpoint.
+    for sink in &sink_records {
+        for variable in referenced_variables(graph, sink.value) {
+            adjacency.entry(variable).or_default()
+                .push((sink.value, "VALUE_FLOWS_TO".to_owned(),
+                       Some("referenced-variable".to_owned()), None));
+            evidence.entry((variable, sink.value)).or_insert_with(|| vec![
+                graph.id(variable).to_owned(), graph.id(sink.value).to_owned(),
+            ]);
         }
     }
 
