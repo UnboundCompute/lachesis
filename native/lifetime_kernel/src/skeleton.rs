@@ -49,6 +49,7 @@ struct WalkState {
 fn walk_region(
     result: &lifetime_proto::NativeSemanticResult,
     region: &lifetime_proto::NativeSourceRegion,
+    context: &str,
 ) -> (Vec<lifetime_proto::NativeSkeletonToken>, Vec<lifetime_proto::NativeSemanticEdge>, bool) {
     let functions = function_map(result);
     let allowed: BTreeSet<&str> = region.functions.iter().map(String::as_str).collect();
@@ -75,10 +76,23 @@ fn walk_region(
     }
 
     let mut starts = Vec::new();
-    for id in &region.source_nodes {
-        if nodes.contains_key(id.as_str()) { starts.push(id.clone()); }
+    if context != "__entry__" {
+        for id in &region.source_nodes {
+            if id != context { continue; }
+            if nodes.contains_key(id.as_str()) {
+                starts.push(id.clone());
+            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id) {
+                starts.push(node.id.clone());
+            }
+        }
+    } else {
+        // A structural root has no catalogued launch site.  Start at its
+        // compiler entry exactly as the old scheduler's __entry__ context did.
+        starts.extend(region.source_nodes.iter()
+            .filter(|id| nodes.contains_key(id.as_str()))
+            .cloned());
     }
-    if starts.is_empty() {
+    if starts.is_empty() && context == "__entry__" {
         if let Some(function) = functions.get(region.source_function.as_str()) {
             if !function.entry.is_empty() && nodes.contains_key(function.entry.as_str()) {
                 starts.push(function.entry.clone());
@@ -175,16 +189,8 @@ pub(crate) fn build(
         let contexts = if region.contexts.is_empty() {
             vec!["__entry__".to_owned()]
         } else { region.contexts.clone() };
-        // Contexts are part of the cache key exposed to Pass 3, but the
-        // current native region sidecar does not yet carry a per-context
-        // launch-node map.  The old FragmentStore therefore has the same
-        // reusable fragment for all equivalent launches.  Walk the function
-        // cone once and clone only the protobuf record for each context;
-        // never repeat the CFG/seam traversal merely because a source has
-        // several catalogued launch sites.
-        let walked = walk_region(result, region);
         for context in contexts {
-            let (mut tokens, edges, complete) = walked.clone();
+            let (mut tokens, edges, complete) = walk_region(result, region, &context);
             // The old renderer always has explicit boundaries around the root
             // as well as every nested call.  Keep these even for a region with
             // no event at its entry: an empty/unresolved fragment must remain
@@ -280,14 +286,14 @@ mod tests {
             ],
             regions: vec![lifetime_proto::NativeSourceRegion {
                 source_function: "source".into(), source_nodes: vec!["s0".into()],
-                functions: vec!["source".into(), "callee".into()], contexts: vec!["ctx".into()], ..Default::default()
+                functions: vec!["source".into(), "callee".into()], contexts: vec!["s0".into()], ..Default::default()
             }], ..Default::default()
         };
         let skeletons = build(&result);
         let kinds: Vec<_> = skeletons[0].tokens.iter().map(|token| token.kind.as_str()).collect();
         assert!(kinds.windows(2).any(|pair| pair == ["enter", "control"]));
         assert!(skeletons[0].tokens.iter().any(|token| token.kind == "exit" && token.function == "callee"));
-        assert_eq!(skeletons[0].context, "ctx");
+        assert_eq!(skeletons[0].context, "s0");
         assert!(skeletons[0].complete);
     }
 }
