@@ -152,7 +152,12 @@ class Analysis:
 
         path = os.path.expanduser(path)
         overlay = os.path.expanduser(overlay) if overlay else overlay
-        store = GraphStore.load(path, overlay_path=overlay, defer_maps=defer_maps)
+        try:
+            store = GraphStore.load(path, overlay_path=overlay, defer_maps=defer_maps)
+        except AnalysisError:
+            raise
+        except (OSError, KeyError, ValueError, RuntimeError) as error:
+            raise AnalysisError(f"could not open graph {path}: {error}") from error
         return cls(store, progress=progress)
 
     @classmethod
@@ -170,9 +175,14 @@ class Analysis:
 
         source = os.path.expanduser(source)
         out = os.path.expanduser(out)
-        graph, snapshots = run_project(source, None, enrich=False,
-                                       timeout_seconds=timeout_seconds)
-        write_kuzu_graph(graph, snapshots, out, enriched=False)
+        try:
+            graph, snapshots = run_project(source, None, enrich=False,
+                                           timeout_seconds=timeout_seconds)
+            write_kuzu_graph(graph, snapshots, out, enriched=False)
+        except AnalysisError:
+            raise
+        except (OSError, KeyError, ValueError, RuntimeError) as error:
+            raise AnalysisError(f"could not build graph from {source}: {error}") from error
         analysis = cls.open(out, progress=progress)
         if enrich:
             analysis.enrich(hard_stop=0)
