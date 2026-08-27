@@ -180,7 +180,7 @@ def _render_candidates(result: dict, *, census: bool) -> None:
         groups = result.get("groups") or [result]
         rows = [row for group in groups for row in group.get("candidates", [])]
         rows.sort(key=lambda r: r.get("rank") or 0.0, reverse=True)
-        print(f"{len(rows)} candidates (rank orders attention; it never filters)")
+        print(f"{len(rows)} leads (rank orders attention; it never filters)")
         for row in rows[:60]:
             obs = row.get("observations", {})
             where = f"{obs.get('file')}:{obs.get('line')}" if obs.get("file") else ""
