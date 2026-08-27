@@ -1543,6 +1543,12 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         if let Some(source_evidence) = source_evidence {
             for function in &mut full.functions {
                 for node in &mut function.nodes {
+                    // The presence of the binary taint sidecar is the
+                    // analysis contract: every candidate gets an explicit
+                    // computed reachability value.  Only nodes present in
+                    // its witness index are reachable; findings themselves
+                    // must not manufacture that fact.
+                    node.source_reachable = Some(false);
                     if let Some(witness) = source_evidence.get(&node.anchor) {
                         node.source_witness_nodes = witness.clone();
                         node.source_reachable = Some(true);
