@@ -7,7 +7,7 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
-## [0.2.0]
+## [0.3.0]
 
 This release introduces a source-rooted semantic flow analysis and a lifetime/typestate
 candidate layer on top of the existing sink-reachability model. Pre-1.0: the graph schema
@@ -78,6 +78,16 @@ and candidate surface grow here; older candidate output remains readable.
 - A size guard must compare magnitude, not merely name a variable.
 - The C frontend slices AST snippets by byte offset rather than code point.
 - Tolerate unreadable legacy graph properties instead of failing the load.
+- Queries materialize the dataflow tier from the native binary sidecar only; the removed
+  in-process Python enrichment fallback is no longer reachable from any query surface, so
+  a batch export (for example the GitHub Action's SARIF run) no longer risks exhausting
+  memory re-enriching a large graph in the query process.
+
+## [0.2.0]
+
+Packaged the reader on PyPI: the graph builder, navigation and dataflow tools, the
+candidate registry, and the MCP server. Superseded by 0.3.0, which lands the source-rooted
+semantic flow analysis and lifetime/typestate candidates described above.
 
 ## [0.1.7]
 
