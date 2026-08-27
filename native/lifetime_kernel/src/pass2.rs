@@ -428,15 +428,31 @@ pub(crate) fn read_taint_evidence_path(
     let _: graph_proto::DataflowOverlay = graph_proto::DataflowOverlay::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 evidence envelope: {error}"))?;
     let mut result = HashMap::new();
+    let mut sink_values = HashMap::new();
+    let mut reaches = Vec::new();
     while let Some(payload) = read_optional_stream_frame(&mut input)? {
         if payload.first() != Some(&b'N') { continue; }
         let node = graph_proto::NodeRecord::decode(&payload[1..])
             .map_err(|error| format!("invalid Pass-2 evidence node: {error}"))?;
-        if node.kind != "taint-reach" { continue; }
-        let Some(sink) = text_property(&node.properties, "sink_id") else { continue; };
-        let witness = text_list_property(&node.properties, "witness_ids");
-        if !witness.is_empty() {
-            result.entry(sink.to_owned()).or_insert(witness);
+        if node.kind == "sink" {
+            if let (Some(value), Some(value_id)) = (
+                text_property(&node.properties, "value_id"),
+                Some(node.id.as_str()),
+            ) {
+                sink_values.insert(value_id.to_owned(), value.to_owned());
+            }
+        } else if node.kind == "taint-reach" {
+            let Some(sink) = text_property(&node.properties, "sink_id") else { continue; };
+            let witness = text_list_property(&node.properties, "witness_ids");
+            if !witness.is_empty() {
+                reaches.push((sink.to_owned(), witness));
+            }
+        }
+    }
+    for (sink, witness) in reaches {
+        result.entry(sink.clone()).or_insert_with(|| witness.clone());
+        if let Some(value) = sink_values.get(&sink) {
+            result.entry(value.clone()).or_insert(witness);
         }
     }
     Ok(result)
