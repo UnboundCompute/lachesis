@@ -391,6 +391,7 @@ message NativeSemanticFunction {
   repeated string exits = 3;
   repeated NativeSemanticNode nodes = 4;
   repeated NativeSemanticEdge edges = 5;
+  string language = 6;
 }
 message NativeSemanticResult {
   repeated NativeSemanticFunction functions = 1;

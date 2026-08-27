@@ -154,7 +154,8 @@ def _decode_native_semantic_result(result, lang="mixed"):
                               path="*" if obj is not None else None,
                               line=node.line if node.has_line else None)
             graph.add_node(node.id, event, fragment=function.id,
-                           owner_function_id=function.id, native_anchor=node.anchor)
+                           owner_function_id=function.id, native_anchor=node.anchor,
+                           language=function.language or lang)
         for edge in function.edges:
             if edge.source in node_ids and edge.target in node_ids:
                 graph.add_edge(edge.source, edge.target, kind=edge.kind or "normal")

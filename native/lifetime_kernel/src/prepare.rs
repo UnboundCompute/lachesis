@@ -1346,6 +1346,19 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
     }
 }
 
+fn semantic_language(function: &str) -> String {
+    if function.contains(":cpython-ast:") || function.contains(":python:") {
+        "python".to_owned()
+    } else if function.contains(":typescript-compiler-api:")
+        || function.contains(":javascript:") || function.contains(":typescript:") {
+        "javascript".to_owned()
+    } else if function.contains(":clang-c:") || function.contains(":clang-cpp:") {
+        "c".to_owned()
+    } else {
+        "mixed".to_owned()
+    }
+}
+
 /// Emit the compact event graph consumed by the semantic query layer.  This
 /// deliberately carries operation-derived events and CFG relations only; the
 /// original AST and solver snapshots never cross the native boundary.
@@ -1471,7 +1484,10 @@ pub(crate) fn semantic_request(
                 || function.successors.iter().all(|item| item.node != **node))
             .filter_map(|node| by_anchor.get(node).and_then(|ids| ids.last()).cloned())
             .collect();
-        Ok(lifetime_proto::NativeSemanticFunction { id, entry, exits, nodes, edges })
+        let language = semantic_language(&id);
+        Ok(lifetime_proto::NativeSemanticFunction {
+            id, entry, exits, nodes, edges, language,
+        })
     }).collect::<Result<Vec<_>, String>>()?;
     Ok(lifetime_proto::NativeSemanticResult { functions, complete: true })
 }
