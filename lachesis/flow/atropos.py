@@ -39,6 +39,68 @@ _EXT_LANG = {
     ".mjs": "javascript", ".ts": "typescript", ".tsx": "typescript",
 }
 
+# The flow-pattern catalog is normally supplied by Atropos.  Keep the planner's
+# constructor vocabulary available in a standalone Lachesis wheel as well: these
+# are routing declarations, not findings or sink-model data.  The external
+# catalog still overrides this table whenever it is installed.
+_FALLBACK_FLOW_PATTERNS = (
+    {"id": "mem.lifetime.leak", "name": "Allocated object remains live at an exit",
+     "cwe": ("CWE-401",), "requires": ("memory.alloc",),
+     "candidate": {"domain": "lifecycle", "family": "leak"},
+     "matcher": {"pattern": "leak", "event_kinds": ("origin",)}},
+    {"id": "mem.lifetime.aggregate-copy-alias",
+     "name": "Aggregate copy duplicates pointer-bearing fields",
+     "cwe": ("CWE-415", "CWE-416"), "requires": ("memory.copy",),
+     "candidate": {"domain": "lifecycle", "family": "aggregate-copy-alias"},
+     "matcher": {"pattern": "aggregate-copy-alias", "event_kinds": ("derive",)}},
+    {"id": "mem.lifetime.uninitialized-use",
+     "name": "Use of an indeterminate pointer value", "cwe": ("CWE-457",),
+     "requires": ("memory.deref",),
+     "candidate": {"domain": "lifecycle", "family": "uninitialized-use"},
+     "matcher": {"pattern": "uninitialized-use",
+                  "event_kinds": ("read_storage", "write_storage", "pass_value", "compare_value")}},
+    {"id": "mem.lifetime.dangling-use",
+     "name": "Freed pointer is passed or compared as a value", "cwe": ("CWE-825",),
+     "requires": ("memory.free",),
+     "candidate": {"domain": "lifecycle", "family": "dangling-use"},
+     "matcher": {"pattern": "use.dangling",
+                  "event_kinds": ("pass_value", "compare_value", "return_value")}},
+    {"id": "mem.lifetime.double-free",
+     "name": "Free reached twice on one path (double free)", "cwe": ("CWE-415",),
+     "requires": ("memory.free",),
+     "candidate": {"domain": "lifecycle", "family": "double-free"},
+     "matcher": {"pattern": "double-free", "event_kinds": ("release",)}},
+    {"id": "mem.lifetime.use-after-free",
+     "name": "Dereference or copy of a pointer after it was freed",
+     "cwe": ("CWE-416",), "requires": ("memory.free", "memory.deref"),
+     "candidate": {"domain": "lifecycle", "family": "use-after-free"},
+     "matcher": {"pattern": "uaf.deref",
+                  "event_kinds": ("read", "write", "read_storage", "write_storage")}},
+    {"id": "mem.lifetime.realloc-failure-leak",
+     "name": "Failed reallocation loses the only owning slot",
+     "cwe": ("CWE-401", "CWE-772"), "requires": ("memory.alloc", "memory.free"),
+     "candidate": {"domain": "lifecycle", "family": "realloc-failure-leak"},
+     "matcher": {"pattern": "mem.lifetime.realloc-failure-leak",
+                  "event_kinds": ("realloc_failed",)}},
+    {"id": "mem.lifetime.null-deref",
+     "name": "Dereference of a known-null storage slot", "cwe": ("CWE-476",),
+     "requires": ("memory.deref",),
+     "candidate": {"domain": "lifecycle", "family": "null-deref"},
+     "matcher": {"pattern": "null-deref",
+                  "event_kinds": ("read", "write", "read_storage", "write_storage")}},
+    {"id": "mem.lifetime.use-after-return",
+     "name": "Address of a local returned or stored past its scope", "cwe": ("CWE-562",),
+     "requires": ("memory.deref",),
+     "candidate": {"domain": "lifecycle", "family": "use-after-return"},
+     "matcher": {"pattern": "use-after-return", "event_kinds": ("return_value",)}},
+    {"id": "ctrl.unchecked-return-deref",
+     "name": "Return value dereferenced without a null/error check",
+     "cwe": ("CWE-476", "CWE-252"), "requires": ("memory.deref",),
+     "candidate": {"domain": "lifecycle", "family": "unchecked-return-deref"},
+     "matcher": {"pattern": "unchecked-return-deref",
+                  "event_kinds": ("read_storage", "write_storage")}},
+)
+
 
 def lang_of(path):
     return _EXT_LANG.get(os.path.splitext(path)[1], "c")
@@ -197,7 +259,8 @@ def pattern_catalog():
     roles.  A missing catalog remains a valid empty result for older installations;
     callers can then use their compatibility defaults.
     """
-    return detection("flow-patterns").get("patterns", [])
+    patterns = detection("flow-patterns").get("patterns", [])
+    return patterns or list(_FALLBACK_FLOW_PATTERNS)
 
 
 def flow_pattern_id(matcher_pattern, family=None):
