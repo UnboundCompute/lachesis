@@ -19,13 +19,17 @@ def _library_candidates() -> tuple[Path, ...]:
     configured = os.environ.get("LACHESIS_NATIVE_LIFETIME_LIB")
     if configured:
         return (Path(configured),)
-    root = Path(__file__).resolve().parents[2]
-    return tuple(root / "native" / "lifetime_kernel" / "target" / "release" / name
-                 for name in (
+    names = (
                      "liblachesis_lifetime_kernel.dylib",
                      "liblachesis_lifetime_kernel.so",
                      "lachesis_lifetime_kernel.dll",
-                 ))
+                 )
+    package_native = Path(__file__).resolve().parents[1] / "_native"
+    root = Path(__file__).resolve().parents[2]
+    return tuple(package_native / name for name in names) + tuple(
+        root / "native" / "lifetime_kernel" / "target" / "release" / name
+        for name in names
+    )
 
 
 def _load():
