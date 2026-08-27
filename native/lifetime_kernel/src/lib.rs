@@ -2001,7 +2001,10 @@ fn solve_graph_mode(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         .or_else(|_| std::env::var("LACHESIS_DIAGNOSTIC_TRANSFER_CAP"))
         .ok().and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(10_000u64);
+        // Match the old engine's graph-relative budget.  Small functions keep
+        // the same minimum guard; large functions are not silently truncated
+        // at the same flat count regardless of their CFG size.
+        .unwrap_or_else(|| 10_000u64.max((nodes.len() as u64).saturating_mul(500)));
     while transfers < transfer_cap {
         let Some(node) = queue.pop_front() else { break };
         queued.remove(&node);
