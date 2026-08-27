@@ -70,6 +70,8 @@ fn scalar_properties(node: &graph_proto::NodeRecord, retain_owner: bool) -> Vec<
             "receiver" |
             "target_id" |
             "value_id" |
+            "linkage" |
+            "exported" |
             "is_alloc" |
             "is_release" |
             "is_realloc" |
@@ -802,7 +804,7 @@ fn compact_node(record: graph_proto::NodeRecord) -> CompactNode {
             "syntax_kind" | "owner_function_id" | "function_id" | "start_line" |
             "start_offset" | "primary_target_id" | "callee" | "receiver" |
             "is_alloc" | "is_release" | "is_realloc" | "is_aggregate_copy" |
-            "type" | "operator" | "storage_class" | "file") {
+            "type" | "operator" | "storage_class" | "linkage" | "exported" | "file") {
             return None;
         }
         let value = field.value?.kind?;
@@ -1216,7 +1218,13 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                 entry.start_line = line;
                 entry.has_start_line = true;
             }
-            entry.externally_visible = compact_property(function, "storage_class") != Some("static");
+            let internal_linkage = matches!(
+                compact_property(function, "storage_class"),
+                Some("static") | Some("internal") | Some("none")
+            ) || matches!(compact_property(function, "linkage"), Some("internal") | Some("none"));
+            entry.externally_visible = compact_property(function, "exported")
+                .map(|value| value == "true")
+                .unwrap_or(!internal_linkage);
         }
     }
     for entry in functions.values_mut() {
