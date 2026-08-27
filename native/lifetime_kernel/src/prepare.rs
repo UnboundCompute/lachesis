@@ -177,6 +177,15 @@ impl<'a> GraphView<'a> {
                 && matches!(self.label(&id).trim(), "0" | "NULL" | "nullptr"))
     }
 
+    fn pointer_arithmetic_source(&self, id: &str) -> Option<Path> {
+        let id = self.peel(id.to_owned());
+        if self.kind(&id) != "BinaryOperator" || !matches!(self.operator(&id), "+" | "-") {
+            return None;
+        }
+        self.children_of(&id).into_iter().flatten()
+            .find_map(|child| self.access_path(child, 0))
+    }
+
     fn peel(&self, mut id: String) -> String {
         for _ in 0..12 {
             if matches!(self.kind(&id), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
@@ -930,6 +939,17 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                     (Kind::Copy, Some(source), false)
                 } else { (Kind::Clobber, None, false) };
                 operations.push(raw_operation(kind, node_id, target, source, line, is_null, "deref"));
+                if let Some(source) = graph.pointer_arithmetic_source(&initializer) {
+                    operations.push(raw_operation(
+                        Kind::Use,
+                        node_id,
+                        graph.access_path(node_id, 0),
+                        Some(source),
+                        line,
+                        false,
+                        "pointer-arithmetic",
+                    ));
+                }
             } else {
                 operations.push(raw_operation(Kind::Clobber, node_id, target, None, line, false, "uninitialized"));
             }

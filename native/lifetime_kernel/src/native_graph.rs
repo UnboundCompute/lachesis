@@ -345,6 +345,7 @@ fn sidecar_to_request_inner(
                 "alloc" | "acquire" => call.is_alloc = true,
                 "release" => call.is_release = true,
                 "realloc" => call.is_realloc = true,
+                "source" => call.is_source = true,
                 _ => {}
             }
         }
