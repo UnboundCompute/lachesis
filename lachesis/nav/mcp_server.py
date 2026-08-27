@@ -1728,16 +1728,28 @@ def call_tool(name, args, format=None):
         bundle = c.flow_bundle
         semantic = bundle.get("semantic_graph")
         payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        rows = [Lead.from_dict(lead) for lead in (bundle.get("leads") or ())]
+        function = args.get("function")
+        if function:
+            rows = [lead for lead in rows if lead.entry == function]
+        page = rows[offset:offset + max(1, limit)]
+        next_offset = offset + len(page)
         return _emit(name, {
             "move": "flow_pass",
             "counts": {
                 "semantic_nodes": len(payload.get("nodes") or {}),
                 "semantic_edges": sum(len(edges) for edges in
                                       (payload.get("edges") or {}).values()),
-                "leads": len(bundle.get("leads") or ()),
+                "leads": len(rows),
             },
-            "semantic_graph": payload,
-            "leads": bundle.get("leads") or (),
+            "leads": [lead.to_dict() for lead in page],
+            "page": {"total": len(rows), "offset": offset,
+                     "returned": len(page), "has_more": next_offset < len(rows),
+                     "next_offset": next_offset if next_offset < len(rows) else None},
+            "semantic_graph": {"available": semantic is not None,
+                               "nodes": len(payload.get("nodes") or {}),
+                               "edges": sum(len(edges) for edges in
+                                             (payload.get("edges") or {}).values())},
             "lifetime": bundle.get("lifetime", {}),
         }, fmt, offset, limit)
     if name == "leads":
@@ -1771,18 +1783,26 @@ def call_tool(name, args, format=None):
         semantic = bundle.get("semantic_graph")
         payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
         fn = args.get("function")
-        leads = [lead for lead in bundle.get("leads") or ()
+        leads = [Lead.from_dict(lead) for lead in bundle.get("leads") or ()
                  if not fn or lead.get("entry") == fn]
+        page = leads[offset:offset + max(1, limit)]
+        next_offset = offset + len(page)
         return _emit(name, {
             "move": "flow_skeleton",
             "counts": {
                 "semantic_nodes": len(payload.get("nodes") or {}),
                 "semantic_edges": sum(len(edges) for edges in
                                       (payload.get("edges") or {}).values()),
-                "leads": len(bundle.get("leads") or ()),
+                "leads": len(leads),
             },
-            "semantic_graph": payload,
-            "leads": leads,
+            "semantic_graph": {"available": semantic is not None,
+                               "nodes": len(payload.get("nodes") or {}),
+                               "edges": sum(len(edges) for edges in
+                                             (payload.get("edges") or {}).values())},
+            "leads": [lead.to_dict() for lead in page],
+            "page": {"total": len(leads), "offset": offset,
+                     "returned": len(page), "has_more": next_offset < len(leads),
+                     "next_offset": next_offset if next_offset < len(leads) else None},
             "lifetime": bundle.get("lifetime", {}),
         }, fmt, offset, limit)
     if name == "taint":
