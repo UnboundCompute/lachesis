@@ -1366,8 +1366,11 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         fs::rename(&temporary, output)
             .map_err(|error| format!("cannot publish semantic result: {error}"))?;
         let events = lifetime_proto::NativeSemanticResult {
-            functions: full.functions.into_iter().map(|mut function| {
+            functions: full.functions.into_iter().filter_map(|mut function| {
                 function.nodes.retain(|node| !node.event_kind.is_empty());
+                if function.nodes.is_empty() {
+                    return None;
+                }
                 {
                     let event_ids: HashSet<&str> = function.nodes.iter()
                         .map(|node| node.id.as_str()).collect();
@@ -1378,7 +1381,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
                     }
                     function.exits.retain(|exit| event_ids.contains(exit.as_str()));
                 }
-                function
+                Some(function)
             }).collect(),
             complete: full.complete,
         }.encode_to_vec();
