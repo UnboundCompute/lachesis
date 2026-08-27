@@ -42,6 +42,10 @@ private/
 # that would land again, in full, on every version bump.
 lachesis/frontends/typescript/vendor/
 
+# Native artifacts are staged locally for wheel builds by tools/stage_native.py.
+# They are platform-specific build outputs, never source-controlled.
+lachesis/_native/
+
 # Scratch analysis notes -- markdown that is generated, never committed. Tracked
 # docs (README.md, docs/*.md) stay tracked; this only stops new scratch .md.
 *.md
