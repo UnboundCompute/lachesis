@@ -51,10 +51,14 @@ fn sink_token(
     let (callee, argument) = sink_parts(&flow.sink).unwrap_or((flow.sink.as_str(), 0));
     lifetime_proto::NativeSkeletonToken {
         kind: "sink".into(), family: family_for(callee, language, argument, catalog),
-        object_root: flow.root.clone(), value: flow.value.clone(), depth,
+        object_root: flow.root.clone(), value: flow.value.clone(), node: flow.node.clone(),
+        line: flow.line, has_line: flow.has_line, depth,
         guarded: flow.guarded, tainted: flow.provenance != "const",
         bound: if flow.guarded { "bounded".into() } else { "unbounded".into() },
         callee: callee.into(), argument, has_argument: true, truncated,
+        size_expression: flow.size_expression.clone(), destination: flow.destination.clone(),
+        control: flow.control.clone(), guards: flow.guard_predicates.iter().map(|value|
+            lifetime_proto::GuardProof { kind: "PREDICATE".into(), value: value.clone() }).collect(),
         ..Default::default()
     }
 }
@@ -137,12 +141,17 @@ pub(crate) fn build(
     }
     let summary_map: HashMap<String, &lifetime_proto::NativeSummaryFunction> = summaries.functions.iter()
         .map(|summary| (summary.name.clone(), summary)).collect();
-    let roots: Vec<String> = functions.keys().filter(|name| !called.contains(*name))
+    // The old engine emitted a skeleton for every function carrying a summary
+    // flow.  Callerless/source roots are marked separately; they are not a
+    // reason to discard callee-local skeletons, which are needed for coverage
+    // and for callers whose chain cannot be stitched completely.
+    let roots: Vec<String> = functions.keys()
+        .filter(|name| summary_map.get(*name).is_some_and(|summary| !summary.sink_flows.is_empty()))
         .cloned().collect();
-    let roots = if roots.is_empty() { functions.keys().cloned().collect() } else { roots };
     let mut output = Vec::new();
     for root in roots {
         let Some(summary) = summary_map.get(&root) else { continue };
+        let is_source = !called.contains(&root);
         for flow in &summary.sink_flows {
             let mut tokens = vec![lifetime_proto::NativeSkeletonToken {
                 kind: "enter".into(), function: root.clone(), depth: 0, ..Default::default()
@@ -154,7 +163,7 @@ pub(crate) fn build(
             });
             output.push(lifetime_proto::NativeFlowSkeleton {
                 kind: "reach".into(), entry: root.clone(), source_function: root.clone(),
-                context: "__entry__".into(), complete, tokens, edges: Vec::new(),
+                context: "__entry__".into(), complete, tokens, edges: Vec::new(), is_source,
             });
         }
     }

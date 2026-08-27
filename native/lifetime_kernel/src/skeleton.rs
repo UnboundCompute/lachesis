@@ -208,7 +208,7 @@ pub(crate) fn build(
                 kind: "source-rooted".into(),
                 entry: region.source_function.clone(),
                 source_function: region.source_function.clone(),
-                context, complete, tokens, edges,
+                context, complete, tokens, edges, is_source: true,
             });
         }
     }

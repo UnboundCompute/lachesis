@@ -335,6 +335,14 @@ message NativeSinkFlow {
   bool guarded = 6;
   bool site_guarded = 7;
   string via = 8;
+  string node = 9;
+  sint64 line = 10;
+  bool has_line = 11;
+  string size_expression = 12;
+  string destination = 13;
+  repeated string control = 14;
+  string guard_status = 15;
+  repeated string guard_predicates = 16;
 }
 message NativeSinkParam {
   string parameter = 1;
@@ -466,6 +474,7 @@ message NativeFlowSkeleton {
   bool complete = 5;
   repeated NativeSkeletonToken tokens = 6;
   repeated NativeSemanticEdge edges = 7;
+  bool is_source = 8;
 }
 message NativeSemanticResult {
   repeated NativeSemanticFunction functions = 1;

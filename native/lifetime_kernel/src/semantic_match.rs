@@ -847,6 +847,7 @@ mod tests {
                 lifetime_proto::NativeSemanticEdge { source: "alloc".into(), target: "free".into(), ..Default::default() },
                 lifetime_proto::NativeSemanticEdge { source: "free".into(), target: "use".into(), ..Default::default() },
             ],
+            is_source: true,
         };
         let matched = match_result(lifetime_proto::NativeSemanticResult {
             skeletons: vec![skeleton], ..Default::default()

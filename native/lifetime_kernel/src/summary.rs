@@ -139,11 +139,23 @@ pub(crate) fn summarize(
 
     let functions = summaries.into_iter().map(|(name, summary)| {
         let item = functions.get(&name).expect("function summary input");
-        let mut sink_flows = summary.flows.into_iter().map(|(sink, value, root, via)|
+        let mut sink_flows = summary.flows.into_iter().map(|(sink, value, root, via)| {
+            let (callee, position) = sink.rsplit_once(".a")
+                .and_then(|(callee, position)| position.parse::<u32>().ok()
+                    .map(|position| (callee, position)))
+                .unwrap_or((sink.as_str(), 0));
+            let call = item.calls.iter().find(|call| call.callee == callee
+                && call.arguments.iter().any(|argument|
+                    argument.position == position && argument_root(argument) == root));
             lifetime_proto::NativeSinkFlow {
                 sink, value, root, provenance: "local".into(), guards: Vec::new(),
                 guarded: false, site_guarded: false, via,
-            }).collect::<Vec<_>>();
+                node: call.map(|call| call.node.clone()).unwrap_or_default(),
+                line: call.map(|call| call.line).unwrap_or_default(),
+                has_line: call.is_some_and(|call| call.has_line),
+                ..Default::default()
+            }
+        }).collect::<Vec<_>>();
         sink_flows.sort_by(|left, right| (&left.sink, &left.root, &left.value, &left.via)
             .cmp(&(&right.sink, &right.root, &right.value, &right.via)));
         let mut sink_params = summary.params.into_iter().map(|(parameter, sink)|
