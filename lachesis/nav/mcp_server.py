@@ -1085,6 +1085,13 @@ def _tool_error(name, error):
     }
 
 
+def _json_tool_error(name, error, **extra):
+    """Serialize the same error contract for control-plane helpers."""
+    payload = _tool_error(name, error)
+    payload.update(extra)
+    return json.dumps(payload)
+
+
 def _capability_blocked(name, reason, prerequisite):
     return {"move": name, "supported": False, "status": "blocked",
             "reason": reason, "prerequisite": prerequisite}
@@ -1882,13 +1889,16 @@ def _build_graph(args):
     store is loaded exactly as `load_graph` would, so the next tool call hits it."""
     source = _expand(args.get("source") or args.get("path"))
     if not source or not os.path.isdir(source):
-        return json.dumps({"error": f"source must be an existing directory: {source!r}"})
+        return _json_tool_error(
+            "build_graph", ValueError(f"source must be an existing directory: {source!r}"))
     try:
         timeout = int(args.get("timeout_seconds", 300))
     except (TypeError, ValueError):
-        return json.dumps({"error": "timeout_seconds must be an integer number of seconds"})
+        return _json_tool_error(
+            "build_graph", ValueError("timeout_seconds must be an integer number of seconds"))
     if timeout < 1:
-        return json.dumps({"error": "timeout_seconds must be greater than zero"})
+        return _json_tool_error(
+            "build_graph", ValueError("timeout_seconds must be greater than zero"))
     refresh = bool(args.get("refresh"))
     from lachesis.cache import entry_for
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
@@ -1898,20 +1908,26 @@ def _build_graph(args):
                                             timeout_seconds=timeout)
     except EnvironmentProblem as error:
         # A missing frontend toolchain (node for TS/JS, clang for C). Actionable, not a crash.
-        return json.dumps({"error": "missing toolchain prerequisite",
-                           "checks": [{"name": c.name, "detail": c.detail, "fix": c.fix}
-                                      for c in error.checks if not c.ok]})
+        return _json_tool_error(
+            "build_graph", error,
+            checks=[{"name": c.name, "detail": c.detail, "fix": c.fix}
+                    for c in error.checks if not c.ok],
+        )
     except NoSourceFound as error:
-        return json.dumps({"error": str(error)})
+        return _json_tool_error("build_graph", error)
     except Exception as error:  # noqa: BLE001 - a frontend timeout or compile failure
-        return json.dumps({"error": f"build failed: {error}",
-                           "hint": "large trees can exceed timeout_seconds (default 300); "
-                                   "raise it and retry, or run lachesis build out of band"})
+        return _json_tool_error(
+            "build_graph", RuntimeError(f"build failed: {error}"),
+            hint="large trees can exceed timeout_seconds (default 300); raise it and retry, "
+                 "or run lachesis build out of band",
+        )
     meta = entry_for(source).meta() or {}
     loaded = json.loads(_load_graph({"path": str(graph_path)}))
     if "error" in loaded:  # built fine but could not attach — surface that, not a fake success
-        return json.dumps({"error": loaded["error"], "graph": str(graph_path),
-                           "rebuilt": rebuilt})
+        return _json_tool_error(
+            "build_graph", RuntimeError(loaded["error"]), graph=str(graph_path),
+            rebuilt=rebuilt,
+        )
     return json.dumps({"move": "build_graph", "graph": str(graph_path),
                        "rebuilt": rebuilt,
                        "nodes": meta.get("nodes", loaded.get("nodes")),
@@ -1926,7 +1942,8 @@ def _load_graph(args):
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _CTX
     path = _expand(args.get("path"))
     if not path or not os.path.exists(path):
-        return json.dumps({"error": f"graph path not found: {path!r}"})
+        return _json_tool_error(
+            "load_graph", ValueError(f"graph path not found: {path!r}"))
     _GRAPH_PATH = path
     _OVERLAY_PATH = _expand(args.get("overlay"))
     prof = args.get("profile")
@@ -1967,6 +1984,18 @@ def _dispatch(msg):
             a = p.get("arguments") or {}
             with _DISPATCH_LOCK:
                 text = call_tool(p["name"], a, format=a.get("format"))
+            structured = None
+            try:
+                candidate = json.loads(text)
+                if isinstance(candidate, dict) and candidate.get("ok") is False:
+                    structured = candidate
+            except (TypeError, ValueError):
+                pass
+            if structured is not None:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "result": {"content": [{"type": "text", "text": text}],
+                                 "structuredContent": structured, "isError": True}})
+                return
             send({"jsonrpc": "2.0", "id": mid,
                   "result": {"content": [{"type": "text", "text": text}]}})
         except Exception as e:  # noqa: BLE001 - one tool's failure is that call's error
