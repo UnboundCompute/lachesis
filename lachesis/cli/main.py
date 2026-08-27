@@ -114,8 +114,16 @@ def command_scan(args: argparse.Namespace) -> int:
     if not args.quiet:
         _stderr(f"lachesis: {source}")
     try:
-        graph_path, _ = ensure_graph(source, refresh=args.refresh, progress=progress,
-                                     timeout_seconds=args.timeout)
+        is_graph = source.is_dir() and (
+            source.name.endswith(".kuzu")
+            or (source / "lachesis-manifest.pb").is_file()
+            or (source / "manifest.pb").is_file()
+        )
+        if is_graph and not args.refresh:
+            graph_path = source
+        else:
+            graph_path, _ = ensure_graph(source, refresh=args.refresh, progress=progress,
+                                         timeout_seconds=args.timeout)
     except EnvironmentProblem as error:
         return _report_environment(error)
     except NoSourceFound as error:

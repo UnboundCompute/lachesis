@@ -70,7 +70,12 @@ def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
     if lens not in {"all", "guard-diff", "flow"}:
         raise ValueError("lens must be one of: all, guard-diff, flow")
     source = os.path.expanduser(path)
-    if os.path.isdir(source):
+    # A Kùzu store is itself a directory. Recognize the named graph artifact
+    # before the generic directory/source-tree branch.
+    is_graph = os.path.isdir(source) and (
+        source.endswith(".kuzu") or os.path.isfile(os.path.join(source, "manifest.pb"))
+    )
+    if os.path.isdir(source) and not is_graph:
         try:
             from lachesis.cli.indexer import ensure_graph
             from lachesis.cli.progress import Progress
