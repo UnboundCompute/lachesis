@@ -41,7 +41,8 @@ const SUBSTRATE_PROPERTY_KEYS: &[&str] = &[
     "primary_target_id", "callee_name", "callee_form", "argument_count", "release_method",
     "release_name", "release_line", "target_id", "value_id", "resolution",
     "allocation_kind", "allocated_type", "control_kind", "is_alloc", "is_release",
-    "is_realloc", "is_aggregate_copy", "declaration_only", "storage_class", "owner_id",
+    "is_realloc", "is_aggregate_copy", "declaration_only", "storage_class", "linkage",
+    "exported", "owner_id",
 ];
 
 fn frame_read<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
