@@ -452,7 +452,25 @@ fn sidecar_to_request_inner(
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
             callee_function_id,
+            size_expression: String::new(),
+            destination: String::new(),
+            control: Vec::new(),
+            guard_status: String::new(),
+            guard_predicates: Vec::new(),
         };
+        call.size_expression = input_text(&item, "size_expr")
+            .or_else(|| input_text(&item, "size_expression"))
+            .unwrap_or_default().to_owned();
+        call.destination = input_text(&item, "dst")
+            .or_else(|| input_text(&item, "destination"))
+            .unwrap_or_default().to_owned();
+        call.guard_status = input_text(&item, "guard_status").unwrap_or_default().to_owned();
+        if let Some(predicates) = input_text(&item, "guard_predicates") {
+            call.guard_predicates.push(predicates.to_owned());
+        }
+        if let Some(control) = input_text(&item, "control") {
+            call.control.push(control.to_owned());
+        }
         // A compiler call may be indirect through a global or local function
         // pointer. If that pointer's initializer resolves to a catalogued
         // release primitive, preserve the same lifecycle effect as a direct
@@ -1232,7 +1250,22 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             arguments: Vec::new(), assigned_root: String::new(), assigned_selectors: Vec::new(),
             assigned_name: String::new(),
             callee_function_id,
+            size_expression: String::new(), destination: String::new(), control: Vec::new(),
+            guard_status: String::new(), guard_predicates: Vec::new(),
         };
+        call.size_expression = compact_property(node, "size_expr")
+            .or_else(|| compact_property(node, "size_expression"))
+            .unwrap_or("").to_owned();
+        call.destination = compact_property(node, "dst")
+            .or_else(|| compact_property(node, "destination"))
+            .unwrap_or("").to_owned();
+        call.guard_status = compact_property(node, "guard_status").unwrap_or("").to_owned();
+        if let Some(predicates) = compact_property(node, "guard_predicates") {
+            call.guard_predicates.push(predicates.to_owned());
+        }
+        if let Some(control) = compact_property(node, "control") {
+            call.control.push(control.to_owned());
+        }
         if let Some(parent) = parents.get(&node.id).and_then(|id| nodes.get(id)) {
             if compact_kind(parent) == "BinaryOperator" && compact_property(parent, "operator") == Some("=") {
                 call.assigned = assignment_left.get(&parent.id).cloned().unwrap_or_default();

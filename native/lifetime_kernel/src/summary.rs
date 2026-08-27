@@ -149,10 +149,18 @@ pub(crate) fn summarize(
                     argument.position == position && argument_root(argument) == root));
             lifetime_proto::NativeSinkFlow {
                 sink, value, root, provenance: "local".into(), guards: Vec::new(),
-                guarded: false, site_guarded: false, via,
+                guarded: call.is_some_and(|call| !call.control.is_empty()
+                    || !call.guard_predicates.is_empty()),
+                site_guarded: call.is_some_and(|call| !call.control.is_empty()
+                    || !call.guard_predicates.is_empty()), via,
                 node: call.map(|call| call.node.clone()).unwrap_or_default(),
                 line: call.map(|call| call.line).unwrap_or_default(),
                 has_line: call.is_some_and(|call| call.has_line),
+                size_expression: call.map(|call| call.size_expression.clone()).unwrap_or_default(),
+                destination: call.map(|call| call.destination.clone()).unwrap_or_default(),
+                control: call.map(|call| call.control.clone()).unwrap_or_default(),
+                guard_status: call.map(|call| call.guard_status.clone()).unwrap_or_default(),
+                guard_predicates: call.map(|call| call.guard_predicates.clone()).unwrap_or_default(),
                 ..Default::default()
             }
         }).collect::<Vec<_>>();

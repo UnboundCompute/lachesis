@@ -644,7 +644,7 @@ fn reach_evaluator(name: &str, token: &lifetime_proto::NativeSkeletonToken) -> b
         "reachability" => token.tainted,
         "relational" => token.tainted && token.bound == "unbounded",
         "presence" => true,
-        "missing-guard" => !token.guarded && !token.control.is_empty(),
+        "missing-guard" => token.guard_status == "fall-through",
         "inverted-capacity-guard" => {
             if !token.tainted || token.size_expression.is_empty() { return false; }
             let size = token.size_expression.replace(' ', "");
