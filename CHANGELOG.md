@@ -9,6 +9,15 @@ than left for you to discover.
 
 ## Unreleased
 
+### Changed
+
+- The developer-facing CLI, library, and MCP surfaces now use one `lead` result vocabulary;
+  engine selection and engine labels are internal implementation details.
+- `lachesis.scan()` and `lachesis scan` default to the whole-taxonomy hunt, with `all`,
+  `guard-diff`, and `flow` available as explicit lenses.
+- The removed Python analysis fallbacks are no longer reachable from query, taint, or flow
+  surfaces; native binary sidecars are the runtime contract.
+
 ## [0.2.0]
 
 This release introduces a source-rooted semantic flow analysis and a lifetime/typestate

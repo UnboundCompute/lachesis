@@ -109,8 +109,7 @@ def command_analyze(args: argparse.Namespace) -> int:
         return _dump(result)
 
     summary = leads.summary()
-    print(f"{summary['total']} leads  (engine={summary['engine']}, "
-          f"timed_out={summary['timed_out']})")
+    print(f"{summary['total']} leads  (timed_out={summary['timed_out']})")
     if summary["timed_out"]:
         # An empty or thin result over a partial run is not "clean" -- say so, and name the
         # fix. Stopping before object analysis means setup (the dataflow tier) alone spent the

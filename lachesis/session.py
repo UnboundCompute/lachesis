@@ -101,7 +101,7 @@ def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
             rows = rows[:limit]
         return LeadSet(
             leads=tuple(Lead.from_dict(row) for row in rows),
-            coverage=result.get("census"), engine="rust", _store=analysis.store,
+            coverage=result.get("census"), _store=analysis.store,
         )
 
     result = analysis.candidates(
@@ -112,7 +112,7 @@ def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
         rows.extend(group.get("candidates") or ())
     return LeadSet(
         leads=tuple(Lead.from_dict(row) for row in rows),
-        coverage=result.get("coverage"), engine="rust", _store=analysis.store,
+        coverage=result.get("coverage"), _store=analysis.store,
     )
 
 
@@ -923,7 +923,6 @@ class LeadSet:
     timings: dict = field(default_factory=dict)
     lifetime: dict = field(default_factory=dict)
     coverage: Any = None
-    engine: str | None = None
     timed_out: bool = False
     truncated_functions: tuple = ()
     _store: Any = field(default=None, compare=False, repr=False)
@@ -943,7 +942,6 @@ class LeadSet:
             timings=dict(bundle.get("timings") or {}),
             lifetime=lifetime,
             coverage=bundle.get("coverage"),
-            engine="rust",
             timed_out=bool(lifetime.get("timed_out")),
             truncated_functions=tuple(diagnostics.get("capped") or ()),
             _store=store,
@@ -1010,7 +1008,6 @@ class LeadSet:
         return {
             "total": len(self.leads),
             "by_pattern": dict(counts),
-            "engine": self.engine,
             "timed_out": self.timed_out,
             "truncated_functions": list(self.truncated_functions),
             # Which phase the budget stopped before, when it fired before object analysis even
