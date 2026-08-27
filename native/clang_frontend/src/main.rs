@@ -272,7 +272,7 @@ fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
 
 fn language_for_path(path: &str) -> &'static str {
     match Path::new(path).extension().and_then(|extension| extension.to_str()) {
-        Some("cc" | "cpp" | "cxx" | "hpp") => "cpp",
+        Some("cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx") => "cpp",
         _ => "c",
     }
 }
@@ -1532,7 +1532,7 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
                 continue;
             }
             if matches!(path.extension().and_then(|extension| extension.to_str()),
-                        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp")) {
+                        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx")) {
                 files.push(path);
             }
         }
@@ -1543,7 +1543,7 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn is_header(path: &Path) -> bool {
     matches!(path.extension().and_then(|extension| extension.to_str()),
-             Some("h" | "hpp"))
+             Some("h" | "hpp" | "hh" | "hxx"))
 }
 
 fn is_translation_unit(path: &Path) -> bool {
@@ -1697,7 +1697,7 @@ fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
                 .map(PathBuf::from)
                 .filter(|path| {
                     matches!(path.extension().and_then(|extension| extension.to_str()),
-                             Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp"))
+                             Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx"))
                         && path.is_file()
                 })
                 .map(|path| path.canonicalize().unwrap_or(path))
