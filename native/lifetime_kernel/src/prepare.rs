@@ -428,9 +428,10 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         // is the conservative equivalent for the native temporal solver.
         let mut body = owned.iter().filter(|node| {
             !matches!(graph.kind(node), "function" | "method" | "constructor" |
+                "CXXMethod" | "Constructor" | "Destructor" | "FunctionTemplate" |
                 "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration" |
                 "ArrowFunction" | "MethodDeclaration" | "MethodDefinition" |
-                "Constructor" | "parameter" | "ParmVarDecl")
+                "parameter" | "ParmVarDecl")
         }).cloned().collect::<Vec<_>>();
         body.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
         body.first()?;

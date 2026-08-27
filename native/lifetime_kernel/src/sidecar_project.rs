@@ -25,6 +25,7 @@ const SUBSTRATE_NODE_KINDS: &[&str] = &[
     "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
     "cfg-exit", "cfg-merge", "cfg-condition", "function", "method", "constructor",
     "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
+    "CXXMethod", "Constructor", "Destructor", "FunctionTemplate",
     "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
     "MethodDeclaration", "MethodDefinition", "Call", "CallExpression", "construct",
     "NewExpression", "Return", "ReturnStatement", "return", "allocation", "release",

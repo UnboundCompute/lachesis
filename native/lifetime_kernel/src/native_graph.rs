@@ -272,10 +272,10 @@ fn function_kind(kind: &str) -> bool {
     matches!(kind, "function" | "method" | "constructor" | "FunctionDecl"
         | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl"
         | "ConversionFunction" | "FunctionTemplateDecl" | "CXXDeductionGuide"
+        | "CXXMethod" | "Constructor" | "Destructor" | "FunctionTemplate"
         | "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration"
         | "FunctionExpression" | "ArrowFunction" | "MethodDeclaration"
-        | "MethodDefinition" | "GetAccessor" | "SetAccessor"
-        | "Constructor")
+        | "MethodDefinition" | "GetAccessor" | "SetAccessor")
 }
 
 fn resolved_function_id(
