@@ -1058,11 +1058,19 @@ class LeadSet:
     # -- filters (each returns a new LeadSet) ---------------------------------------
 
     def by_pattern(self, pattern: str) -> "LeadSet":
+        """Return a new result containing only leads with this pattern name."""
         return self._with(lead for lead in self.leads if lead.get("pattern") == pattern)
 
     def by_function(self, name: str, lines: tuple[int, int] | None = None) -> "LeadSet":
+        """Return a new result containing leads in one enclosing function."""
         return self._with(lead for lead in self.leads
                           if lead.get("entry") == name and self._in_lines(lead, lines))
+
+    def filter(self, predicate: Callable[[Lead], bool]) -> "LeadSet":
+        """Return a new result containing leads for which ``predicate`` returns true."""
+        if not callable(predicate):
+            raise TypeError("predicate must be callable")
+        return self._with(lead for lead in self.leads if predicate(lead))
 
     def near(self, file: str, lines: tuple[int, int] | None = None) -> "LeadSet":
         """Leads whose enclosing function resolves to ``file`` (path, suffix, or basename),
@@ -1073,6 +1081,7 @@ class LeadSet:
                           and self._in_lines(lead, lines))
 
     def at(self, file: str, line: int) -> "LeadSet":
+        """Return leads whose source location matches one file and line."""
         return self.near(file, (line, line))
 
     @staticmethod
