@@ -15,6 +15,7 @@ first thing anyone meets.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -137,6 +138,61 @@ _arguments '1:command:({commands})' '*:option:(--lens --limit --min-rank --hard-
         print(f'''complete -c lachesis -f -n "__fish_use_subcommand" -a "{commands}"
 complete -c lachesis -n "__fish_seen_subcommand_from scan" -l lens -a "all guard-diff flow"
 complete -c lachesis -n "__fish_seen_subcommand_from scan" -l json -l quiet -s q -l verbose -s v -l refresh''')
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------- query / plan
+
+def command_query(args: argparse.Namespace) -> int:
+    """Run the structured graph query parser without a REMAINDER passthrough."""
+    from lachesis.cli import query
+    values = vars(args).copy()
+    values["command"] = values.pop("query_command")
+    query_args = argparse.Namespace(**values)
+    try:
+        result = query.execute(query_args)
+    except (KeyError, ValueError, json.JSONDecodeError, OSError) as error:
+        _stderr(json.dumps({"error": str(error), "query": query_args.command}))
+        return EXIT_FAILURE
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(query.render_text(result), end="")
+    return EXIT_OK
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    """Run the ranked guard-differential view from the parsed top-level command."""
+    from lachesis.nav.graph_store import GraphStore
+    from lachesis.planner.cli import _census_line, _render
+    try:
+        store = GraphStore.load(args.graph)
+        store.ensure_dataflow_tier()
+        from lachesis.planner.constructors import GuardDifferential
+        result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
+    except Exception as error:  # noqa: BLE001 - CLI converts store errors to one line
+        _stderr(f"lachesis plan: {error}")
+        return EXIT_FAILURE
+    _stderr(_census_line(result["census"]))
+    if args.json:
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    queue = result["queue"]
+    shown = queue[:args.limit] if args.limit else queue
+    for position, capsule in enumerate(shown, start=1):
+        print(_render(capsule, position))
+        print()
+    if len(shown) < len(queue):
+        print(f"... {len(queue) - len(shown)} more leads; --limit 0 prints them all")
+    if args.suppressions:
+        print("\nsuppressed, with the guard that did it:")
+        for capsule in result["suppressions"]:
+            names = ", ".join(g["predicate"] for g in capsule["guards_present"]
+                               if g.get("dominates"))
+            print(f"  {capsule['entrypoint']['symbol']} -> "
+                  f"{capsule['sensitive_effect']['symbol']}: {names}")
     return EXIT_OK
 
 
@@ -752,44 +808,70 @@ def build_parser() -> argparse.ArgumentParser:
                        help="stream frontend shards directly into the graph store")
     build.set_defaults(handler=command_build, no_prune=False)
 
-    # Query and plan retain their specialised argument grammars, but are still
-    # explicit verbs in the top-level help. They are the only lower-level tools
-    # whose parsers are not shared with the public Analysis session yet.
-    for name, help_text in (
-        ("query", "engine: query a graph directly"),
-        ("plan", "engine: rank capsules from a graph you already have"),
-    ):
-        passthrough = subcommands.add_parser(
-            name, help=help_text, add_help=False,
-            description=f"{help_text}. Arguments are passed through unchanged; "
-                        f"run `lachesis {name} --help` for its own options.")
-        passthrough.add_argument("rest", nargs=argparse.REMAINDER)
+    query = subcommands.add_parser(
+        "query", help="ask a focused question of a named graph",
+        description="Query a named graph with a bounded, structured question.")
+    query.add_argument("graph", help="path to a .kuzu graph")
+    query.add_argument("--budget-tokens", type=_positive_int, default=12000,
+                       metavar="N", help="approximate answer budget")
+    query.add_argument("--format", choices=("json", "text"), default="json")
+    query_commands = query.add_subparsers(dest="query_command", metavar="<question>",
+                                          required=True)
+    query_commands.add_parser("overview", help="summarize the graph")
+    locate = query_commands.add_parser("locate", help="locate a node id")
+    locate.add_argument("node_id")
+    expand = query_commands.add_parser("expand", help="expand a node neighbourhood")
+    expand.add_argument("node_id")
+    expand.add_argument("--depth", type=_nonnegative_int, default=1)
+    find = query_commands.add_parser("find-entity", help="find a symbol")
+    find.add_argument("name")
+    find.add_argument("--kind")
+    find.add_argument("--file")
+    function = query_commands.add_parser("function", help="read one function slice")
+    function.add_argument("focus")
+    function.add_argument("--file")
+    value = query_commands.add_parser("value-history", help="trace a value")
+    value.add_argument("node_id")
+    call = query_commands.add_parser("call", help="explain a call")
+    call.add_argument("node_id")
+    security = query_commands.add_parser("security-path", help="read one security path")
+    security.add_argument("node_id")
+    query_commands.add_parser("security-paths", help="read security path slices")
+    handler = query_commands.add_parser("handler-security", help="read handler security")
+    handler.add_argument("focus")
+    handler.add_argument("--file")
+    unresolved = query_commands.add_parser("unresolved", help="read unresolved calls")
+    unresolved.add_argument("node_id", nargs="?")
+    # Accept the common `query GRAPH QUESTION --format json` spelling as well as the
+    # parent-option form. SUPPRESS prevents a child default from overwriting the parent.
+    for question in query_commands.choices.values():
+        question.add_argument("--format", choices=("json", "text"),
+                              default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        question.add_argument("--budget-tokens", type=_positive_int, metavar="N",
+                              default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    query.set_defaults(handler=command_query)
+
+    plan = subcommands.add_parser(
+        "plan", help="rank guard-differential leads from a named graph",
+        description="Rank leads from a named graph. Each lead is a question, not a verdict.")
+    plan.add_argument("graph", help="path to a .kuzu graph")
+    plan.add_argument("--limit", type=_nonnegative_int, default=20,
+                      help="how many leads to print (0 = all)")
+    plan.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
+                      help="scan only the first N entrypoints (0 = all)")
+    plan.add_argument("--json", action="store_true", help="print the result as JSON")
+    plan.add_argument("--suppressions", action="store_true",
+                      help="print what was suppressed and which guard did it")
+    plan.set_defaults(handler=command_plan)
 
     return root
 
 
-ENGINE_COMMANDS = ("query", "plan")
 KNOWN_COMMANDS = {
     "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
     "query", "plan", "completion",
 }
-
-
-def _run_engine(name: str, rest: list[str]) -> int:
-    """Hand the rest of the line to an engine program verbatim.
-
-    Dispatched before argparse touches anything: a REMAINDER positional still loses
-    `--help` to the root parser, and an engine tool whose own `--help` is unreachable
-    is not really available. So these three words are routed, not parsed.
-    """
-    from lachesis.cli import analyze, query
-    from lachesis.planner import cli as planner_cli
-    if name == "build":
-        sys.argv = ["lachesis build", *rest]
-        return analyze.main()
-    sys.argv = [f"lachesis {name}", *rest]
-    return (query.main() if name == "query" else planner_cli.main()) or EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -808,8 +890,6 @@ def main(argv: list[str] | None = None) -> int:
     elif (not arguments[0].startswith("-")
           and arguments[0] not in KNOWN_COMMANDS):
         arguments = ["scan", *arguments]
-    if arguments and arguments[0] in ENGINE_COMMANDS:
-        return _run_engine(arguments[0], arguments[1:])
     parser = build_parser()
     args = parser.parse_args(arguments)
     args._bare_invocation = bare_invocation
