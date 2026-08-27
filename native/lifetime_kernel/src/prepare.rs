@@ -186,6 +186,15 @@ impl<'a> GraphView<'a> {
             .find_map(|child| self.access_path(child, 0))
     }
 
+    fn conditional_value_source(&self, id: &str) -> Option<Path> {
+        let id = self.peel(id.to_owned());
+        if self.kind(&id) != "ConditionalOperator" { return None; }
+        self.role_children(&id, "TRUE_VALUE").into_iter().flatten()
+            .find_map(|child| self.access_path(child, 0))
+            .or_else(|| self.children_of(&id).into_iter().flatten().skip(1)
+                .find_map(|child| self.access_path(child, 0)))
+    }
+
     fn peel(&self, mut id: String) -> String {
         for _ in 0..12 {
             if matches!(self.kind(&id), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
@@ -912,6 +921,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                             }
                             else if call.is_source { (Kind::Clobber, None, false) }
                             else { (Kind::Clobber, graph.access_path(&rhs_id, 0), false) }
+                        } else if let Some(source) = graph.conditional_value_source(&rhs_id) {
+                            (Kind::Copy, Some(source), false)
                         } else if graph.is_null(&rhs_id) {
                             (Kind::Clobber, None, true)
                         } else if let Some(source) = graph.access_path(&rhs_id, 0) {
@@ -930,9 +941,15 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 let initializer = graph.peel(initializer.to_owned());
                 let (kind, source, is_null) = if let Some(call) = call_by_node.get(&initializer) {
                     if call.is_alloc { (Kind::Alloc, None, false) }
-                    else if call.is_realloc { (Kind::Realloc, None, false) }
+                    else if call.is_realloc {
+                        let source = call.arguments.iter().find(|arg| arg.position == 0)
+                            .and_then(|arg| graph.access_path(&arg.node, 0));
+                        (Kind::Realloc, source, false)
+                    }
                     else if call.is_source { (Kind::Clobber, None, false) }
                     else { (Kind::Copy, graph.access_path(&initializer, 0), false) }
+                } else if let Some(source) = graph.conditional_value_source(&initializer) {
+                    (Kind::Copy, Some(source), false)
                 } else if graph.is_null(&initializer) {
                     (Kind::Clobber, None, true)
                 } else if let Some(source) = graph.access_path(&initializer, 0) {
