@@ -487,8 +487,9 @@ fn sidecar_to_request_inner(
         // and selectors; no source spelling or vulnerability is involved.
         for returned in &input.returns {
             if returned.kind != "var" { continue; }
-            let Some(declaration) = resolve_decl(&returned.root, &refs, &children,
-                &mut HashSet::new()).or_else(|| Some(returned.root.clone())) else { continue };
+            let returned_root = returned.root.strip_prefix("decl:").unwrap_or(&returned.root);
+            let Some(declaration) = resolve_decl(returned_root, &refs, &children,
+                &mut HashSet::new()).or_else(|| Some(returned_root.to_owned())) else { continue };
             let Some(position) = parameter_positions.get(&declaration) else { continue };
             let effect = SummaryEffect {
                 kind: lifetime_proto::operation::Kind::Use as i32,
