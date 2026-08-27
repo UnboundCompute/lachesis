@@ -634,13 +634,13 @@ def main(argv: list[str] | None = None) -> int:
     # `lachesis scan ./repo`, and a bare invocation scans the current directory.
     if not arguments:
         arguments = ["scan"]
-    elif (not arguments[0].startswith("-")
-          and arguments[0] not in KNOWN_COMMANDS):
-        arguments = ["scan", *arguments]
     if arguments and arguments[0] == "index":
         _stderr("lachesis: 'index' was removed; use 'lachesis build <path>' "
                 "or run 'lachesis scan <path>' to index on demand")
         return EXIT_USAGE
+    elif (not arguments[0].startswith("-")
+          and arguments[0] not in KNOWN_COMMANDS):
+        arguments = ["scan", *arguments]
     if arguments and arguments[0] in ENGINE_COMMANDS:
         return _run_engine(arguments[0], arguments[1:])
     parser = build_parser()
