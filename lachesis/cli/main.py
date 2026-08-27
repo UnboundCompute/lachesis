@@ -27,6 +27,19 @@ EXIT_ENVIRONMENT = 1   # a required tool or runtime is unavailable
 EXIT_FAILURE = 1       # the build or the query broke
 
 EPILOG = """\
+CORE
+  scan       point at a repository and get ranked leads
+  explain    inspect the evidence for one lead
+  mcp        serve the repository to an AI agent
+
+GRAPH PIPELINE
+  build      pass 1: create a named structural graph
+  enrich     pass 2: warm native binary sidecars
+  analyze    pass 3: inspect leads from a named graph
+
+MORE
+  candidates, query, plan, report, communities, doctor, cache, concept-model
+
 examples:
   lachesis scan                     analyse the current directory and report findings
   lachesis scan ~/src/app --json    the same, as JSON, for a script
@@ -675,6 +688,14 @@ def build_parser() -> argparse.ArgumentParser:
             description=f"{help_text}. Arguments are passed through unchanged; "
                         f"run `lachesis {name} --help` for its own options.")
         passthrough.add_argument("rest", nargs=argparse.REMAINDER)
+
+    # The epilog above is the curated first screen. Individual parsers still expose
+    # their full help, but the root screen should teach the product shape instead of
+    # presenting every maintenance/query verb as an equal starting point.
+    for action in root._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for choice in action._choices_actions:
+                choice.help = ""
 
     return root
 
