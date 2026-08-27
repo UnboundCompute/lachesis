@@ -1746,105 +1746,86 @@ def _taint(store, args):
     propagation happen here, in RAM, on top of it. That keeps the cache unambiguous
     and confines every catalog effect to this one on-demand tool.
     """
-    from lachesis.integrations.atropos.enrich import atropos_enrich
-    from lachesis.core.overlays.taint import TaintPropagation
-    from lachesis.nav.kuzu_index import materialize_graph
+    # Pass 2 already emits native taint role/reach records into the binary dataflow
+    # overlay. Read those records directly; the deleted Python overlay solver must not
+    # be reintroduced merely because an MCP client asks for taint evidence.
+    store.ensure_dataflow_tier()
+    index = store.index
+    role_by_value = {}
+    for role in index.nodes_of_kind("source", "sink"):
+        properties = role.get("properties") or {}
+        value_id = properties.get("value_id")
+        if value_id:
+            role_by_value[value_id] = role
 
-    store.ensure_dataflow_tier()  # whole-graph value flow, built once then cached to disk
-    graph = materialize_graph(store.index)
-    stamped, summary = atropos_enrich(graph)
-    if not summary.get("applied"):
-        return {"move": "taint", "applied": False, "reason": summary.get("reason"),
-                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
-                        "at ../atropos, then reload"}
-
-    by_id = {n["id"]: n for n in stamped["nodes"]}
-    marked = {}  # value_id -> the atropos role node that stamped it
-    for node in stamped["nodes"]:
-        props = node.get("properties", {})
-        if props.get("fact_origin") == "atropos-model" and "value_id" in props:
-            marked[props["value_id"]] = node
+    def _node(value_id):
+        return store.node(value_id) or {}
 
     def _loc(value_id):
-        props = by_id.get(value_id, {}).get("properties", {})
-        f = props.get("absolute_file") or props.get("file")
-        line = props.get("start_line")
-        return f"{f}:{line}" if f else None
+        properties = _node(value_id).get("properties") or {}
+        file = properties.get("absolute_file") or properties.get("file")
+        line = properties.get("start_line") or properties.get("line")
+        return f"{file}:{line}" if file else None
 
     def _label(value_id):
-        node = by_id.get(value_id, {})
-        return node.get("label") or (node.get("properties", {}) or {}).get("label") or value_id
+        node = _node(value_id)
+        return node.get("label") or (node.get("properties") or {}).get("label") or value_id
 
     rows = []
-    witnessed = set()  # value_ids that took part in at least one reach
-    for witness in TaintPropagation().enrich(stamped).nodes:
-        if witness.get("kind") != "taint-reach":
+    witnessed = set()
+    for witness in index.nodes_of_kind("taint-reach"):
+        properties = witness.get("properties") or {}
+        source_role = role_by_value.get(properties.get("source_id"))
+        sink_role = role_by_value.get(properties.get("sink_id"))
+        witness_ids = properties.get("witness_ids") or []
+        if not isinstance(witness_ids, list):
+            witness_ids = [witness_ids]
+        if not witness_ids:
             continue
-        props = witness.get("properties", {})
-        sv, kv = props.get("source_value_id"), props.get("sink_value_id")
-        witnessed.add(sv)
-        witnessed.add(kv)
-        src_role, sink_role = marked.get(sv), marked.get(kv)
-        model_props = (sink_role or src_role or {}).get("properties", {})
-        # The witness path taint actually walked, source->sink, as addressable hops.
-        # Taint propagates over REACHING_DEF/summary edges, which `reaches` does not
-        # walk (it follows VALUE_FLOWS_TO/POINTS_TO) -- so a witnessed pair can return
-        # 0 hops under `reaches`. Surfacing the path here lets an agent adjudicate the
-        # lead directly (read source at each hop) instead of re-deriving it.
-        witness_ids = props.get("witness_ids") or []
-        path = [{"id": vid, "label": _label(vid), "at": _loc(vid)} for vid in witness_ids]
+        source_value, sink_value = witness_ids[0], witness_ids[-1]
+        witnessed.update(witness_ids)
+        source_props = (source_role or {}).get("properties") or {}
+        sink_props = (sink_role or {}).get("properties") or {}
+        path = [{"id": value, "label": _label(value), "at": _loc(value)}
+                for value in witness_ids]
         rows.append({
-            "source": _label(sv), "source_at": _loc(sv), "source_id": sv,
-            "sink": _label(kv), "sink_at": _loc(kv), "sink_id": kv,
-            "source_model": (src_role or {}).get("properties", {}).get("model_id"),
-            "sink_model": (sink_role or {}).get("properties", {}).get("model_id"),
-            "cwe": model_props.get("cwe", []),
-            "atropos_connected": bool(src_role or sink_role),
-            "hops": len(path),
-            "path": path,
+            "source": _label(source_value), "source_at": _loc(source_value),
+            "source_id": source_value, "sink": _label(sink_value),
+            "sink_at": _loc(sink_value), "sink_id": sink_value,
+            "source_model": source_props.get("model_id"),
+            "sink_model": sink_props.get("model_id"),
+            "atropos_connected": bool(source_role or sink_role),
+            "hops": len(path), "path": path,
         })
-    # A catalog-driven reach is the point of the tool, so those sort first.
-    rows.sort(key=lambda r: not r["atropos_connected"])
-    total = len(rows)
-    connected = sum(1 for r in rows if r["atropos_connected"])
-    if args.get("atropos_only"):
-        rows = [r for r in rows if r["atropos_connected"]]
 
-    # Bound endpoints that never took part in a reach. These are the addressable
-    # seeds for the dataflow tools -- `sources_of <sink_id>` / `flow <source_id>`
-    # over MCP, no name resolution needed (the endpoint is an external callee's
-    # arg the name index can't reach). On a C graph this listing is the frontier
-    # where the value-flow gaps sever the source->sink chain.
-    lim = int(args.get("limit", 50))
-    unwit = {"sources": [], "sinks": []}
-    for value_id, role_node in marked.items():
+    rows.sort(key=lambda row: not row["atropos_connected"])
+    if args.get("atropos_only"):
+        rows = [row for row in rows if row["atropos_connected"]]
+    limit = max(1, int(args.get("limit", 50)))
+    unwitnessed = {"sources": [], "sinks": []}
+    for value_id, role in role_by_value.items():
         if value_id in witnessed:
             continue
-        bucket = role_node.get("kind")
-        if bucket not in ("source", "sink"):
+        kind = role.get("kind")
+        if kind not in unwitnessed:
             continue
-        rp = role_node.get("properties", {})
-        unwit[bucket + "s"].append({
+        props = role.get("properties") or {}
+        unwitnessed[kind].append({
             "id": value_id, "label": _label(value_id), "at": _loc(value_id),
-            "model": rp.get("model_id"), "cwe": rp.get("cwe", []),
+            "model": props.get("model_id"),
         })
     return {
-        "move": "taint", "applied": True,
-        "atropos_root": summary["atropos_root"],
-        "languages": summary["languages"],
-        "bind": summary["per_language"],
-        "role_nodes": summary["role_nodes"],
-        "witness_count": total,
-        "atropos_connected": connected,
-        "witnesses": rows[:lim],
+        "move": "taint", "applied": True, "backend": "native-rust",
+        "witness_count": len(rows),
+        "atropos_connected": sum(row["atropos_connected"] for row in rows),
+        "witnesses": rows[:limit],
         "unwitnessed": {
-            "sources": unwit["sources"][:lim],
-            "sinks": unwit["sinks"][:lim],
-            "source_total": len(unwit["sources"]),
-            "sink_total": len(unwit["sinks"]),
+            "sources": unwitnessed["sources"][:limit],
+            "sinks": unwitnessed["sinks"][:limit],
+            "source_total": len(unwitnessed["sources"]),
+            "sink_total": len(unwitnessed["sinks"]),
         },
     }
-
 
 def _build_graph(args):
     """Build (or reuse) a graph for a source directory, then attach it in one call.
