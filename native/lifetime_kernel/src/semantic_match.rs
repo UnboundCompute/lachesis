@@ -555,8 +555,13 @@ pub(crate) fn match_result_with_catalog(
     result: lifetime_proto::NativeSemanticResult,
     catalog: Option<&crate::atropos_proto::PatternCatalog>,
 ) -> lifetime_proto::NativeTemporalResult {
+    let Some(catalog) = catalog else { return match_result(result); };
+    let reach_skeletons: Vec<_> = result.skeletons.iter()
+        .filter(|skeleton| skeleton.kind == "reach")
+        .cloned().collect();
     let mut matched = match_result(result);
-    let Some(catalog) = catalog else { return matched; };
+    matched.functions.extend(reach_skeletons.iter().enumerate()
+        .filter_map(|(ordinal, skeleton)| match_reach_skeleton(skeleton, catalog, ordinal)));
     let enabled: HashSet<&str> = catalog.patterns.iter()
         .filter_map(|pattern| (!pattern.matcher_pattern.is_empty())
             .then_some(pattern.matcher_pattern.as_str()))
@@ -566,6 +571,97 @@ pub(crate) fn match_result_with_catalog(
         function.findings.retain(|finding| enabled.contains(finding.pattern.as_str()));
     }
     matched
+}
+
+/// Evaluate the old Python reach substrate over a binary Claus skeleton.
+/// Pattern IDs and sink families are entirely catalog-owned; these are only
+/// the generic evaluator primitives from flow/patterns.py.
+fn match_reach_skeleton(
+    skeleton: &lifetime_proto::NativeFlowSkeleton,
+    catalog: &crate::atropos_proto::PatternCatalog,
+    ordinal: usize,
+) -> Option<lifetime_proto::NativeTemporalFunction> {
+    let mut findings = Vec::new();
+    for token in &skeleton.tokens {
+        if token.kind != "sink" || token.family.is_empty() { continue; }
+        let mut evaluators = Vec::new();
+        if let Some(recipe) = catalog.kind_evaluator.get(&token.family) {
+            evaluators.extend(recipe.split(',').filter(|item| !item.is_empty()));
+        }
+        for pattern in &catalog.patterns {
+            if pattern.matcher_pattern.is_empty() { continue; }
+            if pattern.matcher_families.iter().any(|family| family == &token.family)
+                && !evaluators.iter().any(|name| *name == pattern.evaluator)
+            {
+                evaluators.push(pattern.evaluator.as_str());
+            }
+        }
+        for pattern in &catalog.patterns {
+            if pattern.matcher_pattern.is_empty() { continue; }
+            let family_route = pattern.matcher_families.iter().any(|family| family == &token.family);
+            let evaluator_route = !pattern.evaluator.is_empty()
+                && evaluators.iter().any(|name| *name == pattern.evaluator);
+            if !family_route && !evaluator_route { continue; }
+            let evaluator = if !pattern.evaluator.is_empty() {
+                pattern.evaluator.as_str()
+            } else {
+                continue;
+            };
+            if !reach_evaluator(evaluator, token) { continue; }
+            findings.push(lifetime_proto::NativeTemporalFinding {
+                function: skeleton.source_function.clone(),
+                pattern: pattern.matcher_pattern.clone(),
+                path: Some(lifetime_proto::Path {
+                    root: token.object_root.clone(),
+                    selectors: token.object_selectors.clone(),
+                }),
+                line: token.line,
+                has_line: token.has_line,
+                node: token.node.clone(),
+                witness_nodes: token.source_witness_nodes.clone(),
+                witness_complete: !token.source_witness_nodes.is_empty(),
+                source_witness_nodes: token.source_witness_nodes.clone(),
+                source_reachable: token.source_reachable,
+                guards: token.guards.clone(),
+                guarded: token.guarded,
+            });
+        }
+    }
+    if findings.is_empty() { return None; }
+    findings.sort_by(|left, right| (&left.pattern, &left.node, left.line)
+        .cmp(&(&right.pattern, &right.node, right.line)));
+    Some(lifetime_proto::NativeTemporalFunction {
+        id: format!("native:reach:{ordinal}:{}", skeleton.context),
+        findings,
+        transfers: skeleton.tokens.len() as u64,
+        widenings: 0,
+        capped: !skeleton.complete,
+    })
+}
+
+fn reach_evaluator(name: &str, token: &lifetime_proto::NativeSkeletonToken) -> bool {
+    match name {
+        "reachability" => token.tainted,
+        "relational" => token.tainted && token.bound == "unbounded",
+        "presence" => true,
+        "missing-guard" => !token.guarded && !token.control.is_empty(),
+        "inverted-capacity-guard" => {
+            if !token.tainted || token.size_expression.is_empty() { return false; }
+            let size = token.size_expression.replace(' ', "");
+            token.control.iter().map(|item| item.replace(' ', "")).any(|predicate|
+                predicate.contains(&format!("{}>=", size))
+                    || predicate.contains(&format!("{}>", size)))
+        }
+        "arithmetic-overflow-guard" => token.tainted && token.guarded
+            && token.control.iter().any(|predicate|
+                predicate.contains('+') && (predicate.contains('<') || predicate.contains("<="))),
+        "allocation-overflow-size" => token.family == "alloc-size" && token.tainted
+            && token.size_expression.contains('*')
+            && token.size_expression.split('*').any(|part|
+                part.chars().any(|character| character.is_ascii_alphabetic() || character == '_')),
+        "typestate" => false,
+        _ => false,
+    }
 }
 
 fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
@@ -758,6 +854,35 @@ mod tests {
         assert_eq!(matched.functions.len(), 1);
         assert_eq!(matched.functions[0].findings.len(), 1);
         assert_eq!(matched.functions[0].findings[0].pattern, "uaf.deref");
+    }
+
+    #[test]
+    fn matcher_evaluates_catalogued_reach_skeleton_without_function_names() {
+        let catalog = crate::atropos_proto::PatternCatalog {
+            patterns: vec![crate::atropos_proto::Pattern {
+                matcher_pattern: "relational".into(),
+                matcher_families: vec!["buffer-size".into()],
+                evaluator: "relational".into(),
+                ..Default::default()
+            }],
+            kind_evaluator: [("buffer-size".into(), "relational".into())]
+                .into_iter().collect(),
+            ..Default::default()
+        };
+        let skeleton = lifetime_proto::NativeFlowSkeleton {
+            kind: "reach".into(), entry: "source".into(),
+            source_function: "source".into(), context: "__entry__".into(), complete: true,
+            tokens: vec![lifetime_proto::NativeSkeletonToken {
+                kind: "sink".into(), family: "buffer-size".into(),
+                object_root: "input".into(), tainted: true, bound: "unbounded".into(),
+                ..Default::default()
+            }], ..Default::default()
+        };
+        let matched = match_result_with_catalog(
+            lifetime_proto::NativeSemanticResult { skeletons: vec![skeleton], ..Default::default() },
+            Some(&catalog));
+        assert_eq!(matched.functions.len(), 1);
+        assert_eq!(matched.functions[0].findings[0].pattern, "relational");
     }
 
     #[test]

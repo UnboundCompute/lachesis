@@ -142,6 +142,7 @@ fn walk_region(
                 guarded: !guards.is_empty(), guards,
                 source_reachable: node.source_reachable,
                 source_witness_nodes: node.source_witness_nodes.clone(),
+                ..Default::default()
             });
         for edge in adjacency.get(state.node.as_str()).into_iter().flatten() {
             if !edge.target.is_empty() && !nodes.contains_key(edge.target.as_str()) {

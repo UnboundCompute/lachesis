@@ -446,6 +446,17 @@ message NativeSkeletonToken {
   repeated GuardProof guards = 11;
   optional bool source_reachable = 12;
   repeated string source_witness_nodes = 13;
+  bool tainted = 14;
+  string bound = 15;
+  string callee = 16;
+  uint32 argument = 17;
+  bool has_argument = 18;
+  string value = 19;
+  string size_expression = 20;
+  string destination = 21;
+  repeated string control = 22;
+  bool is_source = 23;
+  bool truncated = 24;
 }
 message NativeFlowSkeleton {
   string kind = 1;

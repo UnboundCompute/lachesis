@@ -46,6 +46,7 @@ mod sidecar_project;
 mod semantic_match;
 mod claus;
 mod skeleton;
+mod reach;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -1541,18 +1542,18 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid semantic output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let roles = if catalog_path.is_null() {
-            HashMap::new()
+        let catalog = if catalog_path.is_null() {
+            None
         } else {
             let catalog = CStr::from_ptr(catalog_path).to_str()
                 .map_err(|error| format!("invalid lifecycle catalog path: {error}"))?;
-            let catalog = atropos_proto::Request::decode(
+            Some(atropos_proto::Request::decode(
                 fs::read(catalog)
                     .map_err(|error| format!("cannot read binary lifecycle catalog: {error}"))?
                     .as_slice(),
-            ).map_err(|error| format!("invalid binary lifecycle catalog: {error}"))?;
-            native_graph::lifecycle_roles(&catalog)
+            ).map_err(|error| format!("invalid binary lifecycle catalog: {error}"))?)
         };
+        let roles = catalog.as_ref().map(native_graph::lifecycle_roles).unwrap_or_default();
         let request = native_graph::sidecar_to_request_with_roles(&bytes, &roles)?;
         // Pass 2 publishes taint witnesses in the sibling binary overlay.  Use
         // the same graph path convention as the Python store, but keep the
@@ -1585,6 +1586,21 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // reuse a completed function/source/context fragment.
         full.regions = claus::pick_regions(&full);
         full.skeletons = skeleton::build(&full);
+        if let Some(catalog) = catalog.as_ref() {
+            let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
+                .map(|base| format!("{base}.pass2.translation.pb"))
+                .filter(|path| std::path::Path::new(path).is_file()) {
+                fs::read(path)
+                    .map_err(|error| format!("cannot read native translation facts: {error}"))?
+            } else {
+                native_graph::sidecar_to_translation(&bytes)?
+            };
+            let translation = lifetime_proto::TranslationResult::decode(
+                translation_bytes.as_slice(),
+            ).map_err(|error| format!("invalid native translation facts: {error}"))?;
+            let summaries = summary::summarize(translation.clone(), catalog.clone());
+            full.skeletons.extend(reach::build(&translation, &summaries, catalog));
+        }
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
