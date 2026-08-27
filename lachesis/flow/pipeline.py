@@ -12,7 +12,7 @@ from time import perf_counter
 
 from .native_translate import (
     build_native_match_result, ensure_native_semantic_sidecar,
-    native_match_leads, native_semantic_sidecar_path,
+    native_catalog_path, native_match_leads, native_semantic_sidecar_path,
 )
 
 
@@ -34,7 +34,7 @@ def run_pass(store, lang="mixed", *, workers=None,
     started = perf_counter()
     if progress is not None:
         progress("native semantic graph", 0.0)
-    semantic_sidecar = ensure_native_semantic_sidecar(store)
+    semantic_sidecar = ensure_native_semantic_sidecar(store, native_catalog_path(store))
     if progress is not None:
         progress("native matching", perf_counter() - started)
     match_result = build_native_match_result(semantic_sidecar)

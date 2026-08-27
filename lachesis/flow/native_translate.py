@@ -39,6 +39,26 @@ def native_semantic_sidecar_path(store) -> Path:
     return Path(f"{base}.pass3.semantic.pb")
 
 
+def native_catalog_path(store) -> Path | None:
+    """Return the compiled Atropos catalog for a store, when available.
+
+    Catalog authoring is allowed to use its source files during setup, but the
+    native analysis boundary receives only the fingerprinted protobuf artifact.
+    Keeping this lookup here makes every Rust entrypoint use the same catalog
+    contract without opening graph data in Python.
+    """
+    base = _base(store)
+    if not base:
+        return None
+    try:
+        from lachesis.integrations.atropos.enrich import locate_atropos
+        from lachesis.integrations.atropos.native_bind import compiled_catalog
+        root = locate_atropos()
+        return compiled_catalog(root, base) if root is not None else None
+    except (OSError, ValueError):
+        return None
+
+
 def native_match_sidecar_path(semantic_path: str | os.PathLike[str]) -> Path:
     """Return the binary cache for final Pass-3 matcher findings."""
     return Path(f"{semantic_path}.match.pb")
