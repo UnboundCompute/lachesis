@@ -78,6 +78,9 @@ def _sidecar_stale(output: Path, *inputs: Path) -> bool:
 def build_native_match_result(semantic_path: str | os.PathLike[str]):
     """Build or load the Rust-owned final matcher result."""
     source = Path(semantic_path)
+    event_source = native_semantic_events_path(source)
+    if event_source.is_file():
+        source = event_source
     output = native_match_sidecar_path(source)
     if _sidecar_stale(output, source):
         match_semantic_path(source, output)

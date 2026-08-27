@@ -1368,9 +1368,16 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         let events = lifetime_proto::NativeSemanticResult {
             functions: full.functions.into_iter().map(|mut function| {
                 function.nodes.retain(|node| !node.event_kind.is_empty());
-                function.edges.clear();
-                function.entry.clear();
-                function.exits.clear();
+                {
+                    let event_ids: HashSet<&str> = function.nodes.iter()
+                        .map(|node| node.id.as_str()).collect();
+                    function.edges.retain(|edge| event_ids.contains(edge.source.as_str())
+                        && event_ids.contains(edge.target.as_str()));
+                    if !event_ids.contains(function.entry.as_str()) {
+                        function.entry.clear();
+                    }
+                    function.exits.retain(|exit| event_ids.contains(exit.as_str()));
+                }
                 function
             }).collect(),
             complete: full.complete,
