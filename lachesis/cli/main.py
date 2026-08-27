@@ -51,6 +51,18 @@ so the first run of a project is slow and every run after it is not.
 """
 
 
+class _RootParser(argparse.ArgumentParser):
+    """Keep root help focused on the curated command groups in ``EPILOG``."""
+
+    def format_help(self) -> str:
+        text = super().format_help()
+        start = text.find("positional arguments:\n")
+        end = text.find("optional arguments:\n", start)
+        if start >= 0 and end >= 0:
+            text = text[:start] + text[end:]
+        return text
+
+
 def _stderr(message: str = "") -> None:
     print(message, file=sys.stderr)
 
@@ -537,7 +549,7 @@ def _positive_days(value: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(
+    root = _RootParser(
         prog="lachesis",
         description="Read a codebase the way a compiler does.",
         epilog=EPILOG,
@@ -688,14 +700,6 @@ def build_parser() -> argparse.ArgumentParser:
             description=f"{help_text}. Arguments are passed through unchanged; "
                         f"run `lachesis {name} --help` for its own options.")
         passthrough.add_argument("rest", nargs=argparse.REMAINDER)
-
-    # The epilog above is the curated first screen. Individual parsers still expose
-    # their full help, but the root screen should teach the product shape instead of
-    # presenting every maintenance/query verb as an equal starting point.
-    for action in root._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for choice in action._choices_actions:
-                choice.help = ""
 
     return root
 
