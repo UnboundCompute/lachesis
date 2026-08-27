@@ -1600,7 +1600,10 @@ pub(crate) fn prepare_and_solve_request_with_metadata(
 fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
     match kind {
         crate::Kind::Alloc => "ORIGIN",
-        crate::Kind::Free => "RELEASE",
+        // Keep lifecycle events explicit in the semantic skeleton.  The
+        // operation kind remains catalog-driven; this is only the neutral
+        // event vocabulary consumed by the matcher.
+        crate::Kind::Free => "memory.free",
         crate::Kind::Realloc => "INVALIDATE",
         crate::Kind::Copy => "DERIVE",
         crate::Kind::Use => match access {
@@ -1609,7 +1612,7 @@ fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
             "return" | "return-stack" => "RETURN_VALUE",
             "pointer-arithmetic" => "POINTER_ARITHMETIC",
             "write" => "WRITE_STORAGE",
-            _ => "READ_STORAGE",
+            _ => "memory.deref",
         },
         crate::Kind::Clobber => match access {
             "uninitialized" => "UNINITIALIZED",

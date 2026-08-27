@@ -292,7 +292,7 @@ fn match_function(
                 realloc_lost.remove(object);
                 origins.insert(object);
             },
-            "RELEASE" => if let Some(object) = object_id {
+            "RELEASE" | "memory.free" => if let Some(object) = object_id {
                 // A release through a slot proven to contain null is a no-op.
                 // Keep this check before adding the object to the released set;
                 // otherwise a later valid release would be misclassified.
@@ -317,7 +317,7 @@ fn match_function(
                 nulls.insert(object);
                 realloc_lost.insert(object);
             },
-            "READ_STORAGE" => if let Some(object) = object_id {
+            "READ_STORAGE" | "memory.deref" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
                                 &objects[object as usize], node, witness);
