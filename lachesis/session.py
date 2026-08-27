@@ -43,6 +43,24 @@ __all__ = ["scan", "Analysis", "Lead", "LeadSet", "Deadline", "AnalysisError"]
 # never imports the CLI's ``Progress`` -- a caller adapts its own sink to this signature.
 ProgressFn = Callable[[str, float], None]
 
+
+class _ProgressAdapter:
+    """Adapt the indexer's phase API to the library's callback-only progress contract."""
+
+    def __init__(self, callback: ProgressFn | None) -> None:
+        self.callback = callback
+
+    def phase(self, label: str) -> None:
+        if self.callback is not None:
+            self.callback(label, 0.0)
+
+    def note(self, message: str) -> None:
+        if self.callback is not None:
+            self.callback(message, 0.0)
+
+    def done(self) -> None:
+        return None
+
 # The library defaults ``analyze`` to a wall-clock bound so a single call can never run
 # unbounded (the friction that cost an hour). ``run_pass(deadline=None)`` stays unbounded for
 # the four existing callers; the bound is a *library* default, resolved here, overridable per
@@ -78,8 +96,9 @@ def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
     if os.path.isdir(source) and not is_graph:
         try:
             from lachesis.cli.indexer import ensure_graph
-            from lachesis.cli.progress import Progress
-            cli_progress = Progress(enabled=progress is None)
+            # The library must never install a terminal renderer. A caller that
+            # wants progress supplies the callback; CLI rendering belongs to CLI code.
+            cli_progress = _ProgressAdapter(progress)
             graph_path, _ = ensure_graph(
                 source, refresh=refresh, progress=cli_progress,
                 timeout_seconds=timeout,
