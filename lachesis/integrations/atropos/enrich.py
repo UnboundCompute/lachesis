@@ -126,8 +126,8 @@ def atropos_enrich(
             if native_input.is_file():
                 try:
                     from .native_bind import bind_path
-                    from lachesis.flow.native_translate import _compiled_catalog
-                    catalog_path = _compiled_catalog(root, base)
+                    from .native_bind import compiled_catalog
+                    catalog_path = compiled_catalog(root, base)
                     with tempfile.NamedTemporaryFile(prefix="lachesis-bind-",
                                                      suffix=".pb", delete=False) as output:
                         native_path_output = Path(output.name)

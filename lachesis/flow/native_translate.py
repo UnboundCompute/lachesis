@@ -6,7 +6,6 @@ needed by the public SDK.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 
@@ -16,26 +15,6 @@ from lachesis.nav.dataflow.substrate import (
     pass2_input_cache_path,
     translation_facts_path,
 )
-
-
-def _compiled_catalog(root, base):
-    """Return the versioned binary Atropos catalog for the native planner."""
-    models_root = Path(root) / "models"
-    model_files = sorted(models_root.rglob("*.json"))
-    fingerprint = hashlib.sha256()
-    for path in model_files:
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        fingerprint.update(str(path).encode())
-        fingerprint.update(str(stat.st_mtime_ns).encode())
-        fingerprint.update(str(stat.st_size).encode())
-    target = Path(f"{base}.atropos.{fingerprint.hexdigest()[:16]}.catalog.pb")
-    if not target.is_file():
-        from lachesis.integrations.atropos.native_bind import compile_catalog
-        compile_catalog(models_root, target)
-    return target
 
 
 def _base(store):
