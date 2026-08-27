@@ -15,6 +15,12 @@ than left for you to discover.
   engine selection and engine labels are internal implementation details.
 - `lachesis.scan()` and `lachesis scan` default to the whole-taxonomy hunt, with `all`,
   `guard-diff`, and `flow` available as explicit lenses.
+- `scan --lens all` now returns one ranked, deduplicated `LeadSet` across registry and
+  native-flow producers; MCP `scan`, `candidates`, and warm `leads` use bounded lead pages
+  with offsets and structured recoverable errors.
+- Low-level `query` and `plan` are parsed Lachesis commands with their own discoverable help;
+  shell completion, terminal color control, verbose native status, and `doctor` kernel checks
+  are available for day-to-day use.
 - The removed Python analysis fallbacks are no longer reachable from query, taint, or flow
   surfaces; native binary sidecars are the runtime contract.
 
