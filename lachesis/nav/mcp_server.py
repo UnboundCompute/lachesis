@@ -989,12 +989,15 @@ TOOLS = [
                     "enclosing function; `at` locates by source position `file`, `file:line`, or "
                     "`file:lo-hi` (a lead carries only its function + line, so the file is "
                     "resolved through the symbol index; a basename or path suffix is enough). "
-                    "Leads are leads, not verdicts -- adjudicate with sources_of/reaches.",
+                    "Leads are leads, not verdicts -- adjudicate with sources_of/reaches. "
+                    "Calls against one session are serialized; results are bounded and paged.",
      "inputSchema": {"type": "object", "properties": {
          "pattern": {"type": "string", "description": "keep only this bug-shape pattern"},
-         "function": {"type": "string", "description": "keep only leads in this function"},
-         "at": {"type": "string", "description": "locate by source position: file | file:line "
-                "| file:lo-hi"}}}},
+        "function": {"type": "string", "description": "keep only leads in this function"},
+        "at": {"type": "string", "description": "locate by source position: file | file:line "
+                "| file:lo-hi"},
+        "offset": {"type": "integer", "default": 0},
+        "limit": {"type": "integer", "default": 40}}}},
     {"name": "flow_skeleton",
      "description": "Interprocedural flow skeletons: compose per-function summaries into "
                     "linear, nesting-aware {control|sink|lifecycle} streams STITCHED across "
@@ -1746,10 +1749,15 @@ def call_tool(name, args, format=None):
         # A bare call (or a summary-shaped one) returns the honest overview; a filtered call
         # returns the matching rows plus that overview so a thin/empty result still carries
         # whether the run was partial.
-        result = {"move": "leads", "summary": ls.summary()}
-        if pattern or function or at:
-            result["leads"] = [lead.to_dict() for lead in ls]
-            result["returned"] = len(ls)
+        start = max(0, int(args.get("offset", 0)))
+        size = max(1, int(args.get("limit", 40)))
+        page = list(ls)[start:start + size]
+        next_offset = start + len(page)
+        result = {"move": "leads", "summary": ls.summary(),
+                  "leads": [lead.to_dict() for lead in page],
+                  "page": {"total": len(ls), "offset": start,
+                           "returned": len(page), "has_more": next_offset < len(ls),
+                           "next_offset": next_offset if next_offset < len(ls) else None}}
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
         bundle = c.flow_bundle
