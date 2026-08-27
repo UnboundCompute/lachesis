@@ -1667,13 +1667,29 @@ fn semantic_language(function: &str) -> String {
 pub(crate) fn semantic_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<lifetime_proto::NativeSemanticResult, String> {
+    // Calls carry the compiler-resolved source spelling while function
+    // fragments are keyed by their stable declaration IDs. Build this
+    // language-neutral spelling→ID index before preparation discards the
+    // declaration labels; do not require a catalog or a name list.
+    let mut function_names: HashMap<String, String> = HashMap::new();
+    for function in &request.functions {
+        let Some(declaration) = function.nodes.iter().find(|node|
+            matches!(node.kind.as_str(), "function" | "method" | "constructor"))
+        else { continue };
+        if !declaration.label.is_empty() {
+            function_names.entry(declaration.label.clone()).or_insert_with(|| function.id.clone());
+        }
+    }
     let prepared = prepare_functions(request.functions)?;
     let by_id: HashMap<String, usize> = prepared.iter().enumerate()
         .map(|(index, function)| (function.id.clone(), index)).collect();
     let mut seams = Vec::new();
     for caller in &prepared {
         for call in &caller.calls {
-            let Some(&callee_index) = by_id.get(&call.callee) else { continue };
+            let Some(callee_id) = by_id.get(&call.callee).copied()
+                .or_else(|| function_names.get(&call.callee).and_then(|id| by_id.get(id).copied()))
+            else { continue };
+            let callee_index = callee_id;
             let callee = &prepared[callee_index];
             let Some(entry_anchor) = callee.nodes.first() else { continue };
             let formal_to_actual: Vec<String> = call.arguments.iter().filter_map(|argument| {
