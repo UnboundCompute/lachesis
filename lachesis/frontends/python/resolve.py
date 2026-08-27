@@ -8,7 +8,7 @@ does not decide is recorded on the call node's ``resolution`` rather than guesse
 at with an edge.
 
 The distinction that matters, and that the C frontend already draws
-(lachesis/frontends/c/build_graph.py): ``confidence: "unresolved"`` describes an
+(the native Clang frontend): ``confidence: "unresolved"`` describes an
 edge emitted on a guess. A *missing* edge is not an unresolved edge, it is the
 absence of a claim, and it is expressed through ``resolution``.
 """
