@@ -983,6 +983,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
                     root: String::new(), selectors: Vec::new(),
                     line: line.unwrap_or_default(), has_line: line.is_some(),
                     root_name: String::new(),
+                    callee_function_id: call.callee_function_id.clone(),
                 });
             } else if let Some(path) = graph.access_path(child, 0) {
                 input.returns.push(lifetime_proto::FunctionReturn {
@@ -990,6 +991,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
                     root: path.root, selectors: path.selectors,
                     line: line.unwrap_or_default(), has_line: line.is_some(),
                     root_name: String::new(),
+                    callee_function_id: String::new(),
                 });
             }
         }
@@ -1187,6 +1189,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         }
     }
     let summary_by_callee = input.summaries.iter().map(|summary| (summary.callee.as_str(), summary)).collect::<HashMap<_, _>>();
+    let summary_by_function_id = input.summaries.iter().filter(|summary| !summary.callee_function_id.is_empty())
+        .map(|summary| (summary.callee_function_id.as_str(), summary)).collect::<HashMap<_, _>>();
     let mut calls = input.calls;
     calls.sort_by_key(|call| (if call.has_line { call.line } else { i64::MAX }, call.node.clone()));
     for call in &mut calls {
@@ -1232,7 +1236,10 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 aggregate.access = "aggregate-copy".to_owned();
                 operations.push(aggregate);
             }
-        } else if let Some(summary) = summary_by_callee.get(call.callee.as_str())
+        } else if let Some(summary) = (!call.callee_function_id.is_empty())
+            .then(|| summary_by_function_id.get(call.callee_function_id.as_str()).copied())
+            .flatten()
+            .or_else(|| summary_by_callee.get(call.callee.as_str()).copied())
             .filter(|summary| !summary.alternatives.is_empty()) {
             for alternative in &summary.alternatives {
                 let mut effects = Vec::new();
@@ -1303,6 +1310,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 root: String::new(), selectors: Vec::new(),
                 line: line.unwrap_or_default(), has_line: line.is_some(),
                 root_name: String::new(),
+                callee_function_id: call.callee_function_id.clone(),
             });
         } else if let Some(path) = graph.value_path(child, 0)
             .or_else(|| graph.access_path(&child, 0)) {
@@ -1328,6 +1336,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 root: path.root, selectors: path.selectors,
                 line: line.unwrap_or_default(), has_line: line.is_some(),
                 root_name: String::new(),
+                callee_function_id: String::new(),
             });
         } else if graph.is_null(&peeled) {
             operations.push(raw_operation(
@@ -1689,7 +1698,10 @@ pub(crate) fn semantic_request(
     let mut seams = Vec::new();
     for caller in &prepared {
         for call in &caller.calls {
-            let Some(callee_id) = by_id.get(&call.callee).copied()
+            let Some(callee_id) = (!call.callee_function_id.is_empty())
+                .then(|| by_id.get(call.callee_function_id.as_str()).copied())
+                .flatten()
+                .or_else(|| by_id.get(&call.callee).copied())
                 .or_else(|| function_names.get(&call.callee).and_then(|id| by_id.get(id).copied()))
             else { continue };
             let callee_index = callee_id;

@@ -429,6 +429,8 @@ fn sidecar_to_request_inner(
             assigned_root: String::new(),
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
+            callee_function_id: input_text(&item, "primary_target_id")
+                .unwrap_or_default().to_owned(),
         };
         // A compiler call may be indirect through a global or local function
         // pointer. If that pointer's initializer resolves to a catalogued
@@ -694,6 +696,7 @@ fn sidecar_to_request_inner(
             let summary_index = summary_index.unwrap_or_else(|| {
                 input.summaries.push(lifetime_proto::FunctionSummary {
                     callee: call.callee.clone(), alternatives: Vec::new(),
+                    callee_function_id: call.callee_function_id.clone(),
                 });
                 input.summaries.len() - 1
             });
@@ -1200,6 +1203,8 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             is_aggregate_copy: compact_property(node, "is_aggregate_copy") == Some("true"),
             arguments: Vec::new(), assigned_root: String::new(), assigned_selectors: Vec::new(),
             assigned_name: String::new(),
+            callee_function_id: compact_property(node, "primary_target_id")
+                .unwrap_or("").to_owned(),
         };
         if let Some(parent) = parents.get(&node.id).and_then(|id| nodes.get(id)) {
             if compact_kind(parent) == "BinaryOperator" && compact_property(parent, "operator") == Some("=") {
@@ -1245,10 +1250,10 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                     .and_then(|id| function_names.get(id).cloned())
                     .or_else(|| nodes.get(&peeled).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
                     .unwrap_or_else(|| nodes.get(&peeled).map(|node| node.label.clone()).unwrap_or_default());
-                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new() });
+                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new(), callee_function_id: call_ids.iter().find(|id| **id == peeled).and_then(|_| nodes.get(&peeled)).and_then(|node| compact_property(node, "primary_target_id")).unwrap_or("").to_owned() });
             } else if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
                 let root_name = compact_path_name(&nodes, &path.root);
-                entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some(), root_name });
+                entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some(), root_name, callee_function_id: String::new() });
             }
         }
     }

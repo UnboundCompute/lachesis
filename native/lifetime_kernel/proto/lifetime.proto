@@ -170,6 +170,10 @@ message FunctionCall {
   string assigned_root = 13;
   repeated string assigned_selectors = 14;
   string assigned_name = 15;
+  // Compiler-resolved declaration identity.  The display name remains for
+  // catalog matching, but native interprocedural routing must not collapse
+  // overloads or same-named functions.
+  string callee_function_id = 16;
 }
 
 message FunctionReturn {
@@ -180,6 +184,7 @@ message FunctionReturn {
   sint64 line = 5;
   bool has_line = 6;
   string root_name = 7;
+  string callee_function_id = 8;
 }
 
 message FunctionSummaryEffect {
@@ -193,6 +198,7 @@ message FunctionSummaryAlternative { repeated FunctionSummaryEffect effects = 1;
 message FunctionSummary {
   string callee = 1;
   repeated FunctionSummaryAlternative alternatives = 2;
+  string callee_function_id = 3;
 }
 
 message FunctionInput {
