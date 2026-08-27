@@ -175,8 +175,16 @@ pub(crate) fn build(
         let contexts = if region.contexts.is_empty() {
             vec!["__entry__".to_owned()]
         } else { region.contexts.clone() };
+        // Contexts are part of the cache key exposed to Pass 3, but the
+        // current native region sidecar does not yet carry a per-context
+        // launch-node map.  The old FragmentStore therefore has the same
+        // reusable fragment for all equivalent launches.  Walk the function
+        // cone once and clone only the protobuf record for each context;
+        // never repeat the CFG/seam traversal merely because a source has
+        // several catalogued launch sites.
+        let walked = walk_region(result, region);
         for context in contexts {
-            let (mut tokens, edges, complete) = walk_region(result, region);
+            let (mut tokens, edges, complete) = walked.clone();
             // The old renderer always has explicit boundaries around the root
             // as well as every nested call.  Keep these even for a region with
             // no event at its entry: an empty/unresolved fragment must remain
