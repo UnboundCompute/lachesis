@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .atropos import flow_pattern_id
 from .native_lifetime import match_semantic_path, write_semantic_path
 from lachesis.core import lifetime_pb2
 from lachesis.nav.dataflow.substrate import (
@@ -73,18 +74,6 @@ def build_native_match_result(semantic_path: str | os.PathLike[str]):
 
 def native_match_leads(result) -> list[dict[str, Any]]:
     """Project compact native findings into the public lead record shape."""
-    pattern_ids = {
-        "pointer-arithmetic-before-validation": "mem.pointer-arithmetic.before-validation",
-        "leak": "mem.lifetime.leak",
-        "uninitialized-use": "mem.lifetime.uninitialized-use",
-        "double-free": "mem.lifetime.double-free",
-        "uaf.deref": "mem.lifetime.use-after-free",
-        "use.dangling": "mem.lifetime.use-after-free",
-        "null-deref": "mem.lifetime.null-deref",
-        "use-after-return": "mem.lifetime.use-after-return",
-        "realloc-failure-leak": "mem.lifetime.realloc-failure-leak",
-        "aggregate-copy-alias": "aggregate-copy-alias",
-    }
     leads = []
     for function in result.functions:
         for finding in function.findings:
@@ -98,22 +87,10 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 "node": finding.node,
                 "entry": finding.function,
                 "line": finding.line if finding.has_line else None,
-                "is_source": True,
-                "guarded": False,
                 "value": rendered,
                 "var": rendered,
                 "at": finding.node,
-                "pattern_id": pattern_ids.get(finding.pattern, finding.pattern),
-                "evaluator": "typestate",
-                "source_reachable": True,
-                "source_influenced": True,
-                "witness": [finding.node],
-                "witness_complete": True,
-                "source_context": finding.function,
-                "source_function": finding.function,
-                "source_entry": finding.function,
-                "source_line": finding.line if finding.has_line else None,
-                "tier": 1,
+                "pattern_id": flow_pattern_id(finding.pattern) or finding.pattern,
             })
     return leads
 
