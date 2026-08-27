@@ -276,6 +276,24 @@ fn function_kind(kind: &str) -> bool {
         | "Constructor")
 }
 
+fn resolved_function_id(
+    initial: &str,
+    function_names: &HashMap<String, String>,
+    refs: &HashMap<String, String>,
+) -> String {
+    let mut current = initial.to_owned();
+    let mut seen = HashSet::new();
+    while seen.insert(current.clone()) {
+        let Some(next) = refs.get(&current) else { break };
+        // REFERS_TO is also used for ordinary declaration references. Follow
+        // it only while both endpoints are function entities, so a compiler
+        // declaration can reach its body without changing value resolution.
+        if !function_names.contains_key(next) { break; }
+        current = next.clone();
+    }
+    current
+}
+
 fn call_kind(kind: &str) -> bool {
     matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
         | "call" | "Call" | "CallExpression" | "construct" | "NewExpression"
@@ -405,10 +423,12 @@ fn sidecar_to_request_inner(
     let mut built_calls = Vec::with_capacity(call_nodes.len());
     for (function, item_id) in call_nodes {
         let Some(item) = node_lookup.get(item_id.as_str()).copied() else { continue };
+        let raw_callee_id = input_text(&item, "primary_target_id").unwrap_or_default();
+        let callee_function_id = resolved_function_id(raw_callee_id, &function_names, &refs);
         let mut call = lifetime_proto::FunctionCall {
             node: item.id.clone(),
             callee: input_text(&item, "primary_target_id")
-                .and_then(|target| function_names.get(target).cloned())
+                .and_then(|_| function_names.get(&callee_function_id).cloned())
                 .or_else(|| input_text(&item, "callee").map(str::to_owned))
                 .or_else(|| input_text(&item, "callee_name").map(str::to_owned))
                 .or_else(|| input_text(&item, "release_method").map(str::to_owned))
@@ -429,8 +449,7 @@ fn sidecar_to_request_inner(
             assigned_root: String::new(),
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
-            callee_function_id: input_text(&item, "primary_target_id")
-                .unwrap_or_default().to_owned(),
+            callee_function_id,
         };
         // A compiler call may be indirect through a global or local function
         // pointer. If that pointer's initializer resolves to a catalogued
@@ -1187,8 +1206,10 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         if !translation_call_kind(compact_kind(node)) { continue; }
         let Some(owner) = compact_owner(node) else { continue };
         let Some(entry) = functions.get_mut(&owner) else { continue };
-        let callee = compact_property(node, "primary_target_id")
-            .and_then(|id| function_names.get(id).cloned())
+        let raw_callee_id = compact_property(node, "primary_target_id").unwrap_or("");
+        let callee_function_id = resolved_function_id(raw_callee_id, &function_names, &refers);
+        let callee = (!callee_function_id.is_empty())
+            .then(|| function_names.get(&callee_function_id).cloned()).flatten()
             .or_else(|| compact_property(node, "callee").map(str::to_owned))
             .unwrap_or_else(|| node.label.clone());
         let mut call = lifetime_proto::FunctionCall {
@@ -1203,8 +1224,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             is_aggregate_copy: compact_property(node, "is_aggregate_copy") == Some("true"),
             arguments: Vec::new(), assigned_root: String::new(), assigned_selectors: Vec::new(),
             assigned_name: String::new(),
-            callee_function_id: compact_property(node, "primary_target_id")
-                .unwrap_or("").to_owned(),
+            callee_function_id,
         };
         if let Some(parent) = parents.get(&node.id).and_then(|id| nodes.get(id)) {
             if compact_kind(parent) == "BinaryOperator" && compact_property(parent, "operator") == Some("=") {
@@ -1247,10 +1267,13 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             if call_ids.contains(&peeled) {
                 let callee = nodes.get(&peeled)
                     .and_then(|node| compact_property(node, "primary_target_id"))
-                    .and_then(|id| function_names.get(id).cloned())
+                    .and_then(|id| {
+                        let resolved = resolved_function_id(id, &function_names, &refers);
+                        function_names.get(&resolved).cloned()
+                    })
                     .or_else(|| nodes.get(&peeled).and_then(|node| compact_property(node, "callee")).map(str::to_owned))
                     .unwrap_or_else(|| nodes.get(&peeled).map(|node| node.label.clone()).unwrap_or_default());
-                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new(), callee_function_id: call_ids.iter().find(|id| **id == peeled).and_then(|_| nodes.get(&peeled)).and_then(|node| compact_property(node, "primary_target_id")).unwrap_or("").to_owned() });
+                entry.returns.push(lifetime_proto::FunctionReturn { kind: "call".to_owned(), callee, root: String::new(), selectors: Vec::new(), line: line.unwrap_or_default(), has_line: line.is_some(), root_name: String::new(), callee_function_id: call_ids.iter().find(|id| **id == peeled).and_then(|_| nodes.get(&peeled)).and_then(|node| compact_property(node, "primary_target_id")).map(|id| resolved_function_id(id, &function_names, &refers)).unwrap_or_default() });
             } else if let Some(path) = compact_path(&nodes, &children, &refers, child, 0) {
                 let root_name = compact_path_name(&nodes, &path.root);
                 entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some(), root_name, callee_function_id: String::new() });
