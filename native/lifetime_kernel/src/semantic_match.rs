@@ -6,6 +6,7 @@
 //! strings on every CFG transfer.
 
 use std::collections::VecDeque;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::lifetime_proto;
@@ -323,8 +324,40 @@ fn match_function(
 pub(crate) fn match_result(
     result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
+    // Function states are independent. Parallelize the common small-function
+    // case, but keep large CFGs serialized so branch-heavy state sets do not
+    // multiply peak RSS on large repositories.
+    const LARGE_FUNCTION_NODES: usize = 2_000;
+    let total = result.functions.len();
+    let (large, small): (Vec<_>, Vec<_>) = result.functions.into_iter().enumerate()
+        .partition(|(_, function)| function.nodes.len() > LARGE_FUNCTION_NODES);
+    let worker_count = std::env::var("LACHESIS_PASS3_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let matched_small: Vec<(usize, lifetime_proto::NativeTemporalFunction)> = match worker_count {
+        Some(1) => small.into_iter().map(|(index, function)|
+            (index, match_function(&function))).collect(),
+        Some(count) => rayon::ThreadPoolBuilder::new()
+            .num_threads(count)
+            .build()
+            .map(|pool| pool.install(|| small.par_iter()
+                .map(|(index, function)| (*index, match_function(function))).collect()))
+            .unwrap_or_else(|_| small.into_iter()
+                .map(|(index, function)| (index, match_function(&function))).collect()),
+        None => small.par_iter()
+            .map(|(index, function)| (*index, match_function(function))).collect(),
+    };
+    let mut ordered: Vec<Option<lifetime_proto::NativeTemporalFunction>> =
+        (0..total).map(|_| None).collect();
+    for (index, matched) in matched_small {
+        ordered[index] = Some(matched);
+    }
+    for (index, function) in large {
+        ordered[index] = Some(match_function(&function));
+    }
     lifetime_proto::NativeTemporalResult {
-        functions: result.functions.iter().map(match_function).collect(),
+        functions: ordered.into_iter().flatten().collect(),
     }
 }
 
