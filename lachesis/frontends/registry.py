@@ -104,17 +104,12 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
             )
             if candidate.is_file()
         ),
-        None,
+        # Keep registry construction usable for non-C projects. If a C project
+        # is selected without a native frontend, run_frontend reports the
+        # missing executable instead of silently entering the legacy JSON path.
+        packaged_binary,
     )
-    if native_binary is not None:
-        command = (str(native_binary), "{source_dir}", "{output_dir}")
-    else:
-        command = (
-            sys.executable,
-            str(root / "lachesis" / "frontends" / "c" / "build_graph.py"),
-            "{source_dir}",
-            "{output_dir}",
-        )
+    command = (str(native_binary), "{source_dir}", "{output_dir}")
     return FrontendSpec(
         frontend_id="clang-c",
         languages=("c",),

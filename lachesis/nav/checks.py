@@ -200,11 +200,16 @@ def open_store(target: str, tier: str = "enriched"):
     holder = tempfile.TemporaryDirectory()
     frontend_out = os.path.join(holder.name, "frontends")
     store_dir = os.path.join(holder.name, "store")
-    graph, snapshots = run_project(target, frontend_out, enrich=enriched)
-    write_kuzu_graph(graph, snapshots, store_dir, prune=False, enriched=enriched)
+    # Build-time enrichment was removed.  Always write the binary core first;
+    # the requested enriched tier is produced by the native store operation below.
+    graph, snapshots = run_project(target, frontend_out, enrich=False)
+    write_kuzu_graph(graph, snapshots, store_dir, prune=False, enriched=False)
+    store = GraphStore.load(store_dir)
+    if enriched:
+        store.ensure_dataflow_tier()
     # The holder is returned so the caller keeps it alive; a store whose directory has
     # been reclaimed fails deep inside Kùzu with a message about a missing file.
-    return GraphStore.load(store_dir), holder
+    return store, holder
 
 
 def _pinned(target: str, revision: str | None) -> str | None:
