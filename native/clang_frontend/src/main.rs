@@ -531,10 +531,10 @@ unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opti
         );
     }
     let referenced = if clang_is_null(direct) == 0 {
-        direct
+        Some(direct)
     } else {
-        probe.cursor.unwrap_or_default()
-    };
+        probe.cursor
+    }?;
     if clang_is_null(referenced) != 0 {
         return None;
     }
@@ -565,10 +565,10 @@ unsafe fn referenced_target_id(cursor: CXCursor, emitter: &mut Emitter) -> Optio
         );
     }
     let referenced = if clang_is_null(direct) == 0 {
-        direct
+        Some(direct)
     } else {
-        probe.cursor.unwrap_or_default()
-    };
+        probe.cursor
+    }?;
     if clang_is_null(referenced) != 0 {
         return None;
     }
@@ -737,8 +737,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         if clang_is_null(direct) != 0 {
             clang_visitChildren(cursor, collect_callee_reference, &mut probe as *mut ReferenceProbe as *mut c_void);
         }
-        let referenced = if clang_is_null(direct) == 0 { direct } else { probe.cursor.unwrap_or_default() };
-        if clang_is_null(referenced) == 0 {
+        if let Some(referenced) = if clang_is_null(direct) == 0 { Some(direct) } else { probe.cursor } {
+            if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
             let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
@@ -787,6 +787,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                         })?;
                     }
                 }
+            }
             }
         }
     }
