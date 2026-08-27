@@ -117,15 +117,36 @@ fn scalar_edge_value(field: &graph_proto::Field) -> Option<String> {
     })
 }
 
-fn input_scalar(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
+fn input_text<'a>(node: &'a lifetime_proto::GraphNode, key: &str) -> Option<&'a str> {
     node.properties.iter().find_map(|property| {
         if property.key != key { return None; }
-        property.value.as_ref().map(|value| match value {
-            lifetime_proto::scalar_property::Value::Text(value) => value.clone(),
-            lifetime_proto::scalar_property::Value::Integer(value) => value.to_string(),
-            lifetime_proto::scalar_property::Value::Boolean(value) => value.to_string(),
-        })
+        match property.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Text(value) => Some(value.as_str()),
+            _ => None,
+        }
     })
+}
+
+fn input_integer(node: &lifetime_proto::GraphNode, key: &str) -> Option<i64> {
+    node.properties.iter().find_map(|property| {
+        if property.key != key { return None; }
+        match property.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Integer(value) => Some(*value),
+            lifetime_proto::scalar_property::Value::Text(value) => value.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+fn input_bool(node: &lifetime_proto::GraphNode, key: &str) -> bool {
+    node.properties.iter().find_map(|property| {
+        if property.key != key { return None; }
+        match property.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Boolean(value) => Some(*value),
+            lifetime_proto::scalar_property::Value::Text(value) => Some(value == "true"),
+            _ => None,
+        }
+    }).unwrap_or(false)
 }
 
 fn resolve_decl(node: &str, refs: &HashMap<String, String>,
@@ -258,37 +279,37 @@ fn sidecar_to_request_with_selection(
         let Some(item) = node_lookup.get(item_id.as_str()).copied() else { continue };
         let mut call = lifetime_proto::FunctionCall {
             node: item.id.clone(),
-            callee: input_scalar(&item, "primary_target_id")
-                .and_then(|target| function_names.get(&target).cloned())
-                .or_else(|| input_scalar(&item, "callee"))
-                .or_else(|| input_scalar(&item, "callee_name"))
-                .or_else(|| input_scalar(&item, "release_method"))
+            callee: input_text(&item, "primary_target_id")
+                .and_then(|target| function_names.get(target).cloned())
+                .or_else(|| input_text(&item, "callee").map(str::to_owned))
+                .or_else(|| input_text(&item, "callee_name").map(str::to_owned))
+                .or_else(|| input_text(&item, "release_method").map(str::to_owned))
                 .unwrap_or_else(|| item.label.clone()),
             assigned: String::new(),
-            receiver: input_scalar(&item, "receiver").unwrap_or_default(),
-            line: input_scalar(&item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
-            has_line: input_scalar(&item, "start_line").is_some(),
-            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true")
-                || input_scalar(&item, "syntax_kind").as_deref() == Some("allocation"),
-            is_release: input_scalar(&item, "is_release").as_deref() == Some("true")
-                || input_scalar(&item, "syntax_kind").as_deref() == Some("release"),
-            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true")
-                || input_scalar(&item, "syntax_kind").as_deref() == Some("realloc"),
+            receiver: input_text(&item, "receiver").unwrap_or_default().to_owned(),
+            line: input_integer(&item, "start_line").unwrap_or_default(),
+            has_line: input_integer(&item, "start_line").is_some(),
+            is_alloc: input_bool(&item, "is_alloc")
+                || input_text(&item, "syntax_kind") == Some("allocation"),
+            is_release: input_bool(&item, "is_release")
+                || input_text(&item, "syntax_kind") == Some("release"),
+            is_realloc: input_bool(&item, "is_realloc")
+                || input_text(&item, "syntax_kind") == Some("realloc"),
             is_source: false,
-            is_aggregate_copy: input_scalar(&item, "is_aggregate_copy").as_deref() == Some("true"),
+            is_aggregate_copy: input_bool(&item, "is_aggregate_copy"),
             arguments: Vec::new(),
             assigned_root: String::new(),
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
-        if let Some(assigned) = input_scalar(&item, "target_id")
-            .or_else(|| input_scalar(&item, "value_id")) {
-            call.assigned = assigned;
+        if let Some(assigned) = input_text(&item, "target_id")
+            .or_else(|| input_text(&item, "value_id")) {
+            call.assigned = assigned.to_owned();
         }
         let parent = parents.get(&item.id).and_then(|id| node_lookup.get(id.as_str()).copied());
         if let Some(parent) = parent {
-            let parent_kind = input_scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
-            if parent_kind == "BinaryOperator" && input_scalar(parent, "operator").as_deref() == Some("=") {
+            let parent_kind = input_text(parent, "syntax_kind").unwrap_or(parent.kind.as_str());
+            if parent_kind == "BinaryOperator" && input_text(parent, "operator") == Some("=") {
                 if let Some(left) = edges_by_source.get(&parent.id).into_iter().flatten().find(|edge| {
                         edge.kind == "AST_CHILD"
                             && edge.role == "LEFT_OPERAND"
@@ -453,7 +474,7 @@ fn sidecar_to_request_with_selection(
     for entry in functions.values_mut() {
         let offsets: HashMap<String, i64> = entry.nodes.iter().filter_map(|node| {
             if node.id.is_empty() { return None; }
-            input_scalar(node, "start_offset").and_then(|value| value.parse().ok())
+            input_integer(node, "start_offset")
                 .map(|offset| (node.id.clone(), offset))
         }).collect();
         entry.parameters.sort_by_key(|id| offsets.get(id).copied().unwrap_or(i64::MAX));
