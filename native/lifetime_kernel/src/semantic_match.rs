@@ -90,6 +90,15 @@ fn add_finding(
 fn match_function(
     function: &lifetime_proto::NativeSemanticFunction,
 ) -> lifetime_proto::NativeTemporalFunction {
+    if function.nodes.is_empty() {
+        return lifetime_proto::NativeTemporalFunction {
+            id: function.id.clone(),
+            findings: Vec::new(),
+            transfers: 0,
+            widenings: 0,
+            capped: false,
+        };
+    }
     let mut by_id = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
     for (index, node) in function.nodes.iter().enumerate() {
         by_id.insert(node.id.as_str(), index);
