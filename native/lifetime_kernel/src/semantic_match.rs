@@ -178,11 +178,16 @@ fn match_function(
                 if !origins.contains(&object) { origins.push(object); }
             },
             "RELEASE" => if let Some(object) = object_id {
-                if released.contains(&object) {
-                    add_finding(&mut findings, &function.id, "double-free",
-                                &objects[object as usize], node);
+                // A release through a slot proven to contain null is a no-op.
+                // Keep this check before adding the object to the released set;
+                // otherwise a later valid release would be misclassified.
+                if !nulls.contains(&object) {
+                    if released.contains(&object) {
+                        add_finding(&mut findings, &function.id, "double-free",
+                                    &objects[object as usize], node);
+                    }
+                    released.push(object);
                 }
-                released.push(object);
             },
             "INVALIDATE" => if let Some(object) = object_id {
                 released.push(object);
@@ -344,5 +349,15 @@ mod tests {
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
         assert_eq!(result.functions[0].findings[0].line, 4);
+    }
+
+    #[test]
+    fn null_release_does_not_create_a_double_free() {
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("n", "WRITE_STORAGE_NULL", 1),
+                                             node("r", "RELEASE", 2)])],
+            complete: true,
+        });
+        assert!(result.functions[0].findings.is_empty());
     }
 }
