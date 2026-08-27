@@ -270,6 +270,13 @@ fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
     Ok(())
 }
 
+fn language_for_path(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|extension| extension.to_str()) {
+        Some("cc" | "cpp" | "cxx" | "hpp") => "cpp",
+        _ => "c",
+    }
+}
+
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
     let absolute = Path::new(path)
         .canonicalize()
@@ -287,6 +294,7 @@ fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Re
         + if !bytes.is_empty() && !bytes.ends_with(b"\n") { 1 } else { 0 };
     let id = stable_id_parts("file", &[absolute_text.clone()]);
     emitter.file_ids.insert(absolute_text.clone(), id.clone());
+    let language = language_for_path(&absolute_text);
     emitter.node(graph::NodeRecord {
         id,
         kind: "file".to_owned(),
@@ -296,7 +304,7 @@ fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Re
             field("absolute_file", text(&absolute_text)),
             field("content_hash", text(&content_hash)),
             field("lines", integer(lines)),
-            field("language", text("c")),
+            field("language", text(language)),
             field("provenance", text("project-root")),
             field("is_external", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
             field("is_system", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
@@ -1229,7 +1237,10 @@ fn add_contract_defaults(
         properties.push(field("compiler_node_id", text(frontend_id)));
     }
     if !has_property(properties, "language") {
-        properties.push(field("language", text("c")));
+        let file = property_text(properties, "absolute_file")
+            .or_else(|| property_text(properties, "file"))
+            .unwrap_or_default();
+        properties.push(field("language", text(language_for_path(&file))));
     }
     if !has_property(properties, "absolute_file") {
         let file = property_text(properties, "file").unwrap_or_default();
@@ -1304,6 +1315,7 @@ fn write_frontend_bundle(
     frontend_id: &str,
     node_count: u64,
     _edge_count: u64,
+    languages: &[String],
 ) -> io::Result<(u64, u64)> {
     let mut tier_files: FxHashMap<&'static str, File> = FxHashMap::default();
     for tier in ["T0", "T1", "T2", "T3", "T4"] {
@@ -1406,7 +1418,7 @@ fn write_frontend_bundle(
                 field("frontend_contract_version", integer(2)),
                 field("frontend_id", text(frontend_id)),
                 field("generator", text(frontend_id)),
-                field("languages", text_list(vec!["c".to_owned()])),
+                field("languages", text_list(languages.to_vec())),
                 field("lexical_tokens", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
                 field("capabilities", object(vec![
                     field("lexical", text("none")),
@@ -1432,6 +1444,7 @@ fn write_frontend_bundle(
 /// the runner to discard it in `_stream_bundle_to_shard`.
 fn write_stream_manifest(
     output: &Path, frontend_id: &str, node_count: u64, edge_count: u64,
+    languages: &[String],
 ) -> io::Result<()> {
     let manifest = graph::Document {
         format_version: 1,
@@ -1441,7 +1454,7 @@ fn write_stream_manifest(
                 field("frontend_contract_version", integer(2)),
                 field("frontend_id", text(frontend_id)),
                 field("generator", text(frontend_id)),
-                field("languages", text_list(vec!["c".to_owned()])),
+                field("languages", text_list(languages.to_vec())),
                 field("lexical_tokens", graph::Value {
                     kind: Some(graph::value::Kind::Boolean(false)),
                 }),
@@ -1819,12 +1832,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         emitter.edges.flush()?;
         let node_count = emitter.node_count;
         let edge_count = emitter.edge_count;
+        let mut languages: Vec<String> = emitter.root_files.iter()
+            .map(|path| language_for_path(path).to_owned())
+            .collect();
+        languages.sort();
+        languages.dedup();
         clang_disposeIndex(index);
         write_manifests(&shard, "clang-c-native", node_count, edge_count)?;
         if env::var_os("LACHESIS_SHARD_ROOT").is_some() {
-            write_stream_manifest(&output, "clang-c", node_count, edge_count)?;
+            write_stream_manifest(&output, "clang-c", node_count, edge_count, &languages)?;
         } else {
-            write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count)?;
+            write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count, &languages)?;
         }
         println!("native clang emitted {node_count} nodes and {edge_count} edges to {}", output.display());
     }
