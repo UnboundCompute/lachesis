@@ -73,7 +73,7 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
     return FrontendSpec(
         frontend_id="typescript-compiler-api",
         languages=("typescript", "javascript"),
-        extensions=(".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"),
+        extensions=(".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"),
         command=(
             # Node's default old-space is around 4GB, which a mid-sized application
             # tree exhausts during analysis, before serialization is even reached: the
@@ -116,7 +116,7 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
         # mixed projects share the same precise symbol/edge contract while the
         # emitted binary manifest still records the concrete root languages.
         languages=("c", "cpp"),
-        extensions=(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"),
+        extensions=(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"),
         command=command,
         working_directory=str(root),
         priority=20,
