@@ -32,6 +32,7 @@ import tempfile
 from time import perf_counter
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from typing import Any, Callable, Iterator, Mapping
 
 from lachesis.flow.deadline import Deadline
@@ -82,6 +83,19 @@ class NoSourceError(AnalysisError):
 
 class NativeKernelError(AnalysisError):
     """Raised when the native analysis kernel cannot be loaded or run."""
+
+
+def _analysis_boundary(function):
+    """Keep expected public-session failures inside the documented error hierarchy."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except AnalysisError:
+            raise
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            raise AnalysisError(f"{function.__name__} failed: {error}") from error
+    return wrapped
 
 
 def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
@@ -499,6 +513,7 @@ class Analysis:
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 
+    @_analysis_boundary
     def analyze(self, *, lang: str | None = None,
                 workers: int | None = None, hard_stop: float | None = None,
                 snapshot: bool = False, deadline: Deadline | None = None,
@@ -541,6 +556,7 @@ class Analysis:
         """Alias for :meth:`analyze` -- reads naturally as ``a.leads().near(...)``."""
         return self.analyze(**kwargs)
 
+    @_analysis_boundary
     def scan(self, *, lens: str = "all", limit: int | None = 20,
               hard_stop: float | None = None, workers: int | None = None) -> "LeadSet":
         """Return one ranked lead set for the selected view.
@@ -587,6 +603,7 @@ class Analysis:
 
     # -- library surface: pass 2 (enrich -> warm sidecars) --------------------------
 
+    @_analysis_boundary
     def enrich(self, *, hard_stop: float | None = None,
                deadline: Deadline | None = None,
                workers: int | None = None) -> dict:
@@ -664,6 +681,7 @@ class Analysis:
         return self._bound_bind(temporal=temporal, hard_stop=hard_stop,
                                 deadline=deadline)["registry"]
 
+    @_analysis_boundary
     def candidates(self, *, temporal: bool = True, hard_stop: float | None = None,
                    deadline: Deadline | None = None, **kwargs: Any) -> dict:
         """Candidate leads across the whole taxonomy (never scoped to one family).
@@ -675,6 +693,7 @@ class Analysis:
         bundle = self._bound_bind(temporal=temporal, hard_stop=hard_stop, deadline=deadline)
         return self._stamp_temporal(bundle["registry"].candidates(**kwargs), bundle)
 
+    @_analysis_boundary
     def census(self, constructor: str | None = None, *, temporal: bool = True,
                hard_stop: float | None = None, deadline: Deadline | None = None) -> dict:
         bundle = self._bound_bind(temporal=temporal, hard_stop=hard_stop, deadline=deadline)
@@ -686,6 +705,7 @@ class Analysis:
     def domains(self) -> list:
         return self._registry().domains()
 
+    @_analysis_boundary
     def candidate_detail(self, candidate_id: str, *, temporal: bool = True,
                          hard_stop: float | None = None,
                          deadline: Deadline | None = None) -> dict:
@@ -696,6 +716,7 @@ class Analysis:
 
     # -- library surface: the one-shot explanation ----------------------------------
 
+    @_analysis_boundary
     def explain(self, candidate_id: str, *, temporal: bool = True,
                 hard_stop: float | None = None, deadline: Deadline | None = None,
                 provenance_limit: int = 200, max_source_chars: int = 4000) -> dict:
@@ -725,6 +746,7 @@ class Analysis:
         return self._stamp_temporal(
             self._compose_explanation(candidate, provenance_limit, max_source_chars), bundle)
 
+    @_analysis_boundary
     def explain_sink(self, file: str, line: int, *, temporal: bool = True,
                      hard_stop: float | None = None, deadline: Deadline | None = None,
                      provenance_limit: int = 200, max_source_chars: int = 4000) -> dict:
