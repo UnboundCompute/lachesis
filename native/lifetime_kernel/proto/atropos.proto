@@ -13,6 +13,8 @@ message Model {
   string access_path = 8;
   string role = 9;
   string kind = 10;
+  string confidence = 11;
+  repeated string cwe = 12;
 }
 message Callee {
   string name = 1;

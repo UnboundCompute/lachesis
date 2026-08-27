@@ -92,10 +92,12 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
             receiver_type=model.get("type") or "",
             access_path=model.get("access_path") or "", role=model.get("role") or "",
             kind=model.get("kind") or "",
+            confidence=model.get("confidence") or "medium",
         )
         if model.get("arity") is not None:
             encoded.arity = int(model["arity"])
             encoded.has_arity = True
+        encoded.cwe.extend(str(value) for value in (model.get("cwe") or ()))
     # Lifecycle roles are compiled into the same protobuf catalog.  This is a
     # build/setup concern: the native analysis path consumes only this binary
     # artifact and never opens the authored catalog files.

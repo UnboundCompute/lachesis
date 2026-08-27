@@ -79,6 +79,17 @@ fn fact(evidence: &[String], confidence: &str) -> Vec<graph_proto::Field> {
          pass2::text_field("confidence", confidence), list_field("evidence_ids", evidence)]
 }
 
+fn catalog_fact(
+    evidence: &[String], model: &crate::atropos_proto::Model,
+) -> Vec<graph_proto::Field> {
+    let confidence = if model.confidence.is_empty() { "medium" } else { &model.confidence };
+    let mut fields = fact(evidence, confidence);
+    if !model.cwe.is_empty() {
+        fields.push(list_field("cwe", &model.cwe));
+    }
+    fields
+}
+
 fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Field>)
     -> graph_proto::EdgeRecord
 {
@@ -222,7 +233,8 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
                 let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
                 for from in from_values {
                     for to in &to_values {
-                        let mut properties = fact(&[graph.id(from).to_owned(), graph.id(*to).to_owned()], "high");
+                        let mut properties = catalog_fact(
+                            &[graph.id(from).to_owned(), graph.id(*to).to_owned()], model);
                         properties.push(pass2::text_field("summary_kind",
                             if model.kind.is_empty() { "flow" } else { model.kind.as_str() }));
                         properties.push(pass2::text_field("catalog_model_id", model_id));
@@ -240,14 +252,14 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
             for value in values {
                 let id = pass2::stable_id("catalog", role, "endpoint",
                     &[graph.id(call.id), model_id, model.access_path.as_str(), graph.id(value)]);
-                let mut properties = fact(&[graph.id(call.id).to_owned()], "high");
+                let mut properties = catalog_fact(&[graph.id(call.id).to_owned()], model);
                 properties.push(pass2::text_field("value_id", graph.id(value)));
                 properties.push(pass2::text_field(if role == "source" { "source_kind" } else { "sink_kind" }, semantic_kind));
                 properties.push(pass2::text_field("catalog_model_id", model_id));
                 nodes.push(graph_proto::NodeRecord { id: id.clone(), kind: kind.to_owned(),
                     label: format!("{}:{}", role, callee), properties, tier: String::new() });
                 edges.push(edge(if role == "source" { "TAINT_SOURCE" } else { "TAINT_SINK" },
-                    &id, graph.id(value), fact(&[graph.id(value).to_owned()], "high")));
+                    &id, graph.id(value), catalog_fact(&[graph.id(value).to_owned()], model)));
             }
         }
     }
