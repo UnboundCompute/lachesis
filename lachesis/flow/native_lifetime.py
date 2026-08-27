@@ -189,17 +189,8 @@ def summaries_path(facts_path, catalog_path, output_path):
     return result
 
 
-def temporal_path(input_path, output_path) -> None:
-    library = _require_library()
-    function = library.lachesis_lifetime_temporal_path
-    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-    function.restype = ctypes.c_int
-    status = function(_encoded(input_path), _encoded(output_path))
-    if status != 0:
-        raise RuntimeError(f"native temporal analysis failed with status {status}")
-
-
-def semantic_path(input_path, output_path):
+def write_semantic_path(input_path, output_path) -> None:
+    """Publish the Rust semantic sidecars without decoding them in Python."""
     library = _require_library()
     function = library.lachesis_lifetime_semantic_path
     function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
@@ -207,6 +198,20 @@ def semantic_path(input_path, output_path):
     status = function(_encoded(input_path), _encoded(output_path))
     if status != 0:
         raise RuntimeError(f"native semantic graph failed with status {status}")
-    result = lifetime_pb2.NativeSemanticResult()
-    result.ParseFromString(Path(output_path).read_bytes())
-    return result
+
+
+def match_semantic_path(input_path: str | os.PathLike[str],
+                        output_path: str | os.PathLike[str]) -> None:
+    """Run the native Pass-3 matcher over a semantic protobuf sidecar.
+
+    Only filenames cross this boundary.  Rust maps the input and writes a
+    ``NativeTemporalResult`` protobuf; Python callers can decode that result
+    without reconstructing the semantic graph or invoking the legacy matcher.
+    """
+    library = _require_library()
+    function = library.lachesis_lifetime_match_semantic_path
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    status = function(_encoded(input_path), _encoded(output_path))
+    if status != 0:
+        raise RuntimeError(f"native semantic matching failed with status {status}")

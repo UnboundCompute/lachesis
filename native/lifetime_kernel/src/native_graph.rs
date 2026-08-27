@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
 use std::path::Path;
 use hashbrown::{HashMap, HashSet};
 use memmap2::{Mmap, MmapOptions};
@@ -36,20 +35,13 @@ pub(crate) fn map_path(path: impl AsRef<Path>) -> Result<Mmap, String> {
         .map_err(|error| format!("cannot map native graph substrate: {error}"))
 }
 
-fn scalar(node: &graph_proto::NodeRecord, key: &str) -> Option<String> {
+fn record_text<'a>(node: &'a graph_proto::NodeRecord, key: &str) -> Option<&'a str> {
     node.properties.iter().find_map(|field| {
         if field.key != key { return None; }
-        let value = field.value.as_ref()?.kind.as_ref()?;
-        Some(match value {
-            graph_proto::value::Kind::Text(value) => value.clone(),
-            graph_proto::value::Kind::Integer(value) => value.to_string(),
-            graph_proto::value::Kind::Real(value) => value.to_string(),
-            graph_proto::value::Kind::Boolean(value) => value.to_string(),
-            graph_proto::value::Kind::Binary(value) => String::from_utf8_lossy(value).into_owned(),
-            graph_proto::value::Kind::List(_) |
-            graph_proto::value::Kind::Object(_) |
-            graph_proto::value::Kind::NullValue(_) => return None,
-        })
+        match field.value.as_ref()?.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+            _ => None,
+        }
     })
 }
 
@@ -117,15 +109,36 @@ fn scalar_edge_value(field: &graph_proto::Field) -> Option<String> {
     })
 }
 
-fn input_scalar(node: &lifetime_proto::GraphNode, key: &str) -> Option<String> {
+fn input_text<'a>(node: &'a lifetime_proto::GraphNode, key: &str) -> Option<&'a str> {
     node.properties.iter().find_map(|property| {
         if property.key != key { return None; }
-        property.value.as_ref().map(|value| match value {
-            lifetime_proto::scalar_property::Value::Text(value) => value.clone(),
-            lifetime_proto::scalar_property::Value::Integer(value) => value.to_string(),
-            lifetime_proto::scalar_property::Value::Boolean(value) => value.to_string(),
-        })
+        match property.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Text(value) => Some(value.as_str()),
+            _ => None,
+        }
     })
+}
+
+fn input_integer(node: &lifetime_proto::GraphNode, key: &str) -> Option<i64> {
+    node.properties.iter().find_map(|property| {
+        if property.key != key { return None; }
+        match property.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Integer(value) => Some(*value),
+            lifetime_proto::scalar_property::Value::Text(value) => value.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+fn input_bool(node: &lifetime_proto::GraphNode, key: &str) -> bool {
+    node.properties.iter().find_map(|property| {
+        if property.key != key { return None; }
+        match property.value.as_ref()? {
+            lifetime_proto::scalar_property::Value::Boolean(value) => Some(*value),
+            lifetime_proto::scalar_property::Value::Text(value) => Some(value == "true"),
+            _ => None,
+        }
+    }).unwrap_or(false)
 }
 
 fn resolve_decl(node: &str, refs: &HashMap<String, String>,
@@ -151,22 +164,8 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     Ok(payload)
 }
 
-fn stream_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
-    let mut header = [0u8; FRAME_HEADER];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(format!("cannot read graph sidecar frame header: {error}")),
-    }
-    let length = u32::from_be_bytes(header) as usize;
-    let mut payload = vec![0u8; length];
-    reader.read_exact(&mut payload)
-        .map_err(|error| format!("truncated graph sidecar frame: {error}"))?;
-    Ok(Some(payload))
-}
-
-fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
-    scalar(node, "owner_function_id").or_else(|| scalar(node, "function_id"))
+fn owner_ref<'a>(node: &'a graph_proto::NodeRecord) -> Option<&'a str> {
+    record_text(node, "owner_function_id").or_else(|| record_text(node, "function_id"))
 }
 
 fn function_kind(kind: &str) -> bool {
@@ -201,15 +200,6 @@ pub(crate) fn sidecar_to_request(
     sidecar_to_request_with_selection(input, None, true)
 }
 
-/// Temporal solving has already grouped each node into its owning function,
-/// so owner properties would be redundant in its per-node records.  Keep them
-/// for the semantic emitter, which still reads them when publishing events.
-pub(crate) fn sidecar_to_temporal_request(
-    input: &[u8],
-) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_with_selection(input, None, false)
-}
-
 pub(crate) fn sidecar_to_request_selected(
     input: &[u8], selected_ids: &HashSet<String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
@@ -221,20 +211,20 @@ fn sidecar_to_request_with_selection(
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
-    let (owners, function_names, call_ids, edges_by_source) = scan_lifetime_metadata(
+    let (owners, function_names, call_ids, edges_by_source, initializer_targets) = scan_lifetime_metadata(
         input, selected_ids, |item| {
             let item_id = item.id.clone();
-            let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+            let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
             let function = if function_kind(&syntax) {
                 Some(item.id.clone())
             } else {
-                owner(&item)
+                owner_ref(&item).map(str::to_owned)
             };
             let Some(function) = function else { return };
             if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
-            if matches!(syntax.as_str(), "ParmVarDecl" | "parameter" | "arg") {
+            if matches!(syntax, "ParmVarDecl" | "parameter" | "arg") {
                 entry.parameters.push(item.id.clone());
             }
             entry.nodes.push(node(&item, retain_owner));
@@ -258,37 +248,37 @@ fn sidecar_to_request_with_selection(
         let Some(item) = node_lookup.get(item_id.as_str()).copied() else { continue };
         let mut call = lifetime_proto::FunctionCall {
             node: item.id.clone(),
-            callee: input_scalar(&item, "primary_target_id")
-                .and_then(|target| function_names.get(&target).cloned())
-                .or_else(|| input_scalar(&item, "callee"))
-                .or_else(|| input_scalar(&item, "callee_name"))
-                .or_else(|| input_scalar(&item, "release_method"))
+            callee: input_text(&item, "primary_target_id")
+                .and_then(|target| function_names.get(target).cloned())
+                .or_else(|| input_text(&item, "callee").map(str::to_owned))
+                .or_else(|| input_text(&item, "callee_name").map(str::to_owned))
+                .or_else(|| input_text(&item, "release_method").map(str::to_owned))
                 .unwrap_or_else(|| item.label.clone()),
             assigned: String::new(),
-            receiver: input_scalar(&item, "receiver").unwrap_or_default(),
-            line: input_scalar(&item, "start_line").and_then(|value| value.parse().ok()).unwrap_or_default(),
-            has_line: input_scalar(&item, "start_line").is_some(),
-            is_alloc: input_scalar(&item, "is_alloc").as_deref() == Some("true")
-                || input_scalar(&item, "syntax_kind").as_deref() == Some("allocation"),
-            is_release: input_scalar(&item, "is_release").as_deref() == Some("true")
-                || input_scalar(&item, "syntax_kind").as_deref() == Some("release"),
-            is_realloc: input_scalar(&item, "is_realloc").as_deref() == Some("true")
-                || input_scalar(&item, "syntax_kind").as_deref() == Some("realloc"),
+            receiver: input_text(&item, "receiver").unwrap_or_default().to_owned(),
+            line: input_integer(&item, "start_line").unwrap_or_default(),
+            has_line: input_integer(&item, "start_line").is_some(),
+            is_alloc: input_bool(&item, "is_alloc")
+                || input_text(&item, "syntax_kind") == Some("allocation"),
+            is_release: input_bool(&item, "is_release")
+                || input_text(&item, "syntax_kind") == Some("release"),
+            is_realloc: input_bool(&item, "is_realloc")
+                || input_text(&item, "syntax_kind") == Some("realloc"),
             is_source: false,
-            is_aggregate_copy: input_scalar(&item, "is_aggregate_copy").as_deref() == Some("true"),
+            is_aggregate_copy: input_bool(&item, "is_aggregate_copy"),
             arguments: Vec::new(),
             assigned_root: String::new(),
             assigned_selectors: Vec::new(),
             assigned_name: String::new(),
         };
-        if let Some(assigned) = input_scalar(&item, "target_id")
-            .or_else(|| input_scalar(&item, "value_id")) {
-            call.assigned = assigned;
+        if let Some(assigned) = input_text(&item, "target_id")
+            .or_else(|| input_text(&item, "value_id")) {
+            call.assigned = assigned.to_owned();
         }
         let parent = parents.get(&item.id).and_then(|id| node_lookup.get(id.as_str()).copied());
         if let Some(parent) = parent {
-            let parent_kind = input_scalar(parent, "syntax_kind").unwrap_or_else(|| parent.kind.clone());
-            if parent_kind == "BinaryOperator" && input_scalar(parent, "operator").as_deref() == Some("=") {
+            let parent_kind = input_text(parent, "syntax_kind").unwrap_or(parent.kind.as_str());
+            if parent_kind == "BinaryOperator" && input_text(parent, "operator") == Some("=") {
                 if let Some(left) = edges_by_source.get(&parent.id).into_iter().flatten().find(|edge| {
                         edge.kind == "AST_CHILD"
                             && edge.role == "LEFT_OPERAND"
@@ -299,8 +289,9 @@ fn sidecar_to_request_with_selection(
         }
         if call.assigned.is_empty() {
             if let Some(initializer) = edges_by_source.get(&item.id).into_iter().flatten().find(|edge| {
-                    edge.kind == "VALUE_FLOWS_TO"
-                        && edge.reason == "initializer"
+                edge.kind == "VALUE_FLOWS_TO"
+                        && initializer_targets.get(&item.id)
+                            .is_some_and(|targets| targets.contains(&edge.target))
                 }) {
                 call.assigned = initializer.target.clone();
             }
@@ -309,7 +300,7 @@ fn sidecar_to_request_with_selection(
             if edge.kind != "AST_CHILD"
                 || edge.role != "ARGUMENT" { return None; }
             Some(lifetime_proto::FunctionArgument {
-                position: edge.position.unwrap_or_default(),
+                position: edge.position as u32,
                 node: edge.target.clone(),
                 root: String::new(),
                 selectors: Vec::new(),
@@ -327,17 +318,16 @@ fn sidecar_to_request_with_selection(
             entry.calls.push(call);
         }
     }
-    // Materialize the final protobuf edge vectors only after call extraction
-    // has finished.  Keeping both CompactEdge and GraphEdge representations
-    // alive across this phase duplicates the entire edge set at the peak.
-    // Consuming the temporary map releases each compact edge as it is moved.
+    // The scan already stores final protobuf edges, so consuming the index
+    // transfers them directly into their owning function without cloning a
+    // second graph-sized edge representation.
     for (_, edges) in edges_by_source {
         for item in edges {
             let source_owner = owners.get(&item.source);
             let target_owner = owners.get(&item.target);
             let Some(function) = source_owner.or(target_owner) else { continue };
             let Some(entry) = functions.get_mut(function) else { continue };
-            entry.edges.push(lifetime_edge(&item));
+            entry.edges.push(item);
         }
     }
     // Build the first native interprocedural summary lattice.  These effects
@@ -453,7 +443,7 @@ fn sidecar_to_request_with_selection(
     for entry in functions.values_mut() {
         let offsets: HashMap<String, i64> = entry.nodes.iter().filter_map(|node| {
             if node.id.is_empty() { return None; }
-            input_scalar(node, "start_offset").and_then(|value| value.parse().ok())
+            input_integer(node, "start_offset")
                 .map(|offset| (node.id.clone(), offset))
         }).collect();
         entry.parameters.sort_by_key(|id| offsets.get(id).copied().unwrap_or(i64::MAX));
@@ -518,9 +508,9 @@ fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
     let role = record.properties.iter().find_map(|field| {
         if field.key == "role" { scalar_edge_value(field) } else { None }
     }).unwrap_or_default();
-    let position = record.properties.iter().find_map(|field| {
+    let position: Option<u32> = record.properties.iter().find_map(|field| {
         if field.key != "position" { return None; }
-        scalar_edge_value(field)?.parse().ok()
+        scalar_edge_value(field)?.parse::<u32>().ok()
     });
     let reason = record.properties.iter().find_map(|field| {
         if field.key == "reason" { scalar_edge_value(field) } else { None }
@@ -529,14 +519,21 @@ fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
                   role, reason, position }
 }
 
-fn lifetime_edge(edge: &CompactEdge) -> lifetime_proto::GraphEdge {
+fn input_edge(record: graph_proto::EdgeRecord) -> lifetime_proto::GraphEdge {
+    let role = record.properties.iter().find_map(|field| {
+        if field.key == "role" { scalar_edge_value(field) } else { None }
+    }).unwrap_or_default();
+    let position: Option<i64> = record.properties.iter().find_map(|field| {
+        if field.key != "position" { return None; }
+        scalar_edge_value(field)?.parse::<i64>().ok()
+    });
     lifetime_proto::GraphEdge {
-        kind: edge.kind.clone(),
-        source: edge.source.clone(),
-        target: edge.target.clone(),
-        role: edge.role.clone(),
-        position: edge.position.unwrap_or_default() as i64,
-        has_position: edge.position.is_some(),
+        kind: record.kind,
+        source: record.source,
+        target: record.target,
+        role,
+        position: position.unwrap_or_default() as i64,
+        has_position: position.is_some(),
     }
 }
 
@@ -548,40 +545,30 @@ fn scan_lifetime_metadata(
     HashMap<String, String>,
     HashMap<String, String>,
     HashSet<String>,
-    HashMap<String, Vec<CompactEdge>>,
+    HashMap<String, Vec<lifetime_proto::GraphEdge>>,
+    HashMap<String, HashSet<String>>,
 ), String> {
     let mut offset = 0;
     let header = frame(input, &mut offset)?;
     let _: graph_proto::Document = graph_proto::Document::decode(header)
         .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    let mut reader = Cursor::new(&input[offset..]);
-    scan_lifetime_metadata_reader(&mut reader, selected_ids, &mut on_node)
-}
-
-fn scan_lifetime_metadata_reader<R: Read>(
-    reader: &mut R,
-    selected_ids: Option<&HashSet<String>>,
-    on_node: &mut impl FnMut(graph_proto::NodeRecord),
-) -> Result<(
-    HashMap<String, String>,
-    HashMap<String, String>,
-    HashSet<String>,
-    HashMap<String, Vec<CompactEdge>>,
-), String> {
+    let mut offset = offset;
     let mut owners = HashMap::new();
     let mut function_names = HashMap::new();
     let mut call_ids = HashSet::new();
-    let mut edges_by_source: HashMap<String, Vec<CompactEdge>> = HashMap::new();
-    while let Some(payload) = stream_frame(reader)? {
+    let mut edges_by_source: HashMap<String, Vec<lifetime_proto::GraphEdge>> = HashMap::new();
+    let mut initializer_targets: HashMap<String, HashSet<String>> = HashMap::new();
+    while offset < input.len() {
+        let payload = frame(input, &mut offset)?;
         if payload.is_empty() { continue; }
         match payload[0] {
             b'N' => {
                 let item = graph_proto::NodeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph node frame: {error}"))?;
-                if let Some(function) = owner(&item) {
-                    owners.insert(item.id.clone(), function);
+                if let Some(function) = owner_ref(&item) {
+                    owners.insert(item.id.clone(), function.to_owned());
                 }
-                let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+                let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
                 if function_kind(&syntax) {
                     function_names.insert(item.id.clone(), item.label.clone());
                 }
@@ -601,12 +588,20 @@ fn scan_lifetime_metadata_reader<R: Read>(
                         .is_some_and(|owner| selected.contains(owner));
                     if !source_selected && !target_selected { continue; }
                 }
-                edges_by_source.entry(item.source.clone()).or_default().push(compact_edge(item));
+                let reason = item.properties.iter().find_map(|field| {
+                    if field.key == "reason" { scalar_edge_value(field) } else { None }
+                });
+                if item.kind == "VALUE_FLOWS_TO" && reason.as_deref() == Some("initializer") {
+                    initializer_targets.entry(item.source.clone()).or_default()
+                        .insert(item.target.clone());
+                }
+                let source = item.source.clone();
+                edges_by_source.entry(source).or_default().push(input_edge(item));
             }
             _ => return Err("unknown graph sidecar record prefix".to_owned()),
         }
     }
-    Ok((owners, function_names, call_ids, edges_by_source))
+    Ok((owners, function_names, call_ids, edges_by_source, initializer_targets))
 }
 
 fn compact_property<'a>(node: &'a CompactNode, key: &str) -> Option<&'a str> {

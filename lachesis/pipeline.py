@@ -212,7 +212,7 @@ def run_project(
     timeout_seconds: int = 300,
     include_tests: bool = False,
     *,
-    enrich: bool = True,
+    enrich: bool = False,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
     """Run selected frontends and compose the canonical core graph.
 

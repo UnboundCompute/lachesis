@@ -52,11 +52,8 @@ def main(argv: list[str] | None = None) -> int:
         from lachesis.flow.pipeline import run_pass
         flow = run_pass(store)
         semantic = flow.get("semantic_graph")
-        if semantic is not None:
-            stamped["semantic_graph"] = {
-                "nodes": semantic.to_dict().get("nodes", {}),
-                "coverage": dict(semantic.coverage or {}),
-            }
+        if isinstance(semantic, dict):
+            stamped["semantic_graph"] = dict(semantic)
 
     registry = default_candidate_registry(stamped, summary)
     if args.candidate_id:

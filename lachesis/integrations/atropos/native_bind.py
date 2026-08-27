@@ -2,11 +2,34 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 from lachesis.core import atropos_pb2
+
+
+def compiled_catalog(root: str | os.PathLike[str], base: str | os.PathLike[str]) -> Path:
+    """Return the versioned binary catalog used by native catalog binding.
+
+    Authored model JSON is read only during setup. The native Pass-2/Pass-3
+    runtime receives the resulting protobuf path and never parses JSON.
+    """
+    models_root = Path(root) / "models"
+    fingerprint = hashlib.sha256()
+    for path in sorted(models_root.rglob("*.json")):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        fingerprint.update(str(path).encode())
+        fingerprint.update(str(stat.st_mtime_ns).encode())
+        fingerprint.update(str(stat.st_size).encode())
+    target = Path(f"{base}.atropos.{fingerprint.hexdigest()[:16]}.catalog.pb")
+    if not target.is_file():
+        compile_catalog(models_root, target)
+    return target
 
 
 def _library_candidates() -> tuple[Path, ...]:

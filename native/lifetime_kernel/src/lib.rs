@@ -42,6 +42,7 @@ mod property_effects;
 mod heap;
 mod summary;
 mod sidecar_project;
+mod semantic_match;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -64,6 +65,179 @@ fn report_native_phase(
         eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges)",
             started.elapsed().as_secs_f64(), nodes, edges);
     }
+}
+
+/// Project a semantic function onto its event nodes while preserving CFG
+/// reachability through removed anchor nodes.  The event sidecar is used by
+/// the matcher, so dropping the anchors must not drop branch/order semantics.
+fn compact_event_function(
+    mut function: lifetime_proto::NativeSemanticFunction,
+) -> Option<lifetime_proto::NativeSemanticFunction> {
+    let full_entry = function.entry.clone();
+    let full_exits = function.exits.clone();
+    // The full function is owned by this projection and its original edge
+    // objects are not needed after indexed adjacency is built. Move them out
+    // instead of cloning the entire edge vector during every function pass.
+    let full_edges = std::mem::take(&mut function.edges);
+    // Use dense node indices while projecting.  The old implementation
+    // rebuilt string-keyed adjacency and cloned IDs on every walk from every
+    // event.  A semantic function's node table is already fixed, so indices
+    // are a lossless and allocation-light representation for this phase.
+    let node_count = function.nodes.len();
+    let node_ids: Vec<String> = function.nodes.iter().map(|node| node.id.clone()).collect();
+    let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(node_count);
+    for (index, node) in function.nodes.iter().enumerate() {
+        by_id.insert(node.id.as_str(), index);
+    }
+    let event_indices: Vec<usize> = function.nodes.iter().enumerate()
+        .filter_map(|(index, node)| (!node.event_kind.is_empty()).then_some(index))
+        .collect();
+    if event_indices.is_empty() { return None; }
+    let mut event_flags = vec![false; node_count];
+    for &index in &event_indices {
+        event_flags[index] = true;
+    }
+    let mut outgoing = vec![Vec::new(); node_count];
+    let mut incoming = vec![Vec::new(); node_count];
+    for edge in full_edges {
+        let (Some(&source), Some(&target)) =
+            (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str()))
+        else { continue };
+        outgoing[source].push(target);
+        incoming[target].push(source);
+    }
+
+    // Walk through non-event anchors until the next event(s).  Each event is
+    // expanded independently, so loops are bounded by the visited set and
+    // branch arms remain separate in the projected graph.
+    let mut visited_marks = vec![0u32; node_count];
+    let mut found_marks = vec![0u32; node_count];
+    let mut walk_stamp = 0u32;
+    let mut pending = Vec::new();
+    let mut found = Vec::new();
+    let mut walk = |start: usize, graph: &[Vec<usize>], result: &mut Vec<usize>| {
+        walk_stamp = walk_stamp.wrapping_add(1);
+        if walk_stamp == 0 {
+            visited_marks.fill(0);
+            found_marks.fill(0);
+            walk_stamp = 1;
+        }
+        let stamp = walk_stamp;
+        pending.clear();
+        result.clear();
+        pending.push(start);
+        while let Some(current) = pending.pop() {
+            if visited_marks[current] == stamp { continue; }
+            visited_marks[current] = stamp;
+            for target in graph.get(current).into_iter().flatten() {
+                if event_flags[*target] {
+                    if found_marks[*target] != stamp {
+                        found_marks[*target] = stamp;
+                        result.push(*target);
+                    }
+                } else {
+                    pending.push(*target);
+                }
+            }
+        }
+    };
+
+    let mut projected: Vec<(usize, usize)> = Vec::new();
+    for &source in &event_indices {
+        walk(source, &outgoing, &mut found);
+        for &target in &found {
+            if source != target {
+                projected.push((source, target));
+            }
+        }
+    }
+    projected.sort_unstable();
+    projected.dedup();
+
+    let entry_events: Vec<usize> = by_id.get(full_entry.as_str()).copied()
+        .map(|entry| if event_flags[entry] {
+            vec![entry]
+        } else {
+            walk(entry, &outgoing, &mut found);
+            found.clone()
+        })
+        .unwrap_or_default();
+    let mut exit_events = Vec::new();
+    let mut exit_flags = vec![false; node_count];
+    for exit in &full_exits {
+        let Some(&exit) = by_id.get(exit.as_str()) else { continue };
+        if event_flags[exit] {
+            if !exit_flags[exit] {
+                exit_flags[exit] = true;
+                exit_events.push(exit);
+            }
+        } else {
+            walk(exit, &incoming, &mut found);
+            for &event in &found {
+                if !exit_flags[event] {
+                    exit_flags[event] = true;
+                    exit_events.push(event);
+                }
+            }
+        }
+    }
+    if exit_events.is_empty() {
+        let mut has_outgoing = vec![false; node_count];
+        for (source, _) in &projected {
+            has_outgoing[*source] = true;
+        }
+        exit_events.extend(event_indices.iter().copied()
+            .filter(|index| !has_outgoing[*index]));
+    }
+
+    let entry = format!("native:{}:event-entry", function.id);
+    let exit = format!("native:{}:event-exit", function.id);
+    let mut projected_edges: Vec<_> = projected.iter().map(|&(source, target)| {
+        lifetime_proto::NativeSemanticEdge {
+            source: node_ids[source].clone(),
+            target: node_ids[target].clone(),
+            kind: "normal".to_owned(),
+        }
+    }).collect();
+    projected_edges.reserve(entry_events.len() + exit_events.len());
+    for target in entry_events {
+        projected_edges.push(lifetime_proto::NativeSemanticEdge {
+            source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(),
+        });
+    }
+    for source in exit_events {
+        projected_edges.push(lifetime_proto::NativeSemanticEdge {
+            source: node_ids[source].clone(),
+            target: exit.clone(), kind: "normal".to_owned(),
+        });
+    }
+    projected_edges.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
+    projected_edges.dedup_by(|left, right| left.source == right.source && left.target == right.target);
+
+    drop(by_id);
+    let event_ids: HashSet<&str> = event_indices.iter()
+        .map(|&index| node_ids[index].as_str())
+        .collect();
+    function.nodes.retain(|node| event_ids.contains(node.id.as_str()));
+
+    function.nodes.push(lifetime_proto::NativeSemanticNode {
+        id: entry.clone(), function: function.id.clone(), event_kind: String::new(),
+        object_root: String::new(), object_selectors: Vec::new(), generation: String::new(),
+        line: 0, has_line: false, anchor: String::new(), stack_local: false,
+        is_null: false, access: String::new(), value_root: String::new(),
+        value_selectors: Vec::new(),
+    });
+    function.nodes.push(lifetime_proto::NativeSemanticNode {
+        id: exit.clone(), function: function.id.clone(), event_kind: String::new(),
+        object_root: String::new(), object_selectors: Vec::new(), generation: String::new(),
+        line: 0, has_line: false, anchor: String::new(), stack_local: false,
+        is_null: false, access: String::new(), value_root: String::new(),
+        value_selectors: Vec::new(),
+    });
+    function.edges = projected_edges;
+    function.entry = entry;
+    function.exits = vec![exit];
+    Some(function)
 }
 
 /// Native-chain runner for the binary Pass-2 path.  The ordering mirrors the
@@ -1307,37 +1481,6 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
     }
 }
 
-/// Run the native temporal solver directly from a framed Pass-1 substrate and
-/// publish only compact findings.  Catalog binding remains a separate input
-/// because temporal state is independent of sink-model selection.
-#[no_mangle]
-pub unsafe extern "C" fn lachesis_lifetime_temporal_path(
-    input_path: *const c_char, output_path: *const c_char,
-) -> i32 {
-    let result = (|| {
-        if input_path.is_null() || output_path.is_null() {
-            return Err("native temporal path is null".to_owned());
-        }
-        let input = CStr::from_ptr(input_path).to_str()
-            .map_err(|error| format!("invalid temporal input path: {error}"))?;
-        let output = CStr::from_ptr(output_path).to_str()
-            .map_err(|error| format!("invalid temporal output path: {error}"))?;
-        let bytes = native_graph::map_path(input)?;
-        let request = native_graph::sidecar_to_temporal_request(&bytes)?;
-        let bytes = prepare::temporal_request(request)?;
-        let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, bytes)
-            .map_err(|error| format!("cannot write temporal result: {error}"))?;
-        fs::rename(&temporary, output)
-            .map_err(|error| format!("cannot publish temporal result: {error}"))?;
-        Ok::<(), String>(())
-    })();
-    match result {
-        Ok(()) => 0,
-        Err(error) => { eprintln!("native temporal path error: {error}"); 1 }
-    }
-}
-
 /// Build a compact Rust-owned semantic event graph from the framed substrate.
 /// Only event nodes and control-flow edges are written to the output sidecar.
 #[no_mangle]
@@ -1360,18 +1503,17 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // Python queries never parse the large anchor/control-flow payload.
         let result = full.encode_to_vec();
         let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, result)
+        fs::write(&temporary, &result)
             .map_err(|error| format!("cannot write semantic result: {error}"))?;
         fs::rename(&temporary, output)
             .map_err(|error| format!("cannot publish semantic result: {error}"))?;
+        // The full sidecar is already durable. Release its encoded byte
+        // buffer before building the compact event projection so peak memory
+        // is not graph + full bytes + event bytes at once.
+        drop(result);
         let events = lifetime_proto::NativeSemanticResult {
-            functions: full.functions.into_iter().map(|mut function| {
-                function.nodes.retain(|node| !node.event_kind.is_empty());
-                function.edges.clear();
-                function.entry.clear();
-                function.exits.clear();
-                function
-            }).collect(),
+            functions: full.functions.into_iter()
+                .filter_map(compact_event_function).collect(),
             complete: full.complete,
         }.encode_to_vec();
         let events_output = format!("{output}.events.pb");
@@ -1385,6 +1527,38 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
     match result {
         Ok(()) => 0,
         Err(error) => { eprintln!("native semantic path error: {error}"); 1 }
+    }
+}
+
+/// Match the compact native semantic sidecar and publish final temporal leads.
+/// The input and output are protobuf files; no graph or JSON representation is
+/// reconstructed by the Python boundary.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native semantic matcher path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path).to_str()
+            .map_err(|error| format!("invalid semantic matcher input path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid semantic matcher output path: {error}"))?;
+        let mapped = native_graph::map_path(input)?;
+        let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
+            .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
+        let matched = semantic_match::match_result(result).encode_to_vec();
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, matched)
+            .map_err(|error| format!("cannot write native match result: {error}"))?;
+        fs::rename(&temporary, output)
+            .map_err(|error| format!("cannot publish native match result: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native semantic matcher error: {error}"); 1 }
     }
 }
 

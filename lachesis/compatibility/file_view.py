@@ -74,7 +74,9 @@ def analyze_files(paths: List[str], workers: Optional[int] = None) -> List[FileI
     from ..pipeline import run_project
 
     project_root = _compiler_project_root(paths)
-    graph, _snapshots = run_project(project_root)
+    # Build-time enrichment was removed.  The native Pass-2 sidecar is a
+    # separate operation owned by the store/session layer.
+    graph, _snapshots = run_project(project_root, enrich=False)
     global LAST_GRAPH
     LAST_GRAPH = graph
     all_infos = graph_file_infos(graph)

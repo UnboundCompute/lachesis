@@ -101,11 +101,20 @@ impl<'a> GraphView<'a> {
             }
         }
         for children in &mut children_by_node {
-            children.sort_by_key(|child| {
-                node_index.get(child).and_then(|index| nodes_input.get(*index))
+            children.sort_by(|left, right| {
+                let left_key = (node_index.get(left).and_then(|index| nodes_input.get(*index))
                     .and_then(|node| integer_property(node, "start_offset"))
-                    .unwrap_or(i64::MAX)
+                    .unwrap_or(i64::MAX), *left);
+                let right_key = (node_index.get(right).and_then(|index| nodes_input.get(*index))
+                    .and_then(|node| integer_property(node, "start_offset"))
+                    .unwrap_or(i64::MAX), *right);
+                left_key.cmp(&right_key)
             });
+        }
+        for role_map in roles.values_mut() {
+            for children in role_map.values_mut() {
+                children.sort();
+            }
         }
         let mut child_offsets = Vec::with_capacity(children_by_node.len() + 1);
         let mut child_targets = Vec::new();
@@ -295,7 +304,8 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
     let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
         graph.parent_of(node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
     if roots.is_empty() { roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt").cloned().collect(); }
-    let root = if let Some(root) = roots.into_iter().min_by_key(|node| graph.offset(node)) {
+    roots.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
+    let root = if let Some(root) = roots.into_iter().next() {
         root
     } else {
         // Normalized non-C frontends may not publish a CompoundStmt. Their
@@ -307,7 +317,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
                 "ArrowFunction" | "MethodDeclaration" | "MethodDefinition" |
                 "Constructor" | "parameter" | "ParmVarDecl")
         }).cloned().collect::<Vec<_>>();
-        body.sort_by_key(|node| graph.offset(node));
+        body.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
         body.first()?;
         let mut linear = HashMap::new();
         for pair in body.windows(2) {
@@ -520,8 +530,10 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
 
     let (entry, exits) = emit(graph, owned, &root, &mut successors, &mut memo, &mut in_progress, 0);
     let entry = entry?;
-    let cfg_entry = owned.iter().find(|node| graph.kind(node) == "cfg-entry").cloned();
-    let cfg_exit = owned.iter().find(|node| graph.kind(node) == "cfg-exit").cloned();
+    let cfg_entry = owned.iter().filter(|node| graph.kind(node) == "cfg-entry")
+        .min_by(|left, right| (graph.offset(left), *left).cmp(&(graph.offset(right), *right))).cloned();
+    let cfg_exit = owned.iter().filter(|node| graph.kind(node) == "cfg-exit")
+        .min_by(|left, right| (graph.offset(left), *left).cmp(&(graph.offset(right), *right))).cloned();
     let mut params = owned.iter().filter(|node| matches!(graph.kind(node),
         "ParmVarDecl" | "parameter" | "arg")).cloned().collect::<Vec<_>>();
     params.sort_by_key(|node| graph.offset(node));
@@ -533,8 +545,9 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         // Recover it here so every finite loop has a native CFG exit. Return
         // statements and other terminal fragments are handled by the same
         // empty-successor closure below.
-        let controls = owned.iter().filter(|node| matches!(graph.kind(node),
+        let mut controls = owned.iter().filter(|node| matches!(graph.kind(node),
             "IfStmt" | "ForStmt" | "WhileStmt" | "DoStmt")).cloned().collect::<Vec<_>>();
+        controls.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
         for control in controls {
             let condition = graph.role_children(&control, "CONDITION")
                 .and_then(|items| items.first()).cloned();
@@ -947,7 +960,10 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         } else if call.is_aggregate_copy {
             if let (Some(destination), Some(source)) = (argument(0), argument(1)) {
-                operations.push(operation(Kind::Copy, &call.node, Some(destination), Some(source), call));
+                let mut aggregate = operation(
+                    Kind::Copy, &call.node, Some(destination), Some(source), call);
+                aggregate.access = "aggregate-copy".to_owned();
+                operations.push(aggregate);
             }
         } else if let Some(summary) = summary_by_callee.get(call.callee.as_str()) {
             for alternative in &summary.alternatives {
@@ -1059,12 +1075,13 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         values.sort_by_key(|node| graph.offset(node));
         values
     };
-    for node in &cfg_node_set {
-        if !prepared_nodes.contains(node) {
-            prepared_nodes.push(node.clone());
-        }
+    let mut extra_cfg_nodes: Vec<_> = cfg_node_set.iter().filter(|node| !prepared_nodes.contains(node))
+        .cloned().collect();
+    extra_cfg_nodes.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
+    for node in extra_cfg_nodes {
+        prepared_nodes.push(node);
     }
-    prepared_nodes.sort_by_key(|node| graph.offset(node));
+    prepared_nodes.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
     prepared_nodes.dedup();
     let prepared_set = prepared_nodes.iter().cloned().collect::<HashSet<_>>();
     operations.retain(|item| prepared_set.contains(&item.node));
@@ -1231,75 +1248,6 @@ pub(crate) fn prepare_and_solve_request_with_metadata(
     solve_prepared_functions(prepared, true)
 }
 
-/// Solve a graph request while retaining only temporal findings and solver
-/// counters.  The normal prepare/solve ABI intentionally returns snapshots
-/// because the semantic emitter consumes them; the path-only temporal ABI does
-/// not need that representation and must never make Python reconstruct it.
-pub(crate) fn temporal_request(
-    request: lifetime_proto::PrepareRequest,
-) -> Result<Vec<u8>, String> {
-    let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
-    let started = std::time::Instant::now();
-    let prepared = prepare_functions(request.functions)?;
-    if timing_enabled {
-        eprintln!("[lachesis native temporal] prepare: {:.3}s ({} functions)",
-            started.elapsed().as_secs_f64(), prepared.len());
-    }
-    let results = prepared.into_par_iter()
-        .map(|function| {
-            let id = function.id.clone();
-            let operations = function.operations.iter().cloned()
-                .map(crate::proto_operation).collect::<Result<Vec<_>, _>>()?;
-            let successors = function.successors.iter()
-                .map(|entry| (entry.node.clone(), entry.targets.clone()))
-                .collect::<HashMap<_, _>>();
-            let mut initial = crate::State::default();
-            for (position, root) in function.parameters.iter().enumerate() {
-                initial.seed_parameter(crate::Path::root(format!("decl:{root}")), position as u32);
-            }
-            let result = if let Some(order) = crate::linear_cfg_order(&function.nodes, &successors) {
-                crate::solve_linear_findings(&order, &operations, initial)
-            } else {
-                crate::solve_graph_findings(&function.nodes, &successors, &operations, initial, 32)
-            };
-            let findings = result.findings.double_free.into_iter()
-                .map(|(line, path, node)| ("double-free", line, path, node))
-                .chain(result.findings.use_after_free.into_iter()
-                    .map(|(line, path, node)| ("use-after-free", line, path, node)))
-                .map(|(pattern, line, path, node)| {
-                lifetime_proto::NativeTemporalFinding {
-                    function: id.clone(),
-                    pattern: pattern.into(),
-                    path: Some(lifetime_proto::Path { root: path.root, selectors: path.selectors }),
-                    line: line.unwrap_or_default(),
-                    has_line: line.is_some(),
-                    node,
-                }
-            }).collect();
-            Ok(lifetime_proto::NativeTemporalFunction {
-                id,
-                findings,
-                transfers: result.transfers,
-                widenings: result.widenings,
-                capped: result.capped,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if timing_enabled {
-        eprintln!("[lachesis native temporal] solve: {:.3}s ({} functions)",
-            started.elapsed().as_secs_f64(), results.len());
-    }
-    let mut output = Vec::new();
-    lifetime_proto::NativeTemporalResult { functions: results }
-        .encode(&mut output)
-        .map_err(|error| error.to_string())?;
-    if timing_enabled {
-        eprintln!("[lachesis native temporal] encode: {:.3}s ({} bytes)",
-            started.elapsed().as_secs_f64(), output.len());
-    }
-    Ok(output)
-}
-
 fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
     match kind {
         crate::Kind::Alloc => "ORIGIN",
@@ -1335,6 +1283,26 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
         line: operation.line.unwrap_or_default(),
         has_line: operation.line.is_some(),
         anchor: operation.node.clone(),
+        stack_local: operation.access == "return-stack",
+        is_null: operation.is_null,
+        access: operation.access.clone(),
+        value_root: operation.source.as_ref().map(|value| value.root.clone()).unwrap_or_default(),
+        value_selectors: operation.source.as_ref().map(|value| value.selectors.clone()).unwrap_or_default(),
+    }
+}
+
+fn semantic_language(function: &str) -> String {
+    if function.contains(":cpython-ast:") || function.contains(":python:") {
+        "python".to_owned()
+    } else if function.contains(":typescript-compiler-api:")
+        || function.contains(":typescript:") {
+        "typescript".to_owned()
+    } else if function.contains(":javascript:") {
+        "javascript".to_owned()
+    } else if function.contains(":clang-c:") || function.contains(":clang-cpp:") {
+        "c".to_owned()
+    } else {
+        "mixed".to_owned()
     }
 }
 
@@ -1365,6 +1333,11 @@ pub(crate) fn semantic_request(
                 line: 0,
                 has_line: false,
                 anchor: anchor.clone(),
+                stack_local: false,
+                is_null: false,
+                access: String::new(),
+                value_root: String::new(),
+                value_selectors: Vec::new(),
             });
         }
         let mut incoming_counts: HashMap<String, usize> = HashMap::new();
@@ -1393,6 +1366,8 @@ pub(crate) fn semantic_request(
                     object_root: String::new(), object_selectors: Vec::new(),
                     generation: String::new(), line: 0, has_line: false,
                     anchor: anchor.clone(),
+                    stack_local: false, is_null: false, access: String::new(),
+                    value_root: String::new(), value_selectors: Vec::new(),
                 });
             }
         }
@@ -1421,6 +1396,7 @@ pub(crate) fn semantic_request(
                 _ => vec![semantic_event_kind(operation.kind, &operation.access)],
             };
             for (ordinal, kind) in kinds.into_iter().enumerate() {
+                let kind = if operation.is_null { "WRITE_STORAGE_NULL" } else { kind };
                 let node_id = format!("native:{}:{}:{}:{}", id, operation.node, index, ordinal);
                 let event = semantic_node(node_id.clone(), &id, kind, &operation, path, generation);
                 by_anchor.entry(operation.node.clone()).or_default().push(node_id);
@@ -1455,7 +1431,16 @@ pub(crate) fn semantic_request(
                 || function.successors.iter().all(|item| item.node != **node))
             .filter_map(|node| by_anchor.get(node).and_then(|ids| ids.last()).cloned())
             .collect();
-        Ok(lifetime_proto::NativeSemanticFunction { id, entry, exits, nodes, edges })
+        // `by_anchor` is a hash map; canonicalize the resulting edge order so
+        // repeated native runs produce byte-identical binary sidecars.
+        edges.sort_by(|left, right| {
+            (&left.source, &left.target, &left.kind)
+                .cmp(&(&right.source, &right.target, &right.kind))
+        });
+        let language = semantic_language(&id);
+        Ok(lifetime_proto::NativeSemanticFunction {
+            id, entry, exits, nodes, edges, language,
+        })
     }).collect::<Result<Vec<_>, String>>()?;
     Ok(lifetime_proto::NativeSemanticResult { functions, complete: true })
 }
