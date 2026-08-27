@@ -93,6 +93,7 @@ fn catalog_language(function: &str) -> Option<&'static str> {
     else if function.contains(":typescript-compiler-api:") { Some("typescript") }
     else if function.contains(":clang-c:") || function.contains(":clang-c-native:") {
         Some("c")
+    } else if function.contains(":clang-cpp:") { Some("cpp")
     } else if function.contains(":javascript:") { Some("javascript") } else { None }
 }
 
