@@ -139,7 +139,15 @@ pub(crate) fn build(
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
     let mut functions = BTreeMap::new();
     for function in &translation.functions {
-        let key = if function.name.is_empty() { function.id.clone() } else { function.name.clone() };
+        let base = if function.name.is_empty() { function.id.clone() } else { function.name.clone() };
+        // Keep the same deterministic collision scheme as summary::function_names.
+        // Display names are not compiler identities: two internal functions in
+        // different translation units may legitimately share one spelling.
+        let key = if functions.contains_key(&base) {
+            format!("{}@{}", base, function.id)
+        } else {
+            base
+        };
         functions.entry(key).or_insert(function);
     }
     let summary_map: HashMap<String, &lifetime_proto::NativeSummaryFunction> = summaries.functions.iter()
@@ -205,13 +213,22 @@ mod tests {
                 id: "static-id".into(), name: "internal_helper".into(), language: "c".into(),
                 calls: vec![call("sink-call", false)], ..Default::default()
             },
+            lifetime_proto::TranslationFunction {
+                id: "static-id-2".into(), name: "internal_helper".into(), language: "c".into(),
+                calls: vec![call("sink-call-2", false)], ..Default::default()
+            },
         ]};
         let summaries = crate::summary::summarize(translation.clone(), sink_catalog());
         let skeletons = build(&translation, &summaries, &sink_catalog());
-        assert_eq!(skeletons.len(), 2);
+        assert_eq!(skeletons.len(), 3);
         assert!(skeletons.iter().any(|item| item.entry == "public_entry" && item.is_source));
         assert!(skeletons.iter().any(|item| item.entry == "internal_helper" && !item.is_source));
-        assert!(skeletons.iter().all(|item| item.tokens.iter().any(|token|
-            token.kind == "sink" && (token.node == "source-call" || token.node == "sink-call"))));
+        assert!(skeletons.iter().any(|item| item.entry == "internal_helper@static-id-2"));
+        let sink_nodes: BTreeSet<&str> = skeletons.iter().flat_map(|item| item.tokens.iter())
+            .filter(|token| token.kind == "sink")
+            .map(|token| token.node.as_str()).collect();
+        assert!(sink_nodes.contains("source-call"));
+        assert!(sink_nodes.contains("sink-call"));
+        assert!(sink_nodes.contains("sink-call-2"));
     }
 }
