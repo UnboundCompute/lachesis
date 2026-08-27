@@ -81,7 +81,7 @@ class TemporalLifecycle:
             # build an unused registry.
             from ..flow.native_translate import load_native_semantic_graph_sidecar
             native = load_native_semantic_graph_sidecar(
-                semantic["native_sidecar"], self.language or "c")
+                semantic["native_sidecar"], self.language or "mixed")
             if native is not None:
                 semantic = {
                     "nodes": native.to_dict().get("nodes", {}),

@@ -135,7 +135,7 @@ def native_match_leads(result) -> list[dict[str, Any]]:
     return leads
 
 
-def _decode_native_semantic_result(result, lang):
+def _decode_native_semantic_result(result, lang="mixed"):
     from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
 
     graph = SkeletonGraph(language=lang)
@@ -169,7 +169,7 @@ def _decode_native_semantic_result(result, lang):
     return graph
 
 
-def build_native_semantic_graph(store, lang="c"):
+def build_native_semantic_graph(store, lang="mixed"):
     """Build or load the Rust semantic graph from the binary Pass-2 substrate."""
     base = _base(store)
     if not base:
@@ -210,7 +210,7 @@ def ensure_native_semantic_sidecar(store):
     return output_path
 
 
-def load_native_semantic_graph_sidecar(path, lang="c"):
+def load_native_semantic_graph_sidecar(path, lang="mixed"):
     """Decode a native semantic sidecar for a scoped SDK/query response."""
     try:
         result = lifetime_pb2.NativeSemanticResult()
@@ -224,7 +224,7 @@ def native_semantic_events_path(path) -> Path:
     return Path(f"{path}.events.pb")
 
 
-def load_native_semantic_events_sidecar(path, lang="c"):
+def load_native_semantic_events_sidecar(path, lang="mixed"):
     """Decode only event nodes from the compact Rust sidecar."""
     from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
 

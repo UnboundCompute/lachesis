@@ -88,11 +88,12 @@ class CandidateRegistry:
 
         from ..flow.native_translate import load_native_semantic_events_sidecar
 
+        language = self.graph.get("language") or "mixed"
         native = load_native_semantic_events_sidecar(
-            semantic["native_sidecar"], self.graph.get("language") or "c")
+            semantic["native_sidecar"], language)
         if native is None:
             native = load_native_semantic_graph_sidecar(
-                semantic["native_sidecar"], self.graph.get("language") or "c")
+                semantic["native_sidecar"], language)
         if native is None:
             return
         payload = native.to_dict()
@@ -108,7 +109,7 @@ class CandidateRegistry:
                     suffix += 1
             node = dict(node)
             metadata = dict(node.get("metadata") or {})
-            metadata.setdefault("language", "c")
+            metadata.setdefault("language", language)
             node["metadata"] = metadata
             materialized_nodes[node_id] = node
         materialized = {"nodes": materialized_nodes}
