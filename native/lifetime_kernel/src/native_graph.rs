@@ -179,6 +179,28 @@ fn assigned_target_from_value(
     None
 }
 
+fn resolve_value_decl(
+    node: &str,
+    edges: &[lifetime_proto::GraphEdge],
+    nodes: &HashMap<&str, &lifetime_proto::GraphNode>,
+    refs: &HashMap<String, String>,
+    children: &HashMap<String, Vec<String>>,
+    seen: &mut HashSet<String>,
+) -> Option<String> {
+    if !seen.insert(node.to_owned()) { return None; }
+    if let Some(declaration) = resolve_decl(node, refs, children, &mut HashSet::new()) {
+        return Some(declaration);
+    }
+    if let Some(target) = nodes.get(node).and_then(|item| input_text(item, "target_id")) {
+        if let Some(declaration) = resolve_decl(target, refs, children, &mut HashSet::new()) {
+            return Some(declaration);
+        }
+        return Some(target.to_owned());
+    }
+    edges.iter().filter(|edge| edge.kind == "VALUE_FLOWS_TO" && edge.target == node)
+        .find_map(|edge| resolve_value_decl(&edge.source, edges, nodes, refs, children, seen))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SummaryEffect {
     kind: i32,
@@ -478,6 +500,8 @@ fn sidecar_to_request_inner(
     let mut summary_effects: HashMap<String, Vec<SummaryEffect>> = HashMap::new();
     for (id, input) in &functions {
         let Some(name) = names_by_input_id.get(id) else { continue };
+        let summary_node_lookup: HashMap<&str, &lifetime_proto::GraphNode> = input.nodes.iter()
+            .map(|node| (node.id.as_str(), node)).collect();
         let refs: HashMap<String, String> = input.edges.iter()
             .filter(|edge| edge.kind == "REFERS_TO")
             .map(|edge| (edge.source.clone(), edge.target.clone()))
@@ -491,7 +515,8 @@ fn sidecar_to_request_inner(
         let has_parameter_pass = input.calls.iter().any(|call| {
             !call.is_release && !call.is_realloc && !call.is_alloc
                 && !call.is_aggregate_copy && call.arguments.iter().any(|argument| {
-                    resolve_decl(&argument.node, &refs, &children, &mut HashSet::new())
+                    resolve_value_decl(&argument.node, &input.edges, &summary_node_lookup,
+                        &refs, &children, &mut HashSet::new())
                         .is_some_and(|declaration| parameter_positions.contains_key(&declaration))
                 })
         });
@@ -509,8 +534,8 @@ fn sidecar_to_request_inner(
         for call in &input.calls {
             if !call.is_release && !call.is_realloc { continue; }
             for argument in &call.arguments {
-                let Some(declaration) = resolve_decl(&argument.node, &refs, &children,
-                    &mut HashSet::new()) else { continue };
+                let Some(declaration) = resolve_value_decl(&argument.node, &input.edges,
+                    &summary_node_lookup, &refs, &children, &mut HashSet::new()) else { continue };
                 let Some(position) = parameter_positions.get(&declaration) else { continue };
                 if !effects.iter().any(|effect| effect.position == *position
                     && effect.selectors.is_empty() && !effect.is_return) {

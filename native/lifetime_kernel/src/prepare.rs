@@ -914,12 +914,14 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
         for call in &mut input.calls {
             for argument in &mut call.arguments {
                 argument.expression = graph.label(&argument.node).to_owned();
-                if let Some(path) = graph.access_path(&argument.node, 0) {
+                if let Some(path) = graph.value_path(&argument.node, 0)
+                    .or_else(|| graph.access_path(&argument.node, 0)) {
                     argument.root = path.root;
                     argument.selectors = path.selectors;
                 }
             }
-            if let Some(path) = graph.access_path(&call.assigned, 0) {
+            if let Some(path) = graph.value_path(&call.assigned, 0)
+                .or_else(|| graph.access_path(&call.assigned, 0)) {
                 call.assigned_root = path.root;
                 call.assigned_selectors = path.selectors;
             }
@@ -1150,19 +1152,23 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for call in &mut calls {
         for argument in &mut call.arguments {
             argument.expression = graph.label(&argument.node).to_owned();
-            if let Some(path) = graph.access_path(&argument.node, 0) {
+            if let Some(path) = graph.value_path(&argument.node, 0)
+                .or_else(|| graph.access_path(&argument.node, 0)) {
                 argument.root = path.root;
                 argument.selectors = path.selectors;
             }
         }
-        if let Some(path) = graph.access_path(&call.assigned, 0) {
+        if let Some(path) = graph.value_path(&call.assigned, 0)
+            .or_else(|| graph.access_path(&call.assigned, 0)) {
             call.assigned_root = path.root;
             call.assigned_selectors = path.selectors;
         }
     }
     for call in &calls {
         let argument = |position: u32| call.arguments.iter().find(|item| item.position == position)
-            .and_then(|item| graph.access_path(&item.node, 0).or_else(|| path(Some(&item.node))));
+            .and_then(|item| graph.value_path(&item.node, 0)
+                .or_else(|| graph.access_path(&item.node, 0))
+                .or_else(|| path(Some(&item.node))));
         let target = path(Some(&call.assigned)).or_else(|| path(Some(&call.receiver)));
         let source = argument(0);
         if call.is_release {
@@ -1192,7 +1198,9 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 let mut effects = Vec::new();
                 for effect in &alternative.effects {
                     let actual = call.arguments.iter().find(|argument| argument.position == effect.position)
-                        .and_then(|argument| graph.access_path(&argument.node, 0).or_else(|| path(Some(&argument.node))));
+                        .and_then(|argument| graph.value_path(&argument.node, 0)
+                            .or_else(|| graph.access_path(&argument.node, 0))
+                            .or_else(|| path(Some(&argument.node))));
                     let Some(mut actual) = actual else { continue };
                     actual.selectors.extend(effect.selectors.iter().cloned());
                     if effect.is_return {
@@ -1220,7 +1228,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         } else {
             for argument in &call.arguments {
-                if let Some(target) = graph.access_path(&argument.node, 0)
+                if let Some(target) = graph.value_path(&argument.node, 0)
+                    .or_else(|| graph.access_path(&argument.node, 0))
                     .or_else(|| path(Some(&argument.node))) {
                     // Match the generic Python operation contract: an
                     // argument to an unknown/ordinary callee is a value pass,
