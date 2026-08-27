@@ -93,6 +93,16 @@ fn stable_id_parts(kind: &str, parts: &[String]) -> String {
     format!("v2:frontend:clang-c:{kind}:{}", &hex[..20])
 }
 
+fn linkage_name(linkage: CXLinkageKind) -> &'static str {
+    match linkage {
+        CXLinkage_Internal => "internal",
+        CXLinkage_External => "external",
+        CXLinkage_UniqueExternal => "unique-external",
+        CXLinkage_NoLinkage => "none",
+        _ => "invalid",
+    }
+}
+
 unsafe fn cx_string(value: CXString) -> String {
     let pointer = clang_getCString(value);
     let result = if pointer.is_null() {
@@ -737,6 +747,14 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             kind: Some(graph::value::Kind::Boolean(!has_definition)),
         }));
         properties.push(field("form", text("function")));
+        // Keep linkage on every function entity, including internal/static
+        // functions.  Export status is a separate graph relationship; using
+        // it as the function identity would make compiler-visible helpers
+        // disappear from downstream resolution.
+        properties.push(field(
+            "linkage",
+            text(linkage_name(clang_getCursorLinkage(cursor))),
+        ));
     }
     let mut call_target = None;
     if syntax_kind == "CallExpr" {
