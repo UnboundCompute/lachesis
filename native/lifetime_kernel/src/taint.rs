@@ -104,22 +104,24 @@ fn model_matches(model: &crate::atropos_proto::Model, language: Option<&str>, ca
     } else { callee == format!("{}.{}", model.package, model.method) }
 }
 
-fn endpoint_value(endpoint: &str, call: &pass2::Node,
-                  arguments: &HashMap<u32, Vec<(u32, u32)>>, graph: &Graph) -> Option<u32> {
+fn endpoint_values(endpoint: &str, call: &pass2::Node,
+                   arguments: &HashMap<u32, Vec<(u32, u32)>>, graph: &Graph) -> Vec<u32> {
     if endpoint == "ReturnValue" {
-        return graph.node_property_text(call, "value_id").and_then(|value| graph.symbol(value));
+        return graph.node_property_text(call, "value_id").and_then(|value| graph.symbol(value))
+            .into_iter().collect();
     }
     if endpoint == "Receiver" {
-        return graph.node_property_text(call, "receiver_value_id").and_then(|value| graph.symbol(value));
+        return graph.node_property_text(call, "receiver_value_id").and_then(|value| graph.symbol(value))
+            .into_iter().collect();
     }
-    let position = endpoint.strip_prefix("Argument[")?.strip_suffix(']')?.parse::<u32>().ok()?;
+    let position = endpoint.strip_prefix("Argument[").and_then(|value| value.strip_suffix(']'));
+    let Some(position) = position else { return Vec::new() };
+    if position == "*" {
+        return arguments.get(&call.id).into_iter().flatten().map(|(_, node)| *node).collect();
+    }
+    let Ok(position) = position.parse::<u32>() else { return Vec::new() };
     arguments.get(&call.id).into_iter().flatten()
-        .find_map(|(index, node)| (*index == position).then_some(*node))
-}
-
-fn model_endpoint(model: &crate::atropos_proto::Model, call: &pass2::Node,
-                  arguments: &HashMap<u32, Vec<(u32, u32)>>, graph: &Graph) -> Option<u32> {
-    endpoint_value(model.access_path.split("->").next()?.trim(), call, arguments, graph)
+        .filter_map(|(index, node)| (*index == position).then_some(*node)).collect()
 }
 
 /// Apply declarative Atropos source/sink rows to compiler call/argument facts.
@@ -146,34 +148,40 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
             if !model_matches(model, language, callee) { continue; }
             if model.role == "summary" {
                 let mut endpoints = model.access_path.split("->").map(str::trim);
-                let Some(from) = endpoints.next().and_then(|endpoint|
-                    endpoint_value(endpoint, call, &arguments, graph)) else { continue };
-                let Some(to) = endpoints.next().and_then(|endpoint|
-                    endpoint_value(endpoint, call, &arguments, graph)) else { continue };
+                let Some(from_endpoint) = endpoints.next() else { continue };
+                let Some(to_endpoint) = endpoints.next() else { continue };
+                let from_values = endpoint_values(from_endpoint, call, &arguments, graph);
+                let to_values = endpoint_values(to_endpoint, call, &arguments, graph);
                 let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
-                let mut properties = fact(&[graph.id(from).to_owned(), graph.id(to).to_owned()], "high");
-                properties.push(pass2::text_field("summary_kind",
-                    if model.kind.is_empty() { "flow" } else { model.kind.as_str() }));
-                properties.push(pass2::text_field("catalog_model_id", model_id));
-                edges.push(edge("VALUE_FLOWS_TO", graph.id(from), graph.id(to), properties));
+                for from in from_values {
+                    for to in &to_values {
+                        let mut properties = fact(&[graph.id(from).to_owned(), graph.id(*to).to_owned()], "high");
+                        properties.push(pass2::text_field("summary_kind",
+                            if model.kind.is_empty() { "flow" } else { model.kind.as_str() }));
+                        properties.push(pass2::text_field("catalog_model_id", model_id));
+                        edges.push(edge("VALUE_FLOWS_TO", graph.id(from), graph.id(*to), properties));
+                    }
+                }
                 continue;
             }
             if !matches!(model.role.as_str(), "source" | "sink") { continue; }
-            let Some(value) = model_endpoint(model, call, &arguments, graph) else { continue; };
+            let values = endpoint_values(model.access_path.trim(), call, &arguments, graph);
             let role = model.role.as_str();
             let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
-            let id = pass2::stable_id("catalog", role, "endpoint",
-                &[graph.id(call.id), model_id, model.access_path.as_str()]);
             let kind = if role == "source" { "source" } else { "sink" };
             let semantic_kind = if model.kind.is_empty() { model_id } else { model.kind.as_str() };
-            let mut properties = fact(&[graph.id(call.id).to_owned()], "high");
-            properties.push(pass2::text_field("value_id", graph.id(value)));
-            properties.push(pass2::text_field(if role == "source" { "source_kind" } else { "sink_kind" }, semantic_kind));
-            properties.push(pass2::text_field("catalog_model_id", model_id));
-            nodes.push(graph_proto::NodeRecord { id: id.clone(), kind: kind.to_owned(),
-                label: format!("{}:{}", role, callee), properties, tier: String::new() });
-            edges.push(edge(if role == "source" { "TAINT_SOURCE" } else { "TAINT_SINK" },
-                &id, graph.id(value), fact(&[graph.id(value).to_owned()], "high")));
+            for value in values {
+                let id = pass2::stable_id("catalog", role, "endpoint",
+                    &[graph.id(call.id), model_id, model.access_path.as_str(), graph.id(value)]);
+                let mut properties = fact(&[graph.id(call.id).to_owned()], "high");
+                properties.push(pass2::text_field("value_id", graph.id(value)));
+                properties.push(pass2::text_field(if role == "source" { "source_kind" } else { "sink_kind" }, semantic_kind));
+                properties.push(pass2::text_field("catalog_model_id", model_id));
+                nodes.push(graph_proto::NodeRecord { id: id.clone(), kind: kind.to_owned(),
+                    label: format!("{}:{}", role, callee), properties, tier: String::new() });
+                edges.push(edge(if role == "source" { "TAINT_SOURCE" } else { "TAINT_SINK" },
+                    &id, graph.id(value), fact(&[graph.id(value).to_owned()], "high")));
+            }
         }
     }
     Delta { nodes, edges }
