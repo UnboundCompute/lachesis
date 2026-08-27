@@ -259,35 +259,6 @@ def command_mcp(args: argparse.Namespace) -> int:
     return mcp_server.main() or EXIT_OK
 
 
-# -------------------------------------------------------------------------- index
-
-def command_index(args: argparse.Namespace) -> int:
-    from lachesis.cache import directory_size, entry_for, human_size
-    from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
-                                      ensure_graph)
-    from lachesis.cli.progress import Progress
-
-    source = _resolved(args.path)
-    _stderr(f"lachesis index: {source}")
-    try:
-        graph_path, rebuilt = ensure_graph(source, refresh=args.refresh,
-                                           progress=Progress(enabled=True),
-                                           timeout_seconds=args.timeout)
-    except EnvironmentProblem as error:
-        return _report_environment(error)
-    except NoSourceFound as error:
-        _stderr(f"lachesis index: {error}")
-        return EXIT_USAGE
-    entry = entry_for(source)
-    meta = entry.meta() or {}
-    _stderr()
-    _stderr(f"  {'built' if rebuilt else 'already current'}: "
-            f"{meta.get('nodes', 0):,} nodes, {meta.get('edges', 0):,} edges, "
-            f"{human_size(directory_size(entry.directory))}")
-    _stderr(f"  {graph_path}")
-    return EXIT_OK
-
-
 # -------------------------------------------------------------------------- cache
 
 def command_cache(args: argparse.Namespace) -> int:
@@ -576,12 +547,6 @@ def build_parser() -> argparse.ArgumentParser:
                      help="'comprehension' hides hunting-only tools")
     mcp.set_defaults(handler=command_mcp)
 
-    index = subcommands.add_parser(
-        "index", help="build or refresh the index for a codebase",
-        description="Do the slow part now, so a later scan or mcp session is instant.")
-    _add_source_flags(index)
-    index.set_defaults(handler=command_index)
-
     cache = subcommands.add_parser("cache", help="inspect or delete cached indexes")
     cache_actions = cache.add_subparsers(dest="cache_action", metavar="<action>")
     cache_actions.add_parser("list", help="what is cached, and whether it is current")
@@ -641,7 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 ENGINE_COMMANDS = ("build", "query", "plan")
 KNOWN_COMMANDS = {
-    "scan", "communities", "report", "mcp", "index", "cache", "doctor",
+    "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
     "query", "plan",
 }
@@ -672,6 +637,10 @@ def main(argv: list[str] | None = None) -> int:
     elif (not arguments[0].startswith("-")
           and arguments[0] not in KNOWN_COMMANDS):
         arguments = ["scan", *arguments]
+    if arguments and arguments[0] == "index":
+        _stderr("lachesis: 'index' was removed; use 'lachesis build <path>' "
+                "or run 'lachesis scan <path>' to index on demand")
+        return EXIT_USAGE
     if arguments and arguments[0] in ENGINE_COMMANDS:
         return _run_engine(arguments[0], arguments[1:])
     parser = build_parser()
