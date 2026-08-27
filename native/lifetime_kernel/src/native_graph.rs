@@ -201,6 +201,34 @@ fn resolve_value_decl(
         .find_map(|edge| resolve_value_decl(&edge.source, edges, nodes, refs, children, seen))
 }
 
+/// Return whether an expression/declaration resolves to a catalogued release
+/// symbol through the compiler's neutral alias edges.
+///
+/// Function-pointer releases are common in real C (and the same shape appears
+/// as method/value aliases in managed-language frontends).  The old check used
+/// a `(label, type)` signature table restricted to ownerless variables.  That
+/// loses local aliases and can make a compiler-precise release call look like
+/// an ordinary call.  Keep this entirely structural: follow references,
+/// children, and value-flow assignments, while never consulting a name list
+/// other than the catalog-derived release symbols.
+fn resolves_to_release(
+    start: &str,
+    release_symbols: &HashSet<String>,
+    edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
+    seen: &mut HashSet<String>,
+) -> bool {
+    if release_symbols.contains(start) || !seen.insert(start.to_owned()) {
+        return release_symbols.contains(start);
+    }
+    edges.get(start).into_iter().flatten().any(|edge| {
+        if edge.role == "ARGUMENT" {
+            return false;
+        }
+        matches!(edge.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO")
+            && resolves_to_release(&edge.target, release_symbols, edges, seen)
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SummaryEffect {
     kind: i32,
@@ -854,21 +882,10 @@ fn scan_lifetime_metadata(
     for edge in edges_by_source.values().flatten().filter(|edge| edge.kind == "AST_CHILD") {
         children.entry(edge.source.clone()).or_default().push(edge.target.clone());
     }
-    let directly_releasing: HashSet<String> = variable_meta.keys().filter(|variable| {
-        children.get(variable.as_str()).into_iter().flatten().any(|child| {
-            release_symbol_ids.contains(child)
-                || resolve_decl(child, &refs, &children, &mut HashSet::new())
-                    .is_some_and(|target| release_symbol_ids.contains(&target))
-        })
-    }).cloned().collect();
-    let release_signatures: HashSet<(String, String)> = directly_releasing.iter()
-        .filter_map(|id| variable_meta.get(id).filter(|(_, _, owner)| !*owner)
-            .map(|(label, ty, _)| (label.clone(), ty.clone())))
-        .collect();
-    let release_value_ids: HashSet<String> = variable_meta.iter()
-        .filter(|(_, (label, ty, owner))| !*owner
-            && release_signatures.contains(&(label.clone(), ty.clone())))
-        .map(|(id, _)| id.clone())
+    let release_value_ids: HashSet<String> = variable_meta.keys()
+        .filter(|variable| resolves_to_release(
+            variable, &release_symbol_ids, &edges_by_source, &mut HashSet::new()))
+        .cloned()
         .collect();
     Ok((owners, function_names, call_ids, edges_by_source, initializer_targets,
         release_value_ids, refs, children))
