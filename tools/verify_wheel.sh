@@ -105,8 +105,8 @@ export function handle(request: Request): string {
   return findById(request.body.id);
 }
 TS
-./v/bin/lachesis-analyze project /tmp/verify-wheel.kuzu
-./v/bin/lachesis-query --format text /tmp/verify-wheel.kuzu overview | tee overview.txt
+./v/bin/lachesis build project /tmp/verify-wheel.kuzu
+./v/bin/lachesis query --format text /tmp/verify-wheel.kuzu overview | tee overview.txt
 grep -q "typescript" overview.txt \
   || { echo "FAIL: TypeScript was not analysed -- vendored compiler not reachable" >&2; exit 1; }
 
@@ -120,14 +120,14 @@ def lookup(identifier):
 def handle(request):
     return lookup(request["id"])
 PY
-./v/bin/lachesis-analyze pyproject_src /tmp/verify-wheel-py.kuzu
+./v/bin/lachesis build pyproject_src /tmp/verify-wheel-py.kuzu
 
 say "the MCP server speaks MCP over stdio"
 ./v/bin/python - <<'PY'
 import json, os, subprocess, sys
 
 server = subprocess.Popen(
-    [os.path.join(os.getcwd(), "v", "bin", "lachesis-mcp"), "/tmp/verify-wheel.kuzu"],
+    [os.path.join(os.getcwd(), "v", "bin", "lachesis"), "mcp", "project"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 )
 
