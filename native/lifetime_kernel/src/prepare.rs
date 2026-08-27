@@ -429,6 +429,8 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         let mut body = owned.iter().filter(|node| {
             !matches!(graph.kind(node), "function" | "method" | "constructor" |
                 "CXXMethod" | "Constructor" | "Destructor" | "FunctionTemplate" |
+                "ConversionFunction" | "CXXDeductionGuide" | "FunctionExpression" |
+                "GetAccessor" | "SetAccessor" |
                 "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration" |
                 "ArrowFunction" | "MethodDeclaration" | "MethodDefinition" |
                 "parameter" | "ParmVarDecl")
