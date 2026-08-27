@@ -116,15 +116,16 @@ fn add_finding(
     node: &lifetime_proto::NativeSemanticNode,
     witness_nodes: &[String],
 ) {
+    let owner = if node.function.is_empty() { function } else { node.function.as_str() };
     let line = if node.has_line { node.line } else { 0 };
-    let key = (function.to_owned(), pattern.to_owned(), node.id.clone(), line);
+    let key = (owner.to_owned(), pattern.to_owned(), node.id.clone(), line);
     let witness = if node.source_witness_nodes.is_empty() {
         witness_nodes
     } else {
         node.source_witness_nodes.as_slice()
     };
     output.entry(key).or_insert_with(|| lifetime_proto::NativeTemporalFinding {
-        function: function.to_owned(),
+        function: owner.to_owned(),
         pattern: pattern.to_owned(),
         path: Some(lifetime_proto::Path {
             root: object.root.clone(),
@@ -398,6 +399,27 @@ fn match_function(
             }
         }
         for (target, guards) in &guarded_outgoing[index] {
+            let mut next_bindings = bindings.clone();
+            if let Some(edge) = function.edges.iter().find(|edge| {
+                by_id.get(edge.source.as_str()) == Some(&index)
+                    && by_id.get(edge.target.as_str()) == Some(target)
+            }) {
+                for binding in &edge.bindings {
+                    for encoded in &binding.formal_to_actual {
+                        let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue };
+                        let object_label = |object: &ObjectKey| {
+                            format!("{}{}", object.root, object.selectors.join(""))
+                        };
+                        let source = objects.iter().position(|object|
+                            object_label(object) == formal && object.generation == "g0");
+                        let target_object = objects.iter().position(|object|
+                            object_label(object) == actual && object.generation == "g0");
+                        if let (Some(source), Some(target_object)) = (source, target_object) {
+                            next_bindings.push((source as u32, target_object as u32));
+                        }
+                    }
+                }
+            }
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
             let mut contradiction = false;
@@ -423,7 +445,7 @@ fn match_function(
                 }
             }
             if !contradiction {
-                queue.push_back((*target, bindings.clone(), released.clone(), origins.clone(), next_nulls,
+                queue.push_back((*target, next_bindings, released.clone(), origins.clone(), next_nulls,
                                  next_nonnull, uninitialized.clone(), pointer_arithmetic.clone(),
                                  escaped.clone(), realloc_lost.clone()));
             }
@@ -447,6 +469,9 @@ fn match_function(
 pub(crate) fn match_result(
     result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
+    if !result.seams.is_empty() {
+        return match_stitched_result(result);
+    }
     // Function states are independent. Parallelize the common small-function
     // case, but keep large CFGs serialized so branch-heavy state sets do not
     // multiply peak RSS on large repositories.
@@ -482,6 +507,38 @@ pub(crate) fn match_result(
     lifetime_proto::NativeTemporalResult {
         functions: ordered.into_iter().flatten().collect(),
     }
+}
+
+fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
+    -> lifetime_proto::NativeTemporalResult
+{
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut exits = Vec::new();
+    let entry = "native:stitched:event-entry".to_owned();
+    let callee_ids: HashSet<String> = result.seams.iter().map(|edge| edge.callee.clone()).collect();
+    for function in result.functions {
+        if function.nodes.is_empty() { continue; }
+        exits.extend(function.exits.iter().cloned());
+        if !callee_ids.contains(&function.id) {
+            edges.push(lifetime_proto::NativeSemanticEdge {
+                source: entry.clone(), target: function.entry.clone(), kind: "normal".into(),
+                ..Default::default()
+            });
+        }
+        nodes.extend(function.nodes);
+        edges.extend(function.edges);
+    }
+    nodes.push(lifetime_proto::NativeSemanticNode {
+        id: entry.clone(), event_kind: String::new(), ..Default::default()
+    });
+    edges.extend(result.seams);
+    let function = lifetime_proto::NativeSemanticFunction {
+        id: "native:stitched".into(), entry, exits, nodes, edges,
+        language: "mixed".into(),
+    };
+    let matched = match_function(&function);
+    lifetime_proto::NativeTemporalResult { functions: vec![matched] }
 }
 
 #[cfg(test)]
@@ -606,6 +663,48 @@ mod tests {
             ..Default::default()
         });
         assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn stitches_lifetime_identity_across_a_call_seam() {
+        let mut origin = node("a-origin", "ORIGIN", 1);
+        origin.function = "a".to_owned();
+        origin.object_root = "actual".to_owned();
+        let mut release = node("b-release", "RELEASE", 2);
+        release.function = "b".to_owned();
+        release.object_root = "formal".to_owned();
+        let mut read = node("b-read", "READ_STORAGE", 3);
+        read.function = "b".to_owned();
+        read.object_root = "formal".to_owned();
+        let seam = lifetime_proto::NativeSemanticEdge {
+            source: "a-origin".to_owned(), target: "b-release".to_owned(), kind: "seam".into(),
+            seam_kind: "call".into(), callee: "b".into(),
+            bindings: vec![lifetime_proto::NativeSeamBinding {
+                caller: "a".into(), callee: "b".into(), call_node: "call".into(),
+                formal_to_actual: vec!["formal\u{1f}actual".into()], return_to: String::new(),
+            }],
+            ..Default::default()
+        };
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![
+                lifetime_proto::NativeSemanticFunction {
+                    id: "a".into(), entry: "a-origin".into(), exits: vec!["a-origin".into()],
+                    nodes: vec![origin], edges: Vec::new(), language: "c".into(),
+                },
+                lifetime_proto::NativeSemanticFunction {
+                    id: "b".into(), entry: "b-release".into(), exits: vec!["b-read".into()],
+                    nodes: vec![release, read],
+                    edges: vec![lifetime_proto::NativeSemanticEdge {
+                        source: "b-release".into(), target: "b-read".into(), kind: "normal".into(),
+                        ..Default::default()
+                    }], language: "c".into(),
+                },
+            ],
+            complete: true, seams: vec![seam],
+        });
+        assert!(result.functions[0].findings.iter().any(|finding|
+            finding.pattern == "uaf.deref" && finding.function == "b"),
+            "findings: {:?}", result.functions[0].findings);
     }
 
     #[test]

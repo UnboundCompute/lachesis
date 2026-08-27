@@ -1884,6 +1884,27 @@ pub(crate) fn semantic_request(
             id, entry, exits, nodes, edges, language,
         })
     }).collect::<Result<Vec<_>, String>>()?;
+    // Seam endpoints must survive the compact event projection. Resolve the
+    // compiler call anchor to the first event at that anchor, and the callee
+    // entry anchor to its first event. Empty-event anchors remain a safe
+    // fallback for query-only sidecars.
+    for seam in &mut seams {
+        let Some(binding) = seam.bindings.first() else { continue };
+        if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
+            let anchor = binding.call_node.as_str();
+            if let Some(node) = function.nodes.iter().find(|node|
+                node.anchor == anchor && !node.event_kind.is_empty())
+                .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
+                seam.source = node.id.clone();
+            }
+        }
+        if let Some(function) = functions.iter().find(|item| item.id == binding.callee) {
+            if let Some(node) = function.nodes.iter().find(|node| !node.event_kind.is_empty())
+                .or_else(|| function.nodes.first()) {
+                seam.target = node.id.clone();
+            }
+        }
+    }
     seams.sort_by(|left, right| (&left.source, &left.target, &left.callee)
         .cmp(&(&right.source, &right.target, &right.callee)));
     Ok(lifetime_proto::NativeSemanticResult { functions, complete: true, seams })
