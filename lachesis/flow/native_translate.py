@@ -135,6 +135,22 @@ def native_match_leads(result) -> list[dict[str, Any]]:
     return leads
 
 
+def _semantic_function_language(function, fallback: str) -> str:
+    """Read the optional native language tag across old/new protobuf bindings."""
+    explicit = getattr(function, "language", "")
+    if explicit:
+        return explicit
+    identifier = getattr(function, "id", "")
+    if ":cpython-ast:" in identifier or ":python:" in identifier:
+        return "python"
+    if (":typescript-compiler-api:" in identifier
+            or ":javascript:" in identifier or ":typescript:" in identifier):
+        return "javascript"
+    if ":clang-c:" in identifier or ":clang-cpp:" in identifier:
+        return "c"
+    return fallback
+
+
 def _decode_native_semantic_result(result, lang="mixed"):
     from .semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
 
@@ -153,9 +169,10 @@ def _decode_native_semantic_result(result, lang="mixed"):
                 event = Event(kind, obj=obj, base=obj,
                               path="*" if obj is not None else None,
                               line=node.line if node.has_line else None)
+            function_language = _semantic_function_language(function, lang)
             graph.add_node(node.id, event, fragment=function.id,
                            owner_function_id=function.id, native_anchor=node.anchor,
-                           language=function.language or lang)
+                           language=function_language)
         for edge in function.edges:
             if edge.source in node_ids and edge.target in node_ids:
                 graph.add_edge(edge.source, edge.target, kind=edge.kind or "normal")
