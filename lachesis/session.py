@@ -1002,6 +1002,12 @@ class LeadSet:
     def __bool__(self) -> bool:
         return bool(self.leads)
 
+    def __getitem__(self, item: int | slice) -> "Lead | LeadSet":
+        """Read one lead or return a new immutable result view for a slice."""
+        if isinstance(item, slice):
+            return self._with(self.leads[item])
+        return self.leads[item]
+
     def top(self, n: int) -> list[Lead]:
         """Return the highest-ranked ``n`` leads without changing this result set."""
         if n < 0:
