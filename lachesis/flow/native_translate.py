@@ -219,9 +219,14 @@ def ensure_native_semantic_sidecar(store):
     output_path = native_semantic_sidecar_path(store)
     input_path = pass2_input_cache_path(base)
     if _sidecar_stale(output_path, input_path):
+        # The Rust path publishes both the full semantic sidecar and its
+        # compact event sibling in one invocation.  Do not immediately invoke
+        # it a second time below on a cold cache.
         write_semantic_path(input_path, output_path)
-    events_path = Path(f"{output_path}.events.pb")
-    if _sidecar_stale(events_path, input_path, output_path):
+    else:
+        events_path = Path(f"{output_path}.events.pb")
+        if not _sidecar_stale(events_path, input_path, output_path):
+            return output_path
         # Regenerate through Rust so the event-only sibling is published atomically.
         temporary = Path(f"{output_path}.events-migrate.{os.getpid()}.pb")
         try:
