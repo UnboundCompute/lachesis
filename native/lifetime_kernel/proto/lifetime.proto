@@ -371,6 +371,9 @@ message NativeSemanticNode {
   sint64 line = 7;
   bool has_line = 8;
   string anchor = 9;
+  bool stack_local = 10;
+  bool is_null = 11;
+  string access = 12;
 }
 message NativeSemanticEdge {
   string source = 1;

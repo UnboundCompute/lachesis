@@ -1335,6 +1335,9 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
         line: operation.line.unwrap_or_default(),
         has_line: operation.line.is_some(),
         anchor: operation.node.clone(),
+        stack_local: operation.access == "return-stack",
+        is_null: operation.is_null,
+        access: operation.access.clone(),
     }
 }
 
@@ -1365,6 +1368,9 @@ pub(crate) fn semantic_request(
                 line: 0,
                 has_line: false,
                 anchor: anchor.clone(),
+                stack_local: false,
+                is_null: false,
+                access: String::new(),
             });
         }
         let mut incoming_counts: HashMap<String, usize> = HashMap::new();
@@ -1393,6 +1399,7 @@ pub(crate) fn semantic_request(
                     object_root: String::new(), object_selectors: Vec::new(),
                     generation: String::new(), line: 0, has_line: false,
                     anchor: anchor.clone(),
+                    stack_local: false, is_null: false, access: String::new(),
                 });
             }
         }
@@ -1421,6 +1428,7 @@ pub(crate) fn semantic_request(
                 _ => vec![semantic_event_kind(operation.kind, &operation.access)],
             };
             for (ordinal, kind) in kinds.into_iter().enumerate() {
+                let kind = if operation.is_null { "WRITE_STORAGE_NULL" } else { kind };
                 let node_id = format!("native:{}:{}:{}:{}", id, operation.node, index, ordinal);
                 let event = semantic_node(node_id.clone(), &id, kind, &operation, path, generation);
                 by_anchor.entry(operation.node.clone()).or_default().push(node_id);

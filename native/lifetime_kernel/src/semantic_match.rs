@@ -41,6 +41,9 @@ struct StateKey {
     node: usize,
     released: Vec<ObjectKey>,
     origins: Vec<ObjectKey>,
+    nulls: Vec<ObjectKey>,
+    uninitialized: Vec<ObjectKey>,
+    pointer_arithmetic: Vec<ObjectKey>,
 }
 
 fn add_finding(
@@ -83,7 +86,14 @@ fn match_function(
         .filter_map(|id| by_id.get(id.as_str()).copied())
         .collect();
 
-    let mut queue = VecDeque::from([(entry, Vec::<ObjectKey>::new(), Vec::<ObjectKey>::new())]);
+    let mut queue = VecDeque::from([(
+        entry,
+        Vec::<ObjectKey>::new(),
+        Vec::<ObjectKey>::new(),
+        Vec::<ObjectKey>::new(),
+        Vec::<ObjectKey>::new(),
+        Vec::<ObjectKey>::new(),
+    )]);
     let mut seen = HashSet::new();
     let mut findings = HashMap::new();
     let mut transfers = 0u64;
@@ -91,18 +101,28 @@ fn match_function(
     // This is a work bound for one function, not a wall-clock hard stop.
     const MAX_STATES: usize = 1_000_000;
 
-    while let Some((index, mut released, mut origins)) = queue.pop_front() {
+    while let Some((index, mut released, mut origins, mut nulls,
+                    mut uninitialized, mut pointer_arithmetic)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
         released.sort();
         origins.sort();
-        let state = StateKey { node: index, released: released.clone(), origins: origins.clone() };
+        nulls.sort();
+        uninitialized.sort();
+        pointer_arithmetic.sort();
+        let state = StateKey {
+            node: index, released: released.clone(), origins: origins.clone(),
+            nulls: nulls.clone(), uninitialized: uninitialized.clone(),
+            pointer_arithmetic: pointer_arithmetic.clone(),
+        };
         if !seen.insert(state) { continue; }
         let node = &function.nodes[index];
         let object = ObjectKey::from_node(node);
         match node.event_kind.as_str() {
             "ORIGIN" => if let Some(object) = object {
                 released.retain(|item| item != &object);
+                nulls.retain(|item| item != &object);
+                uninitialized.retain(|item| item != &object);
                 if !origins.contains(&object) { origins.push(object); }
             },
             "RELEASE" | "INVALIDATE" => if let Some(object) = object {
@@ -115,11 +135,36 @@ fn match_function(
                 if released.contains(&object) {
                     add_finding(&mut findings, &function.id, "uaf.deref", &object, node);
                 }
+                if nulls.contains(&object) {
+                    add_finding(&mut findings, &function.id, "null-deref", &object, node);
+                }
+                if uninitialized.contains(&object) {
+                    add_finding(&mut findings, &function.id, "uninitialized-use", &object, node);
+                }
+                if pointer_arithmetic.contains(&object) {
+                    add_finding(&mut findings, &function.id,
+                                "pointer-arithmetic-before-validation", &object, node);
+                }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object {
                 if released.contains(&object) {
                     add_finding(&mut findings, &function.id, "use.dangling", &object, node);
                 }
+                if uninitialized.contains(&object) {
+                    add_finding(&mut findings, &function.id, "uninitialized-use", &object, node);
+                }
+                if node.event_kind == "RETURN_VALUE" && node.stack_local {
+                    add_finding(&mut findings, &function.id, "use-after-return", &object, node);
+                }
+            },
+            "WRITE_STORAGE_NULL" => if let Some(object) = object {
+                nulls.push(object);
+            },
+            "UNINITIALIZED" => if let Some(object) = object {
+                uninitialized.push(object);
+            },
+            "POINTER_ARITHMETIC" => if let Some(object) = object {
+                pointer_arithmetic.push(object);
             },
             _ => {}
         }
@@ -131,7 +176,8 @@ fn match_function(
             }
         }
         for target in &outgoing[index] {
-            queue.push_back((*target, released.clone(), origins.clone()));
+            queue.push_back((*target, released.clone(), origins.clone(), nulls.clone(),
+                             uninitialized.clone(), pointer_arithmetic.clone()));
         }
     }
 
@@ -161,7 +207,8 @@ mod tests {
             id: id.to_owned(), function: "f".to_owned(),
             event_kind: event_kind.to_owned(), object_root: "p".to_owned(),
             object_selectors: Vec::new(), generation: "g0".to_owned(),
-            line, has_line: true, anchor: id.to_owned(),
+            line, has_line: true, anchor: id.to_owned(), stack_local: false,
+            is_null: false, access: String::new(),
         }
     }
 
