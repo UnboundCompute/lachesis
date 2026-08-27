@@ -604,8 +604,8 @@ TOOLS = [
                     "questions to investigate, never verdicts. Use lens=guard-diff for the "
                     "entrypoint-to-effect guard view or lens=flow for native object-lifetime "
                     "leads. Results are bounded and paged; the response includes coverage and "
-                    "whether the requested temporal work completed. The single native engine "
-                    "is selected internally.",
+                    "whether the requested temporal work completed. Calls against one session "
+                    "are serialized; the native runtime is selected internally.",
      "inputSchema": {"type": "object", "properties": {
          "lens": {"type": "string", "enum": ["all", "guard-diff", "flow"],
                   "default": "all", "description": "lead view; all is the broad default"},
@@ -613,6 +613,8 @@ TOOLS = [
                          "description": "scan only the first N entrypoints (0 = all)"},
          "min_rank": {"type": "number", "default": 0.0},
          "limit": {"type": "integer", "default": 20},
+         "offset": {"type": "integer", "default": 0,
+                    "description": "lead offset for the next page"},
          "hard_stop": {"type": "number", "default": 180,
                        "description": "temporal budget in seconds; 0 = unbounded"},
          "include_suppressions": {"type": "boolean", "default": False}},
@@ -888,13 +890,12 @@ TOOLS = [
          "atropos_only": {"type": "boolean",
                           "description": "only witnesses a catalog fact drove"}}}},
     {"name": "candidates",
-     "description": "Enumerate and rank every observable obligation site selected by an Atropos "
-                    "fact. This is a POINTER, not a safety check: candidates are never suppressed "
+     "description": "Enumerate and rank every observable obligation site as leads. This is a "
+                    "pointer, not a safety check: leads are never suppressed "
                     "because a size is constant, a guard seems nearby, or no input flow was "
-                    "witnessed. The first constructor is memory.copy.capacity. Costs one "
-                    "catalog bind on first call per graph (cached after). `frontiers` here reports "
-                    "coverage as counts (e.g. unbound_sinks_count); call candidate_census for the "
-                    "full roster of catalog sinks that never bound.",
+                    "witnessed. The result is bounded and paged with `leads`, `total`, and "
+                    "`next_offset`; call candidate_census for the full coverage roster. Calls "
+                    "against one session are serialized and the first cold bind can be expensive.",
      "inputSchema": {"type": "object", "properties": {
          "domain": {"type": "string"},
          # Wire name avoids the bare key `constructor`: it collides with
@@ -902,6 +903,7 @@ TOOLS = [
          "constructor_id": {"type": "string"},
          "language": {"type": "string", "enum": ["c", "python", "javascript", "typescript"]},
          "limit": {"type": "integer", "default": 40},
+         "offset": {"type": "integer", "default": 0},
          "cursor": {"type": "string"},
          "detail": {"type": "string", "enum": ["brief", "compact", "full"], "default": "compact",
                     "description": "brief (one-line scan: id/rank/callee/at/size), "
@@ -1651,6 +1653,23 @@ def call_tool(name, args, format=None):
         # counts only, so a list page stays bounded. Nothing is dropped -- the
         # rows are one census call away.
         result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
+        if name == "candidates":
+            rows = list(result.get("candidates") or ())
+            for group in result.get("groups") or ():
+                rows.extend(group.get("candidates") or ())
+            rows.sort(key=lambda row: float(row.get("rank") or 0.0), reverse=True)
+            start = max(0, int(args.get("offset", 0)))
+            size = max(1, int(args.get("limit", 40)))
+            page = rows[start:start + size]
+            next_offset = start + len(page)
+            result.pop("candidates", None)
+            result.pop("groups", None)
+            result["leads"] = page
+            result["page"] = {
+                "total": len(rows), "offset": start, "returned": len(page),
+                "has_more": next_offset < len(rows),
+                "next_offset": next_offset if next_offset < len(rows) else None,
+            }
         return _emit(name, result, fmt, offset, limit)
     if name == "explain":
         # The census->candidates->detail->sources_of->read_body chain in one call, over the
@@ -1729,7 +1748,7 @@ def call_tool(name, args, format=None):
         # whether the run was partial.
         result = {"move": "leads", "summary": ls.summary()}
         if pattern or function or at:
-            result["leads"] = list(ls.leads)
+            result["leads"] = [lead.to_dict() for lead in ls]
             result["returned"] = len(ls)
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
