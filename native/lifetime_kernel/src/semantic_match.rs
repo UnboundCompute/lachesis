@@ -107,8 +107,9 @@ fn match_function(
     // ObjectKey vectors into every worklist state; on branch-heavy functions
     // that made state hashing and transfer cloning dominate the actual event
     // checks.  Handles are local to this function and never cross the ABI.
-    let mut object_ids: HashMap<ObjectKey, u32> = HashMap::default();
-    let mut objects = Vec::new();
+    let mut object_ids: HashMap<ObjectKey, u32> =
+        HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
+    let mut objects = Vec::with_capacity(function.nodes.len());
     let mut node_object_ids = vec![None; function.nodes.len()];
     let mut node_value_ids = vec![None; function.nodes.len()];
     for (index, node) in function.nodes.iter().enumerate() {
@@ -142,8 +143,8 @@ fn match_function(
         Vec::<u32>::new(),
         Vec::<u32>::new(),
     )]);
-    let mut seen = HashSet::default();
-    let mut findings = HashMap::default();
+    let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
+    let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut transfers = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
