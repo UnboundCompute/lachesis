@@ -90,7 +90,10 @@ fn compact_event_function(
         .filter_map(|(index, node)| (!node.event_kind.is_empty()).then_some(index))
         .collect();
     if event_indices.is_empty() { return None; }
-    let event_flags: HashSet<usize> = event_indices.iter().copied().collect();
+    let mut event_flags = vec![false; node_count];
+    for &index in &event_indices {
+        event_flags[index] = true;
+    }
     let mut outgoing = vec![Vec::new(); node_count];
     let mut incoming = vec![Vec::new(); node_count];
     for edge in full_edges {
@@ -104,26 +107,42 @@ fn compact_event_function(
     // Walk through non-event anchors until the next event(s).  Each event is
     // expanded independently, so loops are bounded by the visited set and
     // branch arms remain separate in the projected graph.
-    let walk = |start: usize, graph: &[Vec<usize>]| {
-        let mut pending = vec![start];
-        let mut visited = HashSet::new();
-        let mut found = HashSet::new();
+    let mut visited_marks = vec![0u32; node_count];
+    let mut found_marks = vec![0u32; node_count];
+    let mut walk_stamp = 0u32;
+    let mut pending = Vec::new();
+    let mut found = Vec::new();
+    let mut walk = |start: usize, graph: &[Vec<usize>], result: &mut Vec<usize>| {
+        walk_stamp = walk_stamp.wrapping_add(1);
+        if walk_stamp == 0 {
+            visited_marks.fill(0);
+            found_marks.fill(0);
+            walk_stamp = 1;
+        }
+        let stamp = walk_stamp;
+        pending.clear();
+        result.clear();
+        pending.push(start);
         while let Some(current) = pending.pop() {
-            if !visited.insert(current) { continue; }
+            if visited_marks[current] == stamp { continue; }
+            visited_marks[current] = stamp;
             for target in graph.get(current).into_iter().flatten() {
-                if event_flags.contains(target) {
-                    found.insert(*target);
+                if event_flags[*target] {
+                    if found_marks[*target] != stamp {
+                        found_marks[*target] = stamp;
+                        result.push(*target);
+                    }
                 } else {
                     pending.push(*target);
                 }
             }
         }
-        found
     };
 
     let mut projected: Vec<(usize, usize)> = Vec::new();
     for &source in &event_indices {
-        for target in walk(source, &outgoing) {
+        walk(source, &outgoing, &mut found);
+        for &target in &found {
             if source != target {
                 projected.push((source, target));
             }
@@ -133,26 +152,39 @@ fn compact_event_function(
     projected.dedup();
 
     let entry_events: Vec<usize> = by_id.get(full_entry.as_str()).copied()
-        .map(|entry| if event_flags.contains(&entry) {
+        .map(|entry| if event_flags[entry] {
             vec![entry]
         } else {
-            walk(entry, &outgoing).into_iter().collect()
+            walk(entry, &outgoing, &mut found);
+            found.clone()
         })
         .unwrap_or_default();
-    let mut exit_events: HashSet<usize> = HashSet::new();
+    let mut exit_events = Vec::new();
+    let mut exit_flags = vec![false; node_count];
     for exit in &full_exits {
         let Some(&exit) = by_id.get(exit.as_str()) else { continue };
-        if event_flags.contains(&exit) {
-            exit_events.insert(exit);
+        if event_flags[exit] {
+            if !exit_flags[exit] {
+                exit_flags[exit] = true;
+                exit_events.push(exit);
+            }
         } else {
-            exit_events.extend(walk(exit, &incoming));
+            walk(exit, &incoming, &mut found);
+            for &event in &found {
+                if !exit_flags[event] {
+                    exit_flags[event] = true;
+                    exit_events.push(event);
+                }
+            }
         }
     }
     if exit_events.is_empty() {
-        let has_outgoing: HashSet<usize> = projected.iter()
-            .map(|(source, _)| *source).collect();
+        let mut has_outgoing = vec![false; node_count];
+        for (source, _) in &projected {
+            has_outgoing[*source] = true;
+        }
         exit_events.extend(event_indices.iter().copied()
-            .filter(|index| !has_outgoing.contains(index)));
+            .filter(|index| !has_outgoing[*index]));
     }
 
     let entry = format!("native:{}:event-entry", function.id);
