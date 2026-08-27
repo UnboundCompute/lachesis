@@ -42,6 +42,8 @@ struct StateKey {
     nulls: Vec<u32>,
     uninitialized: Vec<u32>,
     pointer_arithmetic: Vec<u32>,
+    escaped: Vec<u32>,
+    realloc_lost: Vec<u32>,
 }
 
 fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
@@ -142,6 +144,8 @@ fn match_function(
         Vec::<u32>::new(),
         Vec::<u32>::new(),
         Vec::<u32>::new(),
+        Vec::<u32>::new(),
+        Vec::<u32>::new(),
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
@@ -151,7 +155,8 @@ fn match_function(
     const MAX_STATES: usize = 1_000_000;
 
     while let Some((index, mut bindings, mut released, mut origins, mut nulls,
-                    mut uninitialized, mut pointer_arithmetic)) = queue.pop_front() {
+                    mut uninitialized, mut pointer_arithmetic, mut escaped,
+                    mut realloc_lost)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
         bindings.sort_unstable();
@@ -166,10 +171,15 @@ fn match_function(
         uninitialized.dedup();
         pointer_arithmetic.sort_unstable();
         pointer_arithmetic.dedup();
+        escaped.sort_unstable();
+        escaped.dedup();
+        realloc_lost.sort_unstable();
+        realloc_lost.dedup();
         let state = StateKey {
             node: index, bindings: bindings.clone(), released: released.clone(), origins: origins.clone(),
             nulls: nulls.clone(), uninitialized: uninitialized.clone(),
-            pointer_arithmetic: pointer_arithmetic.clone(),
+            pointer_arithmetic: pointer_arithmetic.clone(), escaped: escaped.clone(),
+            realloc_lost: realloc_lost.clone(),
         };
         if !seen.insert(state) { continue; }
         let node = &function.nodes[index];
@@ -189,6 +199,8 @@ fn match_function(
                 released.retain(|item| *item != object);
                 nulls.retain(|item| *item != object);
                 uninitialized.retain(|item| *item != object);
+                escaped.retain(|item| *item != object);
+                realloc_lost.retain(|item| *item != object);
                 if !contains_sorted(&origins, object) { origins.push(object); }
             },
             "RELEASE" => if let Some(object) = object_id {
@@ -205,6 +217,16 @@ fn match_function(
             },
             "INVALIDATE" => if let Some(object) = object_id {
                 released.push(object);
+            },
+            "REALLOC_FAILED" => if let Some(object) = object_id {
+                realloc_lost.push(object);
+            },
+            "ESCAPE" => if let Some(object) = object_id {
+                escaped.push(object);
+            },
+            "LOST_FROM_SLOT" => if let Some(object) = object_id {
+                nulls.push(object);
+                realloc_lost.push(object);
             },
             "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object_id {
                 if contains_sorted(&released, object) {
@@ -251,8 +273,18 @@ fn match_function(
             _ => {}
         }
         if exits.contains(&index) {
+            for object in &realloc_lost {
+                if !contains_sorted(&released, *object)
+                    && !contains_sorted(&escaped, *object)
+                {
+                    add_finding(&mut findings, &function.id,
+                                "realloc-failure-leak", &objects[*object as usize], node);
+                }
+            }
             for object in &origins {
-                if !contains_sorted(&released, *object) {
+                if !contains_sorted(&released, *object)
+                    && !contains_sorted(&escaped, *object)
+                {
                     add_finding(&mut findings, &function.id, "leak",
                                 &objects[*object as usize], node);
                 }
@@ -260,7 +292,8 @@ fn match_function(
         }
         for target in &outgoing[index] {
             queue.push_back((*target, bindings.clone(), released.clone(), origins.clone(), nulls.clone(),
-                             uninitialized.clone(), pointer_arithmetic.clone()));
+                             uninitialized.clone(), pointer_arithmetic.clone(), escaped.clone(),
+                             realloc_lost.clone()));
         }
     }
 
@@ -392,5 +425,27 @@ mod tests {
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "aggregate-copy-alias");
+    }
+
+    #[test]
+    fn records_realloc_failure_leak_at_function_exit() {
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("f", "REALLOC_FAILED", 2),
+                                             node("x", "", 3)])],
+            complete: true,
+        });
+        assert!(result.functions[0].findings.iter()
+            .any(|finding| finding.pattern == "realloc-failure-leak"));
+    }
+
+    #[test]
+    fn escaped_object_is_not_reported_as_a_leak() {
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("e", "ESCAPE", 2)])],
+            complete: true,
+        });
+        assert!(result.functions[0].findings.is_empty());
     }
 }

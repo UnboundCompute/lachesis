@@ -100,6 +100,7 @@ def native_match_leads(result) -> list[dict[str, Any]]:
         "use.dangling": "mem.lifetime.use-after-free",
         "null-deref": "mem.lifetime.null-deref",
         "use-after-return": "mem.lifetime.use-after-return",
+        "realloc-failure-leak": "mem.lifetime.realloc-failure-leak",
         "aggregate-copy-alias": "aggregate-copy-alias",
     }
     leads = []
