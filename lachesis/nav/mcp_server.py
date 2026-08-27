@@ -1058,6 +1058,28 @@ def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
     return render_mod.render(name, result, offset=offset, limit=limit)
 
 
+def _tool_error(name, error):
+    """Return a recoverable, agent-readable error envelope for one tool call."""
+    message = str(error) or type(error).__name__
+    lowered = message.lower()
+    if "native" in lowered and ("kernel" in lowered or "rust" in lowered):
+        fix = ("install a platform wheel with `python -m pip install --upgrade lachesis-cpg`, "
+               "or build native/lifetime_kernel with cargo")
+    elif "path" in lowered or "graph" in lowered or "source" in lowered:
+        fix = "check the path and call `load_graph` or `build_graph` with a readable target"
+    elif "deadline" in lowered or "timeout" in lowered:
+        fix = "retry with a larger hard_stop/timeout, or request the structural fast path"
+    else:
+        fix = "inspect the message, then retry this tool; the MCP session remains available"
+    partial = list(getattr(error, "partial_leads", ()) or ())
+    return {
+        "move": name,
+        "ok": False,
+        "error": {"type": type(error).__name__, "message": message, "fix": fix},
+        "partial_leads": partial,
+    }
+
+
 def _capability_blocked(name, reason, prerequisite):
     return {"move": name, "supported": False, "status": "blocked",
             "reason": reason, "prerequisite": prerequisite}
@@ -1421,10 +1443,6 @@ def call_tool(name, args, format=None):
             "page": page_meta,
             "min_rank": minimum,
         }
-        # Keep the old key only for the guard-diff lens while clients migrate; the
-        # default and new lenses use the one vocabulary promised by the UX contract.
-        if lens == "guard-diff":
-            result["queue"] = page
         if args.get("include_suppressions"):
             result["suppressions"] = scan["suppressions"]
         return _emit(name, result, fmt, offset, limit)
@@ -1926,8 +1944,10 @@ def _dispatch(msg):
                   "result": {"content": [{"type": "text", "text": text}]}})
         except Exception as e:  # noqa: BLE001 - one tool's failure is that call's error
             log("tool error:", e)
+            error_payload = _tool_error(p.get("name", "tool"), e)
             send({"jsonrpc": "2.0", "id": mid,
-                  "result": {"content": [{"type": "text", "text": f"error: {e}"}],
+                  "result": {"content": [{"type": "text", "text": json.dumps(error_payload)}],
+                             "structuredContent": error_payload,
                              "isError": True}})
     elif method == "ping":
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
