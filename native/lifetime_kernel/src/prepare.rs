@@ -101,11 +101,20 @@ impl<'a> GraphView<'a> {
             }
         }
         for children in &mut children_by_node {
-            children.sort_by_key(|child| {
-                node_index.get(child).and_then(|index| nodes_input.get(*index))
+            children.sort_by(|left, right| {
+                let left_key = (node_index.get(left).and_then(|index| nodes_input.get(*index))
                     .and_then(|node| integer_property(node, "start_offset"))
-                    .unwrap_or(i64::MAX)
+                    .unwrap_or(i64::MAX), *left);
+                let right_key = (node_index.get(right).and_then(|index| nodes_input.get(*index))
+                    .and_then(|node| integer_property(node, "start_offset"))
+                    .unwrap_or(i64::MAX), *right);
+                left_key.cmp(&right_key)
             });
+        }
+        for role_map in roles.values_mut() {
+            for children in role_map.values_mut() {
+                children.sort();
+            }
         }
         let mut child_offsets = Vec::with_capacity(children_by_node.len() + 1);
         let mut child_targets = Vec::new();
@@ -295,7 +304,8 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
     let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
         graph.parent_of(node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
     if roots.is_empty() { roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt").cloned().collect(); }
-    let root = if let Some(root) = roots.into_iter().min_by_key(|node| graph.offset(node)) {
+    roots.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
+    let root = if let Some(root) = roots.into_iter().next() {
         root
     } else {
         // Normalized non-C frontends may not publish a CompoundStmt. Their
@@ -307,7 +317,7 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
                 "ArrowFunction" | "MethodDeclaration" | "MethodDefinition" |
                 "Constructor" | "parameter" | "ParmVarDecl")
         }).cloned().collect::<Vec<_>>();
-        body.sort_by_key(|node| graph.offset(node));
+        body.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
         body.first()?;
         let mut linear = HashMap::new();
         for pair in body.windows(2) {
@@ -520,8 +530,10 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
 
     let (entry, exits) = emit(graph, owned, &root, &mut successors, &mut memo, &mut in_progress, 0);
     let entry = entry?;
-    let cfg_entry = owned.iter().find(|node| graph.kind(node) == "cfg-entry").cloned();
-    let cfg_exit = owned.iter().find(|node| graph.kind(node) == "cfg-exit").cloned();
+    let cfg_entry = owned.iter().filter(|node| graph.kind(node) == "cfg-entry")
+        .min_by(|left, right| (graph.offset(left), *left).cmp(&(graph.offset(right), *right))).cloned();
+    let cfg_exit = owned.iter().filter(|node| graph.kind(node) == "cfg-exit")
+        .min_by(|left, right| (graph.offset(left), *left).cmp(&(graph.offset(right), *right))).cloned();
     let mut params = owned.iter().filter(|node| matches!(graph.kind(node),
         "ParmVarDecl" | "parameter" | "arg")).cloned().collect::<Vec<_>>();
     params.sort_by_key(|node| graph.offset(node));
@@ -533,8 +545,9 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         // Recover it here so every finite loop has a native CFG exit. Return
         // statements and other terminal fragments are handled by the same
         // empty-successor closure below.
-        let controls = owned.iter().filter(|node| matches!(graph.kind(node),
+        let mut controls = owned.iter().filter(|node| matches!(graph.kind(node),
             "IfStmt" | "ForStmt" | "WhileStmt" | "DoStmt")).cloned().collect::<Vec<_>>();
+        controls.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
         for control in controls {
             let condition = graph.role_children(&control, "CONDITION")
                 .and_then(|items| items.first()).cloned();
@@ -1062,12 +1075,13 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         values.sort_by_key(|node| graph.offset(node));
         values
     };
-    for node in &cfg_node_set {
-        if !prepared_nodes.contains(node) {
-            prepared_nodes.push(node.clone());
-        }
+    let mut extra_cfg_nodes: Vec<_> = cfg_node_set.iter().filter(|node| !prepared_nodes.contains(node))
+        .cloned().collect();
+    extra_cfg_nodes.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
+    for node in extra_cfg_nodes {
+        prepared_nodes.push(node);
     }
-    prepared_nodes.sort_by_key(|node| graph.offset(node));
+    prepared_nodes.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
     prepared_nodes.dedup();
     let prepared_set = prepared_nodes.iter().cloned().collect::<HashSet<_>>();
     operations.retain(|item| prepared_set.contains(&item.node));
@@ -1486,6 +1500,12 @@ pub(crate) fn semantic_request(
                 || function.successors.iter().all(|item| item.node != **node))
             .filter_map(|node| by_anchor.get(node).and_then(|ids| ids.last()).cloned())
             .collect();
+        // `by_anchor` is a hash map; canonicalize the resulting edge order so
+        // repeated native runs produce byte-identical binary sidecars.
+        edges.sort_by(|left, right| {
+            (&left.source, &left.target, &left.kind)
+                .cmp(&(&right.source, &right.target, &right.kind))
+        });
         let language = semantic_language(&id);
         Ok(lifetime_proto::NativeSemanticFunction {
             id, entry, exits, nodes, edges, language,

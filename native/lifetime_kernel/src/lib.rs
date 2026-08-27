@@ -76,76 +76,115 @@ fn compact_event_function(
     let full_entry = function.entry.clone();
     let full_exits = function.exits.clone();
     let full_edges = function.edges.clone();
-    let event_ids: HashSet<String> = function.nodes.iter()
-        .filter(|node| !node.event_kind.is_empty())
-        .map(|node| node.id.clone())
+    // Use dense node indices while projecting.  The old implementation
+    // rebuilt string-keyed adjacency and cloned IDs on every walk from every
+    // event.  A semantic function's node table is already fixed, so indices
+    // are a lossless and allocation-light representation for this phase.
+    let node_count = function.nodes.len();
+    let node_ids: Vec<String> = function.nodes.iter().map(|node| node.id.clone()).collect();
+    let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(node_count);
+    for (index, node) in function.nodes.iter().enumerate() {
+        by_id.insert(node.id.as_str(), index);
+    }
+    let event_indices: Vec<usize> = function.nodes.iter().enumerate()
+        .filter_map(|(index, node)| (!node.event_kind.is_empty()).then_some(index))
         .collect();
-    if event_ids.is_empty() { return None; }
-    function.nodes.retain(|node| event_ids.contains(&node.id));
-
-    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
-    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+    if event_indices.is_empty() { return None; }
+    let event_flags: HashSet<usize> = event_indices.iter().copied().collect();
+    let mut outgoing = vec![Vec::new(); node_count];
+    let mut incoming = vec![Vec::new(); node_count];
     for edge in full_edges {
-        outgoing.entry(edge.source.clone()).or_default().push(edge.target.clone());
-        incoming.entry(edge.target).or_default().push(edge.source);
+        let (Some(&source), Some(&target)) =
+            (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str()))
+        else { continue };
+        outgoing[source].push(target);
+        incoming[target].push(source);
     }
 
     // Walk through non-event anchors until the next event(s).  Each event is
     // expanded independently, so loops are bounded by the visited set and
     // branch arms remain separate in the projected graph.
-    let walk = |start: &str, graph: &HashMap<String, Vec<String>>| {
-        let mut pending = vec![start.to_owned()];
+    let walk = |start: usize, graph: &[Vec<usize>]| {
+        let mut pending = vec![start];
         let mut visited = HashSet::new();
         let mut found = HashSet::new();
         while let Some(current) = pending.pop() {
-            if !visited.insert(current.clone()) { continue; }
-            for target in graph.get(&current).into_iter().flatten() {
-                if event_ids.contains(target) {
-                    found.insert(target.clone());
+            if !visited.insert(current) { continue; }
+            for target in graph.get(current).into_iter().flatten() {
+                if event_flags.contains(target) {
+                    found.insert(*target);
                 } else {
-                    pending.push(target.clone());
+                    pending.push(*target);
                 }
             }
         }
         found
     };
 
-    let mut projected = Vec::new();
-    for source in &event_ids {
+    let mut projected: Vec<(usize, usize)> = Vec::new();
+    for &source in &event_indices {
         for target in walk(source, &outgoing) {
-            if source != &target {
-                projected.push(lifetime_proto::NativeSemanticEdge {
-                    source: source.clone(), target, kind: "normal".to_owned(),
-                });
+            if source != target {
+                projected.push((source, target));
             }
         }
     }
-    projected.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
-    projected.dedup_by(|left, right| left.source == right.source && left.target == right.target);
+    projected.sort_unstable();
+    projected.dedup();
 
-    let mut entry_events = if event_ids.contains(&full_entry) {
-        vec![full_entry]
-    } else {
-        walk(&full_entry, &outgoing).into_iter().collect()
-    };
-    entry_events.sort();
-    let mut exit_events = HashSet::new();
+    let entry_events: Vec<usize> = by_id.get(full_entry.as_str()).copied()
+        .map(|entry| if event_flags.contains(&entry) {
+            vec![entry]
+        } else {
+            walk(entry, &outgoing).into_iter().collect()
+        })
+        .unwrap_or_default();
+    let mut exit_events: HashSet<usize> = HashSet::new();
     for exit in &full_exits {
-        if event_ids.contains(exit) {
-            exit_events.insert(exit.clone());
+        let Some(&exit) = by_id.get(exit.as_str()) else { continue };
+        if event_flags.contains(&exit) {
+            exit_events.insert(exit);
         } else {
             exit_events.extend(walk(exit, &incoming));
         }
     }
     if exit_events.is_empty() {
-        let has_outgoing: HashSet<&str> = projected.iter()
-            .map(|edge| edge.source.as_str()).collect();
-        exit_events.extend(event_ids.iter()
-            .filter(|id| !has_outgoing.contains(id.as_str())).cloned());
+        let has_outgoing: HashSet<usize> = projected.iter()
+            .map(|(source, _)| *source).collect();
+        exit_events.extend(event_indices.iter().copied()
+            .filter(|index| !has_outgoing.contains(index)));
     }
 
     let entry = format!("native:{}:event-entry", function.id);
     let exit = format!("native:{}:event-exit", function.id);
+    let mut projected_edges: Vec<_> = projected.iter().map(|&(source, target)| {
+        lifetime_proto::NativeSemanticEdge {
+            source: node_ids[source].clone(),
+            target: node_ids[target].clone(),
+            kind: "normal".to_owned(),
+        }
+    }).collect();
+    projected_edges.reserve(entry_events.len() + exit_events.len());
+    for target in entry_events {
+        projected_edges.push(lifetime_proto::NativeSemanticEdge {
+            source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(),
+        });
+    }
+    for source in exit_events {
+        projected_edges.push(lifetime_proto::NativeSemanticEdge {
+            source: node_ids[source].clone(),
+            target: exit.clone(), kind: "normal".to_owned(),
+        });
+    }
+    projected_edges.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
+    projected_edges.dedup_by(|left, right| left.source == right.source && left.target == right.target);
+
+    drop(by_id);
+    let event_ids: HashSet<&str> = event_indices.iter()
+        .map(|&index| node_ids[index].as_str())
+        .collect();
+    function.nodes.retain(|node| event_ids.contains(node.id.as_str()));
+
     function.nodes.push(lifetime_proto::NativeSemanticNode {
         id: entry.clone(), function: function.id.clone(), event_kind: String::new(),
         object_root: String::new(), object_selectors: Vec::new(), generation: String::new(),
@@ -160,16 +199,7 @@ fn compact_event_function(
         is_null: false, access: String::new(), value_root: String::new(),
         value_selectors: Vec::new(),
     });
-    projected.extend(entry_events.into_iter().map(|target| lifetime_proto::NativeSemanticEdge {
-        source: entry.clone(), target, kind: "normal".to_owned(),
-    }));
-    let mut exit_events: Vec<_> = exit_events.into_iter().collect();
-    exit_events.sort();
-    projected.extend(exit_events.into_iter().map(|source| lifetime_proto::NativeSemanticEdge {
-        source, target: exit.clone(), kind: "normal".to_owned(),
-    }));
-    projected.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
-    function.edges = projected;
+    function.edges = projected_edges;
     function.entry = entry;
     function.exits = vec![exit];
     Some(function)
