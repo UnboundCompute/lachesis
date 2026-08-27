@@ -254,9 +254,14 @@ fn match_function(
         }
     }
 
+    let mut findings: Vec<_> = findings.into_values().collect();
+    findings.sort_by(|left, right| {
+        (&left.pattern, &left.node, left.line, left.has_line)
+            .cmp(&(&right.pattern, &right.node, right.line, right.has_line))
+    });
     lifetime_proto::NativeTemporalFunction {
         id: function.id.clone(),
-        findings: findings.into_values().collect(),
+        findings,
         transfers,
         widenings: 0,
         capped: transfers as usize >= MAX_STATES,
