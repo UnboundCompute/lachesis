@@ -38,13 +38,59 @@ impl ObjectKey {
 struct StateKey {
     node: usize,
     bindings: Vec<(u32, u32)>,
-    released: Vec<u32>,
-    origins: Vec<u32>,
-    nulls: Vec<u32>,
-    uninitialized: Vec<u32>,
-    pointer_arithmetic: Vec<u32>,
-    escaped: Vec<u32>,
-    realloc_lost: Vec<u32>,
+    released: MarkSet,
+    origins: MarkSet,
+    nulls: MarkSet,
+    uninitialized: MarkSet,
+    pointer_arithmetic: MarkSet,
+    escaped: MarkSet,
+    realloc_lost: MarkSet,
+}
+
+/// Dense local object-id set used by the matcher worklist. Object handles are
+/// assigned per function, so a bitset avoids sorting/deduplicating/cloning
+/// vectors of u32 on every CFG transfer while retaining deterministic hashing.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MarkSet(Vec<u64>);
+
+impl MarkSet {
+    fn empty(object_count: usize) -> Self {
+        Self(vec![0; object_count.div_ceil(64)])
+    }
+
+    #[inline]
+    fn contains(&self, value: u32) -> bool {
+        let word = (value / 64) as usize;
+        word < self.0.len() && self.0[word] & (1u64 << (value % 64)) != 0
+    }
+
+    #[inline]
+    fn insert(&mut self, value: u32) {
+        let word = (value / 64) as usize;
+        if let Some(bits) = self.0.get_mut(word) {
+            *bits |= 1u64 << (value % 64);
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, value: u32) {
+        let word = (value / 64) as usize;
+        if let Some(bits) = self.0.get_mut(word) {
+            *bits &= !(1u64 << (value % 64));
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(word, bits)| {
+            let mut bits = *bits;
+            std::iter::from_fn(move || {
+                if bits == 0 { return None; }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some((word as u32) * 64 + bit)
+            })
+        })
+    }
 }
 
 fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
@@ -59,11 +105,6 @@ fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
         value = target;
     }
     value
-}
-
-#[inline]
-fn contains_sorted(values: &[u32], value: u32) -> bool {
-    values.binary_search(&value).is_ok()
 }
 
 fn add_finding(
@@ -146,16 +187,11 @@ fn match_function(
         }
     }
 
+    let empty = MarkSet::empty(objects.len());
     let mut queue = VecDeque::from([(
         entry,
-        Vec::<(u32, u32)>::new(),
-        Vec::<u32>::new(),
-        Vec::<u32>::new(),
-        Vec::<u32>::new(),
-        Vec::<u32>::new(),
-        Vec::<u32>::new(),
-        Vec::<u32>::new(),
-        Vec::<u32>::new(),
+        Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
+        empty.clone(), empty.clone(), empty.clone(), empty,
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
@@ -171,20 +207,6 @@ fn match_function(
         transfers += 1;
         bindings.sort_unstable();
         bindings.dedup();
-        released.sort_unstable();
-        released.dedup();
-        origins.sort_unstable();
-        origins.dedup();
-        nulls.sort_unstable();
-        nulls.dedup();
-        uninitialized.sort_unstable();
-        uninitialized.dedup();
-        pointer_arithmetic.sort_unstable();
-        pointer_arithmetic.dedup();
-        escaped.sort_unstable();
-        escaped.dedup();
-        realloc_lost.sort_unstable();
-        realloc_lost.dedup();
         let state = StateKey {
             node: index, bindings: bindings.clone(), released: released.clone(), origins: origins.clone(),
             nulls: nulls.clone(), uninitialized: uninitialized.clone(),
@@ -206,63 +228,63 @@ fn match_function(
                 }
             },
             "ORIGIN" => if let Some(object) = object_id {
-                released.retain(|item| *item != object);
-                nulls.retain(|item| *item != object);
-                uninitialized.retain(|item| *item != object);
-                escaped.retain(|item| *item != object);
-                realloc_lost.retain(|item| *item != object);
-                if !contains_sorted(&origins, object) { origins.push(object); }
+                released.remove(object);
+                nulls.remove(object);
+                uninitialized.remove(object);
+                escaped.remove(object);
+                realloc_lost.remove(object);
+                origins.insert(object);
             },
             "RELEASE" => if let Some(object) = object_id {
                 // A release through a slot proven to contain null is a no-op.
                 // Keep this check before adding the object to the released set;
                 // otherwise a later valid release would be misclassified.
-                if !contains_sorted(&nulls, object) {
-                    if contains_sorted(&released, object) {
+                if !nulls.contains(object) {
+                    if released.contains(object) {
                         add_finding(&mut findings, &function.id, "double-free",
                                     &objects[object as usize], node);
                     }
-                    released.push(object);
+                    released.insert(object);
                 }
             },
             "INVALIDATE" => if let Some(object) = object_id {
-                released.push(object);
+                released.insert(object);
             },
             "REALLOC_FAILED" => if let Some(object) = object_id {
-                realloc_lost.push(object);
+                realloc_lost.insert(object);
             },
             "ESCAPE" => if let Some(object) = object_id {
-                escaped.push(object);
+                escaped.insert(object);
             },
             "LOST_FROM_SLOT" => if let Some(object) = object_id {
-                nulls.push(object);
-                realloc_lost.push(object);
+                nulls.insert(object);
+                realloc_lost.insert(object);
             },
             "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object_id {
-                if contains_sorted(&released, object) {
+                if released.contains(object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
                                 &objects[object as usize], node);
                 }
-                if contains_sorted(&nulls, object) {
+                if nulls.contains(object) {
                     add_finding(&mut findings, &function.id, "null-deref",
                                 &objects[object as usize], node);
                 }
-                if contains_sorted(&uninitialized, object) {
+                if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
                                 &objects[object as usize], node);
                 }
-                if contains_sorted(&pointer_arithmetic, object) {
+                if pointer_arithmetic.contains(object) {
                     add_finding(&mut findings, &function.id,
                                 "pointer-arithmetic-before-validation",
                                 &objects[object as usize], node);
                 }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
-                if contains_sorted(&released, object) {
+                if released.contains(object) {
                     add_finding(&mut findings, &function.id, "use.dangling",
                                 &objects[object as usize], node);
                 }
-                if contains_sorted(&uninitialized, object) {
+                if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
                                 &objects[object as usize], node);
                 }
@@ -272,31 +294,31 @@ fn match_function(
                 }
             },
             "WRITE_STORAGE_NULL" => if let Some(object) = object_id {
-                nulls.push(object);
+                nulls.insert(object);
             },
             "UNINITIALIZED" => if let Some(object) = object_id {
-                uninitialized.push(object);
+                uninitialized.insert(object);
             },
             "POINTER_ARITHMETIC" => if let Some(object) = object_id {
-                pointer_arithmetic.push(object);
+                pointer_arithmetic.insert(object);
             },
             _ => {}
         }
         if exits.contains(&index) {
-            for object in &realloc_lost {
-                if !contains_sorted(&released, *object)
-                    && !contains_sorted(&escaped, *object)
+            for object in realloc_lost.iter() {
+                if !released.contains(object)
+                    && !escaped.contains(object)
                 {
                     add_finding(&mut findings, &function.id,
-                                "realloc-failure-leak", &objects[*object as usize], node);
+                                "realloc-failure-leak", &objects[object as usize], node);
                 }
             }
-            for object in &origins {
-                if !contains_sorted(&released, *object)
-                    && !contains_sorted(&escaped, *object)
+            for object in origins.iter() {
+                if !released.contains(object)
+                    && !escaped.contains(object)
                 {
                     add_finding(&mut findings, &function.id, "leak",
-                                &objects[*object as usize], node);
+                                &objects[object as usize], node);
                 }
             }
         }
