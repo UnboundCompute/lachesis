@@ -35,20 +35,13 @@ pub(crate) fn map_path(path: impl AsRef<Path>) -> Result<Mmap, String> {
         .map_err(|error| format!("cannot map native graph substrate: {error}"))
 }
 
-fn scalar(node: &graph_proto::NodeRecord, key: &str) -> Option<String> {
+fn record_text<'a>(node: &'a graph_proto::NodeRecord, key: &str) -> Option<&'a str> {
     node.properties.iter().find_map(|field| {
         if field.key != key { return None; }
-        let value = field.value.as_ref()?.kind.as_ref()?;
-        Some(match value {
-            graph_proto::value::Kind::Text(value) => value.clone(),
-            graph_proto::value::Kind::Integer(value) => value.to_string(),
-            graph_proto::value::Kind::Real(value) => value.to_string(),
-            graph_proto::value::Kind::Boolean(value) => value.to_string(),
-            graph_proto::value::Kind::Binary(value) => String::from_utf8_lossy(value).into_owned(),
-            graph_proto::value::Kind::List(_) |
-            graph_proto::value::Kind::Object(_) |
-            graph_proto::value::Kind::NullValue(_) => return None,
-        })
+        match field.value.as_ref()?.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+            _ => None,
+        }
     })
 }
 
@@ -171,8 +164,8 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     Ok(payload)
 }
 
-fn owner(node: &graph_proto::NodeRecord) -> Option<String> {
-    scalar(node, "owner_function_id").or_else(|| scalar(node, "function_id"))
+fn owner_ref<'a>(node: &'a graph_proto::NodeRecord) -> Option<&'a str> {
+    record_text(node, "owner_function_id").or_else(|| record_text(node, "function_id"))
 }
 
 fn function_kind(kind: &str) -> bool {
@@ -230,17 +223,17 @@ fn sidecar_to_request_with_selection(
     let (owners, function_names, call_ids, edges_by_source, initializer_targets) = scan_lifetime_metadata(
         input, selected_ids, |item| {
             let item_id = item.id.clone();
-            let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+            let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
             let function = if function_kind(&syntax) {
                 Some(item.id.clone())
             } else {
-                owner(&item)
+                owner_ref(&item).map(str::to_owned)
             };
             let Some(function) = function else { return };
             if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
-            if matches!(syntax.as_str(), "ParmVarDecl" | "parameter" | "arg") {
+            if matches!(syntax, "ParmVarDecl" | "parameter" | "arg") {
                 entry.parameters.push(item.id.clone());
             }
             entry.nodes.push(node(&item, retain_owner));
@@ -581,10 +574,10 @@ fn scan_lifetime_metadata(
             b'N' => {
                 let item = graph_proto::NodeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph node frame: {error}"))?;
-                if let Some(function) = owner(&item) {
-                    owners.insert(item.id.clone(), function);
+                if let Some(function) = owner_ref(&item) {
+                    owners.insert(item.id.clone(), function.to_owned());
                 }
-                let syntax = scalar(&item, "syntax_kind").unwrap_or_else(|| item.kind.clone());
+                let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
                 if function_kind(&syntax) {
                     function_names.insert(item.id.clone(), item.label.clone());
                 }
