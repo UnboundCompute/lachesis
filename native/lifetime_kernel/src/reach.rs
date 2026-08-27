@@ -132,11 +132,7 @@ pub(crate) fn build(
     catalog: &atropos_proto::Request,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
     let mut functions = BTreeMap::new();
-    let mut called = BTreeSet::new();
     for function in &translation.functions {
-        for call in &function.calls {
-            called.insert(call.callee.clone());
-        }
         let key = if function.name.is_empty() { function.id.clone() } else { function.name.clone() };
         functions.entry(key).or_insert(function);
     }
@@ -152,7 +148,8 @@ pub(crate) fn build(
     let mut output = Vec::new();
     for root in roots {
         let Some(summary) = summary_map.get(&root) else { continue };
-        let is_source = !called.contains(&root);
+        let is_source = functions.get(&root).is_some_and(|function|
+            function.calls.iter().any(|call| call.is_source));
         for flow in &summary.sink_flows {
             let mut tokens = vec![lifetime_proto::NativeSkeletonToken {
                 kind: "enter".into(), function: root.clone(), depth: 0, ..Default::default()
