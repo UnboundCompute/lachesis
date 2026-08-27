@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from time import perf_counter
 
-from .native_translate import build_native_semantic_graph
-from .semantic_graph import match_graph
+from .native_translate import (
+    build_native_match_result, build_native_semantic_graph, native_match_leads,
+    native_semantic_sidecar_path,
+)
 
 
 _DEFAULT_LIFETIME_ENGINE = "rust"
@@ -35,7 +37,8 @@ def run_pass(store, lang="mixed", *, workers=None,
     semantic_graph = build_native_semantic_graph(store, lang=lang)
     if progress is not None:
         progress("native matching", perf_counter() - started)
-    leads = match_graph(semantic_graph)
+    match_result = build_native_match_result(native_semantic_sidecar_path(store))
+    leads = native_match_leads(match_result)
     finished = perf_counter()
     return {
         "F": None,

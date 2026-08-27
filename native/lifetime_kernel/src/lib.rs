@@ -42,6 +42,7 @@ mod property_effects;
 mod heap;
 mod summary;
 mod sidecar_project;
+mod semantic_match;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -1385,6 +1386,38 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
     match result {
         Ok(()) => 0,
         Err(error) => { eprintln!("native semantic path error: {error}"); 1 }
+    }
+}
+
+/// Match the compact native semantic sidecar and publish final temporal leads.
+/// The input and output are protobuf files; no graph or JSON representation is
+/// reconstructed by the Python boundary.
+#[no_mangle]
+pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
+    input_path: *const c_char, output_path: *const c_char,
+) -> i32 {
+    let result = (|| {
+        if input_path.is_null() || output_path.is_null() {
+            return Err("native semantic matcher path is null".to_owned());
+        }
+        let input = CStr::from_ptr(input_path).to_str()
+            .map_err(|error| format!("invalid semantic matcher input path: {error}"))?;
+        let output = CStr::from_ptr(output_path).to_str()
+            .map_err(|error| format!("invalid semantic matcher output path: {error}"))?;
+        let mapped = native_graph::map_path(input)?;
+        let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
+            .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
+        let matched = semantic_match::match_result(result).encode_to_vec();
+        let temporary = format!("{output}.tmp.{}", std::process::id());
+        fs::write(&temporary, matched)
+            .map_err(|error| format!("cannot write native match result: {error}"))?;
+        fs::rename(&temporary, output)
+            .map_err(|error| format!("cannot publish native match result: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => { eprintln!("native semantic matcher error: {error}"); 1 }
     }
 }
 

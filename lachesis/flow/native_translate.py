@@ -10,7 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from .native_lifetime import semantic_path
+from .native_lifetime import match_semantic_path, semantic_path
 from lachesis.core import lifetime_pb2
 from lachesis.nav.dataflow.substrate import (
     pass2_input_cache_path,
@@ -57,6 +57,61 @@ def native_semantic_sidecar_path(store) -> Path:
     if not base:
         raise RuntimeError("native Pass-3 requires a store-backed binary substrate")
     return Path(f"{base}.pass3.semantic.pb")
+
+
+def native_match_sidecar_path(semantic_path: str | os.PathLike[str]) -> Path:
+    """Return the binary cache for final Pass-3 matcher findings."""
+    return Path(f"{semantic_path}.match.pb")
+
+
+def build_native_match_result(semantic_path: str | os.PathLike[str]):
+    """Build or load the Rust-owned final matcher result."""
+    source = Path(semantic_path)
+    output = native_match_sidecar_path(source)
+    source_mtime = source.stat().st_mtime_ns
+    if not output.is_file() or output.stat().st_mtime_ns < source_mtime:
+        match_semantic_path(source, output)
+    try:
+        result = lifetime_pb2.NativeTemporalResult()
+        result.ParseFromString(output.read_bytes())
+    except (OSError, ValueError) as error:
+        raise RuntimeError("native Pass-3 matcher sidecar is invalid") from error
+    return result
+
+
+def native_match_leads(result) -> list[dict[str, Any]]:
+    """Project compact native findings into the public lead record shape."""
+    leads = []
+    for function in result.functions:
+        for finding in function.findings:
+            path = finding.path
+            rendered = path.root if path is not None else "unknown"
+            if path is not None and path.selectors:
+                rendered += "".join(path.selectors)
+            leads.append({
+                "pattern": finding.pattern,
+                "object": rendered,
+                "node": finding.node,
+                "entry": finding.function,
+                "line": finding.line if finding.has_line else None,
+                "is_source": True,
+                "guarded": False,
+                "value": rendered,
+                "var": rendered,
+                "at": finding.node,
+                "pattern_id": finding.pattern,
+                "evaluator": "typestate",
+                "source_reachable": True,
+                "source_influenced": True,
+                "witness": [finding.node],
+                "witness_complete": True,
+                "source_context": finding.function,
+                "source_function": finding.function,
+                "source_entry": finding.function,
+                "source_line": finding.line if finding.has_line else None,
+                "tier": 1,
+            })
+    return leads
 
 
 def _decode_native_semantic_result(result, lang):
