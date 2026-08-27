@@ -64,12 +64,22 @@ def native_match_sidecar_path(semantic_path: str | os.PathLike[str]) -> Path:
     return Path(f"{semantic_path}.match.pb")
 
 
+def _sidecar_stale(output: Path, *inputs: Path) -> bool:
+    """Return whether a derived binary sidecar must be regenerated."""
+    if not output.is_file():
+        return True
+    try:
+        output_mtime = output.stat().st_mtime_ns
+        return any(path.stat().st_mtime_ns > output_mtime for path in inputs)
+    except OSError:
+        return True
+
+
 def build_native_match_result(semantic_path: str | os.PathLike[str]):
     """Build or load the Rust-owned final matcher result."""
     source = Path(semantic_path)
     output = native_match_sidecar_path(source)
-    source_mtime = source.stat().st_mtime_ns
-    if not output.is_file() or output.stat().st_mtime_ns < source_mtime:
+    if _sidecar_stale(output, source):
         match_semantic_path(source, output)
     try:
         result = lifetime_pb2.NativeTemporalResult()
@@ -167,7 +177,7 @@ def build_native_semantic_graph(store, lang="c"):
     if not input_path.is_file():
         raise RuntimeError("native Pass-3 substrate sidecar is missing")
     output_path = native_semantic_sidecar_path(store)
-    if not output_path.is_file():
+    if _sidecar_stale(output_path, input_path):
         semantic_path(input_path, output_path)
     try:
         result = lifetime_pb2.NativeSemanticResult()
@@ -183,14 +193,15 @@ def ensure_native_semantic_sidecar(store):
     if not base or not pass2_input_cache_path(base).is_file():
         raise RuntimeError("native Pass-3 substrate sidecar is missing")
     output_path = native_semantic_sidecar_path(store)
-    if not output_path.is_file():
-        semantic_path(pass2_input_cache_path(base), output_path)
+    input_path = pass2_input_cache_path(base)
+    if _sidecar_stale(output_path, input_path):
+        semantic_path(input_path, output_path)
     events_path = Path(f"{output_path}.events.pb")
-    if not events_path.is_file():
+    if _sidecar_stale(events_path, input_path, output_path):
         # Regenerate through Rust so the event-only sibling is published atomically.
         temporary = Path(f"{output_path}.events-migrate.{os.getpid()}.pb")
         try:
-            semantic_path(pass2_input_cache_path(base), temporary)
+            semantic_path(input_path, temporary)
             generated = Path(f"{temporary}.events.pb")
             os.replace(generated, events_path)
         finally:
