@@ -1,9 +1,9 @@
 name: release
 
 # Tagging `vX.Y.Z` builds the platform wheels and the sdist, verifies each one from a
-# clean environment, and publishes them to PyPI through Trusted Publishing (OIDC — no
-# API token stored in the repo). The tag must match the pyproject version and have a
-# CHANGELOG entry, or the run stops before anything is built.
+# clean environment, and publishes them to PyPI with an API token stored as the
+# `PYPI_API_TOKEN` repository secret. The tag must match the pyproject version and have
+# a CHANGELOG entry, or the run stops before anything is built.
 
 on:
   push:
@@ -118,11 +118,6 @@ jobs:
     needs: [sdist, wheels]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment:
-      name: pypi
-      url: https://pypi.org/project/lachesis-cpg/
-    permissions:
-      id-token: write        # Trusted Publishing (OIDC); no stored API token
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -148,3 +143,5 @@ jobs:
           python -m twine check dist/*
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

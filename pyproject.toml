@@ -100,13 +100,20 @@ python_files = ["checks.py", "test_*.py"]
 # TypeScript compiler is vendored on the host before cibuildwheel runs.
 [tool.cibuildwheel]
 build = "cp311-*"
-skip = ["*-musllinux*", "pp*"]
+# 32-bit targets (win32, i686) are skipped: the kuzu and pyarrow runtime deps publish
+# 64-bit wheels only, so a 32-bit build has no way to install them from a clean env.
+skip = ["*-musllinux*", "pp*", "*-win32", "*_i686"]
 before-build = "python {project}/tools/stage_native.py --build"
 # A wheel that installs but whose native kernel cannot load is the exact regression
 # this gate exists to catch, so drive a real end-to-end scan from the installed wheel.
 test-command = "lachesis --version && lachesis doctor"
 
 [tool.cibuildwheel.linux]
+# The default manylinux2014 image predates the glibc 2.28 baseline that kuzu and
+# pyarrow build their wheels against, so the clean-env test install can only source
+# them by compiling from sdist (which fails). Build on manylinux_2_28 instead, where
+# both ship prebuilt x86_64 wheels.
+manylinux-x86_64-image = "manylinux_2_28"
 # manylinux containers ship no Rust toolchain; install it once per platform and put
 # cargo on PATH for the staging step. protoc is vendored through the Cargo build, so
 # no system protobuf compiler is required.
