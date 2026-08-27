@@ -46,6 +46,7 @@ fn sink_token(
     language: &str,
     catalog: &atropos_proto::Request,
     depth: u32,
+    guarded: bool,
     truncated: bool,
 ) -> lifetime_proto::NativeSkeletonToken {
     let (callee, argument) = sink_parts(&flow.sink).unwrap_or((flow.sink.as_str(), 0));
@@ -53,8 +54,8 @@ fn sink_token(
         kind: "sink".into(), family: family_for(callee, language, argument, catalog),
         object_root: flow.root.clone(), value: flow.value.clone(), node: flow.node.clone(),
         line: flow.line, has_line: flow.has_line, depth,
-        guarded: flow.guarded, tainted: flow.provenance != "const",
-        bound: if flow.guarded { "bounded".into() } else { "unbounded".into() },
+        guarded, tainted: flow.provenance != "const",
+        bound: if guarded { "bounded".into() } else { "unbounded".into() },
         callee: callee.into(), argument, has_argument: true, truncated,
         size_expression: flow.size_expression.clone(), destination: flow.destination.clone(),
         control: flow.control.clone(), guards: flow.guard_predicates.iter().map(|value|
@@ -71,16 +72,17 @@ fn expand(
     summaries: &HashMap<String, &lifetime_proto::NativeSummaryFunction>,
     catalog: &atropos_proto::Request,
     depth: u32,
+    guarded_acc: bool,
     chain: &BTreeSet<String>,
     tokens: &mut Vec<lifetime_proto::NativeSkeletonToken>,
 ) -> bool {
     let Some((sink_callee, sink_position)) = sink_parts(&flow.sink) else {
-        tokens.push(sink_token(flow, "", catalog, depth, true));
+        tokens.push(sink_token(flow, "", catalog, depth, guarded_acc || flow.guarded, true));
         return false;
     };
     if flow.via == "direct" {
         let language = functions.get(function).map(|item| item.language.as_str()).unwrap_or("");
-        tokens.push(sink_token(flow, language, catalog, depth, false));
+        tokens.push(sink_token(flow, language, catalog, depth, guarded_acc || flow.guarded, false));
         return true;
     }
     if !chain.contains(&flow.via) {
@@ -102,10 +104,13 @@ fn expand(
                             kind: "enter".into(), function: flow.via.clone(), depth: depth + 1,
                             ..Default::default()
                         });
-                        let mut next_chain = chain.clone();
-                        next_chain.insert(flow.via.clone());
-                        let complete = expand(&flow.via, subflow, functions, summaries, catalog,
-                                              depth + 1, &next_chain, tokens);
+                    let site_guarded = call.is_some_and(|call| !call.control.is_empty()
+                        || !call.guard_predicates.is_empty());
+                    let mut next_chain = chain.clone();
+                    next_chain.insert(flow.via.clone());
+                    let complete = expand(&flow.via, subflow, functions, summaries, catalog,
+                                              depth + 1, guarded_acc || flow.guarded || site_guarded,
+                                              &next_chain, tokens);
                         tokens.push(lifetime_proto::NativeSkeletonToken {
                             kind: "exit".into(), function: flow.via.clone(), depth: depth + 1,
                             ..Default::default()
@@ -118,7 +123,7 @@ fn expand(
     }
     let language = functions.get(function).map(|item| item.language.as_str()).unwrap_or("");
     let _ = (sink_callee, sink_position);
-    tokens.push(sink_token(flow, language, catalog, depth, true));
+    tokens.push(sink_token(flow, language, catalog, depth, guarded_acc || flow.guarded, true));
     false
 }
 
@@ -155,7 +160,7 @@ pub(crate) fn build(
                 kind: "enter".into(), function: root.clone(), depth: 0, ..Default::default()
             }];
             let complete = expand(&root, flow, &functions, &summary_map, catalog, 0,
-                                  &BTreeSet::from([root.clone()]), &mut tokens);
+                                  false, &BTreeSet::from([root.clone()]), &mut tokens);
             tokens.push(lifetime_proto::NativeSkeletonToken {
                 kind: "exit".into(), function: root.clone(), depth: 0, ..Default::default()
             });
