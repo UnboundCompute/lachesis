@@ -112,8 +112,9 @@ fn model_matches(
     argument_count: Option<usize>,
     receiver_type: Option<&str>,
 ) -> bool {
-    if !model.language.is_empty() && language != Some(model.language.as_str())
-        && !(language == Some("typescript") && model.language == "javascript") { return false; }
+    if !model.language.is_empty() && language != Some(model.language.as_str()) {
+        return false;
+    }
     if model.has_arity && argument_count.is_some_and(|count| count as i64 != model.arity) {
         return false;
     }
