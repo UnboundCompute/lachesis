@@ -7,7 +7,9 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
+use std::sync::OnceLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 mod graph {
@@ -15,6 +17,7 @@ mod graph {
 }
 
 const SHARD_FORMAT_VERSION: u32 = 2;
+static MACOS_SYSROOT: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct IdKey([u8; 20]);
@@ -100,6 +103,39 @@ fn linkage_name(linkage: CXLinkageKind) -> &'static str {
         CXLinkage_UniqueExternal => "unique-external",
         CXLinkage_NoLinkage => "none",
         _ => "invalid",
+    }
+}
+
+fn macos_sysroot() -> Option<&'static str> {
+    MACOS_SYSROOT
+        .get_or_init(|| {
+            if !cfg!(target_os = "macos") {
+                return None;
+            }
+            if let Some(value) = env::var_os("SDKROOT").filter(|value| !value.is_empty()) {
+                return value.into_string().ok();
+            }
+            let output = Command::new("xcrun")
+                .args(["--show-sdk-path"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let value = String::from_utf8(output.stdout).ok()?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .as_deref()
+}
+
+fn add_host_compiler_arguments(arguments: &mut Vec<String>) {
+    if arguments.iter().any(|argument| argument == "-isysroot" || argument.starts_with("-isysroot=")) {
+        return;
+    }
+    if let Some(sysroot) = macos_sysroot() {
+        arguments.push("-isysroot".to_owned());
+        arguments.push(sysroot.to_owned());
     }
 }
 
@@ -1498,8 +1534,9 @@ fn parse_unit(
     emitter: &mut Emitter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source_c = CString::new(unit.path.as_bytes())?;
-    let clang_args: Vec<CString> = unit
-        .arguments
+    let mut arguments = unit.arguments.clone();
+    add_host_compiler_arguments(&mut arguments);
+    let clang_args: Vec<CString> = arguments
         .iter()
         .map(|argument| CString::new(argument.as_str()))
         .collect::<Result<_, _>>()?;
