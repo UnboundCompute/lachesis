@@ -4,7 +4,7 @@
 //! graph into a compact, ordered skeleton.  The skeleton retains event order,
 //! control markers, guards, and graph edges; no source text or JSON is needed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::lifetime_proto;
 
@@ -31,78 +31,156 @@ fn function_map(
     result.functions.iter().map(|function| (function.id.as_str(), function)).collect()
 }
 
-fn tokens_for_function(
-    function: &lifetime_proto::NativeSemanticFunction,
-    depth: u32,
-) -> (Vec<lifetime_proto::NativeSkeletonToken>, BTreeSet<String>) {
-    let mut incoming: BTreeMap<&str, Vec<lifetime_proto::GuardProof>> = BTreeMap::new();
-    for edge in &function.edges {
-        if !edge.guards.is_empty() {
-            incoming.entry(edge.target.as_str()).or_default().extend(edge.guards.clone());
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct WalkState {
+    node: String,
+    stack: Vec<String>,
+}
+
+/// Render the same source-rooted composition boundary as the old Claus path.
+///
+/// The old renderer did not print every function in a call cone.  It followed
+/// a concrete summary flow, opening a callee at a call seam and closing it at
+/// the matching return continuation.  The native semantic sidecar carries
+/// those seams explicitly, so keep that discipline here instead of treating a
+/// region's function list as a linear order.  The walk is intentionally
+/// bounded by the finite `(node, call-stack)` state space; revisiting a state
+/// is a loop back-edge, not a second copy of the function.
+fn walk_region(
+    result: &lifetime_proto::NativeSemanticResult,
+    region: &lifetime_proto::NativeSourceRegion,
+) -> (Vec<lifetime_proto::NativeSkeletonToken>, Vec<lifetime_proto::NativeSemanticEdge>, bool) {
+    let functions = function_map(result);
+    let allowed: BTreeSet<&str> = region.functions.iter().map(String::as_str).collect();
+    let mut nodes = HashMap::new();
+    let mut adjacency: HashMap<&str, Vec<&lifetime_proto::NativeSemanticEdge>> = HashMap::new();
+    for function in &result.functions {
+        if !allowed.contains(function.id.as_str()) { continue; }
+        for node in &function.nodes {
+            nodes.insert(node.id.as_str(), node);
+        }
+        for edge in &function.edges {
+            adjacency.entry(edge.source.as_str()).or_default().push(edge);
         }
     }
-    let mut tokens = Vec::new();
-    let mut ids = BTreeSet::new();
-    tokens.push(lifetime_proto::NativeSkeletonToken {
-        kind: "enter".into(), function: function.id.clone(), depth, ..Default::default()
-    });
-    for node in &function.nodes {
-        if node.event_kind.is_empty() { continue; }
-        let guards = incoming.remove(node.id.as_str()).unwrap_or_default();
-        let mut unique = BTreeSet::new();
-        let guards: Vec<_> = guards.into_iter().filter(|guard| {
-            unique.insert((guard.kind.clone(), guard.value.clone()))
-        }).collect();
-        ids.insert(node.id.clone());
-        tokens.push(lifetime_proto::NativeSkeletonToken {
-            kind: if matches!(node.event_kind.as_str(), "BRANCH" | "MERGE" | "LOOP") {
-                "control".into()
-            } else { "event".into() },
-            function: function.id.clone(), node: node.id.clone(),
-            family: lifecycle_family(&node.event_kind, &function.language),
-            object_root: node.object_root.clone(), object_selectors: node.object_selectors.clone(),
-            line: node.line, has_line: node.has_line, depth,
-            guarded: !guards.is_empty(), guards,
-            source_reachable: node.source_reachable,
-            source_witness_nodes: node.source_witness_nodes.clone(),
-        });
+    for edge in &result.seams {
+        if allowed.contains(edge.callee.as_str()) ||
+           (nodes.contains_key(edge.source.as_str()) && nodes.contains_key(edge.target.as_str())) {
+            adjacency.entry(edge.source.as_str()).or_default().push(edge);
+        }
     }
-    tokens.push(lifetime_proto::NativeSkeletonToken {
-        kind: "exit".into(), function: function.id.clone(), depth, ..Default::default()
-    });
-    (tokens, ids)
+    for edges in adjacency.values_mut() {
+        edges.sort_by(|left, right| (&left.kind, &left.seam_kind, &left.target, &left.return_to)
+            .cmp(&(&right.kind, &right.seam_kind, &right.target, &right.return_to)));
+    }
+
+    let mut starts = Vec::new();
+    for id in &region.source_nodes {
+        if nodes.contains_key(id.as_str()) { starts.push(id.clone()); }
+    }
+    if starts.is_empty() {
+        if let Some(function) = functions.get(region.source_function.as_str()) {
+            if !function.entry.is_empty() && nodes.contains_key(function.entry.as_str()) {
+                starts.push(function.entry.clone());
+            } else if let Some(node) = function.nodes.first() {
+                starts.push(node.id.clone());
+            }
+        }
+    }
+    if starts.is_empty() { return (Vec::new(), Vec::new(), false); }
+
+    let mut queue = VecDeque::new();
+    let mut seen = BTreeSet::new();
+    for start in starts {
+        queue.push_back(WalkState { node: start, stack: Vec::new() });
+    }
+    let mut tokens = Vec::new();
+    let mut edges_used = Vec::new();
+    let mut complete = true;
+    while let Some(state) = queue.pop_front() {
+        if !seen.insert(state.clone()) { continue; }
+        let Some(node) = nodes.get(state.node.as_str()) else { complete = false; continue; };
+        let depth = state.stack.len() as u32;
+        let language = functions.get(node.function.as_str())
+            .map(|function| function.language.as_str())
+            .or_else(|| functions.get(region.source_function.as_str())
+                .map(|function| function.language.as_str()))
+            .unwrap_or_default();
+        let guards = adjacency.get(state.node.as_str()).into_iter().flatten()
+            .flat_map(|edge| edge.guards.iter().cloned())
+            .collect::<Vec<_>>();
+        if !node.event_kind.is_empty() {
+            tokens.push(lifetime_proto::NativeSkeletonToken {
+                kind: if matches!(node.event_kind.as_str(), "BRANCH" | "MERGE" | "LOOP") {
+                    "control".into()
+                } else { "event".into() },
+                function: node.function.clone(), node: node.id.clone(),
+                family: lifecycle_family(&node.event_kind, language),
+                object_root: node.object_root.clone(), object_selectors: node.object_selectors.clone(),
+                line: node.line, has_line: node.has_line, depth,
+                guarded: !guards.is_empty(), guards,
+                source_reachable: node.source_reachable,
+                source_witness_nodes: node.source_witness_nodes.clone(),
+            });
+        }
+        for edge in adjacency.get(state.node.as_str()).into_iter().flatten() {
+            if !edge.target.is_empty() && !nodes.contains_key(edge.target.as_str()) {
+                complete = false;
+                continue;
+            }
+            edges_used.push((*edge).clone());
+            let mut next_stack = state.stack.clone();
+            if edge.seam_kind == "call" {
+                let callee = edge.callee.as_str();
+                if !callee.is_empty() && allowed.contains(callee) {
+                    tokens.push(lifetime_proto::NativeSkeletonToken {
+                        kind: "enter".into(), function: callee.to_owned(),
+                        node: edge.target.clone(), depth: depth + 1, ..Default::default()
+                    });
+                    if !edge.return_to.is_empty() { next_stack.push(edge.return_to.clone()); }
+                }
+            } else if edge.seam_kind == "return" {
+                if let Some(expected) = next_stack.pop() {
+                    if !edge.target.is_empty() && expected != edge.target {
+                        complete = false;
+                        continue;
+                    }
+                    tokens.push(lifetime_proto::NativeSkeletonToken {
+                        kind: "exit".into(), function: node.function.clone(),
+                        node: node.id.clone(), depth, ..Default::default()
+                    });
+                } else {
+                    complete = false;
+                    continue;
+                }
+            }
+            queue.push_back(WalkState { node: edge.target.clone(), stack: next_stack });
+        }
+    }
+    (tokens, edges_used, complete && !seen.is_empty())
 }
 
 /// Build one cached skeleton per source/context region.
 pub(crate) fn build(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
-    let functions = function_map(result);
     let mut output = Vec::new();
     for region in &result.regions {
         let contexts = if region.contexts.is_empty() {
             vec!["__entry__".to_owned()]
         } else { region.contexts.clone() };
         for context in contexts {
-            let mut tokens = Vec::new();
-            let mut included = BTreeSet::new();
-            let mut complete = true;
-            for (depth, id) in region.functions.iter().enumerate() {
-                let Some(function) = functions.get(id.as_str()) else {
-                    complete = false;
-                    continue;
-                };
-                let (mut part, ids) = tokens_for_function(function, depth as u32);
-                tokens.append(&mut part);
-                included.extend(ids);
+            let (mut tokens, edges, complete) = walk_region(result, region);
+            // The old typestate renderer always has explicit function
+            // boundaries.  A source-rooted path that contains no event at its
+            // entry still needs the boundary so a matcher can distinguish a
+            // local lifecycle stream from an empty/unresolved fragment.
+            if tokens.first().map(|token| token.kind.as_str()) != Some("enter") {
+                tokens.insert(0, lifetime_proto::NativeSkeletonToken {
+                    kind: "enter".into(), function: region.source_function.clone(),
+                    depth: 0, ..Default::default()
+                });
             }
-            let edges = result.functions.iter()
-                .filter(|function| region.functions.contains(&function.id))
-                .flat_map(|function| function.edges.iter())
-                .chain(result.seams.iter())
-                .filter(|edge| included.contains(&edge.source) && included.contains(&edge.target))
-                .cloned()
-                .collect();
             output.push(lifetime_proto::NativeFlowSkeleton {
                 kind: "source-rooted".into(),
                 entry: region.source_function.clone(),
