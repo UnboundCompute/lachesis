@@ -93,6 +93,16 @@ fn stable_id_parts(kind: &str, parts: &[String]) -> String {
     format!("v2:frontend:clang-c:{kind}:{}", &hex[..20])
 }
 
+fn linkage_name(linkage: CXLinkageKind) -> &'static str {
+    match linkage {
+        CXLinkage_Internal => "internal",
+        CXLinkage_External => "external",
+        CXLinkage_UniqueExternal => "unique-external",
+        CXLinkage_NoLinkage => "none",
+        _ => "invalid",
+    }
+}
+
 unsafe fn cx_string(value: CXString) -> String {
     let pointer = clang_getCString(value);
     let result = if pointer.is_null() {
@@ -530,10 +540,12 @@ unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opti
             &mut probe as *mut ReferenceProbe as *mut c_void,
         );
     }
-    let referenced = if clang_is_null(direct) == 0 {
-        direct
+    let Some(referenced) = (if clang_is_null(direct) == 0 {
+        Some(direct)
     } else {
-        probe.cursor.unwrap_or_default()
+        probe.cursor
+    }) else {
+        return None;
     };
     if clang_is_null(referenced) != 0 {
         return None;
@@ -564,10 +576,12 @@ unsafe fn referenced_target_id(cursor: CXCursor, emitter: &mut Emitter) -> Optio
             &mut probe as *mut ReferenceProbe as *mut c_void,
         );
     }
-    let referenced = if clang_is_null(direct) == 0 {
-        direct
+    let Some(referenced) = (if clang_is_null(direct) == 0 {
+        Some(direct)
     } else {
-        probe.cursor.unwrap_or_default()
+        probe.cursor
+    }) else {
+        return None;
     };
     if clang_is_null(referenced) != 0 {
         return None;
@@ -729,6 +743,14 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             kind: Some(graph::value::Kind::Boolean(!has_definition)),
         }));
         properties.push(field("form", text("function")));
+        // Keep linkage on every function entity, including internal/static
+        // functions.  Export status is a separate graph relationship; using
+        // it as the function identity would make compiler-visible helpers
+        // disappear from downstream resolution.
+        properties.push(field(
+            "linkage",
+            text(linkage_name(clang_getCursorLinkage(cursor))),
+        ));
     }
     let mut call_target = None;
     if syntax_kind == "CallExpr" {
@@ -737,8 +759,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         if clang_is_null(direct) != 0 {
             clang_visitChildren(cursor, collect_callee_reference, &mut probe as *mut ReferenceProbe as *mut c_void);
         }
-        let referenced = if clang_is_null(direct) == 0 { direct } else { probe.cursor.unwrap_or_default() };
-        if clang_is_null(referenced) == 0 {
+        let referenced = if clang_is_null(direct) == 0 { Some(direct) } else { probe.cursor };
+        if let Some(referenced) = referenced.filter(|referenced| clang_is_null(*referenced) == 0) {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
             let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
