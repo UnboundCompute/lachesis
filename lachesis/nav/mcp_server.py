@@ -1099,6 +1099,17 @@ def _capability_blocked(name, reason, prerequisite):
             "reason": reason, "prerequisite": prerequisite}
 
 
+def _semantic_payload(semantic):
+    """Decode the semantic sidecar only for an explicit graph/report query."""
+    if not isinstance(semantic, dict):
+        return semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+    path = semantic.get("native_sidecar")
+    if not path:
+        return semantic
+    from lachesis.flow.native_translate import load_native_semantic_graph_sidecar
+    return load_native_semantic_graph_sidecar(path).to_dict()
+
+
 def _semantic_lifecycle_report(c, args):
     """Expose Pass 3 lifecycle evidence without introducing a second matcher."""
     bundle = c.flow_bundle
@@ -1106,7 +1117,7 @@ def _semantic_lifecycle_report(c, args):
     if semantic is None:
         return _capability_blocked("object_lifecycle", "no semantic graph was produced",
                                    "Pass 3 semantic graph")
-    payload = semantic.to_dict()
+    payload = _semantic_payload(semantic)
     raw_nodes = payload.get("nodes") or {}
     nodes = ([{"id": node_id, **(node or {})} for node_id, node in raw_nodes.items()]
              if isinstance(raw_nodes, dict) else list(raw_nodes))
@@ -1729,7 +1740,7 @@ def call_tool(name, args, format=None):
     if name == "flow_pass":
         bundle = c.flow_bundle
         semantic = bundle.get("semantic_graph")
-        payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        payload = _semantic_payload(semantic)
         rows = [Lead.from_dict(lead) for lead in (bundle.get("leads") or ())]
         function = args.get("function")
         if function:
@@ -1783,7 +1794,7 @@ def call_tool(name, args, format=None):
     if name == "flow_skeleton":
         bundle = c.flow_bundle
         semantic = bundle.get("semantic_graph")
-        payload = semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+        payload = _semantic_payload(semantic)
         fn = args.get("function")
         leads = [Lead.from_dict(lead) for lead in bundle.get("leads") or ()
                  if not fn or lead.get("entry") == fn]
