@@ -32,6 +32,10 @@ class APBuilder:
 
     def __init__(self, sub):
         self.sub = sub                      # Substrate (substrate.py) — provides kind/label/ast/refers
+        # The AST is immutable for a substrate session. Pass 3 requests the same
+        # paths repeatedly across assignment, dereference, and seam extraction, so
+        # cache top-level builds instead of walking the same expression each time.
+        self._build_cache = {}
 
     # -- helpers --------------------------------------------------------------
     def _children(self, nid) -> List:
@@ -83,11 +87,20 @@ class APBuilder:
     # -- recursion ------------------------------------------------------------
     def build(self, nid, depth=0) -> Optional[Tuple[Tuple, List[Elem]]]:
         """Returns (base_key, normalized Elements) or None. Elements in FINAL order."""
+        if depth == 0:
+            cached = self._build_cache.get(nid)
+            if cached is not None or nid in self._build_cache:
+                return cached
         base, rev = self._build_rev(nid, depth)
         if base is None:
+            if depth == 0:
+                self._build_cache[nid] = None
             return None
         rev.reverse()
-        return (base, normalize(rev))
+        result = (base, normalize(rev))
+        if depth == 0:
+            self._build_cache[nid] = result
+        return result
 
     def _build_rev(self, nid, depth) -> Tuple[Optional[Tuple], List[Elem]]:
         """Returns (base_key, path in REVERSED build order). Prepending == list.append here."""

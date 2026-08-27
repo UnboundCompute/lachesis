@@ -3,6 +3,7 @@
 # builds an sdist from what is on disk, so this is what carries the compiler into the
 # sdist and therefore into any wheel built from it.
 recursive-include lachesis/frontends/typescript/vendor *
+recursive-include lachesis/_native *
 
 include LICENSE
 include NOTICE

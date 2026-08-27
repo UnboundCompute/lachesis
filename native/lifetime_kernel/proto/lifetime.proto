@@ -1,0 +1,399 @@
+syntax = "proto3";
+
+package lachesis.lifetime;
+
+message Path {
+  string root = 1;
+  repeated string selectors = 2;
+}
+
+message Operation {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    ALLOC = 1;
+    CLOBBER = 2;
+    COPY = 3;
+    FREE = 4;
+    REALLOC = 5;
+    USE = 6;
+    SUMMARY = 7;
+  }
+  Kind kind = 1;
+  string node = 2;
+  Path target = 3;
+  Path source = 4;
+  string site = 5;
+  sint64 line = 6;
+  bool has_line = 7;
+  bool is_null = 8;
+  string access = 9;
+  repeated Alternative alternatives = 10;
+  string generation = 11;
+  string fresh_generation = 12;
+}
+
+message Alternative { repeated Operation effects = 1; }
+
+message Successors {
+  string node = 1;
+  repeated string targets = 2;
+}
+
+message Parameter {
+  string root = 1;
+  uint32 position = 2;
+}
+
+message Request {
+  repeated string nodes = 1;
+  repeated Successors successors = 2;
+  repeated Operation operations = 3;
+  repeated Parameter parameters = 4;
+}
+
+message ParamMeta { uint32 position = 1; repeated string selectors = 2; }
+message UnknownRootMeta { string root = 1; }
+message UnknownSlotMeta { string base = 1; string selector = 2; }
+message AllocationMeta {
+  Operation.Kind kind = 1;
+  string generation = 2;
+  string site = 3;
+  Path target = 4;
+}
+message PhiMeta { string tag = 1; string node = 2; uint64 index = 3; }
+message ObjectMeta {
+  oneof value {
+    ParamMeta param = 1;
+    UnknownRootMeta unknown_root = 2;
+    UnknownSlotMeta unknown_slot = 3;
+    AllocationMeta allocation = 4;
+    PhiMeta phi = 5;
+  }
+}
+message Object { string id = 1; ObjectMeta meta = 2; }
+message Binding { string root = 1; string object_id = 2; }
+message FactSet { string object_id = 1; repeated uint32 values = 2; }
+message Slot { string base = 1; string selector = 2; string object_id = 3; }
+message FreedPath { Path path = 1; string object_id = 2; }
+message ParamEffect { Operation.Kind kind = 1; uint32 position = 2; repeated string selectors = 3; }
+message ReturnEffect { uint32 position = 1; repeated string selectors = 2; }
+message Effect {
+  oneof value {
+    ParamEffect param = 1;
+    ReturnEffect return_value = 2;
+  }
+}
+message Snapshot {
+  repeated Binding env = 1;
+  repeated FactSet facts = 2;
+  repeated Slot slots = 3;
+  repeated Effect trace = 4;
+  repeated FreedPath freed_paths = 5;
+  repeated Object objects = 6;
+}
+message StateAt { string node = 1; repeated Snapshot states = 2; }
+message Finding {
+  string pattern = 1;
+  Path path = 2;
+  sint64 line = 3;
+  bool has_line = 4;
+  string node = 5;
+}
+message Result {
+  repeated StateAt point_states = 1;
+  repeated StateAt post_states = 2;
+  Snapshot exit_state = 3;
+  repeated Snapshot exit_states = 4;
+  uint64 transfers = 5;
+  uint64 widenings = 6;
+  bool capped = 7;
+  repeated Finding findings = 8;
+}
+
+// Raw, function-scoped graph input for the native preparation path. Python only
+// marshals records into these messages; CFG synthesis and operation extraction
+// happen in Rust. Properties intentionally use a small scalar union because the
+// lifetime preparer only needs syntax/ordering/type metadata.
+message ScalarProperty {
+  string key = 1;
+  oneof value {
+    string text = 2;
+    sint64 integer = 3;
+    bool boolean = 4;
+  }
+}
+
+message GraphNode {
+  string id = 1;
+  string kind = 2;
+  string label = 3;
+  repeated ScalarProperty properties = 4;
+}
+
+message GraphEdge {
+  string kind = 1;
+  string source = 2;
+  string target = 3;
+  string role = 4;
+  sint64 position = 5;
+  bool has_position = 6;
+}
+
+message FunctionArgument {
+  uint32 position = 1;
+  string node = 2;
+  string root = 3;
+  repeated string selectors = 4;
+  string expression = 5;
+  // Resolved declaration label for the path root.  This avoids reopening the
+  // graph substrate in Python merely to turn a root id into a user-facing path.
+  string root_name = 6;
+}
+
+message FunctionCall {
+  string node = 1;
+  string callee = 2;
+  string assigned = 3;
+  string receiver = 4;
+  sint64 line = 5;
+  bool has_line = 6;
+  bool is_alloc = 7;
+  bool is_release = 8;
+  bool is_realloc = 9;
+  bool is_source = 10;
+  bool is_aggregate_copy = 11;
+  repeated FunctionArgument arguments = 12;
+  string assigned_root = 13;
+  repeated string assigned_selectors = 14;
+  string assigned_name = 15;
+}
+
+message FunctionReturn {
+  string kind = 1;
+  string callee = 2;
+  string root = 3;
+  repeated string selectors = 4;
+  sint64 line = 5;
+  bool has_line = 6;
+  string root_name = 7;
+}
+
+message FunctionSummaryEffect {
+  Operation.Kind kind = 1;
+  uint32 position = 2;
+  repeated string selectors = 3;
+  bool is_return = 4;
+}
+
+message FunctionSummaryAlternative { repeated FunctionSummaryEffect effects = 1; }
+message FunctionSummary {
+  string callee = 1;
+  repeated FunctionSummaryAlternative alternatives = 2;
+}
+
+message FunctionInput {
+  string id = 1;
+  repeated GraphNode nodes = 2;
+  repeated GraphEdge edges = 3;
+  repeated string parameters = 4;
+  repeated FunctionCall calls = 5;
+  repeated FunctionSummary summaries = 6;
+  repeated FunctionReturn returns = 7;
+}
+
+message PrepareRequest { repeated FunctionInput functions = 1; }
+message PreparedFunction {
+  string id = 1;
+  repeated string nodes = 2;
+  repeated Successors successors = 3;
+  repeated Operation operations = 4;
+  repeated string parameters = 5;
+  // Native translation facts retained for the Rust-owned Pass-2 path.  Keeping
+  // the calls beside the prepared CFG avoids a second Kùzu walk in Python.
+  repeated FunctionCall calls = 6;
+  repeated FunctionReturn returns = 7;
+  repeated SemanticNodeMetadata metadata = 8;
+  repeated string loop_nodes = 9;
+}
+message PrepareResult { repeated PreparedFunction functions = 1; }
+message PreparedFunctionResult {
+  string id = 1;
+  Result result = 2;
+  PreparedFunction prepared = 3;
+}
+message PrepareSolveResult { repeated PreparedFunctionResult functions = 1; }
+
+// Compact translation-only result. Unlike PrepareResult this intentionally
+// carries no graph nodes, edges, CFG, or operation stream; Python only needs
+// the native call/return facts at this boundary.
+message TranslationFunction {
+  string id = 1;
+  repeated string parameters = 2;
+  repeated FunctionCall calls = 3;
+  repeated FunctionReturn returns = 4;
+  string name = 5;
+  string file = 6;
+  sint64 start_line = 7;
+  bool has_start_line = 8;
+  bool externally_visible = 9;
+  repeated string parameter_names = 10;
+  repeated RootMetadata roots = 11;
+}
+message RootMetadata {
+  string id = 1;
+  string label = 2;
+  string owner = 3;
+  string type = 4;
+}
+message TranslationResult { repeated TranslationFunction functions = 1; }
+
+message SemanticNodeMetadata {
+  string id = 1;
+  string label = 2;
+  string kind = 3;
+  string owner = 4;
+  string type = 5;
+  sint64 offset = 6;
+  bool has_offset = 7;
+}
+
+// Native Pass-2 source/coverage planning.  The planner consumes the compact
+// translation facts directly; it does not reopen Kùzu or materialize Python F
+// records.  Catalog entries are data so the same engine works for every
+// frontend/language.
+message SourceCatalogEntry { string name = 1; string kind = 2; }
+message NativePlanRequest {
+  TranslationResult translation = 1;
+  repeated SourceCatalogEntry sources = 2;
+}
+message NativeSourceSite {
+  string function = 1;
+  string node = 2;
+  string callee = 3;
+  sint64 line = 4;
+  bool has_line = 5;
+  repeated string arguments = 6;
+  repeated string influenced_roots = 7;
+  string kind = 8;
+}
+message NativeSeamBinding {
+  string caller = 1;
+  string callee = 2;
+  string call_node = 3;
+  repeated string formal_to_actual = 4;
+  string return_to = 5;
+}
+message NativePlanFunction {
+  string name = 1;
+  repeated string callees = 2;
+  repeated string callers = 3;
+  repeated NativeSourceSite source_sites = 4;
+  repeated string launch_nodes = 5;
+  string launch_provenance = 6;
+  repeated string provenance = 7;
+  repeated string influenced_roots = 8;
+  bool reachable = 9;
+}
+message NativeCoverageRegion {
+  string target = 1;
+  repeated string sources = 2;
+  repeated string functions = 3;
+  repeated string state_keys = 4;   // flattened function,source pairs
+  repeated string context_keys = 5; // flattened function,source,context triples
+}
+message NativePlanResult {
+  repeated NativePlanFunction functions = 1;
+  repeated NativeSeamBinding bindings = 2;
+  repeated NativeCoverageRegion regions = 3;
+  repeated string covered_functions = 4;
+  repeated string uncovered_functions = 5;
+}
+
+// Compact interprocedural reach summaries. These are the summary fields used
+// by the semantic/Atropos reach matcher; lifetime typestate remains in the
+// native object solver and does not need to cross this boundary.
+message NativeSinkFlow {
+  string sink = 1;
+  string value = 2;
+  string root = 3;
+  string provenance = 4;
+  repeated string guards = 5;
+  bool guarded = 6;
+  bool site_guarded = 7;
+  string via = 8;
+}
+message NativeSinkParam {
+  string parameter = 1;
+  string sink = 2;
+  repeated string guards = 3;
+  bool guarded = 4;
+}
+message NativeSummaryFunction {
+  string name = 1;
+  repeated string parameters = 2;
+  repeated NativeSinkFlow sink_flows = 3;
+  repeated NativeSinkParam sink_params = 4;
+}
+message NativeSummaryResult { repeated NativeSummaryFunction functions = 1; }
+
+// Compact temporal output.  The full solver result contains point/post/exit
+// snapshots for semantic graph construction; callers that only need temporal
+// findings must not deserialize those graph-sized snapshots in Python.
+message NativeTemporalFinding {
+  string function = 1;
+  string pattern = 2;
+  Path path = 3;
+  sint64 line = 4;
+  bool has_line = 5;
+  string node = 6;
+}
+message NativeTemporalFunction {
+  string id = 1;
+  repeated NativeTemporalFinding findings = 2;
+  uint64 transfers = 3;
+  uint64 widenings = 4;
+  bool capped = 5;
+}
+message NativeTemporalResult {
+  repeated NativeTemporalFunction functions = 1;
+}
+
+// Compact event graph consumed by the query/matcher layer.  It carries only
+// semantic events and control-flow relations; AST/CPG nodes and abstract
+// solver snapshots stay native.
+message NativeSemanticNode {
+  string id = 1;
+  string function = 2;
+  string event_kind = 3;
+  string object_root = 4;
+  repeated string object_selectors = 5;
+  string generation = 6;
+  sint64 line = 7;
+  bool has_line = 8;
+  string anchor = 9;
+  bool stack_local = 10;
+  bool is_null = 11;
+  string access = 12;
+  // The source identity is required for native alias/derive propagation.  It
+  // stays in the binary sidecar so the matcher never reconstructs Python
+  // ObjectIds for copied values.
+  string value_root = 13;
+  repeated string value_selectors = 14;
+}
+message NativeSemanticEdge {
+  string source = 1;
+  string target = 2;
+  string kind = 3;
+}
+message NativeSemanticFunction {
+  string id = 1;
+  string entry = 2;
+  repeated string exits = 3;
+  repeated NativeSemanticNode nodes = 4;
+  repeated NativeSemanticEdge edges = 5;
+  string language = 6;
+}
+message NativeSemanticResult {
+  repeated NativeSemanticFunction functions = 1;
+  bool complete = 2;
+}

@@ -36,7 +36,7 @@ set the variable when tuning that bound for a particular runner.
 The bounded core-only path uses the same direct package command exposed in README:
 
 ```bash
-lachesis-analyze /path/to/project /tmp/project.kuzu \
+lachesis build /path/to/project /tmp/project.kuzu \
   --stream-shards /tmp/project-shards --prune
 ```
 
@@ -55,7 +55,7 @@ bundle to protobuf shards, and releases its snapshot before starting the next jo
 
 ```bash
 LACHESIS_TS_MAX_OLD_SPACE_MB=4096 \
-  lachesis-analyze /path/to/monorepo /tmp/project.kuzu \
+  lachesis build /path/to/monorepo /tmp/project.kuzu \
   --parallel-packages --shard-large-packages 100 \
   --stream-shards /tmp/project-shards --prune
 ```
@@ -74,6 +74,10 @@ or source revisions. Record those changes alongside the result.
 
 | Date | Revision | Workload | Build s | Enrichment s | Kùzu s | Nodes | Edges | Peak GiB | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
+| 2026-08-27 | working tree | Full libxml2 pruned streamed core, 10k edge batches | 27.66 | — | 15.06 | 406,952 | 656,691 | ~1.03 | Cold Apple Silicon run; C/Python/TypeScript frontends overlapped; tokens/proofs disabled; zero swaps. Nodes stayed at 2k batches, edges at 10k; exact sidecars and counts preserved. |
+| 2026-08-27 | `c834830` | Full libxml2 pruned streamed core | 28.73 | — | 15.80 | 406,952 | 656,691 | ~0.85 | Cold Apple Silicon run; C/Python/TypeScript frontends overlapped; tokens/proofs disabled; zero swaps. Node protobuf projection scans each repeated property list once; Pass-2 input, facts, and Pass-3 substrate sidecars emitted. |
+| 2026-08-26 | `3b87981` | Full libxml2, corrected streamed Pass-1, `--prune` | 250.29 | — | 67.62 | 979,768 | 2,065,566 | ~3.01 | Apple Silicon; 3 frontends serialized; tokens/proofs disabled; zero swaps. Includes one fewer AST traversal, cached macro spans, and cached frontend file metadata. Pass-2/Pass-3 sidecars emitted and freshly consumed by native Pass 2 in 14.44s (4.51GiB peak RSS). |
+| 2026-08-26 | `228f6f8` | Full libxml2, streamed Pass-1, `--prune` | 268.40 | — | 66.19 | 979,768 | 2,065,561 | ~3.17 | Apple Silicon; 3 frontends serialized; Pass-2/Pass-3 protobuf sidecars emitted; no swap. Sidecar publication was ~85.6s of the build. |
 | 2026-08-20 | `d841e61` | Linux `net` | 191* | — | — | 1,833,812 | 3,507,808 | 4.34* | Direct C frontend; full bundle validated. |
 | 2026-08-20 | `d841e61` | Linux `fs` | >421* | — | — | — | — | >4.77* | Safety-stopped before completion; next scale boundary. |
 | 2026-08-20 | `ad44b90` | Linux `net` CLI + `--enrich` | >160* | — | — | — | — | >5.30* | Frontend child exceeded safety cap before composition; pass 2 not measured. |
@@ -168,7 +172,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-21 | working tree | Linux `fs/netfs` CLI header-only edge scan | 2.00 | — | 1.06 | 13,185 | 24,719 | ~0.37* | Cold output directory; end-to-end 3.43s / 373 MiB max RSS. The first membership/export scan skips recursive edge-property decoding; full edge properties are still decoded once for Kùzu load, with exact store counts. |
 | 2026-08-21 | working tree | Linux `fs/netfs` streamed Kùzu with experimental 25k-row batches | 6.11 | — | 1.15 | 13,185 | 24,719 | not sampled | Fresh disposable Python 3.11/Kùzu env, 1 GiB pool, tokens/proofs disabled, `LACHESIS_STREAM_BATCH_ROWS=25_000`. Small fixture phases improved from 1.23s to 1.15s, but USB confirmation regressed to 59.67s, so the production default remains the measured 10k. |
 | 2026-08-21 | working tree | Linux `fs/netfs` cold streamed core with disposable Python 3.11/Kùzu env | 15.17 | — | included | 13,185 | 24,719 | ~1.69* | 27 files / 10,293 LOC; direct CLI, 1 GiB Kùzu pool, tokens/proofs disabled. Store published and reopened with `streamed=true`, `enriched=false`, and exact manifest counts. Peak RSS 1,810,612,224 bytes. |
-| 2026-08-21 | `5cb1071` | GitHub Action build-step simulation, `--prune --incremental` | 6.80 | — | included | 13,185 | 24,719 | ~0.48* | Linux `fs/netfs`; disposable Python 3.11 env, Action-equivalent 1 GiB Kùzu ceiling, direct `lachesis-analyze` invocation. Cold store published with exact counts; peak RSS 510,869,504 bytes. SARIF export was not run in this timing row. |
+| 2026-08-21 | `5cb1071` | GitHub Action build-step simulation, `--prune --incremental` | 6.80 | — | included | 13,185 | 24,719 | ~0.48* | Linux `fs/netfs`; disposable Python 3.11 env, Action-equivalent 1 GiB Kùzu ceiling, direct `lachesis build` invocation. Cold store published with exact counts; peak RSS 510,869,504 bytes. SARIF export was not run in this timing row. |
 | 2026-08-21 | `4bffec4` | GitHub Action SARIF export simulation | 12.3 | — | included | 13,185 | 24,719 | not sampled | Linux `fs/netfs`; same disposable compatible env and build flags. SARIF export completed with 0 findings; nested query used the current interpreter rather than host `python3`, fixing mixed-runtime protobuf failures. |
 | 2026-08-21 | working tree | Linux `drivers/usb` CLI with prune defaults + bundle-to-shard streaming | >180* | — | stopped | — | — | ~3.11* | 790 files / 582,731 LOC; C pass completed, but Kùzu publication did not finish before the 180s safety cap. The exact temp graph/shards were removed; no graph result is claimed. |
 

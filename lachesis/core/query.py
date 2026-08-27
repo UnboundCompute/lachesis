@@ -68,7 +68,10 @@ class GraphIndex:
         self._buckets["outgoing"][edge["source"]].append(edge)
         self._buckets["incoming"][edge["target"]].append(edge)
 
-    def absorb(self, nodes: Iterable[dict], edges: Iterable[dict]) -> None:
+    def absorb(
+        self, nodes: Iterable[dict], edges: Iterable[dict], *,
+        assume_fresh: bool = False,
+    ) -> None:
         """Take in the facts one overlay added, so this index keeps describing the fold.
 
         Every overlay in a registry fold used to build its own index over a graph that
@@ -91,7 +94,7 @@ class GraphIndex:
         """
         touched: dict[str, set] = {name: set() for name in self._COLLECTIONS}
         for node in nodes:
-            if node["id"] in self.nodes:
+            if not assume_fresh and node["id"] in self.nodes:
                 continue
             self.nodes[node["id"]] = node
             self._file_node(node)

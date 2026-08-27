@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from . import taxonomy
 from .sink_obligation import sink_constructor
 from .unbounded_copy import MemoryCopyCapacity
+from .index_capacity import MemoryIndexCapacity
 from .lifecycle_obligation import constructors as lifecycle_constructors
 from .temporal_obligation import temporal_constructor
 
@@ -16,6 +17,7 @@ from .temporal_obligation import temporal_constructor
 # -- that comes entirely from `taxonomy.family_specs()`.
 _SPECIALIZED: dict[str, type] = {
     MemoryCopyCapacity.metadata["id"]: MemoryCopyCapacity,
+    MemoryIndexCapacity.metadata["id"]: MemoryIndexCapacity,
     **lifecycle_constructors(),
 }
 
@@ -56,9 +58,61 @@ class CandidateRegistry:
         if constructor not in self._specs:
             raise KeyError(f"unknown candidate constructor: {constructor}")
         if constructor not in self._results:
+            # Lifecycle constructors consume the compact semantic event sidecar
+            # only. Do not inflate the 113MB typed structural cache for a
+            # temporal query; structural families still materialize it lazily.
+            if self._specs[constructor].metadata.get("domain") != "lifecycle":
+                self._ensure_typed_structural()
+            self._ensure_native_semantic()
             impl = self._specs[constructor].implementation(self.graph, self.bind_summary)
             self._results[constructor] = impl.enumerate()
         return self._results[constructor]
+
+    def _ensure_typed_structural(self) -> None:
+        path = self.graph.pop("_typed_bind_cache_path", None)
+        if not path:
+            return
+        from .. import bind_cache
+
+        document = bind_cache._load_typed_graph(path)
+        stamped = document.get("stamped") or {}
+        self.graph["nodes"] = stamped.get("nodes", [])
+        self.graph["edges"] = stamped.get("edges", [])
+
+    def _ensure_native_semantic(self) -> None:
+        """Expand a native semantic sidecar once for all temporal constructors."""
+        semantic = self.graph.get("semantic_graph") or {}
+        if not isinstance(semantic, dict) or not semantic.get("native_sidecar"):
+            return
+        from ..nav.semantic_query import load_semantic_sidecar, load_event_sidecar
+
+        language = self.graph.get("language") or "mixed"
+        native = load_event_sidecar(
+            semantic["native_sidecar"], language)
+        if native is None:
+            native = load_semantic_sidecar(
+                semantic["native_sidecar"], language)
+        if native is None:
+            return
+        payload = native.to_dict()
+        materialized_nodes = dict(semantic.get("nodes") or {})
+        native_nodes = payload.get("nodes", {})
+        for node_id, node in native_nodes.items():
+            node_id = str(node_id)
+            if node_id in materialized_nodes:
+                node_id = f"c:{node_id}"
+                suffix = 2
+                while node_id in materialized_nodes:
+                    node_id = f"c:{node_id}:{suffix}"
+                    suffix += 1
+            node = dict(node)
+            metadata = dict(node.get("metadata") or {})
+            metadata.setdefault("language", language)
+            node["metadata"] = metadata
+            materialized_nodes[node_id] = node
+        materialized = {"nodes": materialized_nodes}
+        materialized["coverage"] = semantic.get("coverage") or native.coverage
+        self.graph["semantic_graph"] = materialized
 
     def selected(self, *, constructor: str | None = None,
                  domain: str | None = None, language: str | None = None) -> list[str]:

@@ -16,6 +16,10 @@ from . import graph_pb2
 
 FRAME = struct.Struct("!I")
 WIRE_FORMAT_VERSION = 2
+# Additive dataflow sidecars can be written while overlays run.  The legacy
+# DataflowOverlay protobuf remains readable; this framed variant avoids retaining
+# every derived record in a second protobuf message before writing it.
+DATAFLOW_STREAM_MAGIC = b"LACHESIS-DATAFLOW-STREAM\x00"
 
 
 def _varint(value: int) -> bytes:
@@ -139,12 +143,17 @@ def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
     return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
 
 
-def encode_node(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+def _node_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):
     message = graph_pb2.NodeRecord(
         id=str(record.get("id", "")), kind=str(record.get("kind", "")),
         label=str(record.get("label", "")), tier=str(record.get("tier", "")),
     )
     message.properties.extend(_properties(record.get("properties"), _property_cache))
+    return message
+
+
+def encode_node(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+    message = _node_message(record, _property_cache=_property_cache)
     return message.SerializeToString()
 
 
@@ -166,7 +175,7 @@ def decode_node(payload: bytes, *, properties: bool = True) -> dict[str, Any]:
     return record
 
 
-def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+def _edge_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):
     message = graph_pb2.EdgeRecord(
         kind=str(record.get("kind", "")), source=str(record.get("source", "")),
         target=str(record.get("target", "")),
@@ -174,6 +183,11 @@ def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = Non
         relationship_class=str(record.get("relationship_class", "")),
     )
     message.properties.extend(_properties(record.get("properties"), _property_cache))
+    return message
+
+
+def encode_edge(record: Mapping[str, Any], *, _property_cache: dict | None = None) -> bytes:
+    message = _edge_message(record, _property_cache=_property_cache)
     return message.SerializeToString()
 
 
@@ -198,10 +212,18 @@ def encode_overlay(payload: Mapping[str, Any]) -> bytes:
         source=str(payload.get("source", "")), version=int(payload.get("version", 1)),
         core_content_hash=str(payload.get("core_content_hash", "")),
     )
+    # Build child messages directly.  The old implementation serialized every
+    # record and parsed it back into the repeated field, doing two protobuf
+    # traversals and allocating a temporary bytes object per record.
+    property_cache = {}
     for node in payload.get("derived_nodes", []):
-        message.derived_nodes.add().ParseFromString(encode_node(node))
+        message.derived_nodes.add().CopyFrom(
+            _node_message(node, _property_cache=property_cache)
+        )
     for edge in payload.get("derived_edges", []):
-        message.derived_edges.add().ParseFromString(encode_edge(edge))
+        message.derived_edges.add().CopyFrom(
+            _edge_message(edge, _property_cache=property_cache)
+        )
     return message.SerializeToString()
 
 
@@ -214,6 +236,102 @@ def decode_overlay(payload: bytes) -> dict[str, Any]:
         "derived_nodes": [decode_node(item.SerializeToString()) for item in message.derived_nodes],
         "derived_edges": [decode_edge(item.SerializeToString()) for item in message.derived_edges],
     }
+
+
+def _overlay_header(payload: Mapping[str, Any]) -> bytes:
+    return graph_pb2.DataflowOverlay(
+        overlay_id=str(payload.get("overlay_id", "dataflow")),
+        source=str(payload.get("source", "")), version=int(payload.get("version", 1)),
+        core_content_hash=str(payload.get("core_content_hash", "")),
+    ).SerializeToString()
+
+
+def write_dataflow_stream_header(handle, payload: Mapping[str, Any]) -> None:
+    """Start a streaming additive dataflow sidecar."""
+    handle.write(DATAFLOW_STREAM_MAGIC)
+    write_frame(handle, _overlay_header(payload))
+
+
+def write_dataflow_stream_node(handle, node: Mapping[str, Any]) -> None:
+    write_frame(handle, b"N" + encode_node(node))
+
+
+def write_dataflow_stream_edge(handle, edge: Mapping[str, Any]) -> None:
+    write_frame(handle, b"E" + encode_edge(edge))
+
+
+def is_dataflow_stream(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(DATAFLOW_STREAM_MAGIC)) == DATAFLOW_STREAM_MAGIC
+    except OSError:
+        return False
+
+
+def read_dataflow_stream_header(path: Path) -> dict[str, Any]:
+    """Read only stream metadata for cheap cache validation."""
+    with path.open("rb") as handle:
+        if handle.read(len(DATAFLOW_STREAM_MAGIC)) != DATAFLOW_STREAM_MAGIC:
+            raise ValueError(f"not a dataflow stream: {path}")
+        header = handle.read(FRAME.size)
+        if len(header) != FRAME.size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        (size,) = FRAME.unpack(header)
+        payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        message = graph_pb2.DataflowOverlay()
+        message.ParseFromString(payload)
+        return {
+            "overlay_id": message.overlay_id, "source": message.source,
+            "version": message.version, "core_content_hash": message.core_content_hash,
+        }
+
+
+def read_dataflow_stream(path: Path) -> dict[str, Any]:
+    """Read a framed dataflow sidecar without requiring one giant input bytestring."""
+    with path.open("rb") as handle:
+        if handle.read(len(DATAFLOW_STREAM_MAGIC)) != DATAFLOW_STREAM_MAGIC:
+            raise ValueError(f"not a dataflow stream: {path}")
+        header = handle.read(FRAME.size)
+        if len(header) != FRAME.size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        (size,) = FRAME.unpack(header)
+        payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        message = graph_pb2.DataflowOverlay()
+        message.ParseFromString(payload)
+        result = {
+            "overlay_id": message.overlay_id, "source": message.source,
+            "version": message.version, "core_content_hash": message.core_content_hash,
+            "node_props": {}, "edge_props": {},
+            "derived_nodes": [], "derived_edges": [],
+        }
+        while True:
+            header = handle.read(FRAME.size)
+            if not header:
+                break
+            if len(header) != FRAME.size:
+                raise ValueError(f"truncated dataflow stream frame header: {path}")
+            (size,) = FRAME.unpack(header)
+            frame = handle.read(size)
+            if len(frame) != size or not frame:
+                raise ValueError(f"truncated dataflow stream frame: {path}")
+            kind, record = frame[:1], frame[1:]
+            if kind == b"N":
+                result["derived_nodes"].append(decode_node(record))
+            elif kind == b"E":
+                result["derived_edges"].append(decode_edge(record))
+            else:
+                raise ValueError(f"unknown dataflow stream record {kind!r}")
+    # The stream is written in deterministic overlay order.  Restore the same
+    # canonical view ordering used by the legacy monolithic sidecar on load.
+    result["derived_nodes"].sort(key=lambda node: node["id"])
+    result["derived_edges"].sort(key=lambda edge: (
+        edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
+    ))
+    return result
 
 
 def encode_tier(payload: Mapping[str, Any]) -> bytes:
@@ -328,8 +446,10 @@ def decode_document(payload: bytes) -> dict[str, Any]:
 def write_frame(handle, payload: bytes) -> None:
     if len(payload) >= 2**32:
         raise ValueError("graph protobuf record exceeds 4 GiB frame limit")
-    handle.write(FRAME.pack(len(payload)))
-    handle.write(payload)
+    # Keep the length prefix and payload in one buffered write.  Large Pass-1
+    # builds emit millions of frames; two Python file-method calls per frame
+    # add measurable interpreter overhead while producing identical bytes.
+    handle.write(FRAME.pack(len(payload)) + payload)
 
 
 def read_frames(path: Path) -> Iterator[bytes]:

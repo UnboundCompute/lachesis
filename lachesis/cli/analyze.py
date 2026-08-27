@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import os
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuz
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
-from lachesis.pipeline import (enrich_project_graph, run_project,
+from lachesis.pipeline import (run_project,
                                run_project_incremental, run_project_parallel,
                                run_project_streaming, run_project_streaming_parallel,
                                source_content_hash,
@@ -35,14 +36,20 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _run() -> None:
+def _run(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("source_dir")
     parser.add_argument(
         "output_path", nargs="?", default="graph_out/compiler_project.kuzu",
         help="Kùzu store directory to write (holds graph.kuzu plus the store "
-             "manifest). This is the graph: nav and lachesis-query both read it.",
+             "manifest). This is the graph: nav and `lachesis query` both read it.",
+    )
+    parser.add_argument(
+        "-o", "--output", dest="output_flag", metavar="PATH", default=None,
+        help="the same output path as the positional argument, spelled as a flag "
+             "so it matches `lachesis analyze -o`; a user who learned -o on one pass "
+             "should not be rejected on the other. If both are given, the flag wins.",
     )
     parser.add_argument(
         "--frontend-out", metavar="DIR", default=None,
@@ -59,12 +66,16 @@ def _run() -> None:
              "LLM-drillable view of the same canonical graph.",
     )
     parser.add_argument(
-        "--prune", action="store_true",
+        "--prune", action=argparse.BooleanOptionalAction, default=True,
         help="drop the pure-lexical `token` and `source-span` nodes (and the edges "
              "that touch them) from the store. Every navigation tool answers "
              "identically without them (source excerpts are read from the file by "
-             "offset), so this is lossless for nav and roughly halves the store — but "
-             "it does drop real T0 graph content, so it is off by default.",
+             "offset), so this is lossless for nav and roughly halves the store — and "
+             "it also spares the frontend the token/proof passes that produced them "
+             "(for C, a whole extra clang parse of every file). ON by default so a "
+             "normal build is lean and fast without any flag; pass --no-prune to keep "
+             "the full T0 lexical content, which only matters when literal value nodes "
+             "must be observable (e.g. maximum guard-rank fidelity).",
     )
     parser.add_argument(
         "--enrich", action="store_true",
@@ -123,7 +134,9 @@ def _run() -> None:
         "--stream-shards", metavar="DIR", default=None,
         help="stream core-only frontend shards directly into Kùzu",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.output_flag is not None:
+        args.output_path = args.output_flag
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
             "incremental manifest keys bundles by frontend, not by package")
@@ -133,6 +146,10 @@ def _run() -> None:
         parser.error("--stream-shards currently supports core-only stores")
     if args.stream_shards and args.incremental:
         parser.error("--stream-shards cannot combine with incremental builds")
+    if args.enrich:
+        parser.error("build-time enrichment was removed; run `lachesis enrich` after build")
+    if args.reduced or args.layered_out:
+        parser.error("--reduced/--layered-out are not available in the native-only build path")
     if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
         parser.error("streamed package shards are serialized; use --max-workers 1")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
@@ -172,7 +189,7 @@ def _run() -> None:
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
-    enrich = args.enrich or bool(args.layered_out) or args.reduced
+    enrich = False
     # --prune deletes the pure-lexical nodes on the way into the store, so asking a
     # frontend for them is work whose entire output is discarded a step later. Telling
     # the frontends up front turns that into work not done: for C the token stream costs
@@ -181,7 +198,31 @@ def _run() -> None:
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
-    compile_enrich = enrich and not args.reduced
+    compile_enrich = False
+
+    # Core-only builds do not need a materialized Python graph. Keep frontend
+    # records in binary shards and stream them directly into Kùzu to bound RSS.
+    if (
+        not compile_enrich
+        and not args.reduced
+        and not args.incremental
+        and not args.parallel_packages
+        and not args.layered_out
+    ):
+        with tempfile.TemporaryDirectory(prefix="lachesis-stream-") as stream_root:
+            frontend_out = args.frontend_out or os.path.join(stream_root, "frontends")
+            readers, snapshots = run_project_streaming(
+                args.source_dir, stream_root, frontend_out,
+                timeout_seconds=args.timeout,
+            )
+            stored = write_kuzu_shards(
+                CompositeShardReader(readers), args.output_path, snapshots,
+                prune=args.prune,
+            )
+        print(f"Streamed {len(snapshots)} frontends into {stored}")
+        print("Tier: core-only (nav rebuilds the dataflow tier on first use)")
+        return
+
     frontend_out = args.frontend_out
     if frontend_out is None and (args.parallel_packages or args.incremental):
         # These two keep state on disk by construction: the parallel path gives every
@@ -260,16 +301,24 @@ def _run() -> None:
     print("Node kinds: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    # stdout is block-buffered when piped to a file, so a long build that is killed (or a
+    # `| tee log` capture) loses every line it "printed". Line-buffer so progress reaches
+    # the file as it happens and a kill never swallows the tail. Guarded: some wrapped
+    # streams predate `.reconfigure`.
     try:
-        _run()
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        _run(argv)
     except KeyboardInterrupt:
-        print("lachesis-analyze: interrupted", file=sys.stderr)
+        print("lachesis build: interrupted", file=sys.stderr)
         return 130
     except Exception as error:  # noqa: BLE001 - CLI converts build errors to guidance
         if os.environ.get("LACHESIS_TRACEBACK"):
             raise
-        print(f"lachesis-analyze: {error}", file=sys.stderr)
+        print(f"lachesis build: {error}", file=sys.stderr)
         print("set LACHESIS_TRACEBACK=1 for the full traceback", file=sys.stderr)
         return 2
     return 0

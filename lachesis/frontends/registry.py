@@ -91,18 +91,30 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
 
 def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     root = _workspace_root(workspace_root)
+    packaged_binary = root / "lachesis" / "_native" / "lachesis-clang-frontend"
+    native_binary = next(
+        (
+            candidate
+            for candidate in (
+                packaged_binary,
+                root / "native" / "clang_frontend" / "target" / "release"
+                / "lachesis-clang-frontend",
+                root / "native" / "clang_frontend" / "target" / "debug"
+                / "lachesis-clang-frontend",
+            )
+            if candidate.is_file()
+        ),
+        # Keep registry construction usable for non-C projects. If a C project
+        # is selected without a native frontend, run_frontend reports the
+        # missing executable instead of silently entering the legacy JSON path.
+        packaged_binary,
+    )
+    command = (str(native_binary), "{source_dir}", "{output_dir}")
     return FrontendSpec(
         frontend_id="clang-c",
         languages=("c",),
-        extensions=(".c", ".h"),
-        command=(
-            # sys.executable, not "python3": whatever "python3" resolves to on the
-            # analyst's PATH may be older than pyproject.toml requires, and a
-            # frontend run on the wrong interpreter fails in ways that read as a
-            # bug in the source it was pointed at.
-            sys.executable, str(root / "lachesis" / "frontends" / "c" / "build_graph.py"),
-            "{source_dir}", "{output_dir}",
-        ),
+        extensions=(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"),
+        command=command,
         working_directory=str(root),
         priority=20,
     )

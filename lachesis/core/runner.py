@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
+import time
 from typing import Callable, Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from . import graph_pb2
-from .graph_wire import decode_node, iter_tier_records
+from .graph_wire import WIRE_FORMAT_VERSION, decode_node, iter_tier_records
 from .shards import ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
 
@@ -77,6 +80,36 @@ def _stream_bundle_to_shard(
     """Persist a protobuf bundle record-by-record, without loading its tier arrays."""
     manifest = load_manifest(output_dir)
     frontend_id = manifest.get("frontend_id") or manifest.get("generator")
+    # The native Clang frontend emits the same framed protobuf shard that this
+    # bridge is meant to produce. When no ownership filter is needed, publish the
+    # files directly; decoding and re-encoding every record here is pure Python
+    # overhead and can dominate a large binary frontend's handoff.
+    raw_shard = Path(output_dir) / "shard-0"
+    raw_manifest_path = raw_shard / "manifest.pb"
+    if keep_node is None and frontend_id == "clang-c" and raw_manifest_path.is_file():
+        raw_manifest = graph_pb2.ShardManifest()
+        raw_manifest.ParseFromString(raw_manifest_path.read_bytes())
+        if (
+            raw_manifest.format_version == WIRE_FORMAT_VERSION
+            and raw_manifest.nodes_file == "nodes.pb"
+            and raw_manifest.edges_file == "edges.pb"
+        ):
+            shard_set = ShardSetWriter(os.path.join(root, frontend_id), frontend_id=frontend_id)
+            shard_set.complete_payloads(
+                str(raw_manifest.shard_id),
+                raw_shard / raw_manifest.nodes_file,
+                raw_shard / raw_manifest.edges_file,
+                raw_manifest.node_count, raw_manifest.edge_count,
+            )
+            return FrontendSnapshot(
+                frontend_id=frontend_id,
+                contract_version=manifest.get("frontend_contract_version", manifest.get("version")),
+                languages=tuple(manifest.get("languages", ())),
+                capabilities=dict(manifest.get("capabilities", {})),
+                manifest=manifest, nodes=[], edges=[], stdout=stdout, stderr=stderr,
+                released=True, _released_node_count=raw_manifest.node_count,
+                _released_edge_count=raw_manifest.edge_count,
+            )
     directory = os.path.join(root, frontend_id)
     shard_set = ShardSetWriter(directory, frontend_id=frontend_id)
     shard_id = manifest.get("source_content_hash", "0")
@@ -143,7 +176,7 @@ def _in_process_applies(
     An empty ``environment`` matters because a spec that sets variables for its child
     is saying something about how that child must run, and this process is not it.
     Roots need no such condition: they go down as an argument rather than through
-    ``LACHESIS_ROOTS_FILE``, so both routes compile the same set without this process
+    binary ``LACHESIS_ROOTS_FILE``, so both routes compile the same set without this process
     having to mutate its own environment to say so.
 
     ``LACHESIS_INPROCESS=0`` forces the child unconditionally, so a difference
@@ -165,11 +198,23 @@ def run_frontend(
     roots: Optional[Sequence[str]] = None,
     keep_node: Optional[Callable[[dict], bool]] = None,
 ) -> FrontendSnapshot:
+    started = time.perf_counter()
+
+    def report(snapshot: FrontendSnapshot) -> FrontendSnapshot:
+        if os.environ.get("LACHESIS_TIMINGS") == "1":
+            print(
+                "[lachesis timing] frontend %s: %.3fs (%d nodes, %d edges)"
+                % (frontend.frontend_id, time.perf_counter() - started,
+                   len(snapshot.nodes), len(snapshot.edges)),
+                file=sys.stderr, flush=True,
+            )
+        return snapshot
+
     if _in_process_applies(frontend, output_dir):
         snapshot = frontend.in_process(source_dir, roots)
         _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"),
                        keep_node=keep_node)
-        return snapshot
+        return report(snapshot)
     temporary = None
     if output_dir is None:
         temporary = tempfile.TemporaryDirectory(prefix="lachesis-frontend-")
@@ -181,9 +226,13 @@ def run_frontend(
     # write it beside the output and point the frontend at it so a frontend that
     # re-walks the tree compiles exactly this list — one discovery, no drift.
     if roots is not None:
-        roots_file = os.path.join(output_dir, "lachesis-roots.txt")
-        with open(roots_file, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(roots))
+        roots_file = os.path.join(output_dir, "lachesis-roots.pb")
+        roots_message = graph_pb2.FrontendRoots(
+            format_version=WIRE_FORMAT_VERSION,
+            paths=[str(path) for path in roots],
+        )
+        with open(roots_file, "wb") as handle:
+            handle.write(roots_message.SerializeToString())
         environment["LACHESIS_ROOTS_FILE"] = roots_file
     command = frontend.render_command(source_dir, output_dir)
     try:
@@ -206,7 +255,7 @@ def run_frontend(
             )
         else:
             snapshot = load_snapshot(output_dir, completed.stdout, completed.stderr)
-        return snapshot
+        return report(snapshot)
     except subprocess.TimeoutExpired as error:
         raise ContractError(
             f"frontend {frontend.frontend_id} exceeded {timeout_seconds}s"

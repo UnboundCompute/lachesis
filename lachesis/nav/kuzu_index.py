@@ -54,6 +54,7 @@ from lachesis.kuzu_store import (
 )
 from lachesis.core.graph_wire import decode_document, encode_document
 from lachesis.nav.overlay import edge_key
+from lachesis.timeit import timeit
 
 try:  # 3.10+ only
     import kuzu  # type: ignore
@@ -231,7 +232,8 @@ def materialize_subgraph(index: "KuzuGraphIndex", keep, *, restore_defaults: boo
     return _materialize(index, keep, restore_defaults=restore_defaults)
 
 
-def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True) -> dict:
+def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True,
+                     sort_output: bool = True) -> dict:
     """Rebuild the whole canonical ``{nodes, edges}`` dict from a store.
 
     The rest of this module exists precisely to avoid this — the per-node primitives
@@ -245,10 +247,12 @@ def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True)
     matches ``combine_graphs`` (nodes by id, edges by ``(kind, source, target)``) so a
     materialized graph compares equal to a freshly composed one.
     """
-    return _materialize(index, None, restore_defaults=restore_defaults)
+    return _materialize(index, None, restore_defaults=restore_defaults,
+                        sort_output=sort_output)
 
 
-def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True) -> dict:
+def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True,
+                 sort_output: bool = True) -> dict:
     """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
 
     One body rather than two because a subgraph that restored props even slightly
@@ -351,8 +355,9 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
             if (keep is None or
                 (edge.get("source") in resident and edge.get("target") in resident))
         )
-    _sort_materialized_edges(edges)
-    nodes.sort(key=lambda n: n["id"])
+    if sort_output:
+        _sort_materialized_edges(edges)
+        nodes.sort(key=lambda n: n["id"])
     return {"nodes": nodes, "edges": edges}
 
 
@@ -448,6 +453,7 @@ class KuzuGraphIndex:
             )
         self._db = kuzu.Database(db_file(db_dir), read_only=True)
         self._conn = kuzu.Connection(self._db)
+        self._db_dir = db_dir
         set_threads = getattr(self._conn, "set_max_threads_for_exec", None)
         if set_threads is not None:
             set_threads(_query_threads())
@@ -456,6 +462,7 @@ class KuzuGraphIndex:
         # this same manifest, so a store whose dictionary this reader could not use has
         # been rejected before here.
         manifest = read_store_manifest(db_dir)
+        self._store_manifest = manifest
         self._props_dict = manifest_props_dictionary(manifest)
         self._id_prefixes = manifest_id_prefixes(manifest)
         # The same table inverted, for the lookup direction: `_node`/`_edges` take a
@@ -490,6 +497,11 @@ class KuzuGraphIndex:
         self._overlay = None
         self._derived_out: dict = {}
         self._derived_in: dict = {}
+        self._overlay_argument_edges: dict = {}
+        self._ids = []
+        self._kind_by_id = {}
+        self._label_by_id = {}
+        self._header_by_id = {}
         self.nodes = _NodeMap(self)
         self.outgoing = _Adjacency(self, reverse=False)
         self.incoming = _Adjacency(self, reverse=True)
@@ -503,7 +515,6 @@ class KuzuGraphIndex:
             self.by_label = defaultdict(list)
             self.by_file = defaultdict(list)
             self.by_owner = defaultdict(list)
-            self._ids = []
         else:
             self._build_maps()
 
@@ -520,12 +531,22 @@ class KuzuGraphIndex:
         # every nav tool above it — never sees a coded value.
         res = self._conn.execute(
             "MATCH (n:Node) RETURN n.id, n.kind, n.label, n.file, n.absolute_file, "
+            "n.start_line, n.end_line, n.start_offset, n.end_offset, "
             "n.owner_function_id, n.function_id"
         )
         while res.has_next():
-            nid, kind, label, file, abs_file, owner, fn = res.get_next()
+            (nid, kind, label, file, abs_file, start_line, end_line,
+             start_offset, end_offset, owner, fn) = res.get_next()
             nid = decode_id(nid, self._id_prefixes)
             self._ids.append(nid)
+            self._kind_by_id[nid] = kind
+            self._label_by_id[nid] = label
+            self._header_by_id[nid] = {
+                "file": file, "absolute_file": abs_file,
+                "start_line": start_line, "end_line": end_line,
+                "start_offset": start_offset, "end_offset": end_offset,
+                "owner_function_id": owner, "function_id": fn,
+            }
             self.by_kind[kind].append(nid)
             self.by_label[label].append(nid)
             path = abs_file or file
@@ -542,6 +563,25 @@ class KuzuGraphIndex:
         for buckets in (self.by_kind, self.by_label, self.by_file, self.by_owner):
             for ids in buckets.values():
                 ids.sort()
+
+    def ensure_maps(self) -> None:
+        """Build navigation buckets after a deferred whole-graph operation.
+
+        Pass 2 only needs columnar scans plus the compact projection used by the
+        catalog binder. Building four navigation maps before materializing a million
+        nodes duplicates graph-sized id references during the peak. Deferred callers
+        opt into the maps immediately before a pass-3 translator or navigation query
+        needs them.
+        """
+        if not self._maps_deferred:
+            return
+        overlay = self._overlay
+        self._build_maps()
+        self._maps_deferred = False
+        if overlay is not None:
+            # `_build_maps` covers resident Kùzu rows; reattach additive rows after
+            # rebuilding so warm sidecars are represented in the same buckets too.
+            self.attach_overlay(overlay)
 
     # -- sidecar overlay ----------------------------------------------------
 
@@ -565,9 +605,13 @@ class KuzuGraphIndex:
         self._kind_ids.clear()
         self._derived_out = defaultdict(list)
         self._derived_in = defaultdict(list)
+        overlay_argument_edges = defaultdict(list)
         for edge in overlay.derived_edges:
             self._derived_out[edge["source"]].append(edge)
             self._derived_in[edge["target"]].append(edge)
+            if edge.get("kind") == "HAS_ARGUMENT":
+                overlay_argument_edges[edge["source"]].append(edge)
+        self._overlay_argument_edges = overlay_argument_edges
         for node in overlay.derived_nodes:
             nid = node["id"]
             if nid in self._node_cache:
@@ -586,6 +630,11 @@ class KuzuGraphIndex:
         self._ids.sort()
 
     def _node_count(self) -> int:
+        if self._maps_deferred:
+            result = self._conn.execute("MATCH (n:Node) RETURN count(n)")
+            count = int(result.get_next()[0]) if result.has_next() else 0
+            overlay = getattr(self, "_overlay", None)
+            return count + len(overlay.derived_nodes) if overlay is not None else count
         return len(self._ids)
 
     def _all_ids(self):
@@ -593,6 +642,7 @@ class KuzuGraphIndex:
 
     # -- primitives ---------------------------------------------------------
 
+    @timeit
     def _run(self, cypher: str, params: dict):
         """Execute ``cypher``, preparing it at most once per process.
 
@@ -605,6 +655,7 @@ class KuzuGraphIndex:
             statement = self._prepared[cypher] = self._conn.prepare(cypher)
         return self._conn.execute(statement, params)
 
+    @timeit
     def _node(self, node_id: str) -> Optional[dict]:
         if node_id in self._node_cache:
             return self._node_cache[node_id]
@@ -625,6 +676,7 @@ class KuzuGraphIndex:
         self._node_cache[node_id] = node
         return node
 
+    @timeit
     def _edges(self, node_id: str, reverse: bool) -> list:
         cache = self._in_cache if reverse else self._out_cache
         if node_id in cache:
@@ -658,7 +710,10 @@ class KuzuGraphIndex:
             edges.extend({"source": e["source"], "target": e["target"],
                           "kind": e["kind"], "properties": dict(e.get("properties") or {})}
                          for e in derived.get(node_id, ()))
-        edges.sort(key=_EDGE_SORT)
+        # Most adjacency triples are unique.  Avoid encoding every properties
+        # blob just to establish a tie-break that is only needed for duplicate
+        # (kind, source, target) edges.
+        _sort_materialized_edges(edges)
         cache[node_id] = edges
         return edges
 
@@ -747,6 +802,7 @@ class KuzuGraphIndex:
         return (edge.get("kind") in accepted
                 or self.semantic_edge_kind(edge) in accepted)
 
+    @timeit
     def targets(self, source: str, *edge_kinds: str) -> Iterable[dict]:
         accepted = frozenset(edge_kinds)
         for edge in self._edges(source, reverse=False):
@@ -755,6 +811,7 @@ class KuzuGraphIndex:
                 if node is not None:
                     yield node
 
+    @timeit
     def sources(self, target: str, *edge_kinds: str) -> Iterable[dict]:
         accepted = frozenset(edge_kinds)
         for edge in self._edges(target, reverse=True):
@@ -763,11 +820,13 @@ class KuzuGraphIndex:
                 if node is not None:
                     yield node
 
+    @timeit
     def outgoing_of_kind(self, source: str, *edge_kinds: str) -> tuple:
         accepted = frozenset(edge_kinds)
         return tuple(e for e in self._edges(source, reverse=False)
                      if self._accepted(e, accepted))
 
+    @timeit
     def incoming_of_kind(self, target: str, *edge_kinds: str) -> tuple:
         accepted = frozenset(edge_kinds)
         return tuple(e for e in self._edges(target, reverse=True)
@@ -786,6 +845,7 @@ class KuzuGraphIndex:
     def nodes_in_file(self, path: str) -> tuple:
         return tuple(self._node(nid) for nid in self.by_file.get(path, ()))
 
+    @timeit
     def nodes_owned_by(self, owner_id: str, *kinds: str) -> tuple:
         """The nodes a declaration owns, optionally narrowed to some kinds first.
 
@@ -802,6 +862,41 @@ class KuzuGraphIndex:
             self._warm_nodes(owned)
         return tuple(self._node(nid) for nid in owned)
 
+    @timeit
+    def nodes_owned_headers(self, owner_id: str) -> tuple[dict, ...]:
+        """Return cheap body headers without inflating property tails.
+
+        Header properties are promoted scalar values owned by this read-only
+        index.  Translation only reads them, so sharing the existing dictionary
+        avoids copying one properties mapping for every owned node on every
+        function projection.
+        """
+        owned = self.by_owner.get(owner_id, ())
+        return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
+                      "label": self._label_by_id.get(nid),
+                      "properties": self._header_by_id.get(nid, {})}
+                     for nid in owned)
+
+    def node_headers(self, node_ids) -> tuple[dict, ...]:
+        return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
+                      "label": self._label_by_id.get(nid),
+                      "properties": self._header_by_id.get(nid, {})}
+                     for nid in node_ids)
+
+    @timeit
+    def metadata_by_kind(self, kinds) -> dict[str, dict]:
+        """Read only the property tails for a small set of node kinds."""
+        result = {}
+        res = self._conn.execute(
+            "MATCH (n:Node) WHERE n.kind IN $kinds RETURN n.id, n.props",
+            {"kinds": list(dict.fromkeys(kinds))},
+        )
+        while res.has_next():
+            nid, props = res.get_next()
+            result[decode_id(nid, self._id_prefixes)] = _restore(
+                props, self._props_dict, restore_defaults=False)
+        return result
+
     def _ids_of_kind(self, kinds) -> frozenset:
         key = frozenset(kinds)
         cached = self._kind_ids.get(key)
@@ -810,6 +905,7 @@ class KuzuGraphIndex:
                 nid for kind in key for nid in self.by_kind.get(kind, ()))
         return cached
 
+    @timeit
     def _warm_nodes(self, node_ids) -> None:
         """Fetch a batch of nodes into the node cache with one query.
 
@@ -820,6 +916,13 @@ class KuzuGraphIndex:
         """
         wanted = [nid for nid in node_ids if nid not in self._node_cache]
         if not wanted:
+            return
+        # Keep Kùzu's IN-list planning bounded.  A single callable warm-up can
+        # contain tens of thousands of ids; several moderate batches are faster
+        # and use less temporary query memory than one giant parameter list.
+        if len(wanted) > 5000:
+            for start in range(0, len(wanted), 5000):
+                self._warm_nodes(wanted[start:start + 5000])
             return
         coded = [encode_id(nid, self._id_codes) for nid in wanted]
         res = self._run(
@@ -840,6 +943,189 @@ class KuzuGraphIndex:
         # `_node` from re-querying for it one at a time straight after this returns.
         for node_id in wanted:
             self._node_cache.setdefault(node_id, None)
+
+    @timeit
+    def _warm_nodes_by_owner(self, owner_ids, kinds=None) -> None:
+        """Warm owned flow nodes with one owner/kind columnar scan.
+
+        Passing every node id through a large ``IN`` list makes Kùzu repeatedly
+        plan primary-key probes.  ``owner_function_id`` and ``kind`` are
+        promoted columns, so one scan over the selected definition owners is
+        both smaller and cheaper while producing the identical node cache.
+        """
+        owners = [owner for owner in owner_ids if owner]
+        accepted = list(dict.fromkeys(kinds or ()))
+        if not owners:
+            return
+        kind_clause = " AND n.kind IN $kinds" if accepted else ""
+        params = {"owners": owners}
+        if accepted:
+            params["kinds"] = accepted
+        res = self._conn.execute(
+            f"MATCH (n:Node) WHERE n.owner_function_id IN $owners"
+            f"{kind_clause} RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props",
+            params,
+        )
+        while res.has_next():
+            row = res.get_next()
+            node_id = decode_id(row[0], self._id_prefixes)
+            kind, label = row[1:3]
+            properties = _restore_node_props(
+                row[3:-1], row[-1], self._props_dict, self._id_prefixes)
+            if self._overlay is not None:
+                properties.update(self._overlay.node_props.get(node_id) or {})
+            self._node_cache[node_id] = {
+                "id": node_id, "kind": kind, "label": label,
+                "properties": properties,
+            }
+
+    @timeit
+    def stream_nodes_by_owner(self, owner_ids, callback, kinds=None) -> None:
+        """Feed full owned-node records to ``callback`` one owner at a time.
+
+        The query still scans the selected owners once, but unlike ``_warm_nodes_by_owner``
+        it does not retain every body in ``_node_cache``. Consumers can analyze and evict the
+        current owner's records before the next group arrives.
+        """
+        owners = [owner for owner in owner_ids if owner]
+        accepted = list(dict.fromkeys(kinds or ()))
+        if not owners:
+            return
+        kind_clause = " AND n.kind IN $kinds" if accepted else ""
+        params = {"owners": owners}
+        if accepted:
+            params["kinds"] = accepted
+        merged_without_owner = ", ".join(
+            f"n.{column}" for column in _MERGED_COLUMNS
+            if column != "owner_function_id")
+        res = self._conn.execute(
+            f"MATCH (n:Node) WHERE n.owner_function_id IN $owners"
+            f"{kind_clause} RETURN n.owner_function_id, n.id, n.kind, n.label, "
+            f"{merged_without_owner}, n.props ORDER BY n.owner_function_id",
+            params,
+        )
+        current_owner = None
+        batch = []
+
+        def flush():
+            nonlocal batch, current_owner
+            if current_owner is not None and batch:
+                callback(current_owner, batch)
+            batch = []
+
+        while res.has_next():
+            row = res.get_next()
+            owner = row[0]
+            if owner != current_owner:
+                flush()
+                current_owner = owner
+            node_id = decode_id(row[1], self._id_prefixes)
+            kind, label = row[2:4]
+            selected = iter(row[4:-1])
+            columns = [row[0] if column == "owner_function_id" else next(selected)
+                       for column in _MERGED_COLUMNS]
+            properties = _restore_node_props(
+                columns, row[-1], self._props_dict, self._id_prefixes)
+            if self._overlay is not None:
+                properties.update(self._overlay.node_props.get(node_id) or {})
+            node = {"id": node_id, "kind": kind, "label": label,
+                    "properties": properties}
+            self._node_cache[node_id] = node
+            batch.append(node)
+        flush()
+
+    @timeit
+    def _node_spans(self, node_ids, batch_size: int = 5000) -> dict[str, dict]:
+        """Fetch only source-span columns for a bounded set of node ids.
+
+        Flow guard/region classification needs file offsets, not full node property
+        blobs.  Using ``_warm_nodes`` for that job inflates every tail and defeats
+        the lazy disk-backed Pass 3 path.
+        """
+        wanted = tuple(dict.fromkeys(node_ids))
+        spans = {}
+        for start in range(0, len(wanted), batch_size):
+            batch = wanted[start:start + batch_size]
+            coded = [encode_id(nid, self._id_codes) for nid in batch]
+            res = self._run(
+                "MATCH (n:Node) WHERE n.id IN $ids "
+                "RETURN n.id, n.file, n.absolute_file, n.start_offset, n.end_offset",
+                {"ids": coded},
+            )
+            while res.has_next():
+                nid, file, absolute_file, begin, end = res.get_next()
+                spans[decode_id(nid, self._id_prefixes)] = {
+                    "file": file, "absolute_file": absolute_file,
+                    "start_offset": begin, "end_offset": end,
+                }
+        return spans
+
+    @timeit
+    def _edges_with_target_spans(self, edge_kinds) -> list[tuple[str, str, str, dict]]:
+        """Read selected edges and target spans without inflating node properties."""
+        accepted = frozenset(edge_kinds)
+        rows = []
+        # Most high-volume edge kinds use the generic EDGE table and are
+        # filtered by semantic_kind below.  Branch relationships are stored as
+        # typed Kùzu relations, however, and are not in _HOT_SET; omitting them
+        # makes the lazy branch-region index appear empty.
+        for kind in accepted & _HOT_SET:
+            res = self._conn.execute(
+                f"MATCH (a:Node)-[e:{kind}]->(b:Node) "
+                "RETURN a.id, b.id, b.file, b.absolute_file, "
+                "b.start_offset, b.end_offset"
+            )
+            while res.has_next():
+                src, tgt, file, absolute_file, begin, end = res.get_next()
+                rows.append((decode_id(src, self._id_prefixes),
+                             decode_id(tgt, self._id_prefixes), kind,
+                             {"file": file, "absolute_file": absolute_file,
+                              "start_offset": begin, "end_offset": end}))
+        for kind in accepted - _HOT_SET:
+            try:
+                res = self._conn.execute(
+                    f"MATCH (a:Node)-[e:{kind}]->(b:Node) "
+                    "RETURN a.id, b.id, b.file, b.absolute_file, "
+                    "b.start_offset, b.end_offset"
+                )
+            except RuntimeError:
+                # Stores are allowed to omit optional overlay relationships;
+                # Kùzu reports a missing typed table as a binder error.
+                continue
+            while res.has_next():
+                src, tgt, file, absolute_file, begin, end = res.get_next()
+                rows.append((decode_id(src, self._id_prefixes),
+                             decode_id(tgt, self._id_prefixes), kind,
+                             {"file": file, "absolute_file": absolute_file,
+                              "start_offset": begin, "end_offset": end}))
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+            "WHERE e.semantic_kind IN $kinds OR e.kind IN $kinds "
+            "RETURN a.id, b.id, e.kind, e.semantic_kind, b.file, b.absolute_file, "
+            "b.start_offset, b.end_offset", {"kinds": list(accepted)})
+        while res.has_next():
+            src, tgt, kind, semantic_kind, file, absolute_file, begin, end = res.get_next()
+            kind = semantic_kind or kind
+            rows.append((decode_id(src, self._id_prefixes),
+                         decode_id(tgt, self._id_prefixes), kind,
+                         {"file": file, "absolute_file": absolute_file,
+                          "start_offset": begin, "end_offset": end}))
+        # Enrichment overlays (including branch-region inference) are held as
+        # derived adjacency rather than Kùzu rows.  Include them here using the
+        # already-indexed target headers, keeping this helper property-light.
+        for source, edges in self._derived_out.items():
+            for edge in edges:
+                kind = edge.get("kind")
+                if kind not in accepted:
+                    continue
+                target = self._header_by_id.get(edge.get("target"), {})
+                rows.append((source, edge.get("target"), kind, {
+                    "file": target.get("file"),
+                    "absolute_file": target.get("absolute_file"),
+                    "start_offset": target.get("start_offset"),
+                    "end_offset": target.get("end_offset"),
+                }))
+        return rows
 
     def edges_of_kind(self, *edge_kinds: str) -> Iterable[dict]:
         accepted = frozenset(edge_kinds)
@@ -868,6 +1154,348 @@ class KuzuGraphIndex:
                          if e.get("kind") in accepted)
         edges.sort(key=_EDGE_SORT)
         return edges
+
+    @timeit
+    def incoming_edges_for_targets(self, targets, edge_kind: str) -> tuple[dict, ...]:
+        """Return one value-flow batch for many target ids.
+
+        Candidate evidence walks backwards from catalog sinks.  Issuing one Kùzu
+        traversal per sink/value made the structural Pass 2 bind pay thousands of
+        query plans.  This keeps the same edge shape while using bounded primary-key
+        batches; derived overlay edges are appended so the result remains identical
+        after the dataflow sidecar is attached.
+        """
+        wanted = tuple(dict.fromkeys(value for value in targets if value))
+        if not wanted:
+            return ()
+        result = []
+        for start in range(0, len(wanted), 5000):
+            batch = wanted[start:start + 5000]
+            coded = [encode_id(value, self._id_codes) for value in batch]
+            if edge_kind in _HOT_SET:
+                # Hot relations have their own typed Kùzu table, so querying
+                # EDGE here misses the base value-flow rows entirely.  The
+                # typed relation also avoids a semantic_kind predicate and is
+                # the indexed representation used by the normal adjacency
+                # path.
+                query = (
+                    f"MATCH (a:Node)-[e:{edge_kind}]->(b:Node) "
+                    "WHERE b.id IN $ids "
+                    "RETURN a.id, b.id, e.props"
+                )
+                res = self._conn.execute(query, {"ids": coded})
+                while res.has_next():
+                    source, target, props = res.get_next()
+                    result.append({
+                        "source": decode_id(source, self._id_prefixes),
+                        "target": decode_id(target, self._id_prefixes),
+                        "kind": edge_kind,
+                        "properties": _restore(props, self._props_dict),
+                    })
+                continue
+            query = (
+                "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+                "WHERE e.semantic_kind = $kind AND b.id IN $ids "
+                "RETURN a.id, b.id, e.kind, e.props"
+            )
+            res = self._conn.execute(query, {"kind": edge_kind, "ids": coded})
+            while res.has_next():
+                source, target, kind, props = res.get_next()
+                result.append({
+                    "source": decode_id(source, self._id_prefixes),
+                    "target": decode_id(target, self._id_prefixes),
+                    "kind": kind or edge_kind,
+                    "properties": _restore(props, self._props_dict),
+                })
+        if self._overlay is not None:
+            result.extend(
+                dict(edge) for edge in self._overlay.derived_edges
+                if edge.get("kind") == edge_kind
+                and edge.get("target") in set(wanted)
+            )
+        result.sort(key=_EDGE_SORT)
+        return tuple(result)
+
+    @timeit
+    def argument_edges_by_source(self) -> dict[str, tuple[dict, ...]]:
+        """Return the small call-argument relation indexed by call id.
+
+        Flow translation asks for HAS_ARGUMENT adjacency once per call.  On a
+        large store that turns a fixed 76k-edge relation into thousands of
+        individual Kùzu plans.  This scan reads only the edge properties and
+        keeps the same ``{source: ({source,target,kind,properties}, ...)}``
+        shape accepted by ``_arg_records``; value-flow edges remain lazy.
+        """
+        cached = getattr(self, "_argument_edges_cache", None)
+        if cached is not None:
+            return cached
+        indexed = defaultdict(list)
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+            "WHERE e.semantic_kind = 'HAS_ARGUMENT' OR e.kind = 'HAS_ARGUMENT' "
+            "RETURN a.id, b.id, e.kind, e.semantic_kind, e.props"
+        )
+        while res.has_next():
+            source, target, kind, semantic_kind, props = res.get_next()
+            source = decode_id(source, self._id_prefixes)
+            target = decode_id(target, self._id_prefixes)
+            indexed[source].append({
+                "source": source, "target": target,
+                "kind": semantic_kind or kind or "HAS_ARGUMENT",
+                "properties": _restore(props, self._props_dict),
+            })
+        for source, edges in self._overlay_argument_edges.items():
+            indexed[source].extend(dict(edge) for edge in edges)
+        for edges in indexed.values():
+            _sort_materialized_edges(edges)
+        self._argument_edges_cache = {
+            source: tuple(edges) for source, edges in indexed.items()
+        }
+        return self._argument_edges_cache
+
+    @timeit
+    def atropos_projection(self) -> dict:
+        """Return only the records needed to build Atropos's neutral symbol index.
+
+        Catalog binding needs call/construct/write/argument records, not the full CPG.
+        Export that narrow projection directly from Kùzu so a disk-backed Pass 2 can
+        avoid scanning the million-node materialized graph just to discover callsites.
+        The returned shape is intentionally an ordinary graph fragment: the existing
+        canonical adapter remains the compatibility and parity oracle.
+        """
+        kinds = ["argument", "call", "construct", "write"]
+        nodes = {}
+        res = self._conn.execute(
+            f"MATCH (n:Node) WHERE n.kind IN $kinds "
+            f"RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props",
+            {"kinds": kinds},
+        )
+        while res.has_next():
+            row = res.get_next()
+            nid = decode_id(row[0], self._id_prefixes)
+            nodes[nid] = {
+                "id": nid, "kind": row[1], "label": row[2],
+                "properties": _restore_node_props(
+                    row[3:-1], row[-1], self._props_dict, self._id_prefixes),
+            }
+
+        edges = []
+        for group in self.argument_edges_by_source().values():
+            edges.extend(group)
+
+        # The cursor-factory fallback needs only labels of write targets. Fetch
+        # those targets in one bounded IN query rather than broadening the scan.
+        target_ids = {
+            (node.get("properties") or {}).get("target_id")
+            for node in nodes.values() if node.get("kind") == "write"
+        }
+        target_ids.discard(None)
+        if target_ids:
+            coded = [encode_id(nid, self._id_codes) for nid in target_ids]
+            res = self._conn.execute(
+                "MATCH (n:Node) WHERE n.id IN $ids RETURN n.id, n.kind, n.label",
+                {"ids": coded},
+            )
+            while res.has_next():
+                coded_id, kind, label = res.get_next()
+                nid = decode_id(coded_id, self._id_prefixes)
+                nodes.setdefault(nid, {"id": nid, "kind": kind, "label": label,
+                                       "properties": {}})
+        return {"nodes": tuple(nodes.values()), "edges": tuple(edges)}
+
+    @timeit
+    def value_targets_by_source(self) -> dict[str, tuple[str, ...]]:
+        """Compactly index the hot VALUE_FLOWS_TO relation by source id.
+
+        The flow translator follows only targets for short assignment walks.  Keeping
+        the relation as source -> target tuples avoids one Kùzu adjacency plan per
+        call while avoiding the much larger edge/property dictionaries used by the
+        general graph materializer.
+        """
+        cached = getattr(self, "_value_targets_cache", None)
+        if cached is not None:
+            return cached
+        indexed = defaultdict(list)
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:VALUE_FLOWS_TO]->(b:Node) RETURN a.id, b.id"
+        )
+        while res.has_next():
+            source, target = res.get_next()
+            indexed[decode_id(source, self._id_prefixes)].append(
+                decode_id(target, self._id_prefixes))
+        if self._overlay is not None:
+            for edge in self._overlay.derived_edges:
+                if edge.get("kind") == "VALUE_FLOWS_TO":
+                    indexed[edge["source"]].append(edge["target"])
+        self._value_targets_cache = {
+            source: tuple(sorted(targets))
+            for source, targets in indexed.items()
+        }
+        return self._value_targets_cache
+
+    @timeit
+    def return_value_sources_by_target(self) -> dict[str, tuple[dict, ...]]:
+        """Bulk-index return-value source nodes by their function target."""
+        cached = getattr(self, "_return_value_sources_cache", None)
+        if cached is not None:
+            return cached
+        indexed = defaultdict(list)
+        merged_select = ", ".join(f"a.{column}" for column in _MERGED_COLUMNS)
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+            "WHERE e.semantic_kind = 'RETURNS_VALUE' OR e.kind = 'RETURNS_VALUE' "
+            f"RETURN b.id, a.id, a.kind, a.label, {merged_select}, a.props"
+        )
+        while res.has_next():
+            row = res.get_next()
+            target = decode_id(row[0], self._id_prefixes)
+            source = decode_id(row[1], self._id_prefixes)
+            kind, label = row[2:4]
+            properties = _restore_node_props(row[4:-1], row[-1], self._props_dict,
+                                             self._id_prefixes)
+            indexed[target].append({"id": source, "kind": kind, "label": label,
+                                    "properties": properties})
+        self._return_value_sources_cache = {
+            target: tuple(sorted(nodes, key=lambda node: node["id"]))
+            for target, nodes in indexed.items()
+        }
+        return self._return_value_sources_cache
+
+    @timeit
+    def invoke_edges_by_source(self) -> dict[str, tuple[dict, ...]]:
+        """Bulk-index the small MAY_INVOKE relation used for indirect dispatch."""
+        cached = getattr(self, "_invoke_edges_cache", None)
+        if cached is not None:
+            return cached
+        indexed = defaultdict(list)
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:MAY_INVOKE]->(b:Node) "
+            "RETURN a.id, b.id, e.props"
+        )
+        while res.has_next():
+            source, target, props = res.get_next()
+            source = decode_id(source, self._id_prefixes)
+            target = decode_id(target, self._id_prefixes)
+            indexed[source].append({"source": source, "target": target,
+                                    "kind": "MAY_INVOKE",
+                                    "properties": _restore(props, self._props_dict)})
+        if self._overlay is not None:
+            for edge in self._overlay.derived_edges:
+                if edge.get("kind") == "MAY_INVOKE":
+                    indexed[edge["source"]].append(dict(edge))
+        self._invoke_edges_cache = {
+            source: tuple(sorted(edges, key=_EDGE_SORT))
+            for source, edges in indexed.items()
+        }
+        return self._invoke_edges_cache
+
+    @timeit
+    def structural_edges(self, kind: str) -> tuple[dict, ...]:
+        """Read the minimal fields needed by the object substrate."""
+        rows = []
+        if kind in _HOT_SET:
+            res = self._conn.execute(
+                f"MATCH (a:Node)-[e:{kind}]->(b:Node) "
+                "RETURN a.id, b.id, e.props"
+            )
+            while res.has_next():
+                source, target, props = res.get_next()
+                edge = {"source": decode_id(source, self._id_prefixes),
+                        "target": decode_id(target, self._id_prefixes),
+                        "kind": kind}
+                edge["properties"] = (_restore(props, self._props_dict)
+                                      if kind == "AST_CHILD" else {})
+                rows.append(edge)
+        else:
+            res = self._conn.execute(
+                "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+                "WHERE e.semantic_kind = $kind OR e.kind = $kind "
+                "RETURN a.id, b.id, e.kind, e.semantic_kind, e.props",
+                {"kind": kind},
+            )
+            while res.has_next():
+                source, target, raw_kind, semantic_kind, props = res.get_next()
+                edge = {"source": decode_id(source, self._id_prefixes),
+                        "target": decode_id(target, self._id_prefixes),
+                        "kind": semantic_kind or raw_kind or kind,
+                        "properties": (_restore(props, self._props_dict)
+                                       if kind == "AST_CHILD" else {})}
+                rows.append(edge)
+        if self._overlay is not None:
+            rows.extend(dict(edge) for edge in self._overlay.derived_edges
+                        if edge.get("kind") == kind)
+        return tuple(rows)
+
+    @timeit
+    def initializer_edges(self) -> tuple[dict, ...]:
+        """Read VALUE_FLOWS_TO edges into the selected function-owned nodes."""
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:VALUE_FLOWS_TO]->(b:Node) "
+            "RETURN a.id, b.id, e.props"
+        )
+        rows = []
+        while res.has_next():
+            source, target, props = res.get_next()
+            rows.append({"source": decode_id(source, self._id_prefixes),
+                         "target": decode_id(target, self._id_prefixes),
+                         "kind": "VALUE_FLOWS_TO",
+                         "properties": _restore(props, self._props_dict)})
+        return tuple(rows)
+
+    @timeit
+    def member_expression_nodes(self) -> tuple[dict, ...]:
+        """Columnarly read only expression nodes whose syntax is MemberExpr."""
+        cached = getattr(self, "_pass3_member_expression_cache", None)
+        if cached is not None:
+            return cached
+        cached = getattr(self, "_member_expression_cache", None)
+        if cached is not None:
+            return cached
+        merged_select = _MERGED_SELECT
+        res = self._conn.execute(
+            f"MATCH (n:Node) WHERE n.kind = 'expression' "
+            f"RETURN n.id, n.kind, n.label, {merged_select}, n.props"
+        )
+        members = []
+        while res.has_next():
+            row = res.get_next()
+            node_id = decode_id(row[0], self._id_prefixes)
+            properties = _restore_node_props(row[3:-1], row[-1], self._props_dict,
+                                             self._id_prefixes)
+            if properties.get("syntax_kind") != "MemberExpr":
+                continue
+            node = {"id": node_id, "kind": row[1], "label": row[2],
+                    "properties": properties}
+            self._node_cache[node_id] = node
+            members.append(node)
+        self._member_expression_cache = tuple(members)
+        return self._member_expression_cache
+
+    @timeit
+    def ast_direct_parents(self, target_kinds) -> dict[str, str]:
+        """Return immediate AST parents for the small control-site node set."""
+        key = tuple(sorted(set(target_kinds)))
+        cache = getattr(self, "_ast_direct_parent_cache", None)
+        if cache is None:
+            cache = self._ast_direct_parent_cache = {}
+        if key in cache:
+            return cache[key]
+        parents = {}
+        res = self._conn.execute(
+            "MATCH (a:Node)-[e:EDGE]->(b:Node) "
+            "WHERE (e.semantic_kind = 'AST_CHILD' OR e.kind = 'AST_CHILD') "
+            "AND b.kind IN $kinds RETURN a.id, b.id",
+            {"kinds": list(key)},
+        )
+        while res.has_next():
+            parent, child = res.get_next()
+            parent = decode_id(parent, self._id_prefixes)
+            child = decode_id(child, self._id_prefixes)
+            prior = parents.get(child)
+            if prior is None or parent < prior:
+                parents[child] = parent
+        cache[key] = parents
+        return parents
 
     def flow_edges(self, kinds) -> list:
         return list(self.edges_of_kind(*kinds))

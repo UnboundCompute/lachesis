@@ -28,6 +28,7 @@ hides the four security tools for a focused understanding run — nothing else c
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,6 +47,7 @@ from lachesis.nav import render as render_mod
 from lachesis.nav import skeleton as skeleton_mod
 from lachesis.nav.comprehension import Comprehension
 from lachesis.nav.concept import ConceptSearch, DEFAULT_MODEL
+from lachesis.session import Analysis, LeadSet
 
 _GRAPH_PATH = None
 _OVERLAY_PATH = None
@@ -60,8 +62,8 @@ _DEFAULT_FORMAT = "text"
 # remains additive/backward-compatible; a caller has to request the narrower profile.
 SECURITY_TOOLS = ("guards", "call_roles", "siblings", "guards_top")
 HUNTING_TOOLS = SECURITY_TOOLS + (
-    "candidates", "candidate_detail", "candidate_census", "skeleton",
-    "flow_pass", "flow_skeleton", "taint", "scan", "guard_dominance",
+    "candidates", "candidate_detail", "candidate_census", "explain", "skeleton",
+    "enrich", "flow_pass", "leads", "flow_skeleton", "taint", "scan", "guard_dominance",
     "counterexample", "range_analysis", "object_lifecycle", "error_path_summary",
 )
 
@@ -120,8 +122,8 @@ TOOL_ORDER = (
     "representation_roundtrip", "cross_boundary_paths", "range_analysis",
     "object_lifecycle", "error_path_summary",
     "flow", "reaches", "sources_of", "points_to", "aliases",
-    "candidates", "candidate_detail", "candidate_census", "skeleton",
-    "flow_pass", "flow_skeleton", "taint",
+    "candidates", "candidate_detail", "candidate_census", "explain", "skeleton",
+    "enrich", "flow_pass", "leads", "flow_skeleton", "taint",
     "guards", "call_roles", "siblings", "guards_top",
 )
 
@@ -137,7 +139,23 @@ def _visible_tools():
 
 
 def log(*a):
-    print("[lachesis-mcp]", *a, file=sys.stderr, flush=True)
+    print("[lachesis mcp]", *a, file=sys.stderr, flush=True)
+
+
+def _expand(path):
+    """Expand a leading ``~`` so a user-typed home path resolves instead of 404ing.
+
+    A path that exists on disk but is spelled ``~/.lachesis/graphs/x.kuzu`` used to come
+    back "path not found" because nothing called ``expanduser``. ``None``/empty passes
+    through untouched (an optional overlay or graph that was simply not supplied)."""
+    return os.path.expanduser(path) if path else path
+
+
+# One graph/ctx per process, mutated in place by load_graph. The stdin loop already
+# reads and dispatches requests serially, so there is no live race today; this lock makes
+# that serial contract explicit and keeps the shared _CTX swap atomic under any future
+# concurrent transport, so an overlapping call can never observe a half-attached store.
+_DISPATCH_LOCK = threading.Lock()
 
 
 # What this server calls itself when a client asks. It is the name the user sees in
@@ -156,8 +174,13 @@ except (ImportError, PackageNotFoundError):  # a source checkout that was never 
     SERVER_VERSION = "0+unknown"
 
 
-class _Ctx:
+class _Ctx(Analysis):
     """The loaded store plus the analysis objects, all built on first use.
+
+    Subclasses the public :class:`lachesis.session.Analysis`: the store-load, the memo
+    (``_analysis``/``_sync_tier``), and the two heavy builds (``_flow_bundle``/
+    ``_bind_bundle``) all live on the base, so the MCP server and the library share one
+    implementation. This class adds only the navigation properties the tool surface reads.
 
     Lazy for two reasons. A store built without ``--enrich`` grows its dataflow tier on
     demand, and that rebinds ``store.index``; every analysis object here caches the
@@ -166,28 +189,12 @@ class _Ctx:
     never touch dataflow, so they should never pay for it."""
 
     def __init__(self, graph_path, overlay_path):
-        self.store = GraphStore.load(graph_path, overlay_path=overlay_path)
-        self._built = {}
-        self._tier = (self.store.dataflow_ready,
-                      getattr(self.store, "cone_generation", 0))
+        store = GraphStore.load(graph_path, overlay_path=overlay_path)
+        super().__init__(store)
         log(f"loaded {len(self.store.gl.nodes)} nodes; "
             f"overlay: {self.store.overlay.summary()['derived_edges']} derived edges; "
             f"dataflow tier: "
             f"{'present' if self.store.dataflow_ready else 'on demand, per cone'}")
-
-    def _analysis(self, key, build):
-        # Two ways the index can move: the whole tier arrives (`dataflow_ready` flips)
-        # or a cone graft adds edges to the index in place (`cone_generation` ticks).
-        # The second leaves `dataflow_ready` false forever -- the store still has no
-        # full tier -- so watching only the flag would serve a `Reachability` built
-        # before the graft, which is exactly the answer the graft existed to improve.
-        tier = (self.store.dataflow_ready, getattr(self.store, "cone_generation", 0))
-        if self._tier != tier:
-            self._built.clear()  # the index moved under them; every cache is stale
-            self._tier = tier
-        if key not in self._built:
-            self._built[key] = build()
-        return self._built[key]
 
     @property
     def reach(self):
@@ -227,66 +234,35 @@ class _Ctx:
     def candidate_bundle(self):
         """The catalog-stamped graph and its cached obligation registry.
 
-        Candidate enumeration binds catalog facts against the core symbol index and
-        also publishes the cached semantic skeleton to temporal constructors.  The
-        constructors still emit observations, never verdicts; the graph matcher
-        remains the authority for proving a lifecycle relation.
+        The build lives on :meth:`Analysis._bind_bundle` so the library and the MCP surface
+        share one implementation. Candidate enumeration binds catalog facts against the core
+        symbol index and publishes the cached semantic skeleton to the temporal constructors,
+        which emit observations, never verdicts; the graph matcher remains the authority for
+        proving a lifecycle relation.
+
+        Bounded by the same default budget as every other temporal path
+        (:meth:`Analysis._resolve_deadline`: ``LACHESIS_HARD_STOP`` or 180s) so the temporal
+        bind cannot hang the request loop; a bind that hits the budget degrades to the
+        structural families (``temporal_evaluated=False``) and is not cached, so a later call
+        with a larger budget completes it. ``LACHESIS_HARD_STOP=0`` runs it unbounded.
         """
-        def build():
-            from lachesis.integrations.atropos.enrich import atropos_enrich
-            from lachesis.nav.kuzu_index import materialize_graph
-            from lachesis.planner.registry import default_candidate_registry
-
-            graph = materialize_graph(self.store.index)
-            stamped, summary = atropos_enrich(graph, complete_dataflow=False)
-            # Temporal candidate families observe semantic operations (release,
-            # origin, dereference, and so on), which do not exist as catalog role
-            # nodes in the base CPG.  Reuse the same cached Pass 3 graph exposed
-            # by flow_pass instead of creating a second traversal or teaching the
-            # candidate registry a language-specific lifecycle extractor.
-            from lachesis.flow.pipeline import run_pass
-            from lachesis.planner.temporal_obligation import merge_semantic_nodes
-            semantic_nodes = {}
-            semantic_coverages = []
-            for language in summary.get("languages") or ("c",):
-                flow = (self.flow_bundle if language == "c" else
-                        run_pass(self.store, lang=language, lifetime_engine="object"))
-                semantic = flow.get("semantic_graph")
-                if semantic is not None:
-                    merge_semantic_nodes(semantic_nodes, semantic, language)
-                    semantic_coverages.append(dict(semantic.coverage or {}))
-            if semantic_nodes:
-                stamped["semantic_graph"] = {"nodes": semantic_nodes}
-                if semantic_coverages:
-                    stamped["semantic_graph"]["coverage"] = {
-                        "converged": all(item.get("converged", True)
-                                          for item in semantic_coverages),
-                        "uncovered_states": [state for item in semantic_coverages
-                                             for state in item.get("uncovered_states", ())],
-                        "uncovered_contexts": [context for item in semantic_coverages
-                                               for context in item.get("uncovered_contexts", ())],
-                    }
-            return {
-                "registry": default_candidate_registry(stamped, summary),
-                "stamped": stamped,
-                "atropos": summary,
-            }
-
-        return self._analysis("candidate-registry", build)
+        return self._bind_bundle(deadline=self._resolve_deadline(None, None))
 
     @property
     def flow_bundle(self):
         """The interprocedural flow pass over the whole graph, computed once and cached.
 
-        Composes per-function summaries bottom-up, renders the stitched cross-function flow
-        skeletons, and matches shape patterns over them. Reads the enriched graph only to
-        project the IR; every later stage touches the IR, not the graph.
-        """
-        def build():
-            from lachesis.flow.pipeline import run_pass
-            return run_pass(self.store)
+        Delegates to the single native Rust flow engine shared with the public library.
+        Engine selection is intentionally not configurable on the MCP surface.
 
-        return self._analysis("flow-pass", build)
+        It is *not* neutral on the clock: the pass is bounded by the same default budget the
+        library uses (:meth:`Analysis._resolve_deadline`: ``LACHESIS_HARD_STOP`` or 180s), so a
+        large graph degrades to partial leads instead of hanging the request loop. A timed-out
+        result is never memoized (see ``_flow_bundle``), so a later call with a larger budget
+        recomputes cleanly. ``LACHESIS_HARD_STOP=0`` runs it unbounded.
+        """
+        return self._flow_bundle(
+                                 deadline=self._resolve_deadline(None, None))
 
     @property
     def scan_bundle(self):
@@ -340,6 +316,25 @@ def _seeds(store, token):
 def _seed(store, token):
     seeds = _seeds(store, token)
     return seeds[0] if seeds else None
+
+
+def _parse_at(value):
+    """Parse a `leads` position arg: ``file`` | ``file:line`` | ``file:lo-hi``.
+
+    Returns ``(file, lines)`` where ``lines`` is an inclusive ``(lo, hi)`` tuple or ``None``.
+    Split from the right so a path that itself contains no line suffix is returned whole; a
+    trailing ``:N``/``:LO-HI`` is only consumed when it actually parses as numbers, so a bare
+    file with a colon in the name is not mistaken for a line spec.
+    """
+    head, sep, tail = value.rpartition(":")
+    if sep and head:
+        if "-" in tail:
+            lo, _, hi = tail.partition("-")
+            if lo.isdigit() and hi.isdigit():
+                return head, (int(lo), int(hi))
+        elif tail.isdigit():
+            return head, (int(tail), int(tail))
+    return value, None
 
 
 def _fold_cone(store, name, args):
@@ -405,6 +400,23 @@ def _ref(store, node_id):
             "at": f"{f}:{l}" if f and l else None}
 
 
+# Shared bounding args for the candidate tools. The temporal families (double-free,
+# use-after-free, ...) read the Pass 3 semantic skeleton, whose flow pass materializes the
+# whole dataflow tier -- the one candidate cost that can run long on a large graph. These give
+# a client the escape hatch: `temporal:false` answers the structural families immediately with
+# no tier at all, and `hard_stop` bounds the temporal path so a slow graph degrades to
+# structural (with `temporal_evaluated:false`) instead of hanging the server.
+_TEMPORAL_ARG = {"type": "boolean", "default": True,
+                 "description": "evaluate the temporal families (double-free/UAF/...). Default "
+                                "true. Set false for the guaranteed-bounded fast path: "
+                                "structural families only, no dataflow tier -- use it when a "
+                                "large graph makes the full bind run long. The result's "
+                                "`temporal_evaluated` flag reports whether they were evaluated."}
+_HARD_STOP_ARG = {"type": "number",
+                  "description": "wall-clock budget (seconds) for the temporal families; on "
+                                 "expiry the result degrades to the structural families with "
+                                 "`temporal_evaluated:false` rather than hang. 0 = unbounded."}
+
 TOOLS = [
     {"name": "load_graph",
      "description": "Switch/attach the active graph the whole server reasons over — point it at a "
@@ -418,7 +430,7 @@ TOOLS = [
          "required": ["path"]}},
     {"name": "build_graph",
      "description": "Build a Lachesis graph from a source directory and attach it — the zero-config "
-                    "way to start on a repo that has no graph yet, no separate lachesis-analyze step "
+                    "way to start on a repo that has no graph yet, no separate lachesis build step "
                     "needed. Content-addressed: an unchanged tree returns instantly from cache; pass "
                     "refresh=true to force a rebuild. On success the new graph is loaded, so the next "
                     "tool call reasons over it. Toolchain: Python needs nothing extra; TypeScript/"
@@ -426,7 +438,7 @@ TOOLS = [
                     "an actionable 'missing toolchain prerequisite' error, not a crash. Builds run "
                     "in-process and can take minutes on a large tree (capped by timeout_seconds, "
                     "default 300); a build longer than the MCP client's own request timeout may need a "
-                    "smaller subtree or an out-of-band `lachesis-analyze`.",
+                    "smaller subtree or an out-of-band `lachesis build`.",
      "inputSchema": {"type": "object", "properties": {
          "source": {"type": "string", "description": "path to the source directory to analyse"},
          "refresh": {"type": "boolean", "default": False,
@@ -588,17 +600,23 @@ TOOLS = [
          "unknown_offset": {"type": "integer", "default": 0}},
          "required": ["question"]}},
     {"name": "scan",
-     "description": "Scan the graph for guard-differential investigation capsules: entrypoints "
-                    "that can reach sensitive effects without a recognized dominating guard. "
-                    "Returns ranked questions, not verdicts, plus an exhaustive census showing "
-                    "scanned/skipped entrypoints, suppressed capsules, truncated closures, and "
-                    "the explicit analysis frontier. Results are cached per graph; use "
-                    "entrypoints to bound the initial scan and min_rank/limit for the returned page.",
+     "description": "Return ranked leads from the whole taxonomy by default (lens=all): "
+                    "questions to investigate, never verdicts. Use lens=guard-diff for the "
+                    "entrypoint-to-effect guard view or lens=flow for native object-lifetime "
+                    "leads. Results are bounded and paged; the response includes coverage and "
+                    "whether the requested temporal work completed. Calls against one session "
+                    "are serialized; the native runtime is selected internally.",
      "inputSchema": {"type": "object", "properties": {
+         "lens": {"type": "string", "enum": ["all", "guard-diff", "flow"],
+                  "default": "all", "description": "lead view; all is the broad default"},
          "entrypoints": {"type": "integer", "default": 0,
                          "description": "scan only the first N entrypoints (0 = all)"},
          "min_rank": {"type": "number", "default": 0.0},
          "limit": {"type": "integer", "default": 20},
+         "offset": {"type": "integer", "default": 0,
+                    "description": "lead offset for the next page"},
+         "hard_stop": {"type": "number", "default": 180,
+                       "description": "temporal budget in seconds; 0 = unbounded"},
          "include_suppressions": {"type": "boolean", "default": False}},
          "required": []}},
     {"name": "wrapper_model",
@@ -872,13 +890,12 @@ TOOLS = [
          "atropos_only": {"type": "boolean",
                           "description": "only witnesses a catalog fact drove"}}}},
     {"name": "candidates",
-     "description": "Enumerate and rank every observable obligation site selected by an Atropos "
-                    "fact. This is a POINTER, not a safety check: candidates are never suppressed "
+     "description": "Enumerate and rank every observable obligation site as leads. This is a "
+                    "pointer, not a safety check: leads are never suppressed "
                     "because a size is constant, a guard seems nearby, or no input flow was "
-                    "witnessed. The first constructor is memory.copy.capacity. Costs one "
-                    "catalog bind on first call per graph (cached after). `frontiers` here reports "
-                    "coverage as counts (e.g. unbound_sinks_count); call candidate_census for the "
-                    "full roster of catalog sinks that never bound.",
+                    "witnessed. The result is bounded and paged with `leads`, `total`, and "
+                    "`next_offset`; call candidate_census for the full coverage roster. Calls "
+                    "against one session are serialized and the first cold bind can be expensive.",
      "inputSchema": {"type": "object", "properties": {
          "domain": {"type": "string"},
          # Wire name avoids the bare key `constructor`: it collides with
@@ -886,21 +903,45 @@ TOOLS = [
          "constructor_id": {"type": "string"},
          "language": {"type": "string", "enum": ["c", "python", "javascript", "typescript"]},
          "limit": {"type": "integer", "default": 40},
+         "offset": {"type": "integer", "default": 0},
          "cursor": {"type": "string"},
          "detail": {"type": "string", "enum": ["brief", "compact", "full"], "default": "compact",
                     "description": "brief (one-line scan: id/rank/callee/at/size), "
                                    "compact (triage capsule, no inferences), "
-                                   "full (whole capsule incl. inferences)"}}}},
+                                   "full (whole capsule incl. inferences)"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
     {"name": "candidate_detail",
      "description": "Return the complete neutral evidence capsule for one candidate id. It "
                     "contains observations and bounded inferences, but no safe/unsafe verdict.",
      "inputSchema": {"type": "object", "properties": {
-         "candidate_id": {"type": "string"}}, "required": ["candidate_id"]}},
+         "candidate_id": {"type": "string"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}, "required": ["candidate_id"]}},
     {"name": "candidate_census",
      "description": "Report constructor metadata, exhaustive counts, and explicit analysis "
                     "frontiers. Use this to distinguish an empty result from missing coverage.",
      "inputSchema": {"type": "object", "properties": {
-         "constructor_id": {"type": "string"}}}},
+         "constructor_id": {"type": "string"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
+    {"name": "explain",
+     "description": "One shot from a candidate (by id, or by the sink's file:line) to a "
+                    "judgeable picture: the obligation and where it lands, the guard the "
+                    "enclosing function does or does not place over it, the bounded reverse "
+                    "value-flow cone into the sink, and the enclosing function's source read "
+                    "inline -- the census->candidates->detail->sources_of->read_body chain "
+                    "composed into one result. Provenance and guard are evidence, not verdicts: "
+                    "an empty cone is 'nothing observed under this tier', not 'unreachable'. "
+                    "Pass candidate_id, or file and line.",
+     "inputSchema": {"type": "object", "properties": {
+         "candidate_id": {"type": "string",
+                          "description": "the candidate to explain (from candidates/census)"},
+         "file": {"type": "string", "description": "with `line`: locate the sink by position "
+                                                   "(full path, suffix, or basename)"},
+         "line": {"type": "integer", "description": "with `file`: the sink's source line"},
+         "provenance_limit": {"type": "integer", "default": 200,
+                              "description": "cap on reverse-cone source nodes shown"},
+         "max_source_chars": {"type": "integer", "default": 4000,
+                              "description": "cap on the inlined enclosing-function source"},
+         "temporal": _TEMPORAL_ARG, "hard_stop": _HARD_STOP_ARG}}},
     {"name": "skeleton",
      "description": "Render a function's sink map as a pseudo-function: every catalogued sink "
                     "(all families -- memory, os, file, ...) shown in place, each annotated with "
@@ -917,6 +958,15 @@ TOOLS = [
          "function": {"type": "string", "description": "function name or node id"},
          "candidate_id": {"type": "string", "description": "candidate id; renders its "
                           "enclosing function"}}}},
+    {"name": "enrich",
+     "description": "Warm this graph's sidecars once (the 2nd pass), so later flow_pass / leads / "
+                    "candidates / explain answer fast instead of paying the cost cold. Folds the "
+                    "dataflow tier over the whole graph and binds the catalog, and persists both "
+                    "beside the store (.dataflow.pb / .bind.pb) -- the difference between a >120s "
+                    "cold census and an instant one. Idempotent: a store already enriched is a "
+                    "no-op that just reports what is on disk. An unevaluated temporal family is "
+                    "reported as 'not evaluated', never 'clean'. No arguments.",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "flow_pass",
      "description": "Run the interprocedural flow pass (the 3rd pass) over the whole graph and "
                     "return its per-function SUMMARY census -- the layer beneath the skeletons. "
@@ -924,10 +974,31 @@ TOOLS = [
                     "sink-flow signatures (which value reaches which sink, guarded or not, and "
                     "the callee it flows through), and the pointer lifetime signatures "
                     "(alloc->use->free->escape). This is the composed, interprocedural summary "
-                    "the shape matcher runs on -- one call materializes and caches the pass. Use "
-                    "`function` to scope to one function; paginate with offset/limit.",
+                    "the shape matcher runs on -- one call materializes and caches the pass. The "
+                    "response returns counts and a bounded lead page, never the whole semantic "
+                    "graph. Use `function` to scope to one function; paginate with offset/limit.",
      "inputSchema": {"type": "object", "properties": {
          "function": {"type": "string", "description": "scope the census to one function"}}}},
+    {"name": "leads",
+     "description": "Query the flow pass's LEADS in memory -- the shape-matcher findings the "
+                    "3rd pass already computed and cached, not a fresh cold run. This is the "
+                    "warm counterpart to re-deriving leads by hand every question: the pass is "
+                    "materialized once (via `flow_pass`), then this filters the held result. No "
+                    "arg: a by-pattern summary plus the honesty fields (whether the run timed "
+                    "out, which functions were truncated) -- an empty result over a partial run "
+                    "is never 'clean'. `pattern` filters to one bug shape; `function` to one "
+                    "enclosing function; `at` locates by source position `file`, `file:line`, or "
+                    "`file:lo-hi` (a lead carries only its function + line, so the file is "
+                    "resolved through the symbol index; a basename or path suffix is enough). "
+                    "Leads are leads, not verdicts -- adjudicate with sources_of/reaches. "
+                    "Calls against one session are serialized; results are bounded and paged.",
+     "inputSchema": {"type": "object", "properties": {
+         "pattern": {"type": "string", "description": "keep only this bug-shape pattern"},
+        "function": {"type": "string", "description": "keep only leads in this function"},
+        "at": {"type": "string", "description": "locate by source position: file | file:line "
+                "| file:lo-hi"},
+        "offset": {"type": "integer", "default": 0},
+        "limit": {"type": "integer", "default": 40}}}},
     {"name": "flow_skeleton",
      "description": "Interprocedural flow skeletons: compose per-function summaries into "
                     "linear, nesting-aware {control|sink|lifecycle} streams STITCHED across "
@@ -937,8 +1008,9 @@ TOOLS = [
                     "guarded-vs-unguarded size differential) and TYPESTATE (a pointer's ordered "
                     "alloc/use/free/escape; feeds double-free / use-after-free / leak). Returns "
                     "shape-matcher LEADS (not verdicts -- adjudicate with sources_of/reaches). "
-                    "No arg: every lead, source-rooted first. Pass `function` to scope to one "
-                    "entry and see its rendered skeletons; `kind` to filter reach|typestate.",
+                    "No arg: every lead, source-rooted first. The response is bounded to a lead "
+                    "page and reports graph counts, never the whole graph. Pass `function` to "
+                    "scope to one entry and `kind` to filter reach|typestate.",
      "inputSchema": {"type": "object", "properties": {
          "function": {"type": "string", "description": "entry function name; scopes skeletons "
                       "and renders them"},
@@ -993,9 +1065,49 @@ def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
     return render_mod.render(name, result, offset=offset, limit=limit)
 
 
+def _tool_error(name, error):
+    """Return a recoverable, agent-readable error envelope for one tool call."""
+    message = str(error) or type(error).__name__
+    lowered = message.lower()
+    if "native" in lowered and ("kernel" in lowered or "rust" in lowered):
+        fix = ("install a platform wheel with `python -m pip install --upgrade lachesis-cpg`, "
+               "or build native/lifetime_kernel with cargo")
+    elif "path" in lowered or "graph" in lowered or "source" in lowered:
+        fix = "check the path and call `load_graph` or `build_graph` with a readable target"
+    elif "deadline" in lowered or "timeout" in lowered:
+        fix = "retry with a larger hard_stop/timeout, or request the structural fast path"
+    else:
+        fix = "inspect the message, then retry this tool; the MCP session remains available"
+    partial = list(getattr(error, "partial_leads", ()) or ())
+    return {
+        "move": name,
+        "ok": False,
+        "error": {"type": type(error).__name__, "message": message, "fix": fix},
+        "partial_leads": partial,
+    }
+
+
+def _json_tool_error(name, error, **extra):
+    """Serialize the same error contract for control-plane helpers."""
+    payload = _tool_error(name, error)
+    payload.update(extra)
+    return json.dumps(payload)
+
+
 def _capability_blocked(name, reason, prerequisite):
     return {"move": name, "supported": False, "status": "blocked",
             "reason": reason, "prerequisite": prerequisite}
+
+
+def _semantic_payload(semantic):
+    """Decode the semantic sidecar only for an explicit graph/report query."""
+    if not isinstance(semantic, dict):
+        return semantic.to_dict() if semantic is not None else {"nodes": {}, "edges": {}}
+    path = semantic.get("native_sidecar")
+    if not path:
+        return semantic
+    from lachesis.nav.semantic_query import load_semantic_sidecar
+    return load_semantic_sidecar(path).to_dict()
 
 
 def _semantic_lifecycle_report(c, args):
@@ -1005,7 +1117,7 @@ def _semantic_lifecycle_report(c, args):
     if semantic is None:
         return _capability_blocked("object_lifecycle", "no semantic graph was produced",
                                    "Pass 3 semantic graph")
-    payload = semantic.to_dict()
+    payload = _semantic_payload(semantic)
     raw_nodes = payload.get("nodes") or {}
     nodes = ([{"id": node_id, **(node or {})} for node_id, node in raw_nodes.items()]
              if isinstance(raw_nodes, dict) else list(raw_nodes))
@@ -1306,10 +1418,39 @@ def call_tool(name, args, format=None):
         return _emit(name, result, fmt, offset, limit)
 
     if name == "scan":
-        scan = c.scan_bundle_for(int(args.get("entrypoints", 0)))
+        lens = args.get("lens", "all")
+        if lens not in {"all", "guard-diff", "flow"}:
+            raise ValueError("lens must be one of: all, guard-diff, flow")
+        if lens == "guard-diff":
+            scan = c.scan_bundle_for(int(args.get("entrypoints", 0)))
+        elif lens == "flow":
+            bundle = c._flow_bundle(
+                deadline=c._resolve_deadline(args.get("hard_stop"), None))
+            leads = [lead.to_dict() if hasattr(lead, "to_dict") else lead
+                     for lead in bundle.get("leads") or ()]
+            scan = {
+                "constructor": "native-flow",
+                "queue": leads,
+                "census": bundle.get("coverage") or {},
+                "suppressions": [],
+            }
+        else:
+            result = c.candidates(
+                temporal=True, hard_stop=args.get("hard_stop"), limit=0,
+            )
+            queue = list(result.get("candidates") or ())
+            for group in result.get("groups") or ():
+                queue.extend(group.get("candidates") or ())
+            scan = {
+                "constructor": "all",
+                "queue": queue,
+                "census": result.get("coverage") or {},
+                "suppressions": [],
+                "temporal_evaluated": result.get("temporal_evaluated"),
+            }
         minimum = float(args.get("min_rank", 0.0))
         queue = [capsule for capsule in scan["queue"]
-                 if float(capsule.get("rank", 0.0)) >= minimum]
+                 if float(capsule.get("rank") or 0.0) >= minimum]
         start, size = max(0, offset), max(1, limit)
         page = queue[start:start + size]
         next_offset = start + len(page)
@@ -1320,9 +1461,10 @@ def call_tool(name, args, format=None):
         }
         result = {
             "move": "scan",
+            "lens": lens,
             "constructor": scan["constructor"],
             "census": scan["census"],
-            "queue": page,
+            "leads": page,
             "page": page_meta,
             "min_rank": minimum,
         }
@@ -1502,7 +1644,11 @@ def call_tool(name, args, format=None):
         return _emit(name, {**c.siblings.diff(hits[0]),
                             **_alts(store, args["sym"])}, fmt, offset, limit)
     if name in ("candidates", "candidate_detail", "candidate_census"):
-        bundle = c.candidate_bundle
+        # temporal:false is the guaranteed-bounded fast path (structural families, no dataflow
+        # tier); hard_stop bounds the temporal families so a slow graph degrades instead of
+        # hanging. Default matches the historical unbounded full bind.
+        bundle = c._bound_bind(temporal=args.get("temporal", True),
+                               hard_stop=args.get("hard_stop"), deadline=None)
         summary = bundle["atropos"]
         if not summary.get("applied"):
             return _emit(name, {
@@ -1521,6 +1667,8 @@ def call_tool(name, args, format=None):
         else:
             result = registry.census(args.get("constructor_id"))
         result["applied"] = True
+        # An absent temporal family means "not evaluated on this bounded run", never "clean".
+        result["temporal_evaluated"] = bool(bundle.get("temporal_evaluated"))
         # The per-language bind report carries the full `unbound` row lists
         # (hundreds of rows, ~90KB on a large catalog). That is coverage data:
         # it belongs on `candidate_census`, the move whose job is to distinguish
@@ -1528,6 +1676,38 @@ def call_tool(name, args, format=None):
         # counts only, so a list page stays bounded. Nothing is dropped -- the
         # rows are one census call away.
         result["atropos"] = _atropos_envelope(summary, full=(name == "candidate_census"))
+        if name == "candidates":
+            rows = list(result.get("candidates") or ())
+            for group in result.get("groups") or ():
+                rows.extend(group.get("candidates") or ())
+            rows.sort(key=lambda row: float(row.get("rank") or 0.0), reverse=True)
+            start = max(0, int(args.get("offset", 0)))
+            size = max(1, int(args.get("limit", 40)))
+            page = rows[start:start + size]
+            next_offset = start + len(page)
+            result.pop("candidates", None)
+            result.pop("groups", None)
+            result["leads"] = page
+            result["page"] = {
+                "total": len(rows), "offset": start, "returned": len(page),
+                "has_more": next_offset < len(rows),
+                "next_offset": next_offset if next_offset < len(rows) else None,
+            }
+        return _emit(name, result, fmt, offset, limit)
+    if name == "explain":
+        # The census->candidates->detail->sources_of->read_body chain in one call, over the
+        # shared Analysis.explain. Bounded like every candidate move (temporal/hard_stop); the
+        # provenance walk folds only a cone around the sink, never the whole graph.
+        common = {"temporal": args.get("temporal", True), "hard_stop": args.get("hard_stop"),
+                  "provenance_limit": int(args.get("provenance_limit", 200)),
+                  "max_source_chars": int(args.get("max_source_chars", 4000))}
+        if args.get("candidate_id"):
+            result = c.explain(args["candidate_id"], **common)
+        elif args.get("file") and args.get("line") is not None:
+            result = c.explain_sink(args["file"], int(args["line"]), **common)
+        else:
+            result = {"move": "explain",
+                      "error": "pass candidate_id, or both file and line"}
         return _emit(name, result, fmt, offset, limit)
     if name == "skeleton":
         bundle = c.candidate_bundle
@@ -1553,86 +1733,91 @@ def call_tool(name, args, format=None):
                                 "error": "pass either `function` or `candidate_id`"}, fmt)
         result["move"] = "skeleton"
         return _emit(name, result, fmt, offset, limit)
+    if name == "enrich":
+        result = c.enrich()
+        result["move"] = "enrich"
+        return _emit(name, result, fmt, offset, limit)
     if name == "flow_pass":
         bundle = c.flow_bundle
-        summaries, F = bundle["summaries"], bundle["F"]
-        fn = args.get("function")
-        names = [fn] if fn else sorted(summaries)
-        if fn and fn not in summaries:
-            return _emit(name, {"move": "flow_pass",
-                                "error": f"no function named {fn!r} in the pass"}, fmt)
-        rows = []
-        for nm in names:
-            s = summaries[nm]
-            flows = []
-            for f in s["sink_flows"]:
-                if not f["guarded"]:
-                    g = "UNGUARDED"
-                elif f.get("site_guarded"):
-                    g = "G[" + ",".join(f["guards"]) + "]"
-                else:
-                    g = "G~[" + ",".join(f["guards"]) + "]"
-                via = "" if f["via"] == "direct" else f"~{f['via']}"
-                val = f["value"] or f["provenance"] or "expr"
-                flows.append(f"{val}->{f['sink']}({g}){via}")
-            life = []
-            for v, evs in s.get("typestate", {}).items():
-                life.append(f"{v}:" + "->".join(e["kind"] for e in evs))
-            for v, evs in s.get("param_typestate", {}).items():
-                life.append(f"param {v}:" + "->".join(e["kind"] for e in evs))
-            rows.append({"name": nm, "taxonomy": s["taxonomy"],
-                         "is_source": F.get(nm, {}).get("is_source", False),
-                         "flows": flows, "lifetime": life,
-                         "frees": sorted(s.get("frees_params", {})),
-                         "returns": s.get("returns", "value")})
-        # Most-informative first: sources, then functions carrying flows, then the rest.
-        rows.sort(key=lambda r: (not r["is_source"], not r["flows"], r["name"]))
-        result = {
+        semantic = bundle.get("semantic_graph")
+        payload = _semantic_payload(semantic)
+        rows = [Lead.from_dict(lead) for lead in (bundle.get("leads") or ())]
+        function = args.get("function")
+        if function:
+            rows = [lead for lead in rows if lead.entry == function]
+        page = rows[offset:offset + max(1, limit)]
+        next_offset = offset + len(page)
+        return _emit(name, {
             "move": "flow_pass",
-            "counts": {"functions": len(summaries),
-                       "with_flows": sum(1 for n in summaries if summaries[n]["sink_flows"]),
-                       "sources": sum(1 for n in summaries
-                                      if F.get(n, {}).get("is_source", False)),
-                       "skeletons": len(bundle["skeletons"]), "leads": len(bundle["leads"])},
-            "functions": rows,
+            "counts": {
+                "semantic_nodes": len(payload.get("nodes") or {}),
+                "semantic_edges": sum(len(edges) for edges in
+                                      (payload.get("edges") or {}).values()),
+                "leads": len(rows),
+            },
+            "leads": [lead.to_dict() for lead in page],
+            "page": {"total": len(rows), "offset": offset,
+                     "returned": len(page), "has_more": next_offset < len(rows),
+                     "next_offset": next_offset if next_offset < len(rows) else None},
+            "semantic_graph": {"available": semantic is not None,
+                               "nodes": len(payload.get("nodes") or {}),
+                               "edges": sum(len(edges) for edges in
+                                             (payload.get("edges") or {}).values())},
             "lifetime": bundle.get("lifetime", {}),
-        }
+        }, fmt, offset, limit)
+    if name == "leads":
+        # The warm counterpart to a cold re-run: `flow_bundle` is already materialized and
+        # cached on the ctx, so this wraps it in a LeadSet and filters in memory. Same
+        # LeadSet the library returns -- one implementation, queried from both surfaces.
+        ls = LeadSet._from_bundle(c.flow_bundle, c.store)
+        pattern, function, at = args.get("pattern"), args.get("function"), args.get("at")
+        if pattern:
+            ls = ls.by_pattern(pattern)
+        if function:
+            ls = ls.by_function(function)
+        if at:
+            file, lines = _parse_at(at)
+            ls = ls.near(file, lines)
+        # A bare call (or a summary-shaped one) returns the honest overview; a filtered call
+        # returns the matching rows plus that overview so a thin/empty result still carries
+        # whether the run was partial.
+        start = max(0, int(args.get("offset", 0)))
+        size = max(1, int(args.get("limit", 40)))
+        page = list(ls)[start:start + size]
+        next_offset = start + len(page)
+        result = {"move": "leads", "summary": ls.summary(),
+                  "leads": [lead.to_dict() for lead in page],
+                  "page": {"total": len(ls), "offset": start,
+                           "returned": len(page), "has_more": next_offset < len(ls),
+                           "next_offset": next_offset if next_offset < len(ls) else None}}
         return _emit(name, result, fmt, offset, limit)
     if name == "flow_skeleton":
         bundle = c.flow_bundle
-        all_skels, leads = bundle["skeletons"], bundle["leads"]
-        kind, fn = args.get("kind"), args.get("function")
-        skels = all_skels
-        _reach_pats = ("reachability", "relational", "presence")
-        if kind in ("reach", "typestate"):
-            skels = [s for s in skels if s["kind"] == kind]
-            want_reach = kind == "reach"
-            leads = [l for l in leads
-                     if (l.get("pattern") in _reach_pats) == want_reach]
-        if fn:
-            skels = [s for s in skels if s["entry"] == fn]
-            leads = [l for l in leads if l.get("entry") == fn]
-            if not skels and not leads:
-                return _emit(name, {"move": "flow_skeleton",
-                                    "error": f"no flow skeletons for entry {fn!r}"}, fmt)
-        result = {
+        semantic = bundle.get("semantic_graph")
+        payload = _semantic_payload(semantic)
+        fn = args.get("function")
+        leads = [Lead.from_dict(lead) for lead in bundle.get("leads") or ()
+                 if not fn or lead.get("entry") == fn]
+        page = leads[offset:offset + max(1, limit)]
+        next_offset = offset + len(page)
+        return _emit(name, {
             "move": "flow_skeleton",
-            "counts": {"skeletons": len(all_skels),
-                       "reach": sum(1 for s in all_skels if s["kind"] == "reach"),
-                       "typestate": sum(1 for s in all_skels if s["kind"] == "typestate"),
-                       "leads": len(bundle["leads"])},
-            "leads": leads,
+            "counts": {
+                "semantic_nodes": len(payload.get("nodes") or {}),
+                "semantic_edges": sum(len(edges) for edges in
+                                      (payload.get("edges") or {}).values()),
+                "leads": len(leads),
+            },
+            "semantic_graph": {"available": semantic is not None,
+                               "nodes": len(payload.get("nodes") or {}),
+                               "edges": sum(len(edges) for edges in
+                                             (payload.get("edges") or {}).values())},
+            "leads": [lead.to_dict() for lead in page],
+            "page": {"total": len(leads), "offset": offset,
+                     "returned": len(page), "has_more": next_offset < len(leads),
+                     "next_offset": next_offset if next_offset < len(leads) else None},
             "lifetime": bundle.get("lifetime", {}),
-        }
-        # Render skeleton text only when scoped -- the whole-graph stream would be huge.
-        if fn or kind:
-            from lachesis.flow import render_text as render_flow_skeleton
-            result["skeletons"] = [
-                {"entry": s["entry"], "kind": s["kind"], "sink": s.get("sink"),
-                 "var": s.get("var"), "is_source": s["is_source"],
-                 "complete": s.get("complete", True), "text": render_flow_skeleton(s)}
-                for s in sorted(skels, key=lambda x: (not x["is_source"], x["entry"]))]
-        return _emit(name, result, fmt, offset, limit)
+        }, fmt, offset, limit)
     if name == "taint":
         return _emit(name, _taint(c.store, args), fmt, offset, limit)
     raise ValueError(f"unknown tool: {name}")
@@ -1646,123 +1831,107 @@ def _taint(store, args):
     propagation happen here, in RAM, on top of it. That keeps the cache unambiguous
     and confines every catalog effect to this one on-demand tool.
     """
-    from lachesis.integrations.atropos.enrich import atropos_enrich
-    from lachesis.core.overlays.taint import TaintPropagation
-    from lachesis.nav.kuzu_index import materialize_graph
+    # Pass 2 already emits native taint role/reach records into the binary dataflow
+    # overlay. Read those records directly; the deleted Python overlay solver must not
+    # be reintroduced merely because an MCP client asks for taint evidence.
+    store.ensure_dataflow_tier()
+    index = store.index
+    role_by_value = {}
+    for role in index.nodes_of_kind("source", "sink"):
+        properties = role.get("properties") or {}
+        value_id = properties.get("value_id")
+        if value_id:
+            role_by_value[value_id] = role
 
-    store.ensure_dataflow_tier()  # whole-graph value flow, built once then cached to disk
-    graph = materialize_graph(store.index)
-    stamped, summary = atropos_enrich(graph)
-    if not summary.get("applied"):
-        return {"move": "taint", "applied": False, "reason": summary.get("reason"),
-                "hint": "no Atropos catalog found; set ATROPOS_ROOT or place a checkout "
-                        "at ../atropos, then reload"}
-
-    by_id = {n["id"]: n for n in stamped["nodes"]}
-    marked = {}  # value_id -> the atropos role node that stamped it
-    for node in stamped["nodes"]:
-        props = node.get("properties", {})
-        if props.get("fact_origin") == "atropos-model" and "value_id" in props:
-            marked[props["value_id"]] = node
+    def _node(value_id):
+        return store.node(value_id) or {}
 
     def _loc(value_id):
-        props = by_id.get(value_id, {}).get("properties", {})
-        f = props.get("absolute_file") or props.get("file")
-        line = props.get("start_line")
-        return f"{f}:{line}" if f else None
+        properties = _node(value_id).get("properties") or {}
+        file = properties.get("absolute_file") or properties.get("file")
+        line = properties.get("start_line") or properties.get("line")
+        return f"{file}:{line}" if file else None
 
     def _label(value_id):
-        node = by_id.get(value_id, {})
-        return node.get("label") or (node.get("properties", {}) or {}).get("label") or value_id
+        node = _node(value_id)
+        return node.get("label") or (node.get("properties") or {}).get("label") or value_id
 
     rows = []
-    witnessed = set()  # value_ids that took part in at least one reach
-    for witness in TaintPropagation().enrich(stamped).nodes:
-        if witness.get("kind") != "taint-reach":
+    witnessed = set()
+    for witness in index.nodes_of_kind("taint-reach"):
+        properties = witness.get("properties") or {}
+        source_role = role_by_value.get(properties.get("source_id"))
+        sink_role = role_by_value.get(properties.get("sink_id"))
+        witness_ids = properties.get("witness_ids") or []
+        if not isinstance(witness_ids, list):
+            witness_ids = [witness_ids]
+        if not witness_ids:
             continue
-        props = witness.get("properties", {})
-        sv, kv = props.get("source_value_id"), props.get("sink_value_id")
-        witnessed.add(sv)
-        witnessed.add(kv)
-        src_role, sink_role = marked.get(sv), marked.get(kv)
-        model_props = (sink_role or src_role or {}).get("properties", {})
-        # The witness path taint actually walked, source->sink, as addressable hops.
-        # Taint propagates over REACHING_DEF/summary edges, which `reaches` does not
-        # walk (it follows VALUE_FLOWS_TO/POINTS_TO) -- so a witnessed pair can return
-        # 0 hops under `reaches`. Surfacing the path here lets an agent adjudicate the
-        # lead directly (read source at each hop) instead of re-deriving it.
-        witness_ids = props.get("witness_ids") or []
-        path = [{"id": vid, "label": _label(vid), "at": _loc(vid)} for vid in witness_ids]
+        source_value, sink_value = witness_ids[0], witness_ids[-1]
+        witnessed.update(witness_ids)
+        source_props = (source_role or {}).get("properties") or {}
+        sink_props = (sink_role or {}).get("properties") or {}
+        path = [{"id": value, "label": _label(value), "at": _loc(value)}
+                for value in witness_ids]
         rows.append({
-            "source": _label(sv), "source_at": _loc(sv), "source_id": sv,
-            "sink": _label(kv), "sink_at": _loc(kv), "sink_id": kv,
-            "source_model": (src_role or {}).get("properties", {}).get("model_id"),
-            "sink_model": (sink_role or {}).get("properties", {}).get("model_id"),
-            "cwe": model_props.get("cwe", []),
-            "atropos_connected": bool(src_role or sink_role),
-            "hops": len(path),
-            "path": path,
+            "source": _label(source_value), "source_at": _loc(source_value),
+            "source_id": source_value, "sink": _label(sink_value),
+            "sink_at": _loc(sink_value), "sink_id": sink_value,
+            "source_model": source_props.get("model_id"),
+            "sink_model": sink_props.get("model_id"),
+            "atropos_connected": bool(source_role or sink_role),
+            "hops": len(path), "path": path,
         })
-    # A catalog-driven reach is the point of the tool, so those sort first.
-    rows.sort(key=lambda r: not r["atropos_connected"])
-    total = len(rows)
-    connected = sum(1 for r in rows if r["atropos_connected"])
-    if args.get("atropos_only"):
-        rows = [r for r in rows if r["atropos_connected"]]
 
-    # Bound endpoints that never took part in a reach. These are the addressable
-    # seeds for the dataflow tools -- `sources_of <sink_id>` / `flow <source_id>`
-    # over MCP, no name resolution needed (the endpoint is an external callee's
-    # arg the name index can't reach). On a C graph this listing is the frontier
-    # where the value-flow gaps sever the source->sink chain.
-    lim = int(args.get("limit", 50))
-    unwit = {"sources": [], "sinks": []}
-    for value_id, role_node in marked.items():
+    rows.sort(key=lambda row: not row["atropos_connected"])
+    if args.get("atropos_only"):
+        rows = [row for row in rows if row["atropos_connected"]]
+    limit = max(1, int(args.get("limit", 50)))
+    unwitnessed = {"sources": [], "sinks": []}
+    for value_id, role in role_by_value.items():
         if value_id in witnessed:
             continue
-        bucket = role_node.get("kind")
-        if bucket not in ("source", "sink"):
+        kind = role.get("kind")
+        if kind not in unwitnessed:
             continue
-        rp = role_node.get("properties", {})
-        unwit[bucket + "s"].append({
+        props = role.get("properties") or {}
+        unwitnessed[kind].append({
             "id": value_id, "label": _label(value_id), "at": _loc(value_id),
-            "model": rp.get("model_id"), "cwe": rp.get("cwe", []),
+            "model": props.get("model_id"),
         })
     return {
-        "move": "taint", "applied": True,
-        "atropos_root": summary["atropos_root"],
-        "languages": summary["languages"],
-        "bind": summary["per_language"],
-        "role_nodes": summary["role_nodes"],
-        "witness_count": total,
-        "atropos_connected": connected,
-        "witnesses": rows[:lim],
+        "move": "taint", "applied": True, "backend": "native-rust",
+        "witness_count": len(rows),
+        "atropos_connected": sum(row["atropos_connected"] for row in rows),
+        "witnesses": rows[:limit],
         "unwitnessed": {
-            "sources": unwit["sources"][:lim],
-            "sinks": unwit["sinks"][:lim],
-            "source_total": len(unwit["sources"]),
-            "sink_total": len(unwit["sinks"]),
+            "sources": unwitnessed["sources"][:limit],
+            "sinks": unwitnessed["sinks"][:limit],
+            "source_total": len(unwitnessed["sources"]),
+            "sink_total": len(unwitnessed["sinks"]),
         },
     }
-
 
 def _build_graph(args):
     """Build (or reuse) a graph for a source directory, then attach it in one call.
 
     Zero-config on-ramp: an agent that only has a repo path can call this and go, with no
-    prior `lachesis-analyze` step. In-process wrapper around `ensure_graph`, the same
+    prior `lachesis build` step. In-process wrapper around `ensure_graph`, the same
     build-or-reuse path the server's own startup uses — content-addressed, so a second
     build of an unchanged tree returns instantly from cache. On success the freshly built
     store is loaded exactly as `load_graph` would, so the next tool call hits it."""
-    source = args.get("source") or args.get("path")
+    source = _expand(args.get("source") or args.get("path"))
     if not source or not os.path.isdir(source):
-        return json.dumps({"error": f"source must be an existing directory: {source!r}"})
+        return _json_tool_error(
+            "build_graph", ValueError(f"source must be an existing directory: {source!r}"))
     try:
         timeout = int(args.get("timeout_seconds", 300))
     except (TypeError, ValueError):
-        return json.dumps({"error": "timeout_seconds must be an integer number of seconds"})
+        return _json_tool_error(
+            "build_graph", ValueError("timeout_seconds must be an integer number of seconds"))
     if timeout < 1:
-        return json.dumps({"error": "timeout_seconds must be greater than zero"})
+        return _json_tool_error(
+            "build_graph", ValueError("timeout_seconds must be greater than zero"))
     refresh = bool(args.get("refresh"))
     from lachesis.cache import entry_for
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
@@ -1772,20 +1941,26 @@ def _build_graph(args):
                                             timeout_seconds=timeout)
     except EnvironmentProblem as error:
         # A missing frontend toolchain (node for TS/JS, clang for C). Actionable, not a crash.
-        return json.dumps({"error": "missing toolchain prerequisite",
-                           "checks": [{"name": c.name, "detail": c.detail, "fix": c.fix}
-                                      for c in error.checks if not c.ok]})
+        return _json_tool_error(
+            "build_graph", error,
+            checks=[{"name": c.name, "detail": c.detail, "fix": c.fix}
+                    for c in error.checks if not c.ok],
+        )
     except NoSourceFound as error:
-        return json.dumps({"error": str(error)})
+        return _json_tool_error("build_graph", error)
     except Exception as error:  # noqa: BLE001 - a frontend timeout or compile failure
-        return json.dumps({"error": f"build failed: {error}",
-                           "hint": "large trees can exceed timeout_seconds (default 300); "
-                                   "raise it and retry, or run lachesis-analyze out of band"})
+        return _json_tool_error(
+            "build_graph", RuntimeError(f"build failed: {error}"),
+            hint="large trees can exceed timeout_seconds (default 300); raise it and retry, "
+                 "or run lachesis build out of band",
+        )
     meta = entry_for(source).meta() or {}
     loaded = json.loads(_load_graph({"path": str(graph_path)}))
     if "error" in loaded:  # built fine but could not attach — surface that, not a fake success
-        return json.dumps({"error": loaded["error"], "graph": str(graph_path),
-                           "rebuilt": rebuilt})
+        return _json_tool_error(
+            "build_graph", RuntimeError(loaded["error"]), graph=str(graph_path),
+            rebuilt=rebuilt,
+        )
     return json.dumps({"move": "build_graph", "graph": str(graph_path),
                        "rebuilt": rebuilt,
                        "nodes": meta.get("nodes", loaded.get("nodes")),
@@ -1798,11 +1973,12 @@ def _load_graph(args):
     """Runtime target switch: repoint the server and drop the cached ctx so the next
     tool call rebuilds against the new graph (load-once still holds within a target)."""
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _CTX
-    path = args.get("path")
+    path = _expand(args.get("path"))
     if not path or not os.path.exists(path):
-        return json.dumps({"error": f"graph path not found: {path!r}"})
+        return _json_tool_error(
+            "load_graph", ValueError(f"graph path not found: {path!r}"))
     _GRAPH_PATH = path
-    _OVERLAY_PATH = args.get("overlay")
+    _OVERLAY_PATH = _expand(args.get("overlay"))
     prof = args.get("profile")
     if prof in ("all", "comprehension"):
         _PROFILE = prof
@@ -1817,10 +1993,62 @@ def send(obj):
     sys.stdout.flush()
 
 
+def _dispatch(msg):
+    """Handle one JSON-RPC message, replying via ``send``.
+
+    Split out of the read loop so that ``main`` can wrap a single request in one
+    try/except: a failure in *any* branch (tool call, tools/list, a serialization
+    error) becomes a JSON-RPC error for that one request, never a loop-killing
+    traceback that takes all tools with it. Tool dispatch is held under
+    ``_DISPATCH_LOCK`` so a load_graph swap stays atomic against an overlapping call."""
+    mid, method = msg.get("id"), msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": _visible_tools()}})
+    elif method == "tools/call":
+        p = msg.get("params") or {}
+        try:
+            a = p.get("arguments") or {}
+            with _DISPATCH_LOCK:
+                text = call_tool(p["name"], a, format=a.get("format"))
+            structured = None
+            try:
+                candidate = json.loads(text)
+                if isinstance(candidate, dict) and candidate.get("ok") is False:
+                    structured = candidate
+            except (TypeError, ValueError):
+                pass
+            if structured is not None:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "result": {"content": [{"type": "text", "text": text}],
+                                 "structuredContent": structured, "isError": True}})
+                return
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"content": [{"type": "text", "text": text}]}})
+        except Exception as e:  # noqa: BLE001 - one tool's failure is that call's error
+            log("tool error:", e)
+            error_payload = _tool_error(p.get("name", "tool"), e)
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"content": [{"type": "text", "text": json.dumps(error_payload)}],
+                             "structuredContent": error_payload,
+                             "isError": True}})
+    elif method == "ping":
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif mid is not None:
+        send({"jsonrpc": "2.0", "id": mid,
+              "error": {"code": -32601, "message": f"method not found: {method}"}})
+
+
 def main():
     global _GRAPH_PATH, _OVERLAY_PATH, _PROFILE, _DEFAULT_FORMAT
     if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
-        print("usage: lachesis-mcp [graph.kuzu] [overlay] [profile]")
+        print("usage: lachesis mcp [graph.kuzu] [overlay] [profile]")
         print("Serve a Lachesis graph over MCP stdio; --version prints the installed version.")
         return 0
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
@@ -1828,7 +2056,7 @@ def main():
         return 0
     # Config precedence: explicit argv wins, else env. The graph path may come from
     # argv[1] or LACHESIS_GRAPH; a session can also (re)attach at runtime via load_graph.
-    _GRAPH_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH")
+    _GRAPH_PATH = _expand(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LACHESIS_GRAPH"))
     # A graph only exists after a build somebody had to know to run, which made this
     # server unusable as the first thing anyone tries. So a directory is accepted in
     # the graph's place, and no argument at all means the working directory: the
@@ -1843,13 +2071,13 @@ def main():
             graph, _ = ensure_graph(source, progress=Progress(enabled=True))
         except EnvironmentProblem as error:
             for check in error.checks:
-                print(f"lachesis-mcp: {check.name}: {check.detail}", file=sys.stderr)
+                print(f"lachesis mcp: {check.name}: {check.detail}", file=sys.stderr)
             return 3
         except NoSourceFound as error:
-            print(f"lachesis-mcp: {error}", file=sys.stderr)
+            print(f"lachesis mcp: {error}", file=sys.stderr)
             return 2
         _GRAPH_PATH = str(graph)
-    _OVERLAY_PATH = sys.argv[2] if len(sys.argv) > 2 else None
+    _OVERLAY_PATH = _expand(sys.argv[2] if len(sys.argv) > 2 else None)
     # Profile: explicit 3rd argv wins, else env (LACHESIS_PROFILE, back-compat
     # LACHESIS_MCP_PROFILE), else the default "all". Only "comprehension" narrows the
     # surface; any other value falls back to "all".
@@ -1870,33 +2098,24 @@ def main():
         except Exception as e:  # noqa: BLE001
             log("bad json:", e)
             continue
-        mid, method = msg.get("id"), msg.get("method")
-        if method == "initialize":
-            send({"jsonrpc": "2.0", "id": mid, "result": {
-                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}}})
-        elif method == "notifications/initialized":
-            pass
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": _visible_tools()}})
-        elif method == "tools/call":
-            p = msg.get("params") or {}
-            try:
-                a = p.get("arguments") or {}
-                text = call_tool(p["name"], a, format=a.get("format"))
-                send({"jsonrpc": "2.0", "id": mid,
-                      "result": {"content": [{"type": "text", "text": text}]}})
-            except Exception as e:  # noqa: BLE001
-                log("tool error:", e)
-                send({"jsonrpc": "2.0", "id": mid,
-                      "result": {"content": [{"type": "text", "text": f"error: {e}"}],
-                                 "isError": True}})
-        elif method == "ping":
-            send({"jsonrpc": "2.0", "id": mid, "result": {}})
-        elif mid is not None:
-            send({"jsonrpc": "2.0", "id": mid,
-                  "error": {"code": -32601, "message": f"method not found: {method}"}})
+        try:
+            _dispatch(msg)
+        except (BrokenPipeError, KeyboardInterrupt):
+            # The client hung up (or Ctrl-C) mid-write; there is nothing left to send.
+            # Leave the loop cleanly instead of dumping a traceback that reads as a crash.
+            log("client disconnected; shutting down")
+            break
+        except Exception as e:  # noqa: BLE001 - one request must never kill the server
+            # A failure anywhere in dispatch (even initialize/tools/list) is reported as
+            # an error for that single request; the server keeps serving all 46 tools.
+            log("dispatch error:", e)
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            if mid is not None:
+                try:
+                    send({"jsonrpc": "2.0", "id": mid,
+                          "error": {"code": -32603, "message": f"internal error: {e}"}})
+                except Exception:  # noqa: BLE001 - client already gone
+                    break
 
 
 if __name__ == "__main__":

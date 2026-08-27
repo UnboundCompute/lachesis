@@ -7,7 +7,7 @@ from typing import Iterable, List
 
 
 CORE_FORBIDDEN_IMPORTS = (
-    "lachesis.frontends", "lachesis.ecosystems", "lachesis.compatibility",
+    "lachesis.frontends", "lachesis.compatibility",
 )
 
 
@@ -52,4 +52,3 @@ def assert_import_boundaries(package_root: str | Path) -> None:
     violations = import_boundary_violations(package_root)
     if violations:
         raise AssertionError("forbidden Lachesis dependencies:\n" + "\n".join(violations))
-

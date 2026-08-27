@@ -1,21 +1,22 @@
 # Querying the graph
 
-Once a graph is built there are three ways to ask it questions: `lachesis-query`,
-the verdict-free `lachesis-candidates` worklist command, and the `lachesis-mcp`
-server that exposes both kinds of reasoning to an LLM agent. This page is the
-reference for them. For a hands-on run of the most
-important ones, follow [`examples/README.md`](../examples/README.md).
+Once a graph is built there are three ways to ask it questions: `lachesis query`,
+the verdict-free `lachesis candidates` worklist command, and the `lachesis mcp`
+server that exposes both kinds of reasoning to an LLM agent. All three are
+subcommands of the one `lachesis` entrypoint. This page is the reference for them.
+For a hands-on run of the most important ones, follow
+[`examples/README.md`](../examples/README.md).
 
 Both surfaces read the same canonical graph and speak in terms of the
 [graph model](./graph-model.md): node kinds, edge kinds, and tiers.
 
-## The `lachesis-query` command line
+## The `lachesis query` command line
 
 ```
-lachesis-query [--budget-tokens N] [--format json|text] <graph> <command> [args]
+lachesis query [--budget-tokens N] [--format json|text] <graph> <command> [args]
 ```
 
-`<graph>` is a store directory built by `lachesis-analyze`. Two global flags apply
+`<graph>` is a store directory built by `lachesis build`. Two global flags apply
 to every command:
 
 - `--format json` (default) emits the full result dict. `--format text` emits a
@@ -48,10 +49,10 @@ with `differential_siblings: ["getInvoice"]`, and `security-path` on the unguard
 taint-reach node prints the four-hop path from the public parameter to the
 `findById` sink.
 
-## The `lachesis-mcp` server
+## The `lachesis mcp` server
 
 ```
-lachesis-mcp [graph.kuzu | source-dir] [overlay.json] [profile]
+lachesis mcp [graph.kuzu | source-dir] [overlay.json] [profile]
 ```
 
 The server speaks MCP over stdio as `nav-reasoning`. It loads the graph once at
@@ -64,7 +65,7 @@ path. Start the server with no argument and the client config stays path-free:
 ```json
 {
   "mcpServers": {
-    "lachesis": { "command": "lachesis-mcp" }
+    "lachesis": { "command": "lachesis", "args": ["mcp"] }
   }
 }
 ```
@@ -85,8 +86,8 @@ absolute path and the server serves that graph directly:
 {
   "mcpServers": {
     "lachesis": {
-      "command": "lachesis-mcp",
-      "args": ["/abs/path/to/graph.kuzu"]
+      "command": "lachesis",
+      "args": ["mcp", "/abs/path/to/graph.kuzu"]
     }
   }
 }
@@ -100,8 +101,8 @@ environment:
 {
   "mcpServers": {
     "lachesis": {
-      "command": "/absolute/path/to/venv/bin/lachesis-mcp",
-      "args": ["/absolute/path/to/graph.kuzu"]
+      "command": "/absolute/path/to/venv/bin/lachesis",
+      "args": ["mcp", "/absolute/path/to/graph.kuzu"]
     }
   }
 }
@@ -211,9 +212,9 @@ evidence, and ranks. The LLM remains the judge.
 The same registry is available for batch use:
 
 ```bash
-lachesis-candidates graph.kuzu --constructor memory.copy.capacity --limit 40
-lachesis-candidates graph.kuzu --constructor memory.copy.capacity --census
-lachesis-candidates graph.kuzu --candidate-id obl_...
+lachesis candidates graph.kuzu --constructor memory.copy.capacity --limit 40
+lachesis candidates graph.kuzu --constructor memory.copy.capacity --census
+lachesis explain graph.kuzu obl_...        # the one-shot capsule for a single candidate
 ```
 
 This batch command emits JSON and binds against the core symbol index. It does not

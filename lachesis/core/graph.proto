@@ -73,6 +73,42 @@ message ShardSetManifest {
   repeated ShardSetEntry shards = 3;
 }
 
+// Path-only binary handoff for projecting several language frontend shards.
+// Paths are metadata; the records remain in their immutable protobuf files.
+message NativeShardInput {
+  string frontend_id = 1;
+  string nodes_path = 2;
+  string edges_path = 3;
+}
+
+message NativeShardSet {
+  uint32 format_version = 1;
+  repeated NativeShardInput shards = 2;
+}
+
+// Binary request envelope for native frontends.  It is deliberately language
+// neutral: the caller supplies source units and their already-resolved compiler
+// arguments, while the native frontend owns parsing and shard emission.  No
+// source graph or compiler state crosses the boundary as a text format.
+message NativeFrontendRequest {
+  uint32 format_version = 1;
+  string frontend_id = 2;
+  string source_dir = 3;
+  repeated NativeTranslationUnit translation_units = 4;
+}
+
+message NativeTranslationUnit {
+  string path = 1;
+  repeated string arguments = 2;
+}
+
+// Binary root-set handoff used by every frontend subprocess. The environment
+// variable names the file for compatibility, but its contents are protobuf.
+message FrontendRoots {
+  uint32 format_version = 1;
+  repeated string paths = 2;
+}
+
 message DataflowOverlay {
   string overlay_id = 1;
   string source = 2;
@@ -86,6 +122,18 @@ message DataflowOverlay {
 message Document {
   uint32 format_version = 1;
   ObjectValue fields = 2;
+}
+
+// Typed cache envelope for the structural Pass-2 bind.  The graph records are
+// kept in their native repeated-message form; only the small cache header,
+// stamped metadata, and Atropos summary use the generic document value.
+message BindCache {
+  uint32 format_version = 1;
+  Document header = 2;
+  Document stamped_meta = 3;
+  repeated NodeRecord nodes = 4;
+  repeated EdgeRecord edges = 5;
+  Document summary = 6;
 }
 
 // Typed frontend tier payload. Keeping records typed avoids repeating the field

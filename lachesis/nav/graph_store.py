@@ -28,8 +28,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import tempfile
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,7 +37,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lachesis.nav.graphlib import GraphLib
 from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
-from lachesis.core.graph_wire import decode_overlay, encode_overlay
+from lachesis.core.graph_wire import (
+    decode_overlay, is_dataflow_stream, read_dataflow_stream,
+    read_dataflow_stream_header,
+)
 
 
 def node_view(node: dict) -> dict:
@@ -88,7 +91,9 @@ def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
     if not core_hash or not os.path.isfile(path):
         return False
     try:
-        payload = decode_overlay(Path(path).read_bytes())
+        sidecar = Path(path)
+        payload = (read_dataflow_stream_header(sidecar) if is_dataflow_stream(sidecar)
+                   else decode_overlay(sidecar.read_bytes()))
     except (OSError, ValueError, TypeError):
         return False
     return payload.get("version") == 1 and payload.get("core_content_hash") == core_hash
@@ -106,7 +111,10 @@ def _merge_overlays(primary: Overlay, secondary: Overlay) -> Overlay:
 
 def _load_dataflow_overlay(path: str) -> Overlay:
     """Load the internal protobuf dataflow sidecar."""
-    return Overlay.from_dict(decode_overlay(Path(path).read_bytes()))
+    sidecar = Path(path)
+    payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
+               else decode_overlay(sidecar.read_bytes()))
+    return Overlay.from_dict(payload)
 
 
 def joined_store_path(graph_path: str) -> str:
@@ -213,7 +221,7 @@ def _rejoin(graph_path: str, manifest: dict) -> str:
             f"{graph_path} is a reduced store built from {source_dir}, which has "
             f"changed since (recorded {recorded[:12]}, now {current[:12]}). Its stored "
             f"semantics describe source that is no longer there; rebuild it with "
-            f"`lachesis-analyze {source_dir} {graph_path} --reduced`."
+            f"`lachesis build {source_dir} {graph_path} --reduced`."
         )
     cache = joined_store_path(graph_path)
     if _joined_cache_matches(cache, current):
@@ -265,6 +273,8 @@ def _copy_frontend_inventory(core_path: str, cache_path: str) -> None:
         handle.write("\n")
 
 
+# The dataflow tier still inflates the whole store back into Python objects and folds four
+# overlays over it, all in RAM. The streaming delta sidecar removes the old core/enriched
 class GraphStore:
     """Everything a reasoning move needs, loaded once and shared."""
 
@@ -289,6 +299,7 @@ class GraphStore:
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
+        self._retained_enriched_graph = None
 
     @classmethod
     def from_graphlib(cls, gl: GraphLib, graph_path: str | None = None,
@@ -308,6 +319,7 @@ class GraphStore:
         self._enriched = True
         self._core_path = graph_path
         self._overlay_path = None
+        self._retained_enriched_graph = None
         return self
 
     @classmethod
@@ -317,16 +329,23 @@ class GraphStore:
         accessor surface as the in-RAM one, so ``GraphLib`` and every nav tool are
         unchanged, and nothing loads the whole graph into memory.
 
-        A core-only store (the default `lachesis-analyze` output) opens as-is; the
+        A core-only store (the default `lachesis build` output) opens as-is; the
         overlay dataflow tier is materialized lazily by ``ensure_dataflow_tier`` on the
         first tool that needs it, and a previously built cache beside the store is
         opened directly here so the steady state costs nothing extra."""
         from lachesis.kuzu_store import (STORE_FORMAT_VERSION, is_kuzu_dir,
                                          read_store_manifest)
+        # Expand a leading ``~`` once, at the single load chokepoint, so a home-relative
+        # path resolves the same from the library, the CLI, and the MCP server instead of
+        # failing "not a graph store" for a directory that plainly exists.
+        import os as _os
+        graph_path = _os.path.expanduser(graph_path) if graph_path else graph_path
+        if overlay_path:
+            overlay_path = _os.path.expanduser(overlay_path)
         if not is_kuzu_dir(graph_path):
             raise ValueError(
                 f"{graph_path} is not a Lachesis graph store; build one with "
-                f"`lachesis-analyze <source_dir> {graph_path}`"
+                f"`lachesis build <source_dir> {graph_path}`"
             )
         core_manifest = read_store_manifest(graph_path)
         # Checked here rather than deeper down because the failure it replaces is a
@@ -337,7 +356,7 @@ class GraphStore:
             raise ValueError(
                 f"{graph_path} is a v{found} graph store and this build reads "
                 f"v{STORE_FORMAT_VERSION}; rebuild it with "
-                f"`lachesis-analyze <source_dir> {graph_path}`"
+                f"`lachesis build <source_dir> {graph_path}`"
             )
         open_path = graph_path
         dataflow_path = None
@@ -357,6 +376,10 @@ class GraphStore:
                     dataflow_path = candidate
         self = cls._open(open_path, overlay_path=overlay_path,
                          dataflow_path=dataflow_path, defer_maps=defer_maps)
+        # Structural Pass-3 artifacts are published beside the caller-facing
+        # core store even when this load transparently opened an enriched/rejoined
+        # implementation store.
+        self.index._pass3_cache_base = graph_path
         # The overlay sidecar and the caller-facing identity stay the *core* path even
         # when the derived cache is what is actually open: the cache is an
         # implementation detail, and its sidecar would be a second, divergent copy.
@@ -389,7 +412,7 @@ class GraphStore:
         cache ``store.index`` can watch this to tell when they have gone stale."""
         return bool(getattr(self, "_enriched", True))
 
-    def ensure_dataflow_tier(self) -> "GraphStore":
+    def ensure_dataflow_tier(self, *, retain_materialized: bool = False) -> "GraphStore":
         """Guarantee the overlay dataflow tier is present, building it if needed.
 
         Idempotent, and a no-op for a store that was built with ``--enrich`` or for an
@@ -397,13 +420,8 @@ class GraphStore:
         registries over it (``enriched = f(core_graph, languages, capabilities)`` —
         pure, so this is exactly what a build-time enrich would have produced), write
         additive records to a compact sibling ``<store>.dataflow.pb`` sidecar keyed
-        by the core's content hash, and reopen against it. Non-additive overlays use
-        the older full ``<store>.enriched`` Kùzu-cache fallback.
-
-        The honest cost: enrichment is a whole-graph in-RAM operation, so the first call
-        re-materializes the RAM the columnar store exists to avoid. This *moves* that
-        cost off every build and onto one first query per graph, and caches it
-        permanently. It does not eliminate it.
+        by the core's content hash. Rust owns the complete cold-path enrichment;
+        Python only rebinds the resulting binary overlay for query consumers.
 
         The manifest is written last, so a cache torn by a crash (or by a second
         process rebuilding concurrently) carries no matching hash and is rejected on the
@@ -414,161 +432,69 @@ class GraphStore:
         the index rather than mutating it in place."""
         if getattr(self, "_enriched", True):
             return self
-        from lachesis.kuzu_store import (graph_content_hash, manifest_capabilities,
-                                         manifest_languages, read_store_manifest,
-                                         write_kuzu_graph)
-        from lachesis.pipeline import enrich_graph
-        from lachesis.nav.kuzu_index import materialize_graph
+        from lachesis.kuzu_store import read_store_manifest
+
+        timing_enabled = os.environ.get("LACHESIS_PASS2_TIMINGS") == "1"
+        timing_started = time.perf_counter()
+
+        def timing(label: str) -> None:
+            if timing_enabled:
+                print(
+                    f"[lachesis pass2] {label}: "
+                    f"{time.perf_counter() - timing_started:.3f}s",
+                    file=sys.stderr, flush=True,
+                )
 
         core_path = self._core_path
         manifest = read_store_manifest(core_path)
-        core = materialize_graph(self.index)
-        core_hash = (manifest.get("core_content_hash")
-                     or graph_content_hash(core["nodes"], core["edges"]))
-        enriched = enrich_graph(core, manifest_languages(manifest),
-                               manifest_capabilities(manifest))
-        cache = dataflow_overlay_path(core_path)
-        core_node_ids = {id(node) for node in core["nodes"]}
-        core_edge_ids = {id(edge) for edge in core["edges"]}
-        # The identity sets are all that cache classification needs from the core
-        # containers; release their list/dict wrapper before assembling the derived
-        # payload, which may itself retain the shared record objects.
-        del core
-        enriched_node_ids = {id(node) for node in enriched["nodes"]}
-        enriched_edge_ids = {id(edge) for edge in enriched["edges"]}
-        additive = (
-            core_node_ids.issubset(enriched_node_ids)
-            and core_edge_ids.issubset(enriched_edge_ids)
-        )
-        if additive:
-            payload = {
-                "overlay_id": "dataflow",
-                "source": Path(core_path).name,
-                "version": 1,
-                "core_content_hash": core_hash,
-                "node_props": {}, "edge_props": {},
-                "derived_nodes": [node for node in enriched["nodes"]
-                                  if id(node) not in core_node_ids],
-                "derived_edges": [edge for edge in enriched["edges"]
-                                  if id(edge) not in core_edge_ids],
-            }
-            fd, temporary = tempfile.mkstemp(
-                prefix=".lachesis-dataflow-", suffix=".pb",
-                dir=os.path.dirname(os.path.abspath(cache)),
-            )
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(encode_overlay(payload))
-                os.replace(temporary, cache)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            fresh = type(self)._open(core_path, overlay_path=self._overlay_path,
-                                     dataflow_path=cache)
-        else:
-            # A future overlay that mutates canonical records is not safe to represent
-            # as a delta; retain the existing full Kùzu-cache fallback for that case.
-            cache = enriched_store_path(core_path)
-            write_kuzu_graph(enriched, None, cache, prune=False,
-                             enriched=True, core_content_hash=core_hash,
-                             low_memory=True, buffer_pool_size=2 << 30,
-                             checkpoint_threshold=256 << 20)
-            _copy_frontend_inventory(core_path, cache)
-            fresh = type(self)._open(cache, overlay_path=self._overlay_path)
-        # The derived graph is now represented by the attached cache. Release the
-        # materialized lists before reopening so large action runs do not overlap
-        # two graph-sized Python representations.
-        del enriched
-        self.overlay = fresh.overlay
-        self.graph = fresh.graph
-        self.gl = fresh.gl
-        self.index = fresh.index
-        self._entries = None
-        self._enriched = True
-        return self
+        # The Pass-1 complete binary input is the native Pass-2 contract. When it is
+        # present, keep Python out of the whole-graph enrichment step: Rust opens the
+        # framed protobuf by path, runs the overlays, and publishes the sidecar. The
+        # Python index is only rebound afterwards for query/bind consumers.
+        from lachesis.nav.dataflow.substrate import pass2_input_cache_path
+        native_input = pass2_input_cache_path(core_path)
+        native_cache = dataflow_overlay_path(core_path)
+        if native_input.is_file():
+            from lachesis.flow.native_lifetime import run_pass2_path
+            if not _dataflow_cache_matches(native_cache, manifest.get("core_content_hash")):
+                timing("native Pass-2 starting")
+                run_pass2_path(native_input, native_cache)
+                timing("native Pass-2 published")
+            dataflow_overlay = _load_dataflow_overlay(native_cache)
+            merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+            self.index.attach_overlay(merged_overlay)
+            self.overlay = merged_overlay
+            self.graph = None
+            self.gl = GraphLib.from_index(self.index)
+            self._retained_enriched_graph = None
+            self._entries = None
+            self._enriched = True
+            return self
+        raise RuntimeError(
+            "Pass 2 requires the binary sidecar emitted by a fresh Pass 1; "
+            "rebuild this graph with `lachesis build`")
+
+    def take_retained_enriched_graph(self):
+        """Return the one-shot graph retained for the immediately following bind."""
+        graph = getattr(self, "_retained_enriched_graph", None)
+        self._retained_enriched_graph = None
+        return graph
 
     def ensure_dataflow_cone(self, seed_id: str, budget: int = None) -> dict:
-        """Fold the overlay dataflow tier over the neighbourhood of ``seed_id`` only.
+        """Ensure the complete native tier before a scoped query consumes it.
 
-        The scoped counterpart to ``ensure_dataflow_tier``, and the reason that one
-        should now almost never run. Folding the whole graph to answer a question about
-        one function is the cost this whole tier exists to stop paying: on a 222k-node
-        store the first ``flow`` call spent 49 seconds rebuilding the entire dataflow
-        tier, of which the caller read a few dozen edges.
-
-        What gets folded is the *call neighbourhood* of the seed's owning declaration --
-        callees and callers both, since a backward dataflow question depends on what the
-        callers pass in -- expanded to every node those declarations own. The subgraph is
-        materialized, the four registries fold over it exactly as they would over a whole
-        graph, and the edges the fold invented are grafted into the live index.
-
-        **This is not equal to the whole-graph fold, and the difference is reported.**
-        A value-flow fixpoint over a cone cannot see a path that leaves the cone and
-        comes back, so an answer computed here can be smaller than the eager one. That
-        was an accepted trade, but only on the condition that it is never silent:
-        ``truncated`` is true whenever the neighbourhood hit its budget, and callers
-        surface it. A quiet under-approximation would be worse than the 49 seconds.
-
-        Returns ``{"members", "nodes", "edges", "truncated"}`` -- what it folded and what
-        it grafted -- so the cost is inspectable rather than a claim.
+        The old scoped Python fold was removed. ``budget`` is retained in the signature
+        for callers that still pass it, but native Pass 2 always operates on the complete
+        binary substrate so a scoped query cannot silently under-approximate results.
         """
-        from lachesis.kuzu_store import (manifest_capabilities, manifest_languages,
-                                         read_store_manifest)
-        from lachesis.pipeline import enrich_graph
-        from lachesis.nav.kuzu_index import materialize_subgraph
-        from lachesis.resolution import FOLD_BUDGET
-
         empty = {"members": 0, "nodes": 0, "edges": 0, "truncated": False,
                  "deferred_edges_omitted": 0}
-        # A store that already carries the whole tier has nothing to scope, and an
-        # in-memory graph has no store to scope it out of.
-        if getattr(self, "_enriched", True) or not hasattr(self.index, "graft"):
-            return empty
-        seed = self.index.nodes.get(seed_id)
-        if seed is None:
-            return empty
-        # A call site's dataflow lives in its owner's body, so the apex is the
-        # declaration either way -- the seed itself when it is one, its owner when it
-        # is a node inside one.
-        props = seed.get("properties") or {}
-        apex = props.get("owner_function_id") or props.get("function_id") or seed_id
-        hood = self.resolver.resolve_neighbourhood(
-            apex, FOLD_BUDGET if budget is None else budget)
-        members = hood["members"]
-        if members <= self._folded_cones:
-            return {**empty, "members": len(members),
-                    "truncated": hood["truncated"]}
-        wanted = set(members)
-        for member in members:
-            wanted.update(self.index.by_owner.get(member, ()))
-        core = materialize_subgraph(self.index, wanted)
-        _close_node_property_references(self.index, core)
-        resident = {node["id"] for node in core["nodes"]}
-        wanted.update(resident)
-        from lachesis.nav.kuzu_index import deferred_edges
-        omitted = sum(
-            1 for edge in deferred_edges(self.index)
-            if edge["source"] in wanted and edge["target"] in wanted
-            and (edge["source"] not in resident or edge["target"] not in resident)
-        )
-        manifest = read_store_manifest(self._core_path)
-        enriched = enrich_graph(core, manifest_languages(manifest),
-                                manifest_capabilities(manifest))
-        seen = {node["id"] for node in core["nodes"]}
-        fresh_nodes = [n for n in enriched["nodes"] if n["id"] not in seen]
-        known = {(e["source"], e["target"], e["kind"]) for e in core["edges"]}
-        fresh_edges = [e for e in enriched["edges"]
-                       if (e["source"], e["target"], e["kind"]) not in known]
-        added = self.index.graft(fresh_nodes, fresh_edges)
-        if added or fresh_nodes:
-            self.cone_generation += 1
-        self._folded_cones |= members
-        # `entries` ranks by degree and the graft just changed degrees, so an index
-        # built before it describes the graph as it was.
-        self._entries = None
-        return {"members": len(members), "nodes": len(fresh_nodes),
-                "edges": added, "truncated": hood["truncated"],
-                "deferred_edges_omitted": omitted}
+        # The native Pass-2 engine is whole-graph and binary. A scoped Python
+        # overlay fold is no longer an alternate implementation; ensure the
+        # canonical native tier and let callers query its indexed result.
+        self.ensure_dataflow_tier()
+        return empty
+
 
     # -- name entry / teleport ----------------------------------------------
 

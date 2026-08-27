@@ -45,7 +45,7 @@ For a core-only store on a large mixed-language tree, stream frontend shards dir
 Kùzu to keep the parent process from composing one giant graph:
 
 ```bash
-lachesis-analyze /path/to/project /tmp/project.kuzu \
+lachesis build /path/to/project /tmp/project.kuzu \
   --stream-shards /tmp/project-shards --prune
 ```
 
@@ -55,7 +55,7 @@ Linux/net-sized workloads:
 
 ```bash
 LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
-  lachesis-analyze /path/to/project /tmp/project.kuzu \
+  lachesis build /path/to/project /tmp/project.kuzu \
   --stream-shards /tmp/project-shards --prune
 ```
 
@@ -65,16 +65,27 @@ edge COPY, and index loading; they are silent by default:
 
 ```bash
 LACHESIS_TIMINGS=1 LACHESIS_KUZU_BUFFER_POOL_SIZE=1073741824 \
-  lachesis-analyze /path/to/project /tmp/project.kuzu \
+  lachesis build /path/to/project /tmp/project.kuzu \
   --stream-shards /tmp/project-shards --prune
 ```
 
-`--stream-shards` is currently incompatible with `--enrich`; dataflow partition streaming
-is the next integration step. The resulting store is explicitly marked core-only, so
-`GraphStore`/the GitHub Action builds the dataflow tier on its first security query rather
-than silently skipping enrichment. Additive derived records are cached in a compact
-internal `<store>.dataflow.pb` sidecar; JSON is reserved for user-facing output. A full
-`.enriched` Kùzu cache remains the fallback for overlays that mutate core records.
+`--stream-shards` is a Pass-1/core-only Kùzu build, but it also emits the immutable binary
+inputs required by later passes: `<store>.pass2.input.pb`, `<store>.pass2.facts.pb`, and
+`<store>.pass3.substrate.pb`. Run `lachesis enrich <store>` after the build to consume
+those sidecars without rerunning the frontends. The native Pass-1 projector accepts all
+frontend shard sets together, so cross-language edges survive without a Python graph
+reconstruction. Additive Pass-2 records remain in the compact internal
+`<store>.dataflow.pb` sidecar; internal graph transport uses protobuf rather than JSON.
+A full `.enriched` Kùzu cache remains the fallback for overlays that mutate core records.
+
+The streaming scheduler runs independent C/C++, Python, and TypeScript/JavaScript
+frontends concurrently, then releases their snapshots before Kùzu materialization. On
+the pruned core libxml2 reference tree this measured 27.66 seconds cold at approximately
+1.03 GiB peak RSS with no swap (406,952 nodes / 656,691 edges). Node batches remain at
+2,000 rows for bounded RSS while edge batches use 10,000 rows. The previous 28.73-second
+run used 2,000-row batches for both node and edge records; the older 38.03-second run used
+the older streamed frontend handoff. This is a timing reference, not a cache-warm result; the measurement
+is from one cold run and should be compared on the same machine and input.
 
 ## TypeScript monorepos
 
@@ -85,7 +96,7 @@ starts:
 
 ```bash
 LACHESIS_TS_MAX_OLD_SPACE_MB=4096 \
-  lachesis-analyze /path/to/monorepo /tmp/monorepo.kuzu \
+  lachesis build /path/to/monorepo /tmp/monorepo.kuzu \
   --parallel-packages --shard-large-packages 100 \
   --stream-shards /tmp/monorepo-shards --prune
 ```
@@ -98,7 +109,7 @@ opt-in package-sharded build bounds each compiler root list (it is a semantic tr
 the CLI reports cross-shard edges that could not be merged):
 
 ```bash
-lachesis-analyze /path/to/monorepo /tmp/monorepo.kuzu \
+lachesis build /path/to/monorepo /tmp/monorepo.kuzu \
   --parallel-packages --shard-large-packages 1000 --max-workers 1 --prune
 ```
 
@@ -136,7 +147,7 @@ Linux `fs`, raise it when the runner has room (the tested fs run used 2 GiB):
 
 ```bash
 LACHESIS_KUZU_BUFFER_POOL_SIZE=2147483648 \
-  lachesis-analyze /path/to/linux/fs /tmp/fs.kuzu \
+  lachesis build /path/to/linux/fs /tmp/fs.kuzu \
   --stream-shards /tmp/fs-shards --prune --timeout 900
 ```
 

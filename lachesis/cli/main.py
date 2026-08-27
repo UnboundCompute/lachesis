@@ -15,6 +15,7 @@ first thing anyone meets.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -23,10 +24,23 @@ from pathlib import Path
 EXIT_OK = 0
 EXIT_FINDINGS = 1      # scan found something and was asked to care
 EXIT_USAGE = 2         # argparse's own
-EXIT_ENVIRONMENT = 3   # a tool this machine does not have
-EXIT_FAILURE = 4       # the build or the query broke
+EXIT_ENVIRONMENT = 1   # a required tool or runtime is unavailable
+EXIT_FAILURE = 1       # the build or the query broke
 
 EPILOG = """\
+CORE
+  scan       point at a repository and get ranked leads
+  explain    inspect the evidence for one lead
+  mcp        serve the repository to an AI agent
+
+GRAPH PIPELINE
+  build      pass 1: create a named structural graph
+  enrich     pass 2: warm native binary sidecars
+  analyze    pass 3: inspect leads from a named graph
+
+MORE
+  candidates, query, plan, report, communities, doctor, cache, concept-model
+
 examples:
   lachesis scan                     analyse the current directory and report findings
   lachesis scan ~/src/app --json    the same, as JSON, for a script
@@ -37,9 +51,36 @@ Graphs are cached under ~/.lachesis/cache and rebuilt when the source changes,
 so the first run of a project is slow and every run after it is not.
 """
 
+_ANSI = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "yellow": "\033[33m",
+}
+
+
+class _RootParser(argparse.ArgumentParser):
+    """Keep root help focused on the curated command groups in ``EPILOG``."""
+
+    def format_help(self) -> str:
+        text = super().format_help()
+        start = text.find("positional arguments:\n")
+        end = text.find("optional arguments:\n", start)
+        if start >= 0 and end >= 0:
+            text = text[:start] + text[end:]
+        return text
+
 
 def _stderr(message: str = "") -> None:
     print(message, file=sys.stderr)
+
+
+def _color(text: str, tone: str, mode: str = "auto") -> str:
+    """Apply terminal emphasis without ever putting ANSI escapes in piped data."""
+    enabled = mode == "always" or (
+        mode == "auto" and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    )
+    return f"{_ANSI[tone]}{text}{_ANSI['reset']}" if enabled else text
 
 
 def _report_environment(error) -> int:
@@ -57,6 +98,104 @@ def _resolved(path: str | None) -> Path:
     return Path(path or ".").expanduser().resolve()
 
 
+def _native_status() -> str:
+    """Return a short native-kernel status for ``--version`` without doing analysis."""
+    try:
+        from lachesis.flow.native_lifetime import _library_candidates
+        candidates = _library_candidates()
+    except Exception:
+        return "missing"
+    configured = os.environ.get("LACHESIS_NATIVE_LIFETIME_LIB")
+    if configured and Path(configured).is_file():
+        return f"override:{configured}"
+    if any("/lachesis/_native/" in str(path) and path.is_file() for path in candidates):
+        return "bundled"
+    if any(path.is_file() for path in candidates):
+        return "dev-build"
+    return "missing"
+
+
+# ---------------------------------------------------------------------- completion
+
+def command_completion(args: argparse.Namespace) -> int:
+    """Print a dependency-free completion script for the selected shell."""
+    commands = "scan explain mcp build enrich analyze candidates query plan report communities doctor cache completion"
+    if args.shell == "bash":
+        print(f'''_lachesis_complete() {{
+  local cur="${{COMP_WORDS[COMP_CWORD]}}"
+  local commands="{commands}"
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+  elif [[ "${{COMP_WORDS[1]}}" == "scan" ]]; then
+    COMPREPLY=( $(compgen -W "--lens --limit --min-rank --hard-stop --json --quiet --verbose --color --refresh" -- "$cur") )
+  fi
+}}
+complete -F _lachesis_complete lachesis''')
+    elif args.shell == "zsh":
+        print(f'''#compdef lachesis
+_arguments '1:command:({commands})' '*:option:(--lens --limit --min-rank --hard-stop --json --quiet --verbose --color --refresh)' ''')
+    else:
+        print(f'''complete -c lachesis -f -n "__fish_use_subcommand" -a "{commands}"
+complete -c lachesis -n "__fish_seen_subcommand_from scan" -l lens -a "all guard-diff flow"
+complete -c lachesis -n "__fish_seen_subcommand_from scan" -l json -l quiet -s q -l verbose -s v -l refresh''')
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------- query / plan
+
+def command_query(args: argparse.Namespace) -> int:
+    """Run the structured graph query parser without a REMAINDER passthrough."""
+    from lachesis.cli import query
+    values = vars(args).copy()
+    values["command"] = values.pop("query_command")
+    query_args = argparse.Namespace(**values)
+    try:
+        result = query.execute(query_args)
+    except (KeyError, ValueError, json.JSONDecodeError, OSError) as error:
+        _stderr(json.dumps({"error": str(error), "query": query_args.command}))
+        return EXIT_FAILURE
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(query.render_text(result), end="")
+    return EXIT_OK
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    """Run the ranked guard-differential view from the parsed top-level command."""
+    from lachesis.nav.graph_store import GraphStore
+    from lachesis.planner.cli import _census_line, _render
+    try:
+        store = GraphStore.load(args.graph)
+        store.ensure_dataflow_tier()
+        from lachesis.planner.constructors import GuardDifferential
+        result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
+    except Exception as error:  # noqa: BLE001 - CLI converts store errors to one line
+        _stderr(f"lachesis plan: {error}")
+        return EXIT_FAILURE
+    _stderr(_census_line(result["census"]))
+    if args.json:
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    queue = result["queue"]
+    shown = queue[:args.limit] if args.limit else queue
+    for position, capsule in enumerate(shown, start=1):
+        print(_render(capsule, position))
+        print()
+    if len(shown) < len(queue):
+        print(f"... {len(queue) - len(shown)} more leads; --limit 0 prints them all")
+    if args.suppressions:
+        print("\nsuppressed, with the guard that did it:")
+        for capsule in result["suppressions"]:
+            names = ", ".join(g["predicate"] for g in capsule["guards_present"]
+                               if g.get("dominates"))
+            print(f"  {capsule['entrypoint']['symbol']} -> "
+                  f"{capsule['sensitive_effect']['symbol']}: {names}")
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------- scan
 
 def command_scan(args: argparse.Namespace) -> int:
@@ -71,9 +210,21 @@ def command_scan(args: argparse.Namespace) -> int:
     progress = Progress(enabled=not args.quiet)
     if not args.quiet:
         _stderr(f"lachesis: {source}")
+        if getattr(args, "_bare_invocation", False):
+            _stderr("  scanning ./ — pass a path to scan elsewhere")
+        if args.verbose:
+            _stderr(f"  native-kernel: {_native_status()}")
     try:
-        graph_path, _ = ensure_graph(source, refresh=args.refresh, progress=progress,
-                                     timeout_seconds=args.timeout)
+        is_graph = source.is_dir() and (
+            source.name.endswith(".kuzu")
+            or (source / "lachesis-manifest.pb").is_file()
+            or (source / "manifest.pb").is_file()
+        )
+        if is_graph and not args.refresh:
+            graph_path = source
+        else:
+            graph_path, _ = ensure_graph(source, refresh=args.refresh, progress=progress,
+                                         timeout_seconds=args.timeout)
     except EnvironmentProblem as error:
         return _report_environment(error)
     except NoSourceFound as error:
@@ -81,29 +232,62 @@ def command_scan(args: argparse.Namespace) -> int:
         return EXIT_USAGE
 
     from lachesis.nav.graph_store import GraphStore
-    from lachesis.planner.constructors import GuardDifferential
 
     progress.phase("loading dataflow")
     store = GraphStore.load(str(graph_path))
     store.ensure_dataflow_tier()
     progress.done()
 
-    progress.phase("finding entrypoints that reach sensitive effects")
-    result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
+    if args.lens == "guard-diff":
+        from lachesis.planner.constructors import GuardDifferential
+        progress.phase("finding guard-differential leads")
+        result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
+        queue = [row for row in result.get("queue", ())
+                 if (row.get("rank") or 0.0) >= args.min_rank]
+        census = result.get("census", {})
+    elif args.lens == "flow":
+        from lachesis.session import Analysis
+        progress.phase("finding native flow leads")
+        leads = Analysis(store).analyze(hard_stop=args.hard_stop)
+        queue = [lead.to_dict() for lead in leads.top(args.limit or len(leads))
+                 if (lead.rank or 0.0) >= args.min_rank]
+        census = leads.summary()
+        result = {"lens": args.lens, "queue": queue, "census": census}
+    else:
+        from lachesis.session import Analysis
+        progress.phase("finding taxonomy leads")
+        leads = Analysis(store).scan(
+            lens="all", hard_stop=args.hard_stop,
+            limit=None if args.limit == 0 else args.limit,
+        )
+        queue = [lead.to_dict() for lead in leads
+                 if (lead.rank or 0.0) >= args.min_rank]
+        census = leads.summary()
+        result = {"lens": args.lens, "queue": queue, "census": census}
     progress.done()
-
-    queue = [capsule for capsule in result["queue"] if capsule["rank"] >= args.min_rank]
     if args.json:
         import json
         payload = dict(result)
-        payload["queue"] = queue
+        payload.pop("queue", None)
+        payload["leads"] = queue
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         _stderr()
-        print(_census_line(result["census"]), file=sys.stderr)
+        if args.lens == "guard-diff":
+            print(_census_line(census), file=sys.stderr)
+        else:
+            print(f"{len(queue)} leads  (lens={args.lens})", file=sys.stderr)
         shown = queue[:args.limit] if args.limit else queue
-        for position, capsule in enumerate(shown, start=1):
-            print(_render(capsule, position))
+        for position, lead in enumerate(shown, start=1):
+            if args.lens == "guard-diff":
+                rendered = _render(lead, position)
+            else:
+                observations = lead.get("observations") or {}
+                rendered = (f"{position:>3}. [{(lead.get('rank') or 0.0):.3f}] "
+                            f"{lead.get('pattern') or lead.get('constructor') or 'lead'}  "
+                            f"{lead.get('entry') or observations.get('callee', '')}:"
+                            f"{lead.get('line') or observations.get('line', '')}")
+            print(_color(rendered, "cyan", args.color))
             print()
         if len(shown) < len(queue):
             print(f"... {len(queue) - len(shown)} more; --limit 0 prints them all")
@@ -222,37 +406,8 @@ def command_mcp(args: argparse.Namespace) -> int:
     os.environ["LACHESIS_GRAPH"] = str(graph_path)
     if args.profile:
         os.environ["LACHESIS_PROFILE"] = args.profile
-    sys.argv = ["lachesis-mcp"]
+    sys.argv = ["lachesis mcp"]
     return mcp_server.main() or EXIT_OK
-
-
-# -------------------------------------------------------------------------- index
-
-def command_index(args: argparse.Namespace) -> int:
-    from lachesis.cache import directory_size, entry_for, human_size
-    from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
-                                      ensure_graph)
-    from lachesis.cli.progress import Progress
-
-    source = _resolved(args.path)
-    _stderr(f"lachesis index: {source}")
-    try:
-        graph_path, rebuilt = ensure_graph(source, refresh=args.refresh,
-                                           progress=Progress(enabled=True),
-                                           timeout_seconds=args.timeout)
-    except EnvironmentProblem as error:
-        return _report_environment(error)
-    except NoSourceFound as error:
-        _stderr(f"lachesis index: {error}")
-        return EXIT_USAGE
-    entry = entry_for(source)
-    meta = entry.meta() or {}
-    _stderr()
-    _stderr(f"  {'built' if rebuilt else 'already current'}: "
-            f"{meta.get('nodes', 0):,} nodes, {meta.get('edges', 0):,} edges, "
-            f"{human_size(directory_size(entry.directory))}")
-    _stderr(f"  {graph_path}")
-    return EXIT_OK
 
 
 # -------------------------------------------------------------------------- cache
@@ -356,6 +511,32 @@ def command_cache(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# -------------------------------------------------------------------------- build
+
+def command_build(args: argparse.Namespace) -> int:
+    """Build a named structural graph using the same implementation as the library."""
+    from lachesis.cli import analyze
+
+    forwarded = [args.source_dir, args.output_path, "--timeout", str(args.timeout)]
+    if args.output_flag:
+        forwarded.extend(["--output", args.output_flag])
+    if args.frontend_out:
+        forwarded.extend(["--frontend-out", args.frontend_out])
+    if args.no_prune:
+        forwarded.append("--no-prune")
+    if args.incremental:
+        forwarded.append("--incremental")
+    if args.parallel_packages:
+        forwarded.append("--parallel-packages")
+    if args.max_workers is not None:
+        forwarded.extend(["--max-workers", str(args.max_workers)])
+    if args.shard_large_packages is not None:
+        forwarded.extend(["--shard-large-packages", str(args.shard_large_packages)])
+    if args.stream_shards:
+        forwarded.extend(["--stream-shards", args.stream_shards])
+    return analyze.main(forwarded)
+
+
 # ------------------------------------------------------------------------- doctor
 
 def command_doctor(args: argparse.Namespace) -> int:
@@ -449,6 +630,13 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = _nonnegative_int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def _rank(value: str) -> float:
     try:
         parsed = float(value)
@@ -470,7 +658,7 @@ def _positive_days(value: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(
+    root = _RootParser(
         prog="lachesis",
         description="Read a codebase the way a compiler does.",
         epilog=EPILOG,
@@ -491,12 +679,21 @@ def build_parser() -> argparse.ArgumentParser:
                       help="drop findings ranked below R (0.0-1.0)")
     scan.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
                       help="scan only the first N entrypoints (0 = all)")
+    scan.add_argument("--lens", choices=("all", "guard-diff", "flow"), default="all",
+                      help="analysis view: all families, guard differential, or flow leads")
+    scan.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
+                      help="analysis budget (0 = unbounded; default is bounded)")
     scan.add_argument("--json", action="store_true",
                       help="write the full result to stdout as JSON")
-    scan.add_argument("--fail-on-findings", action="store_true",
+    scan.add_argument("--error-on-findings", "--fail-on-findings", dest="fail_on_findings",
+                      action="store_true",
                       help="exit 1 when anything is reported, for CI")
     scan.add_argument("--quiet", "-q", action="store_true",
                       help="findings only, no progress or guidance")
+    scan.add_argument("--verbose", "-v", action="store_true",
+                      help="include native-kernel details in progress output")
+    scan.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                      help="colour human output (default: auto; NO_COLOR disables it)")
     scan.set_defaults(handler=command_scan)
 
     communities = subcommands.add_parser(
@@ -539,12 +736,6 @@ def build_parser() -> argparse.ArgumentParser:
                      help="'comprehension' hides hunting-only tools")
     mcp.set_defaults(handler=command_mcp)
 
-    index = subcommands.add_parser(
-        "index", help="build or refresh the index for a codebase",
-        description="Do the slow part now, so a later scan or mcp session is instant.")
-    _add_source_flags(index)
-    index.set_defaults(handler=command_index)
-
     cache = subcommands.add_parser("cache", help="inspect or delete cached indexes")
     cache_actions = cache.add_subparsers(dest="cache_action", metavar="<action>")
     cache_actions.add_parser("list", help="what is cached, and whether it is current")
@@ -577,51 +768,133 @@ def build_parser() -> argparse.ArgumentParser:
     concept.set_defaults(handler=command_concept_model, model_action="status",
                          model="BAAI/bge-small-en-v1.5", json=False)
 
-    # The engine's own programs, one word in. Their arguments are passed through
-    # untouched, which is why these take REMAINDER rather than a parsed shape: they
-    # are a different, lower-level surface and should behave exactly as documented
-    # for themselves.
-    for name, help_text in (
-        ("analyze", "engine: build a graph to a path you choose"),
-        ("query", "engine: query a graph directly"),
-        ("plan", "engine: rank capsules from a graph you already have"),
-    ):
-        passthrough = subcommands.add_parser(
-            name, help=help_text, add_help=False,
-            description=f"{help_text}. Arguments are passed through unchanged; "
-                        f"run `lachesis {name} --help` for its own options.")
-        passthrough.add_argument("rest", nargs=argparse.REMAINDER)
+    completion = subcommands.add_parser(
+        "completion", help="print shell completion code")
+    completion.add_argument("shell", choices=("bash", "zsh", "fish"),
+                            help="shell to generate completion for")
+    completion.set_defaults(handler=command_completion)
+
+    # The reader verbs, each a thin shell over one Analysis method: enrich (pass 2),
+    # analyze (pass 3 -> leads), candidates (the registry), explain (the one-shot capsule).
+    # These are parsed, not passed through -- they are the ergonomic front door.
+    from lachesis.cli.verbs import add_reader_verbs
+    add_reader_verbs(subcommands)
+
+    build = subcommands.add_parser(
+        "build", help="pass 1: build a structural graph to a path you choose",
+        description="Parse a source tree into the named binary graph artifact. "
+                    "This is pass 1; enrichment is a separate `lachesis enrich` command.")
+    build.add_argument("source_dir", help="source tree to analyse")
+    build.add_argument("output_path", nargs="?", default="graph_out/compiler_project.kuzu",
+                       help="graph store to write")
+    build.add_argument("-o", "--output", dest="output_flag", metavar="PATH",
+                       help="same as the output path positional")
+    build.add_argument("--frontend-out", metavar="DIR",
+                       help="retain frontend bundles for inspection or incremental builds")
+    build.add_argument("--no-prune", action="store_true",
+                       help="keep lexical token/proof records (pruned by default)")
+    build.add_argument("--timeout", type=_positive_seconds, default=300, metavar="SECONDS",
+                       help="maximum seconds per frontend (default: 300)")
+    build.add_argument("--incremental", action="store_true",
+                       help="reuse unchanged frontend bundles")
+    build.add_argument("--parallel-packages", action="store_true",
+                       help="compile first-party packages independently")
+    build.add_argument("--max-workers", type=_positive_int, default=None, metavar="N",
+                       help="cap parallel package workers")
+    build.add_argument("--shard-large-packages", type=_positive_int, default=None,
+                       metavar="FILES", help="split large packages into bounded jobs")
+    build.add_argument("--stream-shards", metavar="DIR",
+                       help="stream frontend shards directly into the graph store")
+    build.set_defaults(handler=command_build, no_prune=False)
+
+    query = subcommands.add_parser(
+        "query", help="ask a focused question of a named graph",
+        description="Query a named graph with a bounded, structured question.")
+    query.add_argument("graph", help="path to a .kuzu graph")
+    query.add_argument("--budget-tokens", type=_positive_int, default=12000,
+                       metavar="N", help="approximate answer budget")
+    query.add_argument("--format", choices=("json", "text"), default="json")
+    query_commands = query.add_subparsers(dest="query_command", metavar="<question>",
+                                          required=True)
+    query_commands.add_parser("overview", help="summarize the graph")
+    locate = query_commands.add_parser("locate", help="locate a node id")
+    locate.add_argument("node_id")
+    expand = query_commands.add_parser("expand", help="expand a node neighbourhood")
+    expand.add_argument("node_id")
+    expand.add_argument("--depth", type=_nonnegative_int, default=1)
+    find = query_commands.add_parser("find-entity", help="find a symbol")
+    find.add_argument("name")
+    find.add_argument("--kind")
+    find.add_argument("--file")
+    function = query_commands.add_parser("function", help="read one function slice")
+    function.add_argument("focus")
+    function.add_argument("--file")
+    value = query_commands.add_parser("value-history", help="trace a value")
+    value.add_argument("node_id")
+    call = query_commands.add_parser("call", help="explain a call")
+    call.add_argument("node_id")
+    security = query_commands.add_parser("security-path", help="read one security path")
+    security.add_argument("node_id")
+    query_commands.add_parser("security-paths", help="read security path slices")
+    handler = query_commands.add_parser("handler-security", help="read handler security")
+    handler.add_argument("focus")
+    handler.add_argument("--file")
+    unresolved = query_commands.add_parser("unresolved", help="read unresolved calls")
+    unresolved.add_argument("node_id", nargs="?")
+    # Accept the common `query GRAPH QUESTION --format json` spelling as well as the
+    # parent-option form. SUPPRESS prevents a child default from overwriting the parent.
+    for question in query_commands.choices.values():
+        question.add_argument("--format", choices=("json", "text"),
+                              default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        question.add_argument("--budget-tokens", type=_positive_int, metavar="N",
+                              default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    query.set_defaults(handler=command_query)
+
+    plan = subcommands.add_parser(
+        "plan", help="rank guard-differential leads from a named graph",
+        description="Rank leads from a named graph. Each lead is a question, not a verdict.")
+    plan.add_argument("graph", help="path to a .kuzu graph")
+    plan.add_argument("--limit", type=_nonnegative_int, default=20,
+                      help="how many leads to print (0 = all)")
+    plan.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
+                      help="scan only the first N entrypoints (0 = all)")
+    plan.add_argument("--json", action="store_true", help="print the result as JSON")
+    plan.add_argument("--suppressions", action="store_true",
+                      help="print what was suppressed and which guard did it")
+    plan.set_defaults(handler=command_plan)
 
     return root
 
 
-ENGINE_COMMANDS = ("analyze", "query", "plan")
-
-
-def _run_engine(name: str, rest: list[str]) -> int:
-    """Hand the rest of the line to an engine program verbatim.
-
-    Dispatched before argparse touches anything: a REMAINDER positional still loses
-    `--help` to the root parser, and an engine tool whose own `--help` is unreachable
-    is not really available. So these three words are routed, not parsed.
-    """
-    from lachesis.cli import analyze, query
-    from lachesis.planner import cli as planner_cli
-    sys.argv = [f"lachesis-{name}", *rest]
-    if name == "analyze":
-        return analyze.main()
-    return (query.main() if name == "query" else planner_cli.main()) or EXIT_OK
+KNOWN_COMMANDS = {
+    "scan", "communities", "report", "mcp", "cache", "doctor",
+    "concept-model", "enrich", "analyze", "candidates", "explain", "build",
+    "query", "plan", "completion",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if arguments and arguments[0] in ENGINE_COMMANDS:
-        return _run_engine(arguments[0], arguments[1:])
+    # A path is the product's default command: `lachesis ./repo` is exactly
+    # `lachesis scan ./repo`, and a bare invocation scans the current directory.
+    if not arguments:
+        arguments = ["scan"]
+        bare_invocation = True
+    else:
+        bare_invocation = False
+    if arguments and arguments[0] == "index":
+        _stderr("lachesis: 'index' was removed; use 'lachesis build <path>' "
+                "or run 'lachesis scan <path>' to index on demand")
+        return EXIT_USAGE
+    elif (not arguments[0].startswith("-")
+          and arguments[0] not in KNOWN_COMMANDS):
+        arguments = ["scan", *arguments]
     parser = build_parser()
     args = parser.parse_args(arguments)
+    args._bare_invocation = bare_invocation
     if getattr(args, "version", False):
         from lachesis.cache import _version
-        print(_version())
+        print(f"lachesis {_version()} (native-kernel: {_native_status()})")
         return EXIT_OK
     handler = getattr(args, "handler", None)
     if handler is None:

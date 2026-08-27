@@ -1,0 +1,26 @@
+[package]
+name = "lachesis-lifetime-kernel"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+rayon = "1.10"
+rustc-hash = "2"
+hashbrown = "0.15"
+sha2 = "0.10"
+roaring = "0.10"
+memmap2 = "0.9"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

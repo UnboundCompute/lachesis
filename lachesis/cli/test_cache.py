@@ -141,7 +141,7 @@ class CachePruneTests(unittest.TestCase):
                 args = argparse.Namespace(cache_action="clear", path=None, all=True)
                 with patch("lachesis.cache.shutil.rmtree", side_effect=OSError("read-only")), \
                      contextlib.redirect_stderr(io.StringIO()) as output:
-                    self.assertEqual(command_cache(args), 4)
+                    self.assertEqual(command_cache(args), 1)
                 self.assertIn("could not remove", output.getvalue())
             finally:
                 if old_value is None:

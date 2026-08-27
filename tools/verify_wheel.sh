@@ -84,12 +84,23 @@ echo "installed into $workspace/v"
 say "imports resolve"
 ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner; print('ok')"
 
-say "console scripts are on PATH"
-for script in lachesis lachesis-analyze lachesis-query lachesis-mcp lachesis-plan lachesis-candidates; do
-  [[ -x "./v/bin/$script" ]] || { echo "FAIL: missing $script" >&2; exit 1; }
-  "./v/bin/$script" --version >/dev/null
-  echo "  $script"
+say "console script is on PATH"
+# One console script now: the reader is a single `lachesis` with subcommands.
+[[ -x "./v/bin/lachesis" ]] || { echo "FAIL: missing lachesis" >&2; exit 1; }
+./v/bin/lachesis --version >/dev/null
+echo "  lachesis"
+for verb in build enrich analyze query plan candidates mcp; do
+  ./v/bin/lachesis "$verb" --help >/dev/null || { echo "FAIL: verb $verb" >&2; exit 1; }
+  echo "  lachesis $verb"
 done
+
+say "the native analysis kernel loads"
+# doctor exits non-zero when a required check fails; the native kernel is one. A wheel
+# that installs but ships a stale or missing kernel fails here rather than at a user's
+# first scan.
+./v/bin/lachesis doctor >/dev/null \
+  || { echo "FAIL: lachesis doctor reports an unusable install (native kernel not loadable)" >&2; exit 1; }
+echo "  native kernel loads"
 
 say "analyse a TypeScript project with no npm install anywhere"
 mkdir -p project/src
@@ -102,8 +113,8 @@ export function handle(request: Request): string {
   return findById(request.body.id);
 }
 TS
-./v/bin/lachesis-analyze project /tmp/verify-wheel.kuzu
-./v/bin/lachesis-query --format text /tmp/verify-wheel.kuzu overview | tee overview.txt
+./v/bin/lachesis build project /tmp/verify-wheel.kuzu
+./v/bin/lachesis query --format text /tmp/verify-wheel.kuzu overview | tee overview.txt
 grep -q "typescript" overview.txt \
   || { echo "FAIL: TypeScript was not analysed -- vendored compiler not reachable" >&2; exit 1; }
 
@@ -117,14 +128,14 @@ def lookup(identifier):
 def handle(request):
     return lookup(request["id"])
 PY
-./v/bin/lachesis-analyze pyproject_src /tmp/verify-wheel-py.kuzu
+./v/bin/lachesis build pyproject_src /tmp/verify-wheel-py.kuzu
 
 say "the MCP server speaks MCP over stdio"
 ./v/bin/python - <<'PY'
 import json, os, subprocess, sys
 
 server = subprocess.Popen(
-    [os.path.join(os.getcwd(), "v", "bin", "lachesis-mcp"), "/tmp/verify-wheel.kuzu"],
+    [os.path.join(os.getcwd(), "v", "bin", "lachesis"), "mcp", "project"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 )
 

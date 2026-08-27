@@ -885,8 +885,11 @@ class CandidateMcpSurfaceTest(unittest.TestCase):
             "atropos": {"applied": True, "atropos_root": "/catalog",
                         "languages": ["c"], "per_language": {}, "role_nodes": {}},
         }
+        # The candidates handler binds through Analysis._bound_bind now (temporal fast path +
+        # hard-stop), so the mock ctx serves the pre-built bundle from there.
         fake_ctx = SimpleNamespace(
-            store=SimpleNamespace(gl=None), candidate_bundle=bundle)
+            store=SimpleNamespace(gl=None), candidate_bundle=bundle,
+            _bound_bind=lambda **_kwargs: bundle)
         with patch.object(mcp_server, "ctx", return_value=fake_ctx):
             payload = mcp_server.call_tool(
                 "candidates", {"constructor_id": "memory.copy.capacity", "limit": 1},
@@ -956,14 +959,14 @@ class SinkTaxonomyTest(unittest.TestCase):
         # sink kind it models must be placed in the tree. Skipped when the
         # catalog is not checked out beside us (unit runs stay hermetic).
         try:
-            from lachesis.integrations.atropos.enrich import locate_atropos, _load_binder
+            from lachesis.integrations.atropos.enrich import locate_atropos
+            from lachesis.integrations.atropos.models import load_models
         except Exception:  # pragma: no cover - integration module optional
             self.skipTest("atropos integration unavailable")
         root = locate_atropos(None)
         if root is None:
             self.skipTest("atropos catalog not checked out")
-        binder = _load_binder(root)
-        models = binder.load_models(root / "models")
+        models = load_models(root / "models")
         from lachesis.planner import taxonomy
 
         # load_models returns a flat list of role entries; each sink entry
