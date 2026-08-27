@@ -13,22 +13,22 @@ import os
 import tempfile
 import unittest
 
-from lachesis.session import Analysis, Deadline, LeadSet
+from lachesis.session import Analysis, Deadline, Lead, LeadSet
 
 
 def _leads():
     return (
-        {"pattern": "double-free", "entry": "parse", "var": "buf", "line": 40},
-        {"pattern": "double-free", "entry": "parse", "var": "tmp", "line": 55},
-        {"pattern": "leak", "entry": "parse", "var": "node", "line": 60},
-        {"pattern": "leak", "entry": "emit", "var": "out", "line": 120},
-        {"pattern": "missing-guard", "entry": "emit", "var": "len", "line": 130},
+        Lead.from_dict({"pattern": "double-free", "entry": "parse", "var": "buf", "line": 40}),
+        Lead.from_dict({"pattern": "double-free", "entry": "parse", "var": "tmp", "line": 55}),
+        Lead.from_dict({"pattern": "leak", "entry": "parse", "var": "node", "line": 60}),
+        Lead.from_dict({"pattern": "leak", "entry": "emit", "var": "out", "line": 120}),
+        Lead.from_dict({"pattern": "missing-guard", "entry": "emit", "var": "len", "line": 130}),
     )
 
 
 class LeadSetFilterTests(unittest.TestCase):
     def setUp(self):
-        self.ls = LeadSet(leads=_leads(), engine="object")
+        self.ls = LeadSet(leads=_leads())
 
     def test_len_iter_bool(self):
         self.assertEqual(len(self.ls), 5)
@@ -41,7 +41,6 @@ class LeadSetFilterTests(unittest.TestCase):
         self.assertEqual(summary["total"], 5)
         self.assertEqual(summary["by_pattern"],
                          {"double-free": 2, "leak": 2, "missing-guard": 1})
-        self.assertEqual(summary["engine"], "object")
         self.assertFalse(summary["timed_out"])
         # summary must be JSON-safe on its own -- the MCP surface json.dumps it directly.
         json.dumps(summary)
@@ -96,7 +95,7 @@ class LeadSetFilterTests(unittest.TestCase):
 
     def test_to_json_payload_and_atomic_write(self):
         payload = self.ls.to_json()
-        self.assertEqual(set(payload), {"summary", "leads"})
+        self.assertEqual(set(payload), {"schema", "summary", "leads"})
         self.assertEqual(len(payload["leads"]), 5)
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "leads.json")
@@ -154,17 +153,26 @@ class BindCacheTests(unittest.TestCase):
         self.bind_cache._core_hash = self._real_core_hash
 
     def test_round_trip_is_exact(self):
-        stamped = {"nodes": {"n1": {"kind": "alloc"}}, "semantic_graph": {"nodes": {}}}
+        stamped = {"nodes": [{"id": "n1", "kind": "alloc"}], "edges": [],
+                   "semantic_graph": {"nodes": {}}}
         summary = {"languages": ["c"], "sinks": 3}
         self.bind_cache.store(self.store, stamped, summary)
         self.assertTrue(os.path.isfile(self.bind_cache.sidecar_path(self.graph)))
         back = self.bind_cache.load(self.store)
         self.assertIsNotNone(back)
-        self.assertEqual(back[0], stamped)
+        # Typed caches keep graph records on disk and return metadata lazily; loading a
+        # cache must not materialize the full stamped graph just to answer a cache hit.
+        self.assertEqual(back[0]["nodes"], [])
+        self.assertEqual(back[0]["edges"], [])
+        self.assertTrue(back[0]["_typed_bind_cache_path"].endswith(".bind.pb"))
+        self.assertEqual(
+            self.bind_cache._load_typed_graph(back[0]["_typed_bind_cache_path"])["stamped"],
+            stamped,
+        )
         self.assertEqual(back[1], summary)
 
     def test_content_hash_change_invalidates(self):
-        self.bind_cache.store(self.store, {"nodes": {}}, {"languages": ["c"]})
+        self.bind_cache.store(self.store, {"nodes": [], "edges": []}, {"languages": ["c"]})
         self.assertIsNotNone(self.bind_cache.load(self.store))
         # A different store content hash must miss the file written for the old one.
         self.bind_cache._core_hash = lambda path: "hash-B"
@@ -173,28 +181,28 @@ class BindCacheTests(unittest.TestCase):
     def test_unkeyable_store_never_uses_sidecar(self):
         # A store with no content hash can neither be trusted nor invalidated -> decline both.
         self.bind_cache._core_hash = lambda path: ""
-        self.bind_cache.store(self.store, {"nodes": {}}, {"languages": ["c"]})
+        self.bind_cache.store(self.store, {"nodes": [], "edges": []}, {"languages": ["c"]})
         self.assertFalse(os.path.isfile(self.bind_cache.sidecar_path(self.graph)))
         self.assertIsNone(self.bind_cache.load(self.store))
 
     def test_no_path_store_is_a_miss(self):
         pathless = _FakeStore(None)
-        self.bind_cache.store(pathless, {"nodes": {}}, {"languages": ["c"]})
+        self.bind_cache.store(pathless, {"nodes": [], "edges": []}, {"languages": ["c"]})
         self.assertIsNone(self.bind_cache.load(pathless))
 
     def test_opt_out_disables_read_and_write(self):
         os.environ["LACHESIS_BIND_SIDECAR"] = "0"
-        self.bind_cache.store(self.store, {"nodes": {}}, {"languages": ["c"]})
+        self.bind_cache.store(self.store, {"nodes": [], "edges": []}, {"languages": ["c"]})
         self.assertFalse(os.path.isfile(self.bind_cache.sidecar_path(self.graph)))
         # Even with a file present, the opt-out declines the read.
         os.environ.pop("LACHESIS_BIND_SIDECAR")
-        self.bind_cache.store(self.store, {"nodes": {}}, {"languages": ["c"]})
+        self.bind_cache.store(self.store, {"nodes": [], "edges": []}, {"languages": ["c"]})
         os.environ["LACHESIS_BIND_SIDECAR"] = "0"
         self.assertIsNone(self.bind_cache.load(self.store))
 
     def test_size_ceiling_declines_the_write(self):
         os.environ["LACHESIS_BIND_SIDECAR_MAX_MB"] = "0.0001"  # ~100 bytes
-        self.bind_cache.store(self.store, {"nodes": {"n": {"big": "x" * 10000}}},
+        self.bind_cache.store(self.store, {"nodes": [{"id": "n", "big": "x" * 10000}], "edges": []},
                               {"languages": ["c"]})
         self.assertFalse(os.path.isfile(self.bind_cache.sidecar_path(self.graph)))
 
