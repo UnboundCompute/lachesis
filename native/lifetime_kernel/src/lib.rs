@@ -75,7 +75,10 @@ fn compact_event_function(
 ) -> Option<lifetime_proto::NativeSemanticFunction> {
     let full_entry = function.entry.clone();
     let full_exits = function.exits.clone();
-    let full_edges = function.edges.clone();
+    // The full function is owned by this projection and its original edge
+    // objects are not needed after indexed adjacency is built. Move them out
+    // instead of cloning the entire edge vector during every function pass.
+    let full_edges = std::mem::take(&mut function.edges);
     // Use dense node indices while projecting.  The old implementation
     // rebuilt string-keyed adjacency and cloned IDs on every walk from every
     // event.  A semantic function's node table is already fixed, so indices
