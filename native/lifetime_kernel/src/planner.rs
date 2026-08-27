@@ -161,6 +161,30 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         }
     }
 
+    // A recursive component can have no callerless member and no catalogued
+    // source/export root. It is still a real function region and must not be
+    // silently omitted from coverage. Add one structural entry for each such
+    // function after ordinary reachability has been exhausted; this is a
+    // language-neutral fallback, not a source-name special case.
+    let uncovered_roots: Vec<String> = functions.keys()
+        .filter(|name| !reachable.contains(*name))
+        .cloned().collect();
+    for name in uncovered_roots {
+        launches.entry(name.clone()).or_insert_with(||
+            ("structural".into(), vec!["__entry__".into()]));
+        reachable.insert(name.clone());
+        provenance.entry(name.clone()).or_default().insert("structural".into());
+        queue.push_back(name);
+    }
+    while let Some(name) = queue.pop_front() {
+        for callee in &callees[&name] {
+            let inherited = provenance.get(&name).cloned().unwrap_or_default();
+            let before = provenance.get(callee).cloned().unwrap_or_default();
+            provenance.entry(callee.clone()).or_default().extend(inherited);
+            if provenance[callee] != before { queue.push_back(callee.clone()); }
+        }
+    }
+
     // Propagate source influence through formal/actual calls until stable.
     let mut changed = true;
     while changed {
