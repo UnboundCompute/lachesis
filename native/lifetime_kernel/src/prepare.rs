@@ -1605,6 +1605,7 @@ pub(crate) fn semantic_request(
         let id = function.id.clone();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
+        let mut realloc_failures: Vec<(String, String, String)> = Vec::new();
         // Preserve the prepared CFG topology even when an anchor has no
         // lifetime operation.  These empty-event nodes are the compact native
         // equivalent of the Python semantic graph's control-flow substrate.
@@ -1686,12 +1687,25 @@ pub(crate) fn semantic_request(
                     vec!["RETURN_VALUE", "ESCAPE", "RETURN"],
                 _ => vec![semantic_event_kind(operation.kind, &operation.access)],
             };
+            let attempt_id = (operation.kind == crate::Kind::Realloc)
+                .then(|| format!("native:{}:{}:{}:0", id, operation.node, index));
             for (ordinal, kind) in kinds.into_iter().enumerate() {
                 let kind = if operation.is_null { "WRITE_STORAGE_NULL" } else { kind };
                 let node_id = format!("native:{}:{}:{}:{}", id, operation.node, index, ordinal);
-                let event = semantic_node(node_id.clone(), &id, kind, &operation, path, generation);
+                let event_generation = if kind == "ORIGIN" && operation.kind == crate::Kind::Realloc {
+                    operation.fresh_generation.as_deref().unwrap_or(generation)
+                } else { generation };
+                let event = semantic_node(node_id.clone(), &id, kind, &operation, path, event_generation);
                 by_anchor.entry(operation.node.clone()).or_default().push(node_id);
                 nodes.push(event);
+            }
+            if operation.kind == crate::Kind::Realloc {
+                let failure_id = format!("native:{}:{}:{}:failure", id, operation.node, index);
+                nodes.push(semantic_node(failure_id.clone(), &id, "REALLOC_FAILED",
+                    &operation, path, generation));
+                if let Some(attempt_id) = attempt_id {
+                    realloc_failures.push((attempt_id, failure_id, operation.node.clone()));
+                }
             }
         }
         let mut edges = Vec::new();
@@ -1713,6 +1727,23 @@ pub(crate) fn semantic_request(
                 edges.push(lifetime_proto::NativeSemanticEdge {
                     source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(),
                 });
+            }
+        }
+        // Realloc has two semantic outcomes. Keep the failure node out of the
+        // same-anchor linear chain and add an explicit alternate edge; both
+        // outcomes then continue through the original CFG successors.
+        for (attempt, failure, anchor) in realloc_failures {
+            edges.push(lifetime_proto::NativeSemanticEdge {
+                source: attempt, target: failure.clone(), kind: "realloc-failure".into(),
+            });
+            if let Some(successors) = function.successors.iter().find(|item| item.node == anchor) {
+                for target_anchor in &successors.targets {
+                    if let Some(target) = by_anchor.get(target_anchor).and_then(|items| items.first()) {
+                        edges.push(lifetime_proto::NativeSemanticEdge {
+                            source: failure.clone(), target: target.clone(), kind: "normal".into(),
+                        });
+                    }
+                }
             }
         }
         let entry = function.nodes.iter().find_map(|node| by_anchor.get(node)
