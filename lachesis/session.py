@@ -26,8 +26,8 @@ imports live inside the methods, and ``lachesis/__init__.py`` exports these thre
 from __future__ import annotations
 
 import json
+import logging
 import os
-import sys
 import tempfile
 from time import perf_counter
 from collections import Counter
@@ -48,6 +48,7 @@ ProgressFn = Callable[[str, float], None]
 # the four existing callers; the bound is a *library* default, resolved here, overridable per
 # call (``hard_stop``) or by env (``LACHESIS_HARD_STOP``), and disabled by ``hard_stop=0``.
 DEFAULT_HARD_STOP = 180.0
+_LOGGER = logging.getLogger("lachesis")
 
 
 class AnalysisError(RuntimeError):
@@ -199,14 +200,12 @@ class Analysis:
     def _pass2_timing(label: str, started: float) -> None:
         """Emit opt-in timings for the catalog/temporal half of Pass 2."""
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
-            print(f"[lachesis pass2] {label}: {perf_counter() - started:.3f}s",
-                  file=sys.stderr, flush=True)
+            _LOGGER.info("pass2 %s: %.3fs", label, perf_counter() - started)
 
     @staticmethod
     def _pass2_progress(label: str, elapsed: float) -> None:
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
-            print(f"[lachesis pass2] temporal {label}: {elapsed:.3f}s",
-                  file=sys.stderr, flush=True)
+            _LOGGER.info("pass2 temporal %s: %.3fs", label, elapsed)
 
     def _flow_bundle(self, lang: str = "mixed", **run_kwargs: Any) -> dict:
         """The interprocedural flow pass over the whole graph, computed once and cached.
@@ -444,13 +443,12 @@ class Analysis:
                 if node is not None:
                     nodes[node_id] = node
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
-            print(
-                "[lachesis pass2] structural phases: regions=%.3fs cone=%.3fs "
-                "warm=%.3fs region_edges=%d cone_nodes=%d missing=%d"
-                % (region_done - materialize_started, cone_done - region_done,
-                   perf_counter() - cone_done, len(region_edges), len(seen),
-                   len(missing)),
-                file=sys.stderr, flush=True)
+            _LOGGER.info(
+                "pass2 structural phases: regions=%.3fs cone=%.3fs warm=%.3fs "
+                "region_edges=%d cone_nodes=%d missing=%d",
+                region_done - materialize_started, cone_done - region_done,
+                perf_counter() - cone_done, len(region_edges), len(seen), len(missing),
+            )
         return {"nodes": list(nodes.values()), "edges": edges}
 
     def _enrich_and_merge(self, *, deadline: Deadline | None = None,
@@ -884,6 +882,25 @@ class Lead:
     def __getitem__(self, key: str) -> Any:
         return self.to_dict()[key]
 
+    def __repr__(self) -> str:
+        """Show the lead's question and source location in a REPL-friendly form."""
+        pattern = self.pattern or "lead"
+        location = self.file or self.entry or "unknown location"
+        if self.line is not None:
+            location = f"{location}:{self.line}"
+        return f"<Lead {pattern!r} at {location}>"
+
+    def _repr_html_(self) -> str:
+        """Render one compact lead row in notebook environments."""
+        import html
+        pattern = html.escape(self.pattern or "lead")
+        location = html.escape(self.file or self.entry or "unknown location")
+        if self.line is not None:
+            location += f":{self.line}"
+        rank = "" if self.rank is None else f"{self.rank:.3f}"
+        return ("<div><strong>%s</strong> <code>%s</code>"
+                " <span>rank=%s</span></div>" % (pattern, location, rank))
+
 
 @dataclass(frozen=True)
 class LeadSet:
@@ -956,6 +973,24 @@ class LeadSet:
         return f"<LeadSet: {len(self.leads)} leads across {patterns} patterns, {files} files>"
 
     __str__ = __repr__
+
+    def _repr_html_(self) -> str:
+        """Render a bounded ranked table in notebook environments."""
+        import html
+        rows = []
+        for lead in self.top(20):
+            pattern = html.escape(lead.pattern or "lead")
+            location = html.escape(lead.file or lead.entry or "unknown location")
+            if lead.line is not None:
+                location += f":{lead.line}"
+            rank = "" if lead.rank is None else f"{lead.rank:.3f}"
+            rows.append(f"<tr><td>{rank}</td><td>{pattern}</td><td>{location}</td></tr>")
+        if not rows:
+            return "<p><em>No leads.</em></p>"
+        extra = len(self.leads) - min(20, len(self.leads))
+        suffix = f"<p>+{extra} more</p>" if extra else ""
+        return ("<table><thead><tr><th>Rank</th><th>Lead</th><th>Location</th></tr>"
+                "</thead><tbody>" + "".join(rows) + "</tbody></table>" + suffix)
 
     # -- summary --------------------------------------------------------------------
 
