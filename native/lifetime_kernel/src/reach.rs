@@ -173,3 +173,45 @@ pub(crate) fn build(
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sink_catalog() -> atropos_proto::Request {
+        atropos_proto::Request {
+            models: vec![atropos_proto::Model {
+                language: "c".into(), method: "sink_call".into(), role: "sink".into(),
+                access_path: "Argument[0]".into(), kind: "buffer-size".into(),
+                ..Default::default()
+            }], ..Default::default()
+        }
+    }
+
+    #[test]
+    fn emits_a_skeleton_for_each_flow_carrying_function_including_internal_functions() {
+        let call = |node: &str, source: bool| lifetime_proto::FunctionCall {
+            node: node.into(), callee: "sink_call".into(), is_source: source,
+            arguments: vec![lifetime_proto::FunctionArgument {
+                position: 0, root: "input".into(), root_name: "input".into(), ..Default::default()
+            }], ..Default::default()
+        };
+        let translation = lifetime_proto::TranslationResult { functions: vec![
+            lifetime_proto::TranslationFunction {
+                id: "public-id".into(), name: "public_entry".into(), language: "c".into(),
+                calls: vec![call("source-call", true)], ..Default::default()
+            },
+            lifetime_proto::TranslationFunction {
+                id: "static-id".into(), name: "internal_helper".into(), language: "c".into(),
+                calls: vec![call("sink-call", false)], ..Default::default()
+            },
+        ]};
+        let summaries = crate::summary::summarize(translation.clone(), sink_catalog());
+        let skeletons = build(&translation, &summaries, &sink_catalog());
+        assert_eq!(skeletons.len(), 2);
+        assert!(skeletons.iter().any(|item| item.entry == "public_entry" && item.is_source));
+        assert!(skeletons.iter().any(|item| item.entry == "internal_helper" && !item.is_source));
+        assert!(skeletons.iter().all(|item| item.tokens.iter().any(|token|
+            token.kind == "sink" && (token.node == "source-call" || token.node == "sink-call"))));
+    }
+}
