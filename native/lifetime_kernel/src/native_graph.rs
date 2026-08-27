@@ -215,18 +215,29 @@ fn resolves_to_release(
     start: &str,
     release_symbols: &HashSet<String>,
     edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
+    reverse_edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
     seen: &mut HashSet<String>,
 ) -> bool {
     if release_symbols.contains(start) || !seen.insert(start.to_owned()) {
         return release_symbols.contains(start);
     }
-    edges.get(start).into_iter().flatten().any(|edge| {
+    let forward = edges.get(start).into_iter().flatten().filter(|edge| {
         if edge.role == "ARGUMENT" {
             return false;
         }
         matches!(edge.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO")
-            && resolves_to_release(&edge.target, release_symbols, edges, seen)
-    })
+    }).any(|edge| resolves_to_release(
+        &edge.target, release_symbols, edges, reverse_edges, seen));
+    if forward { return true; }
+    // Compiler value-flow is directional (initializer -> destination).  A
+    // function-pointer variable therefore reaches a catalogued release
+    // symbol through an incoming VALUE_FLOWS_TO edge.  Follow only that
+    // reverse relation; reversing AST/reference edges would over-connect
+    // unrelated syntax nodes.
+    reverse_edges.get(start).into_iter().flatten()
+        .filter(|edge| edge.kind == "VALUE_FLOWS_TO" && edge.role != "ARGUMENT")
+        .any(|edge| resolves_to_release(
+            &edge.source, release_symbols, edges, reverse_edges, seen))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -882,9 +893,16 @@ fn scan_lifetime_metadata(
     for edge in edges_by_source.values().flatten().filter(|edge| edge.kind == "AST_CHILD") {
         children.entry(edge.source.clone()).or_default().push(edge.target.clone());
     }
+    let mut reverse_edges: HashMap<String, Vec<lifetime_proto::GraphEdge>> = HashMap::new();
+    for edge in edges_by_source.values().flatten()
+        .filter(|edge| edge.kind == "VALUE_FLOWS_TO")
+    {
+        reverse_edges.entry(edge.target.clone()).or_default().push(edge.clone());
+    }
     let release_value_ids: HashSet<String> = variable_meta.keys()
         .filter(|variable| resolves_to_release(
-            variable, &release_symbol_ids, &edges_by_source, &mut HashSet::new()))
+            variable, &release_symbol_ids, &edges_by_source, &reverse_edges,
+            &mut HashSet::new()))
         .cloned()
         .collect();
     Ok((owners, function_names, call_ids, edges_by_source, initializer_targets,
