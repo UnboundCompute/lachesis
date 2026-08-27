@@ -300,7 +300,7 @@ mod tests {
         }).collect();
         lifetime_proto::NativeSemanticFunction {
             id: "f".to_owned(), entry: ids[0].clone(), exits: vec![ids[ids.len() - 1].clone()],
-            nodes, edges,
+            nodes, edges, language: "c".to_owned(),
         }
     }
 
