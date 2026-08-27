@@ -256,15 +256,14 @@ def command_scan(args: argparse.Namespace) -> int:
     else:
         from lachesis.session import Analysis
         progress.phase("finding taxonomy leads")
-        result = Analysis(store).candidates(
-            temporal=True, hard_stop=args.hard_stop, limit=args.limit or 20,
+        leads = Analysis(store).scan(
+            lens="all", hard_stop=args.hard_stop,
+            limit=None if args.limit == 0 else args.limit,
         )
-        queue = list(result.get("candidates", ()))
-        for group in result.get("groups", ()):
-            queue.extend(group.get("candidates", ()))
-        queue = [row for row in queue if (row.get("rank") or 0.0) >= args.min_rank]
-        census = result.get("coverage") or result.get("summary") or {}
-        result = {**result, "lens": args.lens, "queue": queue, "census": census}
+        queue = [lead.to_dict() for lead in leads
+                 if (lead.rank or 0.0) >= args.min_rank]
+        census = leads.summary()
+        result = {"lens": args.lens, "queue": queue, "census": census}
     progress.done()
     if args.json:
         import json

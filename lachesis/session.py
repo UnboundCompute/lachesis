@@ -116,31 +116,7 @@ def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
         raise NoSourceError(f"source or graph does not exist: {source}")
 
     analysis = Analysis.open(graph_path, progress=progress)
-    if lens == "flow":
-        return analysis.analyze(hard_stop=hard_stop)
-    if lens == "guard-diff":
-        from lachesis.planner.constructors import GuardDifferential
-        result = GuardDifferential(analysis.store).run(
-            limit_entrypoints=limit or 0,
-        )
-        rows = result.get("queue") or ()
-        if limit is not None:
-            rows = rows[:limit]
-        return LeadSet(
-            leads=tuple(Lead.from_dict(row) for row in rows),
-            coverage=result.get("census"), _store=analysis.store,
-        )
-
-    result = analysis.candidates(
-        temporal=True, hard_stop=hard_stop, limit=limit or 20,
-    )
-    rows = list(result.get("candidates") or ())
-    for group in result.get("groups") or ():
-        rows.extend(group.get("candidates") or ())
-    return LeadSet(
-        leads=tuple(Lead.from_dict(row) for row in rows),
-        coverage=result.get("coverage"), _store=analysis.store,
-    )
+    return analysis.scan(lens=lens, hard_stop=hard_stop, limit=limit)
 
 
 class Analysis:
@@ -565,6 +541,50 @@ class Analysis:
         """Alias for :meth:`analyze` -- reads naturally as ``a.leads().near(...)``."""
         return self.analyze(**kwargs)
 
+    def scan(self, *, lens: str = "all", limit: int | None = 20,
+              hard_stop: float | None = None, workers: int | None = None) -> "LeadSet":
+        """Return one ranked lead set for the selected view.
+
+        ``all`` is the honest front-door view: it combines the obligation registry and the
+        native flow leads, removes duplicate identities, and ranks the surviving questions
+        together. ``flow`` is the lifetime-flow view; ``guard-diff`` is the entrypoint guard
+        view. All three return the same typed result object used by :func:`scan`.
+        """
+        if lens == "flow":
+            result = self.analyze(hard_stop=hard_stop, workers=workers)
+            return result if limit is None else result._with(result.top(limit))
+        if lens == "guard-diff":
+            from lachesis.planner.constructors import GuardDifferential
+            result = GuardDifferential(self.store).run(limit_entrypoints=0)
+            rows = [Lead.from_dict(row) for row in (result.get("queue") or ())]
+            rows.sort(key=lambda lead: lead.rank or 0.0, reverse=True)
+            return LeadSet(leads=tuple(rows[:limit] if limit is not None else rows),
+                           coverage=result.get("census"), _store=self.store)
+        if lens != "all":
+            raise ValueError("lens must be one of: all, guard-diff, flow")
+
+        bundle = self._bound_bind(temporal=True, hard_stop=hard_stop, deadline=None,
+                                  workers=workers)
+        registry_leads = [Lead.from_dict(row)
+                          for row in self._iter_candidates(bundle["registry"])]
+        flow_leads = list(self.analyze(hard_stop=hard_stop, workers=workers))
+        merged: dict[tuple[Any, ...], Lead] = {}
+        for lead in (*registry_leads, *flow_leads):
+            raw = lead.to_dict()
+            key = (raw.get("candidate_id") or raw.get("pattern_id") or
+                   (lead.pattern, lead.file, lead.line, lead.entry))
+            current = merged.get(key)
+            if current is None or (lead.rank or 0.0) > (current.rank or 0.0):
+                merged[key] = lead
+        rows = sorted(merged.values(), key=lambda lead: (
+            -(lead.rank or 0.0), lead.file or "", lead.line or 0, lead.pattern or ""))
+        if limit is not None:
+            rows = rows[:limit]
+        coverage = {"registry": bundle.get("atropos"),
+                    "flow": LeadSet._from_bundle(self._built.get(("flow", "mixed"), {}),
+                                                   self.store).summary()}
+        return LeadSet(leads=tuple(rows), coverage=coverage, _store=self.store)
+
     # -- library surface: pass 2 (enrich -> warm sidecars) --------------------------
 
     def enrich(self, *, hard_stop: float | None = None,
@@ -620,7 +640,7 @@ class Analysis:
     # -- library surface: the obligation registry (candidates / census) -------------
 
     def _bound_bind(self, *, temporal: bool, hard_stop: float | None,
-                    deadline: Deadline | None) -> dict:
+                    deadline: Deadline | None, workers: int | None = None) -> dict:
         """The bind bundle for a candidate query, temporal families bounded by the budget.
 
         ``temporal=False`` takes the guaranteed-bounded structural fast path (no dataflow
@@ -629,7 +649,8 @@ class Analysis:
         ``temporal_evaluated=False`` rather than hang.
         """
         return self._bind_bundle(temporal=temporal,
-                                 deadline=self._resolve_deadline(hard_stop, deadline))
+                                 deadline=self._resolve_deadline(hard_stop, deadline),
+                                 workers=workers)
 
     @staticmethod
     def _stamp_temporal(result: dict, bundle: dict) -> dict:
