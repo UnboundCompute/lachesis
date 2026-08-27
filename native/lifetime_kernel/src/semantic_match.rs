@@ -45,13 +45,22 @@ struct StateKey {
 }
 
 fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
-    let mut seen = HashSet::default();
-    while seen.insert(value) {
-        let Some((_, target)) = bindings.iter().find(|(source, _)| *source == value)
+    // Bindings are normalized by source before every transfer.  A binary
+    // search avoids allocating a temporary cycle set on every event.  The
+    // bound still makes malformed cyclic alias data terminate safely.
+    for _ in 0..=bindings.len() {
+        let Some(index) = bindings.binary_search_by_key(&value, |(source, _)| *source).ok()
         else { break };
-        value = *target;
+        let target = bindings[index].1;
+        if target == value { break; }
+        value = target;
     }
     value
+}
+
+#[inline]
+fn contains_sorted(values: &[u32], value: u32) -> bool {
+    values.binary_search(&value).is_ok()
 }
 
 fn add_finding(
@@ -179,14 +188,14 @@ fn match_function(
                 released.retain(|item| *item != object);
                 nulls.retain(|item| *item != object);
                 uninitialized.retain(|item| *item != object);
-                if !origins.contains(&object) { origins.push(object); }
+                if !contains_sorted(&origins, object) { origins.push(object); }
             },
             "RELEASE" => if let Some(object) = object_id {
                 // A release through a slot proven to contain null is a no-op.
                 // Keep this check before adding the object to the released set;
                 // otherwise a later valid release would be misclassified.
-                if !nulls.contains(&object) {
-                    if released.contains(&object) {
+                if !contains_sorted(&nulls, object) {
+                    if contains_sorted(&released, object) {
                         add_finding(&mut findings, &function.id, "double-free",
                                     &objects[object as usize], node);
                     }
@@ -197,30 +206,30 @@ fn match_function(
                 released.push(object);
             },
             "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object_id {
-                if released.contains(&object) {
+                if contains_sorted(&released, object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
                                 &objects[object as usize], node);
                 }
-                if nulls.contains(&object) {
+                if contains_sorted(&nulls, object) {
                     add_finding(&mut findings, &function.id, "null-deref",
                                 &objects[object as usize], node);
                 }
-                if uninitialized.contains(&object) {
+                if contains_sorted(&uninitialized, object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
                                 &objects[object as usize], node);
                 }
-                if pointer_arithmetic.contains(&object) {
+                if contains_sorted(&pointer_arithmetic, object) {
                     add_finding(&mut findings, &function.id,
                                 "pointer-arithmetic-before-validation",
                                 &objects[object as usize], node);
                 }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
-                if released.contains(&object) {
+                if contains_sorted(&released, object) {
                     add_finding(&mut findings, &function.id, "use.dangling",
                                 &objects[object as usize], node);
                 }
-                if uninitialized.contains(&object) {
+                if contains_sorted(&uninitialized, object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
                                 &objects[object as usize], node);
                 }
@@ -242,7 +251,7 @@ fn match_function(
         }
         if exits.contains(&index) {
             for object in &origins {
-                if !released.contains(object) {
+                if !contains_sorted(&released, *object) {
                     add_finding(&mut findings, &function.id, "leak",
                                 &objects[*object as usize], node);
                 }
