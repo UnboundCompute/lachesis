@@ -13,8 +13,10 @@ from typing import Dict, List, Optional, Tuple
 from .emit import Graph, SourceFile, compact, stable_id
 
 # Both ``def`` forms, in one tuple, because every visitor treats them alike apart
-# from the ``is_async`` flag.
+# from the ``is_async`` flag. Lambdas are scope-introducing function objects too;
+# they are kept separate because Python's AST does not give them a name.
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+FUNCTION_LIKE_NODES = FUNCTION_NODES + (ast.Lambda,)
 
 # CPython names the initializer ``__init__``; ``__new__`` is an ordinary (static)
 # method that happens to allocate, so it is not promoted to `constructor`.
@@ -74,7 +76,7 @@ def _parameter_slots(arguments: ast.arguments) -> List[Tuple[ast.arg, str, bool]
 
 
 def signature(source: SourceFile, node: ast.AST) -> str:
-    """``name(a, b=..., *rest)`` rendered from the AST, for the node's `signature`."""
+    """Render a compiler function signature, including anonymous lambdas."""
     rendered = []
     for argument, form, has_default in _parameter_slots(node.args):
         prefix = {"var-positional": "*", "var-keyword": "**"}.get(form, "")
@@ -82,11 +84,14 @@ def signature(source: SourceFile, node: ast.AST) -> str:
         if has_default:
             text += "=..."
         rendered.append(text)
-    return f"{node.name}({', '.join(rendered)})"
+    name = getattr(node, "name", "lambda")
+    return f"{name}({', '.join(rendered)})"
 
 
 def declaration_kind(node: ast.AST, owner_kind: str) -> str:
-    """What a ``def`` is called here, given what encloses it."""
+    """What a function-like AST node is called here, given its owner."""
+    if isinstance(node, ast.Lambda):
+        return "function"
     if owner_kind != "class":
         return "function"
     return "constructor" if node.name == CONSTRUCTOR_NAME else "method"
@@ -101,18 +106,21 @@ def declaration_id(source: SourceFile, node: ast.AST, kind: str) -> str:
     lookup that could silently miss.
     """
     position = source.position(node)
+    name = getattr(node, "name", "lambda")
     return stable_id(
         kind, source.display, position["start_offset"], position["end_offset"],
-        node.name,
+        name,
     )
 
 
-def is_stub_body(body: List[ast.stmt]) -> bool:
+def is_stub_body(body: object) -> bool:
     """True when a body is only ``...``/``pass``/a docstring, i.e. declares no code.
 
     This is the Python analogue of C's bodyless prototype. Flagging it keeps a
     ``.pyi`` stub from twinning its implementation in ``search`` ranking.
     """
+    if not isinstance(body, list):
+        return False
     for statement in body:
         if isinstance(statement, ast.Pass):
             continue
@@ -182,6 +190,11 @@ class DeclarationWalk:
         elif isinstance(statement, ast.ClassDef):
             self._class(statement, owner_id, owner_kind, function_id)
         else:
+            # Lambdas are expressions rather than statements. Register them while
+            # walking the statement that evaluates them, but do not descend into
+            # another def/class here: those scopes are handled by their own branch
+            # and must retain their compiler ownership.
+            self._expression_functions(statement, owner_id, owner_kind, function_id)
             if owner_kind in ("module", "class"):
                 # Only module- and class-level bindings become addressable
                 # `variable` nodes. Function locals are dataflow, not navigation:
@@ -197,7 +210,7 @@ class DeclarationWalk:
         self, node: ast.AST, owner_id: Optional[str], owner_kind: str,
         function_id: Optional[str],
     ) -> None:
-        name = node.name
+        name = getattr(node, "name", "lambda")
         kind = declaration_kind(node, owner_kind)
         position = self.source.position(node)
         node_id = declaration_id(self.source, node, kind)
@@ -210,7 +223,7 @@ class DeclarationWalk:
             is_async=isinstance(node, ast.AsyncFunctionDef),
             is_generator=_contains_yield(node),
             decorators=decorator_texts(self.source, node),
-            returns=annotation_text(self.source, node.returns),
+            returns=annotation_text(self.source, getattr(node, "returns", None)),
             owner_id=owner_id,
             owner_function_id=function_id,
             declaration_only=stub,
@@ -219,13 +232,52 @@ class DeclarationWalk:
         self.declarations_by_node[node] = node_id
         self.function_ids.append(node_id)
         self._declare(owner_id, owner_kind, node_id)
-        self._bind(name, node_id, owner_id if owner_kind == "class" else None, function_id)
-        if owner_kind == "class" and owner_id is not None:
+        if not isinstance(node, ast.Lambda):
+            self._bind(name, node_id, owner_id if owner_kind == "class" else None, function_id)
+        if owner_kind == "class" and owner_id is not None and not isinstance(node, ast.Lambda):
             self.class_members.setdefault(owner_id, {})[name] = node_id
         self._parameters(node, node_id)
+        if isinstance(node, ast.Lambda):
+            self._expression_functions(node.body, node_id, "function", node_id)
+            return
+        # Defaults, decorators, annotations, and bases execute in the enclosing
+        # scope and may themselves contain lambda function objects.
+        for region in self._outer_function_regions(node):
+            self._expression_functions(region, owner_id, owner_kind, function_id)
         # A nested def/class is declared by the enclosing function, and everything
         # inside it is attributed to the inner function.
         self._body(node.body, owner_id=node_id, owner_kind="function", function_id=node_id)
+
+    def _outer_function_regions(self, node: ast.AST) -> List[ast.AST]:
+        arguments = node.args
+        regions: List[ast.AST] = [
+            *arguments.defaults, *arguments.kw_defaults,
+            *getattr(node, "decorator_list", []), getattr(node, "returns", None),
+        ]
+        regions.extend(
+            slot.annotation
+            for slot in (
+                list(getattr(arguments, "posonlyargs", []))
+                + list(arguments.args) + list(arguments.kwonlyargs)
+                + [arguments.vararg, arguments.kwarg]
+            )
+            if slot is not None and getattr(slot, "annotation", None) is not None
+        )
+        return [region for region in regions if region is not None]
+
+    def _expression_functions(
+        self, node: ast.AST, owner_id: Optional[str], owner_kind: str,
+        function_id: Optional[str],
+    ) -> None:
+        """Emit every lambda in an expression with its enclosing compiler scope."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Lambda):
+                self._function(child, owner_id, owner_kind, function_id)
+            elif isinstance(child, (*FUNCTION_NODES, ast.ClassDef)):
+                # The statement walker owns these declarations and their bodies.
+                continue
+            else:
+                self._expression_functions(child, owner_id, owner_kind, function_id)
 
     def _parameters(self, node: ast.AST, function_id: str) -> None:
         slots = self.parameters_by_function.setdefault(function_id, {})
@@ -348,7 +400,8 @@ def _bound_names(target: ast.AST) -> List[ast.Name]:
 
 def _contains_yield(node: ast.AST) -> bool:
     """True when a def is a generator: a yield in its own body, not a nested def's."""
-    for statement in node.body:
+    body = node.body if isinstance(node.body, list) else [node.body]
+    for statement in body:
         for child in ast.walk(statement):
             if isinstance(child, (ast.Yield, ast.YieldFrom)):
                 return True
