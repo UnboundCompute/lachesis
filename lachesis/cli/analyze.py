@@ -36,7 +36,7 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _run() -> None:
+def _run(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("source_dir")
@@ -134,7 +134,7 @@ def _run() -> None:
         "--stream-shards", metavar="DIR", default=None,
         help="stream core-only frontend shards directly into Kùzu",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.output_flag is not None:
         args.output_path = args.output_flag
     if args.parallel_packages and args.incremental:
@@ -301,7 +301,7 @@ def _run() -> None:
     print("Node kinds: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     # stdout is block-buffered when piped to a file, so a long build that is killed (or a
     # `| tee log` capture) loses every line it "printed". Line-buffer so progress reaches
     # the file as it happens and a kill never swallows the tail. Guarded: some wrapped
@@ -311,7 +311,7 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
     try:
-        _run()
+        _run(argv)
     except KeyboardInterrupt:
         print("lachesis build: interrupted", file=sys.stderr)
         return 130

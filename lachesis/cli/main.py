@@ -377,6 +377,32 @@ def command_cache(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# -------------------------------------------------------------------------- build
+
+def command_build(args: argparse.Namespace) -> int:
+    """Build a named structural graph using the same implementation as the library."""
+    from lachesis.cli import analyze
+
+    forwarded = [args.source_dir, args.output_path, "--timeout", str(args.timeout)]
+    if args.output_flag:
+        forwarded.extend(["--output", args.output_flag])
+    if args.frontend_out:
+        forwarded.extend(["--frontend-out", args.frontend_out])
+    if args.no_prune:
+        forwarded.append("--no-prune")
+    if args.incremental:
+        forwarded.append("--incremental")
+    if args.parallel_packages:
+        forwarded.append("--parallel-packages")
+    if args.max_workers is not None:
+        forwarded.extend(["--max-workers", str(args.max_workers)])
+    if args.shard_large_packages is not None:
+        forwarded.extend(["--shard-large-packages", str(args.shard_large_packages)])
+    if args.stream_shards:
+        forwarded.extend(["--stream-shards", args.stream_shards])
+    return analyze.main(forwarded)
+
+
 # ------------------------------------------------------------------------- doctor
 
 def command_doctor(args: argparse.Namespace) -> int:
@@ -467,6 +493,13 @@ def _nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from error
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = _nonnegative_int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
 
 
@@ -603,13 +636,37 @@ def build_parser() -> argparse.ArgumentParser:
     from lachesis.cli.verbs import add_reader_verbs
     add_reader_verbs(subcommands)
 
-    # The engine's own programs, one word in. Their arguments are passed through
-    # untouched, which is why these take REMAINDER rather than a parsed shape: they
-    # are a different, lower-level surface and should behave exactly as documented
-    # for themselves. `build` is pass 1 (the structural graph builder); the parsed
-    # `analyze` above is pass 3 (leads), so the two passes never share a word.
+    build = subcommands.add_parser(
+        "build", help="pass 1: build a structural graph to a path you choose",
+        description="Parse a source tree into the named binary graph artifact. "
+                    "This is pass 1; enrichment is a separate `lachesis enrich` command.")
+    build.add_argument("source_dir", help="source tree to analyse")
+    build.add_argument("output_path", nargs="?", default="graph_out/compiler_project.kuzu",
+                       help="graph store to write")
+    build.add_argument("-o", "--output", dest="output_flag", metavar="PATH",
+                       help="same as the output path positional")
+    build.add_argument("--frontend-out", metavar="DIR",
+                       help="retain frontend bundles for inspection or incremental builds")
+    build.add_argument("--no-prune", action="store_true",
+                       help="keep lexical token/proof records (pruned by default)")
+    build.add_argument("--timeout", type=_positive_seconds, default=300, metavar="SECONDS",
+                       help="maximum seconds per frontend (default: 300)")
+    build.add_argument("--incremental", action="store_true",
+                       help="reuse unchanged frontend bundles")
+    build.add_argument("--parallel-packages", action="store_true",
+                       help="compile first-party packages independently")
+    build.add_argument("--max-workers", type=_positive_int, default=None, metavar="N",
+                       help="cap parallel package workers")
+    build.add_argument("--shard-large-packages", type=_positive_int, default=None,
+                       metavar="FILES", help="split large packages into bounded jobs")
+    build.add_argument("--stream-shards", metavar="DIR",
+                       help="stream frontend shards directly into the graph store")
+    build.set_defaults(handler=command_build, no_prune=False)
+
+    # Query and plan retain their specialised argument grammars, but are still
+    # explicit verbs in the top-level help. They are the only lower-level tools
+    # whose parsers are not shared with the public Analysis session yet.
     for name, help_text in (
-        ("build", "pass 1: build a structural graph to a path you choose"),
         ("query", "engine: query a graph directly"),
         ("plan", "engine: rank capsules from a graph you already have"),
     ):
@@ -622,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     return root
 
 
-ENGINE_COMMANDS = ("build", "query", "plan")
+ENGINE_COMMANDS = ("query", "plan")
 KNOWN_COMMANDS = {
     "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
