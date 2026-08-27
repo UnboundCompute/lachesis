@@ -1447,6 +1447,7 @@ fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
             "compare" => "COMPARE_VALUE",
             "return" | "return-stack" => "RETURN_VALUE",
             "pointer-arithmetic" => "POINTER_ARITHMETIC",
+            "write" => "WRITE_STORAGE",
             _ => "READ_STORAGE",
         },
         crate::Kind::Clobber => match access {
@@ -1581,6 +1582,9 @@ pub(crate) fn semantic_request(
                 crate::Kind::Realloc => vec!["REALLOC_ATTEMPT", "INVALIDATE", "ORIGIN"],
                 crate::Kind::Clobber if operation.access == "return-null" =>
                     vec!["RETURN_VALUE", "RETURN"],
+                crate::Kind::Use if operation.access == "return"
+                    || operation.access == "return-stack" =>
+                    vec!["RETURN_VALUE", "ESCAPE", "RETURN"],
                 _ => vec![semantic_event_kind(operation.kind, &operation.access)],
             };
             for (ordinal, kind) in kinds.into_iter().enumerate() {

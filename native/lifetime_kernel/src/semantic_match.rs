@@ -260,7 +260,7 @@ fn match_function(
                 nulls.insert(object);
                 realloc_lost.insert(object);
             },
-            "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object_id {
+            "READ_STORAGE" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
                                 &objects[object as usize], node);
@@ -277,6 +277,24 @@ fn match_function(
                     add_finding(&mut findings, &function.id,
                                 "pointer-arithmetic-before-validation",
                                 &objects[object as usize], node);
+                }
+            },
+            "WRITE_STORAGE" => if let Some(object) = object_id {
+                if released.contains(object) {
+                    add_finding(&mut findings, &function.id, "uaf.deref",
+                                &objects[object as usize], node);
+                }
+                if nulls.contains(object) {
+                    add_finding(&mut findings, &function.id, "null-deref",
+                                &objects[object as usize], node);
+                }
+                if uninitialized.contains(object) {
+                    add_finding(&mut findings, &function.id,
+                                "uninitialized-use", &objects[object as usize], node);
+                }
+                if let Some(value) = value_id {
+                    bindings.retain(|(source, _)| *source != object);
+                    bindings.push((object, value));
                 }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
