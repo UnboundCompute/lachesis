@@ -1403,7 +1403,7 @@ def call_tool(name, args, format=None):
             }
         minimum = float(args.get("min_rank", 0.0))
         queue = [capsule for capsule in scan["queue"]
-                 if float(capsule.get("rank", 0.0)) >= minimum]
+                 if float(capsule.get("rank") or 0.0) >= minimum]
         start, size = max(0, offset), max(1, limit)
         page = queue[start:start + size]
         next_offset = start + len(page)
