@@ -251,8 +251,12 @@ fn translation_return_kind(kind: &str) -> bool {
 }
 
 fn frontend_languages(function_id: &str) -> &'static [&'static str] {
-    if function_id.contains(":clang-c:") {
-        &["c"]
+    if function_id.contains(":clang-c:") || function_id.contains(":clang-c-native:")
+        || function_id.contains(":clang-cpp:") {
+        // One compiler frontend owns both C and C++ roots.  The function ID
+        // carries the frontend identity, not the source extension, so keep
+        // both catalog namespaces eligible for mixed compiler graphs.
+        &["c", "cpp"]
     } else if function_id.contains(":cpython-ast:") {
         &["python"]
     } else if function_id.contains(":typescript-compiler-api:") {

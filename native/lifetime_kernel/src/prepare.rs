@@ -1596,8 +1596,11 @@ fn semantic_language(function: &str) -> String {
         "typescript".to_owned()
     } else if function.contains(":javascript:") {
         "javascript".to_owned()
-    } else if function.contains(":clang-c:") || function.contains(":clang-cpp:") {
-        "c".to_owned()
+    } else if function.contains(":clang-c:") || function.contains(":clang-c-native:")
+        || function.contains(":clang-cpp:") {
+        // The native Clang frontend may contain C and C++ roots together;
+        // the function ID does not encode the individual source extension.
+        "mixed".to_owned()
     } else {
         "mixed".to_owned()
     }
