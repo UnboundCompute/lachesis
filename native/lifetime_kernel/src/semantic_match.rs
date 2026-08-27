@@ -589,28 +589,20 @@ fn match_reach_skeleton(
             evaluators.extend(recipe.split(',').filter(|item| !item.is_empty()));
         }
         for pattern in &catalog.patterns {
-            if pattern.matcher_pattern.is_empty() { continue; }
+            if pattern.matcher_pattern.is_empty() || pattern.evaluator.is_empty() { continue; }
             if pattern.matcher_families.iter().any(|family| family == &token.family)
-                && !evaluators.iter().any(|name| *name == pattern.evaluator)
+                && !evaluators.iter().any(|name| *name == pattern.evaluator.as_str())
             {
                 evaluators.push(pattern.evaluator.as_str());
             }
         }
-        for pattern in &catalog.patterns {
-            if pattern.matcher_pattern.is_empty() { continue; }
-            let family_route = pattern.matcher_families.iter().any(|family| family == &token.family);
-            let evaluator_route = !pattern.evaluator.is_empty()
-                && evaluators.iter().any(|name| *name == pattern.evaluator);
-            if !family_route && !evaluator_route { continue; }
-            let evaluator = if !pattern.evaluator.is_empty() {
-                pattern.evaluator.as_str()
-            } else {
-                continue;
-            };
+        evaluators.sort_unstable();
+        evaluators.dedup();
+        for evaluator in evaluators {
             if !reach_evaluator(evaluator, token) { continue; }
             findings.push(lifetime_proto::NativeTemporalFinding {
                 function: skeleton.source_function.clone(),
-                pattern: pattern.matcher_pattern.clone(),
+                pattern: evaluator.to_owned(),
                 path: Some(lifetime_proto::Path {
                     root: token.object_root.clone(),
                     selectors: token.object_selectors.clone(),
@@ -865,6 +857,11 @@ mod tests {
                 matcher_families: vec!["buffer-size".into()],
                 evaluator: "relational".into(),
                 ..Default::default()
+            }, crate::atropos_proto::Pattern {
+                matcher_pattern: "mem.copy.in.loop-unbounded".into(),
+                matcher_families: vec!["buffer-size".into()],
+                evaluator: "relational".into(),
+                ..Default::default()
             }],
             kind_evaluator: [("buffer-size".into(), "relational".into())]
                 .into_iter().collect(),
@@ -883,6 +880,7 @@ mod tests {
             lifetime_proto::NativeSemanticResult { skeletons: vec![skeleton], ..Default::default() },
             Some(&catalog));
         assert_eq!(matched.functions.len(), 1);
+        assert_eq!(matched.functions[0].findings.len(), 1);
         assert_eq!(matched.functions[0].findings[0].pattern, "relational");
     }
 
