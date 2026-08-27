@@ -246,7 +246,7 @@ fn compact_event_function(
 /// canonical Python registry so each later overlay observes the preceding
 /// additive facts.
 fn run_native_overlay_chain(
-    input: &std::path::Path, output: &std::path::Path,
+    input: &std::path::Path, catalog: Option<&std::path::Path>, output: &std::path::Path,
 ) -> Result<(usize, usize), String> {
     let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
     let started = std::time::Instant::now();
@@ -258,6 +258,14 @@ fn run_native_overlay_chain(
     let mut writer = pass2::DataflowStreamWriter::begin(
         output, &input.to_string_lossy(), &graph.core_content_hash,
     )?;
+    if let Some(catalog) = catalog {
+        let catalog = atropos_proto::Request::decode(
+            fs::read(catalog).map_err(|error| format!("cannot read binary Atropos catalog: {error}"))?.as_slice()
+        ).map_err(|error| format!("invalid binary Atropos catalog: {error}"))?;
+        let delta = taint::catalog_delta(&graph, &catalog);
+        absorb_native_delta(&mut graph, delta, &mut writer)?;
+        report_native_phase(timing_enabled, started, "atropos source-sink catalog", writer.nodes, writer.edges);
+    }
     let delta = control_flow::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "control-flow", writer.nodes, writer.edges);
@@ -1253,7 +1261,7 @@ pub unsafe extern "C" fn lachesis_pass2_control_flow_path(
 /// Return value: 0 on success, 1 on invalid/null paths or a native failure.
 #[no_mangle]
 pub unsafe extern "C" fn lachesis_pass2_run_path(
-    input_path: *const c_char, output_path: *const c_char,
+    input_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
 ) -> i32 {
     let result = (|| {
         if input_path.is_null() || output_path.is_null() {
@@ -1263,7 +1271,12 @@ pub unsafe extern "C" fn lachesis_pass2_run_path(
             .to_str().map_err(|error| format!("invalid native Pass-2 input path: {error}"))?;
         let output = CStr::from_ptr(output_path)
             .to_str().map_err(|error| format!("invalid native Pass-2 output path: {error}"))?;
-        run_native_overlay_chain(std::path::Path::new(input), std::path::Path::new(output))
+        let catalog = if catalog_path.is_null() { None } else {
+            Some(CStr::from_ptr(catalog_path).to_str()
+                .map_err(|error| format!("invalid Atropos catalog path: {error}"))?.to_owned())
+        };
+        run_native_overlay_chain(std::path::Path::new(input),
+            catalog.as_deref().map(std::path::Path::new), std::path::Path::new(output))
             .map(|(nodes, edges)| {
                 eprintln!("[lachesis native pass2] published {nodes} nodes and {edges} edges");
             })

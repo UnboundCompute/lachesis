@@ -12,6 +12,7 @@ message Model {
   bool has_arity = 7;
   string access_path = 8;
   string role = 9;
+  string kind = 10;
 }
 message Callee {
   string name = 1;

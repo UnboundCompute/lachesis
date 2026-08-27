@@ -104,12 +104,14 @@ def write_translation_facts_path(sidecar_path: str | os.PathLike[str],
 
 
 def run_pass2_path(input_path: str | os.PathLike[str],
-                   output_path: str | os.PathLike[str]) -> None:
+                   output_path: str | os.PathLike[str],
+                   catalog_path: str | os.PathLike[str] | None = None) -> None:
     library = _require_library()
     function = library.lachesis_pass2_run_path
-    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
     function.restype = ctypes.c_int
     status = function(os.fsencode(os.fspath(input_path)),
+                      os.fsencode(os.fspath(catalog_path)) if catalog_path is not None else None,
                       os.fsencode(os.fspath(output_path)))
     if status != 0:
         raise RuntimeError(f"native Pass-2 runner failed with status {status}")

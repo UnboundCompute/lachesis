@@ -91,6 +91,7 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
             method=model.get("method") or "", package=model.get("package") or "",
             receiver_type=model.get("type") or "",
             access_path=model.get("access_path") or "", role=model.get("role") or "",
+            kind=model.get("kind") or "",
         )
         if model.get("arity") is not None:
             encoded.arity = int(model["arity"])

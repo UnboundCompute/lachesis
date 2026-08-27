@@ -88,6 +88,79 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
     }
 }
 
+fn catalog_language(function: &str) -> Option<&'static str> {
+    if function.contains(":cpython-ast:") { Some("python") }
+    else if function.contains(":typescript-compiler-api:") { Some("typescript") }
+    else if function.contains(":clang-c:") || function.contains(":clang-c-native:") {
+        Some("c")
+    } else if function.contains(":javascript:") { Some("javascript") } else { None }
+}
+
+fn model_matches(model: &crate::atropos_proto::Model, language: Option<&str>, callee: &str) -> bool {
+    if !model.language.is_empty() && language != Some(model.language.as_str())
+        && !(language == Some("typescript") && model.language == "javascript") { return false; }
+    if model.package.is_empty() || model.package == "builtins" {
+        model.method == callee || callee.rsplit('.').next() == Some(model.method.as_str())
+    } else { callee == format!("{}.{}", model.package, model.method) }
+}
+
+fn model_endpoint(model: &crate::atropos_proto::Model, call: &pass2::Node,
+                  arguments: &HashMap<u32, Vec<(u32, u32)>>, graph: &Graph) -> Option<u32> {
+    let endpoint = model.access_path.split("->").next()?.trim();
+    if endpoint == "ReturnValue" {
+        return graph.node_property_text(call, "value_id").and_then(|value| graph.symbol(value));
+    }
+    if endpoint == "Receiver" {
+        return graph.node_property_text(call, "receiver_value_id").and_then(|value| graph.symbol(value));
+    }
+    let position = endpoint.strip_prefix("Argument[")?.strip_suffix(']')?.parse::<u32>().ok()?;
+    arguments.get(&call.id).into_iter().flatten()
+        .find_map(|(index, node)| (*index == position).then_some(*node))
+}
+
+/// Apply declarative Atropos source/sink rows to compiler call/argument facts.
+/// The catalog is a binary protobuf by this point; no authored JSON is read.
+pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Request) -> Delta {
+    let mut arguments: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for node in &graph.nodes {
+        if graph.kind(node.kind) != "argument" { continue; }
+        let Some(callsite) = graph.node_property_text(node, "callsite_id")
+            .and_then(|value| graph.symbol(value)) else { continue };
+        let position = graph.node_property_i64(node, "position")
+            .and_then(|value| u32::try_from(value).ok()).unwrap_or(0);
+        arguments.entry(callsite).or_default().push((position, node.id));
+    }
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for call in &graph.nodes {
+        if !matches!(graph.kind(call.kind), "call" | "construct") { continue; }
+        let Some(callee) = graph.node_property_text(call, "callee")
+            .or_else(|| graph.node_property_text(call, "method_name"))
+            .or_else(|| graph.node_property_text(call, "callee_name")) else { continue };
+        let language = graph.node_owner(call).map(|owner| graph.id(owner)).and_then(catalog_language);
+        for model in &catalog.models {
+            if !matches!(model.role.as_str(), "source" | "sink")
+                || !model_matches(model, language, callee) { continue; }
+            let Some(value) = model_endpoint(model, call, &arguments, graph) else { continue; };
+            let role = model.role.as_str();
+            let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
+            let id = pass2::stable_id("catalog", role, "endpoint",
+                &[graph.id(call.id), model_id, model.access_path.as_str()]);
+            let kind = if role == "source" { "source" } else { "sink" };
+            let semantic_kind = if model.kind.is_empty() { model_id } else { model.kind.as_str() };
+            let mut properties = fact(&[graph.id(call.id).to_owned()], "high");
+            properties.push(pass2::text_field("value_id", graph.id(value)));
+            properties.push(pass2::text_field(if role == "source" { "source_kind" } else { "sink_kind" }, semantic_kind));
+            properties.push(pass2::text_field("catalog_model_id", model_id));
+            nodes.push(graph_proto::NodeRecord { id: id.clone(), kind: kind.to_owned(),
+                label: format!("{}:{}", role, callee), properties, tier: String::new() });
+            edges.push(edge(if role == "source" { "TAINT_SOURCE" } else { "TAINT_SINK" },
+                &id, graph.id(value), fact(&[graph.id(value).to_owned()], "high")));
+        }
+    }
+    Delta { nodes, edges }
+}
+
 pub(crate) fn enrich(graph: &Graph) -> Delta {
     let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>, Option<String>)>> = FxHashMap::default();
     let mut evidence: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
