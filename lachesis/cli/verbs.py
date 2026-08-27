@@ -85,7 +85,7 @@ def command_analyze(args: argparse.Namespace) -> int:
 
     with Progress(enabled=not args.json) as progress:
         analysis = _open(args, progress=progress_to(progress))
-        leads = analysis.analyze(engine=args.engine, hard_stop=args.hard_stop,
+        leads = analysis.analyze(hard_stop=args.hard_stop,
                                  workers=args.lifetime_workers)
 
     # --summary is the rollup alone; it wins over any filter so `analyze --summary` always
@@ -308,7 +308,6 @@ def add_reader_verbs(subcommands) -> None:
     analyze.add_argument("--function", help="show only leads in this function")
     analyze.add_argument("--at", metavar="FILE[:LINE|:LO-HI]",
                          help="locate leads by source position")
-    analyze.add_argument("--engine", default="object", help="lifetime engine (default: object)")
     analyze.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
                          dest="hard_stop", help="wall-clock budget (0 = unbounded)")
     analyze.add_argument("--lifetime-workers", type=int, default=2, metavar="N",

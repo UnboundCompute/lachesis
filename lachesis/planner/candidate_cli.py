@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     temporal_ids = {spec["id"] for spec in family_specs() if spec.get("temporal")}
     if args.constructor in temporal_ids:
         from lachesis.flow.pipeline import run_pass
-        flow = run_pass(store, lifetime_engine="object")
+        flow = run_pass(store)
         semantic = flow.get("semantic_graph")
         if semantic is not None:
             stamped["semantic_graph"] = {

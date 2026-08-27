@@ -263,7 +263,7 @@ class _Ctx(Analysis):
         result is never memoized (see ``_flow_bundle``), so a later call with a larger budget
         recomputes cleanly. ``LACHESIS_HARD_STOP=0`` runs it unbounded.
         """
-        return self._flow_bundle(engine=None,
+        return self._flow_bundle(
                                  deadline=self._resolve_deadline(None, None))
 
     @property
@@ -1661,7 +1661,7 @@ def call_tool(name, args, format=None):
         # The warm counterpart to a cold re-run: `flow_bundle` is already materialized and
         # cached on the ctx, so this wraps it in a LeadSet and filters in memory. Same
         # LeadSet the library returns -- one implementation, queried from both surfaces.
-        ls = LeadSet._from_bundle(c.flow_bundle, c.store, engine=None)
+        ls = LeadSet._from_bundle(c.flow_bundle, c.store)
         pattern, function, at = args.get("pattern"), args.get("function"), args.get("at")
         if pattern:
             ls = ls.by_pattern(pattern)

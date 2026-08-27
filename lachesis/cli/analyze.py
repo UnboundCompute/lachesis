@@ -17,7 +17,7 @@ from lachesis.kuzu_store import read_store_manifest, write_kuzu_graph, write_kuz
 from lachesis.core.shards import CompositeShardReader
 from lachesis.partition import (BODY, SEMANTIC, SPINE, partition_counts,
                                 reduce_graph)
-from lachesis.pipeline import (enrich_project_graph, run_project,
+from lachesis.pipeline import (run_project,
                                run_project_incremental, run_project_parallel,
                                run_project_streaming, run_project_streaming_parallel,
                                source_content_hash,
@@ -146,6 +146,10 @@ def _run() -> None:
         parser.error("--stream-shards currently supports core-only stores")
     if args.stream_shards and args.incremental:
         parser.error("--stream-shards cannot combine with incremental builds")
+    if args.enrich:
+        parser.error("build-time enrichment was removed; run `lachesis enrich` after build")
+    if args.reduced or args.layered_out:
+        parser.error("--reduced/--layered-out are not available in the native-only build path")
     if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
         parser.error("streamed package shards are serialized; use --max-workers 1")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
@@ -185,7 +189,7 @@ def _run() -> None:
     # The layered projection is by definition a view of the enriched tier (T4 is the
     # dataflow layer), so asking for it forces enrichment rather than silently emitting
     # an empty top tier.
-    enrich = args.enrich or bool(args.layered_out) or args.reduced
+    enrich = False
     # --prune deletes the pure-lexical nodes on the way into the store, so asking a
     # frontend for them is work whose entire output is discarded a step later. Telling
     # the frontends up front turns that into work not done: for C the token stream costs
@@ -194,7 +198,7 @@ def _run() -> None:
     # A reduced store is defined by the difference between the two tiers — an edge is
     # carried because the core graph does *not* contain it — so the two have to exist as
     # separate values. The compile runs unenriched and this folds the overlay itself.
-    compile_enrich = enrich and not args.reduced
+    compile_enrich = False
 
     # Core-only builds do not need a materialized Python graph. Keep frontend
     # records in binary shards and stream them directly into Kùzu to bound RSS.

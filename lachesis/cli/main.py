@@ -81,18 +81,40 @@ def command_scan(args: argparse.Namespace) -> int:
         return EXIT_USAGE
 
     from lachesis.nav.graph_store import GraphStore
-    from lachesis.planner.constructors import GuardDifferential
 
     progress.phase("loading dataflow")
     store = GraphStore.load(str(graph_path))
     store.ensure_dataflow_tier()
     progress.done()
 
-    progress.phase("finding entrypoints that reach sensitive effects")
-    result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
+    if args.lens == "guard-diff":
+        from lachesis.planner.constructors import GuardDifferential
+        progress.phase("finding guard-differential leads")
+        result = GuardDifferential(store).run(limit_entrypoints=args.entrypoints)
+        queue = [row for row in result.get("queue", ())
+                 if (row.get("rank") or 0.0) >= args.min_rank]
+        census = result.get("census", {})
+    elif args.lens == "flow":
+        from lachesis.session import Analysis
+        progress.phase("finding native flow leads")
+        leads = Analysis(store).analyze(hard_stop=args.hard_stop)
+        queue = [lead.to_dict() for lead in leads.top(args.limit or len(leads))
+                 if (lead.rank or 0.0) >= args.min_rank]
+        census = leads.summary()
+        result = {"lens": args.lens, "queue": queue, "census": census}
+    else:
+        from lachesis.session import Analysis
+        progress.phase("finding taxonomy leads")
+        result = Analysis(store).candidates(
+            temporal=True, hard_stop=args.hard_stop, limit=args.limit or 20,
+        )
+        queue = list(result.get("candidates", ()))
+        for group in result.get("groups", ()):
+            queue.extend(group.get("candidates", ()))
+        queue = [row for row in queue if (row.get("rank") or 0.0) >= args.min_rank]
+        census = result.get("coverage") or result.get("summary") or {}
+        result = {**result, "lens": args.lens, "queue": queue, "census": census}
     progress.done()
-
-    queue = [capsule for capsule in result["queue"] if capsule["rank"] >= args.min_rank]
     if args.json:
         import json
         payload = dict(result)
@@ -100,10 +122,21 @@ def command_scan(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         _stderr()
-        print(_census_line(result["census"]), file=sys.stderr)
+        if args.lens == "guard-diff":
+            print(_census_line(census), file=sys.stderr)
+        else:
+            print(f"{len(queue)} leads  (lens={args.lens})", file=sys.stderr)
         shown = queue[:args.limit] if args.limit else queue
-        for position, capsule in enumerate(shown, start=1):
-            print(_render(capsule, position))
+        for position, lead in enumerate(shown, start=1):
+            if args.lens == "guard-diff":
+                rendered = _render(lead, position)
+            else:
+                observations = lead.get("observations") or {}
+                rendered = (f"{position:>3}. [{(lead.get('rank') or 0.0):.3f}] "
+                            f"{lead.get('pattern') or lead.get('constructor') or 'lead'}  "
+                            f"{lead.get('entry') or observations.get('callee', '')}:"
+                            f"{lead.get('line') or observations.get('line', '')}")
+            print(rendered)
             print()
         if len(shown) < len(queue):
             print(f"... {len(queue) - len(shown)} more; --limit 0 prints them all")
@@ -491,6 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="drop findings ranked below R (0.0-1.0)")
     scan.add_argument("--entrypoints", type=_nonnegative_int, default=0, metavar="N",
                       help="scan only the first N entrypoints (0 = all)")
+    scan.add_argument("--lens", choices=("all", "guard-diff", "flow"), default="all",
+                      help="analysis view: all families, guard differential, or flow leads")
+    scan.add_argument("--hard-stop", type=float, default=None, metavar="SECONDS",
+                      help="analysis budget (0 = unbounded; default is bounded)")
     scan.add_argument("--json", action="store_true",
                       help="write the full result to stdout as JSON")
     scan.add_argument("--fail-on-findings", action="store_true",
@@ -603,6 +640,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 ENGINE_COMMANDS = ("build", "query", "plan")
+KNOWN_COMMANDS = {
+    "scan", "communities", "report", "mcp", "index", "cache", "doctor",
+    "concept-model", "enrich", "analyze", "candidates", "explain", "build",
+    "query", "plan",
+}
 
 
 def _run_engine(name: str, rest: list[str]) -> int:
@@ -623,6 +665,13 @@ def _run_engine(name: str, rest: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    # A path is the product's default command: `lachesis ./repo` is exactly
+    # `lachesis scan ./repo`, and a bare invocation scans the current directory.
+    if not arguments:
+        arguments = ["scan"]
+    elif (not arguments[0].startswith("-")
+          and arguments[0] not in KNOWN_COMMANDS):
+        arguments = ["scan", *arguments]
     if arguments and arguments[0] in ENGINE_COMMANDS:
         return _run_engine(arguments[0], arguments[1:])
     parser = build_parser()

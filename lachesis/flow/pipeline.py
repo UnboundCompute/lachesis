@@ -17,19 +17,17 @@ from .semantic_graph import match_graph
 _DEFAULT_LIFETIME_ENGINE = "rust"
 
 
-def run_pass(store, lang="c", lifetime_engine=None, *, workers=None,
+def run_pass(store, lang="mixed", *, workers=None,
              snapshot=None, deadline=None, progress=None):
     """Run the native semantic engine over a store-backed binary substrate.
 
-    ``lang`` remains part of the public API for catalog/report compatibility, but the
-    substrate is language-neutral and is scanned once for mixed-language stores.
+    ``lang`` remains part of the internal catalog/report contract, but the substrate is
+    language-neutral and is scanned once for mixed-language stores.  Engine selection is
+    intentionally not an argument: the only engine is the native Rust engine.
     ``workers``, ``snapshot``, and ``deadline`` are accepted for API compatibility;
     scheduling and persistence belong to the Rust engine and its sidecars.
     """
-    requested = lifetime_engine or _DEFAULT_LIFETIME_ENGINE
-    if requested != _DEFAULT_LIFETIME_ENGINE:
-        raise ValueError(
-            "Python legacy and shadow engines were removed; use the native Rust engine")
+    requested = _DEFAULT_LIFETIME_ENGINE
 
     started = perf_counter()
     if progress is not None:

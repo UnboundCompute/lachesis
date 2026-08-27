@@ -32,11 +32,11 @@ import tempfile
 from time import perf_counter
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 from lachesis.flow.deadline import Deadline
 
-__all__ = ["Analysis", "LeadSet", "Deadline"]
+__all__ = ["scan", "Analysis", "Lead", "LeadSet", "Deadline", "AnalysisError"]
 
 # A progress sink: called with a phase label and the seconds elapsed since the pass began,
 # at each phase boundary a long analysis already measures. The library defines the shape but
@@ -48,6 +48,71 @@ ProgressFn = Callable[[str, float], None]
 # the four existing callers; the bound is a *library* default, resolved here, overridable per
 # call (``hard_stop``) or by env (``LACHESIS_HARD_STOP``), and disabled by ``hard_stop=0``.
 DEFAULT_HARD_STOP = 180.0
+
+
+class AnalysisError(RuntimeError):
+    """Base error for an analysis request that cannot produce a trustworthy answer."""
+
+
+class NoSourceError(AnalysisError):
+    """Raised when a requested source path has no supported source files."""
+
+
+class NativeKernelError(AnalysisError):
+    """Raised when the native analysis kernel cannot be loaded or run."""
+
+
+def scan(path: str = ".", *, lens: str = "all", hard_stop: float | None = None,
+         refresh: bool = False, timeout: int = 300, limit: int | None = None,
+         progress: ProgressFn | None = None) -> "LeadSet":
+    """Build or open ``path`` and return ranked leads from one selected lens."""
+    if lens not in {"all", "guard-diff", "flow"}:
+        raise ValueError("lens must be one of: all, guard-diff, flow")
+    source = os.path.expanduser(path)
+    if os.path.isdir(source):
+        try:
+            from lachesis.cli.indexer import ensure_graph
+            from lachesis.cli.progress import Progress
+            cli_progress = Progress(enabled=progress is None)
+            graph_path, _ = ensure_graph(
+                source, refresh=refresh, progress=cli_progress,
+                timeout_seconds=timeout,
+            )
+        except AnalysisError:
+            raise
+        except Exception as error:
+            raise AnalysisError(f"could not index {source}: {error}") from error
+    elif os.path.exists(source):
+        graph_path = source
+    else:
+        raise NoSourceError(f"source or graph does not exist: {source}")
+
+    analysis = Analysis.open(graph_path, progress=progress)
+    if lens == "flow":
+        return analysis.analyze(hard_stop=hard_stop)
+    if lens == "guard-diff":
+        from lachesis.planner.constructors import GuardDifferential
+        result = GuardDifferential(analysis.store).run(
+            limit_entrypoints=limit or 0,
+        )
+        rows = result.get("queue") or ()
+        if limit is not None:
+            rows = rows[:limit]
+        return LeadSet(
+            leads=tuple(Lead.from_dict(row) for row in rows),
+            coverage=result.get("census"), engine="rust", _store=analysis.store,
+        )
+
+    result = analysis.candidates(
+        temporal=True, hard_stop=hard_stop, limit=limit or 20,
+    )
+    rows = list(result.get("candidates") or ())
+    for group in result.get("groups") or ():
+        rows.extend(group.get("candidates") or ())
+    return LeadSet(
+        leads=tuple(Lead.from_dict(row) for row in rows),
+        coverage=result.get("coverage"), engine="rust", _store=analysis.store,
+    )
 
 
 class Analysis:
@@ -99,10 +164,13 @@ class Analysis:
 
         source = os.path.expanduser(source)
         out = os.path.expanduser(out)
-        graph, snapshots = run_project(source, None, enrich=enrich,
+        graph, snapshots = run_project(source, None, enrich=False,
                                        timeout_seconds=timeout_seconds)
-        write_kuzu_graph(graph, snapshots, out, enriched=enrich)
-        return cls.open(out, progress=progress)
+        write_kuzu_graph(graph, snapshots, out, enriched=False)
+        analysis = cls.open(out, progress=progress)
+        if enrich:
+            analysis.enrich(hard_stop=0)
+        return analysis
 
     # -- the memo (shared with every _Ctx navigation property) ----------------------
 
@@ -140,22 +208,21 @@ class Analysis:
             print(f"[lachesis pass2] temporal {label}: {elapsed:.3f}s",
                   file=sys.stderr, flush=True)
 
-    def _flow_bundle(self, engine: str | None = None, lang: str = "c",
-                     **run_kwargs: Any) -> dict:
+    def _flow_bundle(self, lang: str = "mixed", **run_kwargs: Any) -> dict:
         """The interprocedural flow pass over the whole graph, computed once and cached.
 
-        Memoized under ``("flow", engine, lang)`` -- a tuple key that never collides with a
+        Memoized under ``("flow", lang)`` -- a tuple key that never collides with a
         subclass's string keys. A *partial* (timed-out) result is never cached: a later, more
         patient call must be free to recompute rather than inherit a truncated answer.
         """
-        key = ("flow", engine, lang)
+        key = ("flow", lang)
         self._sync_tier()
         cached = self._built.get(key)
         if cached is not None and not (cached.get("lifetime") or {}).get("timed_out"):
             return cached
         from lachesis.flow.pipeline import run_pass
 
-        bundle = run_pass(self.store, lang=lang, lifetime_engine=engine, **run_kwargs)
+        bundle = run_pass(self.store, lang=lang, **run_kwargs)
         self._built[key] = bundle
         return bundle
 
@@ -415,7 +482,7 @@ class Analysis:
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 
-    def analyze(self, *, engine: str = "object", lang: str = "c",
+    def analyze(self, *, lang: str | None = None,
                 workers: int | None = None, hard_stop: float | None = None,
                 snapshot: bool = False, deadline: Deadline | None = None,
                 progress: ProgressFn | None = None) -> "LeadSet":
@@ -432,11 +499,11 @@ class Analysis:
         """
         deadline = self._resolve_deadline(hard_stop, deadline)
         bundle = self._flow_bundle(
-            engine, lang,
+            lang or "mixed",
             workers=workers, snapshot=snapshot, deadline=deadline,
             progress=progress if progress is not None else self._progress,
         )
-        return LeadSet._from_bundle(bundle, self.store, engine=engine)
+        return LeadSet._from_bundle(bundle, self.store)
 
     @staticmethod
     def _resolve_deadline(hard_stop: float | None,
@@ -759,6 +826,66 @@ class Analysis:
 
 
 @dataclass(frozen=True)
+class Lead:
+    """One typed, question-not-verdict finding from a Lachesis analysis."""
+
+    rank: float | None = None
+    pattern: str | None = None
+    file: str | None = None
+    line: int | None = None
+    entry: str | None = None
+    evaluator: str | None = None
+    guard: str | None = None
+    tier: str | int | None = None
+    witness: Any = None
+    source_function: str | None = None
+    source_line: int | None = None
+    pattern_id: str | None = None
+    _raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "Lead":
+        """Create a typed lead while preserving producer-specific fields."""
+        observations = value.get("observations") or {}
+        known = {
+            "rank", "pattern", "file", "line", "entry", "evaluator", "guard",
+            "tier", "witness", "source_function", "source_line", "pattern_id",
+        }
+        return cls(
+            rank=value.get("rank") if value.get("rank") is not None else 0.0,
+            pattern=value.get("pattern") or value.get("constructor"),
+            file=value.get("file") or observations.get("file"),
+            line=value.get("line") if value.get("line") is not None
+            else observations.get("line"),
+            entry=value.get("entry") or observations.get("function"),
+            evaluator=value.get("evaluator"), guard=value.get("guard"),
+            tier=value.get("tier"), witness=value.get("witness"),
+            source_function=value.get("source_function"), source_line=value.get("source_line"),
+            pattern_id=value.get("pattern_id"),
+            _raw={key: item for key, item in value.items() if key not in known},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the explicit plain-data representation for serialization."""
+        result = dict(self._raw)
+        for name in (
+            "rank", "pattern", "file", "line", "entry", "evaluator", "guard", "tier",
+            "witness", "source_function", "source_line", "pattern_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                result[name] = value
+        return result
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Compatibility accessor for renderers while callers migrate to attributes."""
+        return self.to_dict().get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+
+@dataclass(frozen=True)
 class LeadSet:
     """An immutable view over one flow pass's leads, with the filters and the persistence
     both sessions kept re-writing by hand.
@@ -769,7 +896,7 @@ class LeadSet:
     filters return a new ``LeadSet`` sharing the same store, so they chain.
     """
 
-    leads: tuple[dict, ...] = ()
+    leads: tuple[Lead, ...] = ()
     timings: dict = field(default_factory=dict)
     lifetime: dict = field(default_factory=dict)
     coverage: Any = None
@@ -782,15 +909,18 @@ class LeadSet:
     # -- construction ---------------------------------------------------------------
 
     @classmethod
-    def _from_bundle(cls, bundle: dict, store: Any, *, engine: str | None) -> "LeadSet":
+    def _from_bundle(cls, bundle: dict, store: Any) -> "LeadSet":
         lifetime = bundle.get("lifetime") or {}
         diagnostics = lifetime.get("diagnostics") or {}
         return cls(
-            leads=tuple(bundle.get("leads") or ()),
+            leads=tuple(
+                lead if isinstance(lead, Lead) else Lead.from_dict(lead)
+                for lead in (bundle.get("leads") or ())
+            ),
             timings=dict(bundle.get("timings") or {}),
             lifetime=lifetime,
             coverage=bundle.get("coverage"),
-            engine=engine,
+            engine="rust",
             timed_out=bool(lifetime.get("timed_out")),
             truncated_functions=tuple(diagnostics.get("capped") or ()),
             _store=store,
@@ -805,7 +935,7 @@ class LeadSet:
 
     # -- container protocol ---------------------------------------------------------
 
-    def __iter__(self) -> Iterator[dict]:
+    def __iter__(self) -> Iterator[Lead]:
         return iter(self.leads)
 
     def __len__(self) -> int:
@@ -813,6 +943,19 @@ class LeadSet:
 
     def __bool__(self) -> bool:
         return bool(self.leads)
+
+    def top(self, n: int) -> list[Lead]:
+        """Return the highest-ranked ``n`` leads without changing this result set."""
+        if n < 0:
+            raise ValueError("n must be zero or greater")
+        return sorted(self.leads, key=lambda lead: lead.rank or 0.0, reverse=True)[:n]
+
+    def __repr__(self) -> str:
+        patterns = len(self.patterns())
+        files = len({lead.file for lead in self.leads if lead.file})
+        return f"<LeadSet: {len(self.leads)} leads across {patterns} patterns, {files} files>"
+
+    __str__ = __repr__
 
     # -- summary --------------------------------------------------------------------
 
@@ -910,7 +1053,8 @@ class LeadSet:
         """
         payload = {
             "summary": self.summary(),
-            "leads": list(self.leads),
+            "schema": "lead/v1",
+            "leads": [lead.to_dict() for lead in self.leads],
         }
         if path is None:
             return payload
