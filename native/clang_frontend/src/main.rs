@@ -323,6 +323,12 @@ fn language_for_path(path: &str) -> &'static str {
     }
 }
 
+fn is_function_syntax(kind: &str) -> bool {
+    matches!(kind,
+        "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
+        "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl")
+}
+
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
     let absolute = Path::new(path)
         .canonicalize()
@@ -593,7 +599,7 @@ unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opti
         return None;
     }
     let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
-    if target_kind != "FunctionDecl" {
+    if !is_function_syntax(&target_kind) {
         return None;
     }
     let target_name = cx_string(clang_getCursorSpelling(referenced));
@@ -628,7 +634,7 @@ unsafe fn referenced_target_id(cursor: CXCursor, emitter: &mut Emitter) -> Optio
     }
     let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
     let id_kind = match target_kind.as_str() {
-        "FunctionDecl" => "function",
+        kind if is_function_syntax(kind) => "function",
         "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => "value",
         _ => return None,
     };
@@ -705,7 +711,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     }
 
     let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
-        "FunctionDecl" => Some("function"),
+        kind if is_function_syntax(kind) => Some("function"),
         "RecordDecl" | "StructDecl" | "UnionDecl" => Some("record"),
         "EnumDecl" => Some("enum"),
         "TypedefDecl" => Some("type"),
@@ -757,7 +763,8 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     let owner_id = function_owner(cursor, emitter);
     if matches!(
         syntax_kind.as_str(),
-        "FunctionDecl"
+        "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl"
+            | "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl"
             | "RecordDecl"
             | "StructDecl"
             | "UnionDecl"
@@ -777,7 +784,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     if let Some(owner_id) = &owner_id {
         properties.push(field("owner_function_id", text(owner_id)));
     }
-    if syntax_kind == "FunctionDecl" {
+    if is_function_syntax(&syntax_kind) {
         let has_definition = clang_isCursorDefinition(cursor) != 0;
         properties.push(field("declaration_only", graph::Value {
             kind: Some(graph::value::Kind::Boolean(!has_definition)),
@@ -807,7 +814,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             let target_file = emitter.canonical_file(target_raw_file);
             if !target_file.is_empty() {
                 let target_id_kind = match target_kind.as_str() {
-                    "FunctionDecl" => Some("function"),
+                    kind if is_function_syntax(kind) => Some("function"),
                     "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                     _ => None,
                 };
@@ -838,7 +845,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                                 source_tier: tier.clone(), relationship_class: "MAY_INVOKE".to_owned(),
                             })?;
                         }
-                    } else if target_kind == "FunctionDecl" {
+                    } else if is_function_syntax(&target_kind) {
                         properties.push(field("primary_target_id", text(&target_id)));
                         properties.push(field("resolution", text("exact")));
                         call_target = Some(target_id.clone());
@@ -1050,7 +1057,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
             let target_file = emitter.canonical_file(target_raw_file);
             let id_kind = match target_kind.as_str() {
-                "FunctionDecl" => Some("function"),
+                kind if is_function_syntax(kind) => Some("function"),
                 "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                 _ => None,
             };
@@ -1104,7 +1111,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         })?;
     }
 
-    if syntax_kind == "FunctionDecl"
+    if is_function_syntax(&syntax_kind)
         && owner_id.is_none()
         && clang_isCursorDefinition(cursor) != 0
         && clang_getCursorLinkage(cursor) != CXLinkage_Internal
@@ -1156,7 +1163,7 @@ unsafe fn function_owner(cursor: CXCursor, emitter: &mut Emitter) -> Option<Stri
         }
         let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(current)));
         let spelling = cx_string(clang_getCursorSpelling(current));
-        if syntax_kind == "FunctionDecl" {
+        if is_function_syntax(&syntax_kind) {
             return Some(stable_id("function", &file, offset, end_offset, &spelling));
         }
         let next = clang_getCursorSemanticParent(current);
@@ -1179,7 +1186,7 @@ fn cursor_identity(
         return None;
     }
     let (kind, tier, id_kind) = match syntax_kind {
-        "FunctionDecl" => ("function", "T1", "function"),
+        kind if is_function_syntax(kind) => ("function", "T1", "function"),
         "RecordDecl" | "StructDecl" | "UnionDecl" => ("record", "T1", "record"),
         "EnumDecl" => ("enum", "T1", "enum"),
         "TypedefDecl" => ("type", "T1", "type"),
