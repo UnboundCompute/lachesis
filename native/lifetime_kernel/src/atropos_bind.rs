@@ -407,7 +407,7 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
     let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
     let mut arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut has_arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    let mut language: Option<&str> = None;
+    let mut language: Option<String> = None;
     let mut mixed_languages = false;
     while let Some(mut payload) = framed_record(&mut reader)? {
         if payload.is_empty() { continue; }
@@ -415,21 +415,25 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
         match tag {
             b'N' => {
                 let node_id = string_field(payload.as_slice(), 1).unwrap_or("");
-                let node_language = if node_id.contains(":clang-c:") { Some("c") }
-                    else if node_id.contains(":cpython-ast:") { Some("python") }
-                    else if node_id.contains(":typescript-compiler-api:") { Some("typescript") }
-                    else { None };
-                if let Some(current) = node_language {
-                    if let Some(previous) = language {
-                        mixed_languages |= previous != current;
-                    } else if !mixed_languages {
-                        language = Some(current);
-                    }
-                }
                 let kind = string_field(payload.as_slice(), 2).unwrap_or("");
                 if kind == "call" || kind == "construct" || kind == "argument" {
                     let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
                         .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
+                    let node_language = property(&node, "language").and_then(|value| match value.as_str() {
+                        "c" | "cpp" | "python" | "typescript" | "javascript" => Some(value),
+                        _ => None,
+                    }).or_else(|| if node_id.contains(":clang-cpp:") { Some("cpp".into()) }
+                        else if node_id.contains(":clang-c:") { Some("c".into()) }
+                        else if node_id.contains(":cpython-ast:") { Some("python".into()) }
+                        else if node_id.contains(":typescript-compiler-api:") { Some("typescript".into()) }
+                        else { None });
+                    if let Some(current) = node_language.as_deref() {
+                        if let Some(previous) = language.as_deref() {
+                            mixed_languages |= previous != current;
+                        } else if !mixed_languages {
+                            language = Some(current.to_owned());
+                        }
+                    }
                     if kind == "call" || kind == "construct" {
                         calls.push(node);
                     } else {
@@ -497,7 +501,7 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             arg_value_ids: args.into_iter().map(|(_, id)| id).collect(),
         })
     }).collect();
-    Ok(Index { language: if mixed_languages { None } else { language.map(str::to_owned) },
+    Ok(Index { language: if mixed_languages { None } else { language },
               source: Some(path.display().to_string()), callsites })
 }
 
