@@ -23,8 +23,8 @@ from pathlib import Path
 EXIT_OK = 0
 EXIT_FINDINGS = 1      # scan found something and was asked to care
 EXIT_USAGE = 2         # argparse's own
-EXIT_ENVIRONMENT = 3   # a tool this machine does not have
-EXIT_FAILURE = 4       # the build or the query broke
+EXIT_ENVIRONMENT = 1   # a required tool or runtime is unavailable
+EXIT_FAILURE = 1       # the build or the query broke
 
 EPILOG = """\
 examples:
@@ -55,6 +55,23 @@ def _report_environment(error) -> int:
 
 def _resolved(path: str | None) -> Path:
     return Path(path or ".").expanduser().resolve()
+
+
+def _native_status() -> str:
+    """Return a short native-kernel status for ``--version`` without doing analysis."""
+    try:
+        from lachesis.flow.native_lifetime import _library_candidates
+        candidates = _library_candidates()
+    except Exception:
+        return "missing"
+    configured = os.environ.get("LACHESIS_NATIVE_LIFETIME_LIB")
+    if configured and Path(configured).is_file():
+        return f"override:{configured}"
+    if any("/lachesis/_native/" in str(path) and path.is_file() for path in candidates):
+        return "bundled"
+    if any(path.is_file() for path in candidates):
+        return "dev-build"
+    return "missing"
 
 
 # --------------------------------------------------------------------------- scan
@@ -501,7 +518,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="analysis budget (0 = unbounded; default is bounded)")
     scan.add_argument("--json", action="store_true",
                       help="write the full result to stdout as JSON")
-    scan.add_argument("--fail-on-findings", action="store_true",
+    scan.add_argument("--error-on-findings", "--fail-on-findings", dest="fail_on_findings",
+                      action="store_true",
                       help="exit 1 when anything is reported, for CI")
     scan.add_argument("--quiet", "-q", action="store_true",
                       help="findings only, no progress or guidance")
@@ -647,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     if getattr(args, "version", False):
         from lachesis.cache import _version
-        print(_version())
+        print(f"lachesis {_version()} (native-kernel: {_native_status()})")
         return EXIT_OK
     handler = getattr(args, "handler", None)
     if handler is None:
