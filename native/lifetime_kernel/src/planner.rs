@@ -225,7 +225,12 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
 
     let source_functions: BTreeSet<String> = result_functions.iter()
         .filter(|item| !item.source_sites.is_empty()
-            || coverage_callers.get(&item.name).is_none_or(BTreeSet::is_empty))
+            || coverage_callers.get(&item.name).is_none_or(BTreeSet::is_empty)
+            // A structurally-launched recursive component has no callerless
+            // member after the ordinary call graph is closed. Its synthetic
+            // entry is nevertheless a valid coverage source; excluding it
+            // leaves the entire isolated SCC out of every region.
+            || item.launch_provenance == "structural")
         .map(|item| item.name.clone()).collect();
     let mut forward: HashMap<String, BTreeSet<String>> = HashMap::new();
     for source in &source_functions {
