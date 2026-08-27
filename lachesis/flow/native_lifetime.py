@@ -49,7 +49,12 @@ def available() -> bool:
 def _require_library():
     library = _load()
     if library is None:
-        raise RuntimeError("native lifetime library is unavailable")
+        candidates = ", ".join(str(path) for path in _library_candidates())
+        raise RuntimeError(
+            "Native analysis kernel not found. Install a prebuilt wheel with "
+            "`python -m pip install --upgrade lachesis-cpg`, or build it from a "
+            "source checkout with `cargo build --release --manifest-path "
+            "native/lifetime_kernel/Cargo.toml`. Checked: " + candidates)
     return library
 
 

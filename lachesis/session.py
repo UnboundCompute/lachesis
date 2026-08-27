@@ -221,7 +221,13 @@ class Analysis:
             return cached
         from lachesis.flow.pipeline import run_pass
 
-        bundle = run_pass(self.store, lang=lang, **run_kwargs)
+        try:
+            bundle = run_pass(self.store, lang=lang, **run_kwargs)
+        except RuntimeError as error:
+            message = str(error)
+            if "Native analysis kernel" in message or "native lifetime" in message.lower():
+                raise NativeKernelError(message) from error
+            raise AnalysisError(f"analysis could not complete: {message}") from error
         self._built[key] = bundle
         return bundle
 
