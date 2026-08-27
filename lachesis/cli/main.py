@@ -168,7 +168,8 @@ def command_scan(args: argparse.Namespace) -> int:
     if args.json:
         import json
         payload = dict(result)
-        payload["queue"] = queue
+        payload.pop("queue", None)
+        payload["leads"] = queue
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         _stderr()

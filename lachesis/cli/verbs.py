@@ -103,7 +103,8 @@ def command_analyze(args: argparse.Namespace) -> int:
     if args.out:
         path = view.to_json(args.out)
     if args.json:
-        result = {"summary": leads.summary(), "leads": list(view)}
+        result = {"summary": leads.summary(),
+                  "leads": [lead.to_dict() for lead in view]}
         if args.out:
             result["written"] = args.out
         return _dump(result)
