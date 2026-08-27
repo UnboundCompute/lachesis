@@ -107,9 +107,8 @@ This moves the cost, it does not remove it: enrichment is a whole-graph in-memor
 operation either way.
 
 The `lachesis build` and `lachesis query` subcommands are the installed-package
-equivalents of these module invocations (the old `lachesis-analyze` / `lachesis-query`
-scripts still work and print a hint to the new verb). The `python3 -m` form works
-straight from a clone.
+equivalents of these module invocations. The `python3 -m` form works straight from
+a clone.
 
 ## Step 2: get your bearings
 
@@ -242,7 +241,7 @@ Everything above is also available to an LLM agent through the MCP server. Point
 an MCP-capable client at the graph:
 
 ```bash
-lachesis-mcp /tmp/example.kuzu
+lachesis mcp /tmp/example.kuzu
 ```
 
 The server speaks MCP over stdio and registers the navigation tools (`search`,
@@ -253,8 +252,8 @@ client that reads a JSON config, the entry looks like this:
 {
   "mcpServers": {
     "lachesis": {
-      "command": "lachesis-mcp",
-      "args": ["/tmp/example.kuzu"]
+      "command": "lachesis",
+      "args": ["mcp", "/tmp/example.kuzu"]
     }
   }
 }

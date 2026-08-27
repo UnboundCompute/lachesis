@@ -94,6 +94,14 @@ for verb in build enrich analyze query plan candidates mcp; do
   echo "  lachesis $verb"
 done
 
+say "the native analysis kernel loads"
+# doctor exits non-zero when a required check fails; the native kernel is one. A wheel
+# that installs but ships a stale or missing kernel fails here rather than at a user's
+# first scan.
+./v/bin/lachesis doctor >/dev/null \
+  || { echo "FAIL: lachesis doctor reports an unusable install (native kernel not loadable)" >&2; exit 1; }
+echo "  native kernel loads"
+
 say "analyse a TypeScript project with no npm install anywhere"
 mkdir -p project/src
 cat > project/src/service.ts <<'TS'

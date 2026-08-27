@@ -7,23 +7,6 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
-## Unreleased
-
-### Changed
-
-- The developer-facing CLI, library, and MCP surfaces now use one `lead` result vocabulary;
-  engine selection and engine labels are internal implementation details.
-- `lachesis.scan()` and `lachesis scan` default to the whole-taxonomy hunt, with `all`,
-  `guard-diff`, and `flow` available as explicit lenses.
-- `scan --lens all` now returns one ranked, deduplicated `LeadSet` across registry and
-  native-flow producers; MCP `scan`, `candidates`, and warm `leads` use bounded lead pages
-  with offsets and structured recoverable errors.
-- Low-level `query` and `plan` are parsed Lachesis commands with their own discoverable help;
-  shell completion, terminal color control, verbose native status, and `doctor` kernel checks
-  are available for day-to-day use.
-- The removed Python analysis fallbacks are no longer reachable from query, taint, or flow
-  surfaces; native binary sidecars are the runtime contract.
-
 ## [0.2.0]
 
 This release introduces a source-rooted semantic flow analysis and a lifetime/typestate
@@ -57,10 +40,37 @@ and candidate surface grow here; older candidate output remains readable.
 
 ### Changed
 
+- **One `lead` vocabulary across every surface.** The CLI, library, and MCP now speak a
+  single `lead` result noun; engine selection and engine labels are internal details.
+  `lachesis.scan()` / `lachesis scan` default to the whole-taxonomy hunt, with `all`,
+  `guard-diff`, and `flow` as explicit lenses. `scan --lens all` returns one ranked,
+  deduplicated `LeadSet` across the registry and native-flow producers; MCP `scan`,
+  `candidates`, and warm `leads` page with offsets and structured recoverable errors.
+- **A five-name library API.** `import lachesis` exposes exactly `scan`, `Analysis`,
+  `LeadSet`, `Deadline`, and `AnalysisError`; bare `lachesis <path>` routes to `scan`.
+- `query` and `plan` are parsed subcommands with their own help; shell completion, color
+  control, verbose native status, and `doctor` kernel checks are available day to day.
+- The removed Python analysis fallbacks are no longer reachable from the query, taint, or
+  flow surfaces; the native binary sidecars are the runtime contract.
 - Object mode produces the semantic flow graph as its production path; legacy skeletons are
   retired from object mode.
 - Coverage accounting is call/return aware and source-rooted, and reusable semantic
   fragments are cached with deterministic fingerprints across pass runs.
+
+### Packaging
+
+- **Cross-platform wheels.** The native kernel and clang frontend load through
+  `ctypes`/`subprocess`, not as CPython extensions, so each release ships one
+  `py3-none-<platform>` wheel per platform (Linux `x86_64`, macOS `x86_64`/`arm64`,
+  Windows `amd64`) that serves every supported interpreter. `setup.py` sets the tag;
+  `cibuildwheel` builds the native binaries per platform and repairs each wheel.
+- **Tag-driven PyPI publishing.** Pushing a `vX.Y.Z` tag builds and verifies the wheels
+  and sdist and publishes them through Trusted Publishing (OIDC, no stored token). The
+  run refuses to build unless the tag matches the version and has a changelog entry, and
+  refuses to publish any platform-agnostic wheel.
+- **Native-kernel install gate.** `lachesis doctor` verifies the bundled kernel loads and
+  matches the package version; the wheel verifier and the release build both run it, so a
+  wheel that ships a stale or missing kernel fails in CI rather than at a user's first scan.
 
 ### Fixed
 

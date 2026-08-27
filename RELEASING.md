@@ -1,140 +1,108 @@
 # Releasing Lachesis
 
 Lachesis publishes to PyPI as [`lachesis-cpg`](https://pypi.org/project/lachesis-cpg/).
-This is the checklist for cutting a release. It exists because one step — vendoring the
-TypeScript compiler — is invisible from the repository, and a wheel built without it
-installs fine and then fails on the first TypeScript project it sees.
+A release is **tag-driven**: pushing a `vX.Y.Z` tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which builds the
+platform wheels and the sdist, verifies each one from a clean environment, and publishes
+them to PyPI through Trusted Publishing. You do not build or upload by hand — and you
+could not build the Linux and Windows wheels from a macOS checkout anyway.
 
 ## What ships
 
-The distribution is pure Python plus two things that are not Python:
+The distribution is Python plus three things that are not:
 
-- `lachesis/frontends/typescript/build_graph.mjs`, the Node frontend, and the copy of
-  the TypeScript compiler next to it under `vendor/`. The compiler is **not in version
-  control** (see `.gitignore`); `tools/vendor_typescript.py` fetches the pinned version
-  and `MANIFEST.in` carries it into the sdist.
+- **The native analysis kernel** (`lachesis/_native/`): a Rust lifetime kernel and a
+  clang frontend, one binary per platform. They load through `ctypes`/`subprocess`, not
+  as CPython extensions, so a single `py3-none-<platform>` wheel serves every supported
+  interpreter (the tag is set in `setup.py`). They are **not in version control** and are
+  built into the tree by `tools/stage_native.py --build`; the release build does this per
+  platform. A wheel without them installs fine and then crashes on the first `lachesis
+  scan` — which is exactly what `lachesis doctor` (run by the artifact verifier and the
+  cibuildwheel test step) exists to catch.
+- **The TypeScript compiler** next to the Node frontend under `vendor/`. Also **not in
+  version control** (see `.gitignore`); `tools/vendor_typescript.py` fetches the pinned
+  version, and the release build vendors it on the host before packaging.
 - the fixture corpora under each frontend, so the parity suite can run from an install.
 
-The C frontend has no vendored component. It shells out to whatever `clang` is on the
-machine, and degrades to "no C analysis" when there is none.
+The C frontend degrades to "no C analysis" when there is no `clang` on the machine.
+
+## One-time setup (per PyPI project)
+
+The publish job authenticates with PyPI over OIDC — there is no API token in the repo.
+Configure it once:
+
+1. On PyPI, add a **Trusted Publisher** for the project: owner `UnboundCompute`, repo
+   `lachesis`, workflow `release.yml`, environment `pypi`.
+2. In the GitHub repo, create an **Environment** named `pypi` (Settings → Environments).
+   Add required reviewers there if you want a manual approval gate before every publish.
 
 ## Before you tag
 
-1. Working tree is clean, and you are on the release commit (normally `main` or an
-   annotated release candidate branch).
+1. Working tree is clean and you are on the release commit (the `prod` branch after the
+   `dev → prod` merge).
 2. Bump `version` in `pyproject.toml`. Lachesis is pre-1.0, so the graph schema and the
    nav tool surface may still change between minor versions; say so in the changelog
-   entry rather than in a patch release note nobody reads.
-3. Run the parity suite against a clean checkout:
+   entry.
+3. Add a `## [X.Y.Z]` heading to `CHANGELOG.md` for the new version. The release workflow
+   refuses to build if the tag has no matching version and changelog heading.
+4. Run the parity suite against a clean checkout — it is the release gate, there is no
+   separate one:
    ```
-python3.11 -m pip install -e ".[dev]" && npm ci
-make PYTHON=python3.11 check
+   python3.11 -m pip install -e ".[dev]" && npm ci
+   make PYTHON=python3.11 check
    ```
-   It must be fully green. The suite is the release gate — there is no separate one.
 
-## Build
+### Optional local smoke test
+
+You cannot build the Linux or Windows wheels locally, but you can prove your own
+platform's wheel before spending a tag on it:
 
 ```
 python3.11 tools/vendor_typescript.py          # fetch the pinned compiler
-python3.11 tools/vendor_typescript.py --check  # confirm it landed
-rm -rf dist build *.egg-info
-export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-python3.11 -m build                            # sdist + wheel
+python3.11 tools/stage_native.py --build        # compile + stage the native binaries
+python3.11 -m build --wheel                      # -> dist/lachesis_cpg-*-py3-none-<platform>.whl
+python3.11 -m twine check dist/*.whl
+tools/verify_wheel.sh                            # installs into a clean venv and runs `lachesis doctor`
 ```
 
-`SOURCE_DATE_EPOCH` anchors archive timestamps to the release commit, so rebuilding
-the same source produces byte-identical distributions instead of changing hashes on
-every run. For a local differential, normalize the sdist after each build before
-calculating hashes; setuptools can otherwise retain filesystem mtimes in the archive:
+`verify_wheel.sh` is the same check CI runs: it installs the built wheel into a throwaway
+virtualenv outside this repository, confirms the one top-level name, that the vendored
+TypeScript compiler is present, that the native kernel loads (`lachesis doctor`), and that
+a TypeScript and a Python project both analyse with no `npm` anywhere.
+
+## Cut the release
 
 ```
-python3.11 tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
-sha256sum dist/* > /tmp/lachesis-first-build.sha256
-python3.11 -m build
-python3.11 tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
-sha256sum -c /tmp/lachesis-first-build.sha256
+git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
 ```
 
-The tagged release workflow performs this normalization automatically.
+That triggers `release.yml`:
 
-`--check` is not ceremony. Everything else in the build fails loudly when it goes
-wrong; a missing vendor directory does not, and the symptom surfaces on a stranger's
-machine rather than yours.
+1. **guard** — the tag matches the `pyproject` version and has a `CHANGELOG` heading.
+2. **sdist** — build and reproducibly re-build the sdist, `twine check`, install-verify.
+3. **wheels** — a matrix of `ubuntu-latest`, `macos-13` (x86_64), `macos-14` (arm64), and
+   `windows-latest`. Each runs `cibuildwheel`, which stages the native binaries for that
+   platform, builds one `py3-none-<platform>` wheel, repairs it (auditwheel/delocate), and
+   smoke-tests it with `lachesis doctor`.
+4. **publish** — downloads every artifact, refuses any `*-none-any.whl`, `twine check`s the
+   set, and uploads to PyPI via `pypa/gh-action-pypi-publish` (Trusted Publishing).
 
-## Verify the artifacts, not the repo
+A version on PyPI cannot be replaced, so the tag is the irreversible step. Tag from the
+release commit, not before it.
 
-The point of this section is that a passing test suite in a checkout proves nothing
-about a wheel. Test the built artifacts, in a virtualenv that has no relationship to
-this repository, from a directory that is not this repository.
-
-```
-python3.11 -m twine check dist/*
-
-cd $(mktemp -d)
-python3.11 -m venv v && ./v/bin/pip install /path/to/dist/lachesis_cpg-*.whl
-```
-
-Then confirm all four of these:
-
-- **The namespace is one name.** `unzip -l dist/*.whl | grep -c '^.*lachesis/'` should
-  account for every module, and nothing outside `lachesis/` should be installed.
-  ```
-  ./v/bin/python -c "import lachesis, lachesis.nav, lachesis.planner"
-  ```
-- **The console scripts exist and run**: `lachesis-analyze`, `lachesis-query`,
-  `lachesis-mcp`, `lachesis-plan`.
-- **TypeScript analysis works with no npm setup anywhere.** This is the vendoring
-  check, and it is the one that fails when the vendor step was skipped:
-  ```
-  mkdir -p src && printf 'export function f(x: string) { return x; }\n' > src/a.ts
-  ./v/bin/lachesis-analyze src /tmp/rel.kuzu
-  ./v/bin/lachesis-query --format text /tmp/rel.kuzu overview
-  ```
-  The output must name `typescript-compiler-api` among its frontends.
-- **The MCP server starts and lists its tools** over stdio against that graph. The
-  verifier also launches the product command (`lachesis mcp <source>`) so the
-  source-indexing handoff and the MCP initialize/tools handshake are covered, not
-  only the lower-level `lachesis-mcp` entry point.
-
-`tools/verify_wheel.sh` and `tools/verify_sdist.sh` run these checks for both artifact
-types. CI runs them on every push and pull request in the `package` job, so a packaging
-mistake surfaces long before release day.
-
-The `release artifacts` workflow repeats the artifact gate for every `v*` tag and
-uploads the verified wheel and sdist as workflow artifacts. It does not publish
-automatically; the TestPyPI and PyPI uploads below remain an explicit release step.
-
-## Publish
-
-Upload to TestPyPI first, install from it, and repeat the four checks above against
-*that* install — it is the only way to catch a packaging problem that only appears
-after a round trip through an index.
-
-```
-python3.11 -m twine upload --repository testpypi dist/*
-python3.11 -m twine upload dist/*
-```
-
-Use an API token scoped to this project, via `~/.pypirc` or `TWINE_PASSWORD`. Then tag
-and push the tag:
-
-```
-git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
-```
-
-Tag after a successful upload, not before. A version on PyPI cannot be replaced, so the
-upload is the irreversible step and the tag should record what actually shipped.
+> Coverage note: the wheel matrix builds Linux `x86_64`, macOS `x86_64`/`arm64`, and
+> Windows `amd64`. Linux `aarch64` and musl (Alpine) are **not** built yet — they need a
+> QEMU leg and a musl native-build recipe respectively. On those platforms `pip` falls
+> back to the sdist, which builds the native binaries from source if Rust is present.
 
 ## If a release is broken
 
 Yank it (`pip` stops resolving to it, existing pins keep working) and release a patch
-version. Do not delete it: deletion frees the version number for reuse, which means two
-different sets of bytes can answer to the same name.
+version. Do not delete it: deletion frees the version number for reuse, so two different
+sets of bytes could answer to the same name.
 
 ## Production checklist
 
-- Build from a clean release commit; never publish from a moving branch.
-- Run the artifact verifier from outside the checkout and verify the sdist as well as
-  the wheel.
-- Use an immutable Lachesis tag in production GitHub Action workflows.
+- Release from a clean `prod` commit; never publish from a moving branch.
 - Keep the previous release available for rollback and never overwrite an artifact.
+- Use an immutable Lachesis tag in production GitHub Action workflows.

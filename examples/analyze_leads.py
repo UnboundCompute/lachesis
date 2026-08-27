@@ -4,7 +4,7 @@
 This is the friction this library exists to remove. Answering "where do the double-frees
 land, and what's near tree.c:185?" used to mean hand-writing ``GraphStore.load(...)`` +
 ``run_pass(...)`` and re-deriving leads from cold every question. Here it is one warm session:
-open once, ``analyze`` once (bounded by default so it can't run away), then filter the held
+open once, ``scan`` once (bounded by default so it can't run away), then filter the held
 result as many ways as you like -- nothing recomputes.
 
 Run it:
@@ -42,7 +42,7 @@ def main() -> int:
         print(f"  [{elapsed:6.2f}s] {label}", file=sys.stderr, flush=True)
 
     analysis = lachesis.Analysis.open(args.graph, progress=progress)
-    leads = analysis.analyze(hard_stop=args.hard_stop)
+    leads = analysis.scan(lens="all", hard_stop=args.hard_stop, limit=None)
 
     # Filters return a new LeadSet each time and chain; the pass is never re-run.
     view = leads
@@ -62,7 +62,7 @@ def main() -> int:
 
     summary = leads.summary()
     print(f"\n{summary['total']} leads over the whole graph "
-          f"(engine={summary['engine']}, timed_out={summary['timed_out']})")
+          f"(timed_out={summary['timed_out']})")
     if summary["timed_out"]:
         # An empty or thin result over a partial run is not "clean" -- say so.
         print(f"  ! partial run: {len(summary['truncated_functions'])} functions truncated")

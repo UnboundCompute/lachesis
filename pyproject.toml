@@ -28,6 +28,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 # The embedded columnar store is the graph store, so `kuzu` is required, and with it
@@ -89,3 +90,25 @@ include-package-data = false
 
 [tool.pytest.ini_options]
 python_files = ["checks.py", "test_*.py"]
+
+# Cross-platform wheels. The native payload (Rust lifetime kernel + clang frontend)
+# is loaded through ctypes/subprocess, never as a CPython extension, so one
+# `py3-none-<platform>` wheel per platform serves every supported interpreter (the
+# tag is set in setup.py). We therefore build with a single interpreter to avoid
+# emitting byte-identical duplicates. `before-build` compiles and stages the native
+# artifacts into the package tree for the platform the wheel is being built on; the
+# TypeScript compiler is vendored on the host before cibuildwheel runs.
+[tool.cibuildwheel]
+build = "cp311-*"
+skip = ["*-musllinux*", "pp*"]
+before-build = "python {project}/tools/stage_native.py --build"
+# A wheel that installs but whose native kernel cannot load is the exact regression
+# this gate exists to catch, so drive a real end-to-end scan from the installed wheel.
+test-command = "lachesis --version && lachesis doctor"
+
+[tool.cibuildwheel.linux]
+# manylinux containers ship no Rust toolchain; install it once per platform and put
+# cargo on PATH for the staging step. protoc is vendored through the Cargo build, so
+# no system protobuf compiler is required.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }

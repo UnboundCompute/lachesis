@@ -80,32 +80,17 @@ lachesis analyze graph.kuzu --summary         # pass 3 — the leads, rolled up 
 lachesis explain graph.kuzu tree.c:1487       # one call: the whole evidence chain for a site
 ```
 
-Pass 1 is bounded by default for core-only builds: each frontend shard streams directly
-into Kùzu instead of composing the complete graph in Python, and the binary Pass-2 and
-Pass-3 sidecars are emitted beside the store:
+For a large tree, build core-only and cap the wall clock — each frontend shard streams
+straight into Kùzu instead of composing a graph-sized Python object, and `enrich` reads
+the sidecars this leaves behind rather than re-parsing the source:
 
 ```bash
 lachesis build ./my-project graph.kuzu --prune --timeout 3600
 ```
 
-The core-only build also avoids token/proof compiler passes whose output is removed by
-`--prune`. The complete Pass-2 input, compact translation facts, and Pass-3 substrate
-are persisted as protobuf sidecars, so `lachesis enrich graph.kuzu` consumes the same
-Pass-1 output without rebuilding the frontends. The optional `--stream-shards DIR`
-form remains available when the intermediate shard directory must be retained.
-Independent frontend subprocesses are run concurrently during the streaming build;
-their shard sets are then projected together by Rust, preserving cross-language edges
-without reconstructing a graph-sized Python object. On the reference pruned core libxml2
-build, the current cold measurement is 27.66 seconds and approximately 1.03 GiB peak RSS
-(C/C++, Python, and TypeScript/JavaScript; no swap; 406,952 nodes / 656,691 edges).
-Node batches remain memory-bounded at 2,000 rows; edge batches use 10,000 rows to reduce
-Arrow/Kùzu handoff overhead.
-The Rust publisher writes
-`<store>.pass2.input.pb`, `<store>.pass2.facts.pb`, and `<store>.pass3.substrate.pb`.
-When the native binary inputs are present, `enrich` hands their paths directly to
-the Rust Pass-2 engine and retains only its compact event sidecar; it does not
-rebuild the whole Pass-1 graph as Python objects. Older stores without these
-sidecars use the compatibility path.
+On a full libxml2 tree that cold build is ~28 s and ~1 GiB peak RSS across all three
+languages. The streaming layout, sidecar formats, and memory/timing knobs are in
+[`docs/scaling.md`](./docs/scaling.md).
 
 **Library** — a warm session: open (or build) once, ask many times, nothing recomputed
 between questions.
@@ -114,7 +99,7 @@ between questions.
 import lachesis
 
 a = lachesis.Analysis.build("./my-project", "graph.kuzu", enrich=True)
-leads = a.analyze(hard_stop=120)               # bounded pass 3 → a LeadSet held in memory
+leads = a.scan(hard_stop=120)                  # bounded scan → a LeadSet held in memory
 print(leads.summary())                         # {'total': ..., 'by_pattern': {...}, 'timed_out': False}
 
 for lead in leads.near("tree.c", (1480, 1500)):   # filter the held leads, no recompute
@@ -123,8 +108,8 @@ for lead in leads.near("tree.c", (1480, 1500)):   # filter the held leads, no re
 print(a.explain_sink("tree.c", 1487))          # the whole evidence chain for one site
 ```
 
-`analyze` returns a `LeadSet` with `.summary()`, `.by_pattern()`, `.by_function()`,
-.near()` / `.at()`, `.top()`, `.to_json()`, and typed iteration — the leads stay in the
+`scan` returns a `LeadSet` with `.summary()`, `.by_pattern()`, `.by_function()`,
+`.near()` / `.at()`, `.top()`, `.to_json()`, and typed iteration — the leads stay in the
 session, so a follow-up question is a filter, not a second pass. Bounded by default: with no `hard_stop`
 it still caps its own wall clock and returns partial, flagged leads rather than hanging.
 Runnable one-file scripts for each operation are in [`examples/`](./examples/README.md).
@@ -318,10 +303,10 @@ Recently shipped:
 - [x] **One reader, three front doors.** The `lachesis.Analysis` library class is the single implementation; a `lachesis <verb>` subcommand and an MCP tool sit over each method — no hand-written graph-loading script on any surface.
 - [x] **Bounded analysis.** Pass 3 takes a `hard_stop` budget and returns partial, flagged leads instead of hanging; the census a graph pays for once is cached as a sidecar so the next process opens warm.
 - [x] **Zero-config MCP.** `lachesis mcp` starts with no graph path; `build_graph` compiles, caches, and attaches on demand, and overlapping requests are serialized around the store.
+- [x] **A smaller front door.** One default command (`lachesis <path>`), one result noun everywhere (`lead`), and a five-name library API (`scan`, `Analysis`, `LeadSet`, `Deadline`, `AnalysisError`) — so the first command and the first import are obvious.
 
 Near-term, roughly in order:
 
-- [ ] **A smaller front door.** One default command (`lachesis <path>`), one result noun everywhere, and a five-name library API — a surface simplification so the first command and the first import are obvious.
 - [ ] **Monorepo-scale builds.** `--parallel-packages` compiles each package on its own so very large TypeScript trees don't exceed the compiler's internal limits; making that the smooth default is active work.
 - [ ] **Bounded security signal.** Reworking the guard-analysis tools to fold the same per-seed, on-demand cone the dataflow tools already use, so they run on a large graph without a whole-graph pass.
 - [ ] **The reachability query, first-class.** "Can attacker input reach this sink" as a single call returning a witness path or a bounded no, across file, package, and language boundaries.

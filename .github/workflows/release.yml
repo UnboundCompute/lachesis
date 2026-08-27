@@ -1,4 +1,9 @@
-name: release artifacts
+name: release
+
+# Tagging `vX.Y.Z` builds the platform wheels and the sdist, verifies each one from a
+# clean environment, and publishes them to PyPI through Trusted Publishing (OIDC — no
+# API token stored in the repo). The tag must match the pyproject version and have a
+# CHANGELOG entry, or the run stops before anything is built.
 
 on:
   push:
@@ -8,8 +13,34 @@ permissions:
   contents: read
 
 jobs:
-  package:
-    name: verify release distribution
+  guard:
+    name: verify tag, version, and changelog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Tag matches pyproject version and has a changelog entry
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          if tag != version:
+              raise SystemExit(f"tag v{tag} does not match pyproject version {version}")
+          if f"## [{version}]" not in Path("CHANGELOG.md").read_text(encoding="utf-8"):
+              raise SystemExit(f"CHANGELOG.md has no release heading for {version}")
+          print(f"release version: {version}")
+          PY
+
+  sdist:
+    name: build and verify the sdist
+    needs: guard
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -21,33 +52,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Verify tag matches package version
-        run: |
-          python - <<'PY'
-          import os
-          import tomllib
-
-          tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          with open("pyproject.toml", "rb") as manifest:
-              package_version = tomllib.load(manifest)["project"]["version"]
-          if tag_version != package_version:
-              raise SystemExit(
-                  f"tag v{tag_version} does not match pyproject version {package_version}"
-              )
-          print(f"release version: {package_version}")
-          PY
-      - name: Verify tag has changelog entry
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-
-          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          heading = f"## [{version}]"
-          if heading not in Path("CHANGELOG.md").read_text(encoding="utf-8"):
-              raise SystemExit(f"CHANGELOG.md has no release heading for {version}")
-          print(f"changelog entry: {heading}")
-          PY
       - name: Install build tooling
         run: python -m pip install --upgrade pip build twine
       - name: Vendor the TypeScript compiler
@@ -56,23 +60,91 @@ jobs:
           python3 tools/vendor_typescript.py --check
       - name: Anchor release timestamps
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-
-      - name: Build distributions
-        run: python -m build
-      - name: Verify reproducible distributions
+      - name: Build the sdist
+        run: python -m build --sdist
+      - name: Verify the sdist is reproducible
         run: |
           python tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
-          sha256sum dist/* > /tmp/lachesis-first-build.sha256
-          python -m build
+          sha256sum dist/*.tar.gz > /tmp/sdist-first.sha256
+          python -m build --sdist
           python tools/normalize_sdist.py dist/lachesis_cpg-*.tar.gz --epoch "$SOURCE_DATE_EPOCH"
-          sha256sum -c /tmp/lachesis-first-build.sha256
-      - name: Verify metadata and clean-install behavior
+          sha256sum -c /tmp/sdist-first.sha256
+      - name: Check metadata and a clean install from the sdist
         run: |
-          python -m twine check dist/*
-          tools/verify_wheel.sh
+          python -m twine check dist/*.tar.gz
           tools/verify_sdist.sh
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: lachesis-${{ github.ref_name }}
-          path: dist/
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    name: wheel (${{ matrix.os }})
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The native kernel and clang frontend are Rust; runners for macOS and Windows
+      # ship a toolchain, and cibuildwheel installs one inside the Linux container.
+      - name: Ensure a Rust toolchain (macOS/Windows host build)
+        if: runner.os != 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+      # The vendored TypeScript compiler is host-side package data; stage it into the
+      # tree before cibuildwheel copies the project into its build environment.
+      - name: Vendor the TypeScript compiler
+        run: |
+          python3 tools/vendor_typescript.py
+          python3 tools/vendor_typescript.py --check
+      - name: Build the platform wheel
+        uses: pypa/cibuildwheel@v2.21
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheel-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  publish:
+    name: publish to PyPI
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/lachesis-cpg/
+    permissions:
+      id-token: write        # Trusted Publishing (OIDC); no stored API token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Show what will be published
+        run: ls -l dist
+      - name: Reject any non-platform wheel
+        # A py3-none-any wheel would install everywhere and carry one platform's
+        # binaries onto every other. setup.py never emits one; fail loudly if it appears.
+        run: |
+          if ls dist/*-none-any.whl >/dev/null 2>&1; then
+            echo "refusing to publish a platform-agnostic wheel:" dist/*-none-any.whl
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check metadata on every distribution
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -36,7 +36,7 @@ set the variable when tuning that bound for a particular runner.
 The bounded core-only path uses the same direct package command exposed in README:
 
 ```bash
-lachesis-analyze /path/to/project /tmp/project.kuzu \
+lachesis build /path/to/project /tmp/project.kuzu \
   --stream-shards /tmp/project-shards --prune
 ```
 
@@ -55,7 +55,7 @@ bundle to protobuf shards, and releases its snapshot before starting the next jo
 
 ```bash
 LACHESIS_TS_MAX_OLD_SPACE_MB=4096 \
-  lachesis-analyze /path/to/monorepo /tmp/project.kuzu \
+  lachesis build /path/to/monorepo /tmp/project.kuzu \
   --parallel-packages --shard-large-packages 100 \
   --stream-shards /tmp/project-shards --prune
 ```
@@ -172,7 +172,7 @@ or source revisions. Record those changes alongside the result.
 | 2026-08-21 | working tree | Linux `fs/netfs` CLI header-only edge scan | 2.00 | — | 1.06 | 13,185 | 24,719 | ~0.37* | Cold output directory; end-to-end 3.43s / 373 MiB max RSS. The first membership/export scan skips recursive edge-property decoding; full edge properties are still decoded once for Kùzu load, with exact store counts. |
 | 2026-08-21 | working tree | Linux `fs/netfs` streamed Kùzu with experimental 25k-row batches | 6.11 | — | 1.15 | 13,185 | 24,719 | not sampled | Fresh disposable Python 3.11/Kùzu env, 1 GiB pool, tokens/proofs disabled, `LACHESIS_STREAM_BATCH_ROWS=25_000`. Small fixture phases improved from 1.23s to 1.15s, but USB confirmation regressed to 59.67s, so the production default remains the measured 10k. |
 | 2026-08-21 | working tree | Linux `fs/netfs` cold streamed core with disposable Python 3.11/Kùzu env | 15.17 | — | included | 13,185 | 24,719 | ~1.69* | 27 files / 10,293 LOC; direct CLI, 1 GiB Kùzu pool, tokens/proofs disabled. Store published and reopened with `streamed=true`, `enriched=false`, and exact manifest counts. Peak RSS 1,810,612,224 bytes. |
-| 2026-08-21 | `5cb1071` | GitHub Action build-step simulation, `--prune --incremental` | 6.80 | — | included | 13,185 | 24,719 | ~0.48* | Linux `fs/netfs`; disposable Python 3.11 env, Action-equivalent 1 GiB Kùzu ceiling, direct `lachesis-analyze` invocation. Cold store published with exact counts; peak RSS 510,869,504 bytes. SARIF export was not run in this timing row. |
+| 2026-08-21 | `5cb1071` | GitHub Action build-step simulation, `--prune --incremental` | 6.80 | — | included | 13,185 | 24,719 | ~0.48* | Linux `fs/netfs`; disposable Python 3.11 env, Action-equivalent 1 GiB Kùzu ceiling, direct `lachesis build` invocation. Cold store published with exact counts; peak RSS 510,869,504 bytes. SARIF export was not run in this timing row. |
 | 2026-08-21 | `4bffec4` | GitHub Action SARIF export simulation | 12.3 | — | included | 13,185 | 24,719 | not sampled | Linux `fs/netfs`; same disposable compatible env and build flags. SARIF export completed with 0 findings; nested query used the current interpreter rather than host `python3`, fixing mixed-runtime protobuf failures. |
 | 2026-08-21 | working tree | Linux `drivers/usb` CLI with prune defaults + bundle-to-shard streaming | >180* | — | stopped | — | — | ~3.11* | 790 files / 582,731 LOC; C pass completed, but Kùzu publication did not finish before the 180s safety cap. The exact temp graph/shards were removed; no graph result is claimed. |
 
