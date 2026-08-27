@@ -4,6 +4,8 @@
 
 **A compiler-precise code graph you can ask questions about: how data moves, who calls what, what reaches a sink. C, Python, and TypeScript, all in one graph.**
 
+Install with `python -m pip install lachesis-cpg`, then use `import lachesis` or the `lachesis` command.
+
 [![PyPI](https://img.shields.io/pypi/v/lachesis-cpg)](https://pypi.org/project/lachesis-cpg/)
 [![Python](https://img.shields.io/pypi/pyversions/lachesis-cpg)](https://pypi.org/project/lachesis-cpg/)
 [![CI](https://github.com/UnboundCompute/lachesis/actions/workflows/ci.yml/badge.svg)](https://github.com/UnboundCompute/lachesis/actions/workflows/ci.yml)
@@ -35,7 +37,7 @@ investigate, not a verdict:
 
 ```bash
 python -m pip install lachesis-cpg
-lachesis scan ./my-project
+lachesis ./my-project
 ```
 
 ```
@@ -43,7 +45,7 @@ lachesis scan ./my-project
   2,677 nodes, 4,539 edges from typescript-compiler-api
   ✓ finding entrypoints that reach sensitive effects (0.1s)
 
-2 candidate(s) from 1/1 entrypoint(s): 0 suppressed, 2 queued
+2 leads (lens=all)
   1. [0.810] handleWebhook (http/webhook.ts:10, route) -> findById(documentId) [database]
      prove or kill: a caller that passes no recognized guard can read or write data
      through findById(documentId) starting from handleWebhook at http/webhook.ts:10
@@ -116,14 +118,14 @@ leads = a.analyze(hard_stop=120)               # bounded pass 3 → a LeadSet he
 print(leads.summary())                         # {'total': ..., 'by_pattern': {...}, 'timed_out': False}
 
 for lead in leads.near("tree.c", (1480, 1500)):   # filter the held leads, no recompute
-    print(lead["pattern"], lead["entry"], lead["line"])
+    print(lead.pattern, lead.entry, lead.line)
 
 print(a.explain_sink("tree.c", 1487))          # the whole evidence chain for one site
 ```
 
 `analyze` returns a `LeadSet` with `.summary()`, `.by_pattern()`, `.by_function()`,
-`.near()` / `.at()`, `.to_json()`, and iteration — the leads stay in the session, so a
-follow-up question is a filter, not a second pass. Bounded by default: with no `hard_stop`
+.near()` / `.at()`, `.top()`, `.to_json()`, and typed iteration — the leads stay in the
+session, so a follow-up question is a filter, not a second pass. Bounded by default: with no `hard_stop`
 it still caps its own wall clock and returns partial, flagged leads rather than hanging.
 Runnable one-file scripts for each operation are in [`examples/`](./examples/README.md).
 
