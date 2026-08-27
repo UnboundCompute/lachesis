@@ -112,7 +112,10 @@ def clang_c_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     command = (str(native_binary), "{source_dir}", "{output_dir}")
     return FrontendSpec(
         frontend_id="clang-c",
-        languages=("c",),
+        # Clang owns both C and C++ roots. Keep one compiler-backed frontend so
+        # mixed projects share the same precise symbol/edge contract while the
+        # emitted binary manifest still records the concrete root languages.
+        languages=("c", "cpp"),
         extensions=(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"),
         command=command,
         working_directory=str(root),
