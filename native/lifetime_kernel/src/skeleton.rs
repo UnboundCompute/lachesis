@@ -171,16 +171,18 @@ pub(crate) fn build(
         } else { region.contexts.clone() };
         for context in contexts {
             let (mut tokens, edges, complete) = walk_region(result, region);
-            // The old typestate renderer always has explicit function
-            // boundaries.  A source-rooted path that contains no event at its
-            // entry still needs the boundary so a matcher can distinguish a
-            // local lifecycle stream from an empty/unresolved fragment.
-            if tokens.first().map(|token| token.kind.as_str()) != Some("enter") {
-                tokens.insert(0, lifetime_proto::NativeSkeletonToken {
-                    kind: "enter".into(), function: region.source_function.clone(),
-                    depth: 0, ..Default::default()
-                });
-            }
+            // The old renderer always has explicit boundaries around the root
+            // as well as every nested call.  Keep these even for a region with
+            // no event at its entry: an empty/unresolved fragment must remain
+            // distinguishable from a missing fragment.
+            tokens.insert(0, lifetime_proto::NativeSkeletonToken {
+                kind: "enter".into(), function: region.source_function.clone(),
+                depth: 0, ..Default::default()
+            });
+            tokens.push(lifetime_proto::NativeSkeletonToken {
+                kind: "exit".into(), function: region.source_function.clone(),
+                depth: 0, ..Default::default()
+            });
             output.push(lifetime_proto::NativeFlowSkeleton {
                 kind: "source-rooted".into(),
                 entry: region.source_function.clone(),
