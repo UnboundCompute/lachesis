@@ -248,6 +248,10 @@ message TranslationFunction {
   bool externally_visible = 9;
   repeated string parameter_names = 10;
   repeated RootMetadata roots = 11;
+  // Frontend-owned language identity.  This is metadata, not an engine
+  // language allow-list; a mixed-language substrate may carry a different
+  // value for each function.
+  string language = 12;
 }
 message RootMetadata {
   string id = 1;

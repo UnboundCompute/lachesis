@@ -79,19 +79,8 @@ pub(crate) fn summarize(
 ) -> lifetime_proto::NativeSummaryResult {
     let (functions, by_base) = function_names(&translation.functions);
     let languages: BTreeSet<String> = translation.functions.iter()
-        .filter_map(|function| {
-            let file = function.file.to_ascii_lowercase();
-            if file.ends_with(".cc") || file.ends_with(".cpp") || file.ends_with(".cxx")
-                || file.ends_with(".hpp") || file.ends_with(".hh") || file.ends_with(".hxx") {
-                Some("cpp".into())
-            }
-            else if file.ends_with(".c") || file.ends_with(".h") { Some("c".into()) }
-            else if file.ends_with(".py") || file.ends_with(".pyi") { Some("python".into()) }
-            else if file.ends_with(".ts") || file.ends_with(".tsx") { Some("typescript".into()) }
-            else if file.ends_with(".js") || file.ends_with(".jsx") || file.ends_with(".mjs")
-                || file.ends_with(".cjs") { Some("javascript".into()) }
-            else { None }
-        }).collect();
+        .filter_map(|function| (!function.language.is_empty()).then(|| function.language.clone()))
+        .collect();
     let sinks = model_sinks(&catalog, &languages);
     let mut summaries: BTreeMap<String, Summary> = functions.keys()
         .map(|name| (name.clone(), Summary::default())).collect();
