@@ -48,49 +48,40 @@ struct StateKey {
     realloc_lost: MarkSet,
 }
 
-/// Dense local object-id set used by the matcher worklist. Object handles are
-/// assigned per function, so a bitset avoids sorting/deduplicating/cloning
-/// vectors of u32 on every CFG transfer while retaining deterministic hashing.
+/// Canonical sparse object-id set used by the matcher worklist.  Stitched
+/// graphs have a large global object universe, while each path usually marks
+/// only a few objects.  Keeping sorted handles avoids cloning a dense bitset
+/// sized to every object in every worklist state and retains deterministic
+/// hashing/equality.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct MarkSet(Vec<u64>);
+struct MarkSet(Vec<u32>);
 
 impl MarkSet {
-    fn empty(object_count: usize) -> Self {
-        Self(vec![0; object_count.div_ceil(64)])
+    fn empty(_object_count: usize) -> Self {
+        Self(Vec::new())
     }
 
     #[inline]
     fn contains(&self, value: u32) -> bool {
-        let word = (value / 64) as usize;
-        word < self.0.len() && self.0[word] & (1u64 << (value % 64)) != 0
+        self.0.binary_search(&value).is_ok()
     }
 
     #[inline]
     fn insert(&mut self, value: u32) {
-        let word = (value / 64) as usize;
-        if let Some(bits) = self.0.get_mut(word) {
-            *bits |= 1u64 << (value % 64);
+        if let Err(index) = self.0.binary_search(&value) {
+            self.0.insert(index, value);
         }
     }
 
     #[inline]
     fn remove(&mut self, value: u32) {
-        let word = (value / 64) as usize;
-        if let Some(bits) = self.0.get_mut(word) {
-            *bits &= !(1u64 << (value % 64));
+        if let Ok(index) = self.0.binary_search(&value) {
+            self.0.remove(index);
         }
     }
 
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.iter().enumerate().flat_map(|(word, bits)| {
-            let mut bits = *bits;
-            std::iter::from_fn(move || {
-                if bits == 0 { return None; }
-                let bit = bits.trailing_zeros();
-                bits &= bits - 1;
-                Some((word as u32) * 64 + bit)
-            })
-        })
+        self.0.iter().copied()
     }
 }
 
@@ -198,11 +189,26 @@ fn match_function(
         by_id.insert(node.id.as_str(), index);
     }
     let mut outgoing = vec![Vec::new(); function.nodes.len()];
-    let mut guarded_outgoing = vec![Vec::new(); function.nodes.len()];
+    // Keep the metadata needed by seam traversal beside the adjacency entry.
+    // Looking it up by scanning `function.edges` inside the state worklist made
+    // stitched matching O(states * edges) on large functions/stitched graphs.
+    let mut guarded_outgoing: Vec<Vec<(
+        usize,
+        Vec<lifetime_proto::GuardProof>,
+        Vec<lifetime_proto::NativeSeamBinding>,
+        String,
+        String,
+    )>> = vec![Vec::new(); function.nodes.len()];
     for edge in &function.edges {
         if let (Some(source), Some(target)) = (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str())) {
             outgoing[*source].push(*target);
-            guarded_outgoing[*source].push((*target, edge.guards.clone()));
+            guarded_outgoing[*source].push((
+                *target,
+                edge.guards.clone(),
+                edge.bindings.clone(),
+                edge.seam_kind.clone(),
+                edge.return_to.clone(),
+            ));
         }
     }
     let entry = by_id.get(function.entry.as_str()).copied().unwrap_or(0);
@@ -398,38 +404,33 @@ fn match_function(
                 }
             }
         }
-        for (target, guards) in &guarded_outgoing[index] {
+        for (target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
             let mut next_bindings = bindings.clone();
-            if let Some(edge) = function.edges.iter().find(|edge| {
-                by_id.get(edge.source.as_str()) == Some(&index)
-                    && by_id.get(edge.target.as_str()) == Some(target)
-            }) {
-                let object_label = |object: &ObjectKey| {
-                    format!("{}{}", object.root, object.selectors.join(""))
-                };
-                for binding in &edge.bindings {
-                    for encoded in &binding.formal_to_actual {
-                        let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue };
-                        let source = objects.iter().position(|object|
-                            object_label(object) == formal && object.generation == "g0");
-                        let target_object = objects.iter().position(|object|
-                            object_label(object) == actual && object.generation == "g0");
-                        if let (Some(source), Some(target_object)) = (source, target_object) {
-                            next_bindings.push((source as u32, target_object as u32));
-                        }
+            let object_label = |object: &ObjectKey| {
+                format!("{}{}", object.root, object.selectors.join(""))
+            };
+            for binding in seam_bindings {
+                for encoded in &binding.formal_to_actual {
+                    let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue; };
+                    let source = objects.iter().position(|object|
+                        object_label(object) == formal && object.generation == "g0");
+                    let target_object = objects.iter().position(|object|
+                        object_label(object) == actual && object.generation == "g0");
+                    if let (Some(source), Some(target_object)) = (source, target_object) {
+                        next_bindings.push((source as u32, target_object as u32));
                     }
                 }
-                if edge.seam_kind == "return" && !edge.return_to.is_empty() {
-                    if let (Some(source), Some(target_object)) = (
-                        node_object_ids[index],
-                        objects.iter().position(|object| object_label(object) == edge.return_to),
-                    ) {
-                        // A returned value is assigned in the caller. Keep
-                        // canonicalization pointed from that caller-side
-                        // destination to the callee-side returned object so
-                        // released/escaped state follows the returned value.
-                        next_bindings.push((target_object as u32, source));
-                    }
+            }
+            if seam_kind == "return" && !return_to.is_empty() {
+                if let (Some(source), Some(target_object)) = (
+                    node_object_ids[index],
+                    objects.iter().position(|object| object_label(object) == *return_to),
+                ) {
+                    // A returned value is assigned in the caller. Keep
+                    // canonicalization pointed from that caller-side
+                    // destination to the callee-side returned object so
+                    // released/escaped state follows the returned value.
+                    next_bindings.push((target_object as u32, source));
                 }
             }
             let mut next_nulls = nulls.clone();
