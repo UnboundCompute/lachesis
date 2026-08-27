@@ -276,3 +276,27 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         uncovered_functions: all_names.difference(&covered).cloned().collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structurally_launched_recursive_components_are_covered() {
+        let recursive = lifetime_proto::TranslationFunction {
+            id: "recursive-id".into(),
+            name: "recursive".into(),
+            calls: vec![lifetime_proto::FunctionCall { callee: "recursive".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![recursive] }),
+            sources: Vec::new(),
+        });
+        assert_eq!(result.functions.len(), 1);
+        assert_eq!(result.covered_functions, vec!["recursive"]);
+        assert!(result.uncovered_functions.is_empty());
+        assert_eq!(result.regions.len(), 1);
+        assert_eq!(result.regions[0].functions, vec!["recursive"]);
+    }
+}
