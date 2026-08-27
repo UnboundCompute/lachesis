@@ -736,6 +736,31 @@ mod tests {
     }
 
     #[test]
+    fn matcher_consumes_a_binary_skeleton_lifecycle_path() {
+        let token = |node: &str, family: &str| lifetime_proto::NativeSkeletonToken {
+            kind: "event".into(), function: "source".into(), node: node.into(),
+            family: family.into(), object_root: "p".into(), ..Default::default()
+        };
+        let skeleton = lifetime_proto::NativeFlowSkeleton {
+            kind: "source-rooted".into(), entry: "source".into(), source_function: "source".into(),
+            context: "ctx".into(),
+            complete: true,
+            tokens: vec![token("alloc", "memory.alloc"), token("free", "memory.free"),
+                         token("use", "memory.deref")],
+            edges: vec![
+                lifetime_proto::NativeSemanticEdge { source: "alloc".into(), target: "free".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticEdge { source: "free".into(), target: "use".into(), ..Default::default() },
+            ],
+        };
+        let matched = match_result(lifetime_proto::NativeSemanticResult {
+            skeletons: vec![skeleton], ..Default::default()
+        });
+        assert_eq!(matched.functions.len(), 1);
+        assert_eq!(matched.functions[0].findings.len(), 1);
+        assert_eq!(matched.functions[0].findings[0].pattern, "uaf.deref");
+    }
+
+    #[test]
     fn reports_the_effective_guard_on_a_finding() {
         let nodes = vec![node("o", "ORIGIN", 1), node("r1", "RELEASE", 2),
                          node("r2", "RELEASE", 3)];
