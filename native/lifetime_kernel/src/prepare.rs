@@ -1724,19 +1724,33 @@ pub(crate) fn semantic_request(
             } else {
                 call.assigned.clone()
             };
-            seams.push(lifetime_proto::NativeSemanticEdge {
-                source: format!("native:{}:anchor:{}", caller.id, call.node),
-                target: format!("native:{}:anchor:{}", callee.id, entry_anchor),
-                kind: "seam".into(), guards: Vec::new(),
-                bindings: vec![lifetime_proto::NativeSeamBinding {
-                    caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
-                    formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
-                }],
-                seam_kind: "call".into(), callee: callee.id.clone(),
-                return_to: return_to.clone(), provenance: "compiler-call".into(),
-            });
-            if let Some(successors) = caller.successors.iter().find(|item| item.node == call.node) {
-                for continuation in &successors.targets {
+            let continuations = caller.successors.iter()
+                .find(|item| item.node == call.node)
+                .map(|successors| successors.targets.clone())
+                .unwrap_or_default();
+            let call_return_targets = if continuations.is_empty() {
+                vec![String::new()]
+            } else {
+                continuations.iter().map(|continuation|
+                    format!("native:{}:anchor:{}", caller.id, continuation)).collect()
+            };
+            // A separate call edge is emitted for each CFG continuation.  The
+            // old Claus pushdown key is the continuation node, while the
+            // binding retains the returned object path for alias propagation.
+            for call_return_target in call_return_targets {
+                seams.push(lifetime_proto::NativeSemanticEdge {
+                    source: format!("native:{}:anchor:{}", caller.id, call.node),
+                    target: format!("native:{}:anchor:{}", callee.id, entry_anchor),
+                    kind: "seam".into(), guards: Vec::new(),
+                    bindings: vec![lifetime_proto::NativeSeamBinding {
+                        caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
+                        formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
+                    }],
+                    seam_kind: "call".into(), callee: callee.id.clone(),
+                    return_to: call_return_target, provenance: "compiler-call".into(),
+                });
+            }
+            for continuation in continuations {
                     seams.push(lifetime_proto::NativeSemanticEdge {
                         source: format!("native:{}:exit", callee.id),
                         target: format!("native:{}:anchor:{}", caller.id, continuation),
@@ -1748,7 +1762,6 @@ pub(crate) fn semantic_request(
                         callee: caller.id.clone(), return_to: return_to.clone(),
                         provenance: "compiler-return".into(),
                     });
-                }
             }
         }
     }
@@ -1942,6 +1955,18 @@ pub(crate) fn semantic_request(
                     node.anchor == anchor && !node.event_kind.is_empty())
                     .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
                     seam.source = node.id.clone();
+                }
+                // ``return_to`` on a call edge is the pushdown continuation,
+                // not the returned object path stored in the binding.  It was
+                // created from a pre-projection anchor above; resolve it to
+                // the compact node ID before the sidecar is published.
+                let prefix = format!("native:{}:anchor:", binding.caller);
+                if let Some(continuation) = seam.return_to.strip_prefix(&prefix) {
+                    if let Some(node) = function.nodes.iter().find(|node|
+                        node.anchor == continuation && !node.event_kind.is_empty())
+                        .or_else(|| function.nodes.iter().find(|node| node.anchor == continuation)) {
+                        seam.return_to = node.id.clone();
+                    }
                 }
             }
         }
