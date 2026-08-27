@@ -1350,7 +1350,9 @@ fn semantic_language(function: &str) -> String {
     if function.contains(":cpython-ast:") || function.contains(":python:") {
         "python".to_owned()
     } else if function.contains(":typescript-compiler-api:")
-        || function.contains(":javascript:") || function.contains(":typescript:") {
+        || function.contains(":typescript:") {
+        "typescript".to_owned()
+    } else if function.contains(":javascript:") {
         "javascript".to_owned()
     } else if function.contains(":clang-c:") || function.contains(":clang-cpp:") {
         "c".to_owned()

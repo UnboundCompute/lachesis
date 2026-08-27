@@ -45,7 +45,11 @@ fn model_sinks(request: &crate::atropos_proto::Request,
     let mut result: HashMap<String, BTreeSet<Option<u32>>> = HashMap::new();
     for model in &request.models {
         if model.role != "sink" { continue; }
-        if !model.language.is_empty() && !languages.contains(&model.language) { continue; }
+        // An unknown or mixed-language substrate must not silently become C.
+        // Empty `languages` means no language filter is safe to apply.
+        if !model.language.is_empty()
+            && !languages.is_empty()
+            && !languages.contains(&model.language) { continue; }
         let Some(position) = sink_position(&model.access_path) else { continue };
         let name = if model.package.is_empty() || model.package == "builtins" {
             model.method.clone()
@@ -79,11 +83,12 @@ pub(crate) fn summarize(
             let file = function.file.to_ascii_lowercase();
             if file.ends_with(".c") || file.ends_with(".h") || file.ends_with(".cc")
                 || file.ends_with(".cpp") || file.ends_with(".cxx") { Some("c".into()) }
-            else if file.ends_with(".py") { Some("python".into()) }
-            else if file.ends_with(".js") || file.ends_with(".ts") { Some("javascript".into()) }
+            else if file.ends_with(".py") || file.ends_with(".pyi") { Some("python".into()) }
+            else if file.ends_with(".ts") || file.ends_with(".tsx") { Some("typescript".into()) }
+            else if file.ends_with(".js") || file.ends_with(".jsx") || file.ends_with(".mjs")
+                || file.ends_with(".cjs") { Some("javascript".into()) }
             else { None }
         }).collect();
-    let languages = if languages.is_empty() { ["c".into()].into_iter().collect() } else { languages };
     let sinks = model_sinks(&catalog, &languages);
     let mut summaries: BTreeMap<String, Summary> = functions.keys()
         .map(|name| (name.clone(), Summary::default())).collect();

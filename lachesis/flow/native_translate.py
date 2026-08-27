@@ -143,8 +143,9 @@ def _semantic_function_language(function, fallback: str) -> str:
     identifier = getattr(function, "id", "")
     if ":cpython-ast:" in identifier or ":python:" in identifier:
         return "python"
-    if (":typescript-compiler-api:" in identifier
-            or ":javascript:" in identifier or ":typescript:" in identifier):
+    if ":typescript-compiler-api:" in identifier or ":typescript:" in identifier:
+        return "typescript"
+    if ":javascript:" in identifier:
         return "javascript"
     if ":clang-c:" in identifier or ":clang-cpp:" in identifier:
         return "c"
