@@ -1625,6 +1625,48 @@ fn automatic_include_arguments(files: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// Read the compiler database through libclang rather than making the Python
+/// boundary parse or rewrite build configuration. The returned arguments are
+/// the compiler's own per-TU arguments, minus argv[0], the source filename, and
+/// output-only switches that are meaningless to libclang parsing.
+unsafe fn compile_database_arguments(source_dir: &Path, source: &Path) -> Option<Vec<String>> {
+    let database_dir = env::var_os("LACHESIS_COMPILE_COMMANDS")
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| source_dir.to_path_buf());
+    let directory = CString::new(database_dir.to_string_lossy().as_bytes()).ok()?;
+    let mut error = CXCompilationDatabase_NoError;
+    let database = clang_CompilationDatabase_fromDirectory(directory.as_ptr(), &mut error);
+    if database.is_null() || error != CXCompilationDatabase_NoError {
+        if !database.is_null() { clang_CompilationDatabase_dispose(database); }
+        return None;
+    }
+    let filename = CString::new(source.to_string_lossy().as_bytes()).ok()?;
+    let commands = clang_CompilationDatabase_getCompileCommands(database, filename.as_ptr());
+    let mut result = None;
+    if !commands.is_null() && clang_CompileCommands_getSize(commands) > 0 {
+        let command = clang_CompileCommands_getCommand(commands, 0);
+        let argc = clang_CompileCommand_getNumArgs(command);
+        let source_text = source.to_string_lossy();
+        let mut args = Vec::new();
+        for index in 1..argc {
+            let argument = cx_string(clang_CompileCommand_getArg(command, index));
+            if argument == source_text || argument == "--" || argument == "-o" || argument == "-MF" || argument == "-MT" {
+                continue;
+            }
+            if index > 0 {
+                let previous = cx_string(clang_CompileCommand_getArg(command, index - 1));
+                if previous == "-o" || previous == "-MF" || previous == "-MT" { continue; }
+            }
+            args.push(argument);
+        }
+        result = Some(args);
+    }
+    if !commands.is_null() { clang_CompileCommands_dispose(commands); }
+    clang_CompilationDatabase_dispose(database);
+    result
+}
+
 fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     let source_dir = if input.is_dir() {
         input.to_path_buf()
@@ -1766,7 +1808,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for source in parse_files {
                 let unit = graph::NativeTranslationUnit {
                     path: source.to_string_lossy().into_owned(),
-                    arguments: clang_arguments.clone(),
+                    arguments: compile_database_arguments(&_source_dir, &source)
+                        .unwrap_or_else(|| clang_arguments.clone()),
                 };
                 parse_unit(index, &unit, &mut emitter)?;
             }
