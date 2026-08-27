@@ -109,20 +109,26 @@ fn walk_region(
         let guards = adjacency.get(state.node.as_str()).into_iter().flatten()
             .flat_map(|edge| edge.guards.iter().cloned())
             .collect::<Vec<_>>();
-        if !node.event_kind.is_empty() {
-            tokens.push(lifetime_proto::NativeSkeletonToken {
-                kind: if matches!(node.event_kind.as_str(), "BRANCH" | "MERGE" | "LOOP") {
+        // Keep anchors in the skeleton even when they carry no lifecycle
+        // event.  The old semantic graph retained those anchors to preserve
+        // branch/loop structure; dropping them forces a later matcher to
+        // reconnect edges heuristically and can create paths that do not
+        // exist.  ``family=control`` is an internal binary marker, not a
+        // catalogued vulnerability family.
+        tokens.push(lifetime_proto::NativeSkeletonToken {
+                kind: if node.event_kind.is_empty() ||
+                    matches!(node.event_kind.as_str(), "BRANCH" | "MERGE" | "LOOP") {
                     "control".into()
                 } else { "event".into() },
                 function: node.function.clone(), node: node.id.clone(),
-                family: lifecycle_family(&node.event_kind, language),
+                family: if node.event_kind.is_empty() { "control".into() }
+                    else { lifecycle_family(&node.event_kind, language) },
                 object_root: node.object_root.clone(), object_selectors: node.object_selectors.clone(),
                 line: node.line, has_line: node.has_line, depth,
                 guarded: !guards.is_empty(), guards,
                 source_reachable: node.source_reachable,
                 source_witness_nodes: node.source_witness_nodes.clone(),
             });
-        }
         for edge in adjacency.get(state.node.as_str()).into_iter().flatten() {
             if !edge.target.is_empty() && !nodes.contains_key(edge.target.as_str()) {
                 complete = false;
@@ -271,7 +277,7 @@ mod tests {
         };
         let skeletons = build(&result);
         let kinds: Vec<_> = skeletons[0].tokens.iter().map(|token| token.kind.as_str()).collect();
-        assert!(kinds.windows(2).any(|pair| pair == ["enter", "event"]));
+        assert!(kinds.windows(2).any(|pair| pair == ["enter", "control"]));
         assert!(skeletons[0].tokens.iter().any(|token| token.kind == "exit" && token.function == "callee"));
         assert_eq!(skeletons[0].context, "ctx");
         assert!(skeletons[0].complete);

@@ -501,6 +501,9 @@ fn match_function(
 pub(crate) fn match_result(
     result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
+    if !result.skeletons.is_empty() {
+        return match_skeletons(result.skeletons);
+    }
     if !result.seams.is_empty() {
         return match_stitched_result(result);
     }
@@ -597,6 +600,76 @@ fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
     };
     let matched = match_function(&function);
     lifetime_proto::NativeTemporalResult { functions: vec![matched] }
+}
+
+fn skeleton_event_kind(family: &str, token_kind: &str) -> String {
+    if token_kind == "control" || family == "control" { return String::new(); }
+    match family {
+        "memory.alloc" | "lifecycle.acquire" => "ORIGIN".into(),
+        "memory.free" | "lifecycle.release" => "memory.free".into(),
+        "memory.deref" | "lifecycle.use" => "memory.deref".into(),
+        "lifecycle.escape" => "ESCAPE".into(),
+        "lifecycle.invalidate" => "INVALIDATE".into(),
+        "lifecycle.derive" => "DERIVE".into(),
+        "lifecycle.return" => "RETURN_VALUE".into(),
+        "lifecycle.pointer_arithmetic" => "POINTER_ARITHMETIC".into(),
+        "lifecycle.uninitialized" => "UNINITIALIZED".into(),
+        _ => family.to_owned(),
+    }
+}
+
+/// Convert one binary Claus skeleton back into the compact native matcher
+/// representation.  This is an in-process Rust projection: it does not cross
+/// Python, serialize JSON, or reopen the graph.  Anchors retained by the
+/// skeleton keep the original branch and seam edges intact.
+fn match_skeleton(
+    skeleton: &lifetime_proto::NativeFlowSkeleton,
+    ordinal: usize,
+) -> Option<lifetime_proto::NativeTemporalFunction> {
+    let mut nodes = Vec::new();
+    let mut seen = HashSet::default();
+    for token in &skeleton.tokens {
+        if token.node.is_empty() || !seen.insert(token.node.clone()) { continue; }
+        nodes.push(lifetime_proto::NativeSemanticNode {
+            id: token.node.clone(), function: token.function.clone(),
+            event_kind: skeleton_event_kind(&token.family, &token.kind),
+            object_root: token.object_root.clone(), object_selectors: token.object_selectors.clone(),
+            generation: "g0".into(), line: token.line, has_line: token.has_line,
+            anchor: token.node.clone(), source_witness_nodes: token.source_witness_nodes.clone(),
+            source_reachable: token.source_reachable, ..Default::default()
+        });
+    }
+    if nodes.is_empty() { return None; }
+    let node_ids: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let mut edges = Vec::new();
+    let mut edge_keys = HashSet::default();
+    for edge in &skeleton.edges {
+        if !node_ids.contains(edge.source.as_str()) || !node_ids.contains(edge.target.as_str()) {
+            continue;
+        }
+        let key = (&edge.source, &edge.target, &edge.kind, &edge.seam_kind, &edge.return_to);
+        if edge_keys.insert(key) { edges.push(edge.clone()); }
+    }
+    let outgoing: HashSet<&str> = edges.iter().map(|edge| edge.source.as_str()).collect();
+    let entry = nodes.iter().find(|node| node.function == skeleton.entry)
+        .or_else(|| nodes.first()).map(|node| node.id.clone())?;
+    let mut exits: Vec<String> = nodes.iter().filter(|node| !outgoing.contains(node.id.as_str()))
+        .map(|node| node.id.clone()).collect();
+    if exits.is_empty() { exits.push(nodes.last()?.id.clone()); }
+    Some(match_function(&lifetime_proto::NativeSemanticFunction {
+        id: format!("native:skeleton:{ordinal}:{}", skeleton.context),
+        entry, exits, nodes, edges, language: String::new(),
+    }))
+}
+
+fn match_skeletons(
+    skeletons: Vec<lifetime_proto::NativeFlowSkeleton>,
+) -> lifetime_proto::NativeTemporalResult {
+    lifetime_proto::NativeTemporalResult {
+        functions: skeletons.iter().enumerate()
+            .filter_map(|(ordinal, skeleton)| match_skeleton(skeleton, ordinal))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
