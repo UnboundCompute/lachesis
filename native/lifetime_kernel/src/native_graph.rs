@@ -294,6 +294,28 @@ fn resolved_function_id(
     current
 }
 
+#[cfg(test)]
+mod tests {
+    use super::resolved_function_id;
+    use hashbrown::HashMap;
+
+    #[test]
+    fn follows_only_function_declaration_to_definition_links() {
+        let functions = HashMap::from([
+            ("prototype".to_owned(), "work".to_owned()),
+            ("definition".to_owned(), "work".to_owned()),
+            ("value".to_owned(), "value".to_owned()),
+        ]);
+        let refs = HashMap::from([
+            ("prototype".to_owned(), "definition".to_owned()),
+            ("value".to_owned(), "not-a-function".to_owned()),
+        ]);
+        assert_eq!(resolved_function_id("prototype", &functions, &refs), "definition");
+        assert_eq!(resolved_function_id("value", &functions, &refs), "value");
+        assert_eq!(resolved_function_id("unknown", &functions, &refs), "unknown");
+    }
+}
+
 fn call_kind(kind: &str) -> bool {
     matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
         | "call" | "Call" | "CallExpression" | "construct" | "NewExpression"
