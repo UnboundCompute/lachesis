@@ -165,6 +165,10 @@ impl<'a> GraphView<'a> {
         self.node(id).and_then(|node| text_property(node, "operator")).unwrap_or("")
     }
 
+    fn property(&self, id: &str, key: &str) -> Option<&str> {
+        self.node(id).and_then(|node| text_property(node, key))
+    }
+
     fn is_pointer(&self, id: &str) -> bool {
         self.node(id).and_then(|node| text_property(node, "type"))
             .is_some_and(|value| value.contains('*') || value.contains('['))
@@ -266,6 +270,26 @@ impl<'a> GraphView<'a> {
             "parameter" | "variable" | "binding" | "property-path" => path(Some(&id)),
             _ => None,
         }
+    }
+
+    fn value_path(&self, id: &str, depth: usize) -> Option<Path> {
+        if depth > 24 { return None; }
+        if let Some(path) = self.access_path(id, 0) { return Some(path); }
+        if let Some(node) = self.node(id) {
+            if let Some(target) = text_property(node, "target_id") {
+                if let Some(path) = self.access_path(target, depth + 1) { return Some(path); }
+            }
+        }
+        self.initializer_of(id).and_then(|source| self.value_path(source, depth + 1))
+    }
+
+    fn value_source(&self, id: &'a str, depth: usize) -> Option<&'a str> {
+        if depth > 24 { return None; }
+        if self.kind(id) == "allocation" || self.kind(id) == "call" {
+            return Some(id);
+        }
+        let source = self.initializer_of(id)?;
+        self.value_source(source, depth + 1)
     }
 
     fn deref_base(&self, id: &str) -> Option<Path> {
@@ -883,7 +907,43 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for node_id in &node_ids {
         let kind = graph.kind(node_id);
         let children = graph.children_owned(node_id);
-        if kind == "BinaryOperator" && matches!(graph.operator(node_id), "==" | "!=" | "<" | "<=" | ">" | ">=") {
+        if kind == "write" || kind == "definition" {
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
+            let target = graph.property(node_id, "target_id")
+                .and_then(|id| graph.access_path(id, 0));
+            let value_id = graph.property(node_id, "value_id");
+            let source = value_id.and_then(|id| graph.value_path(id, 0));
+            let value_source = value_id.and_then(|id| graph.value_source(id, 0));
+            if let Some(target) = target {
+                let origin = value_source.and_then(|source| call_by_node.get(source))
+                    .map(|call| call.is_alloc || call.is_source)
+                    .unwrap_or_else(|| value_source.is_some_and(|source| graph.kind(source) == "allocation"));
+                operations.push(raw_operation(
+                    if origin { Kind::Alloc } else if source.is_some() { Kind::Copy } else { Kind::Clobber },
+                    node_id,
+                    Some(target),
+                    source,
+                    line,
+                    false,
+                    "deref",
+                ));
+            }
+        } else if kind == "read" {
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
+            if let Some(target) = graph.property(node_id, "target_id")
+                .and_then(|id| graph.access_path(id, 0)) {
+                operations.push(raw_operation(Kind::Use, node_id, Some(target), None,
+                    line, false, "deref"));
+            }
+        } else if kind == "release" {
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "release_line"))
+                .or_else(|| graph.node(node_id).and_then(|node| integer_property(node, "start_line")));
+            if let Some(target) = graph.property(node_id, "target_id")
+                .and_then(|id| graph.access_path(id, 0)) {
+                operations.push(raw_operation(Kind::Free, node_id, Some(target), None,
+                    line, false, "release"));
+            }
+        } else if kind == "BinaryOperator" && matches!(graph.operator(node_id), "==" | "!=" | "<" | "<=" | ">" | ">=") {
             for child in &children {
                 if graph.is_pointer(child) {
                     if let Some(target) = graph.access_path(child, 0) {
