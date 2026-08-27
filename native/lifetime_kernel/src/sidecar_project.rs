@@ -26,7 +26,7 @@ const SUBSTRATE_NODE_KINDS: &[&str] = &[
     "cfg-exit", "cfg-merge", "cfg-condition", "function", "method", "constructor",
     "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
     "CXXMethod", "Constructor", "Destructor", "FunctionTemplate", "ConversionFunction",
-    "CXXDeductionGuide", "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration",
+    "CXXDeductionGuide", "ObjCMethodDecl", "BlockDecl", "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration",
     "FunctionExpression", "ArrowFunction", "MethodDeclaration", "MethodDefinition",
     "GetAccessor", "SetAccessor", "Call", "CallExpression", "construct",
     "NewExpression", "Return", "ReturnStatement", "return", "allocation", "release",

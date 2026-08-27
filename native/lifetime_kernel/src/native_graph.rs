@@ -274,6 +274,7 @@ fn function_kind(kind: &str) -> bool {
         | "CXXMethodDecl" | "CXXConstructorDecl" | "CXXDestructorDecl"
         | "ConversionFunction" | "FunctionTemplateDecl" | "CXXDeductionGuide"
         | "CXXMethod" | "Constructor" | "Destructor" | "FunctionTemplate"
+        | "ObjCMethodDecl" | "BlockDecl"
         | "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration"
         | "FunctionExpression" | "ArrowFunction" | "MethodDeclaration"
         | "MethodDefinition" | "GetAccessor" | "SetAccessor")

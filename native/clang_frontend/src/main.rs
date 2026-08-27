@@ -334,7 +334,7 @@ fn is_function_syntax(kind: &str) -> bool {
         "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
         "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl" |
         "CXXDeductionGuide" | "CXXMethod" | "Constructor" | "Destructor" |
-        "FunctionTemplate")
+        "FunctionTemplate" | "ObjCMethodDecl" | "BlockDecl")
 }
 
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
@@ -773,7 +773,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         syntax_kind.as_str(),
         "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl"
             | "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl"
-            | "CXXDeductionGuide"
+            | "CXXDeductionGuide" | "ObjCMethodDecl" | "BlockDecl"
             | "RecordDecl"
             | "StructDecl"
             | "UnionDecl"
