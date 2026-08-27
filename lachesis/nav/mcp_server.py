@@ -974,8 +974,9 @@ TOOLS = [
                     "sink-flow signatures (which value reaches which sink, guarded or not, and "
                     "the callee it flows through), and the pointer lifetime signatures "
                     "(alloc->use->free->escape). This is the composed, interprocedural summary "
-                    "the shape matcher runs on -- one call materializes and caches the pass. Use "
-                    "`function` to scope to one function; paginate with offset/limit.",
+                    "the shape matcher runs on -- one call materializes and caches the pass. The "
+                    "response returns counts and a bounded lead page, never the whole semantic "
+                    "graph. Use `function` to scope to one function; paginate with offset/limit.",
      "inputSchema": {"type": "object", "properties": {
          "function": {"type": "string", "description": "scope the census to one function"}}}},
     {"name": "leads",
@@ -1007,8 +1008,9 @@ TOOLS = [
                     "guarded-vs-unguarded size differential) and TYPESTATE (a pointer's ordered "
                     "alloc/use/free/escape; feeds double-free / use-after-free / leak). Returns "
                     "shape-matcher LEADS (not verdicts -- adjudicate with sources_of/reaches). "
-                    "No arg: every lead, source-rooted first. Pass `function` to scope to one "
-                    "entry and see its rendered skeletons; `kind` to filter reach|typestate.",
+                    "No arg: every lead, source-rooted first. The response is bounded to a lead "
+                    "page and reports graph counts, never the whole graph. Pass `function` to "
+                    "scope to one entry and `kind` to filter reach|typestate.",
      "inputSchema": {"type": "object", "properties": {
          "function": {"type": "string", "description": "entry function name; scopes skeletons "
                       "and renders them"},
