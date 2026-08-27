@@ -428,6 +428,10 @@ pub(crate) fn read_taint_evidence_path(
     let _: graph_proto::DataflowOverlay = graph_proto::DataflowOverlay::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 evidence envelope: {error}"))?;
     let mut result = HashMap::new();
+    // `taint-reach.sink_id` stores the taint sink node id, while the semantic
+    // event anchor is normally the sink's underlying value id.  Keep the
+    // mapping in that direction; indexing value -> sink made witness
+    // attachment silently miss catalog and frontend-produced sinks alike.
     let mut sink_values = HashMap::new();
     let mut reaches = Vec::new();
     while let Some(payload) = read_optional_stream_frame(&mut input)? {
@@ -435,11 +439,8 @@ pub(crate) fn read_taint_evidence_path(
         let node = graph_proto::NodeRecord::decode(&payload[1..])
             .map_err(|error| format!("invalid Pass-2 evidence node: {error}"))?;
         if node.kind == "sink" {
-            if let (Some(value), Some(value_id)) = (
-                text_property(&node.properties, "value_id"),
-                Some(node.id.as_str()),
-            ) {
-                sink_values.insert(value_id.to_owned(), value.to_owned());
+            if let Some(value) = text_property(&node.properties, "value_id") {
+                sink_values.insert(node.id.clone(), value.to_owned());
             }
         } else if node.kind == "taint-reach" {
             let Some(sink) = text_property(&node.properties, "sink_id") else { continue; };
