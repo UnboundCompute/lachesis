@@ -37,6 +37,7 @@ mod dynamic_behavior;
 mod async_events;
 mod interprocedural;
 mod branch_history;
+mod reaching_def;
 mod module_initialization;
 mod property_effects;
 mod heap;
@@ -278,6 +279,9 @@ fn run_native_overlay_chain(
     let delta = branch_history::enrich(&mut graph);
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "branch-history", writer.nodes, writer.edges);
+    let delta = reaching_def::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "reaching-definitions", writer.nodes, writer.edges);
     let delta = dispatch::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "dynamic-dispatch", writer.nodes, writer.edges);
