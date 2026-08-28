@@ -137,8 +137,20 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
     // deterministic structural fallback used by the Python implementation.
     let mut launches: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for name in functions.keys() {
-        if sites.get(name).is_some_and(|value| !value.is_empty()) {
-            launches.insert(name.clone(), ("catalog".into(), sites[name].iter().filter_map(|s| (!s.node.is_empty()).then_some(s.node.clone())).collect()));
+        // Reference gates the catalog launch on the source call carrying a node
+        // (`if call.get("node"): launches.setdefault(caller, []).append(node)`).
+        // A source site without a node still contributes taint influence and a
+        // `source_sites` entry, but is not itself an externally-rooted launch:
+        // a nodeless-source callerless function falls through to the structural/
+        // export branch exactly as `discover_sources` does, and a nodeless-source
+        // function that has callers is not a launch at all (reached, if at all,
+        // through the call graph). Previously any site made a function a
+        // "catalog" launch with a possibly-empty node list, over-claiming
+        // provenance and manufacturing spurious reachability roots.
+        let nodes: Vec<String> = sites.get(name).into_iter().flatten()
+            .filter_map(|site| (!site.node.is_empty()).then_some(site.node.clone())).collect();
+        if !nodes.is_empty() {
+            launches.insert(name.clone(), ("catalog".into(), nodes));
         } else if callers[name].is_empty() {
             launches.insert(name.clone(), (if functions[name].externally_visible { "export" } else { "structural" }.into(), vec!["__entry__".into()]));
         }
@@ -158,6 +170,30 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
             let inherited = provenance.get(&name).cloned().unwrap_or_default();
             provenance.entry(callee.clone()).or_default().extend(inherited);
             if reachable.insert(callee.clone()) || provenance[callee] != before { queue.push_back(callee.clone()); }
+        }
+    }
+
+    // A recursive component can have no callerless member and no catalogued
+    // source/export root. It is still a real function region and must not be
+    // silently omitted from coverage. Add one structural entry for each such
+    // function after ordinary reachability has been exhausted; this is a
+    // language-neutral fallback, not a source-name special case.
+    let uncovered_roots: Vec<String> = functions.keys()
+        .filter(|name| !reachable.contains(*name))
+        .cloned().collect();
+    for name in uncovered_roots {
+        launches.entry(name.clone()).or_insert_with(||
+            ("structural".into(), vec!["__entry__".into()]));
+        reachable.insert(name.clone());
+        provenance.entry(name.clone()).or_default().insert("structural".into());
+        queue.push_back(name);
+    }
+    while let Some(name) = queue.pop_front() {
+        for callee in &callees[&name] {
+            let inherited = provenance.get(&name).cloned().unwrap_or_default();
+            let before = provenance.get(callee).cloned().unwrap_or_default();
+            provenance.entry(callee.clone()).or_default().extend(inherited);
+            if provenance[callee] != before { queue.push_back(callee.clone()); }
         }
     }
 
@@ -201,7 +237,12 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
 
     let source_functions: BTreeSet<String> = result_functions.iter()
         .filter(|item| !item.source_sites.is_empty()
-            || coverage_callers.get(&item.name).is_none_or(BTreeSet::is_empty))
+            || coverage_callers.get(&item.name).is_none_or(BTreeSet::is_empty)
+            // A structurally-launched recursive component has no callerless
+            // member after the ordinary call graph is closed. Its synthetic
+            // entry is nevertheless a valid coverage source; excluding it
+            // leaves the entire isolated SCC out of every region.
+            || item.launch_provenance == "structural")
         .map(|item| item.name.clone()).collect();
     let mut forward: HashMap<String, BTreeSet<String>> = HashMap::new();
     for source in &source_functions {
@@ -225,7 +266,15 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
             }
         }
         let mut sources: Vec<String> = source_functions.intersection(&backward).cloned().collect();
-        if sources.is_empty() { sources = backward.iter().filter(|name| callers[*name].is_empty()).cloned().collect(); }
+        // Deterministic fallback when no catalogued source lies on the backward
+        // cone: the callerless structural roots of that cone.  Read the
+        // callback-normalized reverse graph, not the direct-call map -- the rest
+        // of coverage planning already does, and the reference scheduler's
+        // fallback (`if not self.reverse.get(name)`) is over the normalized graph
+        // so a function reachable only through a callback argument is not a root.
+        if sources.is_empty() {
+            sources = backward.iter().filter(|name| coverage_callers[*name].is_empty()).cloned().collect();
+        }
         let mut region_functions = BTreeSet::new();
         let mut state_keys = Vec::new();
         let mut context_keys = Vec::new();
@@ -235,6 +284,12 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
             let mut contexts: Vec<String> = result_functions.iter().find(|item| &item.name == source)
                 .map(|item| item.source_sites.iter().map(|site| if site.node.is_empty() { format!("{}@{}", site.callee, site.line) } else { site.node.clone() }).collect())
                 .unwrap_or_default();
+            // Reference `_source_contexts` returns `tuple(sorted(set(contexts)))`:
+            // launch contexts are order-independent and must not repeat, so two
+            // source calls that collapse to the same token contribute one key and
+            // the key order is deterministic rather than call order.
+            contexts.sort();
+            contexts.dedup();
             if contexts.is_empty() { contexts.push("__entry__".into()); }
             for context in contexts { for function in &selected { context_keys.push(key3(function, source, &context)); } }
         }
@@ -245,5 +300,138 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
         functions: result_functions, bindings, regions,
         covered_functions: covered.iter().cloned().collect(),
         uncovered_functions: all_names.difference(&covered).cloned().collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structurally_launched_recursive_components_are_covered() {
+        let recursive = lifetime_proto::TranslationFunction {
+            id: "recursive-id".into(),
+            name: "recursive".into(),
+            calls: vec![lifetime_proto::FunctionCall { callee: "recursive".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![recursive] }),
+            sources: Vec::new(),
+        });
+        assert_eq!(result.functions.len(), 1);
+        assert_eq!(result.covered_functions, vec!["recursive"]);
+        assert!(result.uncovered_functions.is_empty());
+        assert_eq!(result.regions.len(), 1);
+        assert_eq!(result.regions[0].functions, vec!["recursive"]);
+    }
+
+    #[test]
+    fn source_contexts_are_sorted_and_deduplicated() {
+        // `src` has three catalogued source calls: two collapse to the same
+        // context token `read@5` and one is `aaa@9`, supplied out of sorted
+        // order.  The reference returns `tuple(sorted(set(contexts)))`, so the
+        // region's context keys must be sorted and carry each launch once.
+        let src = lifetime_proto::TranslationFunction {
+            id: "src".into(), name: "src".into(),
+            calls: vec![
+                lifetime_proto::FunctionCall { callee: "read".into(), line: 5, has_line: true, ..Default::default() },
+                lifetime_proto::FunctionCall { callee: "read".into(), line: 5, has_line: true, ..Default::default() },
+                lifetime_proto::FunctionCall { callee: "aaa".into(), line: 9, has_line: true, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![src] }),
+            sources: vec![
+                lifetime_proto::SourceCatalogEntry { name: "read".into(), kind: "external-input".into() },
+                lifetime_proto::SourceCatalogEntry { name: "aaa".into(), kind: "external-input".into() },
+            ],
+        });
+        let region = result.regions.iter().find(|region| region.target == "src")
+            .expect("region for src");
+        assert_eq!(region.context_keys, vec![
+            key3("src", "src", "aaa@9"),
+            key3("src", "src", "read@5"),
+        ]);
+    }
+
+    #[test]
+    fn nodeful_catalog_source_is_a_catalog_launch() {
+        // A source call that carries a node registers a catalog launch rooted at
+        // that node, matching the reference `launches.setdefault(...).append(node)`.
+        let nodeful = lifetime_proto::TranslationFunction {
+            id: "nodeful".into(), name: "nodeful".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "read".into(), node: "call-1".into(), line: 5, has_line: true,
+                ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![nodeful] }),
+            sources: vec![lifetime_proto::SourceCatalogEntry {
+                name: "read".into(), kind: "external-input".into() }],
+        });
+        let func = result.functions.iter().find(|f| f.name == "nodeful").expect("nodeful function");
+        assert_eq!(func.launch_provenance, "catalog");
+        assert_eq!(func.launch_nodes, vec!["call-1".to_string()]);
+    }
+
+    #[test]
+    fn nodeless_catalog_source_is_structural_not_catalog() {
+        // A catalogued source call with no node contributes influence and a
+        // source site, but the reference only registers a *catalog* launch when
+        // the call has a node. A callerless function whose sole source call is
+        // nodeless therefore surfaces as a structural launch (nodes
+        // `["__entry__"]`), matching `discover_sources`, not as `catalog` with
+        // an empty node list.
+        let nodeless = lifetime_proto::TranslationFunction {
+            id: "nodeless".into(), name: "nodeless".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "read".into(), line: 5, has_line: true, ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![nodeless] }),
+            sources: vec![lifetime_proto::SourceCatalogEntry {
+                name: "read".into(), kind: "external-input".into() }],
+        });
+        let func = result.functions.iter().find(|f| f.name == "nodeless").expect("nodeless function");
+        assert_eq!(func.launch_provenance, "structural");
+        assert_eq!(func.launch_nodes, vec!["__entry__".to_string()]);
+        // The source site and its influence survive; only the launch class changed.
+        assert!(!func.source_sites.is_empty());
+        assert!(func.reachable);
+    }
+
+    #[test]
+    fn nodeless_source_with_callers_is_not_a_launch_root() {
+        // Reference seeds reachability only from `launches`. A nodeless catalog
+        // source on a function that HAS callers is not a launch, so it must not
+        // become an independent reachability root or claim `catalog` provenance;
+        // it is reached through the call graph like any other callee.
+        let entry = lifetime_proto::TranslationFunction {
+            id: "entry".into(), name: "entry".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "mid".into(), node: "c0".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let mid = lifetime_proto::TranslationFunction {
+            id: "mid".into(), name: "mid".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "read".into(), line: 7, has_line: true, ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![entry, mid] }),
+            sources: vec![lifetime_proto::SourceCatalogEntry {
+                name: "read".into(), kind: "external-input".into() }],
+        });
+        let mid_fn = result.functions.iter().find(|f| f.name == "mid").expect("mid function");
+        assert_eq!(mid_fn.launch_provenance, "");
+        assert!(mid_fn.launch_nodes.is_empty());
+        assert!(mid_fn.reachable); // reached via the (structural) entry launch
+        let entry_fn = result.functions.iter().find(|f| f.name == "entry").expect("entry function");
+        assert_eq!(entry_fn.launch_provenance, "structural");
     }
 }

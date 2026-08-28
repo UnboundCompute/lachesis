@@ -34,9 +34,13 @@ message Operation {
 
 message Alternative { repeated Operation effects = 1; }
 
+message GuardProof { string kind = 1; string value = 2; }
+message GuardedTarget { string target = 1; repeated GuardProof guards = 2; }
+
 message Successors {
   string node = 1;
   repeated string targets = 2;
+  repeated GuardedTarget guarded_targets = 3;
 }
 
 message Parameter {
@@ -166,6 +170,27 @@ message FunctionCall {
   string assigned_root = 13;
   repeated string assigned_selectors = 14;
   string assigned_name = 15;
+  // Compiler-resolved declaration identity.  The display name remains for
+  // catalog matching, but native interprocedural routing must not collapse
+  // overloads or same-named functions.
+  string callee_function_id = 16;
+  string size_expression = 17;
+  string destination = 18;
+  repeated string control = 19;
+  string guard_status = 20;
+  repeated string guard_predicates = 21;
+  // Size-testing branch guards active at this call site, each naming one arg
+  // root (``var``) and the controlling condition text (``canon``) the region
+  // classifier observed.  ``guard_predicates`` keeps the canon-only view for the
+  // predicate evaluators; ``guards`` retains the paired var so the seam layer can
+  // emit a typed proof over the named object.
+  repeated GuardFact guards = 22;
+}
+
+// One size-guard fact stamped onto a call site by the branch-region classifier.
+message GuardFact {
+  string var = 1;
+  string canon = 2;
 }
 
 message FunctionReturn {
@@ -176,6 +201,7 @@ message FunctionReturn {
   sint64 line = 5;
   bool has_line = 6;
   string root_name = 7;
+  string callee_function_id = 8;
 }
 
 message FunctionSummaryEffect {
@@ -189,6 +215,7 @@ message FunctionSummaryAlternative { repeated FunctionSummaryEffect effects = 1;
 message FunctionSummary {
   string callee = 1;
   repeated FunctionSummaryAlternative alternatives = 2;
+  string callee_function_id = 3;
 }
 
 message FunctionInput {
@@ -238,6 +265,10 @@ message TranslationFunction {
   bool externally_visible = 9;
   repeated string parameter_names = 10;
   repeated RootMetadata roots = 11;
+  // Frontend-owned language identity.  This is metadata, not an engine
+  // language allow-list; a mixed-language substrate may carry a different
+  // value for each function.
+  string language = 12;
 }
 message RootMetadata {
   string id = 1;
@@ -321,6 +352,15 @@ message NativeSinkFlow {
   bool guarded = 6;
   bool site_guarded = 7;
   string via = 8;
+  string node = 9;
+  sint64 line = 10;
+  bool has_line = 11;
+  string size_expression = 12;
+  string destination = 13;
+  repeated string control = 14;
+  string guard_status = 15;
+  repeated string guard_predicates = 16;
+  repeated string source_witness_nodes = 17;
 }
 message NativeSinkParam {
   string parameter = 1;
@@ -334,7 +374,11 @@ message NativeSummaryFunction {
   repeated NativeSinkFlow sink_flows = 3;
   repeated NativeSinkParam sink_params = 4;
 }
-message NativeSummaryResult { repeated NativeSummaryFunction functions = 1; }
+message NativeSummaryResult {
+  repeated NativeSummaryFunction functions = 1;
+  bool complete = 2;
+  uint32 iterations = 3;
+}
 
 // Compact temporal output.  The full solver result contains point/post/exit
 // snapshots for semantic graph construction; callers that only need temporal
@@ -346,6 +390,20 @@ message NativeTemporalFinding {
   sint64 line = 4;
   bool has_line = 5;
   string node = 6;
+  // Computed CFG witness from the function entry to the finding node.  This
+  // is deliberately separate from the object path above: the matcher must
+  // not present an object identity as if it were a provenance trace.
+  repeated string witness_nodes = 7;
+  bool witness_complete = 8;
+  repeated string source_witness_nodes = 9;
+  optional bool source_reachable = 10;
+  repeated GuardProof guards = 11;
+  bool guarded = 12;
+  string family = 13;
+  string pattern_id = 14;
+  string evaluator = 15;
+  uint32 tier = 16;
+  optional bool source_influenced = 17;
 }
 message NativeTemporalFunction {
   string id = 1;
@@ -379,11 +437,19 @@ message NativeSemanticNode {
   // ObjectIds for copied values.
   string value_root = 13;
   repeated string value_selectors = 14;
+  repeated string source_witness_nodes = 15;
+  optional bool source_reachable = 16;
 }
 message NativeSemanticEdge {
   string source = 1;
   string target = 2;
   string kind = 3;
+  repeated GuardProof guards = 4;
+  repeated NativeSeamBinding bindings = 5;
+  string seam_kind = 6;
+  string callee = 7;
+  string return_to = 8;
+  string provenance = 9;
 }
 message NativeSemanticFunction {
   string id = 1;
@@ -392,8 +458,75 @@ message NativeSemanticFunction {
   repeated NativeSemanticNode nodes = 4;
   repeated NativeSemanticEdge edges = 5;
   string language = 6;
+  // Compiler-resolved source launch anchors.  These are the source contexts
+  // used by the old Claus scheduler; taint witness nodes are not contexts.
+  repeated string source_launch_nodes = 7;
+  // Compiler-owned declaration roots for formal parameters. Pass 3 uses
+  // these identities to keep exported parameter lifecycles distinct from
+  // local object lifecycles without relying on source spelling.
+  repeated string parameter_roots = 8;
+}
+// A source-rooted Claus work region. Function order is stable so cached
+// fragments can be reused without depending on hash-map iteration order.
+message NativeSourceRegion {
+  string source_function = 1;
+  repeated string source_nodes = 2;
+  repeated string functions = 3;
+  repeated string contexts = 4;
+  // The compiler node selected by the seeded unvisited-node scheduler.
+  string seed_node = 5;
+}
+message NativeSkeletonToken {
+  string kind = 1;
+  string function = 2;
+  string node = 3;
+  string family = 4;
+  string object_root = 5;
+  repeated string object_selectors = 6;
+  sint64 line = 7;
+  bool has_line = 8;
+  uint32 depth = 9;
+  bool guarded = 10;
+  repeated GuardProof guards = 11;
+  optional bool source_reachable = 12;
+  repeated string source_witness_nodes = 13;
+  bool tainted = 14;
+  string bound = 15;
+  string callee = 16;
+  uint32 argument = 17;
+  bool has_argument = 18;
+  string value = 19;
+  string size_expression = 20;
+  string destination = 21;
+  repeated string control = 22;
+  bool is_source = 23;
+  bool truncated = 24;
+  string guard_status = 25;
+  // Compiler-derived object generation; empty means the initial generation.
+  string generation = 26;
+  bool stack_local = 27;
+  bool is_null = 28;
+  string access = 29;
+  string value_root = 30;
+  repeated string value_selectors = 31;
+  // Neutral matcher opcode. `family` remains the generalized catalog role;
+  // this field preserves distinct state transitions within that role.
+  string event_kind = 32;
+}
+message NativeFlowSkeleton {
+  string kind = 1;
+  string entry = 2;
+  string source_function = 3;
+  string context = 4;
+  bool complete = 5;
+  repeated NativeSkeletonToken tokens = 6;
+  repeated NativeSemanticEdge edges = 7;
+  bool is_source = 8;
 }
 message NativeSemanticResult {
   repeated NativeSemanticFunction functions = 1;
   bool complete = 2;
+  repeated NativeSemanticEdge seams = 3;
+  repeated NativeSourceRegion regions = 4;
+  repeated NativeFlowSkeleton skeletons = 5;
 }

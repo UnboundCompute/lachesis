@@ -70,6 +70,8 @@ struct GraphView<'a> {
     parent: HashMap<&'a str, &'a str>,
     refers: HashMap<&'a str, &'a str>,
     initializers: HashMap<&'a str, &'a str>,
+    declares: HashMap<&'a str, Vec<&'a str>>,
+    control: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
 }
 
 impl<'a> GraphView<'a> {
@@ -83,6 +85,8 @@ impl<'a> GraphView<'a> {
         let mut roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>> = HashMap::new();
         let mut refers = HashMap::new();
         let mut initializers = HashMap::new();
+        let mut declares: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+        let mut control: HashMap<&'a str, Vec<(&'a str, &'a str)>> = HashMap::new();
         for edge in edges_input {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
@@ -96,7 +100,19 @@ impl<'a> GraphView<'a> {
                     }
                 }
                 "REFERS_TO" => { refers.insert(edge.source.as_str(), edge.target.as_str()); }
-                "VALUE_FLOWS_TO" => { initializers.insert(edge.target.as_str(), edge.source.as_str()); }
+                "DECLARES_VALUE" => {
+                    declares.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+                }
+                "VALUE_FLOWS_TO" => {
+                    initializers.insert(edge.target.as_str(), edge.source.as_str());
+                }
+                "CONDITION" | "TRUE_BRANCH" | "FALSE_BRANCH" | "LOOP_TRUE" |
+                "LOOP_BACK" | "SWITCH_CASE" | "EXCEPTION_BRANCH" | "TRY_BODY" |
+                "RUNS_FINALLY" | "BREAKS_TO" | "CONTINUES_TO" | "ITERATES" |
+                "SHORT_CIRCUIT_LEFT" | "SHORT_CIRCUIT_RIGHT" => {
+                    control.entry(edge.source.as_str()).or_default()
+                        .push((edge.kind.as_str(), edge.target.as_str()));
+                }
                 _ => {}
             }
         }
@@ -123,7 +139,13 @@ impl<'a> GraphView<'a> {
             child_targets.extend(children);
             child_offsets.push(child_targets.len());
         }
-        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers }
+        for targets in declares.values_mut() {
+            targets.sort_by_key(|target| {
+                node_index.get(target).and_then(|index| nodes_input.get(*index))
+                    .and_then(|node| integer_property(node, "start_offset")).unwrap_or(i64::MAX)
+            });
+        }
+        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers, declares, control }
     }
 
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> {
@@ -151,6 +173,17 @@ impl<'a> GraphView<'a> {
 
     fn initializer_of(&self, id: &str) -> Option<&'a str> { self.initializers.get(id).copied() }
 
+    fn declares_owned(&self, id: &str) -> Vec<String> {
+        self.declares.get(id).into_iter().flatten().map(|target| (*target).to_owned()).collect()
+    }
+
+    fn control_targets(&self, id: &str, kind: &str) -> Vec<&'a str> {
+        self.control.get(id).into_iter().flatten()
+            .filter(|(edge_kind, _)| *edge_kind == kind)
+            .map(|(_, target)| *target)
+            .collect()
+    }
+
     fn kind(&self, id: &str) -> &str {
         self.node(id).map(|node| text_property(node, "syntax_kind").unwrap_or(node.kind.as_str())).unwrap_or("")
     }
@@ -165,16 +198,50 @@ impl<'a> GraphView<'a> {
         self.node(id).and_then(|node| text_property(node, "operator")).unwrap_or("")
     }
 
+    fn property(&self, id: &str, key: &str) -> Option<&str> {
+        self.node(id).and_then(|node| text_property(node, key))
+    }
+
     fn is_pointer(&self, id: &str) -> bool {
         self.node(id).and_then(|node| text_property(node, "type"))
             .is_some_and(|value| value.contains('*') || value.contains('['))
     }
 
+    fn is_null(&self, id: &str) -> bool {
+        let id = self.peel(id.to_owned());
+        matches!(self.kind(&id), "GNUNullExpr" | "CXXNullPtrLiteralExpr")
+            || (self.kind(&id) == "IntegerLiteral"
+                && matches!(self.label(&id).trim(), "0" | "NULL" | "nullptr"))
+            || (self.kind(&id) == "value"
+                && matches!(self.label(&id).trim(), "None" | "null" | "NULL"))
+    }
+
+    fn pointer_arithmetic_source(&self, id: &str) -> Option<Path> {
+        let id = self.peel(id.to_owned());
+        if self.kind(&id) != "BinaryOperator" || !matches!(self.operator(&id), "+" | "-") {
+            return None;
+        }
+        self.children_of(&id).into_iter().flatten()
+            .find_map(|child| self.access_path(child, 0))
+    }
+
+    fn conditional_value_source(&self, id: &str) -> Option<Path> {
+        let id = self.peel(id.to_owned());
+        if self.kind(&id) != "ConditionalOperator" { return None; }
+        self.role_children(&id, "TRUE_VALUE").into_iter().flatten()
+            .find_map(|child| self.access_path(child, 0))
+            .or_else(|| self.children_of(&id).into_iter().flatten().skip(1)
+                .find_map(|child| self.access_path(child, 0)))
+    }
+
     fn peel(&self, mut id: String) -> String {
         for _ in 0..12 {
             if matches!(self.kind(&id), "ImplicitCastExpr" | "CStyleCastExpr" | "ParenExpr" |
+                "UnexposedExpr" | "CXXBindTemporaryExpr" | "MaterializeTemporaryExpr" |
+                "ExprWithCleanups" | "ConstantExpr" | "OpaqueValueExpr" |
                 "CXXConstCastExpr" | "CXXStaticCastExpr" | "CXXReinterpretCastExpr" | "CXXFunctionalCastExpr") {
-                if let Some(child) = self.children_of(&id).and_then(|items| items.first()) {
+                if let Some(child) = self.children_of(&id).and_then(|items| items.into_iter()
+                    .find(|child| **child != id.as_str())) {
                     id = (*child).to_owned();
                     continue;
                 }
@@ -240,6 +307,26 @@ impl<'a> GraphView<'a> {
         }
     }
 
+    fn value_path(&self, id: &str, depth: usize) -> Option<Path> {
+        if depth > 24 { return None; }
+        if let Some(path) = self.access_path(id, 0) { return Some(path); }
+        if let Some(node) = self.node(id) {
+            if let Some(target) = text_property(node, "target_id") {
+                if let Some(path) = self.access_path(target, depth + 1) { return Some(path); }
+            }
+        }
+        self.initializer_of(id).and_then(|source| self.value_path(source, depth + 1))
+    }
+
+    fn value_source(&self, id: &'a str, depth: usize) -> Option<&'a str> {
+        if depth > 24 { return None; }
+        if self.kind(id) == "allocation" || self.kind(id) == "call" {
+            return Some(id);
+        }
+        let source = self.initializer_of(id)?;
+        self.value_source(source, depth + 1)
+    }
+
     fn deref_base(&self, id: &str) -> Option<Path> {
         let children = self.children_of(id)?;
         match self.kind(id) {
@@ -267,7 +354,10 @@ fn is_statement(kind: &str) -> bool {
         "cfg-entry" | "cfg-exit" | "cfg-merge" | "cfg-condition" |
         "statement" | "Return" | "ReturnStatement" | "return" |
         "Block" | "ExpressionStatement" | "IfStatement" | "ForStatement" |
-        "WhileStatement" | "TryStatement" | "WithStatement")
+        "WhileStatement" | "TryStatement" | "WithStatement" |
+        "If" | "For" | "AsyncFor" | "While" | "Try" | "Match" |
+        "Raise" | "Break" | "Continue" | "Assign" | "AnnAssign" |
+        "AugAssign" | "Expr" | "Pass")
 }
 
 fn is_return_kind(kind: &str) -> bool {
@@ -300,6 +390,72 @@ fn append_chain(successors: &mut HashMap<String, Vec<String>>, nodes: &[String])
     }
 }
 
+fn guard_value(graph: &GraphView<'_>, node: &str) -> Option<String> {
+    let path = graph.access_path(node, 0)?;
+    let mut value = path.root.trim_start_matches("decl:").to_owned();
+    value.push_str(&path.selectors.join(""));
+    (!value.is_empty()).then(|| format!("{value}#g0"))
+}
+
+fn guard_operand(graph: &GraphView<'_>, node: &str) -> Option<String> {
+    if graph.is_null(node) { return Some("NULL".to_owned()); }
+    if let Some(path) = graph.access_path(node, 0) {
+        let mut value = path.root.trim_start_matches("decl:").to_owned();
+        value.push_str(&path.selectors.join(""));
+        if !value.is_empty() { return Some(value); }
+    }
+    let value = graph.label(node).replace(' ', "");
+    (!value.is_empty()).then_some(value)
+}
+
+fn branch_guards(graph: &GraphView<'_>, source: &str, branch: &str)
+    -> Vec<lifetime_proto::GuardProof>
+{
+    let children = graph.children_of(source).unwrap_or(&[]);
+    let operator = match graph.operator(source) {
+        "" => graph.label(source),
+        value => value,
+    };
+    let proof = |kind: &str, value: Option<String>| value.map(|value|
+        lifetime_proto::GuardProof { kind: kind.to_owned(), value }).into_iter().collect();
+    let invert = branch == "FALSE_BRANCH";
+    if matches!(operator, "==" | "!=") {
+        let null_child = children.iter().find(|child| graph.is_null(child)).copied();
+        let value_child = children.iter().find(|child| Some(**child) != null_child)
+            .and_then(|child| guard_value(graph, child));
+        if null_child.is_some() {
+            let is_null = operator == "==";
+            let is_null = if invert { !is_null } else { is_null };
+            return proof(if is_null { "ISNULL" } else { "NONNULL" }, value_child);
+        }
+    }
+    if matches!(operator, "<" | "<=" | ">" | ">=" | "==" | "!=")
+        && children.len() >= 2
+    {
+        let Some(left) = guard_operand(graph, &children[0]) else { return Vec::new() };
+        let Some(right) = guard_operand(graph, &children[1]) else { return Vec::new() };
+        let relation = if invert {
+            match operator {
+                "<" => ">=", "<=" => ">", ">" => "<=", ">=" => "<",
+                "==" => "!=", "!=" => "==", _ => operator,
+            }
+        } else { operator };
+        return vec![lifetime_proto::GuardProof {
+            kind: "VALUE".to_owned(), value: format!("{left}{relation}{right}"),
+        }];
+    }
+    if operator == "!" {
+        let value = children.first().and_then(|child| guard_value(graph, child));
+        return proof(if invert { "NONNULL" } else { "ISNULL" }, value);
+    }
+    // A bare pointer condition has the same nullability meaning as `p != 0`.
+    if children.is_empty() {
+        let value = guard_value(graph, source);
+        return proof(if invert { "ISNULL" } else { "NONNULL" }, value);
+    }
+    Vec::new()
+}
+
 fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<String>, HashMap<String, Vec<String>>)> {
     let mut roots = owned.iter().filter(|node| graph.kind(node) == "CompoundStmt" &&
         graph.parent_of(node).map(|parent| !owned.contains(parent)).unwrap_or(true)).cloned().collect::<Vec<_>>();
@@ -313,9 +469,12 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         // is the conservative equivalent for the native temporal solver.
         let mut body = owned.iter().filter(|node| {
             !matches!(graph.kind(node), "function" | "method" | "constructor" |
+                "CXXMethod" | "Constructor" | "Destructor" | "FunctionTemplate" |
+                "ConversionFunction" | "CXXDeductionGuide" | "FunctionExpression" |
+                "GetAccessor" | "SetAccessor" |
                 "FunctionDef" | "AsyncFunctionDef" | "FunctionDeclaration" |
                 "ArrowFunction" | "MethodDeclaration" | "MethodDefinition" |
-                "Constructor" | "parameter" | "ParmVarDecl")
+                "parameter" | "ParmVarDecl")
         }).cloned().collect::<Vec<_>>();
         body.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
         body.first()?;
@@ -365,19 +524,37 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
                 exits = next_exits;
             }
             (first, exits)
-        } else if kind == "IfStmt" {
-            let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
+        } else if matches!(kind, "IfStmt" | "If") {
+            let condition_id = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
+                .or_else(|| graph.control_targets(id, "CONDITION").into_iter().next().map(str::to_owned))
                 .or_else(|| children.iter().min_by_key(|child| graph.offset(child)).cloned());
             let mut condition_stream = Vec::new();
-            if let Some(condition) = condition {
-                expression_stream(graph, &condition, owned, &mut condition_stream, &mut HashSet::new(), 0);
+            if let Some(condition) = &condition_id {
+                expression_stream(graph, condition, owned, &mut condition_stream, &mut HashSet::new(), 0);
                 append_chain(successors, &condition_stream);
             }
-            let mut branches = Vec::new();
+            let mut branch_ids: Vec<String> = Vec::new();
             for role in ["TRUE_BRANCH", "FALSE_BRANCH"] {
-                if let Some(branch) = graph.role_children(id, role).and_then(|items| items.first()) {
-                    branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
+                if let Some(branch) = graph.role_children(id, role).and_then(|items| items.first()).copied()
+                    .or_else(|| condition_stream.last().and_then(|condition| {
+                        graph.control_targets(condition, role).into_iter().next()
+                    })) {
+                    branch_ids.push(branch.to_owned());
                 }
+            }
+            // Roleless C clang AST: neither CONDITION/branch roles nor control
+            // edges are published, so identify the arms positionally.  The
+            // condition is the first (expression) child; each remaining
+            // statement child, in source order, is a branch arm (then, else).
+            if branch_ids.is_empty() {
+                branch_ids = children.iter()
+                    .filter(|child| Some(child.as_str()) != condition_id.as_deref()
+                        && is_statement(graph.kind(child)))
+                    .cloned().collect();
+            }
+            let mut branches = Vec::new();
+            for branch in &branch_ids {
+                branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
             }
             let mut exits = Vec::new();
             for (entry, branch_exits) in branches {
@@ -390,7 +567,36 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             if exits.is_empty() { exits = condition_stream.last().cloned().into_iter().collect(); }
             (condition_stream.first().cloned().or_else(|| exits.first().cloned()), exits)
-        } else if kind == "SwitchStmt" {
+        } else if matches!(kind, "Try" | "TryStatement") {
+            // Managed-language frontends publish exception control directly
+            // (TRY_BODY/EXCEPTION_BRANCH/RUNS_FINALLY). Preserve those edges
+            // instead of flattening a try block into source order.
+            let attempted = graph.control_targets(id, "TRY_BODY").into_iter().next()
+                .or_else(|| children.iter().find(|child| is_statement(graph.kind(child))).map(String::as_str));
+            let body_result = attempted.map(|node| emit(graph, owned, node, successors,
+                memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
+            let attempted_anchor = body_result.0.as_deref().or(attempted).unwrap_or(id);
+            let handlers = graph.control_targets(attempted_anchor, "EXCEPTION_BRANCH");
+            let handlers = if handlers.is_empty() { graph.control_targets(id, "EXCEPTION_BRANCH") } else { handlers };
+            let mut exits = Vec::new();
+            for handler in &handlers {
+                let result = emit(graph, owned, handler, successors, memo, in_progress, depth + 1);
+                if let Some(entry) = result.0 {
+                    successors.entry(attempted_anchor.to_owned()).or_default().push(entry);
+                }
+                exits.extend(result.1);
+            }
+            exits.extend(body_result.1);
+            let finally = graph.control_targets(attempted_anchor, "RUNS_FINALLY");
+            let finally = if finally.is_empty() { graph.control_targets(id, "RUNS_FINALLY") } else { finally };
+            if let Some(finally) = finally.first() {
+                let result = emit(graph, owned, finally, successors, memo, in_progress, depth + 1);
+                for exit in &exits { successors.entry(exit.clone()).or_default().push((*finally).to_owned()); }
+                exits = result.1;
+                if exits.is_empty() { exits.push((*finally).to_owned()); }
+            }
+            (body_result.0.or_else(|| handlers.first().map(|node| (*node).to_owned())), exits)
+        } else if matches!(kind, "SwitchStmt" | "Match") {
             // A switch dispatches to every case/default entry. The generic
             // statement path would serialize all case bodies into one chain,
             // making a large opcode switch look like one giant sequential
@@ -407,24 +613,30 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             let body_result = body.as_ref()
                 .map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1))
                 .unwrap_or((None, Vec::new()));
-            let case_nodes = body.as_ref().map(|body| {
+            let mut case_nodes = body.as_ref().map(|body| {
                 graph.children_owned(body)
                     .into_iter().filter(|child| owned.contains(child)
                         && matches!(graph.kind(child), "CaseStmt" | "DefaultStmt"))
                     .collect::<Vec<_>>()
             }).unwrap_or_default();
+            if case_nodes.is_empty() {
+                let source = condition_stream.last().map(String::as_str).unwrap_or(id);
+                case_nodes = graph.control_targets(source, "SWITCH_CASE")
+                    .into_iter().map(str::to_owned).collect();
+            }
             let mut case_entries = Vec::new();
             for case in &case_nodes {
-                let (entry, _) = emit(graph, owned, case, successors, memo, in_progress, depth + 1);
-                if let Some(entry) = entry { case_entries.push(entry); }
+                let (entry, exits) = emit(graph, owned, case, successors, memo, in_progress, depth + 1);
+                if let Some(entry) = entry { case_entries.push((entry, exits)); }
             }
             if let Some(condition_exit) = condition_stream.last() {
-                for entry in &case_entries {
+                for (entry, _) in &case_entries {
                     successors.entry(condition_exit.clone()).or_default().push(entry.clone());
                 }
             }
             let has_default = case_nodes.iter().any(|case| graph.kind(case) == "DefaultStmt");
             let mut exits = body_result.1;
+            exits.extend(case_entries.into_iter().flat_map(|(_, branch_exits)| branch_exits));
             if !has_default { exits.extend(condition_stream.last().cloned()); }
             (condition_stream.first().cloned().or(body_result.0), exits)
         } else if matches!(kind, "CaseStmt" | "DefaultStmt") {
@@ -456,6 +668,39 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         } else if kind == "BreakStmt" || kind == "ContinueStmt" {
             successors.entry(id.to_owned()).or_default();
             (Some(id.to_owned()), Vec::new())
+        } else if matches!(kind, "For" | "AsyncFor") {
+            // Python's normalized frontend publishes iterator/body control
+            // edges rather than a Clang-style CONDITION node. Preserve the
+            // same loop topology: iterator -> body -> iterator, with the
+            // explicit FALSE_BRANCH/else arm left as the finite exit.
+            let iterator = children.iter().find(|child| {
+                !matches!(graph.kind(child), "statement" | "expression")
+                    || graph.offset(child) <= graph.offset(id)
+            }).cloned().or_else(|| children.first().cloned());
+            let mut iterator_stream = Vec::new();
+            if let Some(iterator) = iterator {
+                expression_stream(graph, &iterator, owned, &mut iterator_stream,
+                    &mut HashSet::new(), 0);
+                append_chain(successors, &iterator_stream);
+            }
+            let body = iterator_stream.last().and_then(|iterator| {
+                graph.control_targets(iterator, "ITERATES").into_iter().next()
+            }).or_else(|| graph.control_targets(id, "LOOP_BODY").into_iter().next());
+            let body_result = body.map(|node| emit(graph, owned, node, successors,
+                memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
+            if let (Some(iterator), Some(body_entry)) = (iterator_stream.last(), body_result.0.clone()) {
+                successors.entry(iterator.clone()).or_default().push(body_entry);
+            }
+            if let Some(iterator) = iterator_stream.first() {
+                for exit in &body_result.1 {
+                    successors.entry(exit.clone()).or_default().push(iterator.clone());
+                }
+            }
+            let mut exits = graph.control_targets(
+                iterator_stream.last().map(String::as_str).unwrap_or(id), "FALSE_BRANCH")
+                .into_iter().map(str::to_owned).collect::<Vec<_>>();
+            if exits.is_empty() { exits = iterator_stream.last().cloned().into_iter().collect(); }
+            (iterator_stream.first().cloned().or(body_result.0), exits)
         } else if kind == "ForStmt" {
             let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned());
             let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
@@ -489,9 +734,11 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             let entry = init_result.0.or(condition_result.0).or(body_result.0);
             (entry, condition_result.1.into_iter().chain(body_result.1).collect())
-        } else if matches!(kind, "WhileStmt" | "DoStmt") {
+        } else if matches!(kind, "WhileStmt" | "DoStmt" | "While") {
             let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned());
-            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned());
+            let condition = condition.or_else(|| graph.control_targets(id, "CONDITION").into_iter().next().map(str::to_owned));
+            let body = graph.role_children(id, "LOOP_BODY").and_then(|items| items.first()).map(|child| (*child).to_owned())
+                .or_else(|| condition.as_deref().and_then(|condition| graph.control_targets(condition, "LOOP_TRUE").into_iter().next().map(str::to_owned)));
             let mut condition_stream = Vec::new();
             if let Some(condition) = condition.as_ref() { expression_stream(graph, condition, owned, &mut condition_stream, &mut HashSet::new(), 0); append_chain(successors, &condition_stream); }
             let body_result = body.as_ref().map(|body| emit(graph, owned, body, successors, memo, in_progress, depth + 1)).unwrap_or((None, Vec::new()));
@@ -511,6 +758,20 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             append_chain(successors, &stream);
             if let Some(last) = stream.last() { successors.entry(last.clone()).or_default(); }
             (stream.first().cloned().or_else(|| Some(id.to_owned())), Vec::new())
+        } else if kind == "DeclStmt" {
+            // A declaration statement links its declared variables through
+            // DECLARES_VALUE, not AST_CHILD, so the generic statement path sees
+            // no children and strands the initializer (e.g. the malloc in
+            // `char *p = malloc(16);`). Stream each declared value in source
+            // order; expression_stream walks the VarDecl's initializer child.
+            let mut declared = graph.declares_owned(id)
+                .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
+            if declared.is_empty() { declared = children; }
+            declared.sort_by_key(|child| graph.offset(child));
+            let mut stream = Vec::new();
+            for child in declared { expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0); }
+            append_chain(successors, &stream);
+            (stream.first().cloned(), stream.last().cloned().into_iter().collect())
         } else if is_statement(kind) {
             let mut stream = Vec::new();
             let sorted = children;
@@ -764,12 +1025,14 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
         for call in &mut input.calls {
             for argument in &mut call.arguments {
                 argument.expression = graph.label(&argument.node).to_owned();
-                if let Some(path) = graph.access_path(&argument.node, 0) {
+                if let Some(path) = graph.value_path(&argument.node, 0)
+                    .or_else(|| graph.access_path(&argument.node, 0)) {
                     argument.root = path.root;
                     argument.selectors = path.selectors;
                 }
             }
-            if let Some(path) = graph.access_path(&call.assigned, 0) {
+            if let Some(path) = graph.value_path(&call.assigned, 0)
+                .or_else(|| graph.access_path(&call.assigned, 0)) {
                 call.assigned_root = path.root;
                 call.assigned_selectors = path.selectors;
             }
@@ -791,6 +1054,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
                     root: String::new(), selectors: Vec::new(),
                     line: line.unwrap_or_default(), has_line: line.is_some(),
                     root_name: String::new(),
+                    callee_function_id: call.callee_function_id.clone(),
                 });
             } else if let Some(path) = graph.access_path(child, 0) {
                 input.returns.push(lifetime_proto::FunctionReturn {
@@ -798,6 +1062,7 @@ pub(crate) fn annotate_request(request: &mut lifetime_proto::PrepareRequest) {
                     root: path.root, selectors: path.selectors,
                     line: line.unwrap_or_default(), has_line: line.is_some(),
                     root_name: String::new(),
+                    callee_function_id: String::new(),
                 });
             }
         }
@@ -837,8 +1102,18 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         cfg_node_set.insert(synthetic_exit.clone());
         let mut terminals = node_ids.iter().filter(|node| is_return_kind(graph.kind(node)))
             .cloned().collect::<Vec<_>>();
-        if let Some(last) = node_ids.last() {
-            terminals.push(last.clone());
+        // The fall-through end of the function is any CFG node that has no
+        // outgoing successor.  Wiring the source-order tail (`node_ids.last()`)
+        // instead misattributes the exit to a mid-expression node when the last
+        // statement is a call — the call's argument sorts last in node order —
+        // inventing a phantom exit branch off that node.  The genuine implicit
+        // exits are exactly the successor-less nodes.
+        for node in &node_ids {
+            let has_successor = successor_map.get(node)
+                .map(|targets| !targets.is_empty()).unwrap_or(false);
+            if !has_successor {
+                terminals.push(node.clone());
+            }
         }
         terminals.sort();
         terminals.dedup();
@@ -855,7 +1130,59 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     for node_id in &node_ids {
         let kind = graph.kind(node_id);
         let children = graph.children_owned(node_id);
-        if kind == "BinaryOperator" && graph.operator(node_id) == "=" && children.len() >= 2 {
+        if kind == "write" || kind == "definition" {
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
+            let target = graph.property(node_id, "target_id")
+                .and_then(|id| graph.access_path(id, 0));
+            let value_id = graph.property(node_id, "value_id");
+            let source = value_id.and_then(|id| graph.value_path(id, 0));
+            let value_source = value_id.and_then(|id| graph.value_source(id, 0));
+            if let Some(target) = target {
+                let origin = value_source.and_then(|source| call_by_node.get(source))
+                    .map(|call| call.is_alloc || call.is_source)
+                    .unwrap_or_else(|| value_source.is_some_and(|source| graph.kind(source) == "allocation"));
+                operations.push(raw_operation(
+                    if origin { Kind::Alloc } else if source.is_some() { Kind::Copy } else { Kind::Clobber },
+                    node_id,
+                    Some(target),
+                    source,
+                    line,
+                    false,
+                    "deref",
+                ));
+            }
+        } else if kind == "read" {
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
+            if let Some(target) = graph.property(node_id, "target_id")
+                .and_then(|id| graph.access_path(id, 0)) {
+                operations.push(raw_operation(Kind::Use, node_id, Some(target), None,
+                    line, false, "deref"));
+            }
+        } else if kind == "release" {
+            let line = graph.node(node_id).and_then(|node| integer_property(node, "release_line"))
+                .or_else(|| graph.node(node_id).and_then(|node| integer_property(node, "start_line")));
+            if let Some(target) = graph.property(node_id, "target_id")
+                .and_then(|id| graph.access_path(id, 0)) {
+                operations.push(raw_operation(Kind::Free, node_id, Some(target), None,
+                    line, false, "release"));
+            }
+        } else if kind == "BinaryOperator" && matches!(graph.operator(node_id), "==" | "!=" | "<" | "<=" | ">" | ">=") {
+            for child in &children {
+                if graph.is_pointer(child) {
+                    if let Some(target) = graph.access_path(child, 0) {
+                        operations.push(raw_operation(
+                            Kind::Use,
+                            node_id,
+                            Some(target),
+                            None,
+                            graph.node(node_id).and_then(|node| integer_property(node, "start_line")),
+                            false,
+                            "compare",
+                        ));
+                    }
+                }
+            }
+        } else if kind == "BinaryOperator" && graph.operator(node_id) == "=" && children.len() >= 2 {
             let mut ordered = children;
             ordered.sort_by_key(|child| graph.offset(child));
             let rhs = ordered.get(1).or_else(|| ordered.first());
@@ -877,7 +1204,9 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                             }
                             else if call.is_source { (Kind::Clobber, None, false) }
                             else { (Kind::Clobber, graph.access_path(&rhs_id, 0), false) }
-                        } else if matches!(graph.kind(&rhs_id), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
+                        } else if let Some(source) = graph.conditional_value_source(&rhs_id) {
+                            (Kind::Copy, Some(source), false)
+                        } else if graph.is_null(&rhs_id) {
                             (Kind::Clobber, None, true)
                         } else if let Some(source) = graph.access_path(&rhs_id, 0) {
                             (Kind::Copy, Some(source), false)
@@ -888,24 +1217,43 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                     }
                 }
             }
-        } else if kind == "VarDecl" && graph.is_pointer(node_id) {
+        } else if kind == "VarDecl" {
+            if graph.is_pointer(node_id) {
             let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
             let target = path(Some(node_id));
             if let Some(initializer) = graph.initializer_of(node_id) {
                 let initializer = graph.peel(initializer.to_owned());
                 let (kind, source, is_null) = if let Some(call) = call_by_node.get(&initializer) {
                     if call.is_alloc { (Kind::Alloc, None, false) }
-                    else if call.is_realloc { (Kind::Realloc, None, false) }
+                    else if call.is_realloc {
+                        let source = call.arguments.iter().find(|arg| arg.position == 0)
+                            .and_then(|arg| graph.access_path(&arg.node, 0));
+                        (Kind::Realloc, source, false)
+                    }
                     else if call.is_source { (Kind::Clobber, None, false) }
                     else { (Kind::Copy, graph.access_path(&initializer, 0), false) }
-                } else if matches!(graph.kind(&initializer), "GNUNullExpr" | "CXXNullPtrLiteralExpr") {
+                } else if let Some(source) = graph.conditional_value_source(&initializer) {
+                    (Kind::Copy, Some(source), false)
+                } else if graph.is_null(&initializer) {
                     (Kind::Clobber, None, true)
                 } else if let Some(source) = graph.access_path(&initializer, 0) {
                     (Kind::Copy, Some(source), false)
                 } else { (Kind::Clobber, None, false) };
                 operations.push(raw_operation(kind, node_id, target, source, line, is_null, "deref"));
+                if let Some(source) = graph.pointer_arithmetic_source(&initializer) {
+                    operations.push(raw_operation(
+                        Kind::Use,
+                        node_id,
+                        graph.access_path(node_id, 0),
+                        Some(source),
+                        line,
+                        false,
+                        "pointer-arithmetic",
+                    ));
+                }
             } else {
                 operations.push(raw_operation(Kind::Clobber, node_id, target, None, line, false, "uninitialized"));
+            }
             }
         }
 
@@ -924,24 +1272,30 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         }
     }
     let summary_by_callee = input.summaries.iter().map(|summary| (summary.callee.as_str(), summary)).collect::<HashMap<_, _>>();
+    let summary_by_function_id = input.summaries.iter().filter(|summary| !summary.callee_function_id.is_empty())
+        .map(|summary| (summary.callee_function_id.as_str(), summary)).collect::<HashMap<_, _>>();
     let mut calls = input.calls;
     calls.sort_by_key(|call| (if call.has_line { call.line } else { i64::MAX }, call.node.clone()));
     for call in &mut calls {
         for argument in &mut call.arguments {
             argument.expression = graph.label(&argument.node).to_owned();
-            if let Some(path) = graph.access_path(&argument.node, 0) {
+            if let Some(path) = graph.value_path(&argument.node, 0)
+                .or_else(|| graph.access_path(&argument.node, 0)) {
                 argument.root = path.root;
                 argument.selectors = path.selectors;
             }
         }
-        if let Some(path) = graph.access_path(&call.assigned, 0) {
+        if let Some(path) = graph.value_path(&call.assigned, 0)
+            .or_else(|| graph.access_path(&call.assigned, 0)) {
             call.assigned_root = path.root;
             call.assigned_selectors = path.selectors;
         }
     }
     for call in &calls {
         let argument = |position: u32| call.arguments.iter().find(|item| item.position == position)
-            .and_then(|item| graph.access_path(&item.node, 0).or_else(|| path(Some(&item.node))));
+            .and_then(|item| graph.value_path(&item.node, 0)
+                .or_else(|| graph.access_path(&item.node, 0))
+                .or_else(|| path(Some(&item.node))));
         let target = path(Some(&call.assigned)).or_else(|| path(Some(&call.receiver)));
         let source = argument(0);
         if call.is_release {
@@ -965,12 +1319,18 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 aggregate.access = "aggregate-copy".to_owned();
                 operations.push(aggregate);
             }
-        } else if let Some(summary) = summary_by_callee.get(call.callee.as_str()) {
+        } else if let Some(summary) = (!call.callee_function_id.is_empty())
+            .then(|| summary_by_function_id.get(call.callee_function_id.as_str()).copied())
+            .flatten()
+            .or_else(|| summary_by_callee.get(call.callee.as_str()).copied())
+            .filter(|summary| !summary.alternatives.is_empty()) {
             for alternative in &summary.alternatives {
                 let mut effects = Vec::new();
                 for effect in &alternative.effects {
                     let actual = call.arguments.iter().find(|argument| argument.position == effect.position)
-                        .and_then(|argument| graph.access_path(&argument.node, 0).or_else(|| path(Some(&argument.node))));
+                        .and_then(|argument| graph.value_path(&argument.node, 0)
+                            .or_else(|| graph.access_path(&argument.node, 0))
+                            .or_else(|| path(Some(&argument.node))));
                     let Some(mut actual) = actual else { continue };
                     actual.selectors.extend(effect.selectors.iter().cloned());
                     if effect.is_return {
@@ -998,8 +1358,31 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         } else {
             for argument in &call.arguments {
-                if let Some(target) = path(Some(&argument.node)) {
-                    operations.push(operation(Kind::Use, &call.node, Some(target), None, call));
+                if let Some(target) = graph.value_path(&argument.node, 0)
+                    .or_else(|| graph.access_path(&argument.node, 0))
+                    .or_else(|| path(Some(&argument.node))) {
+                    // Match the generic Python operation contract: an
+                    // argument to an unknown/ordinary callee is a value pass,
+                    // not a proven pointee dereference. The temporal matcher
+                    // can still report a dangling value after a release.
+                    operations.push(raw_operation(
+                        Kind::Use,
+                        &call.node,
+                        Some(target),
+                        None,
+                        call.has_line.then_some(call.line),
+                        false,
+                        "pass",
+                    ));
+                }
+            }
+            if let Some(destination) = target.clone() {
+                let root = destination.root.trim_start_matches("decl:");
+                if graph.is_pointer(root) {
+                    operations.push(raw_operation(
+                        Kind::Clobber, &call.node, Some(destination), None,
+                        call.has_line.then_some(call.line), false, "return-may-null",
+                    ));
                 }
             }
         }
@@ -1019,17 +1402,83 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 root: String::new(), selectors: Vec::new(),
                 line: line.unwrap_or_default(), has_line: line.is_some(),
                 root_name: String::new(),
+                callee_function_id: call.callee_function_id.clone(),
             });
-        } else if let Some(path) = graph.access_path(&child, 0) {
+        } else if let Some(path) = graph.value_path(child, 0)
+            .or_else(|| graph.access_path(&child, 0)) {
+            let root_id = path.root.strip_prefix("decl:").unwrap_or(path.root.as_str());
+            let stack_local = graph.node(root_id)
+                .is_some_and(|root| {
+                    graph.kind(root_id) == "VarDecl"
+                        && text_property(root, "owner_function_id") == Some(input.id.as_str())
+                        && (text_property(root, "type").is_some_and(|value| value.contains('['))
+                            || path.selectors.iter().any(|selector| selector == "&"))
+                });
+            operations.push(raw_operation(
+                Kind::Use,
+                node_id,
+                Some(path.clone()),
+                None,
+                line,
+                false,
+                if stack_local { "return-stack" } else { "return" },
+            ));
             returns.push(lifetime_proto::FunctionReturn {
                 kind: "var".to_owned(), callee: String::new(),
                 root: path.root, selectors: path.selectors,
                 line: line.unwrap_or_default(), has_line: line.is_some(),
                 root_name: String::new(),
+                callee_function_id: String::new(),
             });
+        } else if graph.is_null(&peeled) {
+            operations.push(raw_operation(
+                Kind::Clobber,
+                node_id,
+                Some(Path::root("__return__")),
+                None,
+                line,
+                false,
+                "return-null",
+            ));
         }
     }
     returns.sort_by_key(|item| (if item.has_line { item.line } else { i64::MAX }, item.root.clone()));
+
+    // Splice leading declarations that carry a lifetime operation into the CFG
+    // as their own entry anchor. A statement like `T *p = alloc();` can precede
+    // every persisted CFG statement in source order and expose no AST-parent
+    // edge from its declaration node, so the nearest-CFG remap below finds no
+    // anchor for it and the operation would be dropped -- the abstract state
+    // would never observe the allocation. Chain such declarations in source
+    // order ahead of the earliest existing CFG statement so the alloc is
+    // ordered before any guard or use, exactly as a declaration statement is.
+    if let Some(earliest) = cfg_node_set.iter()
+        .filter(|candidate| graph.node(candidate).is_some())
+        .min_by_key(|candidate| (graph.offset(candidate), (*candidate).clone()))
+        .cloned() {
+        let earliest_offset = graph.offset(&earliest);
+        let mut leading = operations.iter()
+            .filter(|op| matches!(op.kind, Kind::Alloc | Kind::Realloc)
+                && node_set.contains(&op.node)
+                && !cfg_node_set.contains(&op.node)
+                && graph.parent_of(&op.node).is_none()
+                && graph.offset(&op.node) < earliest_offset)
+            .map(|op| op.node.clone())
+            .collect::<Vec<_>>();
+        leading.sort_by_key(|node| (graph.offset(node), node.clone()));
+        leading.dedup();
+        let mut previous: Option<String> = None;
+        for declaration in &leading {
+            cfg_node_set.insert(declaration.clone());
+            if let Some(previous) = previous.take() {
+                successor_map.entry(previous).or_default().push(declaration.clone());
+            }
+            previous = Some(declaration.clone());
+        }
+        if let Some(previous) = previous {
+            successor_map.entry(previous).or_default().push(earliest.clone());
+        }
+    }
 
     // Map expression anchors to the nearest CFG node. The solver consumes the
     // synthesized statement CFG, while operation extraction remains expression
@@ -1047,7 +1496,37 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 if cfg_node_set.contains(&initializer) { anchor = initializer; }
             }
         }
+        if !cfg_node_set.contains(&anchor) {
+            let operation_line = graph.node(&item.node)
+                .and_then(|node| integer_property(node, "start_line"));
+            if let Some(line) = operation_line {
+                if let Some(nearest) = cfg_node_set.iter()
+                    .filter(|candidate| graph.node(candidate)
+                        .and_then(|node| integer_property(node, "start_line")) == Some(line))
+                    .min_by_key(|candidate| graph.offset(candidate).abs_diff(graph.offset(&item.node))) {
+                    anchor = nearest.clone();
+                }
+            }
+        }
+        if !cfg_node_set.contains(&anchor) {
+            // Some compiler ASTs do not persist an AST-parent edge from an
+            // expression to the statement CFG. Attach the operation to the
+            // closest preceding CFG anchor by source offset so control-flow
+            // order remains authoritative without inventing a new path.
+            let operation_offset = graph.offset(&item.node);
+            if let Some(nearest) = cfg_node_set.iter()
+                .filter(|candidate| graph.offset(candidate) <= operation_offset)
+                .max_by_key(|candidate| graph.offset(candidate)) {
+                anchor = nearest.clone();
+            }
+        }
         if cfg_node_set.contains(&anchor) { item.node = anchor; }
+        if item.access == "return-may-null" {
+            if let Some(continuation) = successor_map.get(&item.node)
+                .and_then(|targets| targets.first()) {
+                item.node = continuation.clone();
+            }
+        }
     }
     operations.retain(|item| node_set.contains(&item.node));
     let mut prepared_nodes = if let Some(nodes) = prepared_from_cfg {
@@ -1170,10 +1649,55 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             .map(|offset| (node.id.clone(), offset))
     }).collect();
     assign_generations(&mut operations, &prepared_nodes, &successor_map, &offsets);
+    let mut guard_map: HashMap<(String, String), Vec<lifetime_proto::GuardProof>> = HashMap::new();
+    for edge in &input.edges {
+        if matches!(edge.kind.as_str(), "TRUE_BRANCH" | "FALSE_BRANCH") {
+            let proofs = branch_guards(&graph, &edge.source, &edge.kind);
+            if !proofs.is_empty() {
+                guard_map.insert((edge.source.clone(), edge.target.clone()), proofs);
+            }
+        }
+    }
+    // The C clang AST publishes no TRUE_BRANCH/FALSE_BRANCH roles, so a nullness
+    // `if (p == NULL)` reaches this point as a comparison node with two plain CFG
+    // successors and no guard direction.  Recover the typed null proofs the way
+    // the reference does: for a comparison condition with exactly two successors,
+    // synthesize_cfg emits the then-arm before the fall-through, so the first
+    // successor is the true arm and the second the false arm.  Type each
+    // out-edge's proof from the operator and the successor's position, without
+    // clobbering any proof a real branch role already produced.  Restrict this to
+    // operator-bearing comparison/negation nodes so an ordinary two-successor
+    // statement is never mistaken for a pointer test.
+    for (node, targets) in &successor_map {
+        if targets.len() != 2 {
+            continue;
+        }
+        if !matches!(
+            graph.operator(node),
+            "==" | "!=" | "<" | "<=" | ">" | ">=" | "!"
+        ) {
+            continue;
+        }
+        for (index, target) in targets.iter().enumerate() {
+            let key = (node.clone(), target.clone());
+            if guard_map.contains_key(&key) {
+                continue;
+            }
+            let branch = if index == 0 { "TRUE_BRANCH" } else { "FALSE_BRANCH" };
+            let proofs = branch_guards(&graph, node, branch);
+            if !proofs.is_empty() {
+                guard_map.insert(key, proofs);
+            }
+        }
+    }
     let mut successors = successor_map.into_iter().map(|(node, mut targets)| {
         targets.sort();
         targets.dedup();
-        lifetime_proto::Successors { node, targets }
+        let guarded_targets = targets.iter().filter_map(|target| {
+            guard_map.get(&(node.clone(), target.clone())).map(|guards|
+                lifetime_proto::GuardedTarget { target: target.clone(), guards: guards.clone() })
+        }).collect();
+        lifetime_proto::Successors { node, targets, guarded_targets }
     }).collect::<Vec<_>>();
     successors.sort_by(|left, right| left.node.cmp(&right.node));
     operations.sort_by_key(|item| (item.line.unwrap_or(i64::MAX), item.node.clone(), item.kind as u8));
@@ -1251,7 +1775,10 @@ pub(crate) fn prepare_and_solve_request_with_metadata(
 fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
     match kind {
         crate::Kind::Alloc => "ORIGIN",
-        crate::Kind::Free => "RELEASE",
+        // Keep lifecycle events explicit in the semantic skeleton.  The
+        // operation kind remains catalog-driven; this is only the neutral
+        // event vocabulary consumed by the matcher.
+        crate::Kind::Free => "memory.free",
         crate::Kind::Realloc => "INVALIDATE",
         crate::Kind::Copy => "DERIVE",
         crate::Kind::Use => match access {
@@ -1259,16 +1786,22 @@ fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
             "compare" => "COMPARE_VALUE",
             "return" | "return-stack" => "RETURN_VALUE",
             "pointer-arithmetic" => "POINTER_ARITHMETIC",
-            _ => "READ_STORAGE",
+            "write" => "WRITE_STORAGE",
+            _ => "memory.deref",
         },
         crate::Kind::Clobber => match access {
             "uninitialized" => "UNINITIALIZED",
             "return-null" => "RETURN_VALUE",
+            "return-may-null" => "ORIGIN",
             "source" => "ORIGIN",
             _ => "DERIVE",
         },
         crate::Kind::Summary => "DERIVE",
     }
+}
+
+fn declaration_root(root: &str) -> &str {
+    root.strip_prefix("decl:").unwrap_or(root)
 }
 
 fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Operation,
@@ -1288,22 +1821,62 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
         access: operation.access.clone(),
         value_root: operation.source.as_ref().map(|value| value.root.clone()).unwrap_or_default(),
         value_selectors: operation.source.as_ref().map(|value| value.selectors.clone()).unwrap_or_default(),
+        source_witness_nodes: Vec::new(),
+        source_reachable: None,
     }
 }
 
-fn semantic_language(function: &str) -> String {
-    if function.contains(":cpython-ast:") || function.contains(":python:") {
-        "python".to_owned()
-    } else if function.contains(":typescript-compiler-api:")
-        || function.contains(":typescript:") {
-        "typescript".to_owned()
-    } else if function.contains(":javascript:") {
-        "javascript".to_owned()
-    } else if function.contains(":clang-c:") || function.contains(":clang-cpp:") {
-        "c".to_owned()
-    } else {
-        "mixed".to_owned()
+fn semantic_edge(source: String, target: String, kind: &str,
+                 guards: Vec<lifetime_proto::GuardProof>) -> lifetime_proto::NativeSemanticEdge {
+    lifetime_proto::NativeSemanticEdge {
+        source, target, kind: kind.to_owned(), guards,
+        bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+        return_to: String::new(), provenance: String::new(),
     }
+}
+
+fn function_language(function: &lifetime_proto::FunctionInput) -> String {
+    // Language is frontend-owned metadata.  Do not infer it from an opaque
+    // function id or from a filename: ids are allowed to change and a single
+    // substrate may contain several languages.  The native graph adapter
+    // copies this scalar from the compiler record onto the function's nodes.
+    function.nodes.iter()
+        .find_map(|node| text_property(node, "language"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Translate a call site's neutral branch-region guard facts into matcher
+/// proofs for the call seam.  Faithful port of the reference `_ir_guard_proofs`:
+/// a nullness token yields a typed NONNULL/ISNULL proof over `{var}#g0`, and any
+/// other (size-relational) condition is preserved as a raw VALUE proof so the
+/// bounds-aware patterns can read it without reinterpreting the predicate string.
+fn ir_guard_proofs(call: &lifetime_proto::FunctionCall) -> Vec<lifetime_proto::GuardProof> {
+    let mut proofs = Vec::new();
+    for guard in &call.guards {
+        let canon = guard.canon.as_str();
+        let compact: String = canon.chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(|character| character.to_lowercase())
+            .collect();
+        let value = if !guard.var.is_empty() {
+            format!("{}#g0", guard.var)
+        } else {
+            canon.to_owned()
+        };
+        if ["!=null", "null!=", "isnotnone", "isnotnull"]
+            .iter().any(|token| compact.contains(token))
+        {
+            proofs.push(lifetime_proto::GuardProof { kind: "NONNULL".into(), value });
+        } else if ["==null", "null==", "isnone", "isnull"]
+            .iter().any(|token| compact.contains(token))
+        {
+            proofs.push(lifetime_proto::GuardProof { kind: "ISNULL".into(), value });
+        } else if !canon.is_empty() {
+            proofs.push(lifetime_proto::GuardProof { kind: "VALUE".into(), value: canon.to_owned() });
+        }
+    }
+    proofs
 }
 
 /// Emit the compact event graph consumed by the semantic query layer.  This
@@ -1312,9 +1885,112 @@ fn semantic_language(function: &str) -> String {
 pub(crate) fn semantic_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<lifetime_proto::NativeSemanticResult, String> {
+    let expected_function_ids: HashSet<String> = request.functions.iter()
+        .map(|function| function.id.clone()).collect();
+    // Calls carry the compiler-resolved source spelling while function
+    // fragments are keyed by their stable declaration IDs. Build this
+    // language-neutral spelling→ID index before preparation discards the
+    // declaration labels; do not require a catalog or a name list.
+    let mut function_names: HashMap<String, String> = HashMap::new();
+    for function in &request.functions {
+        let Some(declaration) = function.nodes.iter().find(|node|
+            matches!(node.kind.as_str(), "function" | "method" | "constructor"))
+        else { continue };
+        if !declaration.label.is_empty() {
+            function_names.entry(declaration.label.clone()).or_insert_with(|| function.id.clone());
+        }
+    }
+    let function_languages: HashMap<String, String> = request.functions.iter()
+        .map(|function| (function.id.clone(), function_language(function)))
+        .collect();
     let prepared = prepare_functions(request.functions)?;
-    let functions = prepared.into_iter().map(|function| {
+    let by_id: HashMap<String, usize> = prepared.iter().enumerate()
+        .map(|(index, function)| (function.id.clone(), index)).collect();
+    let mut seams = Vec::new();
+    for caller in &prepared {
+        for call in &caller.calls {
+            let Some(callee_id) = (!call.callee_function_id.is_empty())
+                .then(|| by_id.get(call.callee_function_id.as_str()).copied())
+                .flatten()
+                .or_else(|| by_id.get(&call.callee).copied())
+                .or_else(|| function_names.get(&call.callee).and_then(|id| by_id.get(id).copied()))
+            else { continue };
+            let callee_index = callee_id;
+            let callee = &prepared[callee_index];
+            let Some(entry_anchor) = callee.nodes.first() else { continue };
+            let formal_to_actual: Vec<String> = call.arguments.iter().filter_map(|argument| {
+                let formal = callee.parameters.get(argument.position as usize)?;
+                let actual = if !argument.root_name.is_empty() {
+                    format!("{}{}", argument.root_name, argument.selectors.join(""))
+                } else if !argument.root.is_empty() {
+                    format!("{}{}", argument.root.trim_start_matches("decl:"), argument.selectors.join(""))
+                } else if !argument.expression.is_empty() {
+                    argument.expression.clone()
+                } else {
+                    return None;
+                };
+                Some(format!("{formal}\u{1f}{actual}"))
+            }).collect();
+            let return_to = if !call.assigned_name.is_empty() {
+                format!("{}{}", call.assigned_name, call.assigned_selectors.join(""))
+            } else {
+                call.assigned.clone()
+            };
+            let continuations = caller.successors.iter()
+                .find(|item| item.node == call.node)
+                .map(|successors| successors.targets.clone())
+                .unwrap_or_default();
+            let call_return_targets = if continuations.is_empty() {
+                vec![String::new()]
+            } else {
+                continuations.iter().map(|continuation|
+                    format!("native:{}:anchor:{}", caller.id, continuation)).collect()
+            };
+            // A separate call edge is emitted for each CFG continuation.  The
+            // old Claus pushdown key is the continuation node, while the
+            // binding retains the returned object path for alias propagation.
+            for call_return_target in call_return_targets {
+                seams.push(lifetime_proto::NativeSemanticEdge {
+                    source: format!("native:{}:anchor:{}", caller.id, call.node),
+                    target: format!("native:{}:anchor:{}", callee.id, entry_anchor),
+                    kind: "seam".into(), guards: ir_guard_proofs(call),
+                    bindings: vec![lifetime_proto::NativeSeamBinding {
+                        caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
+                        formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
+                    }],
+                    seam_kind: "call".into(), callee: callee.id.clone(),
+                    return_to: call_return_target, provenance: "compiler-call".into(),
+                });
+            }
+            for continuation in continuations {
+                    seams.push(lifetime_proto::NativeSemanticEdge {
+                        source: format!("native:{}:exit", callee.id),
+                        target: format!("native:{}:anchor:{}", caller.id, continuation),
+                        kind: "seam".into(), guards: Vec::new(),
+                        bindings: vec![lifetime_proto::NativeSeamBinding {
+                            caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
+                            formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
+                        }], seam_kind: "return".into(),
+                        callee: caller.id.clone(), return_to: return_to.clone(),
+                        provenance: "compiler-return".into(),
+                    });
+            }
+        }
+    }
+    let mut internal_call_anchors: HashMap<String, HashSet<String>> = HashMap::new();
+    for seam in seams.iter().filter(|edge| edge.seam_kind == "call") {
+        if let Some(binding) = seam.bindings.first() {
+            internal_call_anchors.entry(binding.caller.clone()).or_default()
+                .insert(binding.call_node.clone());
+        }
+    }
+    let functions: Vec<_> = prepared.into_iter().map(|function| {
         let id = function.id.clone();
+        let parameter_roots = function.parameters.clone();
+        let parameter_root_set: HashSet<&str> = function.parameters.iter()
+            .map(String::as_str).collect();
+        let metadata_by_id: HashMap<&str, &lifetime_proto::SemanticNodeMetadata> =
+            function.metadata.iter().map(|item| (item.id.as_str(), item)).collect();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
         // Preserve the prepared CFG topology even when an anchor has no
@@ -1338,6 +2014,8 @@ pub(crate) fn semantic_request(
                 access: String::new(),
                 value_root: String::new(),
                 value_selectors: Vec::new(),
+                source_witness_nodes: Vec::new(),
+                source_reachable: None,
             });
         }
         let mut incoming_counts: HashMap<String, usize> = HashMap::new();
@@ -1368,6 +2046,7 @@ pub(crate) fn semantic_request(
                     anchor: anchor.clone(),
                     stack_local: false, is_null: false, access: String::new(),
                     value_root: String::new(), value_selectors: Vec::new(),
+                    source_witness_nodes: Vec::new(), source_reachable: None,
                 });
             }
         }
@@ -1375,6 +2054,28 @@ pub(crate) fn semantic_request(
             .filter(|call| !call.is_alloc && !call.is_release && !call.is_realloc
                 && !call.is_source && !call.is_aggregate_copy)
             .map(|call| call.node.as_str()).collect();
+        // Intra-anchor control is an explicit previous-pointer walk (a faithful
+        // port of the Python emitter): each operation appends its event nodes
+        // and is wired after the running tail of its CFG anchor, rather than
+        // being linked by position after the fact.  Allocation and reallocation
+        // expand into a guarded success/failure diamond so the matcher can prove
+        // or refute the null result on each arm instead of seeing one linear
+        // chain that collapses the two outcomes together.
+        let mut edges: Vec<lifetime_proto::NativeSemanticEdge> = Vec::new();
+        let mut previous_by_anchor: HashMap<String, String> = HashMap::new();
+        for (anchor, ids) in by_anchor.iter() {
+            if let Some(tail) = ids.last() {
+                previous_by_anchor.insert(anchor.clone(), tail.clone());
+            }
+            // Chain the anchor's structural prefix: the empty CFG node followed
+            // by its BRANCH/MERGE/LOOP markers.  Inter-anchor edges land on the
+            // prefix head (`.first()`) while operations chain off the tail
+            // (`previous_by_anchor`); without an edge between them, an anchor
+            // that carries a marker strands its events from incoming control.
+            for pair in ids.windows(2) {
+                edges.push(semantic_edge(pair[0].clone(), pair[1].clone(), "normal", Vec::new()));
+            }
+        }
         for (index, raw) in function.operations.iter().cloned().enumerate() {
             let operation = crate::proto_operation(raw)?;
             // Passing an argument to an ordinary call is not a dereference
@@ -1388,23 +2089,240 @@ pub(crate) fn semantic_request(
             }
             let path = operation.target.as_ref();
             let generation = operation.generation.as_deref().unwrap_or("g0");
+            let mut previous = previous_by_anchor.get(&operation.node).cloned();
+            let base = format!("native:{}:{}:{}", id, operation.node, index);
+            let push_event = |nodes: &mut Vec<lifetime_proto::NativeSemanticNode>,
+                                  by_anchor: &mut HashMap<String, Vec<String>>,
+                                  node: lifetime_proto::NativeSemanticNode| {
+                by_anchor.entry(operation.node.clone()).or_default().push(node.id.clone());
+                nodes.push(node);
+            };
+
+            // ---- allocation: guarded success/failure diamond ----
+            if operation.kind == crate::Kind::Alloc && path.is_some() {
+                let obj_root = path.map(|value| value.root.clone()).unwrap_or_default();
+                let guard_value = format!("{obj_root}#{generation}");
+                let attempt_id = format!("{base}:attempt");
+                let branch_id = format!("{base}:branch");
+                let success_id = format!("{base}:success");
+                let failure_id = format!("{base}:failure");
+                let merge_id = format!("{base}:merge");
+                // The failure arm writes NULL into the destination slot; the
+                // success arm carries the fresh allocation and, when the target
+                // has selectors, stores it back into its storage slot.
+                let mut null_op = operation.clone();
+                null_op.is_null = true;
+                null_op.access = "write".to_owned();
+                let slot_id = path.filter(|value| !value.selectors.is_empty())
+                    .map(|_| format!("{success_id}:slot"));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(attempt_id.clone(), &id, "ALLOC_ATTEMPT", &operation, path, generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(branch_id.clone(), &id, "BRANCH", &operation, path, generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(success_id.clone(), &id, "ORIGIN", &operation, path, generation));
+                if let Some(slot_id) = &slot_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(slot_id.clone(), &id, "WRITE_STORAGE", &operation, path, generation));
+                }
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(failure_id.clone(), &id, "WRITE_STORAGE_NULL", &null_op, path, generation));
+                // The merge node is emitted last so it remains the anchor's CFG
+                // tail; control continues from it into the CFG successors.
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(merge_id.clone(), &id, "", &operation, path, generation));
+                if let Some(previous) = &previous {
+                    edges.push(semantic_edge(previous.clone(), attempt_id.clone(), "normal", Vec::new()));
+                }
+                edges.push(semantic_edge(attempt_id, branch_id.clone(), "normal", Vec::new()));
+                edges.push(semantic_edge(branch_id.clone(), success_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "NONNULL".into(), value: guard_value.clone() }]));
+                edges.push(semantic_edge(branch_id, failure_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "ISNULL".into(), value: guard_value }]));
+                match &slot_id {
+                    Some(slot_id) => {
+                        edges.push(semantic_edge(success_id, slot_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(slot_id.clone(), merge_id.clone(), "normal", Vec::new()));
+                    }
+                    None => edges.push(semantic_edge(success_id, merge_id.clone(), "normal", Vec::new())),
+                }
+                edges.push(semantic_edge(failure_id, merge_id.clone(), "normal", Vec::new()));
+                previous_by_anchor.insert(operation.node.clone(), merge_id);
+                continue;
+            }
+
+            // ---- reallocation: guarded success/failure diamond ----
+            if operation.kind == crate::Kind::Realloc && path.is_some() {
+                let target = path.expect("realloc target present");
+                let old_path = operation.source.as_ref().unwrap_or(target).clone();
+                // When the fresh cell overwrites the same slot the old pointer
+                // lived in, a failed realloc leaks the old block and nulls the
+                // slot; otherwise the old pointer is untouched on failure.
+                let overwrites_slot = old_path.root == target.root
+                    && old_path.selectors == target.selectors;
+                let old_generation = generation;
+                let fresh_generation = if overwrites_slot {
+                    operation.fresh_generation.as_deref().unwrap_or(generation)
+                } else { "g0" };
+                let attempt_id = format!("{base}:attempt");
+                let branch_id = format!("{base}:branch");
+                let success_id = format!("{base}:success");
+                let origin_id = format!("{success_id}:origin");
+                let failure_id = format!("{base}:failure");
+                let merge_id = format!("{base}:merge");
+                let slot_id = (overwrites_slot && !target.selectors.is_empty())
+                    .then(|| format!("{origin_id}:slot"));
+                let null_id = overwrites_slot.then(|| format!("{failure_id}:null"));
+                let lost_id = overwrites_slot.then(|| format!("{failure_id}:lost"));
+                let mut old_op = operation.clone();
+                old_op.target = Some(old_path.clone());
+                old_op.source = None;
+                let mut null_op = old_op.clone();
+                null_op.is_null = true;
+                null_op.access = "write".to_owned();
+                let old_ref = Some(&old_path);
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(attempt_id.clone(), &id, "REALLOC_ATTEMPT", &old_op, old_ref, old_generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(branch_id.clone(), &id, "BRANCH", &old_op, old_ref, old_generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(success_id.clone(), &id, "INVALIDATE", &old_op, old_ref, old_generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(origin_id.clone(), &id, "ORIGIN", &operation, path, fresh_generation));
+                if let Some(slot_id) = &slot_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(slot_id.clone(), &id, "WRITE_STORAGE", &operation, path, fresh_generation));
+                }
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(failure_id.clone(), &id, "REALLOC_FAILED", &old_op, old_ref, old_generation));
+                if let Some(null_id) = &null_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(null_id.clone(), &id, "WRITE_STORAGE_NULL", &null_op, old_ref, old_generation));
+                }
+                if let Some(lost_id) = &lost_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(lost_id.clone(), &id, "LOST_FROM_SLOT", &old_op, old_ref, old_generation));
+                }
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(merge_id.clone(), &id, "", &old_op, old_ref, old_generation));
+                if let Some(previous) = &previous {
+                    edges.push(semantic_edge(previous.clone(), attempt_id.clone(), "normal", Vec::new()));
+                }
+                edges.push(semantic_edge(attempt_id, branch_id.clone(), "normal", Vec::new()));
+                // The realloc predicate guards are named after the result, not a
+                // storage object, matching the Python emitter; the matcher reads
+                // them as branch provenance without binding a null fact.
+                edges.push(semantic_edge(branch_id.clone(), success_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "NONNULL".into(), value: "realloc_result".into() }]));
+                edges.push(semantic_edge(branch_id, failure_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "ISNULL".into(), value: "realloc_result".into() }]));
+                edges.push(semantic_edge(success_id, origin_id.clone(), "normal", Vec::new()));
+                match &slot_id {
+                    Some(slot_id) => {
+                        edges.push(semantic_edge(origin_id, slot_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(slot_id.clone(), merge_id.clone(), "normal", Vec::new()));
+                    }
+                    None => edges.push(semantic_edge(origin_id, merge_id.clone(), "normal", Vec::new())),
+                }
+                match (&null_id, &lost_id) {
+                    (Some(null_id), Some(lost_id)) => {
+                        edges.push(semantic_edge(failure_id, null_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(null_id.clone(), lost_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(lost_id.clone(), merge_id.clone(), "normal", Vec::new()));
+                    }
+                    _ => edges.push(semantic_edge(failure_id, merge_id.clone(), "normal", Vec::new())),
+                }
+                previous_by_anchor.insert(operation.node.clone(), merge_id);
+                continue;
+            }
+
+            // ---- linear operations: chain each event after the running tail ----
             let kinds: Vec<&str> = match operation.kind {
                 crate::Kind::Alloc => vec!["ALLOC_ATTEMPT", "ORIGIN"],
                 crate::Kind::Realloc => vec!["REALLOC_ATTEMPT", "INVALIDATE", "ORIGIN"],
                 crate::Kind::Clobber if operation.access == "return-null" =>
-                    vec!["RETURN_VALUE", "RETURN"],
+                    vec!["WRITE_STORAGE_NULL", "RETURN_VALUE", "RETURN"],
+                crate::Kind::Use if operation.access == "return"
+                    || operation.access == "return-stack" =>
+                    vec!["RETURN_VALUE", "ESCAPE", "RETURN"],
                 _ => vec![semantic_event_kind(operation.kind, &operation.access)],
             };
             for (ordinal, kind) in kinds.into_iter().enumerate() {
                 let kind = if operation.is_null { "WRITE_STORAGE_NULL" } else { kind };
-                let node_id = format!("native:{}:{}:{}:{}", id, operation.node, index, ordinal);
-                let event = semantic_node(node_id.clone(), &id, kind, &operation, path, generation);
-                by_anchor.entry(operation.node.clone()).or_default().push(node_id);
-                nodes.push(event);
+                let node_id = format!("{base}:{ordinal}");
+                let event_generation = if kind == "ORIGIN" && operation.kind == crate::Kind::Realloc {
+                    operation.fresh_generation.as_deref().unwrap_or(generation)
+                } else { generation };
+                let event = semantic_node(node_id.clone(), &id, kind, &operation, path, event_generation);
+                if let Some(previous) = &previous {
+                    edges.push(semantic_edge(previous.clone(), node_id.clone(), "normal", Vec::new()));
+                }
+                previous = Some(node_id.clone());
+                push_event(&mut nodes, &mut by_anchor, event);
+            }
+            if operation.kind == crate::Kind::Use && operation.access == "write" {
+                let target_id = path.map(|value| declaration_root(&value.root));
+                let source = operation.source.as_ref();
+                let source_id = source.map(|value| declaration_root(&value.root));
+                let source_is_local_address = source.zip(source_id).is_some_and(|(value, root)| {
+                    value.selectors.iter().any(|selector| selector == "&")
+                        && metadata_by_id.get(root).is_some_and(|metadata|
+                            metadata.owner == id)
+                });
+                let target_is_formal = target_id.is_some_and(|root|
+                    parameter_root_set.contains(root));
+                let target_is_persistent = target_id.is_some_and(|root|
+                    metadata_by_id.get(root).is_some_and(|metadata| metadata.owner.is_empty()));
+
+                if source_is_local_address {
+                    if let Some(source) = source {
+                        let mut returned = operation.clone();
+                        returned.target = Some(source.clone());
+                        returned.source = None;
+                        returned.access = "return-stack".to_owned();
+                        let node_id = format!("{base}:stack-escape");
+                        let event = semantic_node(node_id.clone(), &id, "RETURN_VALUE",
+                            &returned, returned.target.as_ref(), generation);
+                        if let Some(previous) = &previous {
+                            edges.push(semantic_edge(previous.clone(), node_id.clone(), "normal", Vec::new()));
+                        }
+                        previous = Some(node_id.clone());
+                        push_event(&mut nodes, &mut by_anchor, event);
+                    }
+                }
+                if target_is_formal || target_is_persistent {
+                    if let Some(source) = source {
+                        let mut escape = operation.clone();
+                        escape.target = Some(source.clone());
+                        escape.source = None;
+                        escape.access = if target_is_persistent {
+                            "persistent-store".to_owned()
+                        } else {
+                            "out-parameter-store".to_owned()
+                        };
+                        let node_id = format!("{base}:escape");
+                        let event = semantic_node(node_id.clone(), &id, "ESCAPE",
+                            &escape, escape.target.as_ref(), generation);
+                        if let Some(previous) = &previous {
+                            edges.push(semantic_edge(previous.clone(), node_id.clone(), "normal", Vec::new()));
+                        }
+                        previous = Some(node_id.clone());
+                        push_event(&mut nodes, &mut by_anchor, event);
+                    }
+                }
+            }
+            if let Some(previous) = previous {
+                previous_by_anchor.insert(operation.node.clone(), previous);
             }
         }
-        let mut edges = Vec::new();
         for successor in &function.successors {
+            // A compiler-resolved internal call is represented by a call seam
+            // and its pushed return continuation. Retaining this raw CFG edge
+            // would create an impossible execution that skips the callee.
+            if internal_call_anchors.get(&id)
+                .is_some_and(|anchors| anchors.contains(&successor.node)) {
+                continue;
+            }
             let Some(source_nodes) = by_anchor.get(&successor.node) else { continue };
             let source = source_nodes.last().cloned().unwrap_or_default();
             for target_anchor in &successor.targets {
@@ -1412,16 +2330,14 @@ pub(crate) fn semantic_request(
                     if let Some(target) = target_nodes.first() {
                         edges.push(lifetime_proto::NativeSemanticEdge {
                             source: source.clone(), target: target.clone(), kind: "normal".into(),
+                            guards: successor.guarded_targets.iter()
+                                .find(|item| item.target == *target_anchor)
+                                .map(|item| item.guards.clone()).unwrap_or_default(),
+                            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+                            return_to: String::new(), provenance: String::new(),
                         });
                     }
                 }
-            }
-        }
-        for node_ids in by_anchor.values() {
-            for pair in node_ids.windows(2) {
-                edges.push(lifetime_proto::NativeSemanticEdge {
-                    source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(),
-                });
             }
         }
         let entry = function.nodes.iter().find_map(|node| by_anchor.get(node)
@@ -1437,12 +2353,105 @@ pub(crate) fn semantic_request(
             (&left.source, &left.target, &left.kind)
                 .cmp(&(&right.source, &right.target, &right.kind))
         });
-        let language = semantic_language(&id);
+        let language = function_languages.get(&id).cloned().unwrap_or_default();
+        let source_launch_nodes = function.calls.iter()
+            .filter(|call| call.is_source)
+            .map(|call| call.node.clone())
+            .collect();
         Ok(lifetime_proto::NativeSemanticFunction {
-            id, entry, exits, nodes, edges, language,
+            id, entry, exits, nodes, edges, language, source_launch_nodes,
+            parameter_roots,
         })
     }).collect::<Result<Vec<_>, String>>()?;
-    Ok(lifetime_proto::NativeSemanticResult { functions, complete: true })
+    if let Some(missing) = expected_function_ids.iter()
+        .find(|id| !functions.iter().any(|function| function.id == **id))
+    {
+        return Err(format!("native semantic preparation dropped compiler function {missing}"));
+    }
+    // Return from every real compact CFG exit. A function may have several
+    // return statements, and each exit's event chain (including escape/null
+    // facts) must complete before control resumes in the caller.
+    let mut exit_seams = Vec::with_capacity(seams.len());
+    for seam in seams {
+        if seam.seam_kind != "return" {
+            exit_seams.push(seam);
+            continue;
+        }
+        let Some(binding) = seam.bindings.first() else {
+            exit_seams.push(seam);
+            continue;
+        };
+        let Some(callee) = functions.iter().find(|function| function.id == binding.callee)
+        else {
+            exit_seams.push(seam);
+            continue;
+        };
+        if callee.exits.is_empty() {
+            exit_seams.push(seam);
+        } else {
+            for source in &callee.exits {
+                let mut exit = seam.clone();
+                exit.source = source.clone();
+                exit_seams.push(exit);
+            }
+        }
+    }
+    let mut seams = exit_seams;
+    // Seam endpoints must survive the compact event projection. Resolve the
+    // compiler call anchor to the first event at that anchor, and the callee
+    // entry anchor to its first event. Empty-event anchors remain a safe
+    // fallback for query-only sidecars.
+    for seam in &mut seams {
+        let Some(binding) = seam.bindings.first() else { continue };
+        if seam.seam_kind == "call" {
+            if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
+                let anchor = binding.call_node.as_str();
+                if let Some(node) = function.nodes.iter().rev().find(|node|
+                    node.anchor == anchor && !node.event_kind.is_empty())
+                    .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
+                    seam.source = node.id.clone();
+                }
+                // ``return_to`` on a call edge is the pushdown continuation,
+                // not the returned object path stored in the binding.  It was
+                // created from a pre-projection anchor above; resolve it to
+                // the compact node ID before the sidecar is published.
+                let prefix = format!("native:{}:anchor:", binding.caller);
+                if let Some(continuation) = seam.return_to.strip_prefix(&prefix) {
+                    if let Some(node) = function.nodes.iter().find(|node|
+                        node.anchor == continuation && !node.event_kind.is_empty())
+                        .or_else(|| function.nodes.iter().find(|node| node.anchor == continuation)) {
+                        seam.return_to = node.id.clone();
+                    }
+                }
+            }
+        }
+        if seam.seam_kind != "return" {
+            let node = functions.iter().find(|item| item.id == binding.callee)
+                .and_then(|function| function.nodes.iter()
+                    .find(|node| !node.event_kind.is_empty())
+                    .or_else(|| function.nodes.first()));
+            if let Some(node) = node {
+                seam.target = node.id.clone();
+            }
+        }
+        if seam.seam_kind == "return" {
+            let prefix = format!("native:{}:anchor:", binding.caller);
+            if let Some(anchor) = seam.target.strip_prefix(&prefix) {
+                if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
+                    if let Some(node) = function.nodes.iter().find(|node| node.anchor == anchor
+                        && !node.event_kind.is_empty())
+                        .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
+                        seam.target = node.id.clone();
+                    }
+                }
+            }
+        }
+    }
+    seams.sort_by(|left, right| (&left.source, &left.target, &left.callee)
+        .cmp(&(&right.source, &right.target, &right.callee)));
+    Ok(lifetime_proto::NativeSemanticResult {
+        functions, complete: true, seams, regions: Vec::new(), skeletons: Vec::new(),
+    })
 }
 
 fn prepare_functions(
@@ -1573,4 +2582,48 @@ fn slim_prepared(mut function: lifetime_proto::PreparedFunction,
         function.operations.clear();
     }
     function
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call_with_guard(var: &str, canon: &str) -> lifetime_proto::FunctionCall {
+        lifetime_proto::FunctionCall {
+            guards: vec![lifetime_proto::GuardFact { var: var.into(), canon: canon.into() }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn size_guard_becomes_value_proof_carrying_raw_canon() {
+        let proofs = ir_guard_proofs(&call_with_guard("n", "n < cap"));
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].kind, "VALUE");
+        // A relational guard keeps its human-readable canon as the value.
+        assert_eq!(proofs[0].value, "n < cap");
+    }
+
+    #[test]
+    fn nonnull_guard_binds_root_generation_value() {
+        let proofs = ir_guard_proofs(&call_with_guard("p", "p != NULL"));
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].kind, "NONNULL");
+        // Null-shaped guards project to the guarded root at generation zero so
+        // the matcher can split_once('#') into root/generation.
+        assert_eq!(proofs[0].value, "p#g0");
+    }
+
+    #[test]
+    fn isnull_guard_is_recognised_from_compact_spelling() {
+        let proofs = ir_guard_proofs(&call_with_guard("p", "p == NULL"));
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].kind, "ISNULL");
+        assert_eq!(proofs[0].value, "p#g0");
+    }
+
+    #[test]
+    fn empty_canon_yields_no_proof() {
+        assert!(ir_guard_proofs(&call_with_guard("", "")).is_empty());
+    }
 }

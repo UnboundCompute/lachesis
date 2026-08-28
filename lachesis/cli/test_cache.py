@@ -11,9 +11,25 @@ from unittest.mock import patch
 
 from lachesis.cache import build_options_fingerprint, entry_for
 from lachesis.cli.main import command_cache, build_parser
+from lachesis.core.contract import FrontendSpec
+from lachesis.pipeline import _frontend_fingerprint
 
 
 class CachePruneTests(unittest.TestCase):
+    def test_frontend_binary_change_invalidates_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory, "frontend")
+            executable.write_bytes(b"compiler-v1")
+            frontend = FrontendSpec(
+                frontend_id="compiler",
+                languages=("c",), extensions=(".c",),
+                command=(str(executable), "{source_dir}", "{output_dir}"),
+                working_directory=directory,
+            )
+            original = _frontend_fingerprint(frontend)
+            executable.write_bytes(b"compiler-v2")
+            self.assertNotEqual(_frontend_fingerprint(frontend), original)
+
     def test_output_build_options_invalidate_cached_graph(self) -> None:
         with tempfile.TemporaryDirectory() as cache_dir, patch.dict(
             os.environ, {"LACHESIS_EMIT_TOKENS": "1"}, clear=False

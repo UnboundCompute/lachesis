@@ -37,12 +37,16 @@ mod dynamic_behavior;
 mod async_events;
 mod interprocedural;
 mod branch_history;
+mod reaching_def;
 mod module_initialization;
 mod property_effects;
 mod heap;
 mod summary;
 mod sidecar_project;
 mod semantic_match;
+mod claus;
+mod skeleton;
+mod reach;
 
 /// Apply one additive overlay to the shared graph and retain its records for
 /// publication.  Keeping this in one place guarantees that every subsequent
@@ -70,7 +74,7 @@ fn report_native_phase(
 /// Project a semantic function onto its event nodes while preserving CFG
 /// reachability through removed anchor nodes.  The event sidecar is used by
 /// the matcher, so dropping the anchors must not drop branch/order semantics.
-fn compact_event_function(
+pub(crate) fn compact_event_function(
     mut function: lifetime_proto::NativeSemanticFunction,
 ) -> Option<lifetime_proto::NativeSemanticFunction> {
     let full_entry = function.entry.clone();
@@ -99,12 +103,14 @@ fn compact_event_function(
     }
     let mut outgoing = vec![Vec::new(); node_count];
     let mut incoming = vec![Vec::new(); node_count];
+    let mut edge_metadata: HashMap<(usize, usize), lifetime_proto::NativeSemanticEdge> = HashMap::new();
     for edge in full_edges {
         let (Some(&source), Some(&target)) =
             (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str()))
         else { continue };
         outgoing[source].push(target);
         incoming[target].push(source);
+        edge_metadata.entry((source, target)).or_insert(edge);
     }
 
     // Walk through non-event anchors until the next event(s).  Each event is
@@ -193,22 +199,26 @@ fn compact_event_function(
     let entry = format!("native:{}:event-entry", function.id);
     let exit = format!("native:{}:event-exit", function.id);
     let mut projected_edges: Vec<_> = projected.iter().map(|&(source, target)| {
-        lifetime_proto::NativeSemanticEdge {
-            source: node_ids[source].clone(),
-            target: node_ids[target].clone(),
-            kind: "normal".to_owned(),
-        }
+        let mut edge = edge_metadata.remove(&(source, target)).unwrap_or_default();
+        edge.source = node_ids[source].clone();
+        edge.target = node_ids[target].clone();
+        if edge.kind.is_empty() { edge.kind = "normal".to_owned(); }
+        edge
     }).collect();
     projected_edges.reserve(entry_events.len() + exit_events.len());
     for target in entry_events {
         projected_edges.push(lifetime_proto::NativeSemanticEdge {
-            source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(),
+            source: entry.clone(), target: node_ids[target].clone(), kind: "normal".to_owned(), guards: Vec::new(),
+            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+            return_to: String::new(), provenance: String::new(),
         });
     }
     for source in exit_events {
         projected_edges.push(lifetime_proto::NativeSemanticEdge {
             source: node_ids[source].clone(),
-            target: exit.clone(), kind: "normal".to_owned(),
+            target: exit.clone(), kind: "normal".to_owned(), guards: Vec::new(),
+            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+            return_to: String::new(), provenance: String::new(),
         });
     }
     projected_edges.sort_by(|left, right| (&left.source, &left.target).cmp(&(&right.source, &right.target)));
@@ -226,6 +236,7 @@ fn compact_event_function(
         line: 0, has_line: false, anchor: String::new(), stack_local: false,
         is_null: false, access: String::new(), value_root: String::new(),
         value_selectors: Vec::new(),
+        source_witness_nodes: Vec::new(), source_reachable: None,
     });
     function.nodes.push(lifetime_proto::NativeSemanticNode {
         id: exit.clone(), function: function.id.clone(), event_kind: String::new(),
@@ -233,6 +244,7 @@ fn compact_event_function(
         line: 0, has_line: false, anchor: String::new(), stack_local: false,
         is_null: false, access: String::new(), value_root: String::new(),
         value_selectors: Vec::new(),
+        source_witness_nodes: Vec::new(), source_reachable: None,
     });
     function.edges = projected_edges;
     function.entry = entry;
@@ -244,7 +256,7 @@ fn compact_event_function(
 /// canonical Python registry so each later overlay observes the preceding
 /// additive facts.
 fn run_native_overlay_chain(
-    input: &std::path::Path, output: &std::path::Path,
+    input: &std::path::Path, catalog: Option<&std::path::Path>, output: &std::path::Path,
 ) -> Result<(usize, usize), String> {
     let timing_enabled = std::env::var_os("LACHESIS_NATIVE_PASS2_TIMINGS").is_some();
     let started = std::time::Instant::now();
@@ -256,12 +268,23 @@ fn run_native_overlay_chain(
     let mut writer = pass2::DataflowStreamWriter::begin(
         output, &input.to_string_lossy(), &graph.core_content_hash,
     )?;
+    if let Some(catalog) = catalog {
+        let catalog = atropos_proto::Request::decode(
+            fs::read(catalog).map_err(|error| format!("cannot read binary Atropos catalog: {error}"))?.as_slice()
+        ).map_err(|error| format!("invalid binary Atropos catalog: {error}"))?;
+        let delta = taint::catalog_delta(&graph, &catalog);
+        absorb_native_delta(&mut graph, delta, &mut writer)?;
+        report_native_phase(timing_enabled, started, "atropos source-sink catalog", writer.nodes, writer.edges);
+    }
     let delta = control_flow::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "control-flow", writer.nodes, writer.edges);
     let delta = branch_history::enrich(&mut graph);
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "branch-history", writer.nodes, writer.edges);
+    let delta = reaching_def::enrich(&graph);
+    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    report_native_phase(timing_enabled, started, "reaching-definitions", writer.nodes, writer.edges);
     let delta = dispatch::enrich(&graph);
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "dynamic-dispatch", writer.nodes, writer.edges);
@@ -556,6 +579,35 @@ impl State {
         }
     }
 
+    /// Recency predicate: is this handle the aged `summary` generation of an
+    /// allocation site?  Mirrors `object_state.py:302` (`oid[1] == "summary"`).
+    /// Drives weak-vs-strong FACT updates only — a distinct concern from the
+    /// `"<?>"` summary-object rule that gates finding suppression below.
+    fn is_summary_generation(oid: &str) -> bool {
+        oid.split('|').nth(1) == Some("summary")
+    }
+
+    /// Summary-object predicate: does this handle stand for an unbounded set of
+    /// concrete objects (an unknown subscript `"<?>"` anywhere in its path)?
+    /// Mirrors `object_state.py:104-118` — note it does NOT treat the aged
+    /// `summary` generation as a summary object; recency is handled separately
+    /// by `is_summary_generation`.  Gates finding suppression (double-free/UAF).
+    fn is_summary_object(&self, oid: &str) -> bool {
+        fn visit(state: &State, oid: &str, seen: &mut HashSet<String>) -> bool {
+            if !seen.insert(oid.to_owned()) { return false; }
+            match state.objects.get(oid) {
+                Some(ObjectMeta::Param { selectors, .. }) =>
+                    selectors.iter().any(|selector| selector == "<?>") ,
+                Some(ObjectMeta::Allocation { target, .. }) =>
+                    target.selectors.iter().any(|selector| selector == "<?>") ,
+                Some(ObjectMeta::UnknownSlot { base, selector }) =>
+                    selector == "<?>" || visit(state, base, seen),
+                _ => false,
+            }
+        }
+        visit(self, oid, &mut HashSet::new())
+    }
+
     fn age(&mut self, recent: &str, summary: &str) {
         if !self.facts.contains_key(recent) { return; }
         self.merge_object(summary, recent);
@@ -624,13 +676,20 @@ impl State {
         if target.selectors.len() > 0 && parse_param(&oid).is_some() {
             self.freed_paths.insert(target.clone(), oid.clone());
         }
+        // Finding suppression is gated by the "<?>" summary-object rule; the
+        // weak-vs-strong fact update is gated by allocation recency.  Python
+        // keeps these two derivations independent (object_state.py:297 vs :302),
+        // so a "<?>" param object suppresses the finding yet still takes a
+        // strong `= FREED` update, while an aged `summary` generation takes a
+        // weak `|= FREED` update yet (absent "<?>") still raises the finding.
+        let suppress_finding = self.is_summary_object(&oid);
+        let weak_update = Self::is_summary_generation(&oid);
         let facts = self.facts.entry(oid.clone()).or_insert(fact_bit(Fact::Unknown));
-        let weak = oid.split('|').nth(1) == Some("summary");
-        if *facts & fact_bit(Fact::Freed) != 0 && !weak {
+        if *facts & fact_bit(Fact::Freed) != 0 && !suppress_finding {
             findings.double_free.push((op.line, target.clone(), op.node.clone()));
         }
         if *facts != fact_bit(Fact::Null) {
-            if weak { *facts |= fact_bit(Fact::Freed); }
+            if weak_update { *facts |= fact_bit(Fact::Freed); }
             else { *facts = fact_bit(Fact::Freed); }
         }
     }
@@ -670,7 +729,8 @@ impl State {
                 let Some(oid) = self.resolve(&mut target_path, false) else { return };
                 self.record_param(Kind::Use, &oid);
                 if op.access_is_return() { self.record_return(&oid); }
-                if self.facts.get(&oid).is_some_and(|facts| *facts & fact_bit(Fact::Freed) != 0) {
+                if !self.is_summary_object(&oid)
+                    && self.facts.get(&oid).is_some_and(|facts| *facts & fact_bit(Fact::Freed) != 0) {
                     findings.use_after_free.push((op.line, target.clone(), op.node.clone()));
                 }
             }
@@ -1251,7 +1311,7 @@ pub unsafe extern "C" fn lachesis_pass2_control_flow_path(
 /// Return value: 0 on success, 1 on invalid/null paths or a native failure.
 #[no_mangle]
 pub unsafe extern "C" fn lachesis_pass2_run_path(
-    input_path: *const c_char, output_path: *const c_char,
+    input_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
 ) -> i32 {
     let result = (|| {
         if input_path.is_null() || output_path.is_null() {
@@ -1261,7 +1321,12 @@ pub unsafe extern "C" fn lachesis_pass2_run_path(
             .to_str().map_err(|error| format!("invalid native Pass-2 input path: {error}"))?;
         let output = CStr::from_ptr(output_path)
             .to_str().map_err(|error| format!("invalid native Pass-2 output path: {error}"))?;
-        run_native_overlay_chain(std::path::Path::new(input), std::path::Path::new(output))
+        let catalog = if catalog_path.is_null() { None } else {
+            Some(CStr::from_ptr(catalog_path).to_str()
+                .map_err(|error| format!("invalid Atropos catalog path: {error}"))?.to_owned())
+        };
+        run_native_overlay_chain(std::path::Path::new(input),
+            catalog.as_deref().map(std::path::Path::new), std::path::Path::new(output))
             .map(|(nodes, edges)| {
                 eprintln!("[lachesis native pass2] published {nodes} nodes and {edges} edges");
             })
@@ -1461,12 +1526,13 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
             .map_err(|error| format!("invalid catalog path: {error}"))?;
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid output path: {error}"))?;
-        let translation = lifetime_proto::TranslationResult::decode(
+        let mut translation = lifetime_proto::TranslationResult::decode(
             fs::read(facts).map_err(|error| format!("cannot read translation facts: {error}"))?.as_slice()
         ).map_err(|error| format!("invalid translation facts: {error}"))?;
         let catalog = atropos_proto::Request::decode(
             fs::read(catalog).map_err(|error| format!("cannot read binary catalog: {error}"))?.as_slice()
         ).map_err(|error| format!("invalid binary catalog: {error}"))?;
+        native_graph::annotate_translation_roles(&mut translation, &catalog);
         let result = summary::summarize(translation, catalog);
         let mut bytes = Vec::new();
         result.encode(&mut bytes).map_err(|error| format!("cannot encode summaries: {error}"))?;
@@ -1485,9 +1551,11 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
 /// Only event nodes and control-flow edges are written to the output sidecar.
 #[no_mangle]
 pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
-    input_path: *const c_char, output_path: *const c_char,
+    input_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
 ) -> i32 {
     let result = (|| {
+        let timing_enabled = std::env::var("LACHESIS_TIMINGS").ok().as_deref() == Some("1");
+        let semantic_started = std::time::Instant::now();
         if input_path.is_null() || output_path.is_null() {
             return Err("native semantic path is null".to_owned());
         }
@@ -1496,12 +1564,87 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid semantic output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let request = native_graph::sidecar_to_request(&bytes)?;
-        let full = prepare::semantic_request(request)?;
+        let catalog = if catalog_path.is_null() {
+            None
+        } else {
+            let catalog = CStr::from_ptr(catalog_path).to_str()
+                .map_err(|error| format!("invalid lifecycle catalog path: {error}"))?;
+            Some(atropos_proto::Request::decode(
+                fs::read(catalog)
+                    .map_err(|error| format!("cannot read binary lifecycle catalog: {error}"))?
+                    .as_slice(),
+            ).map_err(|error| format!("invalid binary lifecycle catalog: {error}"))?)
+        };
+        let request = match catalog.as_ref() {
+            Some(catalog) => native_graph::sidecar_to_request_with_catalog(&bytes, catalog)?,
+            None => native_graph::sidecar_to_request(&bytes)?,
+        };
+        report_native_phase(timing_enabled, semantic_started, "semantic translation", 0, 0);
+        // Pass 2 publishes taint witnesses in the sibling binary overlay.  Use
+        // the same graph path convention as the Python store, but keep the
+        // lookup and decoding native so semantic findings receive computed
+        // provenance without rebuilding Python graph objects.
+        let source_evidence = input.strip_suffix(".pass2.input.pb")
+            .map(|base| format!("{base}.dataflow.pb"))
+            .filter(|path| std::path::Path::new(path).is_file())
+            .map(pass2::read_taint_evidence_path)
+            .transpose()?;
+        let mut full = prepare::semantic_request(request)?;
+        report_native_phase(timing_enabled, semantic_started, "semantic prepare", full.functions.len(), full.seams.len());
+        if let Some(source_evidence) = source_evidence.as_ref() {
+            for function in &mut full.functions {
+                for node in &mut function.nodes {
+                    if let Some(witness) = source_evidence.witnesses.get(&node.anchor) {
+                        node.source_witness_nodes = witness.clone();
+                        node.source_reachable = Some(true);
+                    } else if !source_evidence.truncated
+                        && source_evidence.observed_sinks.contains(&node.anchor) {
+                        node.source_reachable = Some(false);
+                    }
+                }
+            }
+        }
+        // Match the old Python Pass-3 production flow: reach skeletons are
+        // emitted once per native summary flow, while typestate skeletons are
+        // emitted for each lifecycle stream.  The region-wide structural
+        // Claus renderer is retained as a diagnostic helper, but must not be
+        // mixed into the production result because it changes the skeleton
+        // set and therefore matcher output.
+        full.regions = claus::pick_regions(&full);
+        full.skeletons = skeleton::build(&full);
+        report_native_phase(timing_enabled, semantic_started, "claus skeleton", full.regions.len(), full.skeletons.len());
+        if let Some(catalog) = catalog.as_ref() {
+            let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
+                .map(|base| format!("{base}.pass2.translation.pb"))
+                .filter(|path| std::path::Path::new(path).is_file()) {
+                fs::read(path)
+                    .map_err(|error| format!("cannot read native translation facts: {error}"))?
+            } else {
+                native_graph::sidecar_to_translation(&bytes)?
+            };
+            let mut translation = lifetime_proto::TranslationResult::decode(
+                translation_bytes.as_slice(),
+            ).map_err(|error| format!("invalid native translation facts: {error}"))?;
+            native_graph::annotate_translation_roles(&mut translation, catalog);
+            let summaries = summary::summarize_with_evidence(
+                translation.clone(), catalog.clone(),
+                source_evidence.as_ref().map(|evidence| &evidence.witnesses));
+            if !summaries.complete { full.complete = false; }
+            full.skeletons.extend(reach::build_sink_graphs(
+                &full, &translation, &summaries, catalog));
+            full.skeletons.extend(reach::build(&translation, &summaries, catalog));
+            if !summaries.complete {
+                for skeleton in &mut full.skeletons {
+                    skeleton.complete = false;
+                }
+            }
+            report_native_phase(timing_enabled, semantic_started, "reach summaries", summaries.functions.len(), full.skeletons.len());
+        }
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
         let result = full.encode_to_vec();
+        report_native_phase(timing_enabled, semantic_started, "semantic serialize", 0, result.len());
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, &result)
             .map_err(|error| format!("cannot write semantic result: {error}"))?;
@@ -1515,6 +1658,9 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             functions: full.functions.into_iter()
                 .filter_map(compact_event_function).collect(),
             complete: full.complete,
+            seams: full.seams,
+            regions: full.regions,
+            skeletons: full.skeletons,
         }.encode_to_vec();
         let events_output = format!("{output}.events.pb");
         let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
@@ -1536,6 +1682,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
 #[no_mangle]
 pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
     input_path: *const c_char, output_path: *const c_char,
+    catalog_path: *const c_char,
 ) -> i32 {
     let result = (|| {
         if input_path.is_null() || output_path.is_null() {
@@ -1545,10 +1692,22 @@ pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
             .map_err(|error| format!("invalid semantic matcher input path: {error}"))?;
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid semantic matcher output path: {error}"))?;
+        let catalog = if catalog_path.is_null() {
+            None
+        } else {
+            let path = CStr::from_ptr(catalog_path).to_str()
+                .map_err(|error| format!("invalid binary pattern catalog path: {error}"))?;
+            atropos_proto::Request::decode(
+                fs::read(path)
+                    .map_err(|error| format!("cannot read binary pattern catalog: {error}"))?
+                    .as_slice(),
+            ).map_err(|error| format!("invalid binary pattern catalog: {error}"))?.pattern_catalog
+        };
         let mapped = native_graph::map_path(input)?;
         let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
             .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
-        let matched = semantic_match::match_result(result).encode_to_vec();
+        let matched = semantic_match::match_result_with_catalog(result, catalog.as_ref())
+            .encode_to_vec();
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, matched)
             .map_err(|error| format!("cannot write native match result: {error}"))?;
@@ -1955,7 +2114,10 @@ fn solve_graph_mode(nodes: &[String], successors: &HashMap<String, Vec<String>>,
         .or_else(|_| std::env::var("LACHESIS_DIAGNOSTIC_TRANSFER_CAP"))
         .ok().and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(10_000u64);
+        // Match the old engine's graph-relative budget.  Small functions keep
+        // the same minimum guard; large functions are not silently truncated
+        // at the same flat count regardless of their CFG size.
+        .unwrap_or_else(|| 10_000u64.max((nodes.len() as u64).saturating_mul(500)));
     while transfers < transfer_cap {
         let Some(node) = queue.pop_front() else { break };
         queued.remove(&node);
@@ -2151,6 +2313,19 @@ mod tests {
         state.apply(&op(Kind::Use, path, "use"), &mut findings);
         assert_eq!(findings.use_after_free.len(), 1);
         assert!(state.trace.contains(&Effect::Param { kind: Kind::Free, position: 0, selectors: vec![] }));
+    }
+
+    #[test]
+    fn unknown_index_parameter_is_a_weak_summary_object() {
+        let mut state = State::default();
+        let path = Path { root: "p".into(), selectors: vec!["<?>".into()] };
+        state.seed_parameter(path.clone(), 0);
+        let mut findings = Findings::default();
+        state.apply(&op(Kind::Free, path.clone(), "free-1"), &mut findings);
+        state.apply(&op(Kind::Free, path.clone(), "free-2"), &mut findings);
+        state.apply(&op(Kind::Use, path, "use"), &mut findings);
+        assert!(findings.double_free.is_empty());
+        assert!(findings.use_after_free.is_empty());
     }
 
     #[test]

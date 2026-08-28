@@ -453,6 +453,23 @@ class Analysis:
                     needed.add(source)
         cone_done = perf_counter()
 
+        # Lifecycle release/use constructors census ``release`` nodes and the
+        # member reads rooted in them.  Neither is a callsite nor reachable from
+        # an Atropos sink, so the projection and the sink cone above drop them --
+        # which silently zeroes the lifecycle.release/use census versus the full
+        # graph.  Re-add exactly that small lineage: the release nodes plus the
+        # ``HAS_PROPERTY_PATH -> DEFINES -> READS_FROM`` chain anchored on each
+        # release target (and on any acquisition/source value a use may root in).
+        # These need their full property tails -- the constructor reads
+        # ``target_id``/``base_value_id``/``definition_id``, which the header-only
+        # warm below does not carry -- so they are fetched as complete records
+        # here.  Bounded by the lifecycle values in the program, never by its size.
+        life_nodes, life_edges = Analysis._lifecycle_lineage(index, projection)
+        for node in life_nodes:
+            nodes[node["id"]] = node
+            needed.discard(node["id"])
+        edges.extend(life_edges)
+
         # Fetch only endpoints absent from the narrow Atropos projection.  Kùzu's
         # batch warmer turns this into a small number of primary-key probes rather
         # than one query per record.
@@ -484,6 +501,69 @@ class Analysis:
             )
         return {"nodes": list(nodes.values()), "edges": edges}
 
+    @staticmethod
+    def _lifecycle_lineage(index, projection) -> tuple[list, list]:
+        """Release nodes plus the bounded member-read lineage rooted in them.
+
+        Returns ``(nodes, edges)`` as full records -- the lifecycle constructors
+        read ``target_id``/``base_value_id``/``definition_id`` property tails that
+        the compact graph's header warm does not carry.  Seeds are every release
+        target and every acquisition/source call value (a use may root in either);
+        the walk follows only ``HAS_PROPERTY_PATH -> DEFINES -> READS_FROM`` for a
+        few hops, so the set is bounded by the lifecycle values in the program.
+        """
+        from lachesis.flow import atropos
+        from lachesis.flow.normalize import normalizer
+
+        release_nodes = list(index.nodes_of_kind("release"))
+        seeds: set[str] = set()
+        for node in release_nodes:
+            target_id = (node.get("properties") or {}).get("target_id")
+            if target_id:
+                seeds.add(target_id)
+        for node in projection.get("nodes", ()):
+            if node.get("kind") not in ("call", "construct"):
+                continue
+            props = node.get("properties") or {}
+            callee = props.get("callee") or props.get("method_name")
+            if not callee:
+                continue
+            lang = atropos.lang_of(props.get("absolute_file") or props.get("file") or "")
+            norm = normalizer(lang)
+            if norm.is_acquire(callee) or norm.is_release(callee) or \
+                    callee in atropos.source_catalog(lang):
+                for key in ("return_value_id", "value_id", "assigned_value_id",
+                            "receiver_value_id"):
+                    if props.get(key):
+                        seeds.add(props[key])
+                seeds.update(props.get("argument_value_ids") or ())
+
+        chain = ("HAS_PROPERTY_PATH", "DEFINES", "READS_FROM")
+        lineage_edges: list = []
+        discovered: set[str] = set()
+        frontier = list(seeds)
+        for _hop in range(4):
+            if not frontier:
+                break
+            nxt: list[str] = []
+            for value_id in frontier:
+                for edge in index.outgoing_of_kind(value_id, *chain):
+                    lineage_edges.append(edge)
+                    target = edge.get("target")
+                    if target and target not in discovered:
+                        discovered.add(target)
+                        nxt.append(target)
+            frontier = nxt
+
+        if discovered:
+            index._warm_nodes(list(discovered))
+        lineage_nodes = list(release_nodes)
+        for node_id in discovered:
+            node = index.nodes.get(node_id)
+            if node is not None:
+                lineage_nodes.append(node)
+        return lineage_nodes, lineage_edges
+
     def _enrich_and_merge(self, *, deadline: Deadline | None = None,
                           workers: int | None = None) -> tuple[dict, dict, bool]:
         """The structural bind plus the Pass 3 semantic skeleton the temporal families read.
@@ -503,13 +583,27 @@ class Analysis:
         if not native_semantic:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
-        from lachesis.flow.native_translate import ensure_native_semantic_sidecar
-        native_sidecar = ensure_native_semantic_sidecar(self.store)
+        from lachesis.flow.native_translate import (
+            build_native_match_result, ensure_native_semantic_sidecar,
+        )
+        native_sidecar = ensure_native_semantic_sidecar(
+            self.store, summary.get("catalog_path"),
+        )
+        # Completion is the Rust matcher's call, not ours to assert. A function is
+        # ``capped`` when its state budget was exhausted or its skeleton was partial;
+        # any capped function means the temporal skeleton is truncated. We report that
+        # honestly so the caller drops the partial skeleton (structural families only)
+        # rather than caching a misleadingly thin temporal set as a complete run. The
+        # match sidecar is content-addressed, so the later flow pass reuses it.
+        match_result = build_native_match_result(
+            native_sidecar, summary.get("catalog_path"))
+        converged = not any(getattr(function, "capped", False)
+                            for function in match_result.functions)
         stamped["semantic_graph"] = {
             "native_sidecar": str(native_sidecar),
-            "coverage": {"converged": True},
+            "coverage": {"converged": converged},
         }
-        return stamped, summary, True
+        return stamped, summary, converged
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 

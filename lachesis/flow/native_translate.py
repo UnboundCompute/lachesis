@@ -38,6 +38,26 @@ def native_semantic_sidecar_path(store) -> Path:
     return Path(f"{base}.pass3.semantic.pb")
 
 
+def native_catalog_path(store) -> Path | None:
+    """Return the compiled Atropos catalog for a store, when available.
+
+    Catalog authoring is allowed to use its source files during setup, but the
+    native analysis boundary receives only the fingerprinted protobuf artifact.
+    Keeping this lookup here makes every Rust entrypoint use the same catalog
+    contract without opening graph data in Python.
+    """
+    base = _base(store)
+    if not base:
+        return None
+    try:
+        from lachesis.integrations.atropos.enrich import locate_atropos
+        from lachesis.integrations.atropos.native_bind import compiled_catalog
+        root = locate_atropos()
+        return compiled_catalog(root, base) if root is not None else None
+    except (OSError, ValueError):
+        return None
+
+
 def native_match_sidecar_path(semantic_path: str | os.PathLike[str]) -> Path:
     """Return the binary cache for final Pass-3 matcher findings."""
     return Path(f"{semantic_path}.match.pb")
@@ -54,7 +74,8 @@ def _sidecar_stale(output: Path, *inputs: Path) -> bool:
         return True
 
 
-def build_native_match_result(semantic_path: str | os.PathLike[str]):
+def build_native_match_result(semantic_path: str | os.PathLike[str],
+                              catalog_path: str | os.PathLike[str] | None = None):
     """Build or load the Rust-owned final matcher result."""
     source = Path(semantic_path)
     event_source = native_semantic_events_path(source)
@@ -62,7 +83,7 @@ def build_native_match_result(semantic_path: str | os.PathLike[str]):
         source = event_source
     output = native_match_sidecar_path(source)
     if _sidecar_stale(output, source):
-        match_semantic_path(source, output)
+        match_semantic_path(source, output, catalog_path)
     try:
         result = lifetime_pb2.NativeTemporalResult()
         result.ParseFromString(output.read_bytes())
@@ -73,18 +94,6 @@ def build_native_match_result(semantic_path: str | os.PathLike[str]):
 
 def native_match_leads(result) -> list[dict[str, Any]]:
     """Project compact native findings into the public lead record shape."""
-    pattern_ids = {
-        "pointer-arithmetic-before-validation": "mem.pointer-arithmetic.before-validation",
-        "leak": "mem.lifetime.leak",
-        "uninitialized-use": "mem.lifetime.uninitialized-use",
-        "double-free": "mem.lifetime.double-free",
-        "uaf.deref": "mem.lifetime.use-after-free",
-        "use.dangling": "mem.lifetime.use-after-free",
-        "null-deref": "mem.lifetime.null-deref",
-        "use-after-return": "mem.lifetime.use-after-return",
-        "realloc-failure-leak": "mem.lifetime.realloc-failure-leak",
-        "aggregate-copy-alias": "aggregate-copy-alias",
-    }
     leads = []
     for function in result.functions:
         for finding in function.findings:
@@ -92,33 +101,43 @@ def native_match_leads(result) -> list[dict[str, Any]]:
             rendered = path.root if path is not None else "unknown"
             if path is not None and path.selectors:
                 rendered += "".join(path.selectors)
-            leads.append({
+            witness = list(finding.witness_nodes)
+            lead = {
                 "pattern": finding.pattern,
                 "object": rendered,
                 "node": finding.node,
                 "entry": finding.function,
                 "line": finding.line if finding.has_line else None,
-                "is_source": True,
-                "guarded": False,
                 "value": rendered,
                 "var": rendered,
                 "at": finding.node,
-                "pattern_id": pattern_ids.get(finding.pattern, finding.pattern),
-                "evaluator": "typestate",
-                "source_reachable": True,
-                "source_influenced": True,
-                "witness": [finding.node],
-                "witness_complete": True,
-                "source_context": finding.function,
-                "source_function": finding.function,
-                "source_entry": finding.function,
-                "source_line": finding.line if finding.has_line else None,
-                "tier": 1,
-            })
+                "witness": witness,
+                "witness_complete": finding.witness_complete and bool(witness),
+                "analysis_complete": not function.capped,
+                "truncated": function.capped,
+                "guarded": finding.guarded,
+                "guards": [{"kind": guard.kind, "value": guard.value}
+                           for guard in finding.guards],
+            }
+            if finding.source_witness_nodes:
+                lead["source_witness"] = list(finding.source_witness_nodes)
+            if finding.HasField("source_reachable"):
+                lead["source_reachable"] = finding.source_reachable
+            if finding.HasField("source_influenced"):
+                lead["source_influenced"] = finding.source_influenced
+            if finding.family:
+                lead["family"] = finding.family
+            if finding.pattern_id:
+                lead["pattern_id"] = finding.pattern_id
+            if finding.evaluator:
+                lead["evaluator"] = finding.evaluator
+            if finding.tier:
+                lead["tier"] = finding.tier
+            leads.append(lead)
     return leads
 
 
-def ensure_native_semantic_sidecar(store):
+def ensure_native_semantic_sidecar(store, catalog_path=None):
     """Publish the Rust semantic sidecar without materializing the graph in Python."""
     base = _base(store)
     if not base or not pass2_input_cache_path(base).is_file():
@@ -129,7 +148,7 @@ def ensure_native_semantic_sidecar(store):
         # The Rust path publishes both the full semantic sidecar and its
         # compact event sibling in one invocation.  Do not immediately invoke
         # it a second time below on a cold cache.
-        write_semantic_path(input_path, output_path)
+        write_semantic_path(input_path, output_path, catalog_path)
     else:
         events_path = Path(f"{output_path}.events.pb")
         if not _sidecar_stale(events_path, input_path, output_path):
@@ -137,7 +156,7 @@ def ensure_native_semantic_sidecar(store):
         # Regenerate through Rust so the event-only sibling is published atomically.
         temporary = Path(f"{output_path}.events-migrate.{os.getpid()}.pb")
         try:
-            write_semantic_path(input_path, temporary)
+            write_semantic_path(input_path, temporary, catalog_path)
             generated = Path(f"{temporary}.events.pb")
             os.replace(generated, events_path)
         finally:

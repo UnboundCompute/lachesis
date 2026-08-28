@@ -17,8 +17,19 @@ def compiled_catalog(root: str | os.PathLike[str], base: str | os.PathLike[str])
     runtime receives the resulting protobuf path and never parses JSON.
     """
     models_root = Path(root) / "models"
+    lifecycle_path = Path(root) / "detection" / "lifecycle-roles.json"
+    flow_patterns_path = Path(root) / "detection" / "flow-patterns.json"
+    evaluators_path = Path(root) / "detection" / "evaluators.json"
     fingerprint = hashlib.sha256()
     for path in sorted(models_root.rglob("*.json")):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        fingerprint.update(str(path).encode())
+        fingerprint.update(str(stat.st_mtime_ns).encode())
+        fingerprint.update(str(stat.st_size).encode())
+    for path in (lifecycle_path, flow_patterns_path, evaluators_path):
         try:
             stat = path.stat()
         except OSError:
@@ -73,18 +84,138 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
     This is a setup/build operation. The Pass-2 native runtime consumes only the
     resulting protobuf and never parses JSON.
     """
+    import json
     from .models import load_models
+    root = Path(root)
     request = atropos_pb2.Request()
+    # Lifecycle roles are compiled into the same protobuf catalog.  This is a
+    # build/setup concern: the native analysis path consumes only this binary
+    # artifact and never opens the authored catalog files.  It is loaded before
+    # the models so sized allocators can be derived from the sink catalog below.
+    detection_root = root.parent / "detection"
+    lifecycle_path = detection_root / "lifecycle-roles.json"
+    try:
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        lifecycle = {}
+    # Sized allocators (malloc/calloc/xmlMalloc/...) are NOT listed in the
+    # lifecycle catalog's `alloc` section -- that section carries only the
+    # size-LESS allocators (strdup-family).  The old normalizer derived the
+    # sized allocators from the sink catalog instead: any sink whose family is
+    # an `alloc_kinds` kind (e.g. `alloc-size`) is a lifecycle alloc.  Mirror
+    # that derivation here so the alloc models stay the single source of truth
+    # and the native reader recognizes the same allocators as the Python engine.
+    alloc_kinds = set(lifecycle.get("alloc_kinds") or ())
+    # A name owned by realloc or a release role keeps that more specific role --
+    # the emitter checks realloc/release before alloc -- so it must not be
+    # overwritten by the derived alloc role in the single-role native map.
+    claimed = {
+        (str(language), str(method))
+        for section in ("realloc", "dealloc", "release_methods", "release_qualified")
+        for language, names in (lifecycle.get(section) or {}).items()
+        for method in (names or ())
+    }
+    derived_alloc: dict[tuple[str, str], None] = {}
     for model in load_models(Path(root)):
         encoded = request.models.add(
             id=model.get("id") or "", language=model.get("language") or "",
             method=model.get("method") or "", package=model.get("package") or "",
             receiver_type=model.get("type") or "",
             access_path=model.get("access_path") or "", role=model.get("role") or "",
+            kind=model.get("kind") or "",
+            confidence=model.get("confidence") or "medium",
         )
         if model.get("arity") is not None:
             encoded.arity = int(model["arity"])
             encoded.has_arity = True
+        encoded.cwe.extend(str(value) for value in (model.get("cwe") or ()))
+        if model.get("kind") in alloc_kinds:
+            language = str(model.get("language") or "")
+            method = str(model.get("method") or "")
+            if method and (language, method) not in claimed:
+                derived_alloc.setdefault((language, method), None)
+    role_sections = {
+        "alloc": "lifecycle.alloc",
+        "dealloc": "lifecycle.release",
+        "realloc": "lifecycle.realloc",
+        "acquire_methods": "lifecycle.acquire",
+        "release_methods": "lifecycle.release",
+        "release_qualified": "lifecycle.release",
+    }
+    for section, role in role_sections.items():
+        for language, names in (lifecycle.get(section) or {}).items():
+            for method in names or ():
+                request.models.add(
+                    id=f"{role}:{language}:{method}", language=str(language),
+                    method=str(method), role=role,
+                )
+    # Sized allocators derived from the sink catalog above.  Emitted after the
+    # explicit sections so a name shared with the size-less `alloc` list simply
+    # restates the same role; realloc/release names were already excluded.
+    for language, method in derived_alloc:
+        request.models.add(
+            id=f"lifecycle.alloc:{language}:{method}", language=language,
+            method=method, role="lifecycle.alloc",
+        )
+    # Pass-3 pattern/evaluator data is compiled into the same binary request.
+    # This keeps the runtime path independent of authored JSON while retaining
+    # Atropos as the sole owner of the declarative vocabulary.
+    try:
+        flow_patterns = json.loads(
+            (detection_root / "flow-patterns.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        flow_patterns = {}
+    for item in flow_patterns.get("patterns", ()):
+        matcher = item.get("matcher") or {}
+        pattern = request.pattern_catalog.patterns.add(
+            id=item.get("id") or "",
+            name=item.get("name") or "",
+            tier=int(item.get("tier") or 0),
+            status=item.get("status") or "",
+            shape=item.get("shape") or "",
+            signal=item.get("signal") or "",
+            matcher_pattern=matcher.get("pattern") or "",
+            evaluator=item.get("evaluator") or "",
+        )
+        pattern.cwe.extend(str(value) for value in (item.get("cwe") or ()))
+        pattern.requires.extend(str(value) for value in (item.get("requires") or ()))
+        pattern.matcher_families.extend(str(value) for value in (matcher.get("families") or ()))
+    try:
+        evaluator_doc = json.loads(
+            (detection_root / "evaluators.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        evaluator_doc = {}
+    for name, description in (evaluator_doc.get("evaluators") or {}).items():
+        request.pattern_catalog.evaluators.add(
+            name=str(name), description=str(description))
+    # Compiler frontends may spell a catalogued operation differently (for
+    # example fortified builtins).  Preserve the old normalizer's declarative
+    # aliases in the binary catalog; runtime Rust never opens these JSON files.
+    profiles_root = root.parent / "profiles"
+    for path in sorted(profiles_root.glob("*/normalization.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        language = str(document.get("language") or path.parent.name)
+        for surface, canonical in (document.get("call_aliases") or {}).items():
+            # Match the old normalizer's maintenance-free symbol rule: profile
+            # metadata such as ``_note`` is prose, not an alias entry.
+            if (isinstance(surface, str) and isinstance(canonical, str)
+                    and surface and canonical
+                    and not any(char.isspace() for char in surface)
+                    and not any(char.isspace() for char in canonical)):
+                request.callee_aliases.add(language=language, surface=surface,
+                                           canonical=canonical)
+    request.pattern_catalog.kind_evaluator.update({
+        str(name): ",".join(str(value) for value in values)
+        if isinstance(values, list) else str(values)
+        for name, values in (evaluator_doc.get("kind_evaluator") or {}).items()
+    })
+    request.pattern_catalog.event_evaluator.update({
+        str(name): str(value)
+        for name, value in (evaluator_doc.get("event_evaluator") or {}).items()
+    })
     target = os.fspath(output_path)
     temporary = target + f".tmp.{os.getpid()}"
     with open(temporary, "wb") as stream:

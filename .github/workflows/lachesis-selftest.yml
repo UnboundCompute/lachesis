@@ -23,12 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: UnboundCompute/lachesis-action@v1.1.0
+      - uses: UnboundCompute/lachesis-action@v1.2.0
         with:
           # Scan the whole repo (Python + TypeScript + C), not just a fixture:
           # the real dogfood is Lachesis analyzing its own source.
           source: "."
-          analyze-args: "--prune --incremental"
+          analyze-args: "--incremental"
           # Drop every bundled test fixture from the report (c/python/typescript
           # frontends + planner): they carry deliberate guard differentials that
           # would otherwise drown the real findings in Lachesis's own source.

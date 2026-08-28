@@ -55,6 +55,7 @@ pub struct Callee {
     pub module: Option<String>,
     pub receiver_type: Option<String>,
     pub arity: Option<i64>,
+    pub language: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +161,52 @@ struct Report {
     results: Vec<ResultRow>,
 }
 
+/// Resolve every alias surface to its terminal canonical, following chains
+/// (A->B->C collapses to C) with a cycle guard.  Mirrors the lifecycle-role
+/// resolution in native_graph.rs so the catalog binder shares one canonical
+/// symbol vocabulary: the compiler frontends emit platform surfaces such as
+/// macOS's fortified `__builtin___memcpy_chk`, and the catalog's callee_aliases
+/// map them onto the generic `memcpy` the sink models are keyed by.
+fn build_alias_map(
+    request: &crate::atropos_proto::Request,
+) -> HashMap<(String, String), String> {
+    let direct: HashMap<(String, String), String> = request.callee_aliases.iter()
+        .map(|alias| ((alias.language.clone(), alias.surface.clone()), alias.canonical.clone()))
+        .collect();
+    let mut resolved = HashMap::new();
+    for alias in &request.callee_aliases {
+        let language = alias.language.clone();
+        let mut name = alias.canonical.clone();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(alias.surface.clone());
+        while let Some(next) = direct.get(&(language.clone(), name.clone())) {
+            if !seen.insert(name.clone()) { break; }
+            name = next.clone();
+        }
+        resolved.insert((language, alias.surface.clone()), name);
+    }
+    resolved
+}
+
+/// Rewrite each callsite's callee name to its terminal canonical before model
+/// matching, so a platform-specific surface binds the same generic sink model
+/// as its portable spelling.  Keyed by the callsite's own language, falling
+/// back to the index language, exactly as bind_model's language filter is.
+fn canonicalize_callees(index: &mut Index, aliases: &HashMap<(String, String), String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let index_language = index.language.clone();
+    for callsite in &mut index.callsites {
+        let language = callsite.callee.language.clone().or_else(|| index_language.clone());
+        if let Some(language) = language {
+            if let Some(canonical) = aliases.get(&(language, callsite.callee.name.clone())) {
+                callsite.callee.name = canonical.clone();
+            }
+        }
+    }
+}
+
 fn matches(model: &Model, callee: &Callee) -> bool {
     if model.method.as_deref() != Some(callee.name.as_str()) {
         return false;
@@ -215,7 +262,9 @@ fn resolve(kind: &str, index: Option<usize>, callsite: &Callsite)
 
 fn bind_model(model: &Model, index: &Index) -> ResultRow {
     let callsites: Vec<&Callsite> = index.callsites.iter()
-        .filter(|_| index.language.is_none() || model.language == index.language)
+        .filter(|callsite| model.language.as_ref().is_none_or(|language| {
+            callsite.callee.language.as_ref().or(index.language.as_ref()) == Some(language)
+        }))
         .filter(|callsite| matches(model, &callsite.callee))
         .collect();
     let base = || ResultRow {
@@ -228,9 +277,16 @@ fn bind_model(model: &Model, index: &Index) -> ResultRow {
         let mut row = base(); row.status = "symbol-not-found".into(); return row;
     }
 
+    // The ambiguity guard protects models that pin a receiver identity (package or
+    // receiver_type): binding one of those across call sites with differing identities
+    // would attach it to the wrong receiver. A fully generic method-only model (no
+    // package, no receiver_type) deliberately matches every occurrence of the method, so
+    // differing receiver identities are expected rather than ambiguous — it binds all
+    // matching call sites and lets each attachment stand as a lead, not a verdict.
+    let model_pins_identity = model.package.is_some() || model.receiver_type.is_some();
     let identities: BTreeSet<(Option<String>, Option<String>)> = callsites.iter()
         .map(|c| (c.callee.module.clone(), c.callee.receiver_type.clone())).collect();
-    if identities.len() > 1 {
+    if model_pins_identity && identities.len() > 1 {
         let mut row = base(); row.status = "ambiguous".into();
         let distinct: BTreeSet<(Option<String>, Option<String>, Option<i64>)> = callsites.iter()
             .map(|c| (c.callee.module.clone(), c.callee.receiver_type.clone(), c.callee.arity)).collect();
@@ -405,33 +461,48 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
     let file = File::open(path).map_err(|error| format!("cannot open Pass-1 input: {error}"))?;
     let mut reader = BufReader::new(file);
     let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
+    // Property-write and computed-property-write nodes are not calls, but a
+    // catalog sink can still name them: `el.innerHTML = tainted` (a static
+    // property write) and `obj[key] = value` (a computed write) are bindable
+    // sinks. They are collected here and turned into synthetic callsites below
+    // so the same method/access-path resolution reaches them.
+    let mut writes = Vec::<crate::graph_proto::NodeRecord>::new();
+    let mut computed_writes = Vec::<crate::graph_proto::NodeRecord>::new();
     let mut arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut has_arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    let mut language: Option<&str> = None;
+    let mut language: Option<String> = None;
     let mut mixed_languages = false;
     while let Some(mut payload) = framed_record(&mut reader)? {
         if payload.is_empty() { continue; }
         let tag = payload.remove(0);
         match tag {
             b'N' => {
-                let node_id = string_field(payload.as_slice(), 1).unwrap_or("");
-                let node_language = if node_id.contains(":clang-c:") { Some("c") }
-                    else if node_id.contains(":cpython-ast:") { Some("python") }
-                    else if node_id.contains(":typescript-compiler-api:") { Some("typescript") }
-                    else { None };
-                if let Some(current) = node_language {
-                    if let Some(previous) = language {
-                        mixed_languages |= previous != current;
-                    } else if !mixed_languages {
-                        language = Some(current);
-                    }
-                }
                 let kind = string_field(payload.as_slice(), 2).unwrap_or("");
-                if kind == "call" || kind == "construct" || kind == "argument" {
+                if kind == "call" || kind == "construct" || kind == "argument"
+                    || kind == "write" || kind == "dynamic-behavior" {
                     let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
                         .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
+                let node_language = property(&node, "language");
+                    if let Some(current) = node_language.as_deref() {
+                        if let Some(previous) = language.as_deref() {
+                            mixed_languages |= previous != current;
+                        } else if !mixed_languages {
+                            language = Some(current.to_owned());
+                        }
+                    }
                     if kind == "call" || kind == "construct" {
                         calls.push(node);
+                    } else if kind == "write" {
+                        // Only assignment writes are sink candidates; a static
+                        // property name (`innerHTML`) becomes the callsite method.
+                        if property(&node, "write_kind").as_deref() == Some("assignment") {
+                            writes.push(node);
+                        }
+                    } else if kind == "dynamic-behavior" {
+                        if property(&node, "behavior_kind").as_deref()
+                            == Some("computed-property-write") {
+                            computed_writes.push(node);
+                        }
                     } else {
                     let call = property(&node, "callsite_id");
                     let position = property(&node, "position")
@@ -463,12 +534,17 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             _ => {}
         }
     }
-    let callsites = calls.into_iter().filter_map(|node| {
+    let mut callsites: Vec<Callsite> = calls.into_iter().filter_map(|node| {
         let raw_name = property(&node, "callee")
             .or_else(|| property(&node, "method_name"))
             .or_else(|| property(&node, "callee_name"))?;
         let mut name = raw_name;
-        let mut receiver = property(&node, "receiver");
+        // TypeScript spells a member call's receiver into `receiver_expression`
+        // (Python records it as `receiver`); accept either spelling. The receiver
+        // need not be a bare identifier -- `headers.accept.match` has the member
+        // chain `headers.accept` as its receiver.
+        let mut receiver = property(&node, "receiver")
+            .or_else(|| property(&node, "receiver_expression"));
         if receiver.is_none() {
             if let Some((prefix, leaf)) = name.rsplit_once('.').map(|(prefix, leaf)|
                 (prefix.to_owned(), leaf.to_owned())) {
@@ -477,10 +553,17 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
                     receiver = Some(prefix);
                 }
             }
+        } else if let Some((_, leaf)) = name.rsplit_once('.') {
+            // A member call whose receiver is already known: bind on the leaf
+            // method so catalog models keyed by the bare method name
+            // (`match`/`test`/`html`/...) resolve even when the receiver is a
+            // member chain the bare-identifier rule above would have rejected.
+            name = leaf.to_owned();
         }
         let module = property(&node, "module").or_else(|| receiver.as_deref()
             .filter(|value| simple_identifier(value)).map(str::to_owned));
         let receiver_type = property(&node, "receiver_type");
+        let node_language = property(&node, "language");
         let call_value_id = property(&node, "value_id").or_else(|| Some(node.id.clone()));
         let receiver_value_id = property(&node, "receiver_value_id");
         let mut args = arguments.remove(&node.id)
@@ -491,27 +574,73 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             callee: Callee {
                 name, module, receiver_type,
                 arity: Some(args.len() as i64),
+                language: node_language,
             },
             call_value_id,
             receiver_value_id,
             arg_value_ids: args.into_iter().map(|(_, id)| id).collect(),
         })
     }).collect();
-    Ok(Index { language: if mixed_languages { None } else { language.map(str::to_owned) },
+    // Synthetic callsites for static property writes: `el.innerHTML = tainted`
+    // binds a catalog model keyed by the property name (method `innerHTML`),
+    // with the assigned value (`value_id`, the RHS) as its sole argument.
+    for node in writes {
+        let Some(property_path) = property(&node, "property_path") else { continue };
+        // Only a plain property name is a method-shaped sink; computed writes
+        // (`[key]`) are handled by their dynamic-behavior node below.
+        if !simple_identifier(&property_path) { continue; }
+        let Some(value_id) = property(&node, "value_id") else { continue };
+        let node_language = property(&node, "language");
+        let base_value_id = property(&node, "base_value_id");
+        callsites.push(Callsite {
+            id: node.id,
+            callee: Callee {
+                name: property_path, module: None, receiver_type: None,
+                arity: Some(1), language: node_language,
+            },
+            call_value_id: Some(value_id.clone()),
+            receiver_value_id: base_value_id,
+            arg_value_ids: vec![value_id],
+        });
+    }
+    // Synthetic callsites for computed property writes: `obj[key] = value` binds
+    // a catalog model keyed by the sentinel method `computed-property-write`,
+    // with the dynamic key (`key_value_id`) as its sole argument so a prototype-
+    // pollution obligation can require a `__proto__`/`constructor` guard over it.
+    for node in computed_writes {
+        let Some(key_value_id) = property(&node, "key_value_id") else { continue };
+        let node_language = property(&node, "language");
+        let target_id = property(&node, "target_id");
+        callsites.push(Callsite {
+            id: node.id,
+            callee: Callee {
+                name: "computed-property-write".to_owned(), module: None,
+                receiver_type: None, arity: Some(1), language: node_language,
+            },
+            call_value_id: target_id.clone(),
+            receiver_value_id: target_id,
+            arg_value_ids: vec![key_value_id],
+        });
+    }
+    Ok(Index { language: if mixed_languages { None } else { language },
               source: Some(path.display().to_string()), callsites })
 }
 
-fn load_models_path(path: &Path) -> Result<Vec<Model>, String> {
+fn load_models_path(
+    path: &Path,
+) -> Result<(Vec<Model>, HashMap<(String, String), String>), String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("cannot read binary catalog {path:?}: {error}"))?;
     let request = crate::atropos_proto::Request::decode(bytes.as_slice())
         .map_err(|error| format!("invalid binary catalog {path:?}: {error}"))?;
-    Ok(from_proto(request).0)
+    let aliases = build_alias_map(&request);
+    Ok((from_proto(request).0, aliases))
 }
 
 pub(crate) fn bind_path(input: &Path, catalog: &Path, output: &Path) -> Result<(), String> {
-    let index = index_from_path(input)?;
-    let models = load_models_path(catalog)?;
+    let mut index = index_from_path(input)?;
+    let (models, aliases) = load_models_path(catalog)?;
+    canonicalize_callees(&mut index, &aliases);
     let report = to_proto(bind_all(&models, &index));
     let mut bytes = Vec::new();
     report.encode(&mut bytes).map_err(|error| format!("cannot encode bind report: {error}"))?;
@@ -542,6 +671,7 @@ fn from_proto(request: crate::atropos_proto::Request) -> (Vec<Model>, Index) {
                 name: callee.name, module: optional_string(callee.module),
                 receiver_type: optional_string(callee.receiver_type),
                 arity: callee.has_arity.then_some(callee.arity),
+                language: optional_string(callee.language),
             },
             call_value_id: optional_string(callsite.call_value_id),
             receiver_value_id: optional_string(callsite.receiver_value_id),
@@ -606,7 +736,9 @@ pub unsafe extern "C" fn lachesis_atropos_bind_pb(
         let bytes = std::slice::from_raw_parts(input, length);
         let request = crate::atropos_proto::Request::decode(bytes)
             .map_err(|error| error.to_string())?;
-        let (models, index) = from_proto(request);
+        let aliases = build_alias_map(&request);
+        let (models, mut index) = from_proto(request);
+        canonicalize_callees(&mut index, &aliases);
         let mut output = Vec::new();
         to_proto(bind_all(&models, &index)).encode(&mut output)
             .map_err(|error| error.to_string())?;

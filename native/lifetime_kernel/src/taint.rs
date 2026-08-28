@@ -79,6 +79,17 @@ fn fact(evidence: &[String], confidence: &str) -> Vec<graph_proto::Field> {
          pass2::text_field("confidence", confidence), list_field("evidence_ids", evidence)]
 }
 
+fn catalog_fact(
+    evidence: &[String], model: &crate::atropos_proto::Model,
+) -> Vec<graph_proto::Field> {
+    let confidence = if model.confidence.is_empty() { "medium" } else { &model.confidence };
+    let mut fields = fact(evidence, confidence);
+    if !model.cwe.is_empty() {
+        fields.push(list_field("cwe", &model.cwe));
+    }
+    fields
+}
+
 fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Field>)
     -> graph_proto::EdgeRecord
 {
@@ -86,6 +97,187 @@ fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Fie
         kind: kind.to_owned(), source: source.to_owned(), target: target.to_owned(),
         properties, source_tier: String::new(), relationship_class: String::new(),
     }
+}
+
+fn catalog_language<'a>(graph: &'a Graph, owner: Option<u32>) -> Option<&'a str> {
+    owner.and_then(|owner| graph.node_by_id.get(&owner).copied())
+        .and_then(|owner| graph.nodes.get(owner))
+        .and_then(|node| graph.node_property_text(node, "language"))
+}
+
+fn model_matches(
+    model: &crate::atropos_proto::Model,
+    language: Option<&str>,
+    callee: &str,
+    argument_count: Option<usize>,
+    receiver_type: Option<&str>,
+) -> bool {
+    if !model.language.is_empty() && language != Some(model.language.as_str()) {
+        return false;
+    }
+    if model.has_arity && argument_count.is_some_and(|count| count as i64 != model.arity) {
+        return false;
+    }
+    if !model.receiver_type.is_empty()
+        && receiver_type.is_some_and(|value| value != model.receiver_type.as_str()) {
+        return false;
+    }
+    if model.package.is_empty() || model.package == "builtins" {
+        model.method == callee || callee.rsplit('.').next() == Some(model.method.as_str())
+    } else { callee == format!("{}.{}", model.package, model.method) }
+}
+
+fn endpoint_values(endpoint: &str, call: &pass2::Node,
+                   arguments: &HashMap<u32, Vec<(u32, u32)>>,
+                   call_results: &HashMap<u32, Vec<u32>>, graph: &Graph) -> Vec<u32> {
+    if endpoint == "ReturnValue" {
+        if let Some(value) = graph.node_property_text(call, "value_id")
+            .and_then(|value| graph.symbol(value)) {
+            return vec![value];
+        }
+        // A call node is the language-neutral result identity when the
+        // frontend does not materialize a dedicated value_id.  The existing
+        // call->initializer flow carries it into a local declaration, while
+        // the return-to-callsite rule carries it across a resolved wrapper.
+        let mut values = vec![call.id];
+        if let Some(results) = call_results.get(&call.id) {
+            values.extend(results.iter().copied());
+        }
+        values.sort_unstable();
+        values.dedup();
+        return values;
+    }
+    if endpoint == "Receiver" {
+        return graph.node_property_text(call, "receiver_value_id").and_then(|value| graph.symbol(value))
+            .into_iter().collect();
+    }
+    let position = endpoint.strip_prefix("Argument[").and_then(|value| value.strip_suffix(']'));
+    let Some(position) = position else { return Vec::new() };
+    if position == "*" {
+        return arguments.get(&call.id).into_iter().flatten().map(|(_, node)| *node).collect();
+    }
+    let Ok(position) = position.parse::<u32>() else { return Vec::new() };
+    arguments.get(&call.id).into_iter().flatten()
+        .filter_map(|(index, node)| (*index == position).then_some(*node)).collect()
+}
+
+fn referenced_variables(graph: &Graph, start: u32) -> Vec<u32> {
+    let mut queue = VecDeque::from([start]);
+    let mut seen = HashSet::new();
+    seen.insert(start);
+    let mut variables = Vec::new();
+    while let Some(current) = queue.pop_front() {
+        let Some(index) = graph.node_by_id.get(&current).copied() else { continue };
+        for edge_index in &graph.outgoing[index] {
+            let edge = &graph.edges[*edge_index];
+            match graph.edge_kind(edge) {
+                "AST_CHILD" => {
+                    if seen.insert(edge.target) { queue.push_back(edge.target); }
+                }
+                "REFERS_TO" if graph.node_by_id.get(&edge.target).is_some_and(|target|
+                    graph.node_kind(*target) == "variable") => variables.push(edge.target),
+                _ => {}
+            }
+        }
+    }
+    variables.sort_unstable();
+    variables.dedup();
+    variables
+}
+
+/// Apply declarative Atropos source/sink rows to compiler call/argument facts.
+/// The catalog is a binary protobuf by this point; no authored JSON is read.
+pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Request) -> Delta {
+    let mut arguments: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for node in &graph.nodes {
+        if graph.kind(node.kind) != "argument" { continue; }
+        let Some(callsite) = graph.node_property_text(node, "callsite_id")
+            .and_then(|value| graph.symbol(value)) else { continue };
+        let position = graph.node_property_i64(node, "position")
+            .and_then(|value| u32::try_from(value).ok()).unwrap_or(0);
+        arguments.entry(callsite).or_default().push((position, node.id));
+    }
+    // The compact Pass-1 projection represents the same call arguments as
+    // HAS_ARGUMENT edges.  Prefer/merge that lossless edge form so catalog
+    // models remain independent of whether a frontend materializes explicit
+    // argument nodes.
+    for edge in &graph.edges {
+        if graph.edge_kind(edge) != "HAS_ARGUMENT" { continue; }
+        let Some(position) = graph.edge_property_i64(edge, "position")
+            .and_then(|value| u32::try_from(value).ok()) else { continue };
+        arguments.entry(edge.source).or_default().push((position, edge.target));
+    }
+    for values in arguments.values_mut() {
+        values.sort_unstable();
+        values.dedup();
+    }
+    let mut call_results: HashMap<u32, Vec<u32>> = HashMap::new();
+    for edge in &graph.edges {
+        if graph.edge_kind(edge) != "VALUE_FLOWS_TO"
+            || graph.edge_property_text(edge, "reason") != Some("initializer") {
+            continue;
+        }
+        if graph.node_by_id.contains_key(&edge.source) {
+            call_results.entry(edge.source).or_default().push(edge.target);
+        }
+    }
+    for values in call_results.values_mut() {
+        values.sort_unstable();
+        values.dedup();
+    }
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for call in &graph.nodes {
+        if !matches!(graph.kind(call.kind), "call" | "construct") { continue; }
+        let Some(callee) = graph.node_property_text(call, "callee")
+            .or_else(|| graph.node_property_text(call, "method_name"))
+            .or_else(|| graph.node_property_text(call, "callee_name")) else { continue };
+        let language = catalog_language(graph, graph.node_owner(call));
+        let argument_count = arguments.get(&call.id).map(Vec::len);
+        let receiver_type = graph.node_property_text(call, "receiver_type")
+            .or_else(|| graph.node_property_text(call, "type"));
+        for model in &catalog.models {
+            if !model_matches(model, language, callee, argument_count, receiver_type) { continue; }
+            if model.role == "summary" {
+                let mut endpoints = model.access_path.split("->").map(str::trim);
+                let Some(from_endpoint) = endpoints.next() else { continue };
+                let Some(to_endpoint) = endpoints.next() else { continue };
+                let from_values = endpoint_values(from_endpoint, call, &arguments, &call_results, graph);
+                let to_values = endpoint_values(to_endpoint, call, &arguments, &call_results, graph);
+                let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
+                for from in from_values {
+                    for to in &to_values {
+                        let mut properties = catalog_fact(
+                            &[graph.id(from).to_owned(), graph.id(*to).to_owned()], model);
+                        properties.push(pass2::text_field("summary_kind",
+                            if model.kind.is_empty() { "flow" } else { model.kind.as_str() }));
+                        properties.push(pass2::text_field("catalog_model_id", model_id));
+                        edges.push(edge("VALUE_FLOWS_TO", graph.id(from), graph.id(*to), properties));
+                    }
+                }
+                continue;
+            }
+            if !matches!(model.role.as_str(), "source" | "sink") { continue; }
+            let values = endpoint_values(model.access_path.trim(), call, &arguments, &call_results, graph);
+            let role = model.role.as_str();
+            let model_id = if model.id.is_empty() { model.method.as_str() } else { model.id.as_str() };
+            let kind = if role == "source" { "source" } else { "sink" };
+            let semantic_kind = if model.kind.is_empty() { model_id } else { model.kind.as_str() };
+            for value in values {
+                let id = pass2::stable_id("catalog", role, "endpoint",
+                    &[graph.id(call.id), model_id, model.access_path.as_str(), graph.id(value)]);
+                let mut properties = catalog_fact(&[graph.id(call.id).to_owned()], model);
+                properties.push(pass2::text_field("value_id", graph.id(value)));
+                properties.push(pass2::text_field(if role == "source" { "source_kind" } else { "sink_kind" }, semantic_kind));
+                properties.push(pass2::text_field("catalog_model_id", model_id));
+                nodes.push(graph_proto::NodeRecord { id: id.clone(), kind: kind.to_owned(),
+                    label: format!("{}:{}", role, callee), properties, tier: String::new() });
+                edges.push(edge(if role == "source" { "TAINT_SOURCE" } else { "TAINT_SINK" },
+                    &id, graph.id(value), catalog_fact(&[graph.id(value).to_owned()], model)));
+            }
+        }
+    }
+    Delta { nodes, edges }
 }
 
 pub(crate) fn enrich(graph: &Graph) -> Delta {
@@ -101,6 +293,34 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         evidence.entry((item.source, item.target)).or_insert_with(|| vec![
             graph.id(item.source).to_owned(), graph.id(item.target).to_owned(),
         ]);
+    }
+
+    // Port the old C return-value overlay generically.  A resolved function
+    // return and a resolved callsite share the function endpoint; the value
+    // returned by the callee therefore reaches the caller's call node.  This
+    // is a structural fact and applies equally to every frontend that emits
+    // these neutral edge kinds.
+    let mut returns_by_function: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut calls_by_function: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for item in &graph.edges {
+        match graph.edge_kind(item) {
+            "RETURNS_VALUE" => returns_by_function.entry(item.target).or_default().push(item.source),
+            "INVOKES" => calls_by_function.entry(item.target).or_default().push(item.source),
+            _ => {}
+        }
+    }
+    for (function, returned_values) in returns_by_function {
+        let Some(calls) = calls_by_function.get(&function) else { continue };
+        for returned in returned_values {
+            for call in calls {
+                adjacency.entry(returned).or_default()
+                    .push((*call, "VALUE_FLOWS_TO".to_owned(),
+                           Some("c-return-to-callsite".to_owned()), None));
+                evidence.entry((returned, *call)).or_insert_with(|| vec![
+                    graph.id(returned).to_owned(), graph.id(*call).to_owned(),
+                ]);
+            }
+        }
     }
 
     let mut arguments_by_call: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -184,6 +404,34 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         }
     }
 
+    // Port the old out-parameter writeback overlay.  Only values that the
+    // Atropos catalog actually marked as source arguments are reversed.  The
+    // endpoint can be an AST wrapper, so resolve its descendant reference to
+    // the variable structurally rather than relying on a function/API name.
+    for source in &source_records {
+        for variable in referenced_variables(graph, source.value) {
+            adjacency.entry(source.value).or_default()
+                .push((variable, "VALUE_FLOWS_TO".to_owned(),
+                       Some("c-out-param-writeback".to_owned()), None));
+            evidence.entry((source.value, variable)).or_insert_with(|| vec![
+                graph.id(source.value).to_owned(), graph.id(variable).to_owned(),
+            ]);
+        }
+    }
+    // The same structural aliases are needed on the sink side when a call
+    // argument is an AST wrapper around a reference.  This keeps the source
+    // variable connected to the exact catalog sink endpoint.
+    for sink in &sink_records {
+        for variable in referenced_variables(graph, sink.value) {
+            adjacency.entry(variable).or_default()
+                .push((sink.value, "VALUE_FLOWS_TO".to_owned(),
+                       Some("referenced-variable".to_owned()), None));
+            evidence.entry((variable, sink.value)).or_insert_with(|| vec![
+                graph.id(variable).to_owned(), graph.id(sink.value).to_owned(),
+            ]);
+        }
+    }
+
     // A context-specific transition is a distinct fact even when its endpoints
     // match another flow.  Collapsing on only (source, target) loses call-stack
     // evidence and changes the query-visible graph.
@@ -197,8 +445,9 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
             .map(|record| (record.value, record)).collect();
         let mut reaches: FxHashMap<u32, State> = FxHashMap::default();
+        let mut capped = false;
         while let Some(state) = queue.pop_front() {
-            if seen.len() > MAX_STATES_PER_SOURCE { break; }
+            if seen.len() > MAX_STATES_PER_SOURCE { capped = true; break; }
             if state != initial && sink_by_value.contains_key(&state.value) {
                 reaches.entry(state.value).or_insert_with(|| state.clone());
             }
@@ -231,6 +480,23 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                     output_edges.push(edge("TAINT_FLOWS_TO", &source_name, &target_name, properties));
                 }
             }
+        }
+        if capped {
+            let source_name = graph.id(source.value).to_owned();
+            let truncation_id = pass2::stable_id(
+                "core", "taint-propagation", "taint-truncation", &[&source_name]);
+            nodes.push(graph_proto::NodeRecord {
+                id: truncation_id,
+                kind: "taint-truncation".to_owned(),
+                label: format!("taint truncated at {} states", seen.len()),
+                properties: vec![
+                    pass2::text_field("source_id", &source.node),
+                    pass2::integer_field("states", seen.len() as i64),
+                    pass2::integer_field("state_cap", MAX_STATES_PER_SOURCE as i64),
+                    pass2::bool_field("truncated", true),
+                ],
+                tier: String::new(),
+            });
         }
         for sink_state in reaches.into_values() {
             let Some(sink) = sink_by_value.get(&sink_state.value) else { continue; };

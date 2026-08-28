@@ -7,7 +7,69 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
-## [0.2.0]
+## [0.4.0]
+
+Engine-correctness release. The Rust matcher and flow substrate now report what
+they actually did, the binder attaches a wider class of sinks, and three real
+CVE sinks that the reader previously dropped now surface as leads. Pre-1.0: the
+candidate surface widens here; older candidate output remains readable.
+
+### Added
+
+- **Receiver-access, DOM-write, and computed-write sinks.** New JS/TS catalog
+  models name shapes the reader could not previously express: `.match` /
+  `.search` (Receiver) and `.test` / `.exec` (Argument[0]) as ReDoS leads over a
+  tainted subject, `.innerHTML` / `.outerHTML` assignment as markup-injection,
+  and computed property write as prototype-pollution. All are low-confidence,
+  type-less models — they name the shape and leave adjudication to the reader.
+- **Property-write binding.** The binder scans property-write and
+  computed-property-write nodes into synthetic call sites, so `el.innerHTML =
+  tainted` and `obj[key] = value` become bindable targets for their models.
+
+### Fixed
+
+- **Generic method models bind across differing receivers.** A type-less
+  method-only model no longer bails out `ambiguous` when its method appears on
+  call sites with differing receiver identities; the ambiguity guard now fires
+  only for models that pin a receiver identity (package or type). A generic
+  model binds every matching call site and lets each attachment stand as a lead.
+  This unlocks receiver-access sinks through the existing constructors — a
+  subject-tainted `.match` ReDoS lead now surfaces at its real call site instead
+  of vanishing at bind.
+- **Honest completion and timeout.** `converged` / `timed_out` are reported from
+  the kernel's own convergence state rather than inferred by the Python driver.
+- **Presence observations retained.** Presence-family sinks keep their
+  constant-argument observations instead of discarding them, so a lead whose
+  only evidence is a literal argument carries that evidence into adjudication.
+- **Local prefix alias composition.** The matcher's `canonical()` composes local
+  prefix aliases before comparing value identities, so an argument renamed
+  through a local binding still unifies with its origin across a call seam.
+
+### Known limitations
+
+- **Computed-write candidates are locationless.** Prototype-pollution leads from
+  `obj[key] = value` are enumerated but do not yet carry `file` / `line`, so they
+  are present in the census but not addressable by source location. Call-site
+  sinks are unaffected. Location surfacing for synthetic writes is deferred.
+- **ReDoS coverage is asymmetric.** `.match` / `.search` / `.test` / `.exec` are
+  modeled; `.replace` and `.split` are not yet, so a catastrophic pattern used
+  only through those two methods is not flagged.
+
+## [0.3.1]
+
+Packaging release: Linux arm64 (aarch64) now gets a real prebuilt wheel.
+
+### Added
+
+- **`manylinux_2_28_aarch64` wheel.** The release matrix now builds on a native
+  arm64 Linux runner (`ubuntu-24.04-arm`), so `pip install lachesis-cpg` on Linux
+  arm64 — including Docker containers on Apple Silicon — resolves a prebuilt wheel
+  carrying the native clang frontend and lifetime kernel. Previously Linux arm64
+  had no wheel and fell back to the sdist, which installs without the native C
+  frontend and cannot build C graphs. x86_64 Linux, arm64 macOS, and Windows
+  wheels are unchanged.
+
+## [0.3.0]
 
 This release introduces a source-rooted semantic flow analysis and a lifetime/typestate
 candidate layer on top of the existing sink-reachability model. Pre-1.0: the graph schema
@@ -78,6 +140,16 @@ and candidate surface grow here; older candidate output remains readable.
 - A size guard must compare magnitude, not merely name a variable.
 - The C frontend slices AST snippets by byte offset rather than code point.
 - Tolerate unreadable legacy graph properties instead of failing the load.
+- Queries materialize the dataflow tier from the native binary sidecar only; the removed
+  in-process Python enrichment fallback is no longer reachable from any query surface, so
+  a batch export (for example the GitHub Action's SARIF run) no longer risks exhausting
+  memory re-enriching a large graph in the query process.
+
+## [0.2.0]
+
+Packaged the reader on PyPI: the graph builder, navigation and dataflow tools, the
+candidate registry, and the MCP server. Superseded by 0.3.0, which lands the source-rooted
+semantic flow analysis and lifetime/typestate candidates described above.
 
 ## [0.1.7]
 

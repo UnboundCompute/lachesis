@@ -18,12 +18,23 @@ struct ObjectKey {
     generation: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FindingKey {
+    function: String,
+    pattern: String,
+    object: ObjectKey,
+    node: String,
+    line: i64,
+    launch: String,
+    returns: Vec<usize>,
+}
+
 impl ObjectKey {
     fn from_node(node: &lifetime_proto::NativeSemanticNode) -> Option<Self> {
         if node.object_root.is_empty() { return None; }
         Some(Self {
             root: node.object_root.clone(),
-            selectors: node.object_selectors.clone(),
+            selectors: normalized_selectors(&node.object_selectors),
             generation: if node.generation.is_empty() {
                 "g0".to_owned()
             } else {
@@ -34,62 +45,123 @@ impl ObjectKey {
 
 }
 
+fn normalized_selectors(selectors: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        if normalized.last().is_some_and(|prior: &String|
+            matches!((prior.as_str(), selector.as_str()), ("&", "*") | ("*", "&"))) {
+            normalized.pop();
+        } else {
+            normalized.push(selector.clone());
+        }
+    }
+    normalized
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StateKey {
     node: usize,
+    returns: Vec<usize>,
     bindings: Vec<(u32, u32)>,
+    guards: Vec<(String, String)>,
     released: MarkSet,
     origins: MarkSet,
     nulls: MarkSet,
+    nonnull: MarkSet,
+    nullable: MarkSet,
     uninitialized: MarkSet,
     pointer_arithmetic: MarkSet,
     escaped: MarkSet,
     realloc_lost: MarkSet,
 }
 
-/// Dense local object-id set used by the matcher worklist. Object handles are
-/// assigned per function, so a bitset avoids sorting/deduplicating/cloning
-/// vectors of u32 on every CFG transfer while retaining deterministic hashing.
+#[derive(Clone, Copy)]
+struct TraceStep {
+    node: usize,
+    parent: Option<usize>,
+}
+
+fn trace_witness(
+    traces: &[TraceStep], current: usize,
+    nodes: &[lifetime_proto::NativeSemanticNode],
+) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        let step = traces[index];
+        output.push(nodes[step.node].id.clone());
+        cursor = step.parent;
+    }
+    output.reverse();
+    output
+}
+
+/// Canonical sparse object-id set used by the matcher worklist.  Stitched
+/// graphs have a large global object universe, while each path usually marks
+/// only a few objects.  Keeping sorted handles avoids cloning a dense bitset
+/// sized to every object in every worklist state and retains deterministic
+/// hashing/equality.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct MarkSet(Vec<u64>);
+struct MarkSet(Vec<u32>);
 
 impl MarkSet {
-    fn empty(object_count: usize) -> Self {
-        Self(vec![0; object_count.div_ceil(64)])
+    fn empty(_object_count: usize) -> Self {
+        Self(Vec::new())
     }
 
     #[inline]
     fn contains(&self, value: u32) -> bool {
-        let word = (value / 64) as usize;
-        word < self.0.len() && self.0[word] & (1u64 << (value % 64)) != 0
+        self.0.binary_search(&value).is_ok()
     }
 
     #[inline]
     fn insert(&mut self, value: u32) {
-        let word = (value / 64) as usize;
-        if let Some(bits) = self.0.get_mut(word) {
-            *bits |= 1u64 << (value % 64);
+        if let Err(index) = self.0.binary_search(&value) {
+            self.0.insert(index, value);
         }
     }
 
     #[inline]
     fn remove(&mut self, value: u32) {
-        let word = (value / 64) as usize;
-        if let Some(bits) = self.0.get_mut(word) {
-            *bits &= !(1u64 << (value % 64));
+        if let Ok(index) = self.0.binary_search(&value) {
+            self.0.remove(index);
         }
     }
 
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.iter().enumerate().flat_map(|(word, bits)| {
-            let mut bits = *bits;
-            std::iter::from_fn(move || {
-                if bits == 0 { return None; }
-                let bit = bits.trailing_zeros();
-                bits &= bits - 1;
-                Some((word as u32) * 64 + bit)
-            })
-        })
+        self.0.iter().copied()
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        let mut values = self.0.clone();
+        for value in other.iter() {
+            if let Err(index) = values.binary_search(&value) { values.insert(index, value); }
+        }
+        Self(values)
+    }
+}
+
+fn join_loop_states(left: &StateKey, right: &StateKey) -> StateKey {
+    let mut bindings = left.bindings.clone();
+    for (source, target) in &right.bindings {
+        if bindings.iter().all(|(existing, _)| existing != source) {
+            bindings.push((*source, *target));
+        }
+    }
+    bindings.sort_unstable();
+    let guards = left.guards.iter().filter(|guard| right.guards.contains(guard))
+        .cloned().collect();
+    StateKey {
+        node: right.node, returns: right.returns.clone(), bindings, guards,
+        released: left.released.union(&right.released),
+        origins: left.origins.union(&right.origins),
+        nulls: left.nulls.union(&right.nulls),
+        nonnull: left.nonnull.union(&right.nonnull),
+        nullable: left.nullable.union(&right.nullable),
+        uninitialized: left.uninitialized.union(&right.uninitialized),
+        pointer_arithmetic: left.pointer_arithmetic.union(&right.pointer_arithmetic),
+        escaped: left.escaped.union(&right.escaped),
+        realloc_lost: left.realloc_lost.union(&right.realloc_lost),
     }
 }
 
@@ -107,17 +179,112 @@ fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
     value
 }
 
+/// Rebase the field descendants of a local binding `source := target`, mirroring
+/// the interprocedural seam field-prefix rebase: binding `a := b` must also make
+/// `a.f`, `a->f`, `a[..]` resolve to `b.f`, `b->f`, `b[..]`, so a free/use seen
+/// through one field-alias spelling is not lost through another. `prefix_children`
+/// is precomputed once per function; here we only format the target label and do
+/// an integer id lookup, keeping the worklist cheap.
+fn compose_prefix_bindings(
+    source: u32, target: u32,
+    prefix_children: &[Vec<(u32, String)>],
+    object_labels: &[String],
+    objects_by_label: &HashMap<&str, Vec<u32>>,
+    objects: &[ObjectKey],
+    out: &mut Vec<(u32, u32)>,
+) {
+    for (descendant, suffix) in &prefix_children[source as usize] {
+        let target_label = format!("{}{}", object_labels[target as usize], suffix);
+        let Some(targets) = objects_by_label.get(target_label.as_str()) else { continue };
+        let generation = &objects[*descendant as usize].generation;
+        if let Some(mapped) = targets.iter().copied()
+            .find(|candidate| objects[*candidate as usize].generation == *generation)
+            .or_else(|| targets.iter().copied()
+                .find(|candidate| objects[*candidate as usize].generation == "g0")) {
+            out.push((*descendant, mapped));
+        }
+    }
+}
+
+fn value_constraint(value: &str) -> Option<(&str, &str, &str)> {
+    for operator in ["<=", ">=", "==", "!=", "<", ">"] {
+        if let Some(index) = value.find(operator) {
+            return Some((&value[..index], operator, &value[index + operator.len()..]));
+        }
+    }
+    None
+}
+
+fn contradictory_value(left: &str, right: &str) -> bool {
+    let (Some((left_value, left_op, left_rhs)), Some((right_value, right_op, right_rhs))) =
+        (value_constraint(left), value_constraint(right)) else { return false };
+    if left_value != right_value { return false; }
+    if left_op == "==" && right_op == "==" { return left_rhs != right_rhs; }
+    if matches!((left_op, right_op), ("==", "!=") | ("!=", "==")) {
+        return left_rhs == right_rhs;
+    }
+    matches!((left_op, right_op),
+        ("<", ">=") | (">=", "<") | (">", "<=") | ("<=", ">"))
+}
+
+fn escaped_reaches(
+    value: u32, escaped: &MarkSet, objects: &[ObjectKey], bindings: &[(u32, u32)],
+) -> bool {
+    let value = canonical(value, bindings);
+    let object = &objects[value as usize];
+    escaped.iter().map(|root| canonical(root, bindings)).any(|root| {
+        let root = &objects[root as usize];
+        root.root == object.root && root.generation == object.generation
+            && object.selectors.starts_with(&root.selectors)
+    })
+}
+
+fn has_surviving_alias(value: u32, bindings: &[(u32, u32)]) -> bool {
+    let value = canonical(value, bindings);
+    bindings.iter().any(|(alias, _)| *alias != value && canonical(*alias, bindings) == value)
+}
+
+fn object_label(object: &ObjectKey) -> String {
+    format!("{}{}", object.root.strip_prefix("decl:").unwrap_or(&object.root),
+            object.selectors.join(""))
+}
+
+fn selector_suffix<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = label.strip_prefix(prefix)?;
+    if suffix.is_empty() || matches!(suffix.as_bytes()[0], b'-' | b'.' | b'[' | b'*' | b'&') {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
+fn generation_rank(generation: &str) -> u64 {
+    generation.strip_prefix('g')
+        .and_then(|value| value.split('@').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
 fn add_finding(
-    output: &mut HashMap<(String, String, String, i64), lifetime_proto::NativeTemporalFinding>,
+    output: &mut HashMap<FindingKey, lifetime_proto::NativeTemporalFinding>,
     function: &str,
     pattern: &str,
     object: &ObjectKey,
     node: &lifetime_proto::NativeSemanticNode,
+    witness_nodes: &[String],
+    returns: &[usize],
+    guards: &[lifetime_proto::GuardProof],
 ) {
+    let owner = if node.function.is_empty() { function } else { node.function.as_str() };
     let line = if node.has_line { node.line } else { 0 };
-    let key = (function.to_owned(), pattern.to_owned(), node.id.clone(), line);
+    let key = FindingKey {
+        function: owner.to_owned(), pattern: pattern.to_owned(), object: object.clone(),
+        node: node.id.clone(), line,
+        launch: witness_nodes.first().cloned().unwrap_or_default(),
+        returns: returns.to_vec(),
+    };
     output.entry(key).or_insert_with(|| lifetime_proto::NativeTemporalFinding {
-        function: function.to_owned(),
+        function: owner.to_owned(),
         pattern: pattern.to_owned(),
         path: Some(lifetime_proto::Path {
             root: object.root.clone(),
@@ -126,7 +293,63 @@ fn add_finding(
         line,
         has_line: node.has_line,
         node: node.id.clone(),
+        // This is the exact matcher-state path, including call/return seams.
+        // Source-taint provenance is retained separately below; substituting
+        // it here would mislabel a value-flow proof as the temporal witness.
+        witness_nodes: witness_nodes.to_vec(),
+        witness_complete: !witness_nodes.is_empty(),
+        source_witness_nodes: node.source_witness_nodes.clone(),
+        source_reachable: node.source_reachable,
+        source_influenced: if !node.source_witness_nodes.is_empty() {
+            Some(true)
+        } else {
+            node.source_reachable.map(|_| false)
+        },
+        // Temporal guards are path evidence, not proof that the lifetime
+        // obligation was discharged. The old matcher therefore retained the
+        // predicates while keeping `guarded=false` for emitted findings.
+        guards: guards.to_vec(),
+        guarded: false,
+        family: String::new(), pattern_id: String::new(), evaluator: String::new(), tier: 0,
     });
+}
+
+fn cfg_witnesses(
+    function: &lifetime_proto::NativeSemanticFunction,
+    outgoing: &[Vec<usize>],
+    entry: usize,
+) -> Vec<Vec<String>> {
+    // Compute one real CFG path per node after the compact event graph has
+    // been built.  Keep only predecessor indices during the walk so the
+    // common case does not retain a path vector in every worklist state.
+    let mut predecessor = vec![None; function.nodes.len()];
+    let mut queue = VecDeque::from([entry]);
+    let mut visited = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
+    visited.insert(entry);
+    while let Some(source) = queue.pop_front() {
+        for &target in &outgoing[source] {
+            if visited.insert(target) {
+                predecessor[target] = Some(source);
+                queue.push_back(target);
+            }
+        }
+    }
+    (0..function.nodes.len()).map(|target| {
+        let mut path = Vec::new();
+        let mut current = Some(target);
+        while let Some(index) = current {
+            path.push(function.nodes[index].id.clone());
+            current = predecessor[index];
+        }
+        path.reverse();
+        // A node outside the entry-reachable CFG has no witness.  Do not
+        // manufacture a partial path for it.
+        if path.first().is_some_and(|id| id == &function.nodes[entry].id) {
+            path
+        } else {
+            Vec::new()
+        }
+    }).collect()
 }
 
 fn match_function(
@@ -146,16 +369,34 @@ fn match_function(
         by_id.insert(node.id.as_str(), index);
     }
     let mut outgoing = vec![Vec::new(); function.nodes.len()];
+    // Keep the metadata needed by seam traversal beside the adjacency entry.
+    // Looking it up by scanning `function.edges` inside the state worklist made
+    // stitched matching O(states * edges) on large functions/stitched graphs.
+    let mut guarded_outgoing: Vec<Vec<(
+        usize,
+        Vec<lifetime_proto::GuardProof>,
+        Vec<lifetime_proto::NativeSeamBinding>,
+        String,
+        String,
+    )>> = vec![Vec::new(); function.nodes.len()];
     for edge in &function.edges {
         if let (Some(source), Some(target)) = (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str())) {
             outgoing[*source].push(*target);
+            guarded_outgoing[*source].push((
+                *target,
+                edge.guards.clone(),
+                edge.bindings.clone(),
+                edge.seam_kind.clone(),
+                edge.return_to.clone(),
+            ));
         }
     }
-    let entry = by_id.get(function.entry.as_str()).copied().unwrap_or(0);
+    let entry = by_id.get(function.entry.as_str()).copied();
+    let entry_missing = entry.is_none();
+    let entry = entry.unwrap_or(0);
     let exits: HashSet<usize> = function.exits.iter()
         .filter_map(|id| by_id.get(id.as_str()).copied())
         .collect();
-
     // Intern object identities once.  The old representation put five cloned
     // ObjectKey vectors into every worklist state; on branch-heavy functions
     // that made state hashing and transfer cloning dominate the actual event
@@ -168,7 +409,7 @@ fn match_function(
     for (index, node) in function.nodes.iter().enumerate() {
         let value_object = (!node.value_root.is_empty()).then(|| ObjectKey {
             root: node.value_root.clone(),
-            selectors: node.value_selectors.clone(),
+            selectors: normalized_selectors(&node.value_selectors),
             generation: if node.generation.is_empty() { "g0".to_owned() }
                         else { node.generation.clone() },
         });
@@ -186,63 +427,150 @@ fn match_function(
             else { node_value_ids[index] = Some(id); }
         }
     }
+    let object_labels: Vec<String> = objects.iter().map(object_label).collect();
+    let mut objects_by_label: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (index, label) in object_labels.iter().enumerate() {
+        objects_by_label.entry(label.as_str()).or_default().push(index as u32);
+    }
+    // Precompute the field descendants of every object, grouped by root so two
+    // unrelated variables can never compose (REF's `base == base` gate). This is
+    // the local counterpart of the seam field-prefix rebase compiled below; a
+    // local binding then reuses it to rebase `a.f`->`b.f` when `a := b` is seen.
+    let mut objects_by_root: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (index, object) in objects.iter().enumerate() {
+        objects_by_root.entry(object.root.as_str()).or_default().push(index as u32);
+    }
+    let mut prefix_children: Vec<Vec<(u32, String)>> = vec![Vec::new(); objects.len()];
+    for group in objects_by_root.values() {
+        for &source in group {
+            let source_label = object_labels[source as usize].as_str();
+            for &descendant in group {
+                if descendant == source { continue; }
+                if let Some(suffix) = selector_suffix(&object_labels[descendant as usize], source_label) {
+                    if !suffix.is_empty() {
+                        prefix_children[source as usize].push((descendant, suffix.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    // Compile exact and field-prefix seam rebases once. The old matcher
+    // composed the unmatched selector suffix (formal->field => actual->field);
+    // doing that inside the worklist multiplied string scans by every state.
+    let mut expanded_seam_bindings: HashMap<String, Vec<(u32, u32)>> = HashMap::default();
+    for edge in &function.edges {
+        for binding in &edge.bindings {
+            for encoded in &binding.formal_to_actual {
+                if expanded_seam_bindings.contains_key(encoded) { continue; }
+                let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue };
+                let formal = formal.strip_prefix("decl:").unwrap_or(formal);
+                let actual = actual.strip_prefix("decl:").unwrap_or(actual);
+                let mut pairs = Vec::new();
+                for (source, label) in object_labels.iter().enumerate() {
+                    let Some(suffix) = selector_suffix(label, formal) else { continue };
+                    let target_label = format!("{actual}{suffix}");
+                    let Some(targets) = objects_by_label.get(target_label.as_str()) else { continue };
+                    let source_generation = &objects[source].generation;
+                    if let Some(target) = targets.iter().copied().find(|target|
+                        objects[*target as usize].generation == *source_generation)
+                        .or_else(|| targets.iter().copied().find(|target|
+                            objects[*target as usize].generation == "g0")) {
+                        pairs.push((source as u32, target));
+                    }
+                }
+                pairs.sort_unstable();
+                pairs.dedup();
+                expanded_seam_bindings.insert(encoded.clone(), pairs);
+            }
+        }
+    }
 
     let empty = MarkSet::empty(objects.len());
     let mut queue = VecDeque::from([(
-        entry,
+        entry, None::<usize>, Vec::<usize>::new(),
         Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
-        empty.clone(), empty.clone(), empty.clone(), empty,
+        empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
+        Vec::<lifetime_proto::GuardProof>::new(),
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
+    let mut traces = Vec::new();
+    let mut loop_buckets: HashMap<(usize, Vec<usize>), Vec<StateKey>> = HashMap::default();
     let mut transfers = 0u64;
+    let mut widenings = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
-    const MAX_STATES: usize = 1_000_000;
+    const MAX_STATES: usize = 200_000;
 
-    while let Some((index, mut bindings, mut released, mut origins, mut nulls,
-                    mut uninitialized, mut pointer_arithmetic, mut escaped,
-                    mut realloc_lost)) = queue.pop_front() {
+    while let Some((index, parent_trace, returns, mut bindings, mut released, mut origins, mut nulls,
+                    mut nonnull, mut nullable, mut uninitialized, mut pointer_arithmetic, mut escaped,
+                    mut realloc_lost, mut path_guards)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
         bindings.sort_unstable();
         bindings.dedup();
         let state = StateKey {
-            node: index, bindings: bindings.clone(), released: released.clone(), origins: origins.clone(),
-            nulls: nulls.clone(), uninitialized: uninitialized.clone(),
+            node: index, returns: returns.clone(), bindings: bindings.clone(),
+            guards: path_guards.iter().map(|guard| (guard.kind.clone(), guard.value.clone())).collect(),
+            released: released.clone(), origins: origins.clone(),
+            nulls: nulls.clone(), nonnull: nonnull.clone(), nullable: nullable.clone(),
+            uninitialized: uninitialized.clone(),
             pointer_arithmetic: pointer_arithmetic.clone(), escaped: escaped.clone(),
             realloc_lost: realloc_lost.clone(),
         };
         if !seen.insert(state) { continue; }
+        let trace = traces.len();
+        traces.push(TraceStep { node: index, parent: parent_trace });
         let node = &function.nodes[index];
+        let witness_storage = trace_witness(&traces, trace, &function.nodes);
+        let witness = witness_storage.as_slice();
+        if node.event_kind == "LOOP" {
+            // Predicates from one iteration are not stable facts for the
+            // next. The old matcher clears them at its loop-widening boundary.
+            path_guards.clear();
+        }
         let raw_object_id = node_object_ids[index];
         let object_id = raw_object_id.map(|value| canonical(value, &bindings));
         let value_id = node_value_ids[index].map(|value| canonical(value, &bindings));
         match node.event_kind.as_str() {
             "DERIVE" => if let (Some(target), Some(value)) = (raw_object_id, value_id) {
-                bindings.retain(|(source, _)| *source != target);
+                // Rebinding `target` also drops the stale aliases of its field
+                // descendants before rebasing them onto `value`, so each source
+                // keeps a single canonical target.
+                bindings.retain(|(source, _)| *source != target
+                    && !prefix_children[target as usize].iter().any(|(child, _)| *child == *source));
                 bindings.push((target, value));
+                compose_prefix_bindings(target, value, &prefix_children, &object_labels,
+                                        &objects_by_label, &objects, &mut bindings);
+                uninitialized.remove(target);
                 if node.access == "aggregate-copy" {
                     add_finding(&mut findings, &function.id, "aggregate-copy-alias",
-                                &objects[target as usize], node);
+                                &objects[target as usize], node, witness, &returns, &path_guards);
                 }
             },
             "ORIGIN" => if let Some(object) = object_id {
                 released.remove(object);
-                nulls.remove(object);
+                nulls.remove(raw_object_id.unwrap_or(object));
+                if node.access == "return-may-null" {
+                    nullable.insert(object);
+                    nonnull.remove(object);
+                } else {
+                    nullable.remove(object);
+                    nonnull.insert(object);
+                }
                 uninitialized.remove(object);
                 escaped.remove(object);
                 realloc_lost.remove(object);
                 origins.insert(object);
             },
-            "RELEASE" => if let Some(object) = object_id {
+            "RELEASE" | "memory.free" => if let Some(object) = object_id {
                 // A release through a slot proven to contain null is a no-op.
                 // Keep this check before adding the object to the released set;
                 // otherwise a later valid release would be misclassified.
-                if !nulls.contains(object) {
+                if !raw_object_id.is_some_and(|slot| nulls.contains(slot)) {
                     if released.contains(object) {
                         add_finding(&mut findings, &function.id, "double-free",
-                                    &objects[object as usize], node);
+                                    &objects[object as usize], node, witness, &returns, &path_guards);
                     }
                     released.insert(object);
                 }
@@ -257,44 +585,80 @@ fn match_function(
                 escaped.insert(object);
             },
             "LOST_FROM_SLOT" => if let Some(object) = object_id {
-                nulls.insert(object);
+                nulls.insert(raw_object_id.unwrap_or(object));
                 realloc_lost.insert(object);
             },
-            "READ_STORAGE" | "WRITE_STORAGE" => if let Some(object) = object_id {
+            "READ_STORAGE" | "memory.deref" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
-                if nulls.contains(object) {
+                if raw_object_id.is_some_and(|slot| nulls.contains(slot)) {
                     add_finding(&mut findings, &function.id, "null-deref",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
+                }
+                if nullable.contains(object) && !nonnull.contains(object) {
+                    add_finding(&mut findings, &function.id, "unchecked-return-deref",
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if pointer_arithmetic.contains(object) {
                     add_finding(&mut findings, &function.id,
                                 "pointer-arithmetic-before-validation",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
+                }
+            },
+            "WRITE_STORAGE" => if let Some(object) = object_id {
+                if released.contains(object) {
+                    add_finding(&mut findings, &function.id, "uaf.deref",
+                                &objects[object as usize], node, witness, &returns, &path_guards);
+                }
+                if raw_object_id.is_some_and(|slot| nulls.contains(slot)) {
+                    add_finding(&mut findings, &function.id, "null-deref",
+                                &objects[object as usize], node, witness, &returns, &path_guards);
+                }
+                if uninitialized.contains(object) {
+                    add_finding(&mut findings, &function.id,
+                                "uninitialized-use", &objects[object as usize], node, witness,
+                                &returns, &path_guards);
+                }
+                if let Some(value) = value_id {
+                    let slot = raw_object_id.unwrap_or(object);
+                    bindings.retain(|(source, _)| *source != slot
+                        && !prefix_children[slot as usize].iter().any(|(child, _)| *child == *source));
+                    bindings.push((slot, value));
+                    compose_prefix_bindings(slot, value, &prefix_children, &object_labels,
+                                            &objects_by_label, &objects, &mut bindings);
+                    nulls.remove(slot);
+                    uninitialized.remove(slot);
                 }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "use.dangling",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if node.event_kind == "RETURN_VALUE" && node.stack_local {
                     add_finding(&mut findings, &function.id, "use-after-return",
-                                &objects[object as usize], node);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
+                }
+                if node.event_kind == "RETURN_VALUE" {
+                    escaped.insert(object);
                 }
             },
-            "WRITE_STORAGE_NULL" => if let Some(object) = object_id {
-                nulls.insert(object);
+            "WRITE_STORAGE_NULL" => if let Some(slot) = raw_object_id {
+                // Null is a value in this storage slot. Aliases captured from
+                // its former pointee remain valid independent identities.
+                bindings.retain(|(source, _)| *source != slot);
+                nulls.insert(slot);
+                nonnull.remove(slot);
             },
             "UNINITIALIZED" => if let Some(object) = object_id {
                 uninitialized.insert(object);
@@ -307,25 +671,172 @@ fn match_function(
         if exits.contains(&index) {
             for object in realloc_lost.iter() {
                 if !released.contains(object)
-                    && !escaped.contains(object)
+                    && !escaped_reaches(object, &escaped, &objects, &bindings)
+                    && !has_surviving_alias(object, &bindings)
                 {
                     add_finding(&mut findings, &function.id,
-                                "realloc-failure-leak", &objects[object as usize], node);
+                                "mem.lifetime.realloc-failure-leak",
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
             }
-            for object in origins.iter() {
-                if !released.contains(object)
-                    && !escaped.contains(object)
-                {
-                    add_finding(&mut findings, &function.id, "leak",
-                                &objects[object as usize], node);
+            if returns.is_empty() {
+                for object in origins.iter() {
+                    if !released.contains(object)
+                        && !escaped_reaches(object, &escaped, &objects, &bindings)
+                        && !has_surviving_alias(object, &bindings)
+                    {
+                        add_finding(&mut findings, &function.id, "leak",
+                                    &objects[object as usize], node, witness, &returns, &path_guards);
+                    }
                 }
             }
         }
-        for target in &outgoing[index] {
-            queue.push_back((*target, bindings.clone(), released.clone(), origins.clone(), nulls.clone(),
-                             uninitialized.clone(), pointer_arithmetic.clone(), escaped.clone(),
-                             realloc_lost.clone()));
+        for (target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
+            let mut next_returns = returns.clone();
+            if seam_kind == "call" {
+                if !return_to.is_empty() {
+                    let Some(continuation) = by_id.get(return_to.as_str()).copied() else {
+                        continue;
+                    };
+                    next_returns.push(continuation);
+                }
+            } else if seam_kind == "return" {
+                let Some(continuation) = next_returns.pop() else { continue };
+                if continuation != *target { continue; }
+            }
+            let mut next_bindings = bindings.clone();
+            for binding in seam_bindings {
+                for encoded in &binding.formal_to_actual {
+                    if let Some(pairs) = expanded_seam_bindings.get(encoded) {
+                        next_bindings.extend(pairs.iter().copied());
+                    }
+                }
+            }
+            let mut returned_slot_binding = None;
+            if seam_kind == "return" && !return_to.is_empty() {
+                if let (Some(source), Some(target_object)) = (
+                    node_object_ids[index],
+                    object_labels.iter().position(|label|
+                        label == return_to.strip_prefix("decl:").unwrap_or(return_to)),
+                ) {
+                    // A returned value is assigned in the caller. Keep
+                    // canonicalization pointed from that caller-side
+                    // destination to the callee-side returned object so
+                    // released/escaped state follows the returned value.
+                    next_bindings.push((target_object as u32, source));
+                    returned_slot_binding = Some((target_object as u32, source));
+                }
+            }
+            next_bindings.sort_unstable();
+            next_bindings.dedup();
+            let mut next_nulls = nulls.clone();
+            let mut next_nonnull = nonnull.clone();
+            let mut next_nullable = nullable.clone();
+            let mut next_origins = origins.clone();
+            let mut next_escaped = escaped.clone();
+            if let Some((receiver, returned)) = returned_slot_binding {
+                // Null/non-null are storage-slot facts and therefore flow
+                // opposite to the receiver->returned identity binding.
+                if next_nulls.contains(returned) { next_nulls.insert(receiver); }
+                if next_nonnull.contains(returned) { next_nonnull.insert(receiver); }
+                // RETURN_VALUE is an escape from the callee, but after the
+                // seam the caller receiver owns that value. Keeping it in the
+                // escaped set would suppress a genuine caller-side leak.
+                next_escaped.remove(canonical(receiver, &next_bindings));
+            }
+            let mut next_guards = path_guards.clone();
+            let mut contradiction = false;
+            for guard in guards {
+                if guard.kind == "VALUE" {
+                    if next_guards.iter().any(|existing|
+                        existing.kind == "VALUE" && contradictory_value(&existing.value, &guard.value)) {
+                        contradiction = true;
+                        break;
+                    }
+                    if !next_guards.iter().any(|item|
+                        item.kind == guard.kind && item.value == guard.value) {
+                        next_guards.push(guard.clone());
+                    }
+                    continue;
+                }
+                let Some((guarded_label, generation)) = guard.value.rsplit_once('#') else { continue };
+                let guarded_label = guarded_label.strip_prefix("decl:").unwrap_or(guarded_label);
+                let mut known = Vec::new();
+                known.extend(origins.iter());
+                known.extend(next_nulls.iter());
+                known.extend(next_nonnull.iter());
+                known.extend(released.iter());
+                known.sort_unstable();
+                known.dedup();
+                let raw_object = known.into_iter().filter(|object|
+                    object_labels[*object as usize] == guarded_label)
+                    .max_by_key(|object| generation_rank(&objects[*object as usize].generation))
+                    .or_else(|| object_labels.iter().enumerate().find(|(index, label)|
+                        label.as_str() == guarded_label
+                            && objects[*index].generation == generation)
+                        .map(|(index, _)| index as u32));
+                let Some(raw_object) = raw_object else { continue };
+                let object = canonical(raw_object, &next_bindings);
+                match guard.kind.as_str() {
+                    "ISNULL" => {
+                        if next_nonnull.contains(object) || next_nonnull.contains(raw_object) {
+                            contradiction = true; break;
+                        }
+                        // This arm disproves the nullable allocation origin.
+                        // Keeping it live would manufacture a leak at the
+                        // failure-arm exit even though no object exists.
+                        next_origins.remove(object);
+                        next_nulls.insert(raw_object);
+                        next_nonnull.remove(object);
+                        next_nonnull.remove(raw_object);
+                        next_nullable.remove(object);
+                    }
+                    "NONNULL" => {
+                        if next_nulls.contains(raw_object) || next_nulls.contains(object) {
+                            contradiction = true; break;
+                        }
+                        next_nonnull.insert(object);
+                        next_nulls.remove(raw_object);
+                        next_nullable.remove(object);
+                    }
+                    _ => {}
+                }
+                if !next_guards.iter().any(|item|
+                    item.kind == guard.kind && item.value == guard.value) {
+                    next_guards.push(guard.clone());
+                }
+            }
+            if !contradiction {
+                let mut next_state = StateKey {
+                    node: *target, returns: next_returns, bindings: next_bindings,
+                    guards: next_guards.iter().map(|guard|
+                        (guard.kind.clone(), guard.value.clone())).collect(),
+                    released: released.clone(), origins: next_origins, nulls: next_nulls,
+                    nonnull: next_nonnull, nullable: next_nullable,
+                    uninitialized: uninitialized.clone(),
+                    pointer_arithmetic: pointer_arithmetic.clone(), escaped: next_escaped,
+                    realloc_lost: realloc_lost.clone(),
+                };
+                if function.nodes[*target].event_kind == "LOOP" {
+                    const LOOP_WIDEN_LIMIT: usize = 32;
+                    let key = (*target, next_state.returns.clone());
+                    let bucket = loop_buckets.entry(key).or_default();
+                    if bucket.len() >= LOOP_WIDEN_LIMIT {
+                        let prior = bucket.remove(0);
+                        next_state = join_loop_states(&prior, &next_state);
+                        widenings += 1;
+                    }
+                    bucket.push(next_state.clone());
+                }
+                let next_path_guards = next_state.guards.iter().map(|(kind, value)|
+                    lifetime_proto::GuardProof { kind: kind.clone(), value: value.clone() })
+                    .collect();
+                queue.push_back((next_state.node, Some(trace), next_state.returns,
+                    next_state.bindings, next_state.released, next_state.origins,
+                    next_state.nulls, next_state.nonnull, next_state.nullable,
+                    next_state.uninitialized, next_state.pointer_arithmetic,
+                    next_state.escaped, next_state.realloc_lost, next_path_guards));
+            }
         }
     }
 
@@ -338,14 +849,29 @@ fn match_function(
         id: function.id.clone(),
         findings,
         transfers,
-        widenings: 0,
-        capped: transfers as usize >= MAX_STATES,
+        widenings,
+        capped: entry_missing || transfers as usize >= MAX_STATES,
     }
 }
 
 pub(crate) fn match_result(
     result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
+    let had_skeletons = !result.skeletons.is_empty();
+    let temporal_skeletons: Vec<_> = result.skeletons.iter()
+        .filter(|skeleton| skeleton.kind != "reach")
+        .cloned()
+        .collect();
+    if had_skeletons {
+        let mut matched = match_skeletons(temporal_skeletons);
+        if !result.complete {
+            for function in &mut matched.functions { function.capped = true; }
+        }
+        return matched;
+    }
+    if !result.seams.is_empty() {
+        return match_stitched_result(result);
+    }
     // Function states are independent. Parallelize the common small-function
     // case, but keep large CFGs serialized so branch-heavy state sets do not
     // multiply peak RSS on large repositories.
@@ -378,8 +904,341 @@ pub(crate) fn match_result(
     for (index, function) in large {
         ordered[index] = Some(match_function(&function));
     }
-    lifetime_proto::NativeTemporalResult {
+    let mut matched = lifetime_proto::NativeTemporalResult {
         functions: ordered.into_iter().flatten().collect(),
+    };
+    if !result.complete {
+        for function in &mut matched.functions { function.capped = true; }
+    }
+    matched
+}
+
+/// Apply the executable Atropos pattern set after native state matching.
+///
+/// The transfer engine intentionally discovers generic semantic facts (for
+/// example a release followed by a dereference).  Atropos owns which of those
+/// facts are enabled for the installation.  Keeping that selection in the
+/// compiled protobuf catalog prevents the Rust engine from growing a second,
+/// product-specific pattern registry.
+pub(crate) fn match_result_with_catalog(
+    mut result: lifetime_proto::NativeSemanticResult,
+    catalog: Option<&crate::atropos_proto::PatternCatalog>,
+) -> lifetime_proto::NativeTemporalResult {
+    let Some(catalog) = catalog else { return match_result(result); };
+    // The Python matcher has two disjoint branches: reach skeletons are
+    // evaluated as one sink fact, while typestate skeletons go through the
+    // path-sensitive temporal automaton.  Passing both kinds to
+    // `match_result` makes a reach sink look like a lifecycle event and can
+    // produce duplicate or spurious temporal findings.
+    let reach_skeletons: Vec<_> = result.skeletons.iter()
+        .filter(|skeleton| skeleton.kind == "reach")
+        .cloned().collect();
+    let sink_graphs: Vec<_> = result.skeletons.iter()
+        .filter(|skeleton| skeleton.kind == "reach-graph")
+        .cloned().collect();
+    result.skeletons.retain(|skeleton|
+        skeleton.kind != "reach" && skeleton.kind != "reach-graph");
+    let mut matched = match_result(result);
+    matched.functions.extend(reach_skeletons.iter().enumerate()
+        .filter_map(|(ordinal, skeleton)| match_reach_skeleton(skeleton, catalog, ordinal)));
+    matched.functions.extend(sink_graphs.iter().enumerate()
+        .filter_map(|(ordinal, skeleton)| match_sink_relations(skeleton, catalog, ordinal)));
+    let enabled: HashSet<&str> = catalog.patterns.iter()
+        .filter_map(|pattern| (!pattern.matcher_pattern.is_empty())
+            .then_some(pattern.matcher_pattern.as_str()))
+        .collect();
+    if enabled.is_empty() { return matched; }
+    for function in &mut matched.functions {
+        function.findings.retain(|finding| enabled.contains(finding.pattern.as_str()));
+        for finding in &mut function.findings {
+            if let Some(pattern) = catalog.patterns.iter()
+                .find(|pattern| pattern.matcher_pattern == finding.pattern) {
+                finding.pattern_id = pattern.id.clone();
+                finding.evaluator = pattern.evaluator.clone();
+                finding.tier = pattern.tier;
+            }
+        }
+    }
+    matched
+}
+
+fn match_sink_relations(
+    skeleton: &lifetime_proto::NativeFlowSkeleton,
+    catalog: &crate::atropos_proto::PatternCatalog,
+    ordinal: usize,
+) -> Option<lifetime_proto::NativeTemporalFunction> {
+    let pattern = catalog.patterns.iter().find(|pattern|
+        pattern.evaluator == "relational"
+            && pattern.requires.iter().any(|required| required == "memory.alloc")
+            && pattern.requires.iter().any(|required| required == "memory.copy"))?;
+    let tokens: HashMap<&str, &lifetime_proto::NativeSkeletonToken> = skeleton.tokens.iter()
+        .map(|token| (token.node.as_str(), token)).collect();
+    let mut findings = Vec::new();
+    for edge in &skeleton.edges {
+        let (Some(allocation), Some(copy)) =
+            (tokens.get(edge.source.as_str()), tokens.get(edge.target.as_str())) else { continue };
+        if allocation.family != "alloc-size"
+            || !matches!(copy.family.as_str(), "buffer-write" | "buffer-size")
+            || allocation.destination.is_empty()
+            || allocation.destination != copy.destination
+            || allocation.size_expression.is_empty()
+            || copy.size_expression.is_empty()
+            || allocation.size_expression == copy.size_expression {
+            continue;
+        }
+        findings.push(lifetime_proto::NativeTemporalFinding {
+            function: skeleton.source_function.clone(),
+            pattern: pattern.matcher_pattern.clone(),
+            path: Some(lifetime_proto::Path { root: copy.destination.clone(), selectors: Vec::new() }),
+            line: copy.line, has_line: copy.has_line, node: copy.node.clone(),
+            witness_nodes: vec![allocation.node.clone(), copy.node.clone()],
+            witness_complete: true,
+            source_witness_nodes: copy.source_witness_nodes.clone(),
+            source_reachable: copy.source_reachable,
+            source_influenced: if !copy.source_witness_nodes.is_empty() {
+                Some(true)
+            } else {
+                copy.source_reachable.map(|_| false)
+            },
+            guards: copy.guards.clone(), guarded: copy.guarded,
+            family: copy.family.clone(), pattern_id: pattern.id.clone(),
+            evaluator: pattern.evaluator.clone(), tier: pattern.tier,
+        });
+    }
+    if findings.is_empty() { return None; }
+    findings.sort_by(|left, right| (&left.node, left.line).cmp(&(&right.node, right.line)));
+    findings.dedup_by(|left, right| left.node == right.node && left.path == right.path);
+    Some(lifetime_proto::NativeTemporalFunction {
+        id: format!("native:sink-graph:{ordinal}:{}", skeleton.entry),
+        findings, transfers: skeleton.edges.len() as u64, widenings: 0,
+        capped: !skeleton.complete,
+    })
+}
+
+/// Evaluate the old Python reach substrate over a binary Claus skeleton.
+/// Pattern IDs and sink families are entirely catalog-owned; these are only
+/// the generic evaluator primitives from flow/patterns.py.
+fn match_reach_skeleton(
+    skeleton: &lifetime_proto::NativeFlowSkeleton,
+    catalog: &crate::atropos_proto::PatternCatalog,
+    ordinal: usize,
+) -> Option<lifetime_proto::NativeTemporalFunction> {
+    let mut findings = Vec::new();
+    for token in &skeleton.tokens {
+        if token.kind != "sink" || token.family.is_empty() { continue; }
+        for pattern in &catalog.patterns {
+            if pattern.matcher_pattern.is_empty() || pattern.evaluator.is_empty() { continue; }
+            if pattern.matcher_families.is_empty()
+                || !pattern.matcher_families.iter().any(|family| family == &token.family) {
+                continue;
+            }
+            // The family's primary recipe routes the ordinary one-fact
+            // evaluator. Independently, every declarative pattern explicitly
+            // bound to this family must be eligible for its generic evaluator;
+            // this is the old evaluate_all second pass and is what lets new
+            // structural patterns ship as catalog data alone.
+            let required_control = pattern.requires.iter()
+                .filter(|required| matches!(required.as_str(), "if" | "else" | "for" |
+                    "while" | "switch" | "case" | "default" | "do"));
+            let controls: Vec<&String> = required_control.collect();
+            if !controls.is_empty()
+                && !controls.iter().any(|required| token.control.contains(required)) {
+                continue;
+            }
+            if !reach_evaluator(&pattern.evaluator, token) { continue; }
+            findings.push(lifetime_proto::NativeTemporalFinding {
+                function: skeleton.source_function.clone(),
+                pattern: pattern.matcher_pattern.clone(),
+                path: Some(lifetime_proto::Path {
+                    root: token.object_root.clone(),
+                    selectors: token.object_selectors.clone(),
+                }),
+                line: token.line,
+                has_line: token.has_line,
+                node: token.node.clone(),
+                witness_nodes: token.source_witness_nodes.clone(),
+                witness_complete: !token.source_witness_nodes.is_empty(),
+                source_witness_nodes: token.source_witness_nodes.clone(),
+                source_reachable: token.source_reachable,
+                source_influenced: if !token.source_witness_nodes.is_empty() {
+                    Some(true)
+                } else {
+                    token.source_reachable.map(|_| false)
+                },
+                guards: token.guards.clone(),
+                guarded: token.guarded,
+                family: token.family.clone(), pattern_id: pattern.id.clone(),
+                evaluator: pattern.evaluator.clone(), tier: pattern.tier,
+            });
+        }
+    }
+    if findings.is_empty() { return None; }
+    findings.sort_by(|left, right| (&left.pattern, &left.node, left.line)
+        .cmp(&(&right.pattern, &right.node, right.line)));
+    Some(lifetime_proto::NativeTemporalFunction {
+        id: format!("native:reach:{ordinal}:{}", skeleton.context),
+        findings,
+        transfers: skeleton.tokens.len() as u64,
+        widenings: 0,
+        capped: !skeleton.complete,
+    })
+}
+
+fn inverted_capacity_predicate(predicate: &str, size: &str) -> bool {
+    let predicate = predicate.replace(' ', "");
+    let mut offset = 0;
+    while let Some(relative) = predicate[offset..].find(size) {
+        let start = offset + relative;
+        let boundary = start == 0 || predicate[..start].chars().next_back()
+            .is_some_and(|character| matches!(character, '(' | '&' | '|' | '!'));
+        let suffix = &predicate[start + size.len()..];
+        if boundary && (suffix.starts_with(">=") || suffix.starts_with('>')) {
+            return true;
+        }
+        offset = start + size.len().max(1);
+    }
+    false
+}
+
+fn reach_evaluator(name: &str, token: &lifetime_proto::NativeSkeletonToken) -> bool {
+    match name {
+        "reachability" => token.tainted,
+        "relational" => token.tainted && token.bound == "unbounded",
+        "presence" => true,
+        "missing-guard" => token.guard_status == "fall-through",
+        "inverted-capacity-guard" => {
+            if !token.tainted || token.size_expression.is_empty() { return false; }
+            let size = token.size_expression.replace(' ', "");
+            token.control.iter().any(|predicate|
+                inverted_capacity_predicate(predicate, &size))
+        }
+        "arithmetic-overflow-guard" => token.tainted && token.guarded
+            && token.control.iter().any(|predicate|
+                predicate.contains('+') && (predicate.contains('<') || predicate.contains("<="))),
+        "allocation-overflow-size" => token.family == "alloc-size" && token.tainted
+            && token.size_expression.contains('*')
+            && token.size_expression.split('*').any(|part|
+                part.chars().any(|character| character.is_ascii_alphabetic() || character == '_')),
+        "typestate" => false,
+        _ => false,
+    }
+}
+
+fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
+    -> lifetime_proto::NativeTemporalResult
+{
+    let complete = result.complete;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut exits = Vec::new();
+    let entry = "native:stitched:event-entry".to_owned();
+    let callee_ids: HashSet<String> = result.seams.iter()
+        .filter(|edge| edge.seam_kind == "call")
+        .map(|edge| edge.callee.clone()).collect();
+    for function in result.functions {
+        if function.nodes.is_empty() { continue; }
+        exits.extend(function.exits.iter().cloned());
+        if !callee_ids.contains(&function.id) {
+            edges.push(lifetime_proto::NativeSemanticEdge {
+                source: entry.clone(), target: function.entry.clone(), kind: "normal".into(),
+                ..Default::default()
+            });
+        }
+        nodes.extend(function.nodes);
+        edges.extend(function.edges);
+    }
+    nodes.push(lifetime_proto::NativeSemanticNode {
+        id: entry.clone(), event_kind: String::new(), ..Default::default()
+    });
+    edges.extend(result.seams);
+    let function = lifetime_proto::NativeSemanticFunction {
+        id: "native:stitched".into(), entry, exits, nodes, edges,
+        language: "mixed".into(), source_launch_nodes: Vec::new(),
+        parameter_roots: Vec::new(),
+    };
+    let mut matched = match_function(&function);
+    matched.capped |= !complete;
+    lifetime_proto::NativeTemporalResult { functions: vec![matched] }
+}
+
+fn skeleton_event_kind(family: &str, token_kind: &str) -> String {
+    if token_kind == "control" || family == "control" { return String::new(); }
+    match family {
+        "memory.alloc" | "lifecycle.acquire" => "ORIGIN".into(),
+        "memory.free" | "lifecycle.release" => "memory.free".into(),
+        "memory.deref" | "lifecycle.use" => "memory.deref".into(),
+        "lifecycle.escape" => "ESCAPE".into(),
+        "lifecycle.invalidate" => "INVALIDATE".into(),
+        "lifecycle.derive" => "DERIVE".into(),
+        "lifecycle.return" => "RETURN_VALUE".into(),
+        "lifecycle.pointer_arithmetic" => "POINTER_ARITHMETIC".into(),
+        "lifecycle.uninitialized" => "UNINITIALIZED".into(),
+        _ => family.to_owned(),
+    }
+}
+
+/// Convert one binary Claus skeleton back into the compact native matcher
+/// representation.  This is an in-process Rust projection: it does not cross
+/// Python, serialize JSON, or reopen the graph.  Anchors retained by the
+/// skeleton keep the original branch and seam edges intact.
+fn match_skeleton(
+    skeleton: &lifetime_proto::NativeFlowSkeleton,
+    ordinal: usize,
+) -> Option<lifetime_proto::NativeTemporalFunction> {
+    let mut nodes = Vec::new();
+    let mut seen = HashSet::default();
+    for token in &skeleton.tokens {
+        if token.node.is_empty() || !seen.insert(token.node.clone()) { continue; }
+        nodes.push(lifetime_proto::NativeSemanticNode {
+            id: token.node.clone(), function: token.function.clone(),
+            event_kind: if token.event_kind.is_empty() {
+                skeleton_event_kind(&token.family, &token.kind)
+            } else {
+                token.event_kind.clone()
+            },
+            object_root: token.object_root.clone(), object_selectors: token.object_selectors.clone(),
+            generation: if token.generation.is_empty() { "g0".into() } else { token.generation.clone() },
+            line: token.line, has_line: token.has_line,
+            anchor: token.node.clone(), source_witness_nodes: token.source_witness_nodes.clone(),
+            source_reachable: token.source_reachable, stack_local: token.stack_local,
+            is_null: token.is_null, access: token.access.clone(),
+            value_root: token.value_root.clone(), value_selectors: token.value_selectors.clone(),
+            ..Default::default()
+        });
+    }
+    if nodes.is_empty() { return None; }
+    let node_ids: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let mut edges = Vec::new();
+    let mut edge_keys = HashSet::default();
+    for edge in &skeleton.edges {
+        if !node_ids.contains(edge.source.as_str()) || !node_ids.contains(edge.target.as_str()) {
+            continue;
+        }
+        let key = (&edge.source, &edge.target, &edge.kind, &edge.seam_kind, &edge.return_to);
+        if edge_keys.insert(key) { edges.push(edge.clone()); }
+    }
+    let outgoing: HashSet<&str> = edges.iter().map(|edge| edge.source.as_str()).collect();
+    let entry = nodes.iter().find(|node| node.function == skeleton.entry)
+        .or_else(|| nodes.first()).map(|node| node.id.clone())?;
+    let mut exits: Vec<String> = nodes.iter().filter(|node| !outgoing.contains(node.id.as_str()))
+        .map(|node| node.id.clone()).collect();
+    if exits.is_empty() { exits.push(nodes.last()?.id.clone()); }
+    let mut matched = match_function(&lifetime_proto::NativeSemanticFunction {
+        id: format!("native:skeleton:{ordinal}:{}", skeleton.context),
+        entry, exits, nodes, edges, language: String::new(), source_launch_nodes: Vec::new(),
+        parameter_roots: Vec::new(),
+    });
+    matched.capped |= !skeleton.complete;
+    Some(matched)
+}
+
+fn match_skeletons(
+    skeletons: Vec<lifetime_proto::NativeFlowSkeleton>,
+) -> lifetime_proto::NativeTemporalResult {
+    lifetime_proto::NativeTemporalResult {
+        functions: skeletons.iter().enumerate()
+            .filter_map(|(ordinal, skeleton)| match_skeleton(skeleton, ordinal))
+            .collect(),
     }
 }
 
@@ -395,6 +1254,7 @@ mod tests {
             line, has_line: true, anchor: id.to_owned(), stack_local: false,
             is_null: false, access: String::new(), value_root: String::new(),
             value_selectors: Vec::new(),
+            source_witness_nodes: Vec::new(), source_reachable: None,
         }
     }
 
@@ -403,11 +1263,13 @@ mod tests {
     {
         let ids: Vec<String> = nodes.iter().map(|item| item.id.clone()).collect();
         let edges = ids.windows(2).map(|pair| lifetime_proto::NativeSemanticEdge {
-            source: pair[0].clone(), target: pair[1].clone(), kind: "normal".to_owned(),
+            source: pair[0].clone(), target: pair[1].clone(), kind: "normal".to_owned(), guards: Vec::new(),
+            ..Default::default()
         }).collect();
         lifetime_proto::NativeSemanticFunction {
             id: "f".to_owned(), entry: ids[0].clone(), exits: vec![ids[ids.len() - 1].clone()],
-            nodes, edges, language: "c".to_owned(),
+            nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
+            parameter_roots: Vec::new(),
         }
     }
 
@@ -418,10 +1280,150 @@ mod tests {
                                              node("r1", "RELEASE", 2),
                                              node("r2", "RELEASE", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "double-free");
         assert_eq!(result.functions[0].findings[0].line, 3);
+    }
+
+    #[test]
+    fn fresh_generation_is_not_use_after_free() {
+        let mut reorigin = node("o2", "ORIGIN", 3);
+        reorigin.generation = "g1".into();
+        let mut use_new = node("u2", "READ_STORAGE", 4);
+        use_new.generation = "g1".into();
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("r", "RELEASE", 2),
+                                             reorigin, use_new])],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(!result.functions[0].findings.iter()
+            .any(|finding| finding.pattern == "uaf.deref"));
+    }
+
+    #[test]
+    fn catalog_selects_generic_finding_routes() {
+        let result = lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("r", "memory.free", 2),
+                                             node("u", "memory.deref", 3)])],
+            ..Default::default()
+        };
+        let catalog = crate::atropos_proto::PatternCatalog {
+            patterns: vec![crate::atropos_proto::Pattern {
+                matcher_pattern: "uaf.deref".into(), ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let matched = match_result_with_catalog(result, Some(&catalog));
+        assert_eq!(matched.functions[0].findings.len(), 1);
+        assert_eq!(matched.functions[0].findings[0].pattern, "uaf.deref");
+    }
+
+    #[test]
+    fn matcher_consumes_a_binary_skeleton_lifecycle_path() {
+        let token = |node: &str, family: &str| lifetime_proto::NativeSkeletonToken {
+            kind: "event".into(), function: "source".into(), node: node.into(),
+            family: family.into(), object_root: "p".into(), ..Default::default()
+        };
+        let skeleton = lifetime_proto::NativeFlowSkeleton {
+            kind: "source-rooted".into(), entry: "source".into(), source_function: "source".into(),
+            context: "ctx".into(),
+            complete: true,
+            tokens: vec![token("alloc", "memory.alloc"), token("free", "memory.free"),
+                         token("use", "memory.deref")],
+            edges: vec![
+                lifetime_proto::NativeSemanticEdge { source: "alloc".into(), target: "free".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticEdge { source: "free".into(), target: "use".into(), ..Default::default() },
+            ],
+            is_source: true,
+        };
+        let matched = match_result(lifetime_proto::NativeSemanticResult {
+            skeletons: vec![skeleton], ..Default::default()
+        });
+        assert_eq!(matched.functions.len(), 1);
+        assert_eq!(matched.functions[0].findings.len(), 1);
+        assert_eq!(matched.functions[0].findings[0].pattern, "uaf.deref");
+    }
+
+    #[test]
+    fn matcher_evaluates_catalogued_reach_skeleton_without_function_names() {
+        let catalog = crate::atropos_proto::PatternCatalog {
+            patterns: vec![crate::atropos_proto::Pattern {
+                matcher_pattern: "relational".into(),
+                matcher_families: vec!["buffer-size".into()],
+                evaluator: "relational".into(),
+                ..Default::default()
+            }, crate::atropos_proto::Pattern {
+                matcher_pattern: "mem.copy.in.loop-unbounded".into(),
+                matcher_families: vec!["buffer-size".into()],
+                evaluator: "relational".into(),
+                // This pattern is an in-loop copy: its loop requirement is DATA,
+                // not inferred from the pattern name, so it must not match a sink
+                // whose skeleton carries no loop control.
+                requires: vec!["for".into()],
+                ..Default::default()
+            }, crate::atropos_proto::Pattern {
+                matcher_pattern: "inverted-capacity-guard".into(),
+                matcher_families: vec!["buffer-size".into()],
+                evaluator: "inverted-capacity-guard".into(),
+                ..Default::default()
+            }],
+            kind_evaluator: [("buffer-size".into(), "relational".into())]
+                .into_iter().collect(),
+            ..Default::default()
+        };
+        let skeleton = lifetime_proto::NativeFlowSkeleton {
+            kind: "reach".into(), entry: "source".into(),
+            source_function: "source".into(), context: "__entry__".into(), complete: true,
+            tokens: vec![lifetime_proto::NativeSkeletonToken {
+                kind: "sink".into(), family: "buffer-size".into(),
+                object_root: "input".into(), tainted: true, bound: "unbounded".into(),
+                size_expression: "length".into(),
+                control: vec!["length >= capacity".into()],
+                ..Default::default()
+            }], ..Default::default()
+        };
+        let matched = match_result_with_catalog(
+            lifetime_proto::NativeSemanticResult { skeletons: vec![skeleton], ..Default::default() },
+            Some(&catalog));
+        assert_eq!(matched.functions.len(), 1);
+        assert_eq!(matched.functions[0].findings.len(), 2);
+        assert_eq!(matched.functions[0].findings.iter().map(|finding|
+            finding.pattern.as_str()).collect::<Vec<_>>(),
+            vec!["inverted-capacity-guard", "relational"]);
+    }
+
+    #[test]
+    fn retains_path_guards_without_claiming_temporal_discharge() {
+        let nodes = vec![node("o", "ORIGIN", 1), node("r1", "RELEASE", 2),
+                         node("r2", "RELEASE", 3)];
+        let edges = vec![
+            lifetime_proto::NativeSemanticEdge {
+                source: "o".into(), target: "r1".into(), kind: "normal".into(),
+                ..Default::default()
+            },
+            lifetime_proto::NativeSemanticEdge {
+                source: "r1".into(), target: "r2".into(), kind: "normal".into(),
+                guards: vec![lifetime_proto::GuardProof {
+                    kind: "NONNULL".into(), value: "p#g0".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut function = function(nodes);
+        function.edges = edges;
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function], complete: true, ..Default::default()
+        });
+        let finding = result.functions[0].findings.iter()
+            .find(|finding| finding.pattern == "double-free")
+            .expect("guarded double-free finding");
+        assert!(!finding.guarded);
+        assert_eq!(finding.guards[0].kind, "NONNULL");
     }
 
     #[test]
@@ -431,6 +1433,7 @@ mod tests {
                                              node("r", "RELEASE", 2),
                                              node("u", "READ_STORAGE", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
@@ -444,6 +1447,7 @@ mod tests {
                                              node("i", "INVALIDATE", 2),
                                              node("n", "ORIGIN", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.iter().all(|finding| finding.pattern != "double-free"));
     }
@@ -461,10 +1465,29 @@ mod tests {
                                              node("r", "RELEASE", 3),
                                              use_alias])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
         assert_eq!(result.functions[0].findings[0].line, 4);
+    }
+
+    #[test]
+    fn address_and_dereference_selectors_share_lifetime_identity() {
+        let mut derive = node("derive", "DERIVE", 2);
+        derive.object_root = "alias".to_owned();
+        derive.value_root = "p".to_owned();
+        derive.value_selectors = vec!["&".to_owned(), "*".to_owned()];
+        let mut release = node("release", "RELEASE", 3);
+        release.object_root = "alias".to_owned();
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("origin", "ORIGIN", 1), derive,
+                                             release, node("read", "READ_STORAGE", 4)])],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(result.functions[0].findings.iter().any(|finding|
+            finding.pattern == "uaf.deref" && finding.node == "read"));
     }
 
     #[test]
@@ -473,8 +1496,158 @@ mod tests {
             functions: vec![function(vec![node("n", "WRITE_STORAGE_NULL", 1),
                                              node("r", "RELEASE", 2)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn contradictory_nonnull_guard_prunes_null_release_path() {
+        let nodes = vec![node("n", "WRITE_STORAGE_NULL", 1), node("r", "RELEASE", 2)];
+        let edges = vec![lifetime_proto::NativeSemanticEdge {
+            source: "n".to_owned(),
+            target: "r".to_owned(),
+            kind: "normal".to_owned(),
+            guards: vec![lifetime_proto::GuardProof {
+                kind: "NONNULL".to_owned(), value: "p#g0".to_owned(),
+            }],
+            ..Default::default()
+        }];
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![lifetime_proto::NativeSemanticFunction {
+                id: "f".to_owned(), entry: "n".to_owned(), exits: vec!["r".to_owned()],
+                nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
+                parameter_roots: Vec::new(),
+            }],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn null_guard_removes_a_disproven_nullable_origin() {
+        let mut origin = node("origin", "ORIGIN", 1);
+        origin.access = "return-may-null".to_owned();
+        let nodes = vec![origin, node("exit", "", 2)];
+        let edges = vec![lifetime_proto::NativeSemanticEdge {
+            source: "origin".to_owned(),
+            target: "exit".to_owned(),
+            kind: "normal".to_owned(),
+            guards: vec![lifetime_proto::GuardProof {
+                kind: "ISNULL".to_owned(), value: "p#g0".to_owned(),
+            }],
+            ..Default::default()
+        }];
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![lifetime_proto::NativeSemanticFunction {
+                id: "f".to_owned(), entry: "origin".to_owned(),
+                exits: vec!["exit".to_owned()], nodes, edges,
+                language: "c".to_owned(), source_launch_nodes: Vec::new(),
+                parameter_roots: Vec::new(),
+            }],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn stitches_lifetime_identity_across_a_call_seam() {
+        let mut origin = node("a-origin", "ORIGIN", 1);
+        origin.function = "a".to_owned();
+        origin.object_root = "actual".to_owned();
+        let mut release = node("b-release", "RELEASE", 2);
+        release.function = "b".to_owned();
+        release.object_root = "formal".to_owned();
+        let mut read = node("b-read", "READ_STORAGE", 3);
+        read.function = "b".to_owned();
+        read.object_root = "formal".to_owned();
+        let seam = lifetime_proto::NativeSemanticEdge {
+            source: "a-origin".to_owned(), target: "b-release".to_owned(), kind: "seam".into(),
+            seam_kind: "call".into(), callee: "b".into(),
+            bindings: vec![lifetime_proto::NativeSeamBinding {
+                caller: "a".into(), callee: "b".into(), call_node: "call".into(),
+                formal_to_actual: vec!["formal\u{1f}actual".into()], return_to: String::new(),
+            }],
+            ..Default::default()
+        };
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![
+                lifetime_proto::NativeSemanticFunction {
+                    id: "a".into(), entry: "a-origin".into(), exits: vec!["a-origin".into()],
+                    nodes: vec![origin], edges: Vec::new(), language: "c".into(), source_launch_nodes: Vec::new(),
+                    parameter_roots: Vec::new(),
+                },
+                lifetime_proto::NativeSemanticFunction {
+                    id: "b".into(), entry: "b-release".into(), exits: vec!["b-read".into()],
+                    nodes: vec![release, read],
+                    edges: vec![lifetime_proto::NativeSemanticEdge {
+                        source: "b-release".into(), target: "b-read".into(), kind: "normal".into(),
+                        ..Default::default()
+                    }], language: "c".into(), source_launch_nodes: Vec::new(),
+                    parameter_roots: Vec::new(),
+                },
+            ],
+            complete: true, seams: vec![seam], ..Default::default()
+        });
+        assert!(result.functions[0].findings.iter().any(|finding|
+            finding.pattern == "uaf.deref" && finding.function == "b"),
+            "findings: {:?}", result.functions[0].findings);
+    }
+
+    #[test]
+    fn carries_return_value_identity_back_to_the_caller() {
+        let mut origin = node("a-origin", "ORIGIN", 1);
+        origin.function = "a".into();
+        origin.object_root = "actual".into();
+        let mut release = node("b-release", "RELEASE", 2);
+        release.function = "b".into();
+        release.object_root = "formal".into();
+        let mut returned = node("b-return", "RETURN_VALUE", 3);
+        returned.function = "b".into();
+        returned.object_root = "formal".into();
+        let mut caller_read = node("a-read", "READ_STORAGE", 4);
+        caller_read.function = "a".into();
+        caller_read.object_root = "result".into();
+        let binding = lifetime_proto::NativeSeamBinding {
+            caller: "a".into(), callee: "b".into(), call_node: "call".into(),
+            formal_to_actual: vec!["formal\u{1f}actual".into()], return_to: "result".into(),
+        };
+        let edges = vec![
+            lifetime_proto::NativeSemanticEdge {
+                source: "b-release".into(), target: "b-return".into(), kind: "normal".into(),
+                ..Default::default()
+            },
+            lifetime_proto::NativeSemanticEdge {
+                source: "a-origin".into(), target: "b-release".into(), kind: "seam".into(),
+                seam_kind: "call".into(), callee: "b".into(), return_to: "a-read".into(),
+                bindings: vec![binding.clone()],
+                ..Default::default()
+            },
+            lifetime_proto::NativeSemanticEdge {
+                source: "b-return".into(), target: "a-read".into(), kind: "seam".into(),
+                seam_kind: "return".into(), callee: "a".into(), return_to: "result".into(),
+                bindings: vec![binding], ..Default::default()
+            },
+        ];
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![
+                lifetime_proto::NativeSemanticFunction {
+                    id: "a".into(), entry: "a-origin".into(), exits: vec!["a-read".into()],
+                    nodes: vec![origin, caller_read], edges: Vec::new(), language: "c".into(),
+                    source_launch_nodes: Vec::new(), parameter_roots: Vec::new(),
+                },
+                lifetime_proto::NativeSemanticFunction {
+                    id: "b".into(), entry: "b-release".into(), exits: vec!["b-return".into()],
+                    nodes: vec![release, returned], edges: Vec::new(), language: "c".into(),
+                    source_launch_nodes: Vec::new(), parameter_roots: Vec::new(),
+                },
+            ], complete: true, seams: edges, ..Default::default()
+        });
+        assert!(result.functions[0].findings.iter().any(|finding|
+            finding.pattern == "uaf.deref" && finding.function == "a"),
+            "findings: {:?}", result.functions[0].findings);
     }
 
     #[test]
@@ -486,6 +1659,7 @@ mod tests {
         let result = match_result(lifetime_proto::NativeSemanticResult {
             functions: vec![function(vec![derive])],
             complete: true,
+            ..Default::default()
         });
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "aggregate-copy-alias");
@@ -498,9 +1672,10 @@ mod tests {
                                              node("f", "REALLOC_FAILED", 2),
                                              node("x", "", 3)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.iter()
-            .any(|finding| finding.pattern == "realloc-failure-leak"));
+            .any(|finding| finding.pattern == "mem.lifetime.realloc-failure-leak"));
     }
 
     #[test]
@@ -509,6 +1684,7 @@ mod tests {
             functions: vec![function(vec![node("o", "ORIGIN", 1),
                                              node("e", "ESCAPE", 2)])],
             complete: true,
+            ..Default::default()
         });
         assert!(result.functions[0].findings.is_empty());
     }
