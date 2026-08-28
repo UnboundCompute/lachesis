@@ -404,8 +404,10 @@ pub(crate) fn build(
                     complete,
                     tokens,
                     edges,
-                    is_source: functions.get(region.source_function.as_str())
-                        .is_some_and(|function| !function.source_launch_nodes.is_empty()),
+                    // `pick_regions` has already walked callers to a
+                    // callerless user-defined root. Catalog source launches
+                    // are evidence inside that cone, not the root predicate.
+                    is_source: true,
                 });
             }
         }
