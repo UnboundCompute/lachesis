@@ -34,7 +34,7 @@ impl ObjectKey {
         if node.object_root.is_empty() { return None; }
         Some(Self {
             root: node.object_root.clone(),
-            selectors: node.object_selectors.clone(),
+            selectors: normalized_selectors(&node.object_selectors),
             generation: if node.generation.is_empty() {
                 "g0".to_owned()
             } else {
@@ -43,6 +43,19 @@ impl ObjectKey {
         })
     }
 
+}
+
+fn normalized_selectors(selectors: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        if normalized.last().is_some_and(|prior: &String|
+            matches!((prior.as_str(), selector.as_str()), ("&", "*") | ("*", "&"))) {
+            normalized.pop();
+        } else {
+            normalized.push(selector.clone());
+        }
+    }
+    normalized
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -369,7 +382,7 @@ fn match_function(
     for (index, node) in function.nodes.iter().enumerate() {
         let value_object = (!node.value_root.is_empty()).then(|| ObjectKey {
             root: node.value_root.clone(),
-            selectors: node.value_selectors.clone(),
+            selectors: normalized_selectors(&node.value_selectors),
             generation: if node.generation.is_empty() { "g0".to_owned() }
                         else { node.generation.clone() },
         });
@@ -1388,6 +1401,24 @@ mod tests {
         assert_eq!(result.functions[0].findings.len(), 1);
         assert_eq!(result.functions[0].findings[0].pattern, "uaf.deref");
         assert_eq!(result.functions[0].findings[0].line, 4);
+    }
+
+    #[test]
+    fn address_and_dereference_selectors_share_lifetime_identity() {
+        let mut derive = node("derive", "DERIVE", 2);
+        derive.object_root = "alias".to_owned();
+        derive.value_root = "p".to_owned();
+        derive.value_selectors = vec!["&".to_owned(), "*".to_owned()];
+        let mut release = node("release", "RELEASE", 3);
+        release.object_root = "alias".to_owned();
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("origin", "ORIGIN", 1), derive,
+                                             release, node("read", "READ_STORAGE", 4)])],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(result.functions[0].findings.iter().any(|finding|
+            finding.pattern == "uaf.deref" && finding.node == "read"));
     }
 
     #[test]
