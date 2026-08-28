@@ -125,14 +125,23 @@ pub(crate) fn pick_regions(
         if visited.contains(&source) { continue; }
         let selected = traverse_component(&source, &callees, &callers, &mut visited);
         if selected.is_empty() { continue; }
-        let source_nodes: Vec<String> = selected.iter().flat_map(|name|
-            result.functions.iter().find(|function| function.id == *name)
-                .into_iter().flat_map(|function| function.source_launch_nodes.iter().cloned()))
+        // The random UDF seed is a coverage starting point, not necessarily
+        // the source UDF.  Resolve the source in caller-first traversal order;
+        // this mirrors the old flow's "walk to the source, then launch Claus"
+        // behavior while remaining language/catalog neutral.
+        let source_function = selected.iter().find(|name|
+            result.functions.iter().find(|function| function.id.as_str() == name.as_str())
+                .is_some_and(|function| !function.source_launch_nodes.is_empty()))
+            .cloned().unwrap_or_else(|| source.clone());
+        let source_nodes: Vec<String> = result.functions.iter()
+            .find(|function| function.id == source_function)
+            .into_iter()
+            .flat_map(|function| function.source_launch_nodes.iter().cloned())
             .collect::<BTreeSet<_>>().into_iter().collect();
         let contexts = if source_nodes.is_empty() { vec!["__entry__".to_owned()] }
             else { source_nodes.clone() };
         regions.push(lifetime_proto::NativeSourceRegion {
-            source_function: source,
+            source_function: source_function,
             source_nodes,
             functions: selected,
             contexts,
@@ -160,7 +169,8 @@ mod tests {
                     id: "source".into(), nodes: vec![node("src", "source", Some(true))], ..Default::default()
                 },
                 lifetime_proto::NativeSemanticFunction {
-                    id: "callee".into(), nodes: vec![node("sink", "callee", Some(false))], ..Default::default()
+                    id: "callee".into(), source_launch_nodes: vec!["source-call".into()],
+                    nodes: vec![node("sink", "callee", Some(false))], ..Default::default()
                 },
             ],
             seams: vec![lifetime_proto::NativeSemanticEdge {
@@ -170,6 +180,8 @@ mod tests {
         };
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].source_function, "callee");
+        assert_eq!(regions[0].contexts, vec!["source-call"]);
         assert_eq!(regions[0].functions.iter().collect::<BTreeSet<_>>(),
                    BTreeSet::from([&"source".to_owned(), &"callee".to_owned()]));
     }
