@@ -604,11 +604,16 @@ fn match_function(
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
             let mut next_nullable = nullable.clone();
+            let mut next_escaped = escaped.clone();
             if let Some((receiver, returned)) = returned_slot_binding {
                 // Null/non-null are storage-slot facts and therefore flow
                 // opposite to the receiver->returned identity binding.
                 if next_nulls.contains(returned) { next_nulls.insert(receiver); }
                 if next_nonnull.contains(returned) { next_nonnull.insert(receiver); }
+                // RETURN_VALUE is an escape from the callee, but after the
+                // seam the caller receiver owns that value. Keeping it in the
+                // escaped set would suppress a genuine caller-side leak.
+                next_escaped.remove(canonical(receiver, &next_bindings));
             }
             let mut next_guards = path_guards.clone();
             let mut contradiction = false;
@@ -655,7 +660,7 @@ fn match_function(
             if !contradiction {
                 queue.push_back((*target, Some(trace), next_returns, next_bindings, released.clone(), origins.clone(), next_nulls,
                                  next_nonnull, next_nullable, uninitialized.clone(), pointer_arithmetic.clone(),
-                                 escaped.clone(), realloc_lost.clone(), next_guards));
+                                 next_escaped, realloc_lost.clone(), next_guards));
             }
         }
     }
