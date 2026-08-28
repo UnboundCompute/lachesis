@@ -1813,6 +1813,13 @@ pub(crate) fn semantic_request(
             }
         }
     }
+    let mut internal_call_anchors: HashMap<String, HashSet<String>> = HashMap::new();
+    for seam in seams.iter().filter(|edge| edge.seam_kind == "call") {
+        if let Some(binding) = seam.bindings.first() {
+            internal_call_anchors.entry(binding.caller.clone()).or_default()
+                .insert(binding.call_node.clone());
+        }
+    }
     let functions: Vec<_> = prepared.into_iter().map(|function| {
         let id = function.id.clone();
         let parameter_roots = function.parameters.clone();
@@ -1975,6 +1982,13 @@ pub(crate) fn semantic_request(
         }
         let mut edges = Vec::new();
         for successor in &function.successors {
+            // A compiler-resolved internal call is represented by a call seam
+            // and its pushed return continuation. Retaining this raw CFG edge
+            // would create an impossible execution that skips the callee.
+            if internal_call_anchors.get(&id)
+                .is_some_and(|anchors| anchors.contains(&successor.node)) {
+                continue;
+            }
             let Some(source_nodes) = by_anchor.get(&successor.node) else { continue };
             let source = source_nodes.last().cloned().unwrap_or_default();
             for target_anchor in &successor.targets {
