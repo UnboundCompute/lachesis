@@ -1675,6 +1675,8 @@ fn function_language(function: &lifetime_proto::FunctionInput) -> String {
 pub(crate) fn semantic_request(
     request: lifetime_proto::PrepareRequest,
 ) -> Result<lifetime_proto::NativeSemanticResult, String> {
+    let expected_function_ids: HashSet<String> = request.functions.iter()
+        .map(|function| function.id.clone()).collect();
     // Calls carry the compiler-resolved source spelling while function
     // fragments are keyed by their stable declaration IDs. Build this
     // language-neutral spelling→ID index before preparation discards the
@@ -1765,7 +1767,7 @@ pub(crate) fn semantic_request(
             }
         }
     }
-    let functions = prepared.into_iter().map(|function| {
+    let functions: Vec<_> = prepared.into_iter().map(|function| {
         let id = function.id.clone();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
@@ -1946,6 +1948,11 @@ pub(crate) fn semantic_request(
             id, entry, exits, nodes, edges, language, source_launch_nodes,
         })
     }).collect::<Result<Vec<_>, String>>()?;
+    if let Some(missing) = expected_function_ids.iter()
+        .find(|id| !functions.iter().any(|function| function.id == **id))
+    {
+        return Err(format!("native semantic preparation dropped compiler function {missing}"));
+    }
     // Seam endpoints must survive the compact event projection. Resolve the
     // compiler call anchor to the first event at that anchor, and the callee
     // entry anchor to its first event. Empty-event anchors remain a safe
