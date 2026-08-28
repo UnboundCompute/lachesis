@@ -31,6 +31,36 @@ fn function_map(
     result.functions.iter().map(|function| (function.id.as_str(), function)).collect()
 }
 
+type FunctionIndex<'a> = HashMap<&'a str, &'a lifetime_proto::NativeSemanticFunction>;
+type NodeIndex<'a> = HashMap<&'a str, &'a lifetime_proto::NativeSemanticNode>;
+type EdgeIndex<'a> = HashMap<&'a str, Vec<&'a lifetime_proto::NativeSemanticEdge>>;
+
+fn node_allowed(node: &lifetime_proto::NativeSemanticNode, allowed: &BTreeSet<&str>) -> bool {
+    node.function.is_empty() || allowed.contains(node.function.as_str())
+}
+
+fn semantic_indexes<'a>(
+    result: &'a lifetime_proto::NativeSemanticResult,
+) -> (FunctionIndex<'a>, NodeIndex<'a>, EdgeIndex<'a>) {
+    let functions = function_map(result);
+    let mut nodes = HashMap::new();
+    let mut adjacency = HashMap::new();
+    for function in &result.functions {
+        for node in &function.nodes { nodes.insert(node.id.as_str(), node); }
+        for edge in &function.edges {
+            adjacency.entry(edge.source.as_str()).or_insert_with(Vec::new).push(edge);
+        }
+    }
+    for edge in &result.seams {
+        adjacency.entry(edge.source.as_str()).or_insert_with(Vec::new).push(edge);
+    }
+    for edges in adjacency.values_mut() {
+        edges.sort_by(|left, right| (&left.kind, &left.seam_kind, &left.target, &left.return_to)
+            .cmp(&(&right.kind, &right.seam_kind, &right.target, &right.return_to)));
+    }
+    (functions, nodes, adjacency)
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WalkState {
     node: String,
@@ -50,30 +80,11 @@ fn walk_region(
     result: &lifetime_proto::NativeSemanticResult,
     region: &lifetime_proto::NativeSourceRegion,
     context: &str,
+    functions: &FunctionIndex<'_>,
+    nodes: &NodeIndex<'_>,
+    adjacency: &EdgeIndex<'_>,
 ) -> (Vec<lifetime_proto::NativeSkeletonToken>, Vec<lifetime_proto::NativeSemanticEdge>, bool) {
-    let functions = function_map(result);
     let allowed: BTreeSet<&str> = region.functions.iter().map(String::as_str).collect();
-    let mut nodes = HashMap::new();
-    let mut adjacency: HashMap<&str, Vec<&lifetime_proto::NativeSemanticEdge>> = HashMap::new();
-    for function in &result.functions {
-        if !allowed.contains(function.id.as_str()) { continue; }
-        for node in &function.nodes {
-            nodes.insert(node.id.as_str(), node);
-        }
-        for edge in &function.edges {
-            adjacency.entry(edge.source.as_str()).or_default().push(edge);
-        }
-    }
-    for edge in &result.seams {
-        if allowed.contains(edge.callee.as_str()) ||
-           (nodes.contains_key(edge.source.as_str()) && nodes.contains_key(edge.target.as_str())) {
-            adjacency.entry(edge.source.as_str()).or_default().push(edge);
-        }
-    }
-    for edges in adjacency.values_mut() {
-        edges.sort_by(|left, right| (&left.kind, &left.seam_kind, &left.target, &left.return_to)
-            .cmp(&(&right.kind, &right.seam_kind, &right.target, &right.return_to)));
-    }
 
     let mut starts = Vec::new();
     if context != "__entry__" {
@@ -81,7 +92,8 @@ fn walk_region(
             if id != context { continue; }
             if nodes.contains_key(id.as_str()) {
                 starts.push(id.clone());
-            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id) {
+            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
+                && node_allowed(node, &allowed)) {
                 starts.push(node.id.clone());
             }
         }
@@ -94,9 +106,11 @@ fn walk_region(
     }
     if starts.is_empty() && context == "__entry__" {
         if let Some(function) = functions.get(region.source_function.as_str()) {
-            if !function.entry.is_empty() && nodes.contains_key(function.entry.as_str()) {
+            if !function.entry.is_empty() && nodes.get(function.entry.as_str())
+                .is_some_and(|node| node_allowed(node, &allowed)) {
                 starts.push(function.entry.clone());
-            } else if let Some(node) = function.nodes.first() {
+            } else if let Some(node) = function.nodes.iter()
+                .find(|node| node_allowed(node, &allowed)) {
                 starts.push(node.id.clone());
             }
         }
@@ -113,7 +127,9 @@ fn walk_region(
     let mut complete = true;
     while let Some(state) = queue.pop_front() {
         if !seen.insert(state.clone()) { continue; }
-        let Some(node) = nodes.get(state.node.as_str()) else { complete = false; continue; };
+        let Some(node) = nodes.get(state.node.as_str())
+            .filter(|node| node_allowed(node, &allowed))
+        else { complete = false; continue; };
         let depth = state.stack.len() as u32;
         let language = functions.get(node.function.as_str())
             .map(|function| function.language.as_str())
@@ -145,7 +161,13 @@ fn walk_region(
                 ..Default::default()
             });
         for edge in adjacency.get(state.node.as_str()).into_iter().flatten() {
-            if !edge.target.is_empty() && !nodes.contains_key(edge.target.as_str()) {
+            let target_allowed = nodes.get(edge.target.as_str())
+                .is_some_and(|target| node_allowed(target, &allowed));
+            let seam_allowed = edge.seam_kind.is_empty()
+                || allowed.contains(edge.callee.as_str())
+                || (allowed.contains(node.function.as_str()) && target_allowed);
+            if !seam_allowed { continue; }
+            if !edge.target.is_empty() && !target_allowed {
                 complete = false;
                 continue;
             }
@@ -185,13 +207,15 @@ fn walk_region(
 pub(crate) fn build(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
+    let (functions, nodes, adjacency) = semantic_indexes(result);
     let mut output = Vec::new();
     for region in &result.regions {
         let contexts = if region.contexts.is_empty() {
             vec!["__entry__".to_owned()]
         } else { region.contexts.clone() };
         for context in contexts {
-            let (mut tokens, edges, complete) = walk_region(result, region, &context);
+            let (mut tokens, edges, complete) = walk_region(
+                result, region, &context, &functions, &nodes, &adjacency);
             // The old renderer always has explicit boundaries around the root
             // as well as every nested call.  Keep these even for a region with
             // no event at its entry: an empty/unresolved fragment must remain
