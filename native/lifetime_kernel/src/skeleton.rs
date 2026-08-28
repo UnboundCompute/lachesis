@@ -209,6 +209,68 @@ fn walk_region(
     (tokens, edges_used, complete && !seen.is_empty())
 }
 
+fn typestate_event(event: &str) -> bool {
+    matches!(event,
+        "ORIGIN" | "ALLOC_ATTEMPT" | "REALLOC_ATTEMPT" | "REALLOC_FAILED" |
+        "memory.free" | "RELEASE" | "memory.deref" | "READ_STORAGE" |
+        "WRITE_STORAGE" | "ESCAPE" | "INVALIDATE" | "DERIVE" |
+        "RETURN_VALUE" | "UNINITIALIZED")
+}
+
+/// Render the old engine's per-function/object typestate streams from the
+/// compiler-owned event nodes. Object identity is the native root plus
+/// generation, never a display name.
+fn build_typestate(
+    result: &lifetime_proto::NativeSemanticResult,
+) -> Vec<lifetime_proto::NativeFlowSkeleton> {
+    let mut streams = BTreeSet::new();
+    for function in &result.functions {
+        for node in &function.nodes {
+            if typestate_event(&node.event_kind) && !node.object_root.is_empty() {
+                streams.insert((function.id.clone(), node.object_root.clone(), node.generation.clone()));
+            }
+        }
+    }
+    let functions = function_map(result);
+    let mut output = Vec::new();
+    for (function_id, root, generation) in streams {
+        let Some(function) = functions.get(function_id.as_str()) else { continue };
+        let events: Vec<_> = function.nodes.iter().filter(|node|
+            typestate_event(&node.event_kind)
+                && node.object_root == root && node.generation == generation).collect();
+        if events.is_empty() { continue; }
+        let mut tokens = Vec::with_capacity(events.len() + 2);
+        tokens.push(lifetime_proto::NativeSkeletonToken {
+            kind: "enter".into(), function: function_id.clone(), depth: 0, ..Default::default()
+        });
+        for node in &events {
+            let guards: Vec<_> = function.edges.iter().filter(|edge| edge.source == node.id)
+                .flat_map(|edge| edge.guards.iter().cloned()).collect();
+            tokens.push(lifetime_proto::NativeSkeletonToken {
+                kind: "event".into(), function: function_id.clone(), node: node.id.clone(),
+                family: lifecycle_family(&node.event_kind, &function.language),
+                object_root: node.object_root.clone(), object_selectors: node.object_selectors.clone(),
+                line: node.line, has_line: node.has_line, depth: 1,
+                guarded: !guards.is_empty(), guards,
+                source_reachable: node.source_reachable,
+                source_witness_nodes: node.source_witness_nodes.clone(), ..Default::default()
+            });
+        }
+        tokens.push(lifetime_proto::NativeSkeletonToken {
+            kind: "exit".into(), function: function_id.clone(), depth: 0, ..Default::default()
+        });
+        let edges = events.windows(2).map(|pair| lifetime_proto::NativeSemanticEdge {
+            source: pair[0].id.clone(), target: pair[1].id.clone(), kind: "typestate".into(), ..Default::default()
+        }).collect();
+        output.push(lifetime_proto::NativeFlowSkeleton {
+            kind: "typestate".into(), entry: function_id.clone(), source_function: function_id,
+            context: root, complete: true, tokens, edges,
+            is_source: !function.source_launch_nodes.is_empty(),
+        });
+    }
+    output
+}
+
 /// Build one cached skeleton per source/context region.
 pub(crate) fn build(
     result: &lifetime_proto::NativeSemanticResult,
@@ -233,17 +295,18 @@ pub(crate) fn build(
                     complete,
                     tokens,
                     edges,
-                    is_source: true,
+                    is_source: functions.get(region.source_function.as_str())
+                        .is_some_and(|function| !function.source_launch_nodes.is_empty()),
                 });
             }
         }
+        output.extend(build_typestate(result));
         if !output.is_empty() { return output; }
     }
 
-    // Keep the function-local projection useful for callers that provide a
-    // prepared semantic result without Claus regions (including small unit
-    // inputs and older binary sidecars). The production Pass-3 path always
-    // has regions and therefore takes the source-rooted branch above.
+    // Older or synthetic semantic sidecars may not carry Claus regions.
+    build_typestate(result)
+    /*
     let mut output = Vec::new();
     for function in &result.functions {
         let Some(compact) = crate::compact_event_function(function.clone()) else { continue; };
@@ -280,7 +343,7 @@ pub(crate) fn build(
             is_source: !function.source_launch_nodes.is_empty(),
         });
     }
-    output
+    output */
 }
 
 #[cfg(test)]
