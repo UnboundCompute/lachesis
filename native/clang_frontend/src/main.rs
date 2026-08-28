@@ -916,8 +916,16 @@ unsafe fn visit_one(
         // distinguish file-local definitions.  Keep it compiler-derived and
         // emit it alongside linkage so internal helpers remain resolvable
         // without a product-specific symbol list.
-        if clang_getCursorLinkage(cursor) == CXLinkage_Internal {
-            properties.push(field("storage_class", text("static")));
+        // The reference takes storage_class straight from the AST's storageClass
+        // field: present only for an explicit `extern`/`static` specifier, absent
+        // otherwise. Read the specifier itself, not internal-linkage as a proxy.
+        let storage_class = match clang_Cursor_getStorageClass(cursor) {
+            CX_SC_Extern => Some("extern"),
+            CX_SC_Static => Some("static"),
+            _ => None,
+        };
+        if let Some(storage_class) = storage_class {
+            properties.push(field("storage_class", text(storage_class)));
         }
     }
     // Body nodes (call/statement/expression) label as the raw source text they
@@ -1004,8 +1012,20 @@ unsafe fn visit_one(
         kind: node_kind.clone(),
         label: if !body_snippet.is_empty() {
             body_snippet.clone()
+        } else if node_kind == "record" || node_kind == "enum" {
+            // A tagless struct/union/enum is named by its start byte offset, not
+            // by clang's ASLR-varying node id. libclang additionally borrows a
+            // typedef's name onto its tagless enum (`typedef enum {..} t;`), so
+            // key on isAnonymous rather than on an empty spelling.
+            if clang_Cursor_isAnonymous(cursor) != 0 || spelling.is_empty() {
+                format!("<anonymous@{offset}>")
+            } else {
+                spelling
+            }
         } else if spelling.is_empty() {
-            syntax_kind.clone()
+            // An unnamed value-decl (a nameless parameter, a zero-width bitfield)
+            // takes the literal label `<anonymous>` — no offset suffix.
+            "<anonymous>".to_owned()
         } else {
             spelling
         },
