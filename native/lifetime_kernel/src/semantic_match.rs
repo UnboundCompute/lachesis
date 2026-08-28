@@ -1060,11 +1060,13 @@ fn match_skeleton(
     let mut exits: Vec<String> = nodes.iter().filter(|node| !outgoing.contains(node.id.as_str()))
         .map(|node| node.id.clone()).collect();
     if exits.is_empty() { exits.push(nodes.last()?.id.clone()); }
-    Some(match_function(&lifetime_proto::NativeSemanticFunction {
+    let mut matched = match_function(&lifetime_proto::NativeSemanticFunction {
         id: format!("native:skeleton:{ordinal}:{}", skeleton.context),
         entry, exits, nodes, edges, language: String::new(), source_launch_nodes: Vec::new(),
         parameter_roots: Vec::new(),
-    }))
+    });
+    matched.capped |= !skeleton.complete;
+    Some(matched)
 }
 
 fn match_skeletons(
