@@ -579,10 +579,22 @@ impl State {
         }
     }
 
+    /// Recency predicate: is this handle the aged `summary` generation of an
+    /// allocation site?  Mirrors `object_state.py:302` (`oid[1] == "summary"`).
+    /// Drives weak-vs-strong FACT updates only — a distinct concern from the
+    /// `"<?>"` summary-object rule that gates finding suppression below.
+    fn is_summary_generation(oid: &str) -> bool {
+        oid.split('|').nth(1) == Some("summary")
+    }
+
+    /// Summary-object predicate: does this handle stand for an unbounded set of
+    /// concrete objects (an unknown subscript `"<?>"` anywhere in its path)?
+    /// Mirrors `object_state.py:104-118` — note it does NOT treat the aged
+    /// `summary` generation as a summary object; recency is handled separately
+    /// by `is_summary_generation`.  Gates finding suppression (double-free/UAF).
     fn is_summary_object(&self, oid: &str) -> bool {
         fn visit(state: &State, oid: &str, seen: &mut HashSet<String>) -> bool {
             if !seen.insert(oid.to_owned()) { return false; }
-            if oid.split('|').nth(1) == Some("summary") { return true; }
             match state.objects.get(oid) {
                 Some(ObjectMeta::Param { selectors, .. }) =>
                     selectors.iter().any(|selector| selector == "<?>") ,
@@ -664,13 +676,20 @@ impl State {
         if target.selectors.len() > 0 && parse_param(&oid).is_some() {
             self.freed_paths.insert(target.clone(), oid.clone());
         }
-        let weak = self.is_summary_object(&oid);
+        // Finding suppression is gated by the "<?>" summary-object rule; the
+        // weak-vs-strong fact update is gated by allocation recency.  Python
+        // keeps these two derivations independent (object_state.py:297 vs :302),
+        // so a "<?>" param object suppresses the finding yet still takes a
+        // strong `= FREED` update, while an aged `summary` generation takes a
+        // weak `|= FREED` update yet (absent "<?>") still raises the finding.
+        let suppress_finding = self.is_summary_object(&oid);
+        let weak_update = Self::is_summary_generation(&oid);
         let facts = self.facts.entry(oid.clone()).or_insert(fact_bit(Fact::Unknown));
-        if *facts & fact_bit(Fact::Freed) != 0 && !weak {
+        if *facts & fact_bit(Fact::Freed) != 0 && !suppress_finding {
             findings.double_free.push((op.line, target.clone(), op.node.clone()));
         }
         if *facts != fact_bit(Fact::Null) {
-            if weak { *facts |= fact_bit(Fact::Freed); }
+            if weak_update { *facts |= fact_bit(Fact::Freed); }
             else { *facts = fact_bit(Fact::Freed); }
         }
     }

@@ -126,6 +126,21 @@ fn input_text<'a>(node: &'a lifetime_proto::GraphNode, key: &str) -> Option<&'a 
     })
 }
 
+/// Decode the packed size-guard property the Pass-2 producer stamps onto a call
+/// node.  Each guard is `var\u{1f}canon` and guards are joined by `\u{1e}`; a
+/// missing var (a bare relational canon) decodes to an empty var.  Yields the
+/// `(var, canon)` pairs plus, for callers that keep the canon-only view, their
+/// canons.
+fn parse_guard_facts(raw: &str) -> Vec<(String, String)> {
+    raw.split('\u{1e}')
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| match chunk.split_once('\u{1f}') {
+            Some((var, canon)) => (var.to_owned(), canon.to_owned()),
+            None => (String::new(), chunk.to_owned()),
+        })
+        .collect()
+}
+
 fn input_integer(node: &lifetime_proto::GraphNode, key: &str) -> Option<i64> {
     node.properties.iter().find_map(|property| {
         if property.key != key { return None; }
@@ -318,6 +333,19 @@ mod tests {
     use prost::Message;
 
     #[test]
+    fn parses_packed_guard_facts_and_preserves_empty_var() {
+        // One paired size guard plus a bare relational canon (no named var).
+        let raw = "n\u{1f}n < cap\u{1e}\u{1f}len <= max";
+        let facts = parse_guard_facts(raw);
+        assert_eq!(facts, vec![
+            ("n".to_owned(), "n < cap".to_owned()),
+            (String::new(), "len <= max".to_owned()),
+        ]);
+        // An empty payload yields no guards rather than a spurious empty pair.
+        assert!(parse_guard_facts("").is_empty());
+    }
+
+    #[test]
     fn follows_only_function_declaration_to_definition_links() {
         let functions = HashMap::from([
             ("prototype".to_owned(), "work".to_owned()),
@@ -439,9 +467,23 @@ pub(crate) fn lifecycle_roles(
         let role = model.role.strip_prefix("lifecycle.")?;
         Some(((model.language.clone(), model.method.clone()), role.to_owned()))
     }).collect();
+    // Follow alias chains transitively (A->B->C collapses to C) with a cycle
+    // guard, mirroring the old normalizer's `canon_callee`.  A single pass could
+    // miss a role when a chain's terminal alias is applied after an earlier link,
+    // so resolve each surface to its terminal canonical before inheriting its role.
+    let alias_map: HashMap<(String, String), String> = catalog.callee_aliases.iter()
+        .map(|alias| ((alias.language.clone(), alias.surface.clone()), alias.canonical.clone()))
+        .collect();
     for alias in &catalog.callee_aliases {
-        if let Some(role) = roles.get(&(alias.language.clone(), alias.canonical.clone())).cloned() {
-            roles.insert((alias.language.clone(), alias.surface.clone()), role);
+        let language = alias.language.clone();
+        let mut name = alias.surface.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(next) = alias_map.get(&(language.clone(), name.clone())) {
+            if !seen.insert(name.clone()) { break; }
+            name = next.clone();
+        }
+        if let Some(role) = roles.get(&(language.clone(), name)).cloned() {
+            roles.insert((language, alias.surface.clone()), role);
         }
     }
     roles
@@ -589,6 +631,7 @@ fn sidecar_to_request_inner(
             control: Vec::new(),
             guard_status: String::new(),
             guard_predicates: Vec::new(),
+            guards: Vec::new(),
         };
         // Some compiler frontends retain the resolved target spelling in a
         // canonical property rather than `callee`; use the final resolved
@@ -606,6 +649,12 @@ fn sidecar_to_request_inner(
         call.guard_status = input_text(&item, "guard_status").unwrap_or_default().to_owned();
         if let Some(predicates) = input_text(&item, "guard_predicates") {
             call.guard_predicates.push(predicates.to_owned());
+        }
+        if let Some(raw) = input_text(&item, "guards") {
+            for (var, canon) in parse_guard_facts(raw) {
+                if !canon.is_empty() { call.guard_predicates.push(canon.clone()); }
+                call.guards.push(lifetime_proto::GuardFact { var, canon });
+            }
         }
         if let Some(control) = input_text(&item, "control") {
             call.control.push(control.to_owned());
@@ -1433,7 +1482,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             assigned_name: String::new(),
             callee_function_id,
             size_expression: String::new(), destination: String::new(), control: Vec::new(),
-            guard_status: String::new(), guard_predicates: Vec::new(),
+            guard_status: String::new(), guard_predicates: Vec::new(), guards: Vec::new(),
         };
         call.size_expression = compact_property(node, "size_expr")
             .or_else(|| compact_property(node, "size_expression"))
@@ -1444,6 +1493,12 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         call.guard_status = compact_property(node, "guard_status").unwrap_or("").to_owned();
         if let Some(predicates) = compact_property(node, "guard_predicates") {
             call.guard_predicates.push(predicates.to_owned());
+        }
+        if let Some(raw) = compact_property(node, "guards") {
+            for (var, canon) in parse_guard_facts(raw) {
+                if !canon.is_empty() { call.guard_predicates.push(canon.clone()); }
+                call.guards.push(lifetime_proto::GuardFact { var, canon });
+            }
         }
         if let Some(control) = compact_property(node, "control") {
             call.control.push(control.to_owned());

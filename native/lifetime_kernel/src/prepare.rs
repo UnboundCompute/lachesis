@@ -1704,6 +1704,15 @@ fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Oper
     }
 }
 
+fn semantic_edge(source: String, target: String, kind: &str,
+                 guards: Vec<lifetime_proto::GuardProof>) -> lifetime_proto::NativeSemanticEdge {
+    lifetime_proto::NativeSemanticEdge {
+        source, target, kind: kind.to_owned(), guards,
+        bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
+        return_to: String::new(), provenance: String::new(),
+    }
+}
+
 fn function_language(function: &lifetime_proto::FunctionInput) -> String {
     // Language is frontend-owned metadata.  Do not infer it from an opaque
     // function id or from a filename: ids are allowed to change and a single
@@ -1713,6 +1722,39 @@ fn function_language(function: &lifetime_proto::FunctionInput) -> String {
         .find_map(|node| text_property(node, "language"))
         .unwrap_or_default()
         .to_owned()
+}
+
+/// Translate a call site's neutral branch-region guard facts into matcher
+/// proofs for the call seam.  Faithful port of the reference `_ir_guard_proofs`:
+/// a nullness token yields a typed NONNULL/ISNULL proof over `{var}#g0`, and any
+/// other (size-relational) condition is preserved as a raw VALUE proof so the
+/// bounds-aware patterns can read it without reinterpreting the predicate string.
+fn ir_guard_proofs(call: &lifetime_proto::FunctionCall) -> Vec<lifetime_proto::GuardProof> {
+    let mut proofs = Vec::new();
+    for guard in &call.guards {
+        let canon = guard.canon.as_str();
+        let compact: String = canon.chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(|character| character.to_lowercase())
+            .collect();
+        let value = if !guard.var.is_empty() {
+            format!("{}#g0", guard.var)
+        } else {
+            canon.to_owned()
+        };
+        if ["!=null", "null!=", "isnotnone", "isnotnull"]
+            .iter().any(|token| compact.contains(token))
+        {
+            proofs.push(lifetime_proto::GuardProof { kind: "NONNULL".into(), value });
+        } else if ["==null", "null==", "isnone", "isnull"]
+            .iter().any(|token| compact.contains(token))
+        {
+            proofs.push(lifetime_proto::GuardProof { kind: "ISNULL".into(), value });
+        } else if !canon.is_empty() {
+            proofs.push(lifetime_proto::GuardProof { kind: "VALUE".into(), value: canon.to_owned() });
+        }
+    }
+    proofs
 }
 
 /// Emit the compact event graph consumed by the semantic query layer.  This
@@ -1789,7 +1831,7 @@ pub(crate) fn semantic_request(
                 seams.push(lifetime_proto::NativeSemanticEdge {
                     source: format!("native:{}:anchor:{}", caller.id, call.node),
                     target: format!("native:{}:anchor:{}", callee.id, entry_anchor),
-                    kind: "seam".into(), guards: Vec::new(),
+                    kind: "seam".into(), guards: ir_guard_proofs(call),
                     bindings: vec![lifetime_proto::NativeSeamBinding {
                         caller: caller.id.clone(), callee: callee.id.clone(), call_node: call.node.clone(),
                         formal_to_actual: formal_to_actual.clone(), return_to: return_to.clone(),
@@ -1829,7 +1871,6 @@ pub(crate) fn semantic_request(
             function.metadata.iter().map(|item| (item.id.as_str(), item)).collect();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
-        let mut realloc_failures: Vec<(String, String, String)> = Vec::new();
         // Preserve the prepared CFG topology even when an anchor has no
         // lifetime operation.  These empty-event nodes are the compact native
         // equivalent of the Python semantic graph's control-flow substrate.
@@ -1891,6 +1932,20 @@ pub(crate) fn semantic_request(
             .filter(|call| !call.is_alloc && !call.is_release && !call.is_realloc
                 && !call.is_source && !call.is_aggregate_copy)
             .map(|call| call.node.as_str()).collect();
+        // Intra-anchor control is an explicit previous-pointer walk (a faithful
+        // port of the Python emitter): each operation appends its event nodes
+        // and is wired after the running tail of its CFG anchor, rather than
+        // being linked by position after the fact.  Allocation and reallocation
+        // expand into a guarded success/failure diamond so the matcher can prove
+        // or refute the null result on each arm instead of seeing one linear
+        // chain that collapses the two outcomes together.
+        let mut edges: Vec<lifetime_proto::NativeSemanticEdge> = Vec::new();
+        let mut previous_by_anchor: HashMap<String, String> = HashMap::new();
+        for (anchor, ids) in by_anchor.iter() {
+            if let Some(tail) = ids.last() {
+                previous_by_anchor.insert(anchor.clone(), tail.clone());
+            }
+        }
         for (index, raw) in function.operations.iter().cloned().enumerate() {
             let operation = crate::proto_operation(raw)?;
             // Passing an argument to an ordinary call is not a dereference
@@ -1904,6 +1959,154 @@ pub(crate) fn semantic_request(
             }
             let path = operation.target.as_ref();
             let generation = operation.generation.as_deref().unwrap_or("g0");
+            let mut previous = previous_by_anchor.get(&operation.node).cloned();
+            let base = format!("native:{}:{}:{}", id, operation.node, index);
+            let push_event = |nodes: &mut Vec<lifetime_proto::NativeSemanticNode>,
+                                  by_anchor: &mut HashMap<String, Vec<String>>,
+                                  node: lifetime_proto::NativeSemanticNode| {
+                by_anchor.entry(operation.node.clone()).or_default().push(node.id.clone());
+                nodes.push(node);
+            };
+
+            // ---- allocation: guarded success/failure diamond ----
+            if operation.kind == crate::Kind::Alloc && path.is_some() {
+                let obj_root = path.map(|value| value.root.clone()).unwrap_or_default();
+                let guard_value = format!("{obj_root}#{generation}");
+                let attempt_id = format!("{base}:attempt");
+                let branch_id = format!("{base}:branch");
+                let success_id = format!("{base}:success");
+                let failure_id = format!("{base}:failure");
+                let merge_id = format!("{base}:merge");
+                // The failure arm writes NULL into the destination slot; the
+                // success arm carries the fresh allocation and, when the target
+                // has selectors, stores it back into its storage slot.
+                let mut null_op = operation.clone();
+                null_op.is_null = true;
+                null_op.access = "write".to_owned();
+                let slot_id = path.filter(|value| !value.selectors.is_empty())
+                    .map(|_| format!("{success_id}:slot"));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(attempt_id.clone(), &id, "ALLOC_ATTEMPT", &operation, path, generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(branch_id.clone(), &id, "BRANCH", &operation, path, generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(success_id.clone(), &id, "ORIGIN", &operation, path, generation));
+                if let Some(slot_id) = &slot_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(slot_id.clone(), &id, "WRITE_STORAGE", &operation, path, generation));
+                }
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(failure_id.clone(), &id, "WRITE_STORAGE_NULL", &null_op, path, generation));
+                // The merge node is emitted last so it remains the anchor's CFG
+                // tail; control continues from it into the CFG successors.
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(merge_id.clone(), &id, "", &operation, path, generation));
+                if let Some(previous) = &previous {
+                    edges.push(semantic_edge(previous.clone(), attempt_id.clone(), "normal", Vec::new()));
+                }
+                edges.push(semantic_edge(attempt_id, branch_id.clone(), "normal", Vec::new()));
+                edges.push(semantic_edge(branch_id.clone(), success_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "NONNULL".into(), value: guard_value.clone() }]));
+                edges.push(semantic_edge(branch_id, failure_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "ISNULL".into(), value: guard_value }]));
+                match &slot_id {
+                    Some(slot_id) => {
+                        edges.push(semantic_edge(success_id, slot_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(slot_id.clone(), merge_id.clone(), "normal", Vec::new()));
+                    }
+                    None => edges.push(semantic_edge(success_id, merge_id.clone(), "normal", Vec::new())),
+                }
+                edges.push(semantic_edge(failure_id, merge_id.clone(), "normal", Vec::new()));
+                previous_by_anchor.insert(operation.node.clone(), merge_id);
+                continue;
+            }
+
+            // ---- reallocation: guarded success/failure diamond ----
+            if operation.kind == crate::Kind::Realloc && path.is_some() {
+                let target = path.expect("realloc target present");
+                let old_path = operation.source.as_ref().unwrap_or(target).clone();
+                // When the fresh cell overwrites the same slot the old pointer
+                // lived in, a failed realloc leaks the old block and nulls the
+                // slot; otherwise the old pointer is untouched on failure.
+                let overwrites_slot = old_path.root == target.root
+                    && old_path.selectors == target.selectors;
+                let old_generation = generation;
+                let fresh_generation = if overwrites_slot {
+                    operation.fresh_generation.as_deref().unwrap_or(generation)
+                } else { "g0" };
+                let attempt_id = format!("{base}:attempt");
+                let branch_id = format!("{base}:branch");
+                let success_id = format!("{base}:success");
+                let origin_id = format!("{success_id}:origin");
+                let failure_id = format!("{base}:failure");
+                let merge_id = format!("{base}:merge");
+                let slot_id = (overwrites_slot && !target.selectors.is_empty())
+                    .then(|| format!("{origin_id}:slot"));
+                let null_id = overwrites_slot.then(|| format!("{failure_id}:null"));
+                let lost_id = overwrites_slot.then(|| format!("{failure_id}:lost"));
+                let mut old_op = operation.clone();
+                old_op.target = Some(old_path.clone());
+                old_op.source = None;
+                let mut null_op = old_op.clone();
+                null_op.is_null = true;
+                null_op.access = "write".to_owned();
+                let old_ref = Some(&old_path);
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(attempt_id.clone(), &id, "REALLOC_ATTEMPT", &old_op, old_ref, old_generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(branch_id.clone(), &id, "BRANCH", &old_op, old_ref, old_generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(success_id.clone(), &id, "INVALIDATE", &old_op, old_ref, old_generation));
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(origin_id.clone(), &id, "ORIGIN", &operation, path, fresh_generation));
+                if let Some(slot_id) = &slot_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(slot_id.clone(), &id, "WRITE_STORAGE", &operation, path, fresh_generation));
+                }
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(failure_id.clone(), &id, "REALLOC_FAILED", &old_op, old_ref, old_generation));
+                if let Some(null_id) = &null_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(null_id.clone(), &id, "WRITE_STORAGE_NULL", &null_op, old_ref, old_generation));
+                }
+                if let Some(lost_id) = &lost_id {
+                    push_event(&mut nodes, &mut by_anchor,
+                        semantic_node(lost_id.clone(), &id, "LOST_FROM_SLOT", &old_op, old_ref, old_generation));
+                }
+                push_event(&mut nodes, &mut by_anchor,
+                    semantic_node(merge_id.clone(), &id, "", &old_op, old_ref, old_generation));
+                if let Some(previous) = &previous {
+                    edges.push(semantic_edge(previous.clone(), attempt_id.clone(), "normal", Vec::new()));
+                }
+                edges.push(semantic_edge(attempt_id, branch_id.clone(), "normal", Vec::new()));
+                // The realloc predicate guards are named after the result, not a
+                // storage object, matching the Python emitter; the matcher reads
+                // them as branch provenance without binding a null fact.
+                edges.push(semantic_edge(branch_id.clone(), success_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "NONNULL".into(), value: "realloc_result".into() }]));
+                edges.push(semantic_edge(branch_id, failure_id.clone(), "normal",
+                    vec![lifetime_proto::GuardProof { kind: "ISNULL".into(), value: "realloc_result".into() }]));
+                edges.push(semantic_edge(success_id, origin_id.clone(), "normal", Vec::new()));
+                match &slot_id {
+                    Some(slot_id) => {
+                        edges.push(semantic_edge(origin_id, slot_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(slot_id.clone(), merge_id.clone(), "normal", Vec::new()));
+                    }
+                    None => edges.push(semantic_edge(origin_id, merge_id.clone(), "normal", Vec::new())),
+                }
+                match (&null_id, &lost_id) {
+                    (Some(null_id), Some(lost_id)) => {
+                        edges.push(semantic_edge(failure_id, null_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(null_id.clone(), lost_id.clone(), "normal", Vec::new()));
+                        edges.push(semantic_edge(lost_id.clone(), merge_id.clone(), "normal", Vec::new()));
+                    }
+                    _ => edges.push(semantic_edge(failure_id, merge_id.clone(), "normal", Vec::new())),
+                }
+                previous_by_anchor.insert(operation.node.clone(), merge_id);
+                continue;
+            }
+
+            // ---- linear operations: chain each event after the running tail ----
             let kinds: Vec<&str> = match operation.kind {
                 crate::Kind::Alloc => vec!["ALLOC_ATTEMPT", "ORIGIN"],
                 crate::Kind::Realloc => vec!["REALLOC_ATTEMPT", "INVALIDATE", "ORIGIN"],
@@ -1914,17 +2117,18 @@ pub(crate) fn semantic_request(
                     vec!["RETURN_VALUE", "ESCAPE", "RETURN"],
                 _ => vec![semantic_event_kind(operation.kind, &operation.access)],
             };
-            let attempt_id = (operation.kind == crate::Kind::Realloc)
-                .then(|| format!("native:{}:{}:{}:0", id, operation.node, index));
             for (ordinal, kind) in kinds.into_iter().enumerate() {
                 let kind = if operation.is_null { "WRITE_STORAGE_NULL" } else { kind };
-                let node_id = format!("native:{}:{}:{}:{}", id, operation.node, index, ordinal);
+                let node_id = format!("{base}:{ordinal}");
                 let event_generation = if kind == "ORIGIN" && operation.kind == crate::Kind::Realloc {
                     operation.fresh_generation.as_deref().unwrap_or(generation)
                 } else { generation };
                 let event = semantic_node(node_id.clone(), &id, kind, &operation, path, event_generation);
-                by_anchor.entry(operation.node.clone()).or_default().push(node_id);
-                nodes.push(event);
+                if let Some(previous) = &previous {
+                    edges.push(semantic_edge(previous.clone(), node_id.clone(), "normal", Vec::new()));
+                }
+                previous = Some(node_id.clone());
+                push_event(&mut nodes, &mut by_anchor, event);
             }
             if operation.kind == crate::Kind::Use && operation.access == "write" {
                 let target_id = path.map(|value| declaration_root(&value.root));
@@ -1946,11 +2150,14 @@ pub(crate) fn semantic_request(
                         returned.target = Some(source.clone());
                         returned.source = None;
                         returned.access = "return-stack".to_owned();
-                        let node_id = format!("native:{}:{}:{}:stack-escape", id, operation.node, index);
+                        let node_id = format!("{base}:stack-escape");
                         let event = semantic_node(node_id.clone(), &id, "RETURN_VALUE",
                             &returned, returned.target.as_ref(), generation);
-                        by_anchor.entry(operation.node.clone()).or_default().push(node_id);
-                        nodes.push(event);
+                        if let Some(previous) = &previous {
+                            edges.push(semantic_edge(previous.clone(), node_id.clone(), "normal", Vec::new()));
+                        }
+                        previous = Some(node_id.clone());
+                        push_event(&mut nodes, &mut by_anchor, event);
                     }
                 }
                 if target_is_formal || target_is_persistent {
@@ -1963,24 +2170,21 @@ pub(crate) fn semantic_request(
                         } else {
                             "out-parameter-store".to_owned()
                         };
-                        let node_id = format!("native:{}:{}:{}:escape", id, operation.node, index);
+                        let node_id = format!("{base}:escape");
                         let event = semantic_node(node_id.clone(), &id, "ESCAPE",
                             &escape, escape.target.as_ref(), generation);
-                        by_anchor.entry(operation.node.clone()).or_default().push(node_id);
-                        nodes.push(event);
+                        if let Some(previous) = &previous {
+                            edges.push(semantic_edge(previous.clone(), node_id.clone(), "normal", Vec::new()));
+                        }
+                        previous = Some(node_id.clone());
+                        push_event(&mut nodes, &mut by_anchor, event);
                     }
                 }
             }
-            if operation.kind == crate::Kind::Realloc {
-                let failure_id = format!("native:{}:{}:{}:failure", id, operation.node, index);
-                nodes.push(semantic_node(failure_id.clone(), &id, "REALLOC_FAILED",
-                    &operation, path, generation));
-                if let Some(attempt_id) = attempt_id {
-                    realloc_failures.push((attempt_id, failure_id, operation.node.clone()));
-                }
+            if let Some(previous) = previous {
+                previous_by_anchor.insert(operation.node.clone(), previous);
             }
         }
-        let mut edges = Vec::new();
         for successor in &function.successors {
             // A compiler-resolved internal call is represented by a call seam
             // and its pushed return continuation. Retaining this raw CFG edge
@@ -1999,36 +2203,6 @@ pub(crate) fn semantic_request(
                             guards: successor.guarded_targets.iter()
                                 .find(|item| item.target == *target_anchor)
                                 .map(|item| item.guards.clone()).unwrap_or_default(),
-                            bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
-                            return_to: String::new(), provenance: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-        for node_ids in by_anchor.values() {
-            for pair in node_ids.windows(2) {
-                edges.push(lifetime_proto::NativeSemanticEdge {
-                    source: pair[0].clone(), target: pair[1].clone(), kind: "normal".into(), guards: Vec::new(),
-                    bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
-                    return_to: String::new(), provenance: String::new(),
-                });
-            }
-        }
-        // Realloc has two semantic outcomes. Keep the failure node out of the
-        // same-anchor linear chain and add an explicit alternate edge; both
-        // outcomes then continue through the original CFG successors.
-        for (attempt, failure, anchor) in realloc_failures {
-            edges.push(lifetime_proto::NativeSemanticEdge {
-                source: attempt, target: failure.clone(), kind: "realloc-failure".into(), guards: Vec::new(),
-                bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
-                return_to: String::new(), provenance: String::new(),
-            });
-            if let Some(successors) = function.successors.iter().find(|item| item.node == anchor) {
-                for target_anchor in &successors.targets {
-                    if let Some(target) = by_anchor.get(target_anchor).and_then(|items| items.first()) {
-                        edges.push(lifetime_proto::NativeSemanticEdge {
-                            source: failure.clone(), target: target.clone(), kind: "normal".into(), guards: Vec::new(),
                             bindings: Vec::new(), seam_kind: String::new(), callee: String::new(),
                             return_to: String::new(), provenance: String::new(),
                         });
@@ -2278,4 +2452,48 @@ fn slim_prepared(mut function: lifetime_proto::PreparedFunction,
         function.operations.clear();
     }
     function
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call_with_guard(var: &str, canon: &str) -> lifetime_proto::FunctionCall {
+        lifetime_proto::FunctionCall {
+            guards: vec![lifetime_proto::GuardFact { var: var.into(), canon: canon.into() }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn size_guard_becomes_value_proof_carrying_raw_canon() {
+        let proofs = ir_guard_proofs(&call_with_guard("n", "n < cap"));
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].kind, "VALUE");
+        // A relational guard keeps its human-readable canon as the value.
+        assert_eq!(proofs[0].value, "n < cap");
+    }
+
+    #[test]
+    fn nonnull_guard_binds_root_generation_value() {
+        let proofs = ir_guard_proofs(&call_with_guard("p", "p != NULL"));
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].kind, "NONNULL");
+        // Null-shaped guards project to the guarded root at generation zero so
+        // the matcher can split_once('#') into root/generation.
+        assert_eq!(proofs[0].value, "p#g0");
+    }
+
+    #[test]
+    fn isnull_guard_is_recognised_from_compact_spelling() {
+        let proofs = ir_guard_proofs(&call_with_guard("p", "p == NULL"));
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].kind, "ISNULL");
+        assert_eq!(proofs[0].value, "p#g0");
+    }
+
+    #[test]
+    fn empty_canon_yields_no_proof() {
+        assert!(ir_guard_proofs(&call_with_guard("", "")).is_empty());
+    }
 }

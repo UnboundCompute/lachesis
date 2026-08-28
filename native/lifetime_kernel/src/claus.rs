@@ -167,95 +167,128 @@ fn seed_order(items: &[String]) -> Vec<String> {
     order
 }
 
-/// Match the old two-phase UDF traversal: callers to a fixpoint, then
-/// callees to a fixpoint, with one shared visited set across all seeds.
-fn traverse_component(
-    start: &str,
-    callees: &HashMap<String, Vec<String>>,
-    callers: &HashMap<String, Vec<String>>,
-    visited: &mut BTreeSet<String>,
-) -> Vec<String> {
-    let mut local = Vec::new();
-    if !visited.insert(start.to_owned()) { return local; }
-    local.push(start.to_owned());
-    let mut queue: VecDeque<String> = callers.get(start).into_iter().flatten()
-        .filter(|name| !visited.contains(*name)).cloned().collect();
-    let mut queued: BTreeSet<String> = queue.iter().cloned().collect();
-    while let Some(function) = queue.pop_front() {
-        if !visited.insert(function.clone()) { continue; }
-        local.push(function.clone());
-        for caller in callers.get(&function).into_iter().flatten() {
-            if !visited.contains(caller) && queued.insert(caller.clone()) {
-                queue.push_back(caller.clone());
-            }
-        }
-    }
-    queue.clear();
-    queued.clear();
-    for function in &local {
-        for callee in callees.get(function).into_iter().flatten() {
-            if !visited.contains(callee) && queued.insert(callee.clone()) {
-                queue.push_back(callee.clone());
-            }
-        }
-    }
-    while let Some(function) = queue.pop_front() {
-        if !visited.insert(function.clone()) { continue; }
-        local.push(function.clone());
-        for callee in callees.get(&function).into_iter().flatten() {
-            if !visited.contains(callee) && queued.insert(callee.clone()) {
-                queue.push_back(callee.clone());
-            }
-        }
-    }
-    local
+fn region_seed_node(
+    root: &str,
+    functions_by_id: &HashMap<&str, &lifetime_proto::NativeSemanticFunction>,
+) -> String {
+    functions_by_id.get(root)
+        .and_then(|function| function.nodes.first().map(|node| node.id.clone()))
+        .unwrap_or_else(|| root.to_owned())
 }
 
-/// Pick an unvisited compiler node, walk callers to a callerless user-defined
-/// function, then run Claus down its complete compiler-resolved callee cone.
-/// Repeat until every emitted node is covered. The seeded shuffle is stable,
-/// so binary sidecars remain reproducible while avoiding source-order bias.
+/// Faithful port of the reference source discovery.  Launch roots are the
+/// catalogued source functions unioned with callerless functions; each root
+/// owns the compiler-resolved callee cone reachable below it.  A launch that
+/// is itself reachable from another launch is absorbed into that ancestor's
+/// region -- its launch anchors are still emitted as walk starts, so no
+/// source-originated flow is lost -- while pure cyclic components with neither
+/// a callerless nor a catalogued member fall back to their stable-smallest
+/// member so coverage still terminates over every function.  The seeded
+/// shuffle over roots keeps binary sidecars reproducible while avoiding
+/// source-order bias in which root owns a shared downstream cone.
 pub(crate) fn pick_regions(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeSourceRegion> {
     let (callees, callers) = call_graph(result);
-    let owners: HashMap<&str, &str> = node_functions(result);
-    let mut node_order: Vec<String> = owners.keys().map(|node| (*node).to_owned()).collect();
-    node_order.sort();
-    let shuffled = seed_order(&node_order);
+    let functions_by_id: HashMap<&str, &lifetime_proto::NativeSemanticFunction> =
+        result.functions.iter().map(|function| (function.id.as_str(), function)).collect();
+
+    // Launch anchors per function: catalogued source call nodes when present,
+    // otherwise the structural entry of a callerless function.
+    let mut launch_nodes: HashMap<String, Vec<String>> = HashMap::new();
+    for function in &result.functions {
+        if !function.source_launch_nodes.is_empty() {
+            launch_nodes.insert(function.id.clone(), function.source_launch_nodes.clone());
+        } else if callers.get(&function.id).map_or(true, |parents| parents.is_empty()) {
+            let anchor = if !function.entry.is_empty() {
+                Some(function.entry.clone())
+            } else {
+                function.nodes.first().map(|node| node.id.clone())
+            };
+            launch_nodes.insert(function.id.clone(), anchor.into_iter().collect());
+        }
+    }
+
+    // A launch reachable from another launch's cone is not a distinct root; it
+    // is covered under that ancestor (its anchors still seed the walk there).
+    // One combined downward frontier seeded a single hop below every launch
+    // marks every function dominated by some launch in O(edges); a launch that
+    // lands in it is absorbed.  (A launch reachable only from its own cycle is
+    // re-rooted by the coverage fallback below, so no function is dropped.)
+    let mut dominated: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: VecDeque<String> = VecDeque::new();
+    for launch in launch_nodes.keys() {
+        for callee in callees.get(launch).into_iter().flatten() {
+            if dominated.insert(callee.clone()) { frontier.push_back(callee.clone()); }
+        }
+    }
+    while let Some(function) = frontier.pop_front() {
+        for callee in callees.get(&function).into_iter().flatten() {
+            if dominated.insert(callee.clone()) { frontier.push_back(callee.clone()); }
+        }
+    }
+    let absorbed = dominated;
+
     let mut regions = Vec::new();
-    let mut covered_nodes = BTreeSet::new();
-    let mut emitted_roots = BTreeSet::new();
-    for seed_node in shuffled {
-        if covered_nodes.contains(&seed_node) { continue; }
-        let Some(seed_function) = owners.get(seed_node.as_str()).copied() else { continue };
-        let source_function = callerless_root(seed_function, &callers);
-        let selected = downward_cone(&source_function, &callees);
-        for function_id in &selected {
-            if let Some(function) = result.functions.iter().find(|item| &item.id == function_id) {
-                covered_nodes.extend(function.nodes.iter().map(|node| node.id.clone()));
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    let mut emitted_roots: BTreeSet<String> = BTreeSet::new();
+
+    let mut root_order: Vec<String> = launch_nodes.keys()
+        .filter(|launch| !absorbed.contains(*launch))
+        .cloned().collect();
+    root_order.sort();
+    for root in seed_order(&root_order) {
+        if !emitted_roots.insert(root.clone()) { continue; }
+        let cone = downward_cone(&root, &callees);
+        let mut source_nodes: BTreeSet<String> = BTreeSet::new();
+        for function_id in &cone {
+            if let Some(anchors) = launch_nodes.get(function_id) {
+                source_nodes.extend(anchors.iter().cloned());
             }
         }
-        if !emitted_roots.insert(source_function.clone()) { continue; }
-        let source_nodes = result.functions.iter()
-            .find(|function| function.id == source_function)
+        covered.extend(cone.iter().cloned());
+        regions.push(lifetime_proto::NativeSourceRegion {
+            source_function: root.clone(),
+            source_nodes: source_nodes.into_iter().collect(),
+            functions: cone,
+            contexts: vec!["__entry__".to_owned()],
+            seed_node: region_seed_node(&root, &functions_by_id),
+        });
+    }
+
+    // Coverage fallback: cyclic components with no callerless or catalogued
+    // launch. Root them at their stable-smallest member so every emitted node
+    // still lands in exactly one region.
+    let mut fallback_order: Vec<String> = result.functions.iter()
+        .filter(|function| !function.nodes.is_empty())
+        .map(|function| function.id.clone()).collect();
+    fallback_order.sort();
+    for seed in seed_order(&fallback_order) {
+        if covered.contains(&seed) { continue; }
+        let root = callerless_root(&seed, &callers);
+        if !emitted_roots.insert(root.clone()) { continue; }
+        let cone = downward_cone(&root, &callees);
+        let source_nodes: Vec<String> = functions_by_id.get(root.as_str())
             .and_then(|function| (!function.entry.is_empty()).then(|| function.entry.clone())
                 .or_else(|| function.nodes.first().map(|node| node.id.clone())))
             .into_iter().collect();
-        let contexts = vec!["__entry__".to_owned()];
+        covered.extend(cone.iter().cloned());
         regions.push(lifetime_proto::NativeSourceRegion {
-            source_function,
+            source_function: root.clone(),
             source_nodes,
-            functions: selected,
-            contexts,
-            seed_node,
+            functions: cone,
+            contexts: vec!["__entry__".to_owned()],
+            seed_node: region_seed_node(&root, &functions_by_id),
         });
     }
+
     // Preserve compiler functions whose compact semantic projection has no
     // nodes. They cannot produce a skeleton today, but recording the region
     // keeps the all-function coverage contract explicit in the sidecar.
     for function in &result.functions {
-        if !function.nodes.is_empty() || emitted_roots.contains(&function.id) { continue; }
+        if !function.nodes.is_empty()
+            || covered.contains(&function.id)
+            || emitted_roots.contains(&function.id) { continue; }
         regions.push(lifetime_proto::NativeSourceRegion {
             source_function: function.id.clone(), functions: vec![function.id.clone()],
             seed_node: function.id.clone(), contexts: vec!["__entry__".to_owned()],
@@ -296,7 +329,7 @@ mod tests {
         };
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].source_function, "callee");
+        assert_eq!(regions[0].source_function, "source");
         assert!(["src", "sink"].contains(&regions[0].seed_node.as_str()));
         assert_eq!(regions[0].contexts, vec!["__entry__"]);
         assert_eq!(regions[0].source_nodes.iter().collect::<BTreeSet<_>>(),
