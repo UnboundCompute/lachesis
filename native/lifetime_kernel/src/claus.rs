@@ -47,16 +47,80 @@ fn call_graph(
     (callees, callers)
 }
 
+struct PythonRandom {
+    state: [u32; 624],
+    index: usize,
+}
+
+impl PythonRandom {
+    fn seed_zero() -> Self {
+        let mut state = [0u32; 624];
+        state[0] = 19650218;
+        for index in 1..624 {
+            state[index] = 1812433253u32
+                .wrapping_mul(state[index - 1] ^ (state[index - 1] >> 30))
+                .wrapping_add(index as u32);
+        }
+        let mut index = 1usize;
+        let mut key_index = 0usize;
+        for _ in 0..624 {
+            state[index] = (state[index]
+                ^ (state[index - 1] ^ (state[index - 1] >> 30))
+                    .wrapping_mul(1664525))
+                .wrapping_add(key_index as u32);
+            index += 1;
+            key_index += 1;
+            if index >= 624 { state[0] = state[623]; index = 1; }
+            if key_index >= 1 { key_index = 0; }
+        }
+        for _ in 0..623 {
+            state[index] = (state[index]
+                ^ (state[index - 1] ^ (state[index - 1] >> 30))
+                    .wrapping_mul(1566083941))
+                .wrapping_sub(index as u32);
+            index += 1;
+            if index >= 624 { state[0] = state[623]; index = 1; }
+        }
+        state[0] = 0x8000_0000;
+        Self { state, index: 624 }
+    }
+
+    fn twist(&mut self) {
+        let old = self.state;
+        for index in 0..624 {
+            let value = (old[index] & 0x8000_0000)
+                | (old[(index + 1) % 624] & 0x7fff_ffff);
+            self.state[index] = old[(index + 397) % 624]
+                ^ (value >> 1)
+                ^ if value & 1 != 0 { 0x9908_b0df } else { 0 };
+        }
+        self.index = 0;
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        if self.index >= 624 { self.twist(); }
+        let mut value = self.state[self.index];
+        self.index += 1;
+        value ^= value >> 11;
+        value ^= (value << 7) & 0x9d2c_5680;
+        value ^= (value << 15) & 0xefc6_0000;
+        value ^ (value >> 18)
+    }
+
+    fn randbelow(&mut self, bound: usize) -> usize {
+        let bits = usize::BITS - bound.leading_zeros();
+        loop {
+            let value = (self.next_u32() >> (32 - bits)) as usize;
+            if value < bound { return value; }
+        }
+    }
+}
+
 fn seed_order(items: &[String]) -> Vec<String> {
     let mut order = items.to_vec();
-    let mut state = 0x9e37_79b9_u64;
+    let mut random = PythonRandom::seed_zero();
     for index in (1..order.len()).rev() {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^= value >> 31;
-        order.swap(index, (value as usize) % (index + 1));
+        order.swap(index, random.randbelow(index + 1));
     }
     order
 }
@@ -229,5 +293,11 @@ mod tests {
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].contexts, vec!["__entry__"]);
+    }
+
+    #[test]
+    fn seed_order_matches_python_random_seed_zero() {
+        let items = ["a", "b", "c", "d", "e"].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(seed_order(&items), ["c", "b", "a", "e", "d"]);
     }
 }
