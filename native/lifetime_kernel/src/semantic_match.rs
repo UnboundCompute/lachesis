@@ -722,7 +722,11 @@ pub(crate) fn match_result(
         .cloned()
         .collect();
     if had_skeletons {
-        return match_skeletons(temporal_skeletons);
+        let mut matched = match_skeletons(temporal_skeletons);
+        if !result.complete {
+            for function in &mut matched.functions { function.capped = true; }
+        }
+        return matched;
     }
     if !result.seams.is_empty() {
         return match_stitched_result(result);
@@ -759,9 +763,13 @@ pub(crate) fn match_result(
     for (index, function) in large {
         ordered[index] = Some(match_function(&function));
     }
-    lifetime_proto::NativeTemporalResult {
+    let mut matched = lifetime_proto::NativeTemporalResult {
         functions: ordered.into_iter().flatten().collect(),
+    };
+    if !result.complete {
+        for function in &mut matched.functions { function.capped = true; }
     }
+    matched
 }
 
 /// Apply the executable Atropos pattern set after native state matching.
@@ -966,6 +974,7 @@ fn reach_evaluator(name: &str, token: &lifetime_proto::NativeSkeletonToken) -> b
 fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
     -> lifetime_proto::NativeTemporalResult
 {
+    let complete = result.complete;
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut exits = Vec::new();
@@ -994,7 +1003,8 @@ fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
         language: "mixed".into(), source_launch_nodes: Vec::new(),
         parameter_roots: Vec::new(),
     };
-    let matched = match_function(&function);
+    let mut matched = match_function(&function);
+    matched.capped |= !complete;
     lifetime_proto::NativeTemporalResult { functions: vec![matched] }
 }
 
