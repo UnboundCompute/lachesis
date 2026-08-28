@@ -367,6 +367,24 @@ fn is_function_syntax(kind: &str) -> bool {
         "FunctionTemplate" | "ObjCMethodDecl" | "BlockDecl")
 }
 
+/// Normalize a libclang cursor-kind spelling to the clang JSON AST-dump kind
+/// name that the higher passes branch on — cast-peel sets, member/parameter
+/// recognition, and the sidecar allow-list all match the JSON vocabulary, which
+/// is what the reference frontend (a JSON-dump parser) emitted. libclang uses a
+/// coarser vocabulary: implicit casts surface as UnexposedExpr, member
+/// references as MemberRefExpr, records as StructDecl/UnionDecl, and parameters
+/// as ParmDecl. Only the emitted syntax_kind property is normalized here;
+/// internal control flow keeps the raw libclang spelling.
+fn json_syntax_kind(kind: &str) -> &str {
+    match kind {
+        "ParmDecl" => "ParmVarDecl",
+        "StructDecl" | "UnionDecl" => "RecordDecl",
+        "MemberRefExpr" => "MemberExpr",
+        "UnexposedExpr" => "ImplicitCastExpr",
+        other => other,
+    }
+}
+
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
     let absolute = Path::new(path)
         .canonicalize()
@@ -823,7 +841,7 @@ unsafe fn visit_one(
         field("start_column", integer(column as i64)),
         field("end_line", integer(end_line as i64)),
         field("end_column", integer(end_column as i64)),
-        field("syntax_kind", text(&syntax_kind)),
+        field("syntax_kind", text(json_syntax_kind(&syntax_kind))),
         field("type", text(&type_spelling)),
     ];
     let owner_id = function_owner(cursor, emitter);
