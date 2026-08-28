@@ -74,7 +74,7 @@ fn report_native_phase(
 /// Project a semantic function onto its event nodes while preserving CFG
 /// reachability through removed anchor nodes.  The event sidecar is used by
 /// the matcher, so dropping the anchors must not drop branch/order semantics.
-fn compact_event_function(
+pub(crate) fn compact_event_function(
     mut function: lifetime_proto::NativeSemanticFunction,
 ) -> Option<lifetime_proto::NativeSemanticFunction> {
     let full_entry = function.entry.clone();
