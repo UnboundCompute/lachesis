@@ -574,6 +574,8 @@ fn match_function(
                     next_bindings.push((target_object as u32, source));
                 }
             }
+            next_bindings.sort_unstable();
+            next_bindings.dedup();
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
             let mut next_nullable = nullable.clone();
@@ -598,6 +600,7 @@ fn match_function(
                     item.root.strip_prefix("decl:").unwrap_or(&item.root) == root
                         && item.generation == generation).map(|id| id as u32)
                 else { continue };
+                let object = canonical(object, &next_bindings);
                 match guard.kind.as_str() {
                     "ISNULL" => {
                         if next_nonnull.contains(object) { contradiction = true; break; }
