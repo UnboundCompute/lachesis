@@ -661,6 +661,7 @@ fn match_function(
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
             let mut next_nullable = nullable.clone();
+            let mut next_origins = origins.clone();
             let mut next_escaped = escaped.clone();
             if let Some((receiver, returned)) = returned_slot_binding {
                 // Null/non-null are storage-slot facts and therefore flow
@@ -710,6 +711,10 @@ fn match_function(
                         if next_nonnull.contains(object) || next_nonnull.contains(raw_object) {
                             contradiction = true; break;
                         }
+                        // This arm disproves the nullable allocation origin.
+                        // Keeping it live would manufacture a leak at the
+                        // failure-arm exit even though no object exists.
+                        next_origins.remove(object);
                         next_nulls.insert(raw_object);
                         next_nonnull.remove(object);
                         next_nonnull.remove(raw_object);
@@ -735,7 +740,7 @@ fn match_function(
                     node: *target, returns: next_returns, bindings: next_bindings,
                     guards: next_guards.iter().map(|guard|
                         (guard.kind.clone(), guard.value.clone())).collect(),
-                    released: released.clone(), origins: origins.clone(), nulls: next_nulls,
+                    released: released.clone(), origins: next_origins, nulls: next_nulls,
                     nonnull: next_nonnull, nullable: next_nullable,
                     uninitialized: uninitialized.clone(),
                     pointer_arithmetic: pointer_arithmetic.clone(), escaped: next_escaped,
@@ -1412,6 +1417,33 @@ mod tests {
             functions: vec![lifetime_proto::NativeSemanticFunction {
                 id: "f".to_owned(), entry: "n".to_owned(), exits: vec!["r".to_owned()],
                 nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
+                parameter_roots: Vec::new(),
+            }],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(result.functions[0].findings.is_empty());
+    }
+
+    #[test]
+    fn null_guard_removes_a_disproven_nullable_origin() {
+        let mut origin = node("origin", "ORIGIN", 1);
+        origin.access = "return-may-null".to_owned();
+        let nodes = vec![origin, node("exit", "", 2)];
+        let edges = vec![lifetime_proto::NativeSemanticEdge {
+            source: "origin".to_owned(),
+            target: "exit".to_owned(),
+            kind: "normal".to_owned(),
+            guards: vec![lifetime_proto::GuardProof {
+                kind: "ISNULL".to_owned(), value: "p#g0".to_owned(),
+            }],
+            ..Default::default()
+        }];
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![lifetime_proto::NativeSemanticFunction {
+                id: "f".to_owned(), entry: "origin".to_owned(),
+                exits: vec!["exit".to_owned()], nodes, edges,
+                language: "c".to_owned(), source_launch_nodes: Vec::new(),
                 parameter_roots: Vec::new(),
             }],
             complete: true,
