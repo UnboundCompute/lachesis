@@ -169,6 +169,9 @@ pub(crate) fn build(
     }
     let summary_map: HashMap<String, &lifetime_proto::NativeSummaryFunction> = summaries.functions.iter()
         .map(|summary| (summary.name.clone(), summary)).collect();
+    let function_by_id: HashMap<&str, &str> = functions.values()
+        .map(|function| (function.id.as_str(), function.name.as_str()))
+        .collect();
     // The legacy F record's `is_source` is a graph-topology property: it is
     // true for a function with no resolved callers.  A catalogued source call
     // is separate launch evidence and must not replace that definition. Keep
@@ -178,13 +181,12 @@ pub(crate) fn build(
     for function in functions.values() {
         for call in &function.calls {
             let target = if !call.callee_function_id.is_empty() {
-                functions.iter().find(|(_, candidate)|
-                    candidate.id == call.callee_function_id).map(|(name, _)| name)
+                function_by_id.get(call.callee_function_id.as_str()).copied()
             } else {
-                functions.contains_key(&call.callee).then_some(&call.callee)
+                functions.contains_key(&call.callee).then_some(call.callee.as_str())
             };
             if let Some(target) = target {
-                callers.insert(target.clone());
+                callers.insert(target.to_owned());
             }
         }
     }
