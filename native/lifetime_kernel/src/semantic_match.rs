@@ -122,6 +122,27 @@ fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
     value
 }
 
+fn value_constraint(value: &str) -> Option<(&str, &str, &str)> {
+    for operator in ["<=", ">=", "==", "!=", "<", ">"] {
+        if let Some(index) = value.find(operator) {
+            return Some((&value[..index], operator, &value[index + operator.len()..]));
+        }
+    }
+    None
+}
+
+fn contradictory_value(left: &str, right: &str) -> bool {
+    let (Some((left_value, left_op, left_rhs)), Some((right_value, right_op, right_rhs))) =
+        (value_constraint(left), value_constraint(right)) else { return false };
+    if left_value != right_value { return false; }
+    if left_op == "==" && right_op == "==" { return left_rhs != right_rhs; }
+    if matches!((left_op, right_op), ("==", "!=") | ("!=", "==")) {
+        return left_rhs == right_rhs;
+    }
+    matches!((left_op, right_op),
+        ("<", ">=") | (">=", "<") | (">", "<=") | ("<=", ">"))
+}
+
 fn add_finding(
     output: &mut HashMap<(String, String, String, i64), lifetime_proto::NativeTemporalFinding>,
     function: &str,
@@ -480,6 +501,18 @@ fn match_function(
             let mut next_guards = path_guards.clone();
             let mut contradiction = false;
             for guard in guards {
+                if guard.kind == "VALUE" {
+                    if next_guards.iter().any(|existing|
+                        existing.kind == "VALUE" && contradictory_value(&existing.value, &guard.value)) {
+                        contradiction = true;
+                        break;
+                    }
+                    if !next_guards.iter().any(|item|
+                        item.kind == guard.kind && item.value == guard.value) {
+                        next_guards.push(guard.clone());
+                    }
+                    continue;
+                }
                 let Some((root, generation)) = guard.value.split_once('#') else { continue };
                 let root = root.strip_prefix("decl:").unwrap_or(root);
                 let Some(object) = objects.iter().position(|item|

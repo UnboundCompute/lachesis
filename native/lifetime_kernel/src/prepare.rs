@@ -382,6 +382,17 @@ fn guard_value(graph: &GraphView<'_>, node: &str) -> Option<String> {
     (!value.is_empty()).then(|| format!("{value}#g0"))
 }
 
+fn guard_operand(graph: &GraphView<'_>, node: &str) -> Option<String> {
+    if graph.is_null(node) { return Some("NULL".to_owned()); }
+    if let Some(path) = graph.access_path(node, 0) {
+        let mut value = path.root.trim_start_matches("decl:").to_owned();
+        value.push_str(&path.selectors.join(""));
+        if !value.is_empty() { return Some(value); }
+    }
+    let value = graph.label(node).replace(' ', "");
+    (!value.is_empty()).then_some(value)
+}
+
 fn branch_guards(graph: &GraphView<'_>, source: &str, branch: &str)
     -> Vec<lifetime_proto::GuardProof>
 {
@@ -402,6 +413,21 @@ fn branch_guards(graph: &GraphView<'_>, source: &str, branch: &str)
             let is_null = if invert { !is_null } else { is_null };
             return proof(if is_null { "ISNULL" } else { "NONNULL" }, value_child);
         }
+    }
+    if matches!(operator, "<" | "<=" | ">" | ">=" | "==" | "!=")
+        && children.len() >= 2
+    {
+        let Some(left) = guard_operand(graph, &children[0]) else { return Vec::new() };
+        let Some(right) = guard_operand(graph, &children[1]) else { return Vec::new() };
+        let relation = if invert {
+            match operator {
+                "<" => ">=", "<=" => ">", ">" => "<=", ">=" => "<",
+                "==" => "!=", "!=" => "==", _ => operator,
+            }
+        } else { operator };
+        return vec![lifetime_proto::GuardProof {
+            kind: "VALUE".to_owned(), value: format!("{left}{relation}{right}"),
+        }];
     }
     if operator == "!" {
         let value = children.first().and_then(|child| guard_value(graph, child));
