@@ -552,13 +552,19 @@ pub(crate) fn match_result(
 /// compiled protobuf catalog prevents the Rust engine from growing a second,
 /// product-specific pattern registry.
 pub(crate) fn match_result_with_catalog(
-    result: lifetime_proto::NativeSemanticResult,
+    mut result: lifetime_proto::NativeSemanticResult,
     catalog: Option<&crate::atropos_proto::PatternCatalog>,
 ) -> lifetime_proto::NativeTemporalResult {
     let Some(catalog) = catalog else { return match_result(result); };
+    // The Python matcher has two disjoint branches: reach skeletons are
+    // evaluated as one sink fact, while typestate skeletons go through the
+    // path-sensitive temporal automaton.  Passing both kinds to
+    // `match_result` makes a reach sink look like a lifecycle event and can
+    // produce duplicate or spurious temporal findings.
     let reach_skeletons: Vec<_> = result.skeletons.iter()
         .filter(|skeleton| skeleton.kind == "reach")
         .cloned().collect();
+    result.skeletons.retain(|skeleton| skeleton.kind != "reach");
     let mut matched = match_result(result);
     matched.functions.extend(reach_skeletons.iter().enumerate()
         .filter_map(|(ordinal, skeleton)| match_reach_skeleton(skeleton, catalog, ordinal)));
