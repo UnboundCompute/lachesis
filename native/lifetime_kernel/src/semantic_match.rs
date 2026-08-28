@@ -351,7 +351,9 @@ fn match_function(
             ));
         }
     }
-    let entry = by_id.get(function.entry.as_str()).copied().unwrap_or(0);
+    let entry = by_id.get(function.entry.as_str()).copied();
+    let entry_missing = entry.is_none();
+    let entry = entry.unwrap_or(0);
     let exits: HashSet<usize> = function.exits.iter()
         .filter_map(|id| by_id.get(id.as_str()).copied())
         .collect();
@@ -772,7 +774,7 @@ fn match_function(
         findings,
         transfers,
         widenings,
-        capped: transfers as usize >= MAX_STATES,
+        capped: entry_missing || transfers as usize >= MAX_STATES,
     }
 }
 
