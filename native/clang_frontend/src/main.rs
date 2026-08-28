@@ -197,6 +197,7 @@ struct Emitter {
     function_parameters: FxHashMap<String, Vec<String>>,
     usr_ids: FxHashMap<String, String>,
     path_cache: FxHashMap<String, String>,
+    source_cache: FxHashMap<String, Vec<u8>>,
 }
 
 impl Emitter {
@@ -214,6 +215,34 @@ impl Emitter {
             .into_owned();
         self.path_cache.insert(raw, canonical.clone());
         canonical
+    }
+
+    /// Source snippet for a byte span [start, end), whitespace-collapsed and
+    /// truncated at 300 chars.  Mirrors the reference frontend's
+    /// source_bytes + source_span + compact: a body node's label is the raw
+    /// file text it spells, never an AST-derived name.  Returns empty when the
+    /// span is degenerate or out of range so the caller can fall back.
+    fn snippet(&mut self, file: &str, start: u32, end: u32) -> String {
+        if file.is_empty() || end <= start {
+            return String::new();
+        }
+        if !self.source_cache.contains_key(file) {
+            let bytes = fs::read(file).unwrap_or_default();
+            self.source_cache.insert(file.to_owned(), bytes);
+        }
+        let bytes = &self.source_cache[file];
+        let (s, e) = (start as usize, end as usize);
+        if e > bytes.len() || s >= e {
+            return String::new();
+        }
+        let raw = String::from_utf8_lossy(&bytes[s..e]);
+        let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.chars().count() <= 300 {
+            text
+        } else {
+            let head: String = text.chars().take(299).collect();
+            format!("{head}…")
+        }
     }
 
     fn node(&mut self, record: graph::NodeRecord) -> io::Result<()> {
@@ -847,7 +876,15 @@ unsafe fn visit_one(
             properties.push(field("storage_class", text("static")));
         }
     }
+    // Body nodes (call/statement/expression) label as the raw source text they
+    // spell, matching the reference frontend; declarations keep their spelling.
+    let body_snippet = if tier == "T3" {
+        emitter.snippet(&file, offset, end_offset)
+    } else {
+        String::new()
+    };
     let mut call_target = None;
+    let mut callee_set = false;
     if syntax_kind == "CallExpr" {
         let direct = clang_getCursorReferenced(cursor);
         let mut probe = ReferenceProbe { cursor: None };
@@ -872,6 +909,7 @@ unsafe fn visit_one(
                         target_end, &target_name, emitter,
                     );
                     properties.push(field("callee", text(&target_name)));
+                    callee_set = true;
                     if target_kind == "FieldDecl" {
                         properties.push(field("receiver_member_id", text(&target_id)));
                         properties.push(field("resolution", text("function-pointer")));
@@ -907,11 +945,26 @@ unsafe fn visit_one(
             }
             }
         }
+        // Reference fallback: an unresolved callee (member/indirect call such as
+        // `app->handler(...)`) has no nameable decl, so the callee text is the
+        // source snippet up to the first '(' — the receiver-qualified member.
+        if !callee_set {
+            let callee = body_snippet.split('(').next().unwrap_or("").trim();
+            if !callee.is_empty() {
+                properties.push(field("callee", text(callee)));
+            }
+        }
     }
     emitter.node(graph::NodeRecord {
         id: id.clone(),
         kind: node_kind.clone(),
-        label: if spelling.is_empty() { syntax_kind.clone() } else { spelling },
+        label: if !body_snippet.is_empty() {
+            body_snippet.clone()
+        } else if spelling.is_empty() {
+            syntax_kind.clone()
+        } else {
+            spelling
+        },
         properties,
         tier: tier.clone(),
     })?;
@@ -1872,6 +1925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             function_parameters: FxHashMap::default(),
             usr_ids: FxHashMap::default(),
             path_cache: FxHashMap::default(),
+            source_cache: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
             emitter.project_root = PathBuf::from(&request.source_dir)
