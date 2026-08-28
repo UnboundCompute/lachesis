@@ -4,7 +4,7 @@
 //! graph into a compact, ordered skeleton.  The skeleton retains event order,
 //! control markers, guards, and graph edges; no source text or JSON is needed.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::lifetime_proto;
 
@@ -259,8 +259,36 @@ fn build_typestate(
         tokens.push(lifetime_proto::NativeSkeletonToken {
             kind: "exit".into(), function: function_id.clone(), depth: 0, ..Default::default()
         });
-        let edges = events.windows(2).map(|pair| lifetime_proto::NativeSemanticEdge {
-            source: pair[0].id.clone(), target: pair[1].id.clone(), kind: "typestate".into(), ..Default::default()
+        let event_ids: HashSet<&str> = events.iter().map(|node| node.id.as_str()).collect();
+        let mut successors: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &function.edges {
+            successors.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+        }
+        // Preserve CFG branch structure while keeping each object stream
+        // compact: walk through control/value nodes until the next lifecycle
+        // event, instead of inventing textual edges between branch arms.
+        let mut event_edges = BTreeSet::new();
+        for event in &events {
+            let mut queue: VecDeque<&str> = successors.get(event.id.as_str())
+                .into_iter().flatten().copied().collect();
+            let mut seen = HashSet::new();
+            while let Some(node) = queue.pop_front() {
+                if !seen.insert(node) { continue; }
+                if event_ids.contains(node) {
+                    event_edges.insert((event.id.as_str(), node));
+                    continue;
+                }
+                queue.extend(successors.get(node).into_iter().flatten().copied());
+            }
+        }
+        // Synthetic/unit semantic results can omit CFG links. Retain a
+        // deterministic local stream for those inputs only; compiler-produced
+        // graphs always take the CFG-compressed path above.
+        if event_edges.is_empty() {
+            event_edges.extend(events.windows(2).map(|pair| (pair[0].id.as_str(), pair[1].id.as_str())));
+        }
+        let edges = event_edges.into_iter().map(|(source, target)| lifetime_proto::NativeSemanticEdge {
+            source: source.to_owned(), target: target.to_owned(), kind: "typestate".into(), ..Default::default()
         }).collect();
         output.push(lifetime_proto::NativeFlowSkeleton {
             kind: "typestate".into(), entry: function_id.clone(), source_function: function_id,
