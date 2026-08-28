@@ -2064,6 +2064,35 @@ pub(crate) fn semantic_request(
     {
         return Err(format!("native semantic preparation dropped compiler function {missing}"));
     }
+    // Return from every real compact CFG exit. A function may have several
+    // return statements, and each exit's event chain (including escape/null
+    // facts) must complete before control resumes in the caller.
+    let mut exit_seams = Vec::with_capacity(seams.len());
+    for seam in seams {
+        if seam.seam_kind != "return" {
+            exit_seams.push(seam);
+            continue;
+        }
+        let Some(binding) = seam.bindings.first() else {
+            exit_seams.push(seam);
+            continue;
+        };
+        let Some(callee) = functions.iter().find(|function| function.id == binding.callee)
+        else {
+            exit_seams.push(seam);
+            continue;
+        };
+        if callee.exits.is_empty() {
+            exit_seams.push(seam);
+        } else {
+            for source in &callee.exits {
+                let mut exit = seam.clone();
+                exit.source = source.clone();
+                exit_seams.push(exit);
+            }
+        }
+    }
+    let mut seams = exit_seams;
     // Seam endpoints must survive the compact event projection. Resolve the
     // compiler call anchor to the first event at that anchor, and the callee
     // entry anchor to its first event. Empty-event anchors remain a safe
@@ -2092,19 +2121,13 @@ pub(crate) fn semantic_request(
                 }
             }
         }
-        if let Some(function) = functions.iter().find(|item| item.id == binding.callee) {
-            let node = if seam.seam_kind == "return" {
-                function.nodes.iter().rev().find(|node| node.event_kind == "RETURN_VALUE")
-                    .or_else(|| function.nodes.iter().rev().find(|node| !node.event_kind.is_empty()))
-            } else {
-                function.nodes.iter().find(|node| !node.event_kind.is_empty())
-            }.or_else(|| function.nodes.first());
+        if seam.seam_kind != "return" {
+            let node = functions.iter().find(|item| item.id == binding.callee)
+                .and_then(|function| function.nodes.iter()
+                    .find(|node| !node.event_kind.is_empty())
+                    .or_else(|| function.nodes.first()));
             if let Some(node) = node {
-                if seam.seam_kind == "return" {
-                    seam.source = node.id.clone();
-                } else {
-                    seam.target = node.id.clone();
-                }
+                seam.target = node.id.clone();
             }
         }
         if seam.seam_kind == "return" {
