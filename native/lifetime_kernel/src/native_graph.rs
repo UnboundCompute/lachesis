@@ -1160,7 +1160,7 @@ where
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid graph edge frame: {error}"))?;
-                if matches!(record.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO") {
+                if matches!(record.kind.as_str(), "AST_CHILD" | "HAS_ARGUMENT" | "REFERS_TO" | "VALUE_FLOWS_TO") {
                     on_edge(compact_edge(record));
                 }
             }
@@ -1235,6 +1235,10 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                         relevant.insert(edge.target);
                     }
                 }
+                "HAS_ARGUMENT" if call_ids.contains(&edge.source) || relevant.contains(&edge.source) => {
+                    relevant.insert(edge.source);
+                    relevant.insert(edge.target);
+                }
                 "REFERS_TO" if relevant.contains(&edge.source) => {
                     relevant.insert(edge.target);
                 }
@@ -1258,6 +1262,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     scan_compact_records_at(input, edge_offset, |_| {}, |edge| {
         let keep = match edge.kind.as_str() {
             "AST_CHILD" => relevant.contains(&edge.source) || relevant.contains(&edge.target),
+            "HAS_ARGUMENT" => relevant.contains(&edge.source),
             "REFERS_TO" => relevant.contains(&edge.source),
             "VALUE_FLOWS_TO" => call_ids.contains(&edge.source),
             _ => false,
@@ -1281,6 +1286,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                     argument_edges.entry(edge.source.clone()).or_default().push(edge_index);
                 }
             }
+            "HAS_ARGUMENT" => { argument_edges.entry(edge.source.clone()).or_default().push(edge_index); }
             "REFERS_TO" => { refers.insert(edge.source.clone(), edge.target.clone()); }
             "VALUE_FLOWS_TO" if edge.reason == "initializer" => {
                 initializer_targets.insert(edge.source.clone(), edge.target.clone());
