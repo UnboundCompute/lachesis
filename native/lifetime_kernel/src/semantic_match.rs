@@ -806,6 +806,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_generation_is_not_use_after_free() {
+        let mut reorigin = node("o2", "ORIGIN", 3);
+        reorigin.generation = "g1".into();
+        let mut use_new = node("u2", "READ_STORAGE", 4);
+        use_new.generation = "g1".into();
+        let result = match_result(lifetime_proto::NativeSemanticResult {
+            functions: vec![function(vec![node("o", "ORIGIN", 1),
+                                             node("r", "RELEASE", 2),
+                                             reorigin, use_new])],
+            complete: true,
+            ..Default::default()
+        });
+        assert!(!result.functions[0].findings.iter()
+            .any(|finding| finding.pattern == "uaf.deref"));
+    }
+
+    #[test]
     fn catalog_selects_generic_finding_routes() {
         let result = lifetime_proto::NativeSemanticResult {
             functions: vec![function(vec![node("o", "ORIGIN", 1),
