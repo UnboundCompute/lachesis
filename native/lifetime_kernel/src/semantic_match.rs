@@ -696,6 +696,7 @@ fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
     let function = lifetime_proto::NativeSemanticFunction {
         id: "native:stitched".into(), entry, exits, nodes, edges,
         language: "mixed".into(), source_launch_nodes: Vec::new(),
+        parameter_roots: Vec::new(),
     };
     let matched = match_function(&function);
     lifetime_proto::NativeTemporalResult { functions: vec![matched] }
@@ -762,6 +763,7 @@ fn match_skeleton(
     Some(match_function(&lifetime_proto::NativeSemanticFunction {
         id: format!("native:skeleton:{ordinal}:{}", skeleton.context),
         entry, exits, nodes, edges, language: String::new(), source_launch_nodes: Vec::new(),
+        parameter_roots: Vec::new(),
     }))
 }
 

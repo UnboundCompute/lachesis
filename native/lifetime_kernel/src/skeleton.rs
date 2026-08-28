@@ -251,6 +251,10 @@ fn typestate_event(event: &str) -> bool {
 pub(crate) fn build_typestate(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
+    let called_functions: HashSet<&str> = result.seams.iter()
+        .filter(|edge| edge.seam_kind == "call")
+        .filter_map(|edge| (!edge.callee.is_empty()).then_some(edge.callee.as_str()))
+        .collect();
     let mut streams = BTreeSet::new();
     for function in &result.functions {
         for node in &function.nodes {
@@ -267,6 +271,15 @@ pub(crate) fn build_typestate(
             typestate_event(&node.event_kind)
                 && node.object_root == root && node.generation == generation).collect();
         if events.is_empty() { continue; }
+        let is_parameter = function.parameter_roots.iter().any(|parameter| parameter == &root);
+        // The old summary exports a parameter typestate only when the callee
+        // can release that formal. Parameters are excluded from the local
+        // typestate map, so a use-only formal must not create another stream.
+        if is_parameter && !events.iter().any(|node|
+            matches!(node.event_kind.as_str(), "memory.free" | "RELEASE")) {
+            continue;
+        }
+        let context = if is_parameter { format!("param:{root}") } else { root.clone() };
         let mut tokens = Vec::with_capacity(events.len() + 2);
         tokens.push(lifetime_proto::NativeSkeletonToken {
             kind: "enter".into(), function: function_id.clone(), depth: 0, ..Default::default()
@@ -277,7 +290,7 @@ pub(crate) fn build_typestate(
             tokens.push(lifetime_proto::NativeSkeletonToken {
                 kind: "event".into(), function: function_id.clone(), node: node.id.clone(),
                 family: lifecycle_family(&node.event_kind, &function.language),
-                object_root: node.object_root.clone(), object_selectors: node.object_selectors.clone(),
+                object_root: context.clone(), object_selectors: node.object_selectors.clone(),
                 line: node.line, has_line: node.has_line, depth: 1,
                 guarded: !guards.is_empty(), guards,
                 source_reachable: node.source_reachable,
@@ -322,10 +335,11 @@ pub(crate) fn build_typestate(
         let edges = event_edges.into_iter().map(|(source, target)| lifetime_proto::NativeSemanticEdge {
             source: source.to_owned(), target: target.to_owned(), kind: "typestate".into(), ..Default::default()
         }).collect();
+        let is_source = !called_functions.contains(function_id.as_str());
         output.push(lifetime_proto::NativeFlowSkeleton {
             kind: "typestate".into(), entry: function_id.clone(), source_function: function_id,
-            context: root, complete: true, tokens, edges,
-            is_source: !function.source_launch_nodes.is_empty(),
+            context, complete: true, tokens, edges,
+            is_source,
         });
     }
     output

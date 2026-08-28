@@ -1769,6 +1769,7 @@ pub(crate) fn semantic_request(
     }
     let functions: Vec<_> = prepared.into_iter().map(|function| {
         let id = function.id.clone();
+        let parameter_roots = function.parameters.clone();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
         let mut realloc_failures: Vec<(String, String, String)> = Vec::new();
@@ -1946,6 +1947,7 @@ pub(crate) fn semantic_request(
             .collect();
         Ok(lifetime_proto::NativeSemanticFunction {
             id, entry, exits, nodes, edges, language, source_launch_nodes,
+            parameter_roots,
         })
     }).collect::<Result<Vec<_>, String>>()?;
     if let Some(missing) = expected_function_ids.iter()
