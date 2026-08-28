@@ -562,13 +562,15 @@ fn match_function(
                                 &objects[object as usize], node, witness, &returns, &path_guards);
                 }
             }
-            for object in origins.iter() {
-                if !released.contains(object)
-                    && !escaped_reaches(object, &escaped, &objects, &bindings)
-                    && !has_surviving_alias(object, &bindings)
-                {
-                    add_finding(&mut findings, &function.id, "leak",
-                                &objects[object as usize], node, witness, &returns, &path_guards);
+            if returns.is_empty() {
+                for object in origins.iter() {
+                    if !released.contains(object)
+                        && !escaped_reaches(object, &escaped, &objects, &bindings)
+                        && !has_surviving_alias(object, &bindings)
+                    {
+                        add_finding(&mut findings, &function.id, "leak",
+                                    &objects[object as usize], node, witness, &returns, &path_guards);
+                    }
                 }
             }
         }
