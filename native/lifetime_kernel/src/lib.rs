@@ -1534,6 +1534,8 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
     input_path: *const c_char, catalog_path: *const c_char, output_path: *const c_char,
 ) -> i32 {
     let result = (|| {
+        let timing_enabled = std::env::var("LACHESIS_TIMINGS").ok().as_deref() == Some("1");
+        let semantic_started = std::time::Instant::now();
         if input_path.is_null() || output_path.is_null() {
             return Err("native semantic path is null".to_owned());
         }
@@ -1555,6 +1557,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         };
         let roles = catalog.as_ref().map(native_graph::lifecycle_roles).unwrap_or_default();
         let request = native_graph::sidecar_to_request_with_roles(&bytes, &roles)?;
+        report_native_phase(timing_enabled, semantic_started, "semantic translation", 0, 0);
         // Pass 2 publishes taint witnesses in the sibling binary overlay.  Use
         // the same graph path convention as the Python store, but keep the
         // lookup and decoding native so semantic findings receive computed
@@ -1565,6 +1568,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             .map(pass2::read_taint_evidence_path)
             .transpose()?;
         let mut full = prepare::semantic_request(request)?;
+        report_native_phase(timing_enabled, semantic_started, "semantic prepare", full.functions.len(), full.seams.len());
         if let Some(source_evidence) = source_evidence.as_ref() {
             for function in &mut full.functions {
                 for node in &mut function.nodes {
@@ -1586,6 +1590,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // reuse a completed function/source/context fragment.
         full.regions = claus::pick_regions(&full);
         full.skeletons = skeleton::build(&full);
+        report_native_phase(timing_enabled, semantic_started, "claus skeleton", full.regions.len(), full.skeletons.len());
         if let Some(catalog) = catalog.as_ref() {
             let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
                 .map(|base| format!("{base}.pass2.translation.pb"))
@@ -1601,11 +1606,13 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             let summaries = summary::summarize_with_evidence(
                 translation.clone(), catalog.clone(), source_evidence.as_ref());
             full.skeletons.extend(reach::build(&translation, &summaries, catalog));
+            report_native_phase(timing_enabled, semantic_started, "reach summaries", summaries.functions.len(), full.skeletons.len());
         }
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
         let result = full.encode_to_vec();
+        report_native_phase(timing_enabled, semantic_started, "semantic serialize", 0, result.len());
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, &result)
             .map_err(|error| format!("cannot write semantic result: {error}"))?;
