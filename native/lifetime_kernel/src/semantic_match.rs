@@ -186,6 +186,13 @@ fn selector_suffix<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+fn generation_rank(generation: &str) -> u64 {
+    generation.strip_prefix('g')
+        .and_then(|value| value.split('@').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
 fn add_finding(
     output: &mut HashMap<FindingKey, lifetime_proto::NativeTemporalFinding>,
     function: &str,
@@ -641,24 +648,40 @@ fn match_function(
                     }
                     continue;
                 }
-                let Some((root, generation)) = guard.value.split_once('#') else { continue };
-                let root = root.strip_prefix("decl:").unwrap_or(root);
-                let Some(object) = objects.iter().position(|item|
-                    item.root.strip_prefix("decl:").unwrap_or(&item.root) == root
-                        && item.generation == generation).map(|id| id as u32)
-                else { continue };
-                let object = canonical(object, &next_bindings);
+                let Some((guarded_label, generation)) = guard.value.rsplit_once('#') else { continue };
+                let guarded_label = guarded_label.strip_prefix("decl:").unwrap_or(guarded_label);
+                let mut known = Vec::new();
+                known.extend(origins.iter());
+                known.extend(next_nulls.iter());
+                known.extend(next_nonnull.iter());
+                known.extend(released.iter());
+                known.sort_unstable();
+                known.dedup();
+                let raw_object = known.into_iter().filter(|object|
+                    object_labels[*object as usize] == guarded_label)
+                    .max_by_key(|object| generation_rank(&objects[*object as usize].generation))
+                    .or_else(|| object_labels.iter().enumerate().find(|(index, label)|
+                        label.as_str() == guarded_label
+                            && objects[*index].generation == generation)
+                        .map(|(index, _)| index as u32));
+                let Some(raw_object) = raw_object else { continue };
+                let object = canonical(raw_object, &next_bindings);
                 match guard.kind.as_str() {
                     "ISNULL" => {
-                        if next_nonnull.contains(object) { contradiction = true; break; }
-                        next_nulls.insert(object);
+                        if next_nonnull.contains(object) || next_nonnull.contains(raw_object) {
+                            contradiction = true; break;
+                        }
+                        next_nulls.insert(raw_object);
                         next_nonnull.remove(object);
+                        next_nonnull.remove(raw_object);
                         next_nullable.remove(object);
                     }
                     "NONNULL" => {
-                        if next_nulls.contains(object) { contradiction = true; break; }
+                        if next_nulls.contains(raw_object) || next_nulls.contains(object) {
+                            contradiction = true; break;
+                        }
                         next_nonnull.insert(object);
-                        next_nulls.remove(object);
+                        next_nulls.remove(raw_object);
                         next_nullable.remove(object);
                     }
                     _ => {}
