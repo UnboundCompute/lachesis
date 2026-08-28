@@ -46,6 +46,39 @@ fn family_for(
         .unwrap_or_default()
 }
 
+fn direct_call<'a>(
+    function: &'a lifetime_proto::TranslationFunction,
+    callee: &str,
+    root: &str,
+) -> Option<&'a lifetime_proto::FunctionCall> {
+    let mut fallback = None;
+    for call in &function.calls {
+        if call.callee != callee { continue; }
+        if fallback.is_none() { fallback = Some(call); }
+        if root.is_empty() || call.arguments.iter()
+            .any(|argument| argument_root(argument) == root) {
+            return Some(call);
+        }
+    }
+    fallback
+}
+
+fn append_guard_tokens(
+    call: &lifetime_proto::FunctionCall,
+    function: &str,
+    depth: u32,
+    tokens: &mut Vec<lifetime_proto::NativeSkeletonToken>,
+) {
+    tokens.extend(call.guards.iter().map(|guard| lifetime_proto::NativeSkeletonToken {
+        kind: "guard".into(), function: function.into(), depth,
+        value: guard.var.clone(), control: vec![guard.canon.clone()],
+        guards: vec![lifetime_proto::GuardProof {
+            kind: "VALUE".into(), value: guard.canon.clone(),
+        }],
+        ..Default::default()
+    }));
+}
+
 fn sink_token(
     flow: &lifetime_proto::NativeSinkFlow,
     language: &str,
@@ -99,7 +132,12 @@ fn expand(
         return false;
     };
     if flow.via == "direct" {
-        let language = functions.get(function).map(|item| item.language.as_str()).unwrap_or("");
+        let function_record = functions.get(function).copied();
+        if let Some(call) = function_record.and_then(|item|
+            direct_call(item, sink_callee, &flow.root)) {
+            append_guard_tokens(call, function, depth, tokens);
+        }
+        let language = function_record.map(|item| item.language.as_str()).unwrap_or("");
         tokens.push(sink_token(flow, language, catalog, depth, guarded_acc || flow.guarded, false));
         return true;
     }
@@ -113,10 +151,11 @@ fn expand(
             }).or_else(|| caller.calls.iter().find(|call|
                 call.callee == flow.via || call.callee == callee.name
                     || call.callee_function_id == callee.id));
-            if call.is_some() {
+            if let Some(call) = call {
+                append_guard_tokens(call, function, depth, tokens);
                 if let Some(summary) = summaries.get(&flow.via) {
-                    let formal_root = call.and_then(|call| call.arguments.iter()
-                        .find(|argument| argument_root(argument) == flow.root))
+                    let formal_root = call.arguments.iter()
+                        .find(|argument| argument_root(argument) == flow.root)
                         .and_then(|argument| callee.parameter_names
                             .get(argument.position as usize));
                     if let Some(subflow) = summary.sink_flows.iter().find(|candidate|
@@ -127,7 +166,7 @@ fn expand(
                             kind: "enter".into(), function: flow.via.clone(), depth,
                             ..Default::default()
                         });
-                    let site_guarded = call.is_some_and(|call| !call.guards.is_empty());
+                    let site_guarded = !call.guards.is_empty();
                     let mut next_chain = chain.clone();
                     next_chain.insert(flow.via.clone());
                     let complete = expand(&flow.via, subflow, functions, summaries, catalog,
@@ -314,6 +353,9 @@ mod tests {
     fn emits_a_skeleton_for_each_flow_carrying_function_including_internal_functions() {
         let call = |node: &str, source: bool| lifetime_proto::FunctionCall {
             node: node.into(), callee: "sink_call".into(), is_source: source,
+            guards: source.then(|| lifetime_proto::GuardFact {
+                var: "input".into(), canon: "input < capacity".into(),
+            }).into_iter().collect(),
             arguments: vec![lifetime_proto::FunctionArgument {
                 position: 0, root: "input".into(), root_name: "input".into(), ..Default::default()
             }], ..Default::default()
@@ -344,6 +386,12 @@ mod tests {
         assert!(sink_nodes.contains("source-call"));
         assert!(sink_nodes.contains("sink-call"));
         assert!(sink_nodes.contains("sink-call-2"));
+        let public = skeletons.iter().find(|item| item.entry == "public_entry").unwrap();
+        assert_eq!(public.tokens.iter().map(|token| token.kind.as_str()).collect::<Vec<_>>(),
+            vec!["enter", "guard", "sink", "exit"]);
+        assert_eq!(public.tokens[1].value, "input");
+        assert_eq!(public.tokens[1].control, vec!["input < capacity"]);
+        assert_eq!(public.tokens[1].depth, 1);
         for skeleton in &skeletons {
             assert_eq!(skeleton.tokens.first().map(|token| token.depth), Some(0));
             assert_eq!(skeleton.tokens.last().map(|token| token.depth), Some(0));
