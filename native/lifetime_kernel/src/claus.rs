@@ -138,8 +138,11 @@ pub(crate) fn pick_regions(
             .into_iter()
             .flat_map(|function| function.source_launch_nodes.iter().cloned())
             .collect::<BTreeSet<_>>().into_iter().collect();
-        let contexts = if source_nodes.is_empty() { vec!["__entry__".to_owned()] }
-            else { source_nodes.clone() };
+        // A component is one cached Claus walk. Keep all launch anchors on
+        // that walk instead of replaying the same function cone once per
+        // source callsite; the old renderer composed one function flow and
+        // retained the launch sites as evidence on its tokens.
+        let contexts = vec!["__entry__".to_owned()];
         regions.push(lifetime_proto::NativeSourceRegion {
             source_function: source_function,
             source_nodes,
@@ -181,7 +184,7 @@ mod tests {
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].source_function, "callee");
-        assert_eq!(regions[0].contexts, vec!["source-call"]);
+        assert_eq!(regions[0].contexts, vec!["__entry__"]);
         assert_eq!(regions[0].functions.iter().collect::<BTreeSet<_>>(),
                    BTreeSet::from([&"source".to_owned(), &"callee".to_owned()]));
     }
@@ -212,6 +215,6 @@ mod tests {
         };
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].contexts, vec!["source-call"]);
+        assert_eq!(regions[0].contexts, vec!["__entry__"]);
     }
 }

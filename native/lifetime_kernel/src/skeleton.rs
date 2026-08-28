@@ -98,11 +98,17 @@ fn walk_region(
             }
         }
     } else {
-        // A structural root has no catalogued launch site.  Start at its
-        // compiler entry exactly as the old scheduler's __entry__ context did.
-        starts.extend(region.source_nodes.iter()
-            .filter(|id| nodes.contains_key(id.as_str()))
-            .cloned());
+        // ``__entry__`` is also used for a source-resolved component. Start
+        // from every launch anchor in that component; this is one cached walk,
+        // not one replay per source callsite.
+        for id in &region.source_nodes {
+            if nodes.contains_key(id.as_str()) {
+                starts.push(id.clone());
+            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
+                && node_allowed(node, &allowed)) {
+                starts.push(node.id.clone());
+            }
+        }
     }
     if starts.is_empty() && context == "__entry__" {
         if let Some(function) = functions.get(region.source_function.as_str()) {
