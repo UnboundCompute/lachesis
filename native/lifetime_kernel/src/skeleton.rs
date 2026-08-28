@@ -197,6 +197,15 @@ fn walk_region(
                 complete = false;
                 continue;
             }
+            if edge.seam_kind == "call" && !edge.callee.is_empty()
+                && state.active_functions.iter().any(|function| function == &edge.callee) {
+                // The old Claus expansion used the cached function summary at
+                // this recursive boundary. Re-entering the concrete fragment
+                // would grow a distinct return stack forever, so do not place
+                // that recursive seam in the executable skeleton.
+                complete = false;
+                continue;
+            }
             let edge_key = (&edge.source, &edge.target, &edge.kind, &edge.seam_kind, &edge.return_to);
             if emitted_edges.insert(edge_key) { edges_used.push((*edge).clone()); }
             let mut next_stack = state.stack.clone();
@@ -204,13 +213,6 @@ fn walk_region(
             if edge.seam_kind == "call" {
                 let callee = edge.callee.as_str();
                 if !callee.is_empty() && allowed.contains(callee) {
-                    if state.active_functions.iter().any(|function| function == callee) {
-                        // Match the old `_expand_reach` chain guard: retain
-                        // the discovered recursive edge for diagnostics, but
-                        // do not recurse into an unbounded call stack.
-                        complete = false;
-                        continue;
-                    }
                     tokens.push(lifetime_proto::NativeSkeletonToken {
                         kind: "enter".into(), function: callee.to_owned(),
                         depth: depth + 1, ..Default::default()
