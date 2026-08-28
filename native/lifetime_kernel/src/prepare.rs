@@ -1322,6 +1322,15 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                     ));
                 }
             }
+            if let Some(destination) = target.clone() {
+                let root = destination.root.trim_start_matches("decl:");
+                if graph.is_pointer(root) {
+                    operations.push(raw_operation(
+                        Kind::Clobber, &call.node, Some(destination), None,
+                        call.has_line.then_some(call.line), false, "return-may-null",
+                    ));
+                }
+            }
         }
     }
     let mut returns = Vec::new();
@@ -1655,6 +1664,7 @@ fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
         crate::Kind::Clobber => match access {
             "uninitialized" => "UNINITIALIZED",
             "return-null" => "RETURN_VALUE",
+            "return-may-null" => "ORIGIN",
             "source" => "ORIGIN",
             _ => "DERIVE",
         },

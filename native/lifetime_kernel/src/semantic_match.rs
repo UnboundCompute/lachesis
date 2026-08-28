@@ -44,6 +44,7 @@ struct StateKey {
     origins: MarkSet,
     nulls: MarkSet,
     nonnull: MarkSet,
+    nullable: MarkSet,
     uninitialized: MarkSet,
     pointer_arithmetic: MarkSet,
     escaped: MarkSet,
@@ -292,7 +293,7 @@ fn match_function(
     let mut queue = VecDeque::from([(
         entry, None::<usize>, Vec::<usize>::new(),
         Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
-        empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
+        empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
         Vec::<lifetime_proto::GuardProof>::new(),
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
@@ -305,7 +306,7 @@ fn match_function(
     const MAX_STATES: usize = 1_000_000;
 
     while let Some((index, parent_trace, returns, mut bindings, mut released, mut origins, mut nulls,
-                    mut nonnull, mut uninitialized, mut pointer_arithmetic, mut escaped,
+                    mut nonnull, mut nullable, mut uninitialized, mut pointer_arithmetic, mut escaped,
                     mut realloc_lost, path_guards)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
@@ -315,7 +316,8 @@ fn match_function(
             node: index, returns: returns.clone(), bindings: bindings.clone(),
             guards: path_guards.iter().map(|guard| (guard.kind.clone(), guard.value.clone())).collect(),
             released: released.clone(), origins: origins.clone(),
-            nulls: nulls.clone(), nonnull: nonnull.clone(), uninitialized: uninitialized.clone(),
+            nulls: nulls.clone(), nonnull: nonnull.clone(), nullable: nullable.clone(),
+            uninitialized: uninitialized.clone(),
             pointer_arithmetic: pointer_arithmetic.clone(), escaped: escaped.clone(),
             realloc_lost: realloc_lost.clone(),
         };
@@ -343,7 +345,13 @@ fn match_function(
             "ORIGIN" => if let Some(object) = object_id {
                 released.remove(object);
                 nulls.remove(object);
-                nonnull.remove(object);
+                if node.access == "return-may-null" {
+                    nullable.insert(object);
+                    nonnull.remove(object);
+                } else {
+                    nullable.remove(object);
+                    nonnull.insert(object);
+                }
                 uninitialized.remove(object);
                 escaped.remove(object);
                 realloc_lost.remove(object);
@@ -381,6 +389,10 @@ fn match_function(
                 }
                 if nulls.contains(object) {
                     add_finding(&mut findings, &function.id, "null-deref",
+                                &objects[object as usize], node, witness);
+                }
+                if nullable.contains(object) && !nonnull.contains(object) {
+                    add_finding(&mut findings, &function.id, "unchecked-return-deref",
                                 &objects[object as usize], node, witness);
                 }
                 if uninitialized.contains(object) {
@@ -498,6 +510,7 @@ fn match_function(
             }
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
+            let mut next_nullable = nullable.clone();
             let mut next_guards = path_guards.clone();
             let mut contradiction = false;
             for guard in guards {
@@ -524,11 +537,13 @@ fn match_function(
                         if next_nonnull.contains(object) { contradiction = true; break; }
                         next_nulls.insert(object);
                         next_nonnull.remove(object);
+                        next_nullable.remove(object);
                     }
                     "NONNULL" => {
                         if next_nulls.contains(object) { contradiction = true; break; }
                         next_nonnull.insert(object);
                         next_nulls.remove(object);
+                        next_nullable.remove(object);
                     }
                     _ => {}
                 }
@@ -539,7 +554,7 @@ fn match_function(
             }
             if !contradiction {
                 queue.push_back((*target, Some(trace), next_returns, next_bindings, released.clone(), origins.clone(), next_nulls,
-                                 next_nonnull, uninitialized.clone(), pointer_arithmetic.clone(),
+                                 next_nonnull, next_nullable, uninitialized.clone(), pointer_arithmetic.clone(),
                                  escaped.clone(), realloc_lost.clone(), next_guards));
             }
         }
