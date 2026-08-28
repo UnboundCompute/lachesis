@@ -131,7 +131,12 @@ fn expand(
         tokens.push(sink_token(flow, "", catalog, depth, guarded_acc || flow.guarded, true));
         return false;
     };
-    if flow.via == "direct" {
+    // A "const" flow is a rootless (constant) argument to a sink: the call is a
+    // real, complete observation for the presence evaluator, it simply carries
+    // no taint. Emit it as a terminal sink just like a direct flow -- do not let
+    // it fall through to the interprocedural branch (which would fail to resolve
+    // callee "const" and mark the skeleton truncated/incomplete).
+    if flow.via == "direct" || flow.via == "const" {
         let function_record = functions.get(function).copied();
         if let Some(call) = function_record.and_then(|item|
             direct_call(item, sink_callee, &flow.root)) {

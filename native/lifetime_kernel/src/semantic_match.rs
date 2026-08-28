@@ -179,6 +179,33 @@ fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
     value
 }
 
+/// Rebase the field descendants of a local binding `source := target`, mirroring
+/// the interprocedural seam field-prefix rebase: binding `a := b` must also make
+/// `a.f`, `a->f`, `a[..]` resolve to `b.f`, `b->f`, `b[..]`, so a free/use seen
+/// through one field-alias spelling is not lost through another. `prefix_children`
+/// is precomputed once per function; here we only format the target label and do
+/// an integer id lookup, keeping the worklist cheap.
+fn compose_prefix_bindings(
+    source: u32, target: u32,
+    prefix_children: &[Vec<(u32, String)>],
+    object_labels: &[String],
+    objects_by_label: &HashMap<&str, Vec<u32>>,
+    objects: &[ObjectKey],
+    out: &mut Vec<(u32, u32)>,
+) {
+    for (descendant, suffix) in &prefix_children[source as usize] {
+        let target_label = format!("{}{}", object_labels[target as usize], suffix);
+        let Some(targets) = objects_by_label.get(target_label.as_str()) else { continue };
+        let generation = &objects[*descendant as usize].generation;
+        if let Some(mapped) = targets.iter().copied()
+            .find(|candidate| objects[*candidate as usize].generation == *generation)
+            .or_else(|| targets.iter().copied()
+                .find(|candidate| objects[*candidate as usize].generation == "g0")) {
+            out.push((*descendant, mapped));
+        }
+    }
+}
+
 fn value_constraint(value: &str) -> Option<(&str, &str, &str)> {
     for operator in ["<=", ">=", "==", "!=", "<", ">"] {
         if let Some(index) = value.find(operator) {
@@ -405,6 +432,28 @@ fn match_function(
     for (index, label) in object_labels.iter().enumerate() {
         objects_by_label.entry(label.as_str()).or_default().push(index as u32);
     }
+    // Precompute the field descendants of every object, grouped by root so two
+    // unrelated variables can never compose (REF's `base == base` gate). This is
+    // the local counterpart of the seam field-prefix rebase compiled below; a
+    // local binding then reuses it to rebase `a.f`->`b.f` when `a := b` is seen.
+    let mut objects_by_root: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (index, object) in objects.iter().enumerate() {
+        objects_by_root.entry(object.root.as_str()).or_default().push(index as u32);
+    }
+    let mut prefix_children: Vec<Vec<(u32, String)>> = vec![Vec::new(); objects.len()];
+    for group in objects_by_root.values() {
+        for &source in group {
+            let source_label = object_labels[source as usize].as_str();
+            for &descendant in group {
+                if descendant == source { continue; }
+                if let Some(suffix) = selector_suffix(&object_labels[descendant as usize], source_label) {
+                    if !suffix.is_empty() {
+                        prefix_children[source as usize].push((descendant, suffix.to_owned()));
+                    }
+                }
+            }
+        }
+    }
     // Compile exact and field-prefix seam rebases once. The old matcher
     // composed the unmatched selector suffix (formal->field => actual->field);
     // doing that inside the worklist multiplied string scans by every state.
@@ -485,8 +534,14 @@ fn match_function(
         let value_id = node_value_ids[index].map(|value| canonical(value, &bindings));
         match node.event_kind.as_str() {
             "DERIVE" => if let (Some(target), Some(value)) = (raw_object_id, value_id) {
-                bindings.retain(|(source, _)| *source != target);
+                // Rebinding `target` also drops the stale aliases of its field
+                // descendants before rebasing them onto `value`, so each source
+                // keeps a single canonical target.
+                bindings.retain(|(source, _)| *source != target
+                    && !prefix_children[target as usize].iter().any(|(child, _)| *child == *source));
                 bindings.push((target, value));
+                compose_prefix_bindings(target, value, &prefix_children, &object_labels,
+                                        &objects_by_label, &objects, &mut bindings);
                 uninitialized.remove(target);
                 if node.access == "aggregate-copy" {
                     add_finding(&mut findings, &function.id, "aggregate-copy-alias",
@@ -572,8 +627,11 @@ fn match_function(
                 }
                 if let Some(value) = value_id {
                     let slot = raw_object_id.unwrap_or(object);
-                    bindings.retain(|(source, _)| *source != slot);
+                    bindings.retain(|(source, _)| *source != slot
+                        && !prefix_children[slot as usize].iter().any(|(child, _)| *child == *source));
                     bindings.push((slot, value));
+                    compose_prefix_bindings(slot, value, &prefix_children, &object_labels,
+                                            &objects_by_label, &objects, &mut bindings);
                     nulls.remove(slot);
                     uninitialized.remove(slot);
                 }

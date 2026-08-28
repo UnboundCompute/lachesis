@@ -40,6 +40,17 @@ def run_pass(store, lang="mixed", *, workers=None,
     match_result = build_native_match_result(semantic_sidecar, native_catalog_path(store))
     leads = native_match_leads(match_result)
     finished = perf_counter()
+    # Completion is the Rust result's to report, not ours to assert. A function is
+    # ``capped`` when its matcher exhausted the state budget (or its skeleton was
+    # incomplete); any capped function means the semantic analysis did not fully
+    # converge, so we must not stamp the run complete. ``timed_out`` is the honest
+    # wall-clock signal: if the caller's cooperative budget expired by the time the
+    # single native call returned, a more patient recompute may converge further --
+    # the flow-bundle cache keys on exactly this to avoid inheriting a partial answer.
+    capped_functions = sum(1 for function in match_result.functions
+                           if getattr(function, "capped", False))
+    converged = capped_functions == 0
+    timed_out = bool(deadline is not None and deadline.expired())
     return {
         "F": None,
         "succ": {},
@@ -47,23 +58,24 @@ def run_pass(store, lang="mixed", *, workers=None,
         "skeletons": [],
         "semantic_graph": {
             "native_sidecar": str(native_semantic_sidecar_path(store)),
-            "coverage": {"converged": True},
+            "coverage": {"converged": converged},
         },
-        "coverage": {"converged": True},
+        "coverage": {"converged": converged},
         "leads": leads,
         "lifetime": {
             "requested": requested,
             "active": "rust",
             "available": True,
-            "timed_out": False,
+            "timed_out": timed_out,
             "diagnostics": {
                 "backend": "rust-semantic",
                 "analyzed_functions": len(match_result.functions),
+                "capped_functions": capped_functions,
             },
             "semantic_graph_nodes": 0,
             "semantic_graph_edges": 0,
             "semantic_leads": len(leads),
-            "coverage": {"converged": True},
+            "coverage": {"converged": converged},
         },
         "timings": {
             "dataflow_tier_seconds": 0.0,

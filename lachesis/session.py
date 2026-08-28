@@ -583,15 +583,27 @@ class Analysis:
         if not native_semantic:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
-        from lachesis.flow.native_translate import ensure_native_semantic_sidecar
+        from lachesis.flow.native_translate import (
+            build_native_match_result, ensure_native_semantic_sidecar,
+        )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
         )
+        # Completion is the Rust matcher's call, not ours to assert. A function is
+        # ``capped`` when its state budget was exhausted or its skeleton was partial;
+        # any capped function means the temporal skeleton is truncated. We report that
+        # honestly so the caller drops the partial skeleton (structural families only)
+        # rather than caching a misleadingly thin temporal set as a complete run. The
+        # match sidecar is content-addressed, so the later flow pass reuses it.
+        match_result = build_native_match_result(
+            native_sidecar, summary.get("catalog_path"))
+        converged = not any(getattr(function, "capped", False)
+                            for function in match_result.functions)
         stamped["semantic_graph"] = {
             "native_sidecar": str(native_sidecar),
-            "coverage": {"converged": True},
+            "coverage": {"converged": converged},
         }
-        return stamped, summary, True
+        return stamped, summary, converged
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 

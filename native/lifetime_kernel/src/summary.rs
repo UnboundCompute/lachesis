@@ -134,8 +134,19 @@ fn contribute(
                 };
                 for argument in selected {
                     let root = argument_root(argument);
-                    if root.is_empty() { continue; }
                     let sink = format!("{}.a{}", call.callee, argument.position);
+                    if root.is_empty() {
+                        // Constant / rootless argument (a literal, a computed
+                        // expression with no single root). It carries no taint,
+                        // but the sink call itself is still an observation the
+                        // presence evaluator must see -- e.g. a fixed-format
+                        // string passed to a format sink. Tag it "const" so
+                        // reach/relational (which key on taint) skip it while
+                        // presence keeps it: reach.rs sets tainted=false for
+                        // provenance=="const".
+                        additions.flows.insert((sink, String::new(), String::new(), "const".into()));
+                        continue;
+                    }
                     additions.flows.insert((sink.clone(), root.clone(), root.clone(), "direct".into()));
                     if parameters.contains(root.as_str()) {
                         additions.params.insert((root.clone(), sink));
@@ -306,11 +317,13 @@ pub(crate) fn summarize_with_evidence(
                     .map(|position| (callee, position)))
                 .unwrap_or((sink.as_str(), 0));
             let call = item.calls.iter().find(|call| call.callee == callee
-                && call.arguments.iter().any(|argument|
-                    argument.position == position && argument_root(argument) == root));
+                && call.arguments.iter().any(|argument| argument.position == position
+                    && (root.is_empty() || argument_root(argument) == root)));
             let witness = evidence.and_then(|items| items.get(&root)).cloned().unwrap_or_default();
+            let provenance = if via == "const" { "const".into() }
+                else if witness.is_empty() { "local".into() } else { "source".into() };
             lifetime_proto::NativeSinkFlow {
-                sink, value, root, provenance: if witness.is_empty() { "local".into() } else { "source".into() },
+                sink, value, root, provenance,
                 guarded: call.is_some_and(|call| !call.guards.is_empty()),
                 site_guarded: call.is_some_and(|call| !call.guards.is_empty()), via,
                 node: call.map(|call| call.node.clone()).unwrap_or_default(),
