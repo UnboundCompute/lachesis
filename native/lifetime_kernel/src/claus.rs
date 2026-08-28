@@ -169,36 +169,31 @@ fn traverse_component(
     local
 }
 
-/// Pick source-rooted Claus regions until every emitted compiler node is
-/// covered.  The old scheduler selected an unvisited graph node, then used
-/// its owning UDF as the call-graph traversal seed.  Keeping those two levels
-/// separate is important: a function can contain several independent source
-/// anchors and a function-only scheduler silently drops the later ones.
+/// Pick source-rooted Claus regions until every emitted UDF is covered.  The
+/// old scheduler shuffles the sorted function records, not compiler node IDs,
+/// then runs the two-phase caller/callee traversal from the selected UDF.
+/// Keeping the same scheduling granularity is important: node-level shuffling
+/// changes component seeds and therefore changes the Claus flow order.
 ///
 /// A source witness identifies the function containing the source value.  If
-/// no witness exists, callerless functions are structural roots, matching the
-/// old Python scheduler's conservative fallback.  Each source cone is emitted
-/// once, so downstream Claus/skeleton caches never repeat the same function
-/// for the same source context.
+/// no witness exists, every function still remains a structural root, matching
+/// the old Python scheduler's conservative fallback.  Each source cone is
+/// emitted once, so downstream Claus/skeleton caches never repeat the same
+/// function for the same source context.
 pub(crate) fn pick_regions(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeSourceRegion> {
     let (callees, callers) = call_graph(result);
-    let mut node_order: Vec<(String, String)> = result.functions.iter()
-        .flat_map(|function| function.nodes.iter()
-            .map(|node| (node.id.clone(), function.id.clone())))
-        .collect();
-    node_order.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-    let shuffled: Vec<String> = seed_order(&node_order.iter()
-        .map(|(node, _)| node.clone()).collect::<Vec<_>>());
-    let owners: HashMap<&str, &str> = node_order.iter()
-        .map(|(node, function)| (node.as_str(), function.as_str())).collect();
+    let mut function_order: Vec<String> = result.functions.iter()
+        .map(|function| function.id.clone()).collect();
+    function_order.sort();
+    function_order.dedup();
+    let shuffled = seed_order(&function_order);
     let mut regions = Vec::new();
     let mut visited = BTreeSet::new();
-    for seed_node in shuffled {
-        let Some(source) = owners.get(seed_node.as_str()).copied() else { continue };
-        if visited.contains(source) { continue; }
-        let selected = traverse_component(source, &callees, &callers, &mut visited);
+    for seed_function in shuffled {
+        if visited.contains(&seed_function) { continue; }
+        let selected = traverse_component(&seed_function, &callees, &callers, &mut visited);
         if selected.is_empty() { continue; }
         // The random UDF seed is a coverage starting point, not necessarily
         // the source UDF.  Resolve the source in caller-first traversal order;
@@ -207,12 +202,17 @@ pub(crate) fn pick_regions(
         let source_function = selected.iter().find(|name|
             result.functions.iter().find(|function| function.id.as_str() == name.as_str())
                 .is_some_and(|function| !function.source_launch_nodes.is_empty()))
-            .cloned().unwrap_or_else(|| source.to_owned());
+            .cloned().unwrap_or_else(|| seed_function.clone());
         let source_nodes: Vec<String> = result.functions.iter()
             .find(|function| function.id == source_function)
             .into_iter()
             .flat_map(|function| function.source_launch_nodes.iter().cloned())
             .collect::<BTreeSet<_>>().into_iter().collect();
+        let seed_node = result.functions.iter()
+            .find(|function| function.id == seed_function)
+            .and_then(|function| function.nodes.first())
+            .map(|node| node.id.clone())
+            .unwrap_or_else(|| seed_function.clone());
         // A component is one cached Claus walk. Keep all launch anchors on
         // that walk instead of replaying the same function cone once per
         // source callsite; the old renderer composed one function flow and
