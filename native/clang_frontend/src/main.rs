@@ -810,6 +810,13 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             "linkage",
             text(linkage_name(clang_getCursorLinkage(cursor))),
         ));
+        // The generic resolver's C scoping contract uses storage_class to
+        // distinguish file-local definitions.  Keep it compiler-derived and
+        // emit it alongside linkage so internal helpers remain resolvable
+        // without a product-specific symbol list.
+        if clang_getCursorLinkage(cursor) == CXLinkage_Internal {
+            properties.push(field("storage_class", text("static")));
+        }
     }
     let mut call_target = None;
     if syntax_kind == "CallExpr" {
