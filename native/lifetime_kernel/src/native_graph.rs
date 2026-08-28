@@ -21,6 +21,7 @@ const FRAME_HEADER: usize = 4;
 // from being duplicated into every native FunctionInput.
 fn retain_lifetime_edge(kind: &str) -> bool {
     matches!(kind, "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO" | "CFG_NEXT" | "HAS_ARGUMENT"
+        | "DECLARES_VALUE"
         | "CONDITION" | "TRUE_BRANCH" | "FALSE_BRANCH" | "LOOP_TRUE" | "LOOP_BACK"
         | "SWITCH_CASE" | "EXCEPTION_BRANCH" | "TRY_BODY" | "RUNS_FINALLY"
         | "BREAKS_TO" | "CONTINUES_TO" | "ITERATES" | "SHORT_CIRCUIT_LEFT"

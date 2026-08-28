@@ -70,6 +70,7 @@ struct GraphView<'a> {
     parent: HashMap<&'a str, &'a str>,
     refers: HashMap<&'a str, &'a str>,
     initializers: HashMap<&'a str, &'a str>,
+    declares: HashMap<&'a str, Vec<&'a str>>,
     control: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
 }
 
@@ -84,6 +85,7 @@ impl<'a> GraphView<'a> {
         let mut roles: HashMap<&'a str, HashMap<Role, Vec<&'a str>>> = HashMap::new();
         let mut refers = HashMap::new();
         let mut initializers = HashMap::new();
+        let mut declares: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
         let mut control: HashMap<&'a str, Vec<(&'a str, &'a str)>> = HashMap::new();
         for edge in edges_input {
             match edge.kind.as_str() {
@@ -98,6 +100,9 @@ impl<'a> GraphView<'a> {
                     }
                 }
                 "REFERS_TO" => { refers.insert(edge.source.as_str(), edge.target.as_str()); }
+                "DECLARES_VALUE" => {
+                    declares.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+                }
                 "VALUE_FLOWS_TO" => {
                     initializers.insert(edge.target.as_str(), edge.source.as_str());
                 }
@@ -134,7 +139,13 @@ impl<'a> GraphView<'a> {
             child_targets.extend(children);
             child_offsets.push(child_targets.len());
         }
-        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers, control }
+        for targets in declares.values_mut() {
+            targets.sort_by_key(|target| {
+                node_index.get(target).and_then(|index| nodes_input.get(*index))
+                    .and_then(|node| integer_property(node, "start_offset")).unwrap_or(i64::MAX)
+            });
+        }
+        Self { nodes, node_index, child_offsets, child_targets, roles, parent, refers, initializers, declares, control }
     }
 
     fn node(&self, id: &str) -> Option<&lifetime_proto::GraphNode> {
@@ -161,6 +172,10 @@ impl<'a> GraphView<'a> {
     }
 
     fn initializer_of(&self, id: &str) -> Option<&'a str> { self.initializers.get(id).copied() }
+
+    fn declares_owned(&self, id: &str) -> Vec<String> {
+        self.declares.get(id).into_iter().flatten().map(|target| (*target).to_owned()).collect()
+    }
 
     fn control_targets(&self, id: &str, kind: &str) -> Vec<&'a str> {
         self.control.get(id).into_iter().flatten()
@@ -510,23 +525,36 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             }
             (first, exits)
         } else if matches!(kind, "IfStmt" | "If") {
-            let condition = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
+            let condition_id = graph.role_children(id, "CONDITION").and_then(|items| items.first()).map(|child| (*child).to_owned())
                 .or_else(|| graph.control_targets(id, "CONDITION").into_iter().next().map(str::to_owned))
                 .or_else(|| children.iter().min_by_key(|child| graph.offset(child)).cloned());
             let mut condition_stream = Vec::new();
-            if let Some(condition) = condition {
-                expression_stream(graph, &condition, owned, &mut condition_stream, &mut HashSet::new(), 0);
+            if let Some(condition) = &condition_id {
+                expression_stream(graph, condition, owned, &mut condition_stream, &mut HashSet::new(), 0);
                 append_chain(successors, &condition_stream);
             }
-            let mut branches = Vec::new();
+            let mut branch_ids: Vec<String> = Vec::new();
             for role in ["TRUE_BRANCH", "FALSE_BRANCH"] {
-                let branch = graph.role_children(id, role).and_then(|items| items.first()).copied()
+                if let Some(branch) = graph.role_children(id, role).and_then(|items| items.first()).copied()
                     .or_else(|| condition_stream.last().and_then(|condition| {
                         graph.control_targets(condition, role).into_iter().next()
-                    }));
-                if let Some(branch) = branch {
-                    branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
+                    })) {
+                    branch_ids.push(branch.to_owned());
                 }
+            }
+            // Roleless C clang AST: neither CONDITION/branch roles nor control
+            // edges are published, so identify the arms positionally.  The
+            // condition is the first (expression) child; each remaining
+            // statement child, in source order, is a branch arm (then, else).
+            if branch_ids.is_empty() {
+                branch_ids = children.iter()
+                    .filter(|child| Some(child.as_str()) != condition_id.as_deref()
+                        && is_statement(graph.kind(child)))
+                    .cloned().collect();
+            }
+            let mut branches = Vec::new();
+            for branch in &branch_ids {
+                branches.push(emit(graph, owned, branch, successors, memo, in_progress, depth + 1));
             }
             let mut exits = Vec::new();
             for (entry, branch_exits) in branches {
@@ -730,6 +758,20 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
             append_chain(successors, &stream);
             if let Some(last) = stream.last() { successors.entry(last.clone()).or_default(); }
             (stream.first().cloned().or_else(|| Some(id.to_owned())), Vec::new())
+        } else if kind == "DeclStmt" {
+            // A declaration statement links its declared variables through
+            // DECLARES_VALUE, not AST_CHILD, so the generic statement path sees
+            // no children and strands the initializer (e.g. the malloc in
+            // `char *p = malloc(16);`). Stream each declared value in source
+            // order; expression_stream walks the VarDecl's initializer child.
+            let mut declared = graph.declares_owned(id)
+                .into_iter().filter(|child| owned.contains(child)).collect::<Vec<_>>();
+            if declared.is_empty() { declared = children; }
+            declared.sort_by_key(|child| graph.offset(child));
+            let mut stream = Vec::new();
+            for child in declared { expression_stream(graph, &child, owned, &mut stream, &mut HashSet::new(), 0); }
+            append_chain(successors, &stream);
+            (stream.first().cloned(), stream.last().cloned().into_iter().collect())
         } else if is_statement(kind) {
             let mut stream = Vec::new();
             let sorted = children;
@@ -1060,8 +1102,18 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
         cfg_node_set.insert(synthetic_exit.clone());
         let mut terminals = node_ids.iter().filter(|node| is_return_kind(graph.kind(node)))
             .cloned().collect::<Vec<_>>();
-        if let Some(last) = node_ids.last() {
-            terminals.push(last.clone());
+        // The fall-through end of the function is any CFG node that has no
+        // outgoing successor.  Wiring the source-order tail (`node_ids.last()`)
+        // instead misattributes the exit to a mid-expression node when the last
+        // statement is a call — the call's argument sorts last in node order —
+        // inventing a phantom exit branch off that node.  The genuine implicit
+        // exits are exactly the successor-less nodes.
+        for node in &node_ids {
+            let has_successor = successor_map.get(node)
+                .map(|targets| !targets.is_empty()).unwrap_or(false);
+            if !has_successor {
+                terminals.push(node.clone());
+            }
         }
         terminals.sort();
         terminals.dedup();
@@ -1165,7 +1217,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                     }
                 }
             }
-        } else if kind == "VarDecl" && graph.is_pointer(node_id) {
+        } else if kind == "VarDecl" {
+            if graph.is_pointer(node_id) {
             let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
             let target = path(Some(node_id));
             if let Some(initializer) = graph.initializer_of(node_id) {
@@ -1200,6 +1253,7 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 }
             } else {
                 operations.push(raw_operation(Kind::Clobber, node_id, target, None, line, false, "uninitialized"));
+            }
             }
         }
 
@@ -1390,6 +1444,42 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
     }
     returns.sort_by_key(|item| (if item.has_line { item.line } else { i64::MAX }, item.root.clone()));
 
+    // Splice leading declarations that carry a lifetime operation into the CFG
+    // as their own entry anchor. A statement like `T *p = alloc();` can precede
+    // every persisted CFG statement in source order and expose no AST-parent
+    // edge from its declaration node, so the nearest-CFG remap below finds no
+    // anchor for it and the operation would be dropped -- the abstract state
+    // would never observe the allocation. Chain such declarations in source
+    // order ahead of the earliest existing CFG statement so the alloc is
+    // ordered before any guard or use, exactly as a declaration statement is.
+    if let Some(earliest) = cfg_node_set.iter()
+        .filter(|candidate| graph.node(candidate).is_some())
+        .min_by_key(|candidate| (graph.offset(candidate), (*candidate).clone()))
+        .cloned() {
+        let earliest_offset = graph.offset(&earliest);
+        let mut leading = operations.iter()
+            .filter(|op| matches!(op.kind, Kind::Alloc | Kind::Realloc)
+                && node_set.contains(&op.node)
+                && !cfg_node_set.contains(&op.node)
+                && graph.parent_of(&op.node).is_none()
+                && graph.offset(&op.node) < earliest_offset)
+            .map(|op| op.node.clone())
+            .collect::<Vec<_>>();
+        leading.sort_by_key(|node| (graph.offset(node), node.clone()));
+        leading.dedup();
+        let mut previous: Option<String> = None;
+        for declaration in &leading {
+            cfg_node_set.insert(declaration.clone());
+            if let Some(previous) = previous.take() {
+                successor_map.entry(previous).or_default().push(declaration.clone());
+            }
+            previous = Some(declaration.clone());
+        }
+        if let Some(previous) = previous {
+            successor_map.entry(previous).or_default().push(earliest.clone());
+        }
+    }
+
     // Map expression anchors to the nearest CFG node. The solver consumes the
     // synthesized statement CFG, while operation extraction remains expression
     // precise above.
@@ -1565,6 +1655,38 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             let proofs = branch_guards(&graph, &edge.source, &edge.kind);
             if !proofs.is_empty() {
                 guard_map.insert((edge.source.clone(), edge.target.clone()), proofs);
+            }
+        }
+    }
+    // The C clang AST publishes no TRUE_BRANCH/FALSE_BRANCH roles, so a nullness
+    // `if (p == NULL)` reaches this point as a comparison node with two plain CFG
+    // successors and no guard direction.  Recover the typed null proofs the way
+    // the reference does: for a comparison condition with exactly two successors,
+    // synthesize_cfg emits the then-arm before the fall-through, so the first
+    // successor is the true arm and the second the false arm.  Type each
+    // out-edge's proof from the operator and the successor's position, without
+    // clobbering any proof a real branch role already produced.  Restrict this to
+    // operator-bearing comparison/negation nodes so an ordinary two-successor
+    // statement is never mistaken for a pointer test.
+    for (node, targets) in &successor_map {
+        if targets.len() != 2 {
+            continue;
+        }
+        if !matches!(
+            graph.operator(node),
+            "==" | "!=" | "<" | "<=" | ">" | ">=" | "!"
+        ) {
+            continue;
+        }
+        for (index, target) in targets.iter().enumerate() {
+            let key = (node.clone(), target.clone());
+            if guard_map.contains_key(&key) {
+                continue;
+            }
+            let branch = if index == 0 { "TRUE_BRANCH" } else { "FALSE_BRANCH" };
+            let proofs = branch_guards(&graph, node, branch);
+            if !proofs.is_empty() {
+                guard_map.insert(key, proofs);
             }
         }
     }
@@ -1944,6 +2066,14 @@ pub(crate) fn semantic_request(
         for (anchor, ids) in by_anchor.iter() {
             if let Some(tail) = ids.last() {
                 previous_by_anchor.insert(anchor.clone(), tail.clone());
+            }
+            // Chain the anchor's structural prefix: the empty CFG node followed
+            // by its BRANCH/MERGE/LOOP markers.  Inter-anchor edges land on the
+            // prefix head (`.first()`) while operations chain off the tail
+            // (`previous_by_anchor`); without an edge between them, an anchor
+            // that carries a marker strands its events from incoming control.
+            for pair in ids.windows(2) {
+                edges.push(semantic_edge(pair[0].clone(), pair[1].clone(), "normal", Vec::new()));
             }
         }
         for (index, raw) in function.operations.iter().cloned().enumerate() {

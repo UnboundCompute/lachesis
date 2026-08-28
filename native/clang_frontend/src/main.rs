@@ -179,6 +179,95 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32
     (filename, line, column, offset, end_offset, end_line, end_column)
 }
 
+unsafe fn token_start_offset(tu: CXTranslationUnit, token: CXToken) -> u32 {
+    let location = clang_getTokenLocation(tu, token);
+    let mut file = ptr::null_mut();
+    let mut line = 0;
+    let mut column = 0;
+    let mut offset = 0;
+    clang_getSpellingLocation(location, &mut file, &mut line, &mut column, &mut offset);
+    offset
+}
+
+// libclang leaves `clang_getCursorSpelling` empty for operator expressions, and
+// the binary-opcode accessor is gated behind a newer clang feature than we build
+// against, so recover the operator by tokenizing the expression's extent and
+// picking the punctuation token that sits between the operands.  The reference
+// frontend records this as the node's `operator` property; the Pass-3 skeleton
+// depends on it to emit COMPARE_VALUE events with the null guards that mark a
+// pointer check as taken, so a comparison with no `operator` reads as unguarded.
+unsafe fn operator_spelling(cursor: CXCursor, syntax_kind: &str) -> String {
+    let is_binary = matches!(syntax_kind, "BinaryOperator" | "CompoundAssignOperator");
+    let is_unary = syntax_kind == "UnaryOperator";
+    if !is_binary && !is_unary {
+        return String::new();
+    }
+    let tu = clang_Cursor_getTranslationUnit(cursor);
+    if tu.is_null() {
+        return String::new();
+    }
+    let mut children = ChildProbe { cursors: Vec::new() };
+    clang_visitChildren(
+        cursor,
+        collect_direct_child,
+        &mut children as *mut ChildProbe as *mut c_void,
+    );
+    let extent = clang_getCursorExtent(cursor);
+    let mut tokens: *mut CXToken = ptr::null_mut();
+    let mut count: c_uint = 0;
+    clang_tokenize(tu, extent, &mut tokens, &mut count);
+    if tokens.is_null() || count == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    if is_binary && children.cursors.len() >= 2 {
+        // The operator is the punctuation token after the LHS operand's extent
+        // and before the RHS operand's start.  Bounding by both operand offsets
+        // skips any punctuation nested inside the operands (e.g. `a[i] == b`).
+        let (_, _, _, _, lhs_end, _, _) = cursor_file(children.cursors[0]);
+        let (_, _, _, rhs_start, _, _, _) = cursor_file(children.cursors[1]);
+        for i in 0..count {
+            let token = *tokens.add(i as usize);
+            if clang_getTokenKind(token) != CXToken_Punctuation {
+                continue;
+            }
+            let start = token_start_offset(tu, token);
+            if start >= lhs_end && start < rhs_start {
+                result = cx_string(clang_getTokenSpelling(tu, token));
+                break;
+            }
+        }
+    } else if is_unary {
+        // A prefix operator precedes its operand (take the first punctuation
+        // token before the operand); a postfix operator follows it (take the
+        // last punctuation token after the operand).
+        let operand = children.cursors.first().map(|child| {
+            let (_, _, _, os, oe, _, _) = cursor_file(*child);
+            (os, oe)
+        });
+        for i in 0..count {
+            let token = *tokens.add(i as usize);
+            if clang_getTokenKind(token) != CXToken_Punctuation {
+                continue;
+            }
+            let start = token_start_offset(tu, token);
+            let inside_operand = operand
+                .map(|(os, oe)| start >= os && start < oe)
+                .unwrap_or(false);
+            if inside_operand {
+                continue;
+            }
+            result = cx_string(clang_getTokenSpelling(tu, token));
+            let is_prefix = operand.map(|(os, _)| start < os).unwrap_or(true);
+            if is_prefix {
+                break;
+            }
+        }
+    }
+    clang_disposeTokens(tu, tokens, count);
+    result
+}
+
 struct Emitter {
     nodes: File,
     edges: File,
@@ -871,7 +960,14 @@ unsafe fn visit_one(
         "TypedefDecl" => cx_string(clang_getTypeSpelling(clang_getTypedefDeclUnderlyingType(cursor))),
         _ => cx_string(clang_getTypeSpelling(clang_getCursorType(cursor))),
     };
-    let operator = spelling.clone();
+    let operator = if matches!(
+        syntax_kind.as_str(),
+        "BinaryOperator" | "CompoundAssignOperator" | "UnaryOperator"
+    ) {
+        operator_spelling(cursor, &syntax_kind)
+    } else {
+        spelling.clone()
+    };
     let mut properties = vec![
         field("file", text(&file)),
         field("absolute_file", text(&file)),
@@ -887,6 +983,16 @@ unsafe fn visit_one(
     // statements), leaving it absent rather than an empty string.
     if !type_spelling.is_empty() {
         properties.push(field("type", text(&type_spelling)));
+    }
+    // The reference frontend records `operator` only on operator-kind nodes and
+    // leaves it absent elsewhere; the Pass-3 skeleton reads it to classify
+    // pointer comparisons as guards.
+    if matches!(
+        syntax_kind.as_str(),
+        "BinaryOperator" | "CompoundAssignOperator" | "UnaryOperator"
+    ) && !operator.is_empty()
+    {
+        properties.push(field("operator", text(&operator)));
     }
     let owner_id = function_owner(cursor, emitter);
     if matches!(
