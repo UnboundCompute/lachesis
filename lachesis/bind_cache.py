@@ -34,7 +34,7 @@ from lachesis.core.graph_wire import (
 
 # Bump when the persisted shape changes in a way an old file would misdescribe. The header
 # match turns a bump into a clean miss (recompute) rather than a decode against stale layout.
-BIND_VERSION = 2
+BIND_VERSION = 3
 
 # Never let the sidecar dominate the time it saves: above this, the bind is used but not
 # written, because decoding a multi-gigabyte blob can rival recomputing the bind outright.
@@ -74,6 +74,63 @@ def _core_hash(graph_path: str) -> str:
         return ""
 
 
+def _stat_files(fingerprint, paths) -> None:
+    """Fold each existing file's identity + mtime + size into ``fingerprint``.
+
+    Mirrors ``native_bind.compiled_catalog`` exactly (path, ``st_mtime_ns``, ``st_size``) so
+    the two agree on what "the catalog changed" means. Missing files are skipped, not errors:
+    a component's absence is itself a stable input, so its later appearance is a clean miss.
+    """
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        fingerprint.update(str(path).encode())
+        fingerprint.update(str(stat.st_mtime_ns).encode())
+        fingerprint.update(str(stat.st_size).encode())
+
+
+def _binder_fingerprint() -> str:
+    """Fingerprint the two bind inputs the graph content does NOT capture: the native binder
+    shared library and the Atropos catalog it consults.
+
+    The bind result is a pure function of (graph, binder code, catalog data). The core content
+    hash covers the graph; ``build_options_fingerprint`` covers the environment; neither sees a
+    rebuilt binder ``.dylib`` or an edited model/detection file. Without this, a binder or
+    catalog change replayed a stale bind (the alias-fix regression: bound:1 served after the
+    fix produced bound:10) until the sidecar was hand-deleted. Both inputs are resolved from the
+    filesystem alone -- no dependence on the summary -- so ``load`` and ``store`` derive the
+    identical key. Any resolution failure degrades to a stable empty component, never a throw.
+    """
+    fingerprint = hashlib.sha256()
+    try:
+        from lachesis.integrations.atropos.native_bind import _library_candidates
+
+        for candidate in _library_candidates():
+            if candidate.is_file():
+                _stat_files(fingerprint, (candidate,))
+                break
+    except Exception:  # pragma: no cover - resolver unavailable
+        pass
+    try:
+        from pathlib import Path
+
+        from lachesis.integrations.atropos.enrich import locate_atropos
+
+        root = locate_atropos()
+        if root is not None:
+            root = Path(root)
+            models = sorted((root / "models").rglob("*.json"))
+            detection = [root / "detection" / name for name in (
+                "lifecycle-roles.json", "flow-patterns.json", "evaluators.json")]
+            _stat_files(fingerprint, models)
+            _stat_files(fingerprint, detection)
+    except Exception:  # pragma: no cover - atropos layout unavailable
+        pass
+    return fingerprint.hexdigest()
+
+
 def _header(graph_path: str) -> dict:
     from lachesis.cache import build_options_fingerprint
 
@@ -81,13 +138,15 @@ def _header(graph_path: str) -> dict:
         "version": BIND_VERSION,
         "core_content_hash": _core_hash(graph_path),
         "options": build_options_fingerprint(),
+        "binder": _binder_fingerprint(),
     }
 
 
 def _header_matches(document: dict, header: dict) -> bool:
     return (document.get("version") == header["version"]
             and document.get("core_content_hash") == header["core_content_hash"]
-            and document.get("options") == header["options"])
+            and document.get("options") == header["options"]
+            and document.get("binder") == header["binder"])
 
 
 def _document_message(value: dict) -> graph_pb2.Document:
@@ -105,7 +164,8 @@ def _encode_typed(payload: dict) -> bytes:
     message = graph_pb2.BindCache(
         format_version=1,
         header=_document_message({key: payload[key]
-                                  for key in ("version", "core_content_hash", "options")}),
+                                  for key in ("version", "core_content_hash", "options",
+                                              "binder")}),
         stamped_meta=_document_message({key: value for key, value in stamped.items()
                                         if key not in {"nodes", "edges",
                                                        "_typed_bind_cache_path"}}),
