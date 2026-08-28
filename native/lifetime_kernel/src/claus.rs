@@ -47,15 +47,62 @@ fn call_graph(
     (callees, callers)
 }
 
-fn forward(start: &str, callees: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
-    let mut seen = BTreeSet::from([start.to_owned()]);
-    let mut queue = VecDeque::from([start.to_owned()]);
+fn seed_order(functions: &[String]) -> Vec<String> {
+    let mut order = functions.to_vec();
+    let mut state = 0x9e37_79b9_u64;
+    for index in (1..order.len()).rev() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        order.swap(index, (value as usize) % (index + 1));
+    }
+    order
+}
+
+/// Match the old two-phase UDF traversal: callers to a fixpoint, then
+/// callees to a fixpoint, with one shared visited set across all seeds.
+fn traverse_component(
+    start: &str,
+    callees: &BTreeMap<String, BTreeSet<String>>,
+    callers: &BTreeMap<String, BTreeSet<String>>,
+    visited: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let mut local = Vec::new();
+    if !visited.insert(start.to_owned()) { return local; }
+    local.push(start.to_owned());
+    let mut queue: VecDeque<String> = callers.get(start).into_iter().flatten()
+        .filter(|name| !visited.contains(*name)).cloned().collect();
+    let mut queued: BTreeSet<String> = queue.iter().cloned().collect();
     while let Some(function) = queue.pop_front() {
-        for callee in callees.get(&function).into_iter().flatten() {
-            if seen.insert(callee.clone()) { queue.push_back(callee.clone()); }
+        if !visited.insert(function.clone()) { continue; }
+        local.push(function.clone());
+        for caller in callers.get(&function).into_iter().flatten() {
+            if !visited.contains(caller) && queued.insert(caller.clone()) {
+                queue.push_back(caller.clone());
+            }
         }
     }
-    seen
+    queue.clear();
+    queued.clear();
+    for function in &local {
+        for callee in callees.get(function).into_iter().flatten() {
+            if !visited.contains(callee) && queued.insert(callee.clone()) {
+                queue.push_back(callee.clone());
+            }
+        }
+    }
+    while let Some(function) = queue.pop_front() {
+        if !visited.insert(function.clone()) { continue; }
+        local.push(function.clone());
+        for callee in callees.get(&function).into_iter().flatten() {
+            if !visited.contains(callee) && queued.insert(callee.clone()) {
+                queue.push_back(callee.clone());
+            }
+        }
+    }
+    local
 }
 
 /// Pick source-rooted Claus regions until every emitted function is covered.
@@ -69,73 +116,28 @@ pub(crate) fn pick_regions(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeSourceRegion> {
     let (callees, callers) = call_graph(result);
-    let mut source_nodes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for function in &result.functions {
-        // Source contexts come from compiler-resolved source call sites, just
-        // like CoverageScheduler._source_contexts in the old engine.  A taint
-        // witness is evidence attached to a reached value, not a new launch
-        // context; treating every witness as one caused a full cone walk per
-        // reached node on large graphs.
-        if !function.source_launch_nodes.is_empty() {
-            source_nodes.entry(function.id.clone()).or_default()
-                .extend(function.source_launch_nodes.iter().cloned());
-            continue;
-        }
-        // Source reachability is evidence for matching, not a launch-site
-        // declaration.  In particular, do not turn every witnessed value into
-        // a new Claus root: that multiplies the same function cone once per
-        // sink/value on large graphs.  If a legacy/incomplete artifact has no
-        // compiler source anchors, the structural-root fallback below supplies
-        // the same conservative behavior as the old scheduler.
-    }
-    for (function, incoming) in &callers {
-        if incoming.is_empty() { source_nodes.entry(function.clone()).or_default(); }
-    }
-    if source_nodes.is_empty() {
-        for function in &result.functions { source_nodes.entry(function.id.clone()).or_default(); }
-    }
-
-    // A source is materialized once.  If a disconnected component has no
-    // source root, its callerless/root function is added as a structural root.
+    let mut names: Vec<String> = result.functions.iter().map(|function| function.id.clone()).collect();
+    names.sort();
+    let order = seed_order(&names);
     let mut regions = Vec::new();
-    let mut covered = BTreeSet::new();
-    for (source, nodes) in &source_nodes {
-        let cone = forward(source, &callees);
-        // `cone` is already the intersection of the source's forward
-        // reachability with the call graph represented by `callers`: every
-        // member was reached by following a valid call edge from `source`.
-        // Re-running a reverse traversal for every function here was
-        // quadratic in the number of functions and added no information.
-        let selected: Vec<String> = result.functions.iter()
-            .map(|function| function.id.as_str())
-            .filter(|function| cone.contains(*function))
-            .map(str::to_owned)
-            .collect();
+    let mut visited = BTreeSet::new();
+    for source in order {
+        if visited.contains(&source) { continue; }
+        let selected = traverse_component(&source, &callees, &callers, &mut visited);
         if selected.is_empty() { continue; }
-        covered.extend(selected.iter().cloned());
-        let contexts = if nodes.is_empty() {
-            vec!["__entry__".to_owned()]
-        } else {
-            nodes.iter().cloned().collect()
-        };
+        let source_nodes: Vec<String> = selected.iter().flat_map(|name|
+            result.functions.iter().find(|function| function.id == *name)
+                .into_iter().flat_map(|function| function.source_launch_nodes.iter().cloned()))
+            .collect::<BTreeSet<_>>().into_iter().collect();
+        let contexts = if source_nodes.is_empty() { vec!["__entry__".to_owned()] }
+            else { source_nodes.clone() };
         regions.push(lifetime_proto::NativeSourceRegion {
-            source_function: source.clone(),
-            source_nodes: nodes.iter().cloned().collect(),
+            source_function: source,
+            source_nodes,
             functions: selected,
             contexts,
         });
     }
-    // Ensure the invariant is explicit even when a malformed/incomplete seam
-    // graph leaves a function outside every source cone.
-    for function in result.functions.iter().map(|item| item.id.as_str()).filter(|id| !covered.contains(*id)) {
-        regions.push(lifetime_proto::NativeSourceRegion {
-            source_function: function.to_owned(),
-            source_nodes: Vec::new(),
-            functions: vec![function.to_owned()],
-            contexts: vec!["__entry__".to_owned()],
-        });
-    }
-    regions.sort_by(|left, right| left.source_function.cmp(&right.source_function));
     regions
 }
 
@@ -168,8 +170,8 @@ mod tests {
         };
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].source_function, "source");
-        assert_eq!(regions[0].functions, vec!["source", "callee"]);
+        assert_eq!(regions[0].functions.iter().collect::<BTreeSet<_>>(),
+                   BTreeSet::from([&"source".to_owned(), &"callee".to_owned()]));
     }
 
     #[test]
