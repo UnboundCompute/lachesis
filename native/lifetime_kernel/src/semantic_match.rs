@@ -388,13 +388,14 @@ fn match_function(
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut traces = Vec::new();
     let mut transfers = 0u64;
+    let mut widenings = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
     const MAX_STATES: usize = 1_000_000;
 
     while let Some((index, parent_trace, returns, mut bindings, mut released, mut origins, mut nulls,
                     mut nonnull, mut nullable, mut uninitialized, mut pointer_arithmetic, mut escaped,
-                    mut realloc_lost, path_guards)) = queue.pop_front() {
+                    mut realloc_lost, mut path_guards)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
         transfers += 1;
         bindings.sort_unstable();
@@ -414,6 +415,12 @@ fn match_function(
         let node = &function.nodes[index];
         let witness_storage = trace_witness(&traces, trace, &function.nodes);
         let witness = witness_storage.as_slice();
+        if node.event_kind == "LOOP" {
+            // Predicates from one iteration are not stable facts for the
+            // next. The old matcher clears them at its loop-widening boundary.
+            path_guards.clear();
+            widenings += 1;
+        }
         let raw_object_id = node_object_ids[index];
         let object_id = raw_object_id.map(|value| canonical(value, &bindings));
         let value_id = node_value_ids[index].map(|value| canonical(value, &bindings));
@@ -674,7 +681,7 @@ fn match_function(
         id: function.id.clone(),
         findings,
         transfers,
-        widenings: 0,
+        widenings,
         capped: transfers as usize >= MAX_STATES,
     }
 }
