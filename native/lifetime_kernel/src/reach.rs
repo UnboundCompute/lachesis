@@ -5,7 +5,7 @@
 //! composition data-driven: sink families come from the compiled Atropos
 //! catalog and function identity comes from compiler translation facts.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::{atropos_proto, lifetime_proto};
 
@@ -215,6 +215,79 @@ pub(crate) fn build(
                 context: "__entry__".into(), complete, tokens, edges: Vec::new(), is_source,
             });
         }
+    }
+    output
+}
+
+/// Build compact per-function sink graphs for catalog patterns that relate
+/// two sink observations. Only proven CFG reachability between sink anchors
+/// is retained; the semantic graph itself is not duplicated in the sidecar.
+pub(crate) fn build_sink_graphs(
+    semantic: &lifetime_proto::NativeSemanticResult,
+    translation: &lifetime_proto::TranslationResult,
+    summaries: &lifetime_proto::NativeSummaryResult,
+    catalog: &atropos_proto::Request,
+) -> Vec<lifetime_proto::NativeFlowSkeleton> {
+    let by_id: HashMap<&str, &lifetime_proto::TranslationFunction> = translation.functions.iter()
+        .map(|function| (function.id.as_str(), function)).collect();
+    let mut by_name = HashMap::new();
+    for function in &translation.functions {
+        let base = if function.name.is_empty() { function.id.clone() } else { function.name.clone() };
+        let key = if by_name.contains_key(&base) { format!("{}@{}", base, function.id) } else { base };
+        by_name.insert(key, function);
+    }
+    let mut output = Vec::new();
+    for summary in &summaries.functions {
+        let Some(translation_function) = by_name.get(&summary.name).copied()
+            .or_else(|| by_id.get(summary.name.as_str()).copied()) else { continue };
+        let Some(function) = semantic.functions.iter()
+            .find(|function| function.id == translation_function.id) else { continue };
+        let direct: Vec<_> = summary.sink_flows.iter()
+            .filter(|flow| flow.via == "direct").collect();
+        if direct.len() < 2 { continue; }
+        let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &function.edges {
+            adjacency.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+        }
+        let mut tokens = Vec::new();
+        let mut anchors = Vec::new();
+        for (ordinal, flow) in direct.into_iter().enumerate() {
+            let anchor = function.nodes.iter().find(|node| node.anchor == flow.node)
+                .map(|node| node.id.clone());
+            let Some(anchor) = anchor else { continue };
+            let mut token = sink_token(flow, &function.language, catalog, 0,
+                flow.guarded, false);
+            token.node = format!("native:sink:{}:{}:{ordinal}", function.id, flow.node);
+            token.function = function.id.clone();
+            anchors.push(anchor);
+            tokens.push(token);
+        }
+        if tokens.len() < 2 { continue; }
+        let mut edges = Vec::new();
+        for (source_index, source) in anchors.iter().enumerate() {
+            if tokens[source_index].family != "alloc-size" { continue; }
+            let mut queue = VecDeque::from([source.as_str()]);
+            let mut seen = HashSet::from([source.as_str()]);
+            while let Some(node) = queue.pop_front() {
+                for target in adjacency.get(node).into_iter().flatten() {
+                    if seen.insert(target) { queue.push_back(target); }
+                }
+            }
+            for (target_index, target) in anchors.iter().enumerate() {
+                if source_index != target_index && seen.contains(target.as_str()) {
+                    edges.push(lifetime_proto::NativeSemanticEdge {
+                        source: tokens[source_index].node.clone(),
+                        target: tokens[target_index].node.clone(),
+                        kind: "sink-reaches".into(), ..Default::default()
+                    });
+                }
+            }
+        }
+        output.push(lifetime_proto::NativeFlowSkeleton {
+            kind: "reach-graph".into(), entry: function.id.clone(),
+            source_function: function.id.clone(), context: "__entry__".into(),
+            complete: true, tokens, edges, is_source: false,
+        });
     }
     output
 }

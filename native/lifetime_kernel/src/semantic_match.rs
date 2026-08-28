@@ -653,10 +653,16 @@ pub(crate) fn match_result_with_catalog(
     let reach_skeletons: Vec<_> = result.skeletons.iter()
         .filter(|skeleton| skeleton.kind == "reach")
         .cloned().collect();
-    result.skeletons.retain(|skeleton| skeleton.kind != "reach");
+    let sink_graphs: Vec<_> = result.skeletons.iter()
+        .filter(|skeleton| skeleton.kind == "reach-graph")
+        .cloned().collect();
+    result.skeletons.retain(|skeleton|
+        skeleton.kind != "reach" && skeleton.kind != "reach-graph");
     let mut matched = match_result(result);
     matched.functions.extend(reach_skeletons.iter().enumerate()
         .filter_map(|(ordinal, skeleton)| match_reach_skeleton(skeleton, catalog, ordinal)));
+    matched.functions.extend(sink_graphs.iter().enumerate()
+        .filter_map(|(ordinal, skeleton)| match_sink_relations(skeleton, catalog, ordinal)));
     let enabled: HashSet<&str> = catalog.patterns.iter()
         .filter_map(|pattern| (!pattern.matcher_pattern.is_empty())
             .then_some(pattern.matcher_pattern.as_str()))
@@ -674,6 +680,54 @@ pub(crate) fn match_result_with_catalog(
         }
     }
     matched
+}
+
+fn match_sink_relations(
+    skeleton: &lifetime_proto::NativeFlowSkeleton,
+    catalog: &crate::atropos_proto::PatternCatalog,
+    ordinal: usize,
+) -> Option<lifetime_proto::NativeTemporalFunction> {
+    let pattern = catalog.patterns.iter().find(|pattern|
+        pattern.evaluator == "relational"
+            && pattern.requires.iter().any(|required| required == "memory.alloc")
+            && pattern.requires.iter().any(|required| required == "memory.copy"))?;
+    let tokens: HashMap<&str, &lifetime_proto::NativeSkeletonToken> = skeleton.tokens.iter()
+        .map(|token| (token.node.as_str(), token)).collect();
+    let mut findings = Vec::new();
+    for edge in &skeleton.edges {
+        let (Some(allocation), Some(copy)) =
+            (tokens.get(edge.source.as_str()), tokens.get(edge.target.as_str())) else { continue };
+        if allocation.family != "alloc-size"
+            || !matches!(copy.family.as_str(), "buffer-write" | "buffer-size")
+            || allocation.destination.is_empty()
+            || allocation.destination != copy.destination
+            || allocation.size_expression.is_empty()
+            || copy.size_expression.is_empty()
+            || allocation.size_expression == copy.size_expression {
+            continue;
+        }
+        findings.push(lifetime_proto::NativeTemporalFinding {
+            function: skeleton.source_function.clone(),
+            pattern: pattern.matcher_pattern.clone(),
+            path: Some(lifetime_proto::Path { root: copy.destination.clone(), selectors: Vec::new() }),
+            line: copy.line, has_line: copy.has_line, node: copy.node.clone(),
+            witness_nodes: vec![allocation.node.clone(), copy.node.clone()],
+            witness_complete: true,
+            source_witness_nodes: copy.source_witness_nodes.clone(),
+            source_reachable: copy.source_reachable,
+            guards: copy.guards.clone(), guarded: copy.guarded,
+            family: copy.family.clone(), pattern_id: pattern.id.clone(),
+            evaluator: pattern.evaluator.clone(), tier: pattern.tier,
+        });
+    }
+    if findings.is_empty() { return None; }
+    findings.sort_by(|left, right| (&left.node, left.line).cmp(&(&right.node, right.line)));
+    findings.dedup_by(|left, right| left.node == right.node && left.path == right.path);
+    Some(lifetime_proto::NativeTemporalFunction {
+        id: format!("native:sink-graph:{ordinal}:{}", skeleton.entry),
+        findings, transfers: skeleton.edges.len() as u64, widenings: 0,
+        capped: !skeleton.complete,
+    })
 }
 
 /// Evaluate the old Python reach substrate over a binary Claus skeleton.
