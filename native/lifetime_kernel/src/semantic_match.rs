@@ -501,8 +501,13 @@ fn match_function(
 pub(crate) fn match_result(
     result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
-    if !result.skeletons.is_empty() {
-        return match_skeletons(result.skeletons);
+    let had_skeletons = !result.skeletons.is_empty();
+    let temporal_skeletons: Vec<_> = result.skeletons.iter()
+        .filter(|skeleton| skeleton.kind != "reach")
+        .cloned()
+        .collect();
+    if had_skeletons {
+        return match_skeletons(temporal_skeletons);
     }
     if !result.seams.is_empty() {
         return match_stitched_result(result);
