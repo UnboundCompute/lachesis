@@ -235,6 +235,12 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
             for definition in environment.get(&target).into_iter().flatten() {
                 let definition_text = graph.id(*definition).to_owned(); let read_text = graph.id(read.id).to_owned(); let statement_text = graph.id(statement).to_owned(); let evidence = vec![definition_text.clone(), read_text.clone(), statement_text.clone()];
                 add_edge("BRANCH_READS_FROM", definition_text.clone(), read_text.clone(), evidence.clone(), vec![pass2::text_field("statement_id", &statement_text)]);
+                // The branch-sensitive solver above is also the native
+                // field-sensitive reaching-definition producer. Publish its
+                // canonical relation under the edge kind consumed by taint
+                // and lifetime clients; the access-path target identity is
+                // already part of the computed definition key.
+                add_edge("REACHING_DEF", definition_text.clone(), read_text.clone(), evidence.clone(), vec![pass2::text_field("statement_id", &statement_text)]);
                 add_edge("VALUE_FLOWS_TO", definition_text, read_text, evidence, vec![pass2::text_field("reason", "branch-reaching-definition")]);
             }
         }

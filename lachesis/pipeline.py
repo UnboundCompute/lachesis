@@ -97,13 +97,13 @@ def _combine_graphs(
     }, len(dangling)
 
 
-def source_inventory(source_dir: str, include_tests: bool = False) -> List[str]:
-    """Discover source files. Test/spec files are excluded by default — they are not
-    attack surface and production code does not import them, so dropping them at
-    discovery (before compile) is safe for type resolution and shrinks the graph. The
-    test predicate is the single source of truth in ``nav.symbol_index`` (imported
-    lazily to avoid an import cycle), so build-time exclusion can never drift from any
-    query-time notion of "is a test"."""
+def source_inventory(source_dir: str, include_tests: bool = True) -> List[str]:
+    """Discover every supported source file, including tests and specifications.
+
+    Complete compiler coverage is the default: a function must not disappear merely
+    because its path looks like a test. Callers that explicitly need a production-only
+    inventory may still pass ``include_tests=False``.
+    """
     # node_modules has a Python counterpart in every direction: an installed
     # virtualenv, a build cache, and a tool cache. Walking any of them analyses
     # somebody else's source as if it were the project's, which is both slow and
@@ -210,15 +210,15 @@ def run_project(
     output_root: Optional[str] = None,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
-    include_tests: bool = False,
+    include_tests: bool = True,
     *,
     enrich: bool = False,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
     """Run selected frontends and compose the canonical core graph.
 
-    Discovery (``source_inventory``) drops test files by default; the filtered
-    per-frontend file list is handed to each frontend as its explicit root set, so a
-    frontend that re-walks the tree cannot re-introduce the tests we excluded.
+    Discovery includes test/specification files by default; the complete per-frontend
+    file list is handed to each frontend as its explicit root set, so a frontend that
+    re-walks the tree cannot silently change the inventory.
 
     The removed ``enrich=True`` build-time overlay mode is rejected; native Pass 2
     runs only after the binary store has been written.
@@ -256,7 +256,7 @@ def run_project_streaming(
     output_root: str,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
-    include_tests: bool = False,
+    include_tests: bool = True,
 ):
     """Run frontends one at a time and return shard readers plus metadata.
 
@@ -317,7 +317,7 @@ def run_project_streaming_parallel(
     output_root: str,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
-    include_tests: bool = False,
+    include_tests: bool = True,
     *,
     max_files_per_package: Optional[int] = None,
     workspace_root: Optional[str] = None,
@@ -432,7 +432,7 @@ def _group_digests(files: Iterable[str], source_dir: str) -> Dict[str, str]:
             for path in sorted(files)}
 
 
-def source_content_hash(source_dir: str, include_tests: bool = False) -> str:
+def source_content_hash(source_dir: str, include_tests: bool = True) -> str:
     """One digest over every source file a build of ``source_dir`` would see.
 
     The validity key for anything derived from a compile of this tree. A reduced store
@@ -473,6 +473,37 @@ def _build_options() -> Dict[str, str]:
             for name in _OUTPUT_BEARING_ENVIRONMENT if name in os.environ}
 
 
+def _frontend_fingerprint(frontend) -> str:
+    """Identify the executable/script that produced a reusable frontend bundle.
+
+    Source digests alone are insufficient: upgrading the compiler frontend can
+    change the graph for unchanged sources (for example, when internal-linkage
+    functions become first-class entities). Hash command-file contents so an
+    incremental build cannot silently reuse a bundle produced by an older
+    compiler. Runtime transport remains protobuf-only; this is only a cache key.
+    """
+    digest = hashlib.sha256()
+    digest.update(frontend.frontend_id.encode("utf-8"))
+    digest.update(b"\0")
+    for part in frontend.command:
+        digest.update(str(part).encode("utf-8"))
+        digest.update(b"\0")
+        path = Path(part)
+        if not path.is_file():
+            continue
+        digest.update(b"file\0")
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    for key, value in sorted(frontend.environment.items()):
+        digest.update(key.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
     if not manifest_path or not os.path.isfile(manifest_path):
         return {}
@@ -500,7 +531,7 @@ def run_project_incremental(
     output_root: str,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
-    include_tests: bool = False,
+    include_tests: bool = True,
     manifest_path: Optional[str] = None,
     *,
     enrich: bool = True,
@@ -529,22 +560,26 @@ def run_project_incremental(
         frontend_output = os.path.join(output_root, frontend_id)
         digests = _group_digests(groups[frontend_id], source_dir)
         prior_entry = prior.get(frontend_id) or {}
+        frontend = registry.get(frontend_id)
+        reuse_options = {
+            **options,
+            "frontend_fingerprint": _frontend_fingerprint(frontend),
+        }
         can_reuse = (
             prior_entry.get("files") == digests
             # a bundle built under different settings answers a different question
-            and (prior_entry.get("options") or {}) == options
+            and (prior_entry.get("options") or {}) == reuse_options
             and Path(frontend_output, "manifest.pb").is_file()
         )
         if can_reuse:
             snapshots.append(load_snapshot(frontend_output))
         else:
-            frontend = registry.get(frontend_id)
             snapshots.append(run_frontend(
                 frontend, source_dir, frontend_output, timeout_seconds,
                 roots=groups[frontend_id],
             ))
         manifest[frontend_id] = {"bundle_dir": frontend_output, "files": digests,
-                                 "options": options}
+                                 "options": reuse_options}
 
     if not snapshots:
         supported = sorted({
@@ -574,7 +609,7 @@ def package_jobs(
     source_dir: str,
     output_root: str,
     registry: FrontendRegistry,
-    include_tests: bool = False,
+    include_tests: bool = True,
     packages: Optional[Dict[str, List[str]]] = None,
 ) -> List[Tuple[str, str, str, str, List[str]]]:
     """The (frontend_id, package, compile_root, output_dir, roots) units of a build.
@@ -697,7 +732,7 @@ def run_project_parallel(
     output_root: str,
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
-    include_tests: bool = False,
+    include_tests: bool = True,
     *,
     enrich: bool = True,
     max_workers: Optional[int] = None,

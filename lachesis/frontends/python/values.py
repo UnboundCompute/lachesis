@@ -574,7 +574,7 @@ class ValueWalk:
     ) -> None:
         """``self.x = param``: the shape a constructor stores its inputs with.
 
-        lachesis/frontends/c/build_graph.py:1046 emits the same edge, and
+        the native Clang frontend emits the same edge, and
         lachesis/frontends/checks.py asserts on it, so a receiver-and-value pair
         that are both parameters of the owning function is reported the same way
         here rather than in a Python-shaped variant of it.

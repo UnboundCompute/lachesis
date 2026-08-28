@@ -200,6 +200,16 @@ impl Graph {
         })
     }
 
+    pub(crate) fn edge_property_i64(&self, edge: &Edge, key: &str) -> Option<i64> {
+        edge.properties.iter().find_map(|field| {
+            if field.key != key { return None; }
+            match field.value.as_ref()?.kind.as_ref()? {
+                graph_proto::value::Kind::Integer(value) => Some(*value),
+                _ => None,
+            }
+        })
+    }
+
     pub(crate) fn node_property_text<'a>(&self, node: &'a Node, key: &str) -> Option<&'a str> {
         self.node_property(node, key).and_then(|value| match value.kind.as_ref()? {
             graph_proto::value::Kind::Text(value) => Some(value.as_str()),
@@ -373,6 +383,92 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
         }
     }
     finish_graph(symbols, nodes, edges, core_content_hash)
+}
+
+fn text_property<'a>(properties: &'a [graph_proto::Field], key: &str) -> Option<&'a str> {
+    properties.iter().find_map(|field| {
+        (field.key == key).then_some(field.value.as_ref())
+            .flatten()
+            .and_then(|value| match value.kind.as_ref()? {
+                graph_proto::value::Kind::Text(value) => Some(value.as_str()),
+                _ => None,
+            })
+    })
+}
+
+fn text_list_property(properties: &[graph_proto::Field], key: &str) -> Vec<String> {
+    properties.iter().find_map(|field| {
+        if field.key != key { return None; }
+        let value = field.value.as_ref()?.kind.as_ref()?;
+        let graph_proto::value::Kind::List(list) = value else { return None; };
+        Some(list.values.iter().filter_map(|item| match item.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.clone()),
+            _ => None,
+        }).collect())
+    }).unwrap_or_default()
+}
+
+/// Read only the already-computed native taint witnesses from a Pass-2
+/// overlay.  The semantic pass uses this compact index to attach source
+/// provenance to event findings; it never reconstructs the graph or invokes a
+/// second taint analysis.
+pub(crate) struct TaintEvidence {
+    pub(crate) witnesses: HashMap<String, Vec<String>>,
+    pub(crate) observed_sinks: std::collections::HashSet<String>,
+    pub(crate) truncated: bool,
+}
+
+pub(crate) fn read_taint_evidence_path(
+    path: impl AsRef<Path>,
+) -> Result<TaintEvidence, String> {
+    let file = File::open(path.as_ref())
+        .map_err(|error| format!("cannot open Pass-2 evidence sidecar: {error}"))?;
+    let mut input = BufReader::with_capacity(1024 * 1024, file);
+    let mut magic = vec![0u8; DATAFLOW_STREAM_MAGIC.len()];
+    input.read_exact(&mut magic)
+        .map_err(|error| format!("cannot read Pass-2 evidence header: {error}"))?;
+    if magic != DATAFLOW_STREAM_MAGIC {
+        return Err("invalid Pass-2 evidence sidecar magic".to_owned());
+    }
+    let header = read_stream_frame(&mut input)?;
+    let _: graph_proto::DataflowOverlay = graph_proto::DataflowOverlay::decode(header.as_slice())
+        .map_err(|error| format!("invalid Pass-2 evidence envelope: {error}"))?;
+    let mut result = HashMap::new();
+    let mut observed_sinks = std::collections::HashSet::new();
+    let mut truncated = false;
+    // `taint-reach.sink_id` stores the taint sink node id, while the semantic
+    // event anchor is normally the sink's underlying value id.  Keep the
+    // mapping in that direction; indexing value -> sink made witness
+    // attachment silently miss catalog and frontend-produced sinks alike.
+    let mut sink_values = HashMap::new();
+    let mut reaches = Vec::new();
+    while let Some(payload) = read_optional_stream_frame(&mut input)? {
+        if payload.first() != Some(&b'N') { continue; }
+        let node = graph_proto::NodeRecord::decode(&payload[1..])
+            .map_err(|error| format!("invalid Pass-2 evidence node: {error}"))?;
+        if node.kind == "sink" {
+            if let Some(value) = text_property(&node.properties, "value_id") {
+                sink_values.insert(node.id.clone(), value.to_owned());
+                observed_sinks.insert(node.id.clone());
+                observed_sinks.insert(value.to_owned());
+            }
+        } else if node.kind == "taint-reach" {
+            let Some(sink) = text_property(&node.properties, "sink_id") else { continue; };
+            let witness = text_list_property(&node.properties, "witness_ids");
+            if !witness.is_empty() {
+                reaches.push((sink.to_owned(), witness));
+            }
+        } else if node.kind == "taint-truncation" {
+            truncated = true;
+        }
+    }
+    for (sink, witness) in reaches {
+        result.entry(sink.clone()).or_insert_with(|| witness.clone());
+        if let Some(value) = sink_values.get(&sink) {
+            result.entry(value.clone()).or_insert(witness);
+        }
+    }
+    Ok(TaintEvidence { witnesses: result, observed_sinks, truncated })
 }
 
 fn finish_graph(

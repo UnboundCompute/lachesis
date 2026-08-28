@@ -29,7 +29,7 @@ from __future__ import annotations
 import ast
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
-from .declarations import declaration_id, declaration_kind
+from .declarations import declaration_id, declaration_kind, FUNCTION_LIKE_NODES
 from .emit import Graph, SourceFile, compact, stable_id
 from .resolve import DYNAMIC_CALLEES, NOTHING, Resolution, Resolver
 from .scopes import (
@@ -155,7 +155,7 @@ class BodyWalk:
         kind = scope_kind(node)
         graph_id: Optional[str] = None
         self_name: Optional[str] = None
-        if isinstance(node, FUNCTION_NODES):
+        if isinstance(node, FUNCTION_LIKE_NODES):
             owner_kind = parent.kind if parent is not None else "module"
             graph_id = declaration_id(
                 self.source, node, declaration_kind(node, owner_kind),
@@ -189,12 +189,12 @@ class BodyWalk:
         if kind in ("function", "lambda", "comprehension"):
             occurrences = bound_occurrences(own_regions(node))
             locals_of_scope = set(occurrences)
-            if isinstance(node, (ast.Lambda,) + FUNCTION_NODES):
+            if isinstance(node, FUNCTION_LIKE_NODES):
                 locals_of_scope.update(
                     slot.arg for slot in _all_parameters(node.args)
                 )
             for name, anchor in occurrences.items():
-                if isinstance(anchor, FUNCTION_NODES):
+                if isinstance(anchor, FUNCTION_LIKE_NODES):
                     declarations[name] = declaration_id(self.source, anchor, "function")
                 elif isinstance(anchor, ast.ClassDef):
                     declarations[name] = declaration_id(self.source, anchor, "class")

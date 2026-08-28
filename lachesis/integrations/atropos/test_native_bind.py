@@ -53,6 +53,37 @@ class NativeAtroposBinderParity(unittest.TestCase):
         self.assertEqual(by_id["unsupported"]["status"], "unsupported-path")
         self.assertEqual(by_id["arity"]["status"], "arity-mismatch")
 
+    def test_generic_method_model_binds_across_receiver_identities(self):
+        # A type-less method model (no package, no receiver_type) deliberately matches
+        # every occurrence of the method, so differing receiver identities across the
+        # call sites are expected -- it binds all of them rather than bailing out
+        # ambiguous. A model that pins an identity still guards against the same shape.
+        # (Regression: the octokit ReDoS `.match` sink was refused as "ambiguous" because
+        # one receiver carried a module and the other did not.)
+        models = [
+            {"id": "generic", "language": "typescript", "method": "match",
+             "role": "sink", "access_path": "Receiver"},
+            {"id": "pinned", "language": "typescript", "method": "match",
+             "type": "String", "role": "sink", "access_path": "Receiver"},
+        ]
+        index = {
+            "format": "atropos-symbol-index", "version": 1,
+            "language": "typescript", "source": "test",
+            "callsites": [
+                {"id": "match-headers", "callee": {"name": "match", "module": None,
+                 "receiver_type": None, "arity": 1}, "call_value_id": "m1",
+                 "receiver_value_id": "headers.accept", "arg_value_ids": ["re"]},
+                {"id": "match-url", "callee": {"name": "match", "module": "url",
+                 "receiver_type": None, "arity": 1}, "call_value_id": "m2",
+                 "receiver_value_id": "url", "arg_value_ids": ["re"]},
+            ],
+        }
+        report = bind_all(models, index)
+        by_id = {row["model_id"]: row for row in report["results"]}
+        self.assertEqual(by_id["generic"]["status"], "bound")
+        self.assertEqual(len(by_id["generic"]["attachments"]), 2)
+        self.assertEqual(by_id["pinned"]["status"], "ambiguous")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -202,6 +202,7 @@ def atropos_enrich(
                 role_nodes[kind] = role_nodes.get(kind, 0) + 1
             return graph, {
                 "applied": True, "atropos_root": str(root),
+                "catalog_path": str(catalog_path),
                 "languages": languages, "per_language": per_language,
                 "stamps": len(stamps), "role_nodes": role_nodes,
             }
@@ -218,6 +219,7 @@ def atropos_enrich(
     return enriched, {
         "applied": True,
         "atropos_root": str(root),
+        "catalog_path": str(catalog_path) if native_path_report is not None else None,
         "languages": languages,
         "per_language": per_language,
         "stamps": len(stamps),

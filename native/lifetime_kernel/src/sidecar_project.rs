@@ -25,8 +25,10 @@ const SUBSTRATE_NODE_KINDS: &[&str] = &[
     "UnaryOperator", "UnaryExprOrTypeTraitExpr", "VarDecl", "WhileStmt", "cfg-entry",
     "cfg-exit", "cfg-merge", "cfg-condition", "function", "method", "constructor",
     "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
-    "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration", "ArrowFunction",
-    "MethodDeclaration", "MethodDefinition", "Call", "CallExpression", "construct",
+    "CXXMethod", "Constructor", "Destructor", "FunctionTemplate", "ConversionFunction",
+    "CXXDeductionGuide", "ObjCMethodDecl", "BlockDecl", "FunctionDef", "AsyncFunctionDef", "FunctionDeclaration",
+    "FunctionExpression", "ArrowFunction", "MethodDeclaration", "MethodDefinition",
+    "GetAccessor", "SetAccessor", "Call", "CallExpression", "construct",
     "NewExpression", "Return", "ReturnStatement", "return", "allocation", "release",
     "realloc", "parameter", "arg",
 ];
@@ -35,11 +37,12 @@ const SUBSTRATE_PROPERTY_KEYS: &[&str] = &[
     "absolute_file", "end_line", "end_offset", "file", "function_id", "operator",
     "owner_function_id", "receiver", "receiver_id", "receiver_member_id",
     "receiver_symbol_id", "receiver_value", "receiver_value_id", "start_line",
-    "start_offset", "syntax_kind", "type", "callee", "form", "method_name",
+    "start_offset", "syntax_kind", "type", "language", "receiver_type", "callee", "form", "method_name",
     "primary_target_id", "callee_name", "callee_form", "argument_count", "release_method",
     "release_name", "release_line", "target_id", "value_id", "resolution",
     "allocation_kind", "allocated_type", "control_kind", "is_alloc", "is_release",
-    "is_realloc", "is_aggregate_copy", "declaration_only", "storage_class", "owner_id",
+    "is_realloc", "is_aggregate_copy", "declaration_only", "storage_class", "linkage",
+    "exported", "owner_id",
 ];
 
 fn frame_read<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {

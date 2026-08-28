@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lachesis-cpg"
-version = "0.3.0"
+version = "0.4.0"
 description = "A compiler-precise code property graph with an embedded columnar store and a navigation layer for security reasoning over source code."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -114,6 +114,9 @@ test-command = "lachesis --version && lachesis doctor"
 # them by compiling from sdist (which fails). Build on manylinux_2_28 instead, where
 # both ship prebuilt x86_64 wheels.
 manylinux-x86_64-image = "manylinux_2_28"
+# Same glibc 2.28 baseline for arm64: kuzu and pyarrow publish manylinux_2_28
+# aarch64 wheels, so the clean-env test install resolves them without an sdist build.
+manylinux-aarch64-image = "manylinux_2_28"
 # manylinux containers ship no Rust toolchain; install it once per platform and put
 # cargo on PATH for the staging step. protoc is vendored through the Cargo build, so
 # no system protobuf compiler is required.

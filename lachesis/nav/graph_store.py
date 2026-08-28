@@ -456,9 +456,15 @@ class GraphStore:
         native_cache = dataflow_overlay_path(core_path)
         if native_input.is_file():
             from lachesis.flow.native_lifetime import run_pass2_path
+            catalog_path = None
+            from lachesis.integrations.atropos.enrich import locate_atropos
+            atropos_root = locate_atropos()
+            if atropos_root is not None:
+                from lachesis.integrations.atropos.native_bind import compiled_catalog
+                catalog_path = compiled_catalog(atropos_root, core_path)
             if not _dataflow_cache_matches(native_cache, manifest.get("core_content_hash")):
                 timing("native Pass-2 starting")
-                run_pass2_path(native_input, native_cache)
+                run_pass2_path(native_input, native_cache, catalog_path)
                 timing("native Pass-2 published")
             dataflow_overlay = _load_dataflow_overlay(native_cache)
             merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)

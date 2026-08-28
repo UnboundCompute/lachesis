@@ -28,7 +28,7 @@ def _function_language(function, fallback: str) -> str:
 
 
 def _decode(result, lang="mixed"):
-    from lachesis.flow.semantic_graph import Event, EventKind, ObjRef, SkeletonGraph
+    from lachesis.flow.semantic_graph import Event, EventKind, GuardProof, ObjRef, SkeletonGraph
 
     graph = SkeletonGraph(language=lang)
     for function in result.functions:
@@ -51,12 +51,43 @@ def _decode(result, lang="mixed"):
                            language=function_language)
         for edge in function.edges:
             if edge.source in node_ids and edge.target in node_ids:
-                graph.add_edge(edge.source, edge.target, kind=edge.kind or "normal")
+                guards = tuple(GuardProof(item.kind, item.value) for item in edge.guards)
+                bindings = []
+                for binding in edge.bindings:
+                    for item in binding.formal_to_actual:
+                        formal, separator, actual = item.partition("\x1f")
+                        if separator and formal and actual:
+                            bindings.append((ObjRef(formal, (), "g0"),
+                                             ObjRef(actual, (), "g0")))
+                graph.add_edge(
+                    edge.source, edge.target, kind=edge.seam_kind or edge.kind or "normal",
+                    guard=guards, return_to=edge.return_to or None,
+                    binding=bindings,
+                    provenance=((edge.provenance, edge.callee),) if edge.provenance else (),
+                )
         exits = [node for node in function.exits if node in node_ids]
         graph.add_fragment(
             function.id,
             function.entry if function.entry in node_ids else function.nodes[0].id,
             exits=exits or [function.nodes[-1].id],
+        )
+    # Seam edges are emitted outside function-local edge lists because their
+    # endpoints belong to different fragments. They remain binary in the
+    # engine; this reconstruction exists only for explicit query consumers.
+    for edge in result.seams:
+        if edge.source not in graph.nodes or edge.target not in graph.nodes:
+            continue
+        guards = tuple(GuardProof(item.kind, item.value) for item in edge.guards)
+        bindings = []
+        for binding in edge.bindings:
+            for item in binding.formal_to_actual:
+                formal, separator, actual = item.partition("\x1f")
+                if separator and formal and actual:
+                    bindings.append((ObjRef(formal, (), "g0"), ObjRef(actual, (), "g0")))
+        graph.add_edge(
+            edge.source, edge.target, kind=edge.seam_kind or edge.kind or "seam",
+            guard=guards, return_to=edge.return_to or None, binding=bindings,
+            provenance=((edge.provenance, edge.callee),) if edge.provenance else (),
         )
     if not result.complete:
         graph.coverage["converged"] = False

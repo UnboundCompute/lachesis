@@ -7,7 +7,9 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
+use std::sync::OnceLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 mod graph {
@@ -15,6 +17,7 @@ mod graph {
 }
 
 const SHARD_FORMAT_VERSION: u32 = 2;
+static MACOS_SYSROOT: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct IdKey([u8; 20]);
@@ -93,6 +96,49 @@ fn stable_id_parts(kind: &str, parts: &[String]) -> String {
     format!("v2:frontend:clang-c:{kind}:{}", &hex[..20])
 }
 
+fn linkage_name(linkage: CXLinkageKind) -> &'static str {
+    match linkage {
+        CXLinkage_Internal => "internal",
+        CXLinkage_External => "external",
+        CXLinkage_UniqueExternal => "unique-external",
+        CXLinkage_NoLinkage => "none",
+        _ => "invalid",
+    }
+}
+
+fn macos_sysroot() -> Option<&'static str> {
+    MACOS_SYSROOT
+        .get_or_init(|| {
+            if !cfg!(target_os = "macos") {
+                return None;
+            }
+            if let Some(value) = env::var_os("SDKROOT").filter(|value| !value.is_empty()) {
+                return value.into_string().ok();
+            }
+            let output = Command::new("xcrun")
+                .args(["--show-sdk-path"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let value = String::from_utf8(output.stdout).ok()?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .as_deref()
+}
+
+fn add_host_compiler_arguments(arguments: &mut Vec<String>) {
+    if arguments.iter().any(|argument| argument == "-isysroot" || argument.starts_with("-isysroot=")) {
+        return;
+    }
+    if let Some(sysroot) = macos_sysroot() {
+        arguments.push("-isysroot".to_owned());
+        arguments.push(sysroot.to_owned());
+    }
+}
+
 unsafe fn cx_string(value: CXString) -> String {
     let pointer = clang_getCString(value);
     let result = if pointer.is_null() {
@@ -133,6 +179,95 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32
     (filename, line, column, offset, end_offset, end_line, end_column)
 }
 
+unsafe fn token_start_offset(tu: CXTranslationUnit, token: CXToken) -> u32 {
+    let location = clang_getTokenLocation(tu, token);
+    let mut file = ptr::null_mut();
+    let mut line = 0;
+    let mut column = 0;
+    let mut offset = 0;
+    clang_getSpellingLocation(location, &mut file, &mut line, &mut column, &mut offset);
+    offset
+}
+
+// libclang leaves `clang_getCursorSpelling` empty for operator expressions, and
+// the binary-opcode accessor is gated behind a newer clang feature than we build
+// against, so recover the operator by tokenizing the expression's extent and
+// picking the punctuation token that sits between the operands.  The reference
+// frontend records this as the node's `operator` property; the Pass-3 skeleton
+// depends on it to emit COMPARE_VALUE events with the null guards that mark a
+// pointer check as taken, so a comparison with no `operator` reads as unguarded.
+unsafe fn operator_spelling(cursor: CXCursor, syntax_kind: &str) -> String {
+    let is_binary = matches!(syntax_kind, "BinaryOperator" | "CompoundAssignOperator");
+    let is_unary = syntax_kind == "UnaryOperator";
+    if !is_binary && !is_unary {
+        return String::new();
+    }
+    let tu = clang_Cursor_getTranslationUnit(cursor);
+    if tu.is_null() {
+        return String::new();
+    }
+    let mut children = ChildProbe { cursors: Vec::new() };
+    clang_visitChildren(
+        cursor,
+        collect_direct_child,
+        &mut children as *mut ChildProbe as *mut c_void,
+    );
+    let extent = clang_getCursorExtent(cursor);
+    let mut tokens: *mut CXToken = ptr::null_mut();
+    let mut count: c_uint = 0;
+    clang_tokenize(tu, extent, &mut tokens, &mut count);
+    if tokens.is_null() || count == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    if is_binary && children.cursors.len() >= 2 {
+        // The operator is the punctuation token after the LHS operand's extent
+        // and before the RHS operand's start.  Bounding by both operand offsets
+        // skips any punctuation nested inside the operands (e.g. `a[i] == b`).
+        let (_, _, _, _, lhs_end, _, _) = cursor_file(children.cursors[0]);
+        let (_, _, _, rhs_start, _, _, _) = cursor_file(children.cursors[1]);
+        for i in 0..count {
+            let token = *tokens.add(i as usize);
+            if clang_getTokenKind(token) != CXToken_Punctuation {
+                continue;
+            }
+            let start = token_start_offset(tu, token);
+            if start >= lhs_end && start < rhs_start {
+                result = cx_string(clang_getTokenSpelling(tu, token));
+                break;
+            }
+        }
+    } else if is_unary {
+        // A prefix operator precedes its operand (take the first punctuation
+        // token before the operand); a postfix operator follows it (take the
+        // last punctuation token after the operand).
+        let operand = children.cursors.first().map(|child| {
+            let (_, _, _, os, oe, _, _) = cursor_file(*child);
+            (os, oe)
+        });
+        for i in 0..count {
+            let token = *tokens.add(i as usize);
+            if clang_getTokenKind(token) != CXToken_Punctuation {
+                continue;
+            }
+            let start = token_start_offset(tu, token);
+            let inside_operand = operand
+                .map(|(os, oe)| start >= os && start < oe)
+                .unwrap_or(false);
+            if inside_operand {
+                continue;
+            }
+            result = cx_string(clang_getTokenSpelling(tu, token));
+            let is_prefix = operand.map(|(os, _)| start < os).unwrap_or(true);
+            if is_prefix {
+                break;
+            }
+        }
+    }
+    clang_disposeTokens(tu, tokens, count);
+    result
+}
+
 struct Emitter {
     nodes: File,
     edges: File,
@@ -142,13 +277,16 @@ struct Emitter {
     edge_count: u64,
     file_ids: FxHashMap<String, String>,
     root_files: FxHashSet<String>,
+    project_root: String,
     slot_bindings: FxHashMap<String, FxHashSet<String>>,
     function_ids: FxHashMap<String, FxHashSet<String>>,
     function_definitions: FxHashMap<String, FxHashSet<String>>,
     function_declarations: FxHashMap<String, FxHashSet<String>>,
+    function_usrs: FxHashMap<String, String>,
     function_parameters: FxHashMap<String, Vec<String>>,
     usr_ids: FxHashMap<String, String>,
     path_cache: FxHashMap<String, String>,
+    source_cache: FxHashMap<String, Vec<u8>>,
 }
 
 impl Emitter {
@@ -168,9 +306,50 @@ impl Emitter {
         canonical
     }
 
-    fn node(&mut self, record: graph::NodeRecord) -> io::Result<()> {
+    /// Source snippet for a byte span [start, end), whitespace-collapsed and
+    /// truncated at 300 chars.  Mirrors the reference frontend's
+    /// source_bytes + source_span + compact: a body node's label is the raw
+    /// file text it spells, never an AST-derived name.  Returns empty when the
+    /// span is degenerate or out of range so the caller can fall back.
+    fn snippet(&mut self, file: &str, start: u32, end: u32) -> String {
+        if file.is_empty() || end <= start {
+            return String::new();
+        }
+        if !self.source_cache.contains_key(file) {
+            let bytes = fs::read(file).unwrap_or_default();
+            self.source_cache.insert(file.to_owned(), bytes);
+        }
+        let bytes = &self.source_cache[file];
+        let (s, e) = (start as usize, end as usize);
+        if e > bytes.len() || s >= e {
+            return String::new();
+        }
+        let raw = String::from_utf8_lossy(&bytes[s..e]);
+        let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.chars().count() <= 300 {
+            text
+        } else {
+            let head: String = text.chars().take(299).collect();
+            format!("{head}…")
+        }
+    }
+
+    fn node(&mut self, mut record: graph::NodeRecord) -> io::Result<()> {
         if !self.node_ids.insert(id_key(&record.id)) {
             return Ok(());
+        }
+        // Stamp `language` on every node at the single emit choke point so it
+        // lands in nodes.pb regardless of the output path. The frontend-bundle
+        // writer applies the identical stamp in add_contract_defaults, but the
+        // streaming path (LACHESIS_SHARD_ROOT) bypasses that post-process, so
+        // without this call/expression/argument nodes reach the graph with no
+        // language and the Pass-2 native binder's language filter drops every
+        // callsite. Derive it exactly as add_contract_defaults does.
+        if !has_property(&record.properties, "language") {
+            let file = property_text(&record.properties, "absolute_file")
+                .or_else(|| property_text(&record.properties, "file"))
+                .unwrap_or_default();
+            record.properties.push(field("language", text(language_for_path(&file))));
         }
         if record.kind == "function" {
             let declaration_only = record.properties.iter().find_map(|property| {
@@ -242,19 +421,24 @@ unsafe fn resolved_declaration_id(
 }
 
 fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
-    let definitions: Vec<(String, String)> = emitter
-        .function_definitions
-        .iter()
-        .filter_map(|(name, ids)| {
-            if ids.len() == 1 { Some((name.clone(), ids.iter().next()?.clone())) } else { None }
-        })
-        .collect();
-    for (name, definition) in definitions {
-        let declarations: Vec<String> = emitter
-            .function_declarations
-            .get(&name)
-            .into_iter()
-            .flat_map(|ids| ids.iter().cloned())
+    let mut definitions = Vec::new();
+    for (name, ids) in &emitter.function_definitions {
+        for definition in ids {
+            let identity = emitter.function_usrs.get(definition)
+                .map(|usr| ("usr".to_owned(), usr.clone()))
+                .unwrap_or_else(|| ("name".to_owned(), name.clone()));
+            definitions.push((identity, definition.clone()));
+        }
+    }
+    for ((identity_kind, identity), definition) in definitions {
+        let declarations: Vec<String> = emitter.function_declarations.iter()
+            .filter(|(name, ids)| ids.iter().any(|id| {
+                match emitter.function_usrs.get(id) {
+                    Some(usr) => identity_kind == "usr" && usr == &identity,
+                    None => identity_kind == "name" && name.as_str() == identity,
+                }
+            }))
+            .flat_map(|(_, ids)| ids.iter().cloned())
             .collect();
         for declaration in declarations {
             if declaration == definition {
@@ -268,6 +452,44 @@ fn emit_cross_tu_links(emitter: &mut Emitter) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn language_for_path(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|extension| extension.to_str()) {
+        Some("cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx") => "cpp",
+        _ => "c",
+    }
+}
+
+fn is_function_syntax(kind: &str) -> bool {
+    matches!(kind,
+        "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl" |
+        "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl" |
+        "CXXDeductionGuide" | "CXXMethod" | "Constructor" | "Destructor" |
+        "FunctionTemplate" | "ObjCMethodDecl" | "BlockDecl")
+}
+
+/// Normalize a libclang cursor-kind spelling to the clang JSON AST-dump kind
+/// name that the higher passes branch on — cast-peel sets, member/parameter
+/// recognition, and the sidecar allow-list all match the JSON vocabulary, which
+/// is what the reference frontend (a JSON-dump parser) emitted. libclang uses a
+/// coarser vocabulary: implicit casts surface as UnexposedExpr, member
+/// references as MemberRefExpr, records as StructDecl/UnionDecl, and parameters
+/// as ParmDecl. Only the emitted syntax_kind property is normalized here;
+/// internal control flow keeps the raw libclang spelling.
+fn json_syntax_kind(kind: &str) -> &str {
+    match kind {
+        "ParmDecl" => "ParmVarDecl",
+        "StructDecl" | "UnionDecl" => "RecordDecl",
+        "MemberRefExpr" => "MemberExpr",
+        "UnexposedExpr" => "ImplicitCastExpr",
+        // libclang spells sizeof/alignof/vec_step as the bare "UnaryExpr"; the
+        // clang-JSON reference (and every downstream substrate whitelist) names
+        // it UnaryExprOrTypeTraitExpr. Ordinary unary operators are a distinct
+        // kind (UnaryOperator), so this remap only touches size-of-type nodes.
+        "UnaryExpr" => "UnaryExprOrTypeTraitExpr",
+        other => other,
+    }
 }
 
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
@@ -287,6 +509,7 @@ fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Re
         + if !bytes.is_empty() && !bytes.ends_with(b"\n") { 1 } else { 0 };
     let id = stable_id_parts("file", &[absolute_text.clone()]);
     emitter.file_ids.insert(absolute_text.clone(), id.clone());
+    let language = language_for_path(&absolute_text);
     emitter.node(graph::NodeRecord {
         id,
         kind: "file".to_owned(),
@@ -296,7 +519,7 @@ fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Re
             field("absolute_file", text(&absolute_text)),
             field("content_hash", text(&content_hash)),
             field("lines", integer(lines)),
-            field("language", text("c")),
+            field("language", text(language)),
             field("provenance", text("project-root")),
             field("is_external", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
             field("is_system", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
@@ -386,7 +609,28 @@ fn emit_macros_for_file(emitter: &mut Emitter, path: &str) -> io::Result<()> {
 extern "C" fn visit(cursor: CXCursor, parent: CXCursor, data: CXClientData) -> CXChildVisitResult {
     unsafe {
         let emitter = &mut *(data as *mut Emitter);
-        if let Err(error) = visit_one(cursor, parent, emitter) {
+        let header_function = match visit_one(cursor, parent, emitter, false) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("native clang frontend: {error}");
+                return CXChildVisit_Break;
+            }
+        };
+        if header_function {
+            clang_visitChildren(cursor, visit_header_body,
+                emitter as *mut Emitter as *mut c_void);
+            return CXChildVisit_Continue;
+        }
+    }
+    CXChildVisit_Recurse
+}
+
+extern "C" fn visit_header_body(
+    cursor: CXCursor, parent: CXCursor, data: CXClientData,
+) -> CXChildVisitResult {
+    unsafe {
+        let emitter = &mut *(data as *mut Emitter);
+        if let Err(error) = visit_one(cursor, parent, emitter, true) {
             eprintln!("native clang frontend: {error}");
             return CXChildVisit_Break;
         }
@@ -531,15 +775,15 @@ unsafe fn function_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opti
         );
     }
     let referenced = if clang_is_null(direct) == 0 {
-        direct
+        Some(direct)
     } else {
-        probe.cursor.unwrap_or_default()
-    };
+        probe.cursor
+    }?;
     if clang_is_null(referenced) != 0 {
         return None;
     }
     let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
-    if target_kind != "FunctionDecl" {
+    if !is_function_syntax(&target_kind) {
         return None;
     }
     let target_name = cx_string(clang_getCursorSpelling(referenced));
@@ -565,16 +809,16 @@ unsafe fn referenced_target_id(cursor: CXCursor, emitter: &mut Emitter) -> Optio
         );
     }
     let referenced = if clang_is_null(direct) == 0 {
-        direct
+        Some(direct)
     } else {
-        probe.cursor.unwrap_or_default()
-    };
+        probe.cursor
+    }?;
     if clang_is_null(referenced) != 0 {
         return None;
     }
     let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
     let id_kind = match target_kind.as_str() {
-        "FunctionDecl" => "function",
+        kind if is_function_syntax(kind) => "function",
         "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => "value",
         _ => return None,
     };
@@ -623,13 +867,20 @@ unsafe fn parameter_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opt
     ))
 }
 
-unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
+unsafe fn visit_one(
+    cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter, allow_nonroot: bool,
+) -> io::Result<bool> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
     let (raw_file, line, column, offset, end_offset, end_line, end_column) = cursor_file(cursor);
     let file = emitter.canonical_file(raw_file);
-    if file.is_empty() || (!emitter.root_files.is_empty() && !emitter.root_files.contains(&file)) {
-        return Ok(());
+    let is_root_file = emitter.root_files.is_empty() || emitter.root_files.contains(&file);
+    let project_file = !is_root_file && is_function_syntax(&syntax_kind)
+        && (emitter.project_root.is_empty()
+            || Path::new(&file).strip_prefix(Path::new(&emitter.project_root)).is_ok());
+    let header_function = project_file && clang_isCursorDefinition(cursor) != 0;
+    if file.is_empty() || (!is_root_file && !allow_nonroot && !header_function) {
+        return Ok(false);
     }
     if syntax_kind == "InclusionDirective" {
         let included = clang_getIncludedFile(cursor);
@@ -647,11 +898,25 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                 })?;
             }
         }
-        return Ok(());
+        return Ok(false);
+    }
+
+    // The reference frontend emits a parameter node only for the formals of a real
+    // function. The formals of a function-pointer typedef (e.g.
+    // `typedef int (*fn)(const char *path)`) hang off the type, not a function —
+    // libclang reports their semantic parent as the translation unit — so they must
+    // not become parameter nodes.
+    if matches!(syntax_kind.as_str(), "ParmVarDecl" | "ParmDecl") {
+        let sem_parent = clang_getCursorSemanticParent(cursor);
+        let sem_parent_kind =
+            cx_string(clang_getCursorKindSpelling(clang_getCursorKind(sem_parent)));
+        if !is_function_syntax(&sem_parent_kind) {
+            return Ok(false);
+        }
     }
 
     let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
-        "FunctionDecl" => Some("function"),
+        kind if is_function_syntax(kind) => Some("function"),
         "RecordDecl" | "StructDecl" | "UnionDecl" => Some("record"),
         "EnumDecl" => Some("enum"),
         "TypedefDecl" => Some("type"),
@@ -683,11 +948,26 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             stable_id("body", &file, offset, end_offset, &syntax_kind),
         )
     } else {
-        return Ok(());
+        return Ok(false);
     };
 
-    let type_spelling = cx_string(clang_getTypeSpelling(clang_getCursorType(cursor)));
-    let operator = spelling.clone();
+    // The reference frontend takes `type` from the AST node's `qualType`: a
+    // record/enum declaration carries none (→ absent), and a typedef carries its
+    // *underlying* type, not the alias's own name. libclang would otherwise spell
+    // `struct file_operations` for the record and `read_fn` for the typedef.
+    let type_spelling = match syntax_kind.as_str() {
+        "RecordDecl" | "StructDecl" | "UnionDecl" | "EnumDecl" => String::new(),
+        "TypedefDecl" => cx_string(clang_getTypeSpelling(clang_getTypedefDeclUnderlyingType(cursor))),
+        _ => cx_string(clang_getTypeSpelling(clang_getCursorType(cursor))),
+    };
+    let operator = if matches!(
+        syntax_kind.as_str(),
+        "BinaryOperator" | "CompoundAssignOperator" | "UnaryOperator"
+    ) {
+        operator_spelling(cursor, &syntax_kind)
+    } else {
+        spelling.clone()
+    };
     let mut properties = vec![
         field("file", text(&file)),
         field("absolute_file", text(&file)),
@@ -697,13 +977,29 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         field("start_column", integer(column as i64)),
         field("end_line", integer(end_line as i64)),
         field("end_column", integer(end_column as i64)),
-        field("syntax_kind", text(&syntax_kind)),
-        field("type", text(&type_spelling)),
+        field("syntax_kind", text(json_syntax_kind(&syntax_kind))),
     ];
+    // The reference frontend omits `type` when clang spells nothing (e.g.
+    // statements), leaving it absent rather than an empty string.
+    if !type_spelling.is_empty() {
+        properties.push(field("type", text(&type_spelling)));
+    }
+    // The reference frontend records `operator` only on operator-kind nodes and
+    // leaves it absent elsewhere; the Pass-3 skeleton reads it to classify
+    // pointer comparisons as guards.
+    if matches!(
+        syntax_kind.as_str(),
+        "BinaryOperator" | "CompoundAssignOperator" | "UnaryOperator"
+    ) && !operator.is_empty()
+    {
+        properties.push(field("operator", text(&operator)));
+    }
     let owner_id = function_owner(cursor, emitter);
     if matches!(
         syntax_kind.as_str(),
-        "FunctionDecl"
+        "FunctionDecl" | "CXXMethodDecl" | "CXXConstructorDecl"
+            | "CXXDestructorDecl" | "ConversionFunction" | "FunctionTemplateDecl"
+            | "CXXDeductionGuide" | "ObjCMethodDecl" | "BlockDecl"
             | "RecordDecl"
             | "StructDecl"
             | "UnionDecl"
@@ -717,35 +1013,69 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
     ) {
         let usr = cursor_usr(cursor);
         if !usr.is_empty() {
+            if is_function_syntax(&syntax_kind) {
+                emitter.function_usrs.insert(id.clone(), usr.clone());
+            }
             emitter.usr_ids.entry(usr).or_insert_with(|| id.clone());
         }
     }
     if let Some(owner_id) = &owner_id {
         properties.push(field("owner_function_id", text(owner_id)));
     }
-    if syntax_kind == "FunctionDecl" {
+    if is_function_syntax(&syntax_kind) {
         let has_definition = clang_isCursorDefinition(cursor) != 0;
         properties.push(field("declaration_only", graph::Value {
             kind: Some(graph::value::Kind::Boolean(!has_definition)),
         }));
         properties.push(field("form", text("function")));
+        // Keep linkage on every function entity, including internal/static
+        // functions.  Export status is a separate graph relationship; using
+        // it as the function identity would make compiler-visible helpers
+        // disappear from downstream resolution.
+        properties.push(field(
+            "linkage",
+            text(linkage_name(clang_getCursorLinkage(cursor))),
+        ));
+        // The generic resolver's C scoping contract uses storage_class to
+        // distinguish file-local definitions.  Keep it compiler-derived and
+        // emit it alongside linkage so internal helpers remain resolvable
+        // without a product-specific symbol list.
+        // The reference takes storage_class straight from the AST's storageClass
+        // field: present only for an explicit `extern`/`static` specifier, absent
+        // otherwise. Read the specifier itself, not internal-linkage as a proxy.
+        let storage_class = match clang_Cursor_getStorageClass(cursor) {
+            CX_SC_Extern => Some("extern"),
+            CX_SC_Static => Some("static"),
+            _ => None,
+        };
+        if let Some(storage_class) = storage_class {
+            properties.push(field("storage_class", text(storage_class)));
+        }
     }
+    // Body nodes (call/statement/expression) label as the raw source text they
+    // spell, matching the reference frontend; declarations keep their spelling.
+    let body_snippet = if tier == "T3" {
+        emitter.snippet(&file, offset, end_offset)
+    } else {
+        String::new()
+    };
     let mut call_target = None;
+    let mut callee_set = false;
     if syntax_kind == "CallExpr" {
         let direct = clang_getCursorReferenced(cursor);
         let mut probe = ReferenceProbe { cursor: None };
         if clang_is_null(direct) != 0 {
             clang_visitChildren(cursor, collect_callee_reference, &mut probe as *mut ReferenceProbe as *mut c_void);
         }
-        let referenced = if clang_is_null(direct) == 0 { direct } else { probe.cursor.unwrap_or_default() };
-        if clang_is_null(referenced) == 0 {
+        if let Some(referenced) = if clang_is_null(direct) == 0 { Some(direct) } else { probe.cursor } {
+            if clang_is_null(referenced) == 0 {
             let target_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(referenced)));
             let target_name = cx_string(clang_getCursorSpelling(referenced));
             let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
             let target_file = emitter.canonical_file(target_raw_file);
             if !target_file.is_empty() {
                 let target_id_kind = match target_kind.as_str() {
-                    "FunctionDecl" => Some("function"),
+                    kind if is_function_syntax(kind) => Some("function"),
                     "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                     _ => None,
                 };
@@ -755,6 +1085,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                         target_end, &target_name, emitter,
                     );
                     properties.push(field("callee", text(&target_name)));
+                    callee_set = true;
                     if target_kind == "FieldDecl" {
                         properties.push(field("receiver_member_id", text(&target_id)));
                         properties.push(field("resolution", text("function-pointer")));
@@ -776,7 +1107,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                                 source_tier: tier.clone(), relationship_class: "MAY_INVOKE".to_owned(),
                             })?;
                         }
-                    } else if target_kind == "FunctionDecl" {
+                    } else if is_function_syntax(&target_kind) {
                         properties.push(field("primary_target_id", text(&target_id)));
                         properties.push(field("resolution", text("exact")));
                         call_target = Some(target_id.clone());
@@ -788,12 +1119,40 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                     }
                 }
             }
+            }
+        }
+        // Reference fallback: an unresolved callee (member/indirect call such as
+        // `app->handler(...)`) has no nameable decl, so the callee text is the
+        // source snippet up to the first '(' — the receiver-qualified member.
+        if !callee_set {
+            let callee = body_snippet.split('(').next().unwrap_or("").trim();
+            if !callee.is_empty() {
+                properties.push(field("callee", text(callee)));
+            }
         }
     }
     emitter.node(graph::NodeRecord {
         id: id.clone(),
         kind: node_kind.clone(),
-        label: if spelling.is_empty() { syntax_kind.clone() } else { spelling },
+        label: if !body_snippet.is_empty() {
+            body_snippet.clone()
+        } else if node_kind == "record" || node_kind == "enum" {
+            // A tagless struct/union/enum is named by its start byte offset, not
+            // by clang's ASLR-varying node id. libclang additionally borrows a
+            // typedef's name onto its tagless enum (`typedef enum {..} t;`), so
+            // key on isAnonymous rather than on an empty spelling.
+            if clang_Cursor_isAnonymous(cursor) != 0 || spelling.is_empty() {
+                format!("<anonymous@{offset}>")
+            } else {
+                spelling
+            }
+        } else if spelling.is_empty() {
+            // An unnamed value-decl (a nameless parameter, a zero-width bitfield)
+            // takes the literal label `<anonymous>` — no offset suffix.
+            "<anonymous>".to_owned()
+        } else {
+            spelling
+        },
         properties,
         tier: tier.clone(),
     })?;
@@ -987,7 +1346,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             let (target_raw_file, _, _, target_offset, target_end, _, _) = cursor_file(referenced);
             let target_file = emitter.canonical_file(target_raw_file);
             let id_kind = match target_kind.as_str() {
-                "FunctionDecl" => Some("function"),
+                kind if is_function_syntax(kind) => Some("function"),
                 "VarDecl" | "ParmVarDecl" | "ParmDecl" | "FieldDecl" => Some("value"),
                 _ => None,
             };
@@ -1041,7 +1400,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
         })?;
     }
 
-    if syntax_kind == "FunctionDecl"
+    if is_function_syntax(&syntax_kind)
         && owner_id.is_none()
         && clang_isCursorDefinition(cursor) != 0
         && clang_getCursorLinkage(cursor) != CXLinkage_Internal
@@ -1055,7 +1414,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             })?;
         }
     }
-    Ok(())
+    Ok(header_function)
 }
 
 unsafe fn child_ids_for_value_preserving(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
@@ -1093,7 +1452,7 @@ unsafe fn function_owner(cursor: CXCursor, emitter: &mut Emitter) -> Option<Stri
         }
         let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(current)));
         let spelling = cx_string(clang_getCursorSpelling(current));
-        if syntax_kind == "FunctionDecl" {
+        if is_function_syntax(&syntax_kind) {
             return Some(stable_id("function", &file, offset, end_offset, &spelling));
         }
         let next = clang_getCursorSemanticParent(current);
@@ -1116,7 +1475,7 @@ fn cursor_identity(
         return None;
     }
     let (kind, tier, id_kind) = match syntax_kind {
-        "FunctionDecl" => ("function", "T1", "function"),
+        kind if is_function_syntax(kind) => ("function", "T1", "function"),
         "RecordDecl" | "StructDecl" | "UnionDecl" => ("record", "T1", "record"),
         "EnumDecl" => ("enum", "T1", "enum"),
         "TypedefDecl" => ("type", "T1", "type"),
@@ -1228,7 +1587,10 @@ fn add_contract_defaults(
         properties.push(field("compiler_node_id", text(frontend_id)));
     }
     if !has_property(properties, "language") {
-        properties.push(field("language", text("c")));
+        let file = property_text(properties, "absolute_file")
+            .or_else(|| property_text(properties, "file"))
+            .unwrap_or_default();
+        properties.push(field("language", text(language_for_path(&file))));
     }
     if !has_property(properties, "absolute_file") {
         let file = property_text(properties, "file").unwrap_or_default();
@@ -1303,6 +1665,7 @@ fn write_frontend_bundle(
     frontend_id: &str,
     node_count: u64,
     _edge_count: u64,
+    languages: &[String],
 ) -> io::Result<(u64, u64)> {
     let mut tier_files: FxHashMap<&'static str, File> = FxHashMap::default();
     for tier in ["T0", "T1", "T2", "T3", "T4"] {
@@ -1405,7 +1768,7 @@ fn write_frontend_bundle(
                 field("frontend_contract_version", integer(2)),
                 field("frontend_id", text(frontend_id)),
                 field("generator", text(frontend_id)),
-                field("languages", text_list(vec!["c".to_owned()])),
+                field("languages", text_list(languages.to_vec())),
                 field("lexical_tokens", graph::Value { kind: Some(graph::value::Kind::Boolean(false)) }),
                 field("capabilities", object(vec![
                     field("lexical", text("none")),
@@ -1431,6 +1794,7 @@ fn write_frontend_bundle(
 /// the runner to discard it in `_stream_bundle_to_shard`.
 fn write_stream_manifest(
     output: &Path, frontend_id: &str, node_count: u64, edge_count: u64,
+    languages: &[String],
 ) -> io::Result<()> {
     let manifest = graph::Document {
         format_version: 1,
@@ -1440,7 +1804,7 @@ fn write_stream_manifest(
                 field("frontend_contract_version", integer(2)),
                 field("frontend_id", text(frontend_id)),
                 field("generator", text(frontend_id)),
-                field("languages", text_list(vec!["c".to_owned()])),
+                field("languages", text_list(languages.to_vec())),
                 field("lexical_tokens", graph::Value {
                     kind: Some(graph::value::Kind::Boolean(false)),
                 }),
@@ -1466,8 +1830,9 @@ fn parse_unit(
     emitter: &mut Emitter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source_c = CString::new(unit.path.as_bytes())?;
-    let clang_args: Vec<CString> = unit
-        .arguments
+    let mut arguments = unit.arguments.clone();
+    add_host_compiler_arguments(&mut arguments);
+    let clang_args: Vec<CString> = arguments
         .iter()
         .map(|argument| CString::new(argument.as_str()))
         .collect::<Result<_, _>>()?;
@@ -1518,7 +1883,7 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
                 continue;
             }
             if matches!(path.extension().and_then(|extension| extension.to_str()),
-                        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp")) {
+                        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx")) {
                 files.push(path);
             }
         }
@@ -1529,7 +1894,7 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn is_header(path: &Path) -> bool {
     matches!(path.extension().and_then(|extension| extension.to_str()),
-             Some("h" | "hpp"))
+             Some("h" | "hpp" | "hh" | "hxx"))
 }
 
 fn is_translation_unit(path: &Path) -> bool {
@@ -1624,6 +1989,48 @@ fn automatic_include_arguments(files: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// Read the compiler database through libclang rather than making the Python
+/// boundary parse or rewrite build configuration. The returned arguments are
+/// the compiler's own per-TU arguments, minus argv[0], the source filename, and
+/// output-only switches that are meaningless to libclang parsing.
+unsafe fn compile_database_arguments(source_dir: &Path, source: &Path) -> Option<Vec<String>> {
+    let database_dir = env::var_os("LACHESIS_COMPILE_COMMANDS")
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| source_dir.to_path_buf());
+    let directory = CString::new(database_dir.to_string_lossy().as_bytes()).ok()?;
+    let mut error = CXCompilationDatabase_NoError;
+    let database = clang_CompilationDatabase_fromDirectory(directory.as_ptr(), &mut error);
+    if database.is_null() || error != CXCompilationDatabase_NoError {
+        if !database.is_null() { clang_CompilationDatabase_dispose(database); }
+        return None;
+    }
+    let filename = CString::new(source.to_string_lossy().as_bytes()).ok()?;
+    let commands = clang_CompilationDatabase_getCompileCommands(database, filename.as_ptr());
+    let mut result = None;
+    if !commands.is_null() && clang_CompileCommands_getSize(commands) > 0 {
+        let command = clang_CompileCommands_getCommand(commands, 0);
+        let argc = clang_CompileCommand_getNumArgs(command);
+        let source_text = source.to_string_lossy();
+        let mut args = Vec::new();
+        for index in 1..argc {
+            let argument = cx_string(clang_CompileCommand_getArg(command, index));
+            if argument == source_text || argument == "--" || argument == "-o" || argument == "-MF" || argument == "-MT" {
+                continue;
+            }
+            if index > 0 {
+                let previous = cx_string(clang_CompileCommand_getArg(command, index - 1));
+                if previous == "-o" || previous == "-MF" || previous == "-MT" { continue; }
+            }
+            args.push(argument);
+        }
+        result = Some(args);
+    }
+    if !commands.is_null() { clang_CompileCommands_dispose(commands); }
+    clang_CompilationDatabase_dispose(database);
+    result
+}
+
 fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     let source_dir = if input.is_dir() {
         input.to_path_buf()
@@ -1641,7 +2048,7 @@ fn selected_files(input: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
                 .map(PathBuf::from)
                 .filter(|path| {
                     matches!(path.extension().and_then(|extension| extension.to_str()),
-                             Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp"))
+                             Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx"))
                         && path.is_file()
                 })
                 .map(|path| path.canonicalize().unwrap_or(path))
@@ -1697,15 +2104,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             edge_count: 0,
             file_ids: FxHashMap::default(),
             root_files: FxHashSet::default(),
+            project_root: String::new(),
             slot_bindings: FxHashMap::default(),
             function_ids: FxHashMap::default(),
             function_definitions: FxHashMap::default(),
             function_declarations: FxHashMap::default(),
+            function_usrs: FxHashMap::default(),
             function_parameters: FxHashMap::default(),
             usr_ids: FxHashMap::default(),
             path_cache: FxHashMap::default(),
+            source_cache: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
+            emitter.project_root = PathBuf::from(&request.source_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&request.source_dir))
+                .to_string_lossy().into_owned();
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
                 PathBuf::from(&unit.path)
                     .canonicalize()
@@ -1726,6 +2140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
             let (source_dir, files) = selected_files(&input)?;
+            emitter.project_root = source_dir.to_string_lossy().into_owned();
             if files.is_empty() {
                 clang_disposeIndex(index);
                 return Err(format!("no C or header roots found under {}", source_dir.display()).into());
@@ -1765,7 +2180,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for source in parse_files {
                 let unit = graph::NativeTranslationUnit {
                     path: source.to_string_lossy().into_owned(),
-                    arguments: clang_arguments.clone(),
+                    arguments: compile_database_arguments(&_source_dir, &source)
+                        .unwrap_or_else(|| clang_arguments.clone()),
                 };
                 parse_unit(index, &unit, &mut emitter)?;
             }
@@ -1775,12 +2191,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         emitter.edges.flush()?;
         let node_count = emitter.node_count;
         let edge_count = emitter.edge_count;
+        let mut languages: Vec<String> = emitter.root_files.iter()
+            .map(|path| language_for_path(path).to_owned())
+            .collect();
+        languages.sort();
+        languages.dedup();
         clang_disposeIndex(index);
         write_manifests(&shard, "clang-c-native", node_count, edge_count)?;
         if env::var_os("LACHESIS_SHARD_ROOT").is_some() {
-            write_stream_manifest(&output, "clang-c", node_count, edge_count)?;
+            write_stream_manifest(&output, "clang-c", node_count, edge_count, &languages)?;
         } else {
-            write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count)?;
+            write_frontend_bundle(&output, &shard, "clang-c", node_count, edge_count, &languages)?;
         }
         println!("native clang emitted {node_count} nodes and {edge_count} edges to {}", output.display());
     }

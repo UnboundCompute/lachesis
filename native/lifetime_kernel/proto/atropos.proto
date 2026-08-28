@@ -12,6 +12,9 @@ message Model {
   bool has_arity = 7;
   string access_path = 8;
   string role = 9;
+  string kind = 10;
+  string confidence = 11;
+  repeated string cwe = 12;
 }
 message Callee {
   string name = 1;
@@ -19,6 +22,7 @@ message Callee {
   string receiver_type = 3;
   int64 arity = 4;
   bool has_arity = 5;
+  string language = 6;
 }
 message Callsite {
   string id = 1;
@@ -35,6 +39,13 @@ message Index {
 message Request {
   repeated Model models = 1;
   Index index = 2;
+  PatternCatalog pattern_catalog = 3;
+  repeated CalleeAlias callee_aliases = 4;
+}
+message CalleeAlias {
+  string language = 1;
+  string surface = 2;
+  string canonical = 3;
 }
 message Candidate {
   string module = 1;
@@ -84,4 +95,33 @@ message Report {
   string index = 3;
   Summary summary = 4;
   repeated ResultRow results = 5;
+}
+
+// Declarative Pass-3 data compiled from Atropos during setup.  These records
+// are part of the binary runtime catalog; the Rust engine never reads the
+// authored JSON files.
+message Pattern {
+  string id = 1;
+  string name = 2;
+  repeated string cwe = 3;
+  uint32 tier = 4;
+  string status = 5;
+  repeated string requires = 6;
+  string shape = 7;
+  string signal = 8;
+  string matcher_pattern = 9;
+  repeated string matcher_families = 10;
+  string evaluator = 11;
+}
+
+message Evaluator {
+  string name = 1;
+  string description = 2;
+}
+
+message PatternCatalog {
+  repeated Pattern patterns = 1;
+  repeated Evaluator evaluators = 2;
+  map<string, string> kind_evaluator = 3;
+  map<string, string> event_evaluator = 4;
 }
