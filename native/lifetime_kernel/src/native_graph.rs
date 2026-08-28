@@ -313,8 +313,9 @@ fn resolved_function_id(
 
 #[cfg(test)]
 mod tests {
-    use super::resolved_function_id;
+    use super::*;
     use hashbrown::HashMap;
+    use prost::Message;
 
     #[test]
     fn follows_only_function_declaration_to_definition_links() {
@@ -330,6 +331,65 @@ mod tests {
         assert_eq!(resolved_function_id("prototype", &functions, &refs), "definition");
         assert_eq!(resolved_function_id("value", &functions, &refs), "value");
         assert_eq!(resolved_function_id("unknown", &functions, &refs), "unknown");
+    }
+
+    fn text(value: &str) -> graph_proto::Value {
+        graph_proto::Value { kind: Some(graph_proto::value::Kind::Text(value.to_owned())) }
+    }
+
+    fn integer(value: i64) -> graph_proto::Value {
+        graph_proto::Value { kind: Some(graph_proto::value::Kind::Integer(value)) }
+    }
+
+    fn property(key: &str, value: graph_proto::Value) -> graph_proto::Field {
+        graph_proto::Field { key: key.to_owned(), value: Some(value) }
+    }
+
+    fn framed(payload: Vec<u8>, output: &mut Vec<u8>) {
+        output.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        output.extend_from_slice(&payload);
+    }
+
+    #[test]
+    fn translation_preserves_compiler_has_argument_edges() {
+        let mut input = Vec::new();
+        framed(graph_proto::Document::default().encode_to_vec(), &mut input);
+        let function = graph_proto::NodeRecord {
+            id: "f".into(), kind: "function".into(), label: "f".into(),
+            properties: vec![property("syntax_kind", text("FunctionDecl")),
+                property("file", text("sample.c"))], ..Default::default()
+        };
+        let call = graph_proto::NodeRecord {
+            id: "call".into(), kind: "call".into(), label: "sink".into(),
+            properties: vec![property("syntax_kind", text("CallExpr")),
+                property("owner_function_id", text("f")),
+                property("callee", text("sink"))], ..Default::default()
+        };
+        let argument = graph_proto::NodeRecord {
+            id: "arg".into(), kind: "variable".into(), label: "value".into(),
+            properties: vec![property("syntax_kind", text("DeclRefExpr")),
+                property("owner_function_id", text("f"))], ..Default::default()
+        };
+        for node in [function, call, argument] {
+            let mut payload = vec![b'N'];
+            payload.extend(node.encode_to_vec());
+            framed(payload, &mut input);
+        }
+        let edge = graph_proto::EdgeRecord {
+            kind: "HAS_ARGUMENT".into(), source: "call".into(), target: "arg".into(),
+            properties: vec![property("position", integer(0))], ..Default::default()
+        };
+        let mut payload = vec![b'E'];
+        payload.extend(edge.encode_to_vec());
+        framed(payload, &mut input);
+        let bytes = sidecar_to_translation(&input).expect("translation succeeds");
+        let result = lifetime_proto::TranslationResult::decode(bytes.as_slice()).unwrap();
+        assert_eq!(result.functions.len(), 1);
+        assert_eq!(result.functions[0].language, "c");
+        assert_eq!(result.functions[0].calls.len(), 1);
+        assert_eq!(result.functions[0].calls[0].arguments.len(), 1);
+        assert_eq!(result.functions[0].calls[0].arguments[0].position, 0);
+        assert_eq!(result.functions[0].calls[0].arguments[0].node, "arg");
     }
 }
 
