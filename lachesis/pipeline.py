@@ -473,6 +473,37 @@ def _build_options() -> Dict[str, str]:
             for name in _OUTPUT_BEARING_ENVIRONMENT if name in os.environ}
 
 
+def _frontend_fingerprint(frontend) -> str:
+    """Identify the executable/script that produced a reusable frontend bundle.
+
+    Source digests alone are insufficient: upgrading the compiler frontend can
+    change the graph for unchanged sources (for example, when internal-linkage
+    functions become first-class entities). Hash command-file contents so an
+    incremental build cannot silently reuse a bundle produced by an older
+    compiler. Runtime transport remains protobuf-only; this is only a cache key.
+    """
+    digest = hashlib.sha256()
+    digest.update(frontend.frontend_id.encode("utf-8"))
+    digest.update(b"\0")
+    for part in frontend.command:
+        digest.update(str(part).encode("utf-8"))
+        digest.update(b"\0")
+        path = Path(part)
+        if not path.is_file():
+            continue
+        digest.update(b"file\0")
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    for key, value in sorted(frontend.environment.items()):
+        digest.update(key.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _load_manifest(manifest_path: Optional[str]) -> Dict[str, dict]:
     if not manifest_path or not os.path.isfile(manifest_path):
         return {}
@@ -529,22 +560,26 @@ def run_project_incremental(
         frontend_output = os.path.join(output_root, frontend_id)
         digests = _group_digests(groups[frontend_id], source_dir)
         prior_entry = prior.get(frontend_id) or {}
+        frontend = registry.get(frontend_id)
+        reuse_options = {
+            **options,
+            "frontend_fingerprint": _frontend_fingerprint(frontend),
+        }
         can_reuse = (
             prior_entry.get("files") == digests
             # a bundle built under different settings answers a different question
-            and (prior_entry.get("options") or {}) == options
+            and (prior_entry.get("options") or {}) == reuse_options
             and Path(frontend_output, "manifest.pb").is_file()
         )
         if can_reuse:
             snapshots.append(load_snapshot(frontend_output))
         else:
-            frontend = registry.get(frontend_id)
             snapshots.append(run_frontend(
                 frontend, source_dir, frontend_output, timeout_seconds,
                 roots=groups[frontend_id],
             ))
         manifest[frontend_id] = {"bundle_dir": frontend_output, "files": digests,
-                                 "options": options}
+                                 "options": reuse_options}
 
     if not snapshots:
         supported = sorted({
