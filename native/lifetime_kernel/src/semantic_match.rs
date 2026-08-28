@@ -949,7 +949,11 @@ fn match_skeleton(
         if token.node.is_empty() || !seen.insert(token.node.clone()) { continue; }
         nodes.push(lifetime_proto::NativeSemanticNode {
             id: token.node.clone(), function: token.function.clone(),
-            event_kind: skeleton_event_kind(&token.family, &token.kind),
+            event_kind: if token.event_kind.is_empty() {
+                skeleton_event_kind(&token.family, &token.kind)
+            } else {
+                token.event_kind.clone()
+            },
             object_root: token.object_root.clone(), object_selectors: token.object_selectors.clone(),
             generation: if token.generation.is_empty() { "g0".into() } else { token.generation.clone() },
             line: token.line, has_line: token.has_line,
@@ -1021,6 +1025,7 @@ mod tests {
         lifetime_proto::NativeSemanticFunction {
             id: "f".to_owned(), entry: ids[0].clone(), exits: vec![ids[ids.len() - 1].clone()],
             nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
+            parameter_roots: Vec::new(),
         }
     }
 
@@ -1112,6 +1117,10 @@ mod tests {
                 matcher_pattern: "mem.copy.in.loop-unbounded".into(),
                 matcher_families: vec!["buffer-size".into()],
                 evaluator: "relational".into(),
+                // This pattern is an in-loop copy: its loop requirement is DATA,
+                // not inferred from the pattern name, so it must not match a sink
+                // whose skeleton carries no loop control.
+                requires: vec!["for".into()],
                 ..Default::default()
             }],
             kind_evaluator: [("buffer-size".into(), "relational".into())]
@@ -1237,6 +1246,7 @@ mod tests {
             functions: vec![lifetime_proto::NativeSemanticFunction {
                 id: "f".to_owned(), entry: "n".to_owned(), exits: vec!["r".to_owned()],
                 nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
+                parameter_roots: Vec::new(),
             }],
             complete: true,
             ..Default::default()
@@ -1269,6 +1279,7 @@ mod tests {
                 lifetime_proto::NativeSemanticFunction {
                     id: "a".into(), entry: "a-origin".into(), exits: vec!["a-origin".into()],
                     nodes: vec![origin], edges: Vec::new(), language: "c".into(), source_launch_nodes: Vec::new(),
+                    parameter_roots: Vec::new(),
                 },
                 lifetime_proto::NativeSemanticFunction {
                     id: "b".into(), entry: "b-release".into(), exits: vec!["b-read".into()],
@@ -1277,6 +1288,7 @@ mod tests {
                         source: "b-release".into(), target: "b-read".into(), kind: "normal".into(),
                         ..Default::default()
                     }], language: "c".into(), source_launch_nodes: Vec::new(),
+                    parameter_roots: Vec::new(),
                 },
             ],
             complete: true, seams: vec![seam], ..Default::default()
@@ -1311,7 +1323,8 @@ mod tests {
             },
             lifetime_proto::NativeSemanticEdge {
                 source: "a-origin".into(), target: "b-release".into(), kind: "seam".into(),
-                seam_kind: "call".into(), callee: "b".into(), bindings: vec![binding.clone()],
+                seam_kind: "call".into(), callee: "b".into(), return_to: "a-read".into(),
+                bindings: vec![binding.clone()],
                 ..Default::default()
             },
             lifetime_proto::NativeSemanticEdge {
@@ -1325,12 +1338,12 @@ mod tests {
                 lifetime_proto::NativeSemanticFunction {
                     id: "a".into(), entry: "a-origin".into(), exits: vec!["a-read".into()],
                     nodes: vec![origin, caller_read], edges: Vec::new(), language: "c".into(),
-                    source_launch_nodes: Vec::new(),
+                    source_launch_nodes: Vec::new(), parameter_roots: Vec::new(),
                 },
                 lifetime_proto::NativeSemanticFunction {
                     id: "b".into(), entry: "b-release".into(), exits: vec!["b-return".into()],
                     nodes: vec![release, returned], edges: Vec::new(), language: "c".into(),
-                    source_launch_nodes: Vec::new(),
+                    source_launch_nodes: Vec::new(), parameter_roots: Vec::new(),
                 },
             ], complete: true, seams: edges, ..Default::default()
         });
@@ -1364,7 +1377,7 @@ mod tests {
             ..Default::default()
         });
         assert!(result.functions[0].findings.iter()
-            .any(|finding| finding.pattern == "realloc-failure-leak"));
+            .any(|finding| finding.pattern == "mem.lifetime.realloc-failure-leak"));
     }
 
     #[test]

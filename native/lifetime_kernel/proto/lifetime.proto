@@ -179,6 +179,18 @@ message FunctionCall {
   repeated string control = 19;
   string guard_status = 20;
   repeated string guard_predicates = 21;
+  // Size-testing branch guards active at this call site, each naming one arg
+  // root (``var``) and the controlling condition text (``canon``) the region
+  // classifier observed.  ``guard_predicates`` keeps the canon-only view for the
+  // predicate evaluators; ``guards`` retains the paired var so the seam layer can
+  // emit a typed proof over the named object.
+  repeated GuardFact guards = 22;
+}
+
+// One size-guard fact stamped onto a call site by the branch-region classifier.
+message GuardFact {
+  string var = 1;
+  string canon = 2;
 }
 
 message FunctionReturn {
@@ -496,6 +508,9 @@ message NativeSkeletonToken {
   string access = 29;
   string value_root = 30;
   repeated string value_selectors = 31;
+  // Neutral matcher opcode. `family` remains the generalized catalog role;
+  // this field preserves distinct state transitions within that role.
+  string event_kind = 32;
 }
 message NativeFlowSkeleton {
   string kind = 1;

@@ -174,6 +174,7 @@ fn walk_region(
                 stack_local: node.stack_local, is_null: node.is_null,
                 access: node.access.clone(), value_root: node.value_root.clone(),
                 value_selectors: node.value_selectors.clone(),
+                event_kind: node.event_kind.clone(),
                 ..Default::default()
             });
         }
@@ -305,6 +306,7 @@ pub(crate) fn build_typestate(
                 generation: node.generation.clone(), stack_local: node.stack_local,
                 is_null: node.is_null, access: node.access.clone(),
                 value_root: node.value_root.clone(), value_selectors: node.value_selectors.clone(),
+                event_kind: node.event_kind.clone(),
                 ..Default::default()
             });
         }
