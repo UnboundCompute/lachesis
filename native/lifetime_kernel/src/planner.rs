@@ -254,7 +254,15 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
             }
         }
         let mut sources: Vec<String> = source_functions.intersection(&backward).cloned().collect();
-        if sources.is_empty() { sources = backward.iter().filter(|name| callers[*name].is_empty()).cloned().collect(); }
+        // Deterministic fallback when no catalogued source lies on the backward
+        // cone: the callerless structural roots of that cone.  Read the
+        // callback-normalized reverse graph, not the direct-call map -- the rest
+        // of coverage planning already does, and the reference scheduler's
+        // fallback (`if not self.reverse.get(name)`) is over the normalized graph
+        // so a function reachable only through a callback argument is not a root.
+        if sources.is_empty() {
+            sources = backward.iter().filter(|name| coverage_callers[*name].is_empty()).cloned().collect();
+        }
         let mut region_functions = BTreeSet::new();
         let mut state_keys = Vec::new();
         let mut context_keys = Vec::new();
@@ -264,6 +272,12 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
             let mut contexts: Vec<String> = result_functions.iter().find(|item| &item.name == source)
                 .map(|item| item.source_sites.iter().map(|site| if site.node.is_empty() { format!("{}@{}", site.callee, site.line) } else { site.node.clone() }).collect())
                 .unwrap_or_default();
+            // Reference `_source_contexts` returns `tuple(sorted(set(contexts)))`:
+            // launch contexts are order-independent and must not repeat, so two
+            // source calls that collapse to the same token contribute one key and
+            // the key order is deterministic rather than call order.
+            contexts.sort();
+            contexts.dedup();
             if contexts.is_empty() { contexts.push("__entry__".into()); }
             for context in contexts { for function in &selected { context_keys.push(key3(function, source, &context)); } }
         }
@@ -298,5 +312,35 @@ mod tests {
         assert!(result.uncovered_functions.is_empty());
         assert_eq!(result.regions.len(), 1);
         assert_eq!(result.regions[0].functions, vec!["recursive"]);
+    }
+
+    #[test]
+    fn source_contexts_are_sorted_and_deduplicated() {
+        // `src` has three catalogued source calls: two collapse to the same
+        // context token `read@5` and one is `aaa@9`, supplied out of sorted
+        // order.  The reference returns `tuple(sorted(set(contexts)))`, so the
+        // region's context keys must be sorted and carry each launch once.
+        let src = lifetime_proto::TranslationFunction {
+            id: "src".into(), name: "src".into(),
+            calls: vec![
+                lifetime_proto::FunctionCall { callee: "read".into(), line: 5, has_line: true, ..Default::default() },
+                lifetime_proto::FunctionCall { callee: "read".into(), line: 5, has_line: true, ..Default::default() },
+                lifetime_proto::FunctionCall { callee: "aaa".into(), line: 9, has_line: true, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![src] }),
+            sources: vec![
+                lifetime_proto::SourceCatalogEntry { name: "read".into(), kind: "external-input".into() },
+                lifetime_proto::SourceCatalogEntry { name: "aaa".into(), kind: "external-input".into() },
+            ],
+        });
+        let region = result.regions.iter().find(|region| region.target == "src")
+            .expect("region for src");
+        assert_eq!(region.context_keys, vec![
+            key3("src", "src", "aaa@9"),
+            key3("src", "src", "read@5"),
+        ]);
     }
 }
