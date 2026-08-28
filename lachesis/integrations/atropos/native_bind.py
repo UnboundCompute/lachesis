@@ -84,9 +84,38 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
     This is a setup/build operation. The Pass-2 native runtime consumes only the
     resulting protobuf and never parses JSON.
     """
+    import json
     from .models import load_models
     root = Path(root)
     request = atropos_pb2.Request()
+    # Lifecycle roles are compiled into the same protobuf catalog.  This is a
+    # build/setup concern: the native analysis path consumes only this binary
+    # artifact and never opens the authored catalog files.  It is loaded before
+    # the models so sized allocators can be derived from the sink catalog below.
+    detection_root = root.parent / "detection"
+    lifecycle_path = detection_root / "lifecycle-roles.json"
+    try:
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        lifecycle = {}
+    # Sized allocators (malloc/calloc/xmlMalloc/...) are NOT listed in the
+    # lifecycle catalog's `alloc` section -- that section carries only the
+    # size-LESS allocators (strdup-family).  The old normalizer derived the
+    # sized allocators from the sink catalog instead: any sink whose family is
+    # an `alloc_kinds` kind (e.g. `alloc-size`) is a lifecycle alloc.  Mirror
+    # that derivation here so the alloc models stay the single source of truth
+    # and the native reader recognizes the same allocators as the Python engine.
+    alloc_kinds = set(lifecycle.get("alloc_kinds") or ())
+    # A name owned by realloc or a release role keeps that more specific role --
+    # the emitter checks realloc/release before alloc -- so it must not be
+    # overwritten by the derived alloc role in the single-role native map.
+    claimed = {
+        (str(language), str(method))
+        for section in ("realloc", "dealloc", "release_methods", "release_qualified")
+        for language, names in (lifecycle.get(section) or {}).items()
+        for method in (names or ())
+    }
+    derived_alloc: dict[tuple[str, str], None] = {}
     for model in load_models(Path(root)):
         encoded = request.models.add(
             id=model.get("id") or "", language=model.get("language") or "",
@@ -100,16 +129,11 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
             encoded.arity = int(model["arity"])
             encoded.has_arity = True
         encoded.cwe.extend(str(value) for value in (model.get("cwe") or ()))
-    # Lifecycle roles are compiled into the same protobuf catalog.  This is a
-    # build/setup concern: the native analysis path consumes only this binary
-    # artifact and never opens the authored catalog files.
-    detection_root = root.parent / "detection"
-    lifecycle_path = detection_root / "lifecycle-roles.json"
-    try:
-        import json
-        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        lifecycle = {}
+        if model.get("kind") in alloc_kinds:
+            language = str(model.get("language") or "")
+            method = str(model.get("method") or "")
+            if method and (language, method) not in claimed:
+                derived_alloc.setdefault((language, method), None)
     role_sections = {
         "alloc": "lifecycle.alloc",
         "dealloc": "lifecycle.release",
@@ -125,6 +149,14 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
                     id=f"{role}:{language}:{method}", language=str(language),
                     method=str(method), role=role,
                 )
+    # Sized allocators derived from the sink catalog above.  Emitted after the
+    # explicit sections so a name shared with the size-less `alloc` list simply
+    # restates the same role; realloc/release names were already excluded.
+    for language, method in derived_alloc:
+        request.models.add(
+            id=f"lifecycle.alloc:{language}:{method}", language=language,
+            method=method, role="lifecycle.alloc",
+        )
     # Pass-3 pattern/evaluator data is compiled into the same binary request.
     # This keeps the runtime path independent of authored JSON while retaining
     # Atropos as the sole owner of the declarative vocabulary.
