@@ -47,6 +47,11 @@ def locate_atropos(explicit: Optional[str] = None) -> Optional[Path]:
     # its parent is the workspace that also holds a sibling ``atropos`` checkout.
     candidates.append(Path(__file__).resolve().parents[3].parent / "atropos")
     candidates.append(Path.home() / "project" / "unboundcompute" / "atropos")
+    # The catalog bundled into the wheel at build time (tools/vendor_atropos.py). It is
+    # the last candidate so an explicit root or a live sibling checkout still wins, but
+    # it means an installed package always finds a catalog even with no checkout beside
+    # it. parents[2] is the ``lachesis`` package directory.
+    candidates.append(Path(__file__).resolve().parents[2] / "_atropos_catalog")
     for candidate in candidates:
         if (candidate / "models").is_dir():
             return candidate

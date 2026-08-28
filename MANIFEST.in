@@ -4,6 +4,7 @@
 # sdist and therefore into any wheel built from it.
 recursive-include lachesis/frontends/typescript/vendor *
 recursive-include lachesis/_native *
+recursive-include lachesis/_atropos_catalog *
 
 include LICENSE
 include NOTICE
