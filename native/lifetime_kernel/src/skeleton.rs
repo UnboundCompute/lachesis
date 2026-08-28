@@ -67,7 +67,7 @@ struct WalkState {
     stack: Vec<String>,
 }
 
-/// Render the same source-rooted composition boundary as the old Claus path.
+/// Render the same function-local event boundary as the old TYPESTATE path.
 ///
 /// The old renderer did not print every function in a call cone.  It followed
 /// a concrete summary flow, opening a callee at a call seam and closing it at
@@ -203,41 +203,56 @@ fn walk_region(
     (tokens, edges_used, complete && !seen.is_empty())
 }
 
-/// Build one cached skeleton per source/context region.
+/// Build one cached TYPESTATE skeleton per compiler function.
+///
+/// The old renderer emitted one lifecycle skeleton for every function carrying
+/// object events.  REACH skeletons are a separate product of summary
+/// composition (`reach.rs`); keeping the families separate prevents the same
+/// lifecycle event from being matched once per coverage region and once per
+/// sink flow.
 pub(crate) fn build(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
     let (functions, nodes, adjacency) = semantic_indexes(result);
     let mut output = Vec::new();
+    let mut ordered = Vec::new();
+    let mut seen = BTreeSet::new();
     for region in &result.regions {
-        let contexts = if region.contexts.is_empty() {
-            vec!["__entry__".to_owned()]
-        } else { region.contexts.clone() };
-        for context in contexts {
-            let (mut tokens, edges, complete) = walk_region(
-                result, region, &context, &functions, &nodes, &adjacency);
-            // The old renderer always has explicit boundaries around the root
-            // as well as every nested call.  Keep these even for a region with
-            // no event at its entry: an empty/unresolved fragment must remain
-            // distinguishable from a missing fragment.
-            tokens.insert(0, lifetime_proto::NativeSkeletonToken {
-                kind: "enter".into(), function: region.source_function.clone(),
-                depth: 0, ..Default::default()
-            });
-            tokens.push(lifetime_proto::NativeSkeletonToken {
-                kind: "exit".into(), function: region.source_function.clone(),
-                depth: 0, ..Default::default()
-            });
-            output.push(lifetime_proto::NativeFlowSkeleton {
-                kind: "source-rooted".into(),
-                entry: region.source_function.clone(),
-                source_function: region.source_function.clone(),
-                context, complete, tokens, edges, is_source: true,
-            });
+        for function in &region.functions {
+            if seen.insert(function.clone()) { ordered.push(function.clone()); }
         }
     }
-    output.sort_by(|left, right| (&left.source_function, &left.context)
-        .cmp(&(&right.source_function, &right.context)));
+    for function in &result.functions {
+        if seen.insert(function.id.clone()) { ordered.push(function.id.clone()); }
+    }
+    for function_id in ordered {
+        let Some(function) = functions.get(function_id.as_str()) else { continue };
+        if !function.nodes.iter().any(|node| !node.event_kind.is_empty()) { continue; }
+        let region = lifetime_proto::NativeSourceRegion {
+            source_function: function_id.clone(),
+            functions: vec![function_id.clone()],
+            contexts: vec!["__entry__".to_owned()],
+            ..Default::default()
+        };
+        let (mut tokens, edges, complete) = walk_region(
+            result, &region, "__entry__", &functions, &nodes, &adjacency);
+        tokens.insert(0, lifetime_proto::NativeSkeletonToken {
+            kind: "enter".into(), function: function_id.clone(),
+            depth: 0, ..Default::default()
+        });
+        tokens.push(lifetime_proto::NativeSkeletonToken {
+            kind: "exit".into(), function: function_id.clone(),
+            depth: 0, ..Default::default()
+        });
+        output.push(lifetime_proto::NativeFlowSkeleton {
+            kind: "typestate".into(),
+            entry: function_id.clone(),
+            source_function: function_id,
+            context: "__entry__".into(),
+            complete, tokens, edges,
+            is_source: !function.source_launch_nodes.is_empty(),
+        });
+    }
     output
 }
 
@@ -274,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn follows_call_and_matching_return_instead_of_concatenating_functions() {
+    fn emits_function_local_typestate_fragments_without_concatenating_functions() {
         let source = lifetime_proto::NativeSemanticFunction {
             id: "source".into(), entry: "s0".into(),
             nodes: vec![
@@ -316,9 +331,10 @@ mod tests {
         };
         let skeletons = build(&result);
         let kinds: Vec<_> = skeletons[0].tokens.iter().map(|token| token.kind.as_str()).collect();
+        assert_eq!(skeletons.len(), 2);
         assert!(kinds.windows(2).any(|pair| pair == ["enter", "control"]));
-        assert!(skeletons[0].tokens.iter().any(|token| token.kind == "exit" && token.function == "callee"));
-        assert_eq!(skeletons[0].context, "s0");
-        assert!(skeletons[0].complete);
+        assert_eq!(skeletons[0].kind, "typestate");
+        assert_eq!(skeletons[0].context, "__entry__");
+        assert!(skeletons.iter().any(|skeleton| skeleton.entry == "callee"));
     }
 }
