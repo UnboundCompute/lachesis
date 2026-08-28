@@ -794,6 +794,20 @@ unsafe fn visit_one(
         return Ok(false);
     }
 
+    // The reference frontend emits a parameter node only for the formals of a real
+    // function. The formals of a function-pointer typedef (e.g.
+    // `typedef int (*fn)(const char *path)`) hang off the type, not a function —
+    // libclang reports their semantic parent as the translation unit — so they must
+    // not become parameter nodes.
+    if matches!(syntax_kind.as_str(), "ParmVarDecl" | "ParmDecl") {
+        let sem_parent = clang_getCursorSemanticParent(cursor);
+        let sem_parent_kind =
+            cx_string(clang_getCursorKindSpelling(clang_getCursorKind(sem_parent)));
+        if !is_function_syntax(&sem_parent_kind) {
+            return Ok(false);
+        }
+    }
+
     let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
         kind if is_function_syntax(kind) => Some("function"),
         "RecordDecl" | "StructDecl" | "UnionDecl" => Some("record"),
@@ -830,7 +844,15 @@ unsafe fn visit_one(
         return Ok(false);
     };
 
-    let type_spelling = cx_string(clang_getTypeSpelling(clang_getCursorType(cursor)));
+    // The reference frontend takes `type` from the AST node's `qualType`: a
+    // record/enum declaration carries none (→ absent), and a typedef carries its
+    // *underlying* type, not the alias's own name. libclang would otherwise spell
+    // `struct file_operations` for the record and `read_fn` for the typedef.
+    let type_spelling = match syntax_kind.as_str() {
+        "RecordDecl" | "StructDecl" | "UnionDecl" | "EnumDecl" => String::new(),
+        "TypedefDecl" => cx_string(clang_getTypeSpelling(clang_getTypedefDeclUnderlyingType(cursor))),
+        _ => cx_string(clang_getTypeSpelling(clang_getCursorType(cursor))),
+    };
     let operator = spelling.clone();
     let mut properties = vec![
         field("file", text(&file)),
