@@ -209,11 +209,16 @@ pub(crate) fn pick_regions(
             result.functions.iter().find(|function| function.id.as_str() == name.as_str())
                 .is_some_and(|function| !function.source_launch_nodes.is_empty()))
             .cloned().unwrap_or_else(|| seed_function.clone());
-        let source_nodes: Vec<String> = result.functions.iter()
-            .find(|function| function.id == source_function)
-            .into_iter()
-            .flat_map(|function| function.source_launch_nodes.iter().cloned())
-            .collect::<BTreeSet<_>>().into_iter().collect();
+        let mut source_nodes = Vec::new();
+        for function_id in &selected {
+            let Some(function) = result.functions.iter().find(|function| &function.id == function_id)
+            else { continue };
+            for launch in &function.source_launch_nodes {
+                if !source_nodes.iter().any(|item| item == launch) {
+                    source_nodes.push(launch.clone());
+                }
+            }
+        }
         let seed_node = result.functions.iter()
             .find(|function| function.id == seed_function)
             .and_then(|function| function.nodes.first())
@@ -251,7 +256,8 @@ mod tests {
         let result = lifetime_proto::NativeSemanticResult {
             functions: vec![
                 lifetime_proto::NativeSemanticFunction {
-                    id: "source".into(), nodes: vec![node("src", "source", Some(true))], ..Default::default()
+                    id: "source".into(), source_launch_nodes: vec!["src-source".into()],
+                    nodes: vec![node("src", "source", Some(true))], ..Default::default()
                 },
                 lifetime_proto::NativeSemanticFunction {
                     id: "callee".into(), source_launch_nodes: vec!["source-call".into()],
@@ -268,6 +274,8 @@ mod tests {
         assert_eq!(regions[0].source_function, "callee");
         assert!(["src", "sink"].contains(&regions[0].seed_node.as_str()));
         assert_eq!(regions[0].contexts, vec!["__entry__"]);
+        assert_eq!(regions[0].source_nodes.iter().collect::<BTreeSet<_>>(),
+                   BTreeSet::from([&"src-source".to_owned(), &"source-call".to_owned()]));
         assert_eq!(regions[0].functions.iter().collect::<BTreeSet<_>>(),
                    BTreeSet::from([&"source".to_owned(), &"callee".to_owned()]));
     }
