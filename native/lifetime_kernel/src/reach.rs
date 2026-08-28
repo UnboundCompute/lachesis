@@ -89,9 +89,11 @@ fn expand(
     if !chain.contains(&flow.via) {
         if let (Some(caller), Some(callee)) = (functions.get(function), functions.get(&flow.via)) {
             let call = caller.calls.iter().find(|call| {
-                call.callee == flow.via && call.arguments.iter().any(|argument|
+                (call.callee == flow.via || call.callee_function_id == flow.via)
+                    && call.arguments.iter().any(|argument|
                     argument_root(argument) == flow.root)
-            }).or_else(|| caller.calls.iter().find(|call| call.callee == flow.via));
+            }).or_else(|| caller.calls.iter().find(|call|
+                call.callee == flow.via || call.callee_function_id == flow.via));
             if call.is_some() && callee.id == flow.via {
                 if let Some(summary) = summaries.get(&flow.via) {
                     let actual_root = call.and_then(|call| call.arguments.iter()

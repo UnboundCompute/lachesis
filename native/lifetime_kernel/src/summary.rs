@@ -60,17 +60,19 @@ fn model_sinks(request: &crate::atropos_proto::Request,
 }
 
 fn function_names(items: &[lifetime_proto::TranslationFunction])
-    -> (BTreeMap<String, lifetime_proto::TranslationFunction>, HashMap<String, String>) {
+    -> (BTreeMap<String, lifetime_proto::TranslationFunction>, HashMap<String, String>, HashMap<String, String>) {
     let mut functions = BTreeMap::new();
     let mut by_base = HashMap::new();
+    let mut by_id = HashMap::new();
     for item in items {
         let base = if item.name.is_empty() { item.id.clone() } else { item.name.clone() };
         if base.is_empty() { continue; }
         let name = if functions.contains_key(&base) { format!("{}@{}", base, item.id) } else { base.clone() };
         by_base.entry(base).or_insert_with(|| name.clone());
+        by_id.insert(item.id.clone(), name.clone());
         functions.insert(name, item.clone());
     }
-    (functions, by_base)
+    (functions, by_base, by_id)
 }
 
 pub(crate) fn summarize(
@@ -85,7 +87,7 @@ pub(crate) fn summarize_with_evidence(
     catalog: crate::atropos_proto::Request,
     evidence: Option<&HashMap<String, Vec<String>>>,
 ) -> lifetime_proto::NativeSummaryResult {
-    let (functions, by_base) = function_names(&translation.functions);
+    let (functions, by_base, by_id) = function_names(&translation.functions);
     let languages: BTreeSet<String> = translation.functions.iter()
         .filter_map(|function| (!function.language.is_empty()).then(|| function.language.clone()))
         .collect();
@@ -120,7 +122,11 @@ pub(crate) fn summarize_with_evidence(
                         }
                     }
                 }
-                let Some(callee_name) = by_base.get(&call.callee) else { continue };
+                let callee_name = (!call.callee_function_id.is_empty())
+                    .then(|| by_id.get(&call.callee_function_id))
+                    .flatten()
+                    .or_else(|| by_base.get(&call.callee));
+                let Some(callee_name) = callee_name else { continue };
                 let Some(callee) = functions.get(callee_name) else { continue };
                 let Some(callee_summary) = summaries.get(callee_name) else { continue };
                 for (position, formal) in callee.parameter_names.iter().enumerate() {
@@ -185,4 +191,47 @@ pub(crate) fn summarize_with_evidence(
         }
     }).collect();
     lifetime_proto::NativeSummaryResult { functions }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_same_named_internal_callee_by_compiler_id() {
+        let sink = |node: &str, root: &str| lifetime_proto::FunctionCall {
+            node: node.into(), callee: "sink_call".into(),
+            arguments: vec![lifetime_proto::FunctionArgument {
+                position: 0, root: root.into(), root_name: root.into(), ..Default::default()
+            }], ..Default::default()
+        };
+        let forward = lifetime_proto::FunctionCall {
+            node: "forward-call".into(), callee: "helper".into(),
+            callee_function_id: "helper-2".into(),
+            arguments: vec![lifetime_proto::FunctionArgument {
+                position: 0, root: "input".into(), root_name: "input".into(), ..Default::default()
+            }], ..Default::default()
+        };
+        let translation = lifetime_proto::TranslationResult { functions: vec![
+            lifetime_proto::TranslationFunction {
+                id: "caller".into(), name: "caller".into(), parameter_names: vec!["input".into()],
+                calls: vec![forward], ..Default::default()
+            },
+            lifetime_proto::TranslationFunction {
+                id: "helper-1".into(), name: "helper".into(), parameter_names: vec!["p".into()],
+                calls: vec![sink("sink-1", "p")], ..Default::default()
+            },
+            lifetime_proto::TranslationFunction {
+                id: "helper-2".into(), name: "helper".into(), parameter_names: vec!["p".into()],
+                calls: vec![sink("sink-2", "p")], ..Default::default()
+            },
+        ]};
+        let catalog = crate::atropos_proto::Request { models: vec![crate::atropos_proto::Model {
+            method: "sink_call".into(), role: "sink".into(), access_path: "Argument[0]".into(),
+            ..Default::default()
+        }], ..Default::default() };
+        let result = summarize(translation, catalog);
+        let caller = result.functions.iter().find(|item| item.name == "caller").unwrap();
+        assert!(caller.sink_flows.iter().any(|flow| flow.via == "helper@helper-2"));
+    }
 }
