@@ -325,6 +325,36 @@ pub(crate) fn build(
             } else {
                 region.contexts.clone()
             } {
+                // A region without a compiler/source launch is the generic
+                // structural coverage fallback.  It must remain represented,
+                // but walking its entire CFG would repeat the same expensive
+                // path exploration once per disconnected function.  The
+                // function-local typestate builder below retains all event
+                // semantics; source-launched regions alone need Claus's full
+                // nested walk.
+                if region.source_nodes.is_empty() {
+                    let entry = functions.get(region.source_function.as_str())
+                        .and_then(|function| {
+                            (!function.entry.is_empty()).then(|| function.entry.clone())
+                                .or_else(|| function.nodes.first().map(|node| node.id.clone()))
+                        });
+                    if let Some(entry) = entry {
+                        output.push(lifetime_proto::NativeFlowSkeleton {
+                            kind: "source-rooted".into(),
+                            entry: region.source_function.clone(),
+                            source_function: region.source_function.clone(),
+                            context,
+                            complete: true,
+                            tokens: vec![lifetime_proto::NativeSkeletonToken {
+                                kind: "control".into(), function: region.source_function.clone(),
+                                node: entry, ..Default::default()
+                            }],
+                            edges: Vec::new(),
+                            is_source: false,
+                        });
+                    }
+                    continue;
+                }
                 let (tokens, edges, complete) = walk_region(
                     region, &context, &functions, &nodes, &adjacency);
                 if tokens.is_empty() { continue; }
@@ -407,7 +437,8 @@ mod tests {
         let result = lifetime_proto::NativeSemanticResult {
             functions: vec![function],
             regions: vec![lifetime_proto::NativeSourceRegion {
-                source_function: "f".into(), functions: vec!["f".into()],
+                source_function: "f".into(), source_nodes: vec!["a".into()],
+                functions: vec!["f".into()],
                 contexts: vec!["__entry__".into()], ..Default::default()
             }],
             ..Default::default()
