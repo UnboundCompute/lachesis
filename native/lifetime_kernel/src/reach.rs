@@ -124,7 +124,7 @@ fn expand(
                             && formal_root.is_none_or(|root| candidate.root == *root)
                     ) {
                         tokens.push(lifetime_proto::NativeSkeletonToken {
-                            kind: "enter".into(), function: flow.via.clone(), depth: depth + 1,
+                            kind: "enter".into(), function: flow.via.clone(), depth,
                             ..Default::default()
                         });
                     let site_guarded = call.is_some_and(|call| !call.guards.is_empty());
@@ -134,7 +134,7 @@ fn expand(
                                               depth + 1, guarded_acc || flow.guarded || site_guarded,
                                               &next_chain, tokens);
                         tokens.push(lifetime_proto::NativeSkeletonToken {
-                            kind: "exit".into(), function: flow.via.clone(), depth: depth + 1,
+                            kind: "exit".into(), function: flow.via.clone(), depth,
                             ..Default::default()
                         });
                         return complete;
@@ -209,7 +209,7 @@ pub(crate) fn build(
             let mut tokens = vec![lifetime_proto::NativeSkeletonToken {
                 kind: "enter".into(), function: root.clone(), depth: 0, ..Default::default()
             }];
-            let complete = expand(&root, flow, &functions, &summary_map, catalog, 0,
+            let complete = expand(&root, flow, &functions, &summary_map, catalog, 1,
                                   false, &BTreeSet::from([root.clone()]), &mut tokens);
             tokens.push(lifetime_proto::NativeSkeletonToken {
                 kind: "exit".into(), function: root.clone(), depth: 0, ..Default::default()
@@ -344,6 +344,13 @@ mod tests {
         assert!(sink_nodes.contains("source-call"));
         assert!(sink_nodes.contains("sink-call"));
         assert!(sink_nodes.contains("sink-call-2"));
+        for skeleton in &skeletons {
+            assert_eq!(skeleton.tokens.first().map(|token| token.depth), Some(0));
+            assert_eq!(skeleton.tokens.last().map(|token| token.depth), Some(0));
+            assert!(skeleton.tokens.iter()
+                .filter(|token| token.kind == "sink")
+                .all(|token| token.depth == 1));
+        }
     }
 
     #[test]
