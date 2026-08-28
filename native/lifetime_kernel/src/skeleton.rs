@@ -248,7 +248,7 @@ fn typestate_event(event: &str) -> bool {
 /// Render the old engine's per-function/object typestate streams from the
 /// compiler-owned event nodes. Object identity is the native root plus
 /// generation, never a display name.
-fn build_typestate(
+pub(crate) fn build_typestate(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
     let mut streams = BTreeSet::new();

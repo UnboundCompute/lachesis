@@ -1593,7 +1593,13 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // reuse a completed function/source/context fragment.
         full.regions = claus::pick_regions(&full);
         report_native_phase(timing_enabled, semantic_started, "claus regions", full.regions.len(), 0);
-        full.skeletons = skeleton::build(&full);
+        // Match the old Python Pass-3 production flow: reach skeletons are
+        // emitted once per native summary flow, while typestate skeletons are
+        // emitted for each lifecycle stream.  The region-wide structural
+        // Claus renderer is retained as a diagnostic helper, but must not be
+        // mixed into the production result because it changes the skeleton
+        // set and therefore matcher output.
+        full.skeletons = skeleton::build_typestate(&full);
         report_native_phase(timing_enabled, semantic_started, "claus skeleton", full.regions.len(), full.skeletons.len());
         if let Some(catalog) = catalog.as_ref() {
             let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
