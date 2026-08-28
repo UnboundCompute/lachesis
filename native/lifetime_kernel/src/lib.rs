@@ -1589,6 +1589,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // subsequent skeleton builder consumes these stable regions and can
         // reuse a completed function/source/context fragment.
         full.regions = claus::pick_regions(&full);
+        report_native_phase(timing_enabled, semantic_started, "claus regions", full.regions.len(), 0);
         full.skeletons = skeleton::build(&full);
         report_native_phase(timing_enabled, semantic_started, "claus skeleton", full.regions.len(), full.skeletons.len());
         if let Some(catalog) = catalog.as_ref() {
