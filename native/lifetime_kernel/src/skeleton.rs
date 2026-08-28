@@ -77,7 +77,6 @@ struct WalkState {
 /// bounded by the finite `(node, call-stack)` state space; revisiting a state
 /// is a loop back-edge, not a second copy of the function.
 fn walk_region(
-    result: &lifetime_proto::NativeSemanticResult,
     region: &lifetime_proto::NativeSourceRegion,
     context: &str,
     functions: &FunctionIndex<'_>,
@@ -235,7 +234,7 @@ pub(crate) fn build(
             ..Default::default()
         };
         let (mut tokens, edges, complete) = walk_region(
-            result, &region, "__entry__", &functions, &nodes, &adjacency);
+            &region, "__entry__", &functions, &nodes, &adjacency);
         tokens.insert(0, lifetime_proto::NativeSkeletonToken {
             kind: "enter".into(), function: function_id.clone(),
             depth: 0, ..Default::default()
