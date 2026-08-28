@@ -188,6 +188,7 @@ struct Emitter {
     edge_count: u64,
     file_ids: FxHashMap<String, String>,
     root_files: FxHashSet<String>,
+    project_root: String,
     slot_bindings: FxHashMap<String, FxHashSet<String>>,
     function_ids: FxHashMap<String, FxHashSet<String>>,
     function_definitions: FxHashMap<String, FxHashSet<String>>,
@@ -454,7 +455,28 @@ fn emit_macros_for_file(emitter: &mut Emitter, path: &str) -> io::Result<()> {
 extern "C" fn visit(cursor: CXCursor, parent: CXCursor, data: CXClientData) -> CXChildVisitResult {
     unsafe {
         let emitter = &mut *(data as *mut Emitter);
-        if let Err(error) = visit_one(cursor, parent, emitter) {
+        let header_function = match visit_one(cursor, parent, emitter, false) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("native clang frontend: {error}");
+                return CXChildVisit_Break;
+            }
+        };
+        if header_function {
+            clang_visitChildren(cursor, visit_header_body,
+                emitter as *mut Emitter as *mut c_void);
+            return CXChildVisit_Continue;
+        }
+    }
+    CXChildVisit_Recurse
+}
+
+extern "C" fn visit_header_body(
+    cursor: CXCursor, parent: CXCursor, data: CXClientData,
+) -> CXChildVisitResult {
+    unsafe {
+        let emitter = &mut *(data as *mut Emitter);
+        if let Err(error) = visit_one(cursor, parent, emitter, true) {
             eprintln!("native clang frontend: {error}");
             return CXChildVisit_Break;
         }
@@ -691,13 +713,20 @@ unsafe fn parameter_reference_id(cursor: CXCursor, emitter: &mut Emitter) -> Opt
     ))
 }
 
-unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -> io::Result<()> {
+unsafe fn visit_one(
+    cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter, allow_nonroot: bool,
+) -> io::Result<bool> {
     let syntax_kind = cx_string(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
     let spelling = cx_string(clang_getCursorSpelling(cursor));
     let (raw_file, line, column, offset, end_offset, end_line, end_column) = cursor_file(cursor);
     let file = emitter.canonical_file(raw_file);
-    if file.is_empty() || (!emitter.root_files.is_empty() && !emitter.root_files.contains(&file)) {
-        return Ok(());
+    let is_root_file = emitter.root_files.is_empty() || emitter.root_files.contains(&file);
+    let project_file = !is_root_file && is_function_syntax(&syntax_kind)
+        && (emitter.project_root.is_empty()
+            || Path::new(&file).strip_prefix(Path::new(&emitter.project_root)).is_ok());
+    let header_function = project_file && clang_isCursorDefinition(cursor) != 0;
+    if file.is_empty() || (!is_root_file && !allow_nonroot && !header_function) {
+        return Ok(false);
     }
     if syntax_kind == "InclusionDirective" {
         let included = clang_getIncludedFile(cursor);
@@ -715,7 +744,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
                 })?;
             }
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let (node_kind, tier, id) = if let Some(mapped_kind) = match syntax_kind.as_str() {
@@ -751,7 +780,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             stable_id("body", &file, offset, end_offset, &syntax_kind),
         )
     } else {
-        return Ok(());
+        return Ok(false);
     };
 
     let type_spelling = cx_string(clang_getTypeSpelling(clang_getCursorType(cursor)));
@@ -1144,7 +1173,7 @@ unsafe fn visit_one(cursor: CXCursor, parent: CXCursor, emitter: &mut Emitter) -
             })?;
         }
     }
-    Ok(())
+    Ok(header_function)
 }
 
 unsafe fn child_ids_for_value_preserving(cursor: CXCursor, emitter: &mut Emitter) -> Option<String> {
@@ -1834,6 +1863,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             edge_count: 0,
             file_ids: FxHashMap::default(),
             root_files: FxHashSet::default(),
+            project_root: String::new(),
             slot_bindings: FxHashMap::default(),
             function_ids: FxHashMap::default(),
             function_definitions: FxHashMap::default(),
@@ -1844,6 +1874,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path_cache: FxHashMap::default(),
         };
         if let Some(request) = request.as_ref() {
+            emitter.project_root = PathBuf::from(&request.source_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&request.source_dir))
+                .to_string_lossy().into_owned();
             emitter.root_files.extend(request.translation_units.iter().map(|unit| {
                 PathBuf::from(&unit.path)
                     .canonicalize()
@@ -1864,6 +1898,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&arguments[1]));
             let (source_dir, files) = selected_files(&input)?;
+            emitter.project_root = source_dir.to_string_lossy().into_owned();
             if files.is_empty() {
                 clang_disposeIndex(index);
                 return Err(format!("no C or header roots found under {}", source_dir.display()).into());
