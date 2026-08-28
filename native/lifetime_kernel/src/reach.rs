@@ -104,19 +104,22 @@ fn expand(
     if !chain.contains(&flow.via) {
         if let (Some(caller), Some(callee)) = (functions.get(function), functions.get(&flow.via)) {
             let call = caller.calls.iter().find(|call| {
-                (call.callee == flow.via || call.callee_function_id == flow.via)
+                (call.callee == flow.via || call.callee == callee.name
+                    || call.callee_function_id == callee.id)
                     && call.arguments.iter().any(|argument|
                     argument_root(argument) == flow.root)
             }).or_else(|| caller.calls.iter().find(|call|
-                call.callee == flow.via || call.callee_function_id == flow.via));
-            if call.is_some() && callee.id == flow.via {
+                call.callee == flow.via || call.callee == callee.name
+                    || call.callee_function_id == callee.id));
+            if call.is_some() {
                 if let Some(summary) = summaries.get(&flow.via) {
-                    let actual_root = call.and_then(|call| call.arguments.iter()
+                    let formal_root = call.and_then(|call| call.arguments.iter()
                         .find(|argument| argument_root(argument) == flow.root))
-                        .map(argument_root);
+                        .and_then(|argument| callee.parameter_names
+                            .get(argument.position as usize));
                     if let Some(subflow) = summary.sink_flows.iter().find(|candidate|
                         candidate.sink == flow.sink
-                            && actual_root.as_deref().is_none_or(|root| candidate.root == root)
+                            && formal_root.is_none_or(|root| candidate.root == *root)
                     ) {
                         tokens.push(lifetime_proto::NativeSkeletonToken {
                             kind: "enter".into(), function: flow.via.clone(), depth: depth + 1,
