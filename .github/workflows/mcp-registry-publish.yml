@@ -24,6 +24,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The release workflow uploads the wheels/sdist to PyPI in parallel with
+      # this job, and the registry rejects a server.json whose package version
+      # is not yet live on PyPI. Poll the PyPI JSON API for the exact version in
+      # server.json until it appears (or give up after the timeout), so a single
+      # tag push publishes everything without a manual re-dispatch.
+      - name: Wait for the PyPI release to go live
+        run: |
+          identifier="$(jq -r '.packages[0].identifier' server.json)"
+          version="$(jq -r '.packages[0].version' server.json)"
+          echo "Waiting for ${identifier}==${version} on PyPI"
+          url="https://pypi.org/pypi/${identifier}/${version}/json"
+          for attempt in $(seq 1 60); do
+            code="$(curl -fsS -o /dev/null -w '%{http_code}' "$url" || true)"
+            if [ "$code" = "200" ]; then
+              echo "Found ${identifier}==${version} on PyPI (attempt ${attempt})."
+              exit 0
+            fi
+            echo "attempt ${attempt}: PyPI returned ${code}; retrying in 15s"
+            sleep 15
+          done
+          echo "::error::${identifier}==${version} did not appear on PyPI within the timeout" >&2
+          exit 1
+
       - name: Install mcp-publisher
         run: |
           curl -fsSL \
