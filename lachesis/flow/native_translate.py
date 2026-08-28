@@ -123,6 +123,8 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 lead["source_witness"] = list(finding.source_witness_nodes)
             if finding.HasField("source_reachable"):
                 lead["source_reachable"] = finding.source_reachable
+            if finding.HasField("source_influenced"):
+                lead["source_influenced"] = finding.source_influenced
             if finding.family:
                 lead["family"] = finding.family
             if finding.pattern_id:

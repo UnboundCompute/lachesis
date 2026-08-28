@@ -403,6 +403,7 @@ message NativeTemporalFinding {
   string pattern_id = 14;
   string evaluator = 15;
   uint32 tier = 16;
+  optional bool source_influenced = 17;
 }
 message NativeTemporalFunction {
   string id = 1;

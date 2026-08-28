@@ -228,6 +228,11 @@ fn add_finding(
         witness_complete: !witness_nodes.is_empty(),
         source_witness_nodes: node.source_witness_nodes.clone(),
         source_reachable: node.source_reachable,
+        source_influenced: if !node.source_witness_nodes.is_empty() {
+            Some(true)
+        } else {
+            node.source_reachable.map(|_| false)
+        },
         // Temporal guards are path evidence, not proof that the lifetime
         // obligation was discharged. The old matcher therefore retained the
         // predicates while keeping `guarded=false` for emitted findings.
@@ -854,6 +859,11 @@ fn match_sink_relations(
             witness_complete: true,
             source_witness_nodes: copy.source_witness_nodes.clone(),
             source_reachable: copy.source_reachable,
+            source_influenced: if !copy.source_witness_nodes.is_empty() {
+                Some(true)
+            } else {
+                copy.source_reachable.map(|_| false)
+            },
             guards: copy.guards.clone(), guarded: copy.guarded,
             family: copy.family.clone(), pattern_id: pattern.id.clone(),
             evaluator: pattern.evaluator.clone(), tier: pattern.tier,
@@ -912,6 +922,11 @@ fn match_reach_skeleton(
                 witness_complete: !token.source_witness_nodes.is_empty(),
                 source_witness_nodes: token.source_witness_nodes.clone(),
                 source_reachable: token.source_reachable,
+                source_influenced: if !token.source_witness_nodes.is_empty() {
+                    Some(true)
+                } else {
+                    token.source_reachable.map(|_| false)
+                },
                 guards: token.guards.clone(),
                 guarded: token.guarded,
                 family: token.family.clone(), pattern_id: pattern.id.clone(),
