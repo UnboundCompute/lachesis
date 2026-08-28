@@ -277,9 +277,16 @@ fn bind_model(model: &Model, index: &Index) -> ResultRow {
         let mut row = base(); row.status = "symbol-not-found".into(); return row;
     }
 
+    // The ambiguity guard protects models that pin a receiver identity (package or
+    // receiver_type): binding one of those across call sites with differing identities
+    // would attach it to the wrong receiver. A fully generic method-only model (no
+    // package, no receiver_type) deliberately matches every occurrence of the method, so
+    // differing receiver identities are expected rather than ambiguous — it binds all
+    // matching call sites and lets each attachment stand as a lead, not a verdict.
+    let model_pins_identity = model.package.is_some() || model.receiver_type.is_some();
     let identities: BTreeSet<(Option<String>, Option<String>)> = callsites.iter()
         .map(|c| (c.callee.module.clone(), c.callee.receiver_type.clone())).collect();
-    if identities.len() > 1 {
+    if model_pins_identity && identities.len() > 1 {
         let mut row = base(); row.status = "ambiguous".into();
         let distinct: BTreeSet<(Option<String>, Option<String>, Option<i64>)> = callsites.iter()
             .map(|c| (c.callee.module.clone(), c.callee.receiver_type.clone(), c.callee.arity)).collect();
@@ -454,6 +461,13 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
     let file = File::open(path).map_err(|error| format!("cannot open Pass-1 input: {error}"))?;
     let mut reader = BufReader::new(file);
     let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
+    // Property-write and computed-property-write nodes are not calls, but a
+    // catalog sink can still name them: `el.innerHTML = tainted` (a static
+    // property write) and `obj[key] = value` (a computed write) are bindable
+    // sinks. They are collected here and turned into synthetic callsites below
+    // so the same method/access-path resolution reaches them.
+    let mut writes = Vec::<crate::graph_proto::NodeRecord>::new();
+    let mut computed_writes = Vec::<crate::graph_proto::NodeRecord>::new();
     let mut arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut has_arguments: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut language: Option<String> = None;
@@ -464,7 +478,8 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
         match tag {
             b'N' => {
                 let kind = string_field(payload.as_slice(), 2).unwrap_or("");
-                if kind == "call" || kind == "construct" || kind == "argument" {
+                if kind == "call" || kind == "construct" || kind == "argument"
+                    || kind == "write" || kind == "dynamic-behavior" {
                     let node = crate::graph_proto::NodeRecord::decode(payload.as_slice())
                         .map_err(|error| format!("invalid Pass-1 node: {error}"))?;
                 let node_language = property(&node, "language");
@@ -477,6 +492,17 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
                     }
                     if kind == "call" || kind == "construct" {
                         calls.push(node);
+                    } else if kind == "write" {
+                        // Only assignment writes are sink candidates; a static
+                        // property name (`innerHTML`) becomes the callsite method.
+                        if property(&node, "write_kind").as_deref() == Some("assignment") {
+                            writes.push(node);
+                        }
+                    } else if kind == "dynamic-behavior" {
+                        if property(&node, "behavior_kind").as_deref()
+                            == Some("computed-property-write") {
+                            computed_writes.push(node);
+                        }
                     } else {
                     let call = property(&node, "callsite_id");
                     let position = property(&node, "position")
@@ -508,12 +534,17 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             _ => {}
         }
     }
-    let callsites = calls.into_iter().filter_map(|node| {
+    let mut callsites: Vec<Callsite> = calls.into_iter().filter_map(|node| {
         let raw_name = property(&node, "callee")
             .or_else(|| property(&node, "method_name"))
             .or_else(|| property(&node, "callee_name"))?;
         let mut name = raw_name;
-        let mut receiver = property(&node, "receiver");
+        // TypeScript spells a member call's receiver into `receiver_expression`
+        // (Python records it as `receiver`); accept either spelling. The receiver
+        // need not be a bare identifier -- `headers.accept.match` has the member
+        // chain `headers.accept` as its receiver.
+        let mut receiver = property(&node, "receiver")
+            .or_else(|| property(&node, "receiver_expression"));
         if receiver.is_none() {
             if let Some((prefix, leaf)) = name.rsplit_once('.').map(|(prefix, leaf)|
                 (prefix.to_owned(), leaf.to_owned())) {
@@ -522,6 +553,12 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
                     receiver = Some(prefix);
                 }
             }
+        } else if let Some((_, leaf)) = name.rsplit_once('.') {
+            // A member call whose receiver is already known: bind on the leaf
+            // method so catalog models keyed by the bare method name
+            // (`match`/`test`/`html`/...) resolve even when the receiver is a
+            // member chain the bare-identifier rule above would have rejected.
+            name = leaf.to_owned();
         }
         let module = property(&node, "module").or_else(|| receiver.as_deref()
             .filter(|value| simple_identifier(value)).map(str::to_owned));
@@ -544,6 +581,47 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
             arg_value_ids: args.into_iter().map(|(_, id)| id).collect(),
         })
     }).collect();
+    // Synthetic callsites for static property writes: `el.innerHTML = tainted`
+    // binds a catalog model keyed by the property name (method `innerHTML`),
+    // with the assigned value (`value_id`, the RHS) as its sole argument.
+    for node in writes {
+        let Some(property_path) = property(&node, "property_path") else { continue };
+        // Only a plain property name is a method-shaped sink; computed writes
+        // (`[key]`) are handled by their dynamic-behavior node below.
+        if !simple_identifier(&property_path) { continue; }
+        let Some(value_id) = property(&node, "value_id") else { continue };
+        let node_language = property(&node, "language");
+        let base_value_id = property(&node, "base_value_id");
+        callsites.push(Callsite {
+            id: node.id,
+            callee: Callee {
+                name: property_path, module: None, receiver_type: None,
+                arity: Some(1), language: node_language,
+            },
+            call_value_id: Some(value_id.clone()),
+            receiver_value_id: base_value_id,
+            arg_value_ids: vec![value_id],
+        });
+    }
+    // Synthetic callsites for computed property writes: `obj[key] = value` binds
+    // a catalog model keyed by the sentinel method `computed-property-write`,
+    // with the dynamic key (`key_value_id`) as its sole argument so a prototype-
+    // pollution obligation can require a `__proto__`/`constructor` guard over it.
+    for node in computed_writes {
+        let Some(key_value_id) = property(&node, "key_value_id") else { continue };
+        let node_language = property(&node, "language");
+        let target_id = property(&node, "target_id");
+        callsites.push(Callsite {
+            id: node.id,
+            callee: Callee {
+                name: "computed-property-write".to_owned(), module: None,
+                receiver_type: None, arity: Some(1), language: node_language,
+            },
+            call_value_id: target_id.clone(),
+            receiver_value_id: target_id,
+            arg_value_ids: vec![key_value_id],
+        });
+    }
     Ok(Index { language: if mixed_languages { None } else { language },
               source: Some(path.display().to_string()), callsites })
 }
