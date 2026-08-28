@@ -77,6 +77,7 @@ fn sink_token(
             lifetime_proto::GuardProof { kind: "PREDICATE".into(), value: value.clone() }).collect(),
         guard_status: flow.guard_status.clone(),
         source_witness_nodes: flow.source_witness_nodes.clone(),
+        source_reachable: (!flow.source_witness_nodes.is_empty()).then_some(true),
         ..Default::default()
     }
 }
