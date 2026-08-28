@@ -1893,7 +1893,7 @@ pub(crate) fn semantic_request(
                 crate::Kind::Alloc => vec!["ALLOC_ATTEMPT", "ORIGIN"],
                 crate::Kind::Realloc => vec!["REALLOC_ATTEMPT", "INVALIDATE", "ORIGIN"],
                 crate::Kind::Clobber if operation.access == "return-null" =>
-                    vec!["RETURN_VALUE", "RETURN"],
+                    vec!["WRITE_STORAGE_NULL", "RETURN_VALUE", "RETURN"],
                 crate::Kind::Use if operation.access == "return"
                     || operation.access == "return-stack" =>
                     vec!["RETURN_VALUE", "ESCAPE", "RETURN"],
