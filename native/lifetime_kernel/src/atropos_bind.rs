@@ -161,6 +161,52 @@ struct Report {
     results: Vec<ResultRow>,
 }
 
+/// Resolve every alias surface to its terminal canonical, following chains
+/// (A->B->C collapses to C) with a cycle guard.  Mirrors the lifecycle-role
+/// resolution in native_graph.rs so the catalog binder shares one canonical
+/// symbol vocabulary: the compiler frontends emit platform surfaces such as
+/// macOS's fortified `__builtin___memcpy_chk`, and the catalog's callee_aliases
+/// map them onto the generic `memcpy` the sink models are keyed by.
+fn build_alias_map(
+    request: &crate::atropos_proto::Request,
+) -> HashMap<(String, String), String> {
+    let direct: HashMap<(String, String), String> = request.callee_aliases.iter()
+        .map(|alias| ((alias.language.clone(), alias.surface.clone()), alias.canonical.clone()))
+        .collect();
+    let mut resolved = HashMap::new();
+    for alias in &request.callee_aliases {
+        let language = alias.language.clone();
+        let mut name = alias.canonical.clone();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(alias.surface.clone());
+        while let Some(next) = direct.get(&(language.clone(), name.clone())) {
+            if !seen.insert(name.clone()) { break; }
+            name = next.clone();
+        }
+        resolved.insert((language, alias.surface.clone()), name);
+    }
+    resolved
+}
+
+/// Rewrite each callsite's callee name to its terminal canonical before model
+/// matching, so a platform-specific surface binds the same generic sink model
+/// as its portable spelling.  Keyed by the callsite's own language, falling
+/// back to the index language, exactly as bind_model's language filter is.
+fn canonicalize_callees(index: &mut Index, aliases: &HashMap<(String, String), String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let index_language = index.language.clone();
+    for callsite in &mut index.callsites {
+        let language = callsite.callee.language.clone().or_else(|| index_language.clone());
+        if let Some(language) = language {
+            if let Some(canonical) = aliases.get(&(language, callsite.callee.name.clone())) {
+                callsite.callee.name = canonical.clone();
+            }
+        }
+    }
+}
+
 fn matches(model: &Model, callee: &Callee) -> bool {
     if model.method.as_deref() != Some(callee.name.as_str()) {
         return false;
@@ -502,17 +548,21 @@ fn index_from_path(path: &Path) -> Result<Index, String> {
               source: Some(path.display().to_string()), callsites })
 }
 
-fn load_models_path(path: &Path) -> Result<Vec<Model>, String> {
+fn load_models_path(
+    path: &Path,
+) -> Result<(Vec<Model>, HashMap<(String, String), String>), String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("cannot read binary catalog {path:?}: {error}"))?;
     let request = crate::atropos_proto::Request::decode(bytes.as_slice())
         .map_err(|error| format!("invalid binary catalog {path:?}: {error}"))?;
-    Ok(from_proto(request).0)
+    let aliases = build_alias_map(&request);
+    Ok((from_proto(request).0, aliases))
 }
 
 pub(crate) fn bind_path(input: &Path, catalog: &Path, output: &Path) -> Result<(), String> {
-    let index = index_from_path(input)?;
-    let models = load_models_path(catalog)?;
+    let mut index = index_from_path(input)?;
+    let (models, aliases) = load_models_path(catalog)?;
+    canonicalize_callees(&mut index, &aliases);
     let report = to_proto(bind_all(&models, &index));
     let mut bytes = Vec::new();
     report.encode(&mut bytes).map_err(|error| format!("cannot encode bind report: {error}"))?;
@@ -608,7 +658,9 @@ pub unsafe extern "C" fn lachesis_atropos_bind_pb(
         let bytes = std::slice::from_raw_parts(input, length);
         let request = crate::atropos_proto::Request::decode(bytes)
             .map_err(|error| error.to_string())?;
-        let (models, index) = from_proto(request);
+        let aliases = build_alias_map(&request);
+        let (models, mut index) = from_proto(request);
+        canonicalize_callees(&mut index, &aliases);
         let mut output = Vec::new();
         to_proto(bind_all(&models, &index)).encode(&mut output)
             .map_err(|error| error.to_string())?;
