@@ -1555,8 +1555,10 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
                     .as_slice(),
             ).map_err(|error| format!("invalid binary lifecycle catalog: {error}"))?)
         };
-        let roles = catalog.as_ref().map(native_graph::lifecycle_roles).unwrap_or_default();
-        let request = native_graph::sidecar_to_request_with_roles(&bytes, &roles)?;
+        let request = match catalog.as_ref() {
+            Some(catalog) => native_graph::sidecar_to_request_with_catalog(&bytes, catalog)?,
+            None => native_graph::sidecar_to_request(&bytes)?,
+        };
         report_native_phase(timing_enabled, semantic_started, "semantic translation", 0, 0);
         // Pass 2 publishes taint witnesses in the sibling binary overlay.  Use
         // the same graph path convention as the Python store, but keep the
@@ -1601,9 +1603,10 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             } else {
                 native_graph::sidecar_to_translation(&bytes)?
             };
-            let translation = lifetime_proto::TranslationResult::decode(
+            let mut translation = lifetime_proto::TranslationResult::decode(
                 translation_bytes.as_slice(),
             ).map_err(|error| format!("invalid native translation facts: {error}"))?;
+            native_graph::annotate_translation_roles(&mut translation, catalog);
             let summaries = summary::summarize_with_evidence(
                 translation.clone(), catalog.clone(), source_evidence.as_ref());
             full.skeletons.extend(reach::build(&translation, &summaries, catalog));

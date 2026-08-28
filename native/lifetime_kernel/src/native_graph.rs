@@ -339,6 +339,16 @@ fn call_kind(kind: &str) -> bool {
         | "allocation" | "release" | "realloc")
 }
 
+fn language_for_file(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|extension| extension.to_str()) {
+        Some("py" | "pyi") => "python",
+        Some("js" | "jsx" | "mjs" | "cjs") => "javascript",
+        Some("ts" | "tsx" | "mts" | "cts") => "typescript",
+        Some("cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx") => "cpp",
+        _ => "c",
+    }
+}
+
 fn translation_call_kind(kind: &str) -> bool {
     matches!(kind, "CallExpr" | "CXXMemberCallExpr" | "CXXOperatorCallExpr"
         | "call" | "Call" | "CallExpression" | "construct" | "NewExpression")
@@ -383,29 +393,53 @@ pub(crate) fn lifecycle_roles(
 pub(crate) fn sidecar_to_request(
     input: &[u8],
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_inner(input, None, true, &HashMap::new())
+    sidecar_to_request_inner(input, None, true, &HashMap::new(), &HashSet::new(), None)
 }
 
 pub(crate) fn sidecar_to_request_with_roles(
     input: &[u8], roles: &HashMap<(String, String), String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_inner(input, None, true, roles)
+    sidecar_to_request_inner(input, None, true, roles, &HashSet::new(), None)
+}
+
+/// Build the native preparation request from the complete compiled catalog.
+/// Lifecycle and source roles share the same catalog-owned symbol vocabulary;
+/// keeping both classifications at this boundary makes the subsequent Claus
+/// scheduler independent of language- or product-specific names.
+pub(crate) fn sidecar_to_request_with_catalog(
+    input: &[u8], catalog: &crate::atropos_proto::Request,
+) -> Result<lifetime_proto::PrepareRequest, String> {
+    let roles = lifecycle_roles(catalog);
+    let mut sources: HashSet<(String, String)> = catalog.models.iter()
+        .filter(|model| model.role == "source")
+        .map(|model| (model.language.clone(), model.method.clone()))
+        .collect();
+    for alias in &catalog.callee_aliases {
+        if sources.contains(&(alias.language.clone(), alias.canonical.clone())) {
+            sources.insert((alias.language.clone(), alias.surface.clone()));
+        }
+    }
+    let default_language = sidecar_language(input)?;
+    sidecar_to_request_inner(input, None, true, &roles, &sources, default_language.as_deref())
 }
 
 pub(crate) fn sidecar_to_request_selected(
     input: &[u8], selected_ids: &HashSet<String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
-    sidecar_to_request_inner(input, Some(selected_ids), true, &HashMap::new())
+    sidecar_to_request_inner(input, Some(selected_ids), true, &HashMap::new(), &HashSet::new(), None)
 }
 
 fn sidecar_to_request_inner(
     input: &[u8], selected_ids: Option<&HashSet<String>>, retain_owner: bool,
     roles: &HashMap<(String, String), String>,
+    source_names: &HashSet<(String, String)>,
+    default_language: Option<&str>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
     let timing_enabled = std::env::var("LACHESIS_TIMINGS").ok().as_deref() == Some("1");
     let started = std::time::Instant::now();
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
+    let mut function_languages: HashMap<String, String> = HashMap::new();
     let release_names: HashSet<String> = roles.iter()
         .filter(|(_, role)| role.as_str() == "release")
         .map(|((_, name), _)| name.clone())
@@ -421,6 +455,12 @@ fn sidecar_to_request_inner(
                 owner_ref(&item).map(str::to_owned)
             };
             let Some(function) = function else { return };
+            if function_kind(&syntax) {
+                if let Some(file) = record_text(&item, "file") {
+                    function_languages.entry(function.clone())
+                        .or_insert_with(|| language_for_file(file).to_owned());
+                }
+            }
             if selected_ids.is_some_and(|selected| !selected.contains(&function)) { return; }
             let entry = functions.entry(function.clone()).or_insert_with(||
                 lifetime_proto::FunctionInput { id: function.clone(), ..Default::default() });
@@ -447,6 +487,13 @@ fn sidecar_to_request_inner(
     let mut built_calls = Vec::with_capacity(call_nodes.len());
     for (function, item_id) in call_nodes {
         let Some(item) = node_lookup.get(item_id.as_str()).copied() else { continue };
+        // Some frontend call records omit language metadata. Resolve it from
+        // the owning function before consulting the generic binary catalog.
+        let call_language = input_text(&item, "language").or_else(|| {
+            owners.get(&item.id).and_then(|owner| node_lookup.get(owner.as_str()))
+                .and_then(|owner| input_text(owner, "language"))
+        }).or_else(|| owners.get(&item.id).and_then(|owner| function_languages.get(owner).map(String::as_str)))
+            .or(default_language);
         let raw_callee_id = input_text(&item, "primary_target_id").unwrap_or_default();
         let callee_function_id = resolved_function_id(raw_callee_id, &function_names, &refs);
         let mut call = lifetime_proto::FunctionCall {
@@ -467,7 +514,10 @@ fn sidecar_to_request_inner(
                 || input_text(&item, "syntax_kind") == Some("release"),
             is_realloc: input_bool(&item, "is_realloc")
                 || input_text(&item, "syntax_kind") == Some("realloc"),
-            is_source: false,
+            is_source: source_names.contains(&(
+                call_language.unwrap_or_default().to_owned(),
+                input_text(&item, "callee").unwrap_or_default().to_owned(),
+            )),
             is_aggregate_copy: input_bool(&item, "is_aggregate_copy"),
             arguments: Vec::new(),
             assigned_root: String::new(),
@@ -480,6 +530,13 @@ fn sidecar_to_request_inner(
             guard_status: String::new(),
             guard_predicates: Vec::new(),
         };
+        // Some compiler frontends retain the resolved target spelling in a
+        // canonical property rather than `callee`; use the final resolved
+        // spelling for catalog role matching as well.
+        if !call.is_source {
+            let language = call_language.unwrap_or_default();
+            call.is_source = source_names.contains(&(language.to_owned(), call.callee.clone()));
+        }
         call.size_expression = input_text(&item, "size_expr")
             .or_else(|| input_text(&item, "size_expression"))
             .unwrap_or_default().to_owned();
@@ -503,7 +560,7 @@ fn sidecar_to_request_inner(
             .any(|edge| resolve_decl(&edge.target, &refs, &children, &mut HashSet::new())
                 .is_some_and(|target| release_value_ids.contains(&target)));
         if indirect_release { call.is_release = true; }
-        if let Some(role) = lifecycle_role(roles, input_text(&item, "language"), &call.callee) {
+        if let Some(role) = lifecycle_role(roles, call_language, &call.callee) {
             match role {
                 "alloc" | "acquire" => call.is_alloc = true,
                 "release" => call.is_release = true,
@@ -581,6 +638,10 @@ fn sidecar_to_request_inner(
         arguments.sort_by_key(|argument| argument.position);
         call.arguments = arguments;
         built_calls.push((function, call));
+    }
+    if timing_enabled {
+        let source_count = built_calls.iter().filter(|(_, call)| call.is_source).count();
+        eprintln!("[lachesis native pass2] catalog source calls: {source_count}");
     }
     drop(node_lookup);
     for (function, call) in built_calls {
@@ -1125,6 +1186,25 @@ fn compact_edge_offset(input: &[u8]) -> Result<usize, String> {
     Ok(input.len())
 }
 
+fn sidecar_language(input: &[u8]) -> Result<Option<String>, String> {
+    let mut offset = 0;
+    let header = frame(input, &mut offset)?;
+    let document = graph_proto::Document::decode(header)
+        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
+    let Some(fields) = document.fields else { return Ok(None) };
+    let Some(field) = fields.fields.iter().find(|field| field.key == "languages") else {
+        return Ok(None)
+    };
+    let Some(graph_proto::value::Kind::List(list)) = field.value.as_ref().and_then(|value| value.kind.as_ref()) else {
+        return Ok(None)
+    };
+    let languages: Vec<&str> = list.values.iter().filter_map(|value| match value.kind.as_ref() {
+        Some(graph_proto::value::Kind::Text(language)) => Some(language.as_str()),
+        _ => None,
+    }).collect();
+    Ok((languages.len() == 1).then(|| languages[0].to_owned()))
+}
+
 pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     // Keep only the records needed to seed relevance.  The previous version
     // retained every compact node before filtering edges, which defeated the
@@ -1358,4 +1438,58 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     result.encode(&mut output).map_err(|error| error.to_string())?;
     Ok(output)
+}
+
+/// Apply catalog-owned call roles to the binary translation projection.  The
+/// translation sidecar may have been produced before a catalog was available,
+/// so role binding belongs here at the Rust semantic boundary rather than in
+/// the Python caller.  Matching is language-qualified and alias-aware; no
+/// product or library symbol is embedded in the engine.
+pub(crate) fn annotate_translation_roles(
+    translation: &mut lifetime_proto::TranslationResult,
+    catalog: &crate::atropos_proto::Request,
+) {
+    let roles = lifecycle_roles(catalog);
+    let mut sources: HashSet<(String, String)> = catalog.models.iter()
+        .filter(|model| model.role == "source")
+        .map(|model| (model.language.clone(), model.method.clone()))
+        .collect();
+    for alias in &catalog.callee_aliases {
+        // Source aliases are carried in the same catalog relation as the
+        // canonical source model; lifecycle aliases are handled through
+        // `roles` above.
+        if sources.contains(&(alias.language.clone(), alias.canonical.clone())) {
+            sources.insert((alias.language.clone(), alias.surface.clone()));
+        }
+    }
+    for function in &mut translation.functions {
+        if function.language.is_empty() {
+            function.language = language_for_file(&function.file).to_owned();
+        }
+        for call in &mut function.calls {
+            let inferred_language;
+            let language = if function.language.is_empty() {
+                inferred_language = language_for_file(&function.file);
+                inferred_language
+            } else {
+                function.language.as_str()
+            };
+            if let Some(role) = lifecycle_role(&roles, Some(language), &call.callee) {
+                match role {
+                    "alloc" | "acquire" => call.is_alloc = true,
+                    "release" => call.is_release = true,
+                    "realloc" => call.is_realloc = true,
+                    "source" => call.is_source = true,
+                    _ => {}
+                }
+            }
+            if sources.contains(&(language.to_owned(), call.callee.clone())) {
+                call.is_source = true;
+            }
+            let method = call.callee.rsplit('.').next().unwrap_or(&call.callee);
+            if sources.contains(&(language.to_owned(), method.to_owned())) {
+                call.is_source = true;
+            }
+        }
+    }
 }
