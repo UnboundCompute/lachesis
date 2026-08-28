@@ -923,6 +923,22 @@ fn match_reach_skeleton(
     })
 }
 
+fn inverted_capacity_predicate(predicate: &str, size: &str) -> bool {
+    let predicate = predicate.replace(' ', "");
+    let mut offset = 0;
+    while let Some(relative) = predicate[offset..].find(size) {
+        let start = offset + relative;
+        let boundary = start == 0 || predicate[..start].chars().next_back()
+            .is_some_and(|character| matches!(character, '(' | '&' | '|' | '!'));
+        let suffix = &predicate[start + size.len()..];
+        if boundary && (suffix.starts_with(">=") || suffix.starts_with('>')) {
+            return true;
+        }
+        offset = start + size.len().max(1);
+    }
+    false
+}
+
 fn reach_evaluator(name: &str, token: &lifetime_proto::NativeSkeletonToken) -> bool {
     match name {
         "reachability" => token.tainted,
@@ -932,9 +948,8 @@ fn reach_evaluator(name: &str, token: &lifetime_proto::NativeSkeletonToken) -> b
         "inverted-capacity-guard" => {
             if !token.tainted || token.size_expression.is_empty() { return false; }
             let size = token.size_expression.replace(' ', "");
-            token.control.iter().map(|item| item.replace(' ', "")).any(|predicate|
-                predicate.contains(&format!("{}>=", size))
-                    || predicate.contains(&format!("{}>", size)))
+            token.control.iter().any(|predicate|
+                inverted_capacity_predicate(predicate, &size))
         }
         "arithmetic-overflow-guard" => token.tainted && token.guarded
             && token.control.iter().any(|predicate|
