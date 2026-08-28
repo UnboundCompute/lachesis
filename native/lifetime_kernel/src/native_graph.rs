@@ -383,6 +383,8 @@ fn sidecar_to_request_inner(
     input: &[u8], selected_ids: Option<&HashSet<String>>, retain_owner: bool,
     roles: &HashMap<(String, String), String>,
 ) -> Result<lifetime_proto::PrepareRequest, String> {
+    let timing_enabled = std::env::var("LACHESIS_TIMINGS").ok().as_deref() == Some("1");
+    let started = std::time::Instant::now();
     let mut functions: BTreeMap<String, lifetime_proto::FunctionInput> = BTreeMap::new();
     let mut call_nodes: Vec<(String, String)> = Vec::new();
     let release_names: HashSet<String> = roles.iter()
@@ -412,6 +414,7 @@ fn sidecar_to_request_inner(
             }
         },
     )?;
+    if timing_enabled { eprintln!("[lachesis native pass2] substrate scan: {:.3}s", started.elapsed().as_secs_f64()); }
     let parents: HashMap<String, String> = edges_by_source.values().flatten()
         .filter(|item| item.kind == "AST_CHILD" && call_ids.contains(&item.target))
         .map(|item| (item.target.clone(), item.source.clone()))
@@ -566,6 +569,7 @@ fn sidecar_to_request_inner(
             entry.calls.push(call);
         }
     }
+    if timing_enabled { eprintln!("[lachesis native pass2] call reconstruction: {:.3}s", started.elapsed().as_secs_f64()); }
     // The scan already stores final protobuf edges, so consuming the index
     // transfers them directly into their owning function without cloning a
     // second graph-sized edge representation.
@@ -578,6 +582,7 @@ fn sidecar_to_request_inner(
             entry.edges.push(item);
         }
     }
+    if timing_enabled { eprintln!("[lachesis native pass2] edge attachment: {:.3}s", started.elapsed().as_secs_f64()); }
     // Build the first native interprocedural summary lattice.  These effects
     // are deliberately expressed in formal-parameter positions, which is the
     // same contract consumed by the lifetime preparer.  A small fixed-point is
@@ -724,6 +729,7 @@ fn sidecar_to_request_inner(
         }
         if !changed { break; }
     }
+    if timing_enabled { eprintln!("[lachesis native pass2] summary effects: {:.3}s", started.elapsed().as_secs_f64()); }
     for input in functions.values_mut() {
         for call in &input.calls {
             let Some(effects) = summary_effects.get(&call.callee) else { continue };
