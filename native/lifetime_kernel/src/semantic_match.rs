@@ -37,6 +37,7 @@ impl ObjectKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StateKey {
     node: usize,
+    returns: Vec<usize>,
     bindings: Vec<(u32, u32)>,
     guards: Vec<(String, String)>,
     released: MarkSet,
@@ -251,7 +252,7 @@ fn match_function(
 
     let empty = MarkSet::empty(objects.len());
     let mut queue = VecDeque::from([(
-        entry,
+        entry, Vec::<usize>::new(),
         Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
         empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
         Vec::<lifetime_proto::GuardProof>::new(),
@@ -264,7 +265,7 @@ fn match_function(
     // This is a work bound for one function, not a wall-clock hard stop.
     const MAX_STATES: usize = 1_000_000;
 
-    while let Some((index, mut bindings, mut released, mut origins, mut nulls,
+    while let Some((index, returns, mut bindings, mut released, mut origins, mut nulls,
                     mut nonnull, mut uninitialized, mut pointer_arithmetic, mut escaped,
                     mut realloc_lost, path_guards)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
@@ -272,7 +273,7 @@ fn match_function(
         bindings.sort_unstable();
         bindings.dedup();
         let state = StateKey {
-            node: index, bindings: bindings.clone(),
+            node: index, returns: returns.clone(), bindings: bindings.clone(),
             guards: path_guards.iter().map(|guard| (guard.kind.clone(), guard.value.clone())).collect(),
             released: released.clone(), origins: origins.clone(),
             nulls: nulls.clone(), nonnull: nonnull.clone(), uninitialized: uninitialized.clone(),
@@ -413,6 +414,18 @@ fn match_function(
             }
         }
         for (target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
+            let mut next_returns = returns.clone();
+            if seam_kind == "call" {
+                if !return_to.is_empty() {
+                    let Some(continuation) = by_id.get(return_to.as_str()).copied() else {
+                        continue;
+                    };
+                    next_returns.push(continuation);
+                }
+            } else if seam_kind == "return" {
+                let Some(continuation) = next_returns.pop() else { continue };
+                if continuation != *target { continue; }
+            }
             let mut next_bindings = bindings.clone();
             let object_label = |object: &ObjectKey| {
                 format!("{}{}", object.root, object.selectors.join(""))
@@ -471,7 +484,7 @@ fn match_function(
                 }
             }
             if !contradiction {
-                queue.push_back((*target, next_bindings, released.clone(), origins.clone(), next_nulls,
+                queue.push_back((*target, next_returns, next_bindings, released.clone(), origins.clone(), next_nulls,
                                  next_nonnull, uninitialized.clone(), pointer_arithmetic.clone(),
                                  escaped.clone(), realloc_lost.clone(), next_guards));
             }

@@ -1594,7 +1594,8 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // Claus renderer is retained as a diagnostic helper, but must not be
         // mixed into the production result because it changes the skeleton
         // set and therefore matcher output.
-        full.skeletons = skeleton::build_typestate(&full);
+        full.regions = claus::pick_regions(&full);
+        full.skeletons = skeleton::build(&full);
         report_native_phase(timing_enabled, semantic_started, "claus skeleton", full.regions.len(), full.skeletons.len());
         if let Some(catalog) = catalog.as_ref() {
             let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")

@@ -50,7 +50,43 @@ fn call_graph(
             callers_for_callee.push((*caller).to_owned());
         }
     }
+    for targets in callees.values_mut() { targets.sort(); }
+    for targets in callers.values_mut() { targets.sort(); }
     (callees, callers)
+}
+
+fn callerless_root(
+    start: &str,
+    callers: &HashMap<String, Vec<String>>,
+) -> String {
+    let mut queue = VecDeque::from([start.to_owned()]);
+    let mut seen = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    while let Some(function) = queue.pop_front() {
+        if !seen.insert(function.clone()) { continue; }
+        let parents = callers.get(&function).map(Vec::as_slice).unwrap_or_default();
+        if parents.is_empty() {
+            roots.insert(function);
+        } else {
+            queue.extend(parents.iter().cloned());
+        }
+    }
+    // A recursive component may have no callerless member. Use its stable
+    // smallest member as the structural root so coverage still terminates.
+    roots.into_iter().next().or_else(|| seen.into_iter().next())
+        .unwrap_or_else(|| start.to_owned())
+}
+
+fn downward_cone(start: &str, callees: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut queue = VecDeque::from([start.to_owned()]);
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::new();
+    while let Some(function) = queue.pop_front() {
+        if !seen.insert(function.clone()) { continue; }
+        ordered.push(function.clone());
+        queue.extend(callees.get(&function).into_iter().flatten().cloned());
+    }
+    ordered
 }
 
 struct PythonRandom {
@@ -175,66 +211,55 @@ fn traverse_component(
     local
 }
 
-/// Pick source-rooted Claus regions until every emitted UDF is covered.  The
-/// old scheduler shuffles the sorted function records, not compiler node IDs,
-/// then runs the two-phase caller/callee traversal from the selected UDF.
-/// Keeping the same scheduling granularity is important: node-level shuffling
-/// changes component seeds and therefore changes the Claus flow order.
-///
-/// A source witness identifies the function containing the source value.  If
-/// no witness exists, every function still remains a structural root, matching
-/// the old Python scheduler's conservative fallback.  Each source cone is
-/// emitted once, so downstream Claus/skeleton caches never repeat the same
-/// function for the same source context.
+/// Pick an unvisited compiler node, walk callers to a callerless user-defined
+/// function, then run Claus down its complete compiler-resolved callee cone.
+/// Repeat until every emitted node is covered. The seeded shuffle is stable,
+/// so binary sidecars remain reproducible while avoiding source-order bias.
 pub(crate) fn pick_regions(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeSourceRegion> {
     let (callees, callers) = call_graph(result);
-    let mut function_order: Vec<String> = result.functions.iter()
-        .map(|function| function.id.clone()).collect();
-    function_order.sort();
-    function_order.dedup();
-    let shuffled = seed_order(&function_order);
+    let owners: HashMap<&str, &str> = node_functions(result);
+    let mut node_order: Vec<String> = owners.keys().map(|node| (*node).to_owned()).collect();
+    node_order.sort();
+    let shuffled = seed_order(&node_order);
     let mut regions = Vec::new();
-    let mut visited = BTreeSet::new();
-    for seed_function in shuffled {
-        if visited.contains(&seed_function) { continue; }
-        let selected = traverse_component(&seed_function, &callees, &callers, &mut visited);
-        if selected.is_empty() { continue; }
-        // The random UDF seed is a coverage starting point, not necessarily
-        // the source UDF.  Resolve the source in caller-first traversal order;
-        // this mirrors the old flow's "walk to the source, then launch Claus"
-        // behavior while remaining language/catalog neutral.
-        let source_function = selected.iter().find(|name|
-            result.functions.iter().find(|function| function.id.as_str() == name.as_str())
-                .is_some_and(|function| !function.source_launch_nodes.is_empty()))
-            .cloned().unwrap_or_else(|| seed_function.clone());
-        let mut source_nodes = Vec::new();
+    let mut covered_nodes = BTreeSet::new();
+    let mut emitted_roots = BTreeSet::new();
+    for seed_node in shuffled {
+        if covered_nodes.contains(&seed_node) { continue; }
+        let Some(seed_function) = owners.get(seed_node.as_str()).copied() else { continue };
+        let source_function = callerless_root(seed_function, &callers);
+        let selected = downward_cone(&source_function, &callees);
         for function_id in &selected {
-            let Some(function) = result.functions.iter().find(|function| &function.id == function_id)
-            else { continue };
-            for launch in &function.source_launch_nodes {
-                if !source_nodes.iter().any(|item| item == launch) {
-                    source_nodes.push(launch.clone());
-                }
+            if let Some(function) = result.functions.iter().find(|item| &item.id == function_id) {
+                covered_nodes.extend(function.nodes.iter().map(|node| node.id.clone()));
             }
         }
-        let seed_node = result.functions.iter()
-            .find(|function| function.id == seed_function)
-            .and_then(|function| function.nodes.first())
-            .map(|node| node.id.clone())
-            .unwrap_or_else(|| seed_function.clone());
-        // A component is one cached Claus walk. Keep all launch anchors on
-        // that walk instead of replaying the same function cone once per
-        // source callsite; the old renderer composed one function flow and
-        // retained the launch sites as evidence on its tokens.
+        if !emitted_roots.insert(source_function.clone()) { continue; }
+        let source_nodes = result.functions.iter()
+            .find(|function| function.id == source_function)
+            .and_then(|function| (!function.entry.is_empty()).then(|| function.entry.clone())
+                .or_else(|| function.nodes.first().map(|node| node.id.clone())))
+            .into_iter().collect();
         let contexts = vec!["__entry__".to_owned()];
         regions.push(lifetime_proto::NativeSourceRegion {
-            source_function: source_function,
+            source_function,
             source_nodes,
             functions: selected,
             contexts,
             seed_node,
+        });
+    }
+    // Preserve compiler functions whose compact semantic projection has no
+    // nodes. They cannot produce a skeleton today, but recording the region
+    // keeps the all-function coverage contract explicit in the sidecar.
+    for function in &result.functions {
+        if !function.nodes.is_empty() || emitted_roots.contains(&function.id) { continue; }
+        regions.push(lifetime_proto::NativeSourceRegion {
+            source_function: function.id.clone(), functions: vec![function.id.clone()],
+            seed_node: function.id.clone(), contexts: vec!["__entry__".to_owned()],
+            ..Default::default()
         });
     }
     regions

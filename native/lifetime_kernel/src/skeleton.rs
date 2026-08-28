@@ -404,7 +404,6 @@ pub(crate) fn build(
                 });
             }
         }
-        output.extend(build_typestate(result));
         if !output.is_empty() { return output; }
     }
 
