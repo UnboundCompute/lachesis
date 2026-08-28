@@ -46,6 +46,12 @@ lachesis/frontends/typescript/vendor/
 # They are platform-specific build outputs, never source-controlled.
 lachesis/_native/
 
+# The Atropos catalog bundled into the distribution. Staged by
+# `tools/vendor_atropos.py` at release time and shipped inside the sdist and wheel,
+# but not carried in the repository: the catalog is a separate public repo with its
+# own release cadence, duplicated here only as a build artifact.
+lachesis/_atropos_catalog/
+
 # Scratch analysis notes -- markdown that is generated, never committed. Tracked
 # docs (README.md, docs/*.md) stay tracked; this only stops new scratch .md.
 *.md

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lachesis-cpg"
-version = "0.4.1"
+version = "0.4.2"
 description = "A compiler-precise code property graph with an embedded columnar store and a navigation layer for security reasoning over source code."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -80,7 +80,12 @@ include-package-data = false
 # The capsule schema is the artifact an external consumer validates against, and the
 # golden capsule is what the planner's own suite checks the serializer round-trips.
 "lachesis.planner" = ["*.json", "fixtures/*.json", "fixtures/project/*"]
-"lachesis" = ["py.typed", "_native/*"]
+# The Atropos catalog (sink models, syntactic profiles, detection roles/patterns) is
+# the data every catalog-keyed judgement reads. It is staged into `_atropos_catalog/`
+# by `tools/vendor_atropos.py` before a release build -- absent from the repository for
+# the same reason the TypeScript compiler is -- so a wheel built without that step ships
+# without a bundled catalog and falls back to a sibling checkout at runtime.
+"lachesis" = ["py.typed", "_native/*", "_atropos_catalog/**/*"]
 
 # Never ship interpreter caches in release artifacts.  Fixture trees are included
 # intentionally for frontend/runtime behavior, but their local `__pycache__`
