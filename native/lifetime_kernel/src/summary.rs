@@ -104,7 +104,10 @@ pub(crate) fn summarize_with_evidence(
 
     // Monotone union fixed point. The number of call edges is small relative
     // to the graph substrate, and this avoids allocating SCC metadata twice.
+    let mut complete = false;
+    let mut iterations = 0u32;
     for _ in 0..64 {
+        iterations += 1;
         let before = summaries.clone();
         for (name, function) in &functions {
             let parameters: BTreeSet<&str> = function.parameter_names.iter()
@@ -155,7 +158,7 @@ pub(crate) fn summarize_with_evidence(
             target.flows.extend(additions.flows);
             target.params.extend(additions.params);
         }
-        if summaries == before { break; }
+        if summaries == before { complete = true; break; }
     }
 
     let functions = summaries.into_iter().map(|(name, summary)| {
@@ -197,7 +200,7 @@ pub(crate) fn summarize_with_evidence(
             name, parameters: item.parameter_names.clone(), sink_flows, sink_params,
         }
     }).collect();
-    lifetime_proto::NativeSummaryResult { functions }
+    lifetime_proto::NativeSummaryResult { functions, complete, iterations }
 }
 
 #[cfg(test)]

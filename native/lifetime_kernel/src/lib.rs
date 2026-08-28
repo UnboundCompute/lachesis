@@ -1610,9 +1610,15 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             let summaries = summary::summarize_with_evidence(
                 translation.clone(), catalog.clone(),
                 source_evidence.as_ref().map(|evidence| &evidence.witnesses));
+            if !summaries.complete { full.complete = false; }
             full.skeletons.extend(reach::build_sink_graphs(
                 &full, &translation, &summaries, catalog));
             full.skeletons.extend(reach::build(&translation, &summaries, catalog));
+            if !summaries.complete {
+                for skeleton in &mut full.skeletons {
+                    skeleton.complete = false;
+                }
+            }
             report_native_phase(timing_enabled, semantic_started, "reach summaries", summaries.functions.len(), full.skeletons.len());
         }
         // Temporal candidate enumeration only needs operation-derived event

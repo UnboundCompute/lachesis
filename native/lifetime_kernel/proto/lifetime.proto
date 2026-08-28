@@ -362,7 +362,11 @@ message NativeSummaryFunction {
   repeated NativeSinkFlow sink_flows = 3;
   repeated NativeSinkParam sink_params = 4;
 }
-message NativeSummaryResult { repeated NativeSummaryFunction functions = 1; }
+message NativeSummaryResult {
+  repeated NativeSummaryFunction functions = 1;
+  bool complete = 2;
+  uint32 iterations = 3;
+}
 
 // Compact temporal output.  The full solver result contains point/post/exit
 // snapshots for semantic graph construction; callers that only need temporal
