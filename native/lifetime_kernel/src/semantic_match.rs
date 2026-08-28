@@ -1251,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_the_effective_guard_on_a_finding() {
+    fn retains_path_guards_without_claiming_temporal_discharge() {
         let nodes = vec![node("o", "ORIGIN", 1), node("r1", "RELEASE", 2),
                          node("r2", "RELEASE", 3)];
         let edges = vec![
@@ -1275,7 +1275,7 @@ mod tests {
         let finding = result.functions[0].findings.iter()
             .find(|finding| finding.pattern == "double-free")
             .expect("guarded double-free finding");
-        assert!(finding.guarded);
+        assert!(!finding.guarded);
         assert_eq!(finding.guards[0].kind, "NONNULL");
     }
 
