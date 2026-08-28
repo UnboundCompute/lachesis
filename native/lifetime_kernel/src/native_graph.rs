@@ -220,9 +220,15 @@ fn resolves_to_release(
     edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
     reverse_edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
     seen: &mut HashSet<String>,
+    memo: &mut HashMap<String, bool>,
 ) -> bool {
-    if release_symbols.contains(start) || !seen.insert(start.to_owned()) {
-        return release_symbols.contains(start);
+    if let Some(result) = memo.get(start) { return *result; }
+    if release_symbols.contains(start) {
+        memo.insert(start.to_owned(), true);
+        return true;
+    }
+    if !seen.insert(start.to_owned()) {
+        return false;
     }
     let forward = edges.get(start).into_iter().flatten().filter(|edge| {
         if edge.role == "ARGUMENT" {
@@ -230,17 +236,24 @@ fn resolves_to_release(
         }
         matches!(edge.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO")
     }).any(|edge| resolves_to_release(
-        &edge.target, release_symbols, edges, reverse_edges, seen));
-    if forward { return true; }
+        &edge.target, release_symbols, edges, reverse_edges, seen, memo));
+    if forward {
+        seen.remove(start);
+        memo.insert(start.to_owned(), true);
+        return true;
+    }
     // Compiler value-flow is directional (initializer -> destination).  A
     // function-pointer variable therefore reaches a catalogued release
     // symbol through an incoming VALUE_FLOWS_TO edge.  Follow only that
     // reverse relation; reversing AST/reference edges would over-connect
     // unrelated syntax nodes.
-    reverse_edges.get(start).into_iter().flatten()
+    let reverse = reverse_edges.get(start).into_iter().flatten()
         .filter(|edge| edge.kind == "VALUE_FLOWS_TO" && edge.role != "ARGUMENT")
         .any(|edge| resolves_to_release(
-            &edge.source, release_symbols, edges, reverse_edges, seen))
+            &edge.source, release_symbols, edges, reverse_edges, seen, memo));
+    seen.remove(start);
+    memo.insert(start.to_owned(), forward || reverse);
+    forward || reverse
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -880,9 +893,17 @@ fn scan_lifetime_metadata(
     let mut initializer_targets: HashMap<String, HashSet<String>> = HashMap::new();
     let mut variable_meta: HashMap<String, (String, String, bool)> = HashMap::new();
     let mut release_symbol_ids = HashSet::new();
+    let timing_enabled = std::env::var("LACHESIS_TIMINGS").ok().as_deref() == Some("1");
+    let started = std::time::Instant::now();
+    let mut record_count = 0usize;
     while offset < input.len() {
         let payload = frame(input, &mut offset)?;
         if payload.is_empty() { continue; }
+        record_count += 1;
+        if timing_enabled && record_count % 100_000 == 0 {
+            eprintln!("[lachesis native pass2] substrate records: {} ({:.3}s)",
+                      record_count, started.elapsed().as_secs_f64());
+        }
         match payload[0] {
             b'N' => {
                 let item = graph_proto::NodeRecord::decode(&payload[1..])
@@ -947,10 +968,11 @@ fn scan_lifetime_metadata(
     {
         reverse_edges.entry(edge.target.clone()).or_default().push(edge.clone());
     }
+    let mut release_memo = HashMap::new();
     let release_value_ids: HashSet<String> = variable_meta.keys()
         .filter(|variable| resolves_to_release(
             variable, &release_symbol_ids, &edges_by_source, &reverse_edges,
-            &mut HashSet::new()))
+            &mut HashSet::new(), &mut release_memo))
         .cloned()
         .collect();
     Ok((owners, function_names, call_ids, edges_by_source, initializer_targets,
