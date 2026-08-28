@@ -479,6 +479,11 @@ message NativeSkeletonToken {
   string guard_status = 25;
   // Compiler-derived object generation; empty means the initial generation.
   string generation = 26;
+  bool stack_local = 27;
+  bool is_null = 28;
+  string access = 29;
+  string value_root = 30;
+  repeated string value_selectors = 31;
 }
 message NativeFlowSkeleton {
   string kind = 1;

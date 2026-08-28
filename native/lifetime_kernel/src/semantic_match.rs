@@ -725,7 +725,10 @@ fn match_skeleton(
             generation: if token.generation.is_empty() { "g0".into() } else { token.generation.clone() },
             line: token.line, has_line: token.has_line,
             anchor: token.node.clone(), source_witness_nodes: token.source_witness_nodes.clone(),
-            source_reachable: token.source_reachable, ..Default::default()
+            source_reachable: token.source_reachable, stack_local: token.stack_local,
+            is_null: token.is_null, access: token.access.clone(),
+            value_root: token.value_root.clone(), value_selectors: token.value_selectors.clone(),
+            ..Default::default()
         });
     }
     if nodes.is_empty() { return None; }

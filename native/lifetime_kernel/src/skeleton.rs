@@ -161,6 +161,9 @@ fn walk_region(
                 source_reachable: node.source_reachable,
                 source_witness_nodes: node.source_witness_nodes.clone(),
                 generation: node.generation.clone(),
+                stack_local: node.stack_local, is_null: node.is_null,
+                access: node.access.clone(), value_root: node.value_root.clone(),
+                value_selectors: node.value_selectors.clone(),
                 ..Default::default()
             });
         let outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
@@ -260,7 +263,10 @@ fn build_typestate(
                 guarded: !guards.is_empty(), guards,
                 source_reachable: node.source_reachable,
                 source_witness_nodes: node.source_witness_nodes.clone(),
-                generation: node.generation.clone(), ..Default::default()
+                generation: node.generation.clone(), stack_local: node.stack_local,
+                is_null: node.is_null, access: node.access.clone(),
+                value_root: node.value_root.clone(), value_selectors: node.value_selectors.clone(),
+                ..Default::default()
             });
         }
         tokens.push(lifetime_proto::NativeSkeletonToken {
