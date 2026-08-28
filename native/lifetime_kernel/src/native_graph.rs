@@ -1326,7 +1326,9 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         if let Some(function) = nodes.get(&entry.id) {
             entry.name = function.label.clone();
             entry.file = compact_property(function, "file").unwrap_or("").to_owned();
-            entry.language = compact_property(function, "language").unwrap_or("").to_owned();
+            entry.language = compact_property(function, "language")
+                .map(str::to_owned)
+                .unwrap_or_else(|| language_for_file(&entry.file).to_owned());
             if let Some(line) = compact_property(function, "start_line")
                 .and_then(|value| value.parse::<i64>().ok())
             {

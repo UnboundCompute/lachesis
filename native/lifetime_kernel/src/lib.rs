@@ -1507,12 +1507,13 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
             .map_err(|error| format!("invalid catalog path: {error}"))?;
         let output = CStr::from_ptr(output_path).to_str()
             .map_err(|error| format!("invalid output path: {error}"))?;
-        let translation = lifetime_proto::TranslationResult::decode(
+        let mut translation = lifetime_proto::TranslationResult::decode(
             fs::read(facts).map_err(|error| format!("cannot read translation facts: {error}"))?.as_slice()
         ).map_err(|error| format!("invalid translation facts: {error}"))?;
         let catalog = atropos_proto::Request::decode(
             fs::read(catalog).map_err(|error| format!("cannot read binary catalog: {error}"))?.as_slice()
         ).map_err(|error| format!("invalid binary catalog: {error}"))?;
+        native_graph::annotate_translation_roles(&mut translation, &catalog);
         let result = summary::summarize(translation, catalog);
         let mut bytes = Vec::new();
         result.encode(&mut bytes).map_err(|error| format!("cannot encode summaries: {error}"))?;
