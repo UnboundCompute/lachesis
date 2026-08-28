@@ -391,7 +391,7 @@ fn match_function(
     let mut widenings = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
-    const MAX_STATES: usize = 1_000_000;
+    const MAX_STATES: usize = 200_000;
 
     while let Some((index, parent_trace, returns, mut bindings, mut released, mut origins, mut nulls,
                     mut nonnull, mut nullable, mut uninitialized, mut pointer_arithmetic, mut escaped,
