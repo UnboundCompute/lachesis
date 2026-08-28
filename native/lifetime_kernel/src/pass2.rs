@@ -412,9 +412,14 @@ fn text_list_property(properties: &[graph_proto::Field], key: &str) -> Vec<Strin
 /// overlay.  The semantic pass uses this compact index to attach source
 /// provenance to event findings; it never reconstructs the graph or invokes a
 /// second taint analysis.
+pub(crate) struct TaintEvidence {
+    pub(crate) witnesses: HashMap<String, Vec<String>>,
+    pub(crate) observed_sinks: std::collections::HashSet<String>,
+}
+
 pub(crate) fn read_taint_evidence_path(
     path: impl AsRef<Path>,
-) -> Result<HashMap<String, Vec<String>>, String> {
+) -> Result<TaintEvidence, String> {
     let file = File::open(path.as_ref())
         .map_err(|error| format!("cannot open Pass-2 evidence sidecar: {error}"))?;
     let mut input = BufReader::with_capacity(1024 * 1024, file);
@@ -428,6 +433,7 @@ pub(crate) fn read_taint_evidence_path(
     let _: graph_proto::DataflowOverlay = graph_proto::DataflowOverlay::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 evidence envelope: {error}"))?;
     let mut result = HashMap::new();
+    let mut observed_sinks = std::collections::HashSet::new();
     // `taint-reach.sink_id` stores the taint sink node id, while the semantic
     // event anchor is normally the sink's underlying value id.  Keep the
     // mapping in that direction; indexing value -> sink made witness
@@ -441,6 +447,8 @@ pub(crate) fn read_taint_evidence_path(
         if node.kind == "sink" {
             if let Some(value) = text_property(&node.properties, "value_id") {
                 sink_values.insert(node.id.clone(), value.to_owned());
+                observed_sinks.insert(node.id.clone());
+                observed_sinks.insert(value.to_owned());
             }
         } else if node.kind == "taint-reach" {
             let Some(sink) = text_property(&node.properties, "sink_id") else { continue; };
@@ -456,7 +464,7 @@ pub(crate) fn read_taint_evidence_path(
             result.entry(value.clone()).or_insert(witness);
         }
     }
-    Ok(result)
+    Ok(TaintEvidence { witnesses: result, observed_sinks })
 }
 
 fn finish_graph(

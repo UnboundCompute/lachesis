@@ -456,7 +456,8 @@ fn match_function(
                     && !escaped.contains(object)
                 {
                     add_finding(&mut findings, &function.id,
-                                "realloc-failure-leak", &objects[object as usize], node, witness);
+                                "mem.lifetime.realloc-failure-leak",
+                                &objects[object as usize], node, witness);
                 }
             }
             for object in origins.iter() {

@@ -1575,15 +1575,11 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         if let Some(source_evidence) = source_evidence.as_ref() {
             for function in &mut full.functions {
                 for node in &mut function.nodes {
-                    // The presence of the binary taint sidecar is the
-                    // analysis contract: every candidate gets an explicit
-                    // computed reachability value.  Only nodes present in
-                    // its witness index are reachable; findings themselves
-                    // must not manufacture that fact.
-                    node.source_reachable = Some(false);
-                    if let Some(witness) = source_evidence.get(&node.anchor) {
+                    if let Some(witness) = source_evidence.witnesses.get(&node.anchor) {
                         node.source_witness_nodes = witness.clone();
                         node.source_reachable = Some(true);
+                    } else if source_evidence.observed_sinks.contains(&node.anchor) {
+                        node.source_reachable = Some(false);
                     }
                 }
             }
@@ -1611,7 +1607,8 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             ).map_err(|error| format!("invalid native translation facts: {error}"))?;
             native_graph::annotate_translation_roles(&mut translation, catalog);
             let summaries = summary::summarize_with_evidence(
-                translation.clone(), catalog.clone(), source_evidence.as_ref());
+                translation.clone(), catalog.clone(),
+                source_evidence.as_ref().map(|evidence| &evidence.witnesses));
             full.skeletons.extend(reach::build(&translation, &summaries, catalog));
             report_native_phase(timing_enabled, semantic_started, "reach summaries", summaries.functions.len(), full.skeletons.len());
         }
