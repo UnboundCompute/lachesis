@@ -55,12 +55,22 @@ fn sink_token(
     truncated: bool,
 ) -> lifetime_proto::NativeSkeletonToken {
     let (callee, argument) = sink_parts(&flow.sink).unwrap_or((flow.sink.as_str(), 0));
+    let family = family_for(callee, language, argument, catalog);
+    // The legacy renderer exposes a bound only for the relational evaluator.
+    // Other sink families must not acquire synthetic bounded/unbounded state
+    // merely because a call site happens to have a guard.
+    let bound = (catalog.pattern_catalog.as_ref()
+        .and_then(|catalog| catalog.kind_evaluator.get(&family))
+        .is_some_and(|evaluator| evaluator == "relational"))
+        .then(|| if guarded { "bounded" } else { "unbounded" })
+        .unwrap_or_default()
+        .to_owned();
     lifetime_proto::NativeSkeletonToken {
-        kind: "sink".into(), family: family_for(callee, language, argument, catalog),
+        kind: "sink".into(), family,
         object_root: flow.root.clone(), value: flow.value.clone(), node: flow.node.clone(),
         line: flow.line, has_line: flow.has_line, depth,
         guarded, tainted: flow.provenance != "const",
-        bound: if guarded { "bounded".into() } else { "unbounded".into() },
+        bound,
         callee: callee.into(), argument, has_argument: true, truncated,
         size_expression: flow.size_expression.clone(), destination: flow.destination.clone(),
         control: flow.control.clone(), guards: flow.guard_predicates.iter().map(|value|
@@ -244,5 +254,19 @@ mod tests {
         let catalog = sink_catalog();
         assert_eq!(family_for("sink_call", "c", 0, &catalog), "buffer-size");
         assert!(family_for("other_call", "c", 0, &catalog).is_empty());
+    }
+
+    #[test]
+    fn bound_is_reserved_for_relational_sink_families() {
+        let mut catalog = sink_catalog();
+        catalog.pattern_catalog.get_or_insert_with(Default::default).kind_evaluator.insert(
+            "buffer-size".into(), "relational".into());
+        let flow = lifetime_proto::NativeSinkFlow {
+            sink: "sink_call.a0".into(), provenance: "source".into(), ..Default::default()
+        };
+        assert_eq!(sink_token(&flow, "c", &catalog, 0, false, false).bound, "unbounded");
+        catalog.pattern_catalog.get_or_insert_with(Default::default).kind_evaluator.insert(
+            "buffer-size".into(), "presence".into());
+        assert!(sink_token(&flow, "c", &catalog, 0, true, false).bound.is_empty());
     }
 }
