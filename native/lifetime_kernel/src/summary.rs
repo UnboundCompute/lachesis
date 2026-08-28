@@ -56,6 +56,13 @@ fn model_sinks(request: &crate::atropos_proto::Request,
         } else { format!("{}.{}", model.package, model.method) };
         result.entry(name).or_default().insert(position);
     }
+    for alias in &request.callee_aliases {
+        if !alias.language.is_empty() && !languages.is_empty()
+            && !languages.contains(&alias.language) { continue; }
+        if let Some(positions) = result.get(&alias.canonical).cloned() {
+            result.entry(alias.surface.clone()).or_default().extend(positions);
+        }
+    }
     result.into_iter().map(|(name, positions)| (name, positions.into_iter().collect())).collect()
 }
 

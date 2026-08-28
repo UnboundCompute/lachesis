@@ -365,10 +365,16 @@ fn lifecycle_role<'a>(
 pub(crate) fn lifecycle_roles(
     catalog: &crate::atropos_proto::Request,
 ) -> HashMap<(String, String), String> {
-    catalog.models.iter().filter_map(|model| {
+    let mut roles: HashMap<(String, String), String> = catalog.models.iter().filter_map(|model| {
         let role = model.role.strip_prefix("lifecycle.")?;
         Some(((model.language.clone(), model.method.clone()), role.to_owned()))
-    }).collect()
+    }).collect();
+    for alias in &catalog.callee_aliases {
+        if let Some(role) = roles.get(&(alias.language.clone(), alias.canonical.clone())).cloned() {
+            roles.insert((alias.language.clone(), alias.surface.clone()), role);
+        }
+    }
+    roles
 }
 
 /// Convert the complete framed substrate to the existing native preparation

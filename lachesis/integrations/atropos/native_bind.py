@@ -156,6 +156,25 @@ def compile_catalog(root: str | os.PathLike[str], output_path: str | os.PathLike
     for name, description in (evaluator_doc.get("evaluators") or {}).items():
         request.pattern_catalog.evaluators.add(
             name=str(name), description=str(description))
+    # Compiler frontends may spell a catalogued operation differently (for
+    # example fortified builtins).  Preserve the old normalizer's declarative
+    # aliases in the binary catalog; runtime Rust never opens these JSON files.
+    profiles_root = root.parent / "profiles"
+    for path in sorted(profiles_root.glob("*/normalization.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        language = str(document.get("language") or path.parent.name)
+        for surface, canonical in (document.get("call_aliases") or {}).items():
+            # Match the old normalizer's maintenance-free symbol rule: profile
+            # metadata such as ``_note`` is prose, not an alias entry.
+            if (isinstance(surface, str) and isinstance(canonical, str)
+                    and surface and canonical
+                    and not any(char.isspace() for char in surface)
+                    and not any(char.isspace() for char in canonical)):
+                request.callee_aliases.add(language=language, surface=surface,
+                                           canonical=canonical)
     request.pattern_catalog.kind_evaluator.update({
         str(name): ",".join(str(value) for value in values)
         if isinstance(values, list) else str(values)

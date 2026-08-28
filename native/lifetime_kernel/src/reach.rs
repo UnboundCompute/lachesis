@@ -28,13 +28,17 @@ fn family_for(
     position: u32,
     catalog: &atropos_proto::Request,
 ) -> String {
+    let canonical = catalog.callee_aliases.iter()
+        .find(|alias| alias.language == language && alias.surface == callee)
+        .map(|alias| alias.canonical.as_str())
+        .unwrap_or(callee);
     catalog.models.iter()
         .filter(|model| model.role == "sink"
             && (model.language.is_empty() || model.language == language)
             && (model.package.is_empty() || model.package == "builtins"
-                && model.method == callee
+                && model.method == canonical
                 || !model.package.is_empty()
-                    && format!("{}.{}", model.package, model.method) == callee))
+                    && format!("{}.{}", model.package, model.method) == canonical))
         .filter(|model| model.access_path.contains(&format!("Argument[{position}]"))
             || model.access_path.contains("Argument[*]"))
         .find_map(|model| (!model.kind.is_empty()).then(|| model.kind.clone()))

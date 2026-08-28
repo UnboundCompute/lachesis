@@ -40,6 +40,12 @@ message Request {
   repeated Model models = 1;
   Index index = 2;
   PatternCatalog pattern_catalog = 3;
+  repeated CalleeAlias callee_aliases = 4;
+}
+message CalleeAlias {
+  string language = 1;
+  string surface = 2;
+  string canonical = 3;
 }
 message Candidate {
   string module = 1;
