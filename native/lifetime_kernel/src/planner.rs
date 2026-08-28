@@ -137,8 +137,20 @@ pub(crate) fn plan(request: lifetime_proto::NativePlanRequest) -> lifetime_proto
     // deterministic structural fallback used by the Python implementation.
     let mut launches: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for name in functions.keys() {
-        if sites.get(name).is_some_and(|value| !value.is_empty()) {
-            launches.insert(name.clone(), ("catalog".into(), sites[name].iter().filter_map(|s| (!s.node.is_empty()).then_some(s.node.clone())).collect()));
+        // Reference gates the catalog launch on the source call carrying a node
+        // (`if call.get("node"): launches.setdefault(caller, []).append(node)`).
+        // A source site without a node still contributes taint influence and a
+        // `source_sites` entry, but is not itself an externally-rooted launch:
+        // a nodeless-source callerless function falls through to the structural/
+        // export branch exactly as `discover_sources` does, and a nodeless-source
+        // function that has callers is not a launch at all (reached, if at all,
+        // through the call graph). Previously any site made a function a
+        // "catalog" launch with a possibly-empty node list, over-claiming
+        // provenance and manufacturing spurious reachability roots.
+        let nodes: Vec<String> = sites.get(name).into_iter().flatten()
+            .filter_map(|site| (!site.node.is_empty()).then_some(site.node.clone())).collect();
+        if !nodes.is_empty() {
+            launches.insert(name.clone(), ("catalog".into(), nodes));
         } else if callers[name].is_empty() {
             launches.insert(name.clone(), (if functions[name].externally_visible { "export" } else { "structural" }.into(), vec!["__entry__".into()]));
         }
@@ -342,5 +354,84 @@ mod tests {
             key3("src", "src", "aaa@9"),
             key3("src", "src", "read@5"),
         ]);
+    }
+
+    #[test]
+    fn nodeful_catalog_source_is_a_catalog_launch() {
+        // A source call that carries a node registers a catalog launch rooted at
+        // that node, matching the reference `launches.setdefault(...).append(node)`.
+        let nodeful = lifetime_proto::TranslationFunction {
+            id: "nodeful".into(), name: "nodeful".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "read".into(), node: "call-1".into(), line: 5, has_line: true,
+                ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![nodeful] }),
+            sources: vec![lifetime_proto::SourceCatalogEntry {
+                name: "read".into(), kind: "external-input".into() }],
+        });
+        let func = result.functions.iter().find(|f| f.name == "nodeful").expect("nodeful function");
+        assert_eq!(func.launch_provenance, "catalog");
+        assert_eq!(func.launch_nodes, vec!["call-1".to_string()]);
+    }
+
+    #[test]
+    fn nodeless_catalog_source_is_structural_not_catalog() {
+        // A catalogued source call with no node contributes influence and a
+        // source site, but the reference only registers a *catalog* launch when
+        // the call has a node. A callerless function whose sole source call is
+        // nodeless therefore surfaces as a structural launch (nodes
+        // `["__entry__"]`), matching `discover_sources`, not as `catalog` with
+        // an empty node list.
+        let nodeless = lifetime_proto::TranslationFunction {
+            id: "nodeless".into(), name: "nodeless".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "read".into(), line: 5, has_line: true, ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![nodeless] }),
+            sources: vec![lifetime_proto::SourceCatalogEntry {
+                name: "read".into(), kind: "external-input".into() }],
+        });
+        let func = result.functions.iter().find(|f| f.name == "nodeless").expect("nodeless function");
+        assert_eq!(func.launch_provenance, "structural");
+        assert_eq!(func.launch_nodes, vec!["__entry__".to_string()]);
+        // The source site and its influence survive; only the launch class changed.
+        assert!(!func.source_sites.is_empty());
+        assert!(func.reachable);
+    }
+
+    #[test]
+    fn nodeless_source_with_callers_is_not_a_launch_root() {
+        // Reference seeds reachability only from `launches`. A nodeless catalog
+        // source on a function that HAS callers is not a launch, so it must not
+        // become an independent reachability root or claim `catalog` provenance;
+        // it is reached through the call graph like any other callee.
+        let entry = lifetime_proto::TranslationFunction {
+            id: "entry".into(), name: "entry".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "mid".into(), node: "c0".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let mid = lifetime_proto::TranslationFunction {
+            id: "mid".into(), name: "mid".into(),
+            calls: vec![lifetime_proto::FunctionCall {
+                callee: "read".into(), line: 7, has_line: true, ..Default::default() }],
+            ..Default::default()
+        };
+        let result = plan(lifetime_proto::NativePlanRequest {
+            translation: Some(lifetime_proto::TranslationResult { functions: vec![entry, mid] }),
+            sources: vec![lifetime_proto::SourceCatalogEntry {
+                name: "read".into(), kind: "external-input".into() }],
+        });
+        let mid_fn = result.functions.iter().find(|f| f.name == "mid").expect("mid function");
+        assert_eq!(mid_fn.launch_provenance, "");
+        assert!(mid_fn.launch_nodes.is_empty());
+        assert!(mid_fn.reachable); // reached via the (structural) entry launch
+        let entry_fn = result.functions.iter().find(|f| f.name == "entry").expect("entry function");
+        assert_eq!(entry_fn.launch_provenance, "structural");
     }
 }
