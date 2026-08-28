@@ -6,7 +6,7 @@
 //! deliberately independent of vulnerability names: source identity comes
 //! from the binary taint evidence and call identity comes from compiler seams.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::lifetime_proto;
 
@@ -20,12 +20,12 @@ fn node_functions(result: &lifetime_proto::NativeSemanticResult) -> HashMap<&str
 
 fn call_graph(
     result: &lifetime_proto::NativeSemanticResult,
-) -> (BTreeMap<String, BTreeSet<String>>, BTreeMap<String, BTreeSet<String>>) {
+) -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
     let owners = node_functions(result);
-    let mut callees: BTreeMap<String, BTreeSet<String>> = result.functions.iter()
-        .map(|function| (function.id.clone(), BTreeSet::new()))
+    let mut callees: HashMap<String, Vec<String>> = result.functions.iter()
+        .map(|function| (function.id.clone(), Vec::new()))
         .collect();
-    let mut callers: BTreeMap<String, BTreeSet<String>> = callees.clone();
+    let mut callers = callees.clone();
     for edge in &result.seams {
         if edge.seam_kind != "call" { continue; }
         let Some(caller) = owners.get(edge.source.as_str()).copied()
@@ -41,8 +41,14 @@ fn call_graph(
             continue;
         };
         if !callees.contains_key(caller) || !callees.contains_key(callee) { continue; }
-        callees.get_mut(caller).expect("caller exists").insert(callee.to_owned());
-        callers.get_mut(callee).expect("callee exists").insert((*caller).to_owned());
+        let callees_for_caller = callees.get_mut(caller).expect("caller exists");
+        if !callees_for_caller.iter().any(|item| item == callee) {
+            callees_for_caller.push(callee.to_owned());
+        }
+        let callers_for_callee = callers.get_mut(callee).expect("callee exists");
+        if !callers_for_callee.iter().any(|item| item.as_str() == caller) {
+            callers_for_callee.push((*caller).to_owned());
+        }
     }
     (callees, callers)
 }
@@ -129,8 +135,8 @@ fn seed_order(items: &[String]) -> Vec<String> {
 /// callees to a fixpoint, with one shared visited set across all seeds.
 fn traverse_component(
     start: &str,
-    callees: &BTreeMap<String, BTreeSet<String>>,
-    callers: &BTreeMap<String, BTreeSet<String>>,
+    callees: &HashMap<String, Vec<String>>,
+    callers: &HashMap<String, Vec<String>>,
     visited: &mut BTreeSet<String>,
 ) -> Vec<String> {
     let mut local = Vec::new();
