@@ -144,6 +144,23 @@ fn contradictory_value(left: &str, right: &str) -> bool {
         ("<", ">=") | (">=", "<") | (">", "<=") | ("<=", ">"))
 }
 
+fn escaped_reaches(
+    value: u32, escaped: &MarkSet, objects: &[ObjectKey], bindings: &[(u32, u32)],
+) -> bool {
+    let value = canonical(value, bindings);
+    let object = &objects[value as usize];
+    escaped.iter().map(|root| canonical(root, bindings)).any(|root| {
+        let root = &objects[root as usize];
+        root.root == object.root && root.generation == object.generation
+            && object.selectors.starts_with(&root.selectors)
+    })
+}
+
+fn has_surviving_alias(value: u32, bindings: &[(u32, u32)]) -> bool {
+    let value = canonical(value, bindings);
+    bindings.iter().any(|(alias, _)| *alias != value && canonical(*alias, bindings) == value)
+}
+
 fn add_finding(
     output: &mut HashMap<(String, String, String, i64), lifetime_proto::NativeTemporalFinding>,
     function: &str,
@@ -453,7 +470,8 @@ fn match_function(
         if exits.contains(&index) {
             for object in realloc_lost.iter() {
                 if !released.contains(object)
-                    && !escaped.contains(object)
+                    && !escaped_reaches(object, &escaped, &objects, &bindings)
+                    && !has_surviving_alias(object, &bindings)
                 {
                     add_finding(&mut findings, &function.id,
                                 "mem.lifetime.realloc-failure-leak",
@@ -462,7 +480,8 @@ fn match_function(
             }
             for object in origins.iter() {
                 if !released.contains(object)
-                    && !escaped.contains(object)
+                    && !escaped_reaches(object, &escaped, &objects, &bindings)
+                    && !has_surviving_alias(object, &bindings)
                 {
                     add_finding(&mut findings, &function.id, "leak",
                                 &objects[object as usize], node, witness);
