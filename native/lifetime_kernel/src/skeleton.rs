@@ -133,6 +133,8 @@ fn walk_region(
     }
     let mut tokens = Vec::new();
     let mut edges_used = Vec::new();
+    let mut emitted_nodes = BTreeSet::new();
+    let mut emitted_edges = BTreeSet::new();
     let mut complete = true;
     while let Some(state) = stack.pop() {
         if !seen.insert(state.clone()) { continue; }
@@ -154,7 +156,8 @@ fn walk_region(
         // reconnect edges heuristically and can create paths that do not
         // exist.  ``family=control`` is an internal binary marker, not a
         // catalogued vulnerability family.
-        tokens.push(lifetime_proto::NativeSkeletonToken {
+        if emitted_nodes.insert(node.id.as_str()) {
+            tokens.push(lifetime_proto::NativeSkeletonToken {
                 kind: if node.event_kind.is_empty() ||
                     matches!(node.event_kind.as_str(), "BRANCH" | "MERGE" | "LOOP") {
                     "control".into()
@@ -173,6 +176,7 @@ fn walk_region(
                 value_selectors: node.value_selectors.clone(),
                 ..Default::default()
             });
+        }
         let outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
             .copied().collect::<Vec<_>>();
         // Claus is a nested flow renderer: a call seam is entered before the
@@ -193,7 +197,8 @@ fn walk_region(
                 complete = false;
                 continue;
             }
-            edges_used.push((*edge).clone());
+            let edge_key = (&edge.source, &edge.target, &edge.kind, &edge.seam_kind, &edge.return_to);
+            if emitted_edges.insert(edge_key) { edges_used.push((*edge).clone()); }
             let mut next_stack = state.stack.clone();
             let mut next_active_functions = state.active_functions.clone();
             if edge.seam_kind == "call" {
@@ -208,7 +213,7 @@ fn walk_region(
                     }
                     tokens.push(lifetime_proto::NativeSkeletonToken {
                         kind: "enter".into(), function: callee.to_owned(),
-                        node: edge.target.clone(), depth: depth + 1, ..Default::default()
+                        depth: depth + 1, ..Default::default()
                     });
                     if !edge.return_to.is_empty() { next_stack.push(edge.return_to.clone()); }
                     next_active_functions.push(callee.to_owned());
@@ -221,7 +226,7 @@ fn walk_region(
                     }
                     tokens.push(lifetime_proto::NativeSkeletonToken {
                         kind: "exit".into(), function: node.function.clone(),
-                        node: node.id.clone(), depth, ..Default::default()
+                        depth, ..Default::default()
                     });
                     next_active_functions.pop();
                 } else {
