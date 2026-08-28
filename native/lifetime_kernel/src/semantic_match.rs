@@ -50,6 +50,27 @@ struct StateKey {
     realloc_lost: MarkSet,
 }
 
+#[derive(Clone, Copy)]
+struct TraceStep {
+    node: usize,
+    parent: Option<usize>,
+}
+
+fn trace_witness(
+    traces: &[TraceStep], current: usize,
+    nodes: &[lifetime_proto::NativeSemanticNode],
+) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        let step = traces[index];
+        output.push(nodes[step.node].id.clone());
+        cursor = step.parent;
+    }
+    output.reverse();
+    output
+}
+
 /// Canonical sparse object-id set used by the matcher worklist.  Stitched
 /// graphs have a large global object universe, while each path usually marks
 /// only a few objects.  Keeping sorted handles avoids cloning a dense bitset
@@ -112,11 +133,6 @@ fn add_finding(
     let owner = if node.function.is_empty() { function } else { node.function.as_str() };
     let line = if node.has_line { node.line } else { 0 };
     let key = (owner.to_owned(), pattern.to_owned(), node.id.clone(), line);
-    let witness = if node.source_witness_nodes.is_empty() {
-        witness_nodes
-    } else {
-        node.source_witness_nodes.as_slice()
-    };
     output.entry(key).or_insert_with(|| lifetime_proto::NativeTemporalFinding {
         function: owner.to_owned(),
         pattern: pattern.to_owned(),
@@ -127,8 +143,11 @@ fn add_finding(
         line,
         has_line: node.has_line,
         node: node.id.clone(),
-        witness_nodes: witness.to_vec(),
-        witness_complete: !witness.is_empty(),
+        // This is the exact matcher-state path, including call/return seams.
+        // Source-taint provenance is retained separately below; substituting
+        // it here would mislabel a value-flow proof as the temporal witness.
+        witness_nodes: witness_nodes.to_vec(),
+        witness_complete: !witness_nodes.is_empty(),
         source_witness_nodes: node.source_witness_nodes.clone(),
         source_reachable: node.source_reachable,
         guards: Vec::new(),
@@ -217,8 +236,6 @@ fn match_function(
     let exits: HashSet<usize> = function.exits.iter()
         .filter_map(|id| by_id.get(id.as_str()).copied())
         .collect();
-    let witnesses = cfg_witnesses(function, &outgoing, entry);
-
     // Intern object identities once.  The old representation put five cloned
     // ObjectKey vectors into every worklist state; on branch-heavy functions
     // that made state hashing and transfer cloning dominate the actual event
@@ -252,7 +269,7 @@ fn match_function(
 
     let empty = MarkSet::empty(objects.len());
     let mut queue = VecDeque::from([(
-        entry, Vec::<usize>::new(),
+        entry, None::<usize>, Vec::<usize>::new(),
         Vec::<(u32, u32)>::new(), empty.clone(), empty.clone(), empty.clone(),
         empty.clone(), empty.clone(), empty.clone(), empty.clone(), empty,
         Vec::<lifetime_proto::GuardProof>::new(),
@@ -260,12 +277,13 @@ fn match_function(
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut guarded_nodes: HashMap<String, Vec<lifetime_proto::GuardProof>> = HashMap::default();
+    let mut traces = Vec::new();
     let mut transfers = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
     // This is a work bound for one function, not a wall-clock hard stop.
     const MAX_STATES: usize = 1_000_000;
 
-    while let Some((index, returns, mut bindings, mut released, mut origins, mut nulls,
+    while let Some((index, parent_trace, returns, mut bindings, mut released, mut origins, mut nulls,
                     mut nonnull, mut uninitialized, mut pointer_arithmetic, mut escaped,
                     mut realloc_lost, path_guards)) = queue.pop_front() {
         if transfers as usize >= MAX_STATES { break; }
@@ -281,8 +299,11 @@ fn match_function(
             realloc_lost: realloc_lost.clone(),
         };
         if !seen.insert(state) { continue; }
+        let trace = traces.len();
+        traces.push(TraceStep { node: index, parent: parent_trace });
         let node = &function.nodes[index];
-        let witness = &witnesses[index];
+        let witness_storage = trace_witness(&traces, trace, &function.nodes);
+        let witness = witness_storage.as_slice();
         if !path_guards.is_empty() {
             guarded_nodes.entry(node.id.clone()).or_insert_with(|| path_guards.clone());
         }
@@ -484,7 +505,7 @@ fn match_function(
                 }
             }
             if !contradiction {
-                queue.push_back((*target, next_returns, next_bindings, released.clone(), origins.clone(), next_nulls,
+                queue.push_back((*target, Some(trace), next_returns, next_bindings, released.clone(), origins.clone(), next_nulls,
                                  next_nonnull, uninitialized.clone(), pointer_arithmetic.clone(),
                                  escaped.clone(), realloc_lost.clone(), next_guards));
             }
