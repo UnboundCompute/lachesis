@@ -61,6 +61,10 @@ fn semantic_indexes<'a>(
 struct WalkState {
     node: String,
     stack: Vec<String>,
+    // Active function identities mirror the old Claus recursion guard.  A
+    // return address alone is insufficient: mutually recursive calls can
+    // keep producing distinct return-node stacks indefinitely.
+    active_functions: Vec<String>,
 }
 
 /// Render the same source-rooted composition boundary as the old Claus path.
@@ -122,7 +126,10 @@ fn walk_region(
     let mut stack = Vec::new();
     let mut seen = BTreeSet::new();
     for start in starts.into_iter().rev() {
-        stack.push(WalkState { node: start, stack: Vec::new() });
+        let active_functions = nodes.get(start.as_str())
+            .map(|node| vec![node.function.clone()])
+            .unwrap_or_default();
+        stack.push(WalkState { node: start, stack: Vec::new(), active_functions });
     }
     let mut tokens = Vec::new();
     let mut edges_used = Vec::new();
@@ -188,14 +195,23 @@ fn walk_region(
             }
             edges_used.push((*edge).clone());
             let mut next_stack = state.stack.clone();
+            let mut next_active_functions = state.active_functions.clone();
             if edge.seam_kind == "call" {
                 let callee = edge.callee.as_str();
                 if !callee.is_empty() && allowed.contains(callee) {
+                    if state.active_functions.iter().any(|function| function == callee) {
+                        // Match the old `_expand_reach` chain guard: retain
+                        // the discovered recursive edge for diagnostics, but
+                        // do not recurse into an unbounded call stack.
+                        complete = false;
+                        continue;
+                    }
                     tokens.push(lifetime_proto::NativeSkeletonToken {
                         kind: "enter".into(), function: callee.to_owned(),
                         node: edge.target.clone(), depth: depth + 1, ..Default::default()
                     });
                     if !edge.return_to.is_empty() { next_stack.push(edge.return_to.clone()); }
+                    next_active_functions.push(callee.to_owned());
                 }
             } else if edge.seam_kind == "return" {
                 if let Some(expected) = next_stack.pop() {
@@ -207,12 +223,15 @@ fn walk_region(
                         kind: "exit".into(), function: node.function.clone(),
                         node: node.id.clone(), depth, ..Default::default()
                     });
+                    next_active_functions.pop();
                 } else {
                     complete = false;
                     continue;
                 }
             }
-            stack.push(WalkState { node: edge.target.clone(), stack: next_stack });
+            stack.push(WalkState {
+                node: edge.target.clone(), stack: next_stack, active_functions: next_active_functions,
+            });
         }
     }
     (tokens, edges_used, complete && !seen.is_empty())
