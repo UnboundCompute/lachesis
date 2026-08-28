@@ -47,8 +47,8 @@ fn call_graph(
     (callees, callers)
 }
 
-fn seed_order(functions: &[String]) -> Vec<String> {
-    let mut order = functions.to_vec();
+fn seed_order(items: &[String]) -> Vec<String> {
+    let mut order = items.to_vec();
     let mut state = 0x9e37_79b9_u64;
     for index in (1..order.len()).rev() {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -105,7 +105,11 @@ fn traverse_component(
     local
 }
 
-/// Pick source-rooted Claus regions until every emitted function is covered.
+/// Pick source-rooted Claus regions until every emitted compiler node is
+/// covered.  The old scheduler selected an unvisited graph node, then used
+/// its owning UDF as the call-graph traversal seed.  Keeping those two levels
+/// separate is important: a function can contain several independent source
+/// anchors and a function-only scheduler silently drops the later ones.
 ///
 /// A source witness identifies the function containing the source value.  If
 /// no witness exists, callerless functions are structural roots, matching the
@@ -116,14 +120,21 @@ pub(crate) fn pick_regions(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeSourceRegion> {
     let (callees, callers) = call_graph(result);
-    let mut names: Vec<String> = result.functions.iter().map(|function| function.id.clone()).collect();
-    names.sort();
-    let order = seed_order(&names);
+    let mut node_order: Vec<(String, String)> = result.functions.iter()
+        .flat_map(|function| function.nodes.iter()
+            .map(|node| (node.id.clone(), function.id.clone())))
+        .collect();
+    node_order.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let shuffled: Vec<String> = seed_order(&node_order.iter()
+        .map(|(node, _)| node.clone()).collect::<Vec<_>>());
+    let owners: HashMap<&str, &str> = node_order.iter()
+        .map(|(node, function)| (node.as_str(), function.as_str())).collect();
     let mut regions = Vec::new();
     let mut visited = BTreeSet::new();
-    for source in order {
-        if visited.contains(&source) { continue; }
-        let selected = traverse_component(&source, &callees, &callers, &mut visited);
+    for seed_node in shuffled {
+        let Some(source) = owners.get(seed_node.as_str()).copied() else { continue };
+        if visited.contains(source) { continue; }
+        let selected = traverse_component(source, &callees, &callers, &mut visited);
         if selected.is_empty() { continue; }
         // The random UDF seed is a coverage starting point, not necessarily
         // the source UDF.  Resolve the source in caller-first traversal order;
@@ -132,7 +143,7 @@ pub(crate) fn pick_regions(
         let source_function = selected.iter().find(|name|
             result.functions.iter().find(|function| function.id.as_str() == name.as_str())
                 .is_some_and(|function| !function.source_launch_nodes.is_empty()))
-            .cloned().unwrap_or_else(|| source.clone());
+            .cloned().unwrap_or_else(|| source.to_owned());
         let source_nodes: Vec<String> = result.functions.iter()
             .find(|function| function.id == source_function)
             .into_iter()
@@ -148,6 +159,7 @@ pub(crate) fn pick_regions(
             source_nodes,
             functions: selected,
             contexts,
+            seed_node,
         });
     }
     regions
@@ -184,6 +196,7 @@ mod tests {
         let regions = pick_regions(&result);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].source_function, "callee");
+        assert!(["src", "sink"].contains(&regions[0].seed_node.as_str()));
         assert_eq!(regions[0].contexts, vec!["__entry__"]);
         assert_eq!(regions[0].functions.iter().collect::<BTreeSet<_>>(),
                    BTreeSet::from([&"source".to_owned(), &"callee".to_owned()]));

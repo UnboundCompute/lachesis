@@ -77,7 +77,6 @@ struct WalkState {
 /// bounded by the finite `(node, call-stack)` state space; revisiting a state
 /// is a loop back-edge, not a second copy of the function.
 fn walk_region(
-    result: &lifetime_proto::NativeSemanticResult,
     region: &lifetime_proto::NativeSourceRegion,
     context: &str,
     functions: &FunctionIndex<'_>,
@@ -102,6 +101,7 @@ fn walk_region(
         // from every launch anchor in that component; this is one cached walk,
         // not one replay per source callsite.
         for id in &region.source_nodes {
+            if starts.iter().any(|start| start == id) { continue; }
             if nodes.contains_key(id.as_str()) {
                 starts.push(id.clone());
             } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
@@ -213,6 +213,37 @@ fn walk_region(
 pub(crate) fn build(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
+    if !result.regions.is_empty() {
+        let (functions, nodes, adjacency) = semantic_indexes(result);
+        let mut output = Vec::new();
+        for region in &result.regions {
+            for context in if region.contexts.is_empty() {
+                vec!["__entry__".to_owned()]
+            } else {
+                region.contexts.clone()
+            } {
+                let (tokens, edges, complete) = walk_region(
+                    region, &context, &functions, &nodes, &adjacency);
+                if tokens.is_empty() { continue; }
+                output.push(lifetime_proto::NativeFlowSkeleton {
+                    kind: "source-rooted".into(),
+                    entry: region.source_function.clone(),
+                    source_function: region.source_function.clone(),
+                    context,
+                    complete,
+                    tokens,
+                    edges,
+                    is_source: true,
+                });
+            }
+        }
+        if !output.is_empty() { return output; }
+    }
+
+    // Keep the function-local projection useful for callers that provide a
+    // prepared semantic result without Claus regions (including small unit
+    // inputs and older binary sidecars). The production Pass-3 path always
+    // has regions and therefore takes the source-rooted branch above.
     let mut output = Vec::new();
     for function in &result.functions {
         let Some(compact) = crate::compact_event_function(function.clone()) else { continue; };
@@ -279,8 +310,8 @@ mod tests {
         };
         let skeletons = build(&result);
         assert_eq!(skeletons.len(), 1);
-        assert_eq!(skeletons[0].tokens[1].family, "memory.alloc");
-        assert_eq!(skeletons[0].tokens[2].family, "memory.free");
+        assert_eq!(skeletons[0].tokens[0].family, "memory.alloc");
+        assert_eq!(skeletons[0].tokens[1].family, "memory.free");
         assert!(skeletons[0].edges.len() >= 1);
     }
 
@@ -326,12 +357,12 @@ mod tests {
             }], ..Default::default()
         };
         let skeletons = build(&result);
-        assert_eq!(skeletons.len(), 2);
+        assert_eq!(skeletons.len(), 1);
         let kinds: Vec<_> = skeletons[0].tokens.iter().map(|token| token.kind.as_str()).collect();
-        assert!(kinds.windows(2).any(|pair| pair == ["enter", "event"]));
-        assert_eq!(skeletons[0].kind, "typestate");
-        assert_eq!(skeletons[0].context, "__entry__");
-        assert!(skeletons.iter().any(|skeleton| skeleton.entry == "callee"));
+        assert!(kinds.iter().any(|kind| *kind == "event"));
+        assert_eq!(skeletons[0].kind, "source-rooted");
+        assert_eq!(skeletons[0].context, "s0");
+        assert!(skeletons[0].tokens.iter().any(|token| token.function == "callee"));
         assert!(skeletons[0].complete);
     }
 }

@@ -448,6 +448,8 @@ message NativeSourceRegion {
   repeated string source_nodes = 2;
   repeated string functions = 3;
   repeated string contexts = 4;
+  // The compiler node selected by the seeded unvisited-node scheduler.
+  string seed_node = 5;
 }
 message NativeSkeletonToken {
   string kind = 1;
