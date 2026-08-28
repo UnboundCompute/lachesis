@@ -18,6 +18,17 @@ struct ObjectKey {
     generation: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FindingKey {
+    function: String,
+    pattern: String,
+    object: ObjectKey,
+    node: String,
+    line: i64,
+    launch: String,
+    returns: Vec<usize>,
+}
+
 impl ObjectKey {
     fn from_node(node: &lifetime_proto::NativeSemanticNode) -> Option<Self> {
         if node.object_root.is_empty() { return None; }
@@ -176,16 +187,23 @@ fn selector_suffix<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 fn add_finding(
-    output: &mut HashMap<(String, String, String, i64), lifetime_proto::NativeTemporalFinding>,
+    output: &mut HashMap<FindingKey, lifetime_proto::NativeTemporalFinding>,
     function: &str,
     pattern: &str,
     object: &ObjectKey,
     node: &lifetime_proto::NativeSemanticNode,
     witness_nodes: &[String],
+    returns: &[usize],
+    guards: &[lifetime_proto::GuardProof],
 ) {
     let owner = if node.function.is_empty() { function } else { node.function.as_str() };
     let line = if node.has_line { node.line } else { 0 };
-    let key = (owner.to_owned(), pattern.to_owned(), node.id.clone(), line);
+    let key = FindingKey {
+        function: owner.to_owned(), pattern: pattern.to_owned(), object: object.clone(),
+        node: node.id.clone(), line,
+        launch: witness_nodes.first().cloned().unwrap_or_default(),
+        returns: returns.to_vec(),
+    };
     output.entry(key).or_insert_with(|| lifetime_proto::NativeTemporalFinding {
         function: owner.to_owned(),
         pattern: pattern.to_owned(),
@@ -203,7 +221,10 @@ fn add_finding(
         witness_complete: !witness_nodes.is_empty(),
         source_witness_nodes: node.source_witness_nodes.clone(),
         source_reachable: node.source_reachable,
-        guards: Vec::new(),
+        // Temporal guards are path evidence, not proof that the lifetime
+        // obligation was discharged. The old matcher therefore retained the
+        // predicates while keeping `guarded=false` for emitted findings.
+        guards: guards.to_vec(),
         guarded: false,
         family: String::new(), pattern_id: String::new(), evaluator: String::new(), tier: 0,
     });
@@ -365,7 +386,6 @@ fn match_function(
     )]);
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
-    let mut guarded_nodes: HashMap<String, Vec<lifetime_proto::GuardProof>> = HashMap::default();
     let mut traces = Vec::new();
     let mut transfers = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
@@ -394,9 +414,6 @@ fn match_function(
         let node = &function.nodes[index];
         let witness_storage = trace_witness(&traces, trace, &function.nodes);
         let witness = witness_storage.as_slice();
-        if !path_guards.is_empty() {
-            guarded_nodes.entry(node.id.clone()).or_insert_with(|| path_guards.clone());
-        }
         let raw_object_id = node_object_ids[index];
         let object_id = raw_object_id.map(|value| canonical(value, &bindings));
         let value_id = node_value_ids[index].map(|value| canonical(value, &bindings));
@@ -406,7 +423,7 @@ fn match_function(
                 bindings.push((target, value));
                 if node.access == "aggregate-copy" {
                     add_finding(&mut findings, &function.id, "aggregate-copy-alias",
-                                &objects[target as usize], node, witness);
+                                &objects[target as usize], node, witness, &returns, &path_guards);
                 }
             },
             "ORIGIN" => if let Some(object) = object_id {
@@ -431,7 +448,7 @@ fn match_function(
                 if !nulls.contains(object) {
                     if released.contains(object) {
                         add_finding(&mut findings, &function.id, "double-free",
-                                    &objects[object as usize], node, witness);
+                                    &objects[object as usize], node, witness, &returns, &path_guards);
                     }
                     released.insert(object);
                 }
@@ -452,38 +469,39 @@ fn match_function(
             "READ_STORAGE" | "memory.deref" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if nulls.contains(object) {
                     add_finding(&mut findings, &function.id, "null-deref",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if nullable.contains(object) && !nonnull.contains(object) {
                     add_finding(&mut findings, &function.id, "unchecked-return-deref",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if pointer_arithmetic.contains(object) {
                     add_finding(&mut findings, &function.id,
                                 "pointer-arithmetic-before-validation",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
             },
             "WRITE_STORAGE" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "uaf.deref",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if nulls.contains(object) {
                     add_finding(&mut findings, &function.id, "null-deref",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id,
-                                "uninitialized-use", &objects[object as usize], node, witness);
+                                "uninitialized-use", &objects[object as usize], node, witness,
+                                &returns, &path_guards);
                 }
                 if let Some(value) = value_id {
                     bindings.retain(|(source, _)| *source != object);
@@ -493,15 +511,15 @@ fn match_function(
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
                 if released.contains(object) {
                     add_finding(&mut findings, &function.id, "use.dangling",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if uninitialized.contains(object) {
                     add_finding(&mut findings, &function.id, "uninitialized-use",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if node.event_kind == "RETURN_VALUE" && node.stack_local {
                     add_finding(&mut findings, &function.id, "use-after-return",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
                 if node.event_kind == "RETURN_VALUE" {
                     escaped.insert(object);
@@ -527,7 +545,7 @@ fn match_function(
                 {
                     add_finding(&mut findings, &function.id,
                                 "mem.lifetime.realloc-failure-leak",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
             }
             for object in origins.iter() {
@@ -536,7 +554,7 @@ fn match_function(
                     && !has_surviving_alias(object, &bindings)
                 {
                     add_finding(&mut findings, &function.id, "leak",
-                                &objects[object as usize], node, witness);
+                                &objects[object as usize], node, witness, &returns, &path_guards);
                 }
             }
         }
@@ -629,12 +647,6 @@ fn match_function(
         }
     }
 
-    for finding in findings.values_mut() {
-        if let Some(guards) = guarded_nodes.get(&finding.node) {
-            finding.guards = guards.clone();
-            finding.guarded = true;
-        }
-    }
     let mut findings: Vec<_> = findings.into_values().collect();
     findings.sort_by(|left, right| {
         (&left.pattern, &left.node, left.line, left.has_line)
