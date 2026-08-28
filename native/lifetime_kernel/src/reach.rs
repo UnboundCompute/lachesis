@@ -122,8 +122,7 @@ fn expand(
                             kind: "enter".into(), function: flow.via.clone(), depth: depth + 1,
                             ..Default::default()
                         });
-                    let site_guarded = call.is_some_and(|call| !call.control.is_empty()
-                        || !call.guard_predicates.is_empty());
+                    let site_guarded = call.is_some_and(|call| !call.guards.is_empty());
                     let mut next_chain = chain.clone();
                     next_chain.insert(flow.via.clone());
                     let complete = expand(&flow.via, subflow, functions, summaries, catalog,

@@ -174,10 +174,8 @@ pub(crate) fn summarize_with_evidence(
             let witness = evidence.and_then(|items| items.get(&root)).cloned().unwrap_or_default();
             lifetime_proto::NativeSinkFlow {
                 sink, value, root, provenance: if witness.is_empty() { "local".into() } else { "source".into() },
-                guarded: call.is_some_and(|call| !call.control.is_empty()
-                    || !call.guard_predicates.is_empty()),
-                site_guarded: call.is_some_and(|call| !call.control.is_empty()
-                    || !call.guard_predicates.is_empty()), via,
+                guarded: call.is_some_and(|call| !call.guards.is_empty()),
+                site_guarded: call.is_some_and(|call| !call.guards.is_empty()), via,
                 node: call.map(|call| call.node.clone()).unwrap_or_default(),
                 line: call.map(|call| call.line).unwrap_or_default(),
                 has_line: call.is_some_and(|call| call.has_line),
