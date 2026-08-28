@@ -245,9 +245,22 @@ impl Emitter {
         }
     }
 
-    fn node(&mut self, record: graph::NodeRecord) -> io::Result<()> {
+    fn node(&mut self, mut record: graph::NodeRecord) -> io::Result<()> {
         if !self.node_ids.insert(id_key(&record.id)) {
             return Ok(());
+        }
+        // Stamp `language` on every node at the single emit choke point so it
+        // lands in nodes.pb regardless of the output path. The frontend-bundle
+        // writer applies the identical stamp in add_contract_defaults, but the
+        // streaming path (LACHESIS_SHARD_ROOT) bypasses that post-process, so
+        // without this call/expression/argument nodes reach the graph with no
+        // language and the Pass-2 native binder's language filter drops every
+        // callsite. Derive it exactly as add_contract_defaults does.
+        if !has_property(&record.properties, "language") {
+            let file = property_text(&record.properties, "absolute_file")
+                .or_else(|| property_text(&record.properties, "file"))
+                .unwrap_or_default();
+            record.properties.push(field("language", text(language_for_path(&file))));
         }
         if record.kind == "function" {
             let declaration_only = record.properties.iter().find_map(|property| {
@@ -381,6 +394,11 @@ fn json_syntax_kind(kind: &str) -> &str {
         "StructDecl" | "UnionDecl" => "RecordDecl",
         "MemberRefExpr" => "MemberExpr",
         "UnexposedExpr" => "ImplicitCastExpr",
+        // libclang spells sizeof/alignof/vec_step as the bare "UnaryExpr"; the
+        // clang-JSON reference (and every downstream substrate whitelist) names
+        // it UnaryExprOrTypeTraitExpr. Ordinary unary operators are a distinct
+        // kind (UnaryOperator), so this remap only touches size-of-type nodes.
+        "UnaryExpr" => "UnaryExprOrTypeTraitExpr",
         other => other,
     }
 }
