@@ -58,17 +58,6 @@ fn forward(start: &str, callees: &BTreeMap<String, BTreeSet<String>>) -> BTreeSe
     seen
 }
 
-fn backward(start: &str, callers: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
-    let mut seen = BTreeSet::from([start.to_owned()]);
-    let mut queue = VecDeque::from([start.to_owned()]);
-    while let Some(function) = queue.pop_front() {
-        for caller in callers.get(&function).into_iter().flatten() {
-            if seen.insert(caller.clone()) { queue.push_back(caller.clone()); }
-        }
-    }
-    seen
-}
-
 /// Pick source-rooted Claus regions until every emitted function is covered.
 ///
 /// A source witness identifies the function containing the source value.  If
@@ -119,14 +108,14 @@ pub(crate) fn pick_regions(
     let mut covered = BTreeSet::new();
     for (source, nodes) in &source_nodes {
         let cone = forward(source, &callees);
-        // Keep the old scheduler's two-sided proof: a function belongs to a
-        // source region only when it is both forward-reachable from that
-        // source and backward-reachable to it.  This prevents a malformed
-        // disconnected seam from crediting an unrelated function.
+        // `cone` is already the intersection of the source's forward
+        // reachability with the call graph represented by `callers`: every
+        // member was reached by following a valid call edge from `source`.
+        // Re-running a reverse traversal for every function here was
+        // quadratic in the number of functions and added no information.
         let selected: Vec<String> = result.functions.iter()
             .map(|function| function.id.as_str())
-            .filter(|function| cone.contains(*function)
-                && backward(function, &callers).contains(source))
+            .filter(|function| cone.contains(*function))
             .map(str::to_owned)
             .collect();
         if selected.is_empty() { continue; }
