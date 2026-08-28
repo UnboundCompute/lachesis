@@ -161,6 +161,20 @@ fn has_surviving_alias(value: u32, bindings: &[(u32, u32)]) -> bool {
     bindings.iter().any(|(alias, _)| *alias != value && canonical(*alias, bindings) == value)
 }
 
+fn object_label(object: &ObjectKey) -> String {
+    format!("{}{}", object.root.strip_prefix("decl:").unwrap_or(&object.root),
+            object.selectors.join(""))
+}
+
+fn selector_suffix<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = label.strip_prefix(prefix)?;
+    if suffix.is_empty() || matches!(suffix.as_bytes()[0], b'-' | b'.' | b'[' | b'*' | b'&') {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
 fn add_finding(
     output: &mut HashMap<(String, String, String, i64), lifetime_proto::NativeTemporalFinding>,
     function: &str,
@@ -304,6 +318,41 @@ fn match_function(
             };
             if slot == 0 { node_object_ids[index] = Some(id); }
             else { node_value_ids[index] = Some(id); }
+        }
+    }
+    let object_labels: Vec<String> = objects.iter().map(object_label).collect();
+    let mut objects_by_label: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (index, label) in object_labels.iter().enumerate() {
+        objects_by_label.entry(label.as_str()).or_default().push(index as u32);
+    }
+    // Compile exact and field-prefix seam rebases once. The old matcher
+    // composed the unmatched selector suffix (formal->field => actual->field);
+    // doing that inside the worklist multiplied string scans by every state.
+    let mut expanded_seam_bindings: HashMap<String, Vec<(u32, u32)>> = HashMap::default();
+    for edge in &function.edges {
+        for binding in &edge.bindings {
+            for encoded in &binding.formal_to_actual {
+                if expanded_seam_bindings.contains_key(encoded) { continue; }
+                let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue };
+                let formal = formal.strip_prefix("decl:").unwrap_or(formal);
+                let actual = actual.strip_prefix("decl:").unwrap_or(actual);
+                let mut pairs = Vec::new();
+                for (source, label) in object_labels.iter().enumerate() {
+                    let Some(suffix) = selector_suffix(label, formal) else { continue };
+                    let target_label = format!("{actual}{suffix}");
+                    let Some(targets) = objects_by_label.get(target_label.as_str()) else { continue };
+                    let source_generation = &objects[source].generation;
+                    if let Some(target) = targets.iter().copied().find(|target|
+                        objects[*target as usize].generation == *source_generation)
+                        .or_else(|| targets.iter().copied().find(|target|
+                            objects[*target as usize].generation == "g0")) {
+                        pairs.push((source as u32, target));
+                    }
+                }
+                pairs.sort_unstable();
+                pairs.dedup();
+                expanded_seam_bindings.insert(encoded.clone(), pairs);
+            }
         }
     }
 
@@ -505,25 +554,18 @@ fn match_function(
                 if continuation != *target { continue; }
             }
             let mut next_bindings = bindings.clone();
-            let object_label = |object: &ObjectKey| {
-                format!("{}{}", object.root, object.selectors.join(""))
-            };
             for binding in seam_bindings {
                 for encoded in &binding.formal_to_actual {
-                    let Some((formal, actual)) = encoded.split_once('\u{1f}') else { continue; };
-                    let source = objects.iter().position(|object|
-                        object_label(object) == formal && object.generation == "g0");
-                    let target_object = objects.iter().position(|object|
-                        object_label(object) == actual && object.generation == "g0");
-                    if let (Some(source), Some(target_object)) = (source, target_object) {
-                        next_bindings.push((source as u32, target_object as u32));
+                    if let Some(pairs) = expanded_seam_bindings.get(encoded) {
+                        next_bindings.extend(pairs.iter().copied());
                     }
                 }
             }
             if seam_kind == "return" && !return_to.is_empty() {
                 if let (Some(source), Some(target_object)) = (
                     node_object_ids[index],
-                    objects.iter().position(|object| object_label(object) == *return_to),
+                    object_labels.iter().position(|label|
+                        label == return_to.strip_prefix("decl:").unwrap_or(return_to)),
                 ) {
                     // A returned value is assigned in the caller. Keep
                     // canonicalization pointed from that caller-side
