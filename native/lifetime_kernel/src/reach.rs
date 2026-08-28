@@ -169,6 +169,25 @@ pub(crate) fn build(
     }
     let summary_map: HashMap<String, &lifetime_proto::NativeSummaryFunction> = summaries.functions.iter()
         .map(|summary| (summary.name.clone(), summary)).collect();
+    // The legacy F record's `is_source` is a graph-topology property: it is
+    // true for a function with no resolved callers.  A catalogued source call
+    // is separate launch evidence and must not replace that definition. Keep
+    // compiler-ID resolution first so same-spelled internal functions do not
+    // steal one another's caller relation.
+    let mut callers = BTreeSet::new();
+    for function in functions.values() {
+        for call in &function.calls {
+            let target = if !call.callee_function_id.is_empty() {
+                functions.iter().find(|(_, candidate)|
+                    candidate.id == call.callee_function_id).map(|(name, _)| name)
+            } else {
+                functions.contains_key(&call.callee).then_some(&call.callee)
+            };
+            if let Some(target) = target {
+                callers.insert(target.clone());
+            }
+        }
+    }
     // The old engine emitted a skeleton for every function carrying a summary
     // flow.  Callerless/source roots are marked separately; they are not a
     // reason to discard callee-local skeletons, which are needed for coverage
@@ -179,8 +198,7 @@ pub(crate) fn build(
     let mut output = Vec::new();
     for root in roots {
         let Some(summary) = summary_map.get(&root) else { continue };
-        let is_source = functions.get(&root).is_some_and(|function|
-            function.calls.iter().any(|call| call.is_source));
+        let is_source = !callers.contains(&root);
         for flow in &summary.sink_flows {
             let mut tokens = vec![lifetime_proto::NativeSkeletonToken {
                 kind: "enter".into(), function: root.clone(), depth: 0, ..Default::default()
@@ -239,7 +257,7 @@ mod tests {
         let skeletons = build(&translation, &summaries, &sink_catalog());
         assert_eq!(skeletons.len(), 3);
         assert!(skeletons.iter().any(|item| item.entry == "public_entry" && item.is_source));
-        assert!(skeletons.iter().any(|item| item.entry == "internal_helper" && !item.is_source));
+        assert!(skeletons.iter().any(|item| item.entry == "internal_helper" && item.is_source));
         assert!(skeletons.iter().any(|item| item.entry == "internal_helper@static-id-2"));
         let sink_nodes: BTreeSet<&str> = skeletons.iter().flat_map(|item| item.tokens.iter())
             .filter(|token| token.kind == "sink")
