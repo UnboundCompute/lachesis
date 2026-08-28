@@ -1431,6 +1431,12 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             }
         }
         if cfg_node_set.contains(&anchor) { item.node = anchor; }
+        if item.access == "return-may-null" {
+            if let Some(continuation) = successor_map.get(&item.node)
+                .and_then(|targets| targets.first()) {
+                item.node = continuation.clone();
+            }
+        }
     }
     operations.retain(|item| node_set.contains(&item.node));
     let mut prepared_nodes = if let Some(nodes) = prepared_from_cfg {
@@ -2000,7 +2006,7 @@ pub(crate) fn semantic_request(
         if seam.seam_kind == "call" {
             if let Some(function) = functions.iter().find(|item| item.id == binding.caller) {
                 let anchor = binding.call_node.as_str();
-                if let Some(node) = function.nodes.iter().find(|node|
+                if let Some(node) = function.nodes.iter().rev().find(|node|
                     node.anchor == anchor && !node.event_kind.is_empty())
                     .or_else(|| function.nodes.iter().find(|node| node.anchor == anchor)) {
                     seam.source = node.id.clone();
