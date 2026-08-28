@@ -25,6 +25,7 @@ from lachesis.core.graph_wire import (
     read_frames, write_frame,
 )
 from lachesis.core import graph_pb2, lifetime_pb2
+from lachesis.planner.unbounded_copy import BranchRegions, _REGION_EDGE_KINDS
 
 from lachesis.timeit import timeit
 
@@ -74,6 +75,25 @@ _SUBSTRATE_PROPERTY_KEYS = frozenset({
     "receiver_member_id", "resolution", "allocation_kind", "allocated_type",
     "control_kind", "is_alloc", "is_release", "is_realloc", "is_aggregate_copy",
     "declaration_only", "storage_class", "owner_id",
+    # Size-guard facts stamped by the branch-region classifier before pruning.
+    # Both are scalar strings so they survive the substrate's scalar filter and
+    # reach the native kernel on the filtered Pass-3 substrate as well as the
+    # lossless Pass-2 input.
+    "guard_status", "guards",
+})
+
+# Delimiters packing the per-call guard list into one scalar node property: each
+# guard is ``var<US>canon`` and guards are joined by ``<RS>``.  Both are single
+# ASCII control bytes (valid UTF-8) that never occur in a source identifier or
+# condition, so the string round-trips through the graph-wire text encoder.
+_GUARD_PAIR_SEP = "\x1f"
+_GUARD_SEP = "\x1e"
+
+# Call/construct node kinds across every frontend, shared by the translation
+# projection and the guard-fact stamper.
+_CALL_KINDS = frozenset({
+    "CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "call", "Call",
+    "CallExpression", "construct", "NewExpression",
 })
 
 
@@ -210,54 +230,65 @@ _PATH_CASTS = {
 }
 
 
-def _translation_facts(nodes, records):
-    """Project the Pass-1 records into the compact native translation ABI."""
-    by_id = {node["id"]: node for node in nodes}
-    children = defaultdict(list)
-    parents = {}
-    refers = {}
-    source_edges = defaultdict(list)
-    for edge in records:
-        source, target = edge["source"], edge["target"]
-        source_edges[source].append(edge)
-        if edge["kind"] == "AST_CHILD":
-            children[source].append((target, (edge.get("properties") or {}).get("role", "")))
-            parents.setdefault(target, source)
-        elif edge["kind"] == "REFERS_TO":
-            refers[source] = target
+class _AstPaths:
+    """Shared AST/value index + expression-root path resolver over Pass-1 records.
 
-    def props(node):
+    The translation projection and the guard-fact stamper both need the same
+    by-id / AST-child / REFERS_TO maps and the same peel/path resolution to turn
+    a call argument node into its source variable root.  They read the same
+    immutable Pass-1 records (the stamper the full set, the projection the pruned
+    one), so the resolution is identical either way -- extracting it keeps the two
+    consumers in exact agreement instead of drifting behind two copies.
+    """
+
+    def __init__(self, nodes, records):
+        self.by_id = {node["id"]: node for node in nodes}
+        self.children = defaultdict(list)
+        self.parents = {}
+        self.refers = {}
+        self.source_edges = defaultdict(list)
+        for edge in records:
+            source, target = edge["source"], edge["target"]
+            self.source_edges[source].append(edge)
+            if edge["kind"] == "AST_CHILD":
+                self.children[source].append(
+                    (target, (edge.get("properties") or {}).get("role", "")))
+                self.parents.setdefault(target, source)
+            elif edge["kind"] == "REFERS_TO":
+                self.refers[source] = target
+
+    def props(self, node):
         return node.get("properties") or {}
 
-    def syntax(node_id):
-        node = by_id.get(node_id)
-        return (props(node).get("syntax_kind") or node.get("kind")) if node else ""
+    def syntax(self, node_id):
+        node = self.by_id.get(node_id)
+        return (self.props(node).get("syntax_kind") or node.get("kind")) if node else ""
 
-    def peel(node_id):
+    def peel(self, node_id):
         for _ in range(12):
-            if syntax(node_id) not in _PATH_CASTS:
+            if self.syntax(node_id) not in _PATH_CASTS:
                 break
-            items = children.get(node_id, ())
+            items = self.children.get(node_id, ())
             if not items:
                 break
             node_id = items[0][0]
         return node_id
 
-    def path(node_id, depth=0):
+    def path(self, node_id, depth=0):
         if not node_id or depth > 40:
             return None
-        node_id = peel(node_id)
-        node = by_id.get(node_id)
+        node_id = self.peel(node_id)
+        node = self.by_id.get(node_id)
         if node is None:
             return None
-        kind = syntax(node_id)
+        kind = self.syntax(node_id)
         if kind == "DeclRefExpr":
-            return path(refers.get(node_id), depth + 1)
+            return self.path(self.refers.get(node_id), depth + 1)
         if kind in {"ParmVarDecl", "VarDecl"}:
             return (f"decl:{node_id}", [])
         if kind == "MemberExpr":
-            items = children.get(node_id, ())
-            base = path(items[0][0], depth + 1) if items else None
+            items = self.children.get(node_id, ())
+            base = self.path(items[0][0], depth + 1) if items else None
             if base is None:
                 return None
             label = node.get("label") or ""
@@ -273,20 +304,184 @@ def _translation_facts(nodes, records):
             selectors = (["*"] if arrow else []) + [field] + list(base[1])
             return base[0], selectors
         if kind == "ArraySubscriptExpr":
-            items = children.get(node_id, ())
-            base = path(items[0][0], depth + 1) if items else None
+            items = self.children.get(node_id, ())
+            base = self.path(items[0][0], depth + 1) if items else None
             return None if base is None else (base[0], list(base[1]) + ["<?>", "*"])
         if kind == "UnaryOperator":
-            items = children.get(node_id, ())
-            base = path(items[0][0], depth + 1) if items else None
+            items = self.children.get(node_id, ())
+            base = self.path(items[0][0], depth + 1) if items else None
             if base is None:
                 return None
-            operator = props(node).get("operator", "")
+            operator = self.props(node).get("operator", "")
             selectors = list(base[1])
             if operator in {"*", "&"}:
                 selectors.append(operator)
             return base[0], selectors
         return None
+
+    def root_label(self, root):
+        root = (root or "").removeprefix("decl:")
+        node = self.by_id.get(root)
+        return (node.get("label") or root) if node else root
+
+
+def _guard_span(props):
+    """(file, start_offset, end_offset) of a call node, or None -- the tuple the
+    branch-region classifier places a call site against."""
+    path = props.get("absolute_file") or props.get("file")
+    start, end = props.get("start_offset"), props.get("end_offset")
+    if not path or start is None or end is None:
+        return None
+    return path, start, end
+
+
+def _compute_call_guard_facts(nodes, edges):
+    """Name the branch-region size guard on every call site.
+
+    Faithful port of the reference Pass-2 guard projection (``translate._guards_for``
+    / ``_guard_status_for``): ``BranchRegions`` over the graph names, for each call
+    site, the size-testing branch whose region contains it.  Returns
+    ``{call_node_id: {"guard_status", "guards"?}}`` -- the shared core of the
+    in-place stamper (below) and the streamed guard pre-pass (:func:`_streaming_guard_map`),
+    so both derive identical facts from one code path.  Only magnitude-relation
+    branches are named (a nullness test is not a size guard, and lifetime nullness is
+    recovered separately from the alloc/realloc diamonds); when the graph carries no
+    branch-region substrate the map is empty -- an honest absence, not a regression.
+    """
+    regions = BranchRegions({"nodes": nodes, "edges": edges})
+    if not regions.has_substrate:
+        return {}
+    idx = _AstPaths(nodes, edges)
+    facts = {}
+    for node in nodes:
+        if idx.syntax(node["id"]) not in _CALL_KINDS:
+            continue
+        node_props = node.get("properties")
+        if not isinstance(node_props, dict):
+            continue
+        owner = node_props.get("owner_function_id") or node_props.get("function_id")
+        if not owner:
+            continue
+        span = _guard_span(node_props)
+        if span is None:
+            continue
+        idents = set()
+        for edge in idx.source_edges[node["id"]]:
+            if (edge["kind"] == "AST_CHILD"
+                    and (edge.get("properties") or {}).get("role") == "ARGUMENT"):
+                arg_path = idx.path(edge["target"])
+                if arg_path and arg_path[0]:
+                    idents.add(idx.root_label(arg_path[0]))
+        if not idents:
+            continue
+        verdict = regions.classify(owner, idents, span)
+        status = verdict.get("status", "not-computed")
+        if status not in {"guarded-region", "fall-through"}:
+            continue
+        fact = {"guard_status": status}
+        if status == "guarded-region":
+            packed, seen = [], set()
+            for region in verdict.get("regions", ()):
+                canon = region.get("condition") or ""
+                for name in region.get("names", ()):
+                    if (name, canon) in seen:
+                        continue
+                    seen.add((name, canon))
+                    packed.append(f"{name}{_GUARD_PAIR_SEP}{canon}")
+            if packed:
+                fact["guards"] = _GUARD_SEP.join(packed)
+        facts[node["id"]] = fact
+    return facts
+
+
+def _stamp_call_guard_facts(nodes, edges):
+    """Stamp size-guard facts onto call nodes from the branch-region substrate.
+
+    Used by the whole-graph writer, where the region edges the classifier needs
+    survive only until pruning drops them.  Stamping onto the shared node dicts
+    before the copy means both the lossless Pass-2 input (full nodes) and the
+    filtered Pass-3 substrate (allowlisted scalar copy) carry the facts downstream.
+    See :func:`_compute_call_guard_facts` for the classification semantics.
+    """
+    facts = _compute_call_guard_facts(nodes, edges)
+    if not facts:
+        return
+    for node in nodes:
+        fact = facts.get(node["id"])
+        node_props = node.get("properties") if fact else None
+        if isinstance(node_props, dict):
+            node_props.update(fact)
+
+
+def _streaming_guard_map(reader):
+    """Per-call size-guard facts for a streamed build, without composing the graph.
+
+    The branch-region classifier needs each function's condition nodes and region
+    edges together, but the single copy pass must emit a call node before it has
+    seen that function's later branches.  A bounded pre-pass replays the reader
+    once, holding only the substrate-kind nodes and the AST/region edges the
+    classifier reads (never the token/source-span bulk), then keeps just the small
+    ``{call_id -> guard fact}`` map.  Peak is the order of the translation index the
+    streamed writer already builds, incurred sequentially rather than added to it.
+    """
+    nodes, edges = [], []
+    raw_nodes = getattr(reader, "raw_nodes", None)
+    if raw_nodes is not None:
+        for payload in raw_nodes():
+            message, properties = _native_node_projection(payload)
+            syntax_kind = properties.get("syntax_kind") or message.kind
+            if syntax_kind in _SUBSTRATE_NODE_KINDS:
+                nodes.append({"id": message.id, "kind": message.kind,
+                              "label": message.label, "properties": properties})
+    else:
+        for node in reader.nodes():
+            props = node.get("properties") or {}
+            syntax_kind = props.get("syntax_kind") or node.get("kind")
+            if syntax_kind in _SUBSTRATE_NODE_KINDS:
+                nodes.append(node)
+    wanted_edges = {"AST_CHILD", "REFERS_TO"} | set(_REGION_EDGE_KINDS)
+    raw_edges = getattr(reader, "raw_edges", None)
+    if raw_edges is not None:
+        for payload in raw_edges():
+            message, properties = _native_edge_projection(payload)
+            kind = properties.get("semantic_kind") or message.kind
+            if kind in wanted_edges:
+                edges.append({"kind": kind, "source": message.source,
+                              "target": message.target, "properties": properties})
+    else:
+        for edge in reader.edges():
+            props = edge.get("properties") or {}
+            kind = props.get("semantic_kind") or edge.get("semantic_kind") or edge.get("kind")
+            if kind in wanted_edges:
+                edges.append({"kind": kind, "source": edge.get("source"),
+                              "target": edge.get("target"), "properties": props})
+    return _compute_call_guard_facts(nodes, edges)
+
+
+def _guard_property_fragment(fact):
+    """A NodeRecord byte fragment carrying only the guard scalar properties.
+
+    Concatenating serialized protobuf messages merges their repeated fields, so
+    appending this fragment to an existing NodeRecord payload adds the guard
+    ``properties`` entries losslessly -- the streamed writer never re-encodes or
+    inspects the original call record, which keeps the Pass-2 input exact.
+    """
+    return encode_node({"properties": fact})
+
+
+def _translation_facts(nodes, records):
+    """Project the Pass-1 records into the compact native translation ABI."""
+    idx = _AstPaths(nodes, records)
+    by_id = idx.by_id
+    children = idx.children
+    parents = idx.parents
+    refers = idx.refers
+    source_edges = idx.source_edges
+    props = idx.props
+    syntax = idx.syntax
+    peel = idx.peel
+    path = idx.path
+    root_label = idx.root_label
 
     function_kinds = {
         "function", "method", "constructor", "FunctionDecl", "CXXMethodDecl",
@@ -297,11 +492,6 @@ def _translation_facts(nodes, records):
     function_names = {node["id"]: node.get("label", "") for node in nodes
                       if syntax(node["id"]) in function_kinds}
     function_ids = set(function_names)
-
-    def root_label(root):
-        root = (root or "").removeprefix("decl:")
-        node = by_id.get(root)
-        return (node.get("label") or root) if node else root
 
     functions = {}
     return_nodes = defaultdict(list)
@@ -356,6 +546,19 @@ def _translation_facts(nodes, records):
             is_realloc=node_props.get("is_realloc") is True,
             is_aggregate_copy=node_props.get("is_aggregate_copy") is True,
         )
+        # Carry the branch-region guard facts stamped before pruning.  The
+        # translation ABI keeps the canon-only ``guard_predicates`` view (field 21)
+        # and the region ``guard_status`` (field 20); the paired-var form rides the
+        # lossless Pass-2 input for the seam layer, so it is not repeated here.
+        guard_status = node_props.get("guard_status")
+        if guard_status:
+            call.guard_status = guard_status
+        guards_raw = node_props.get("guards")
+        if guards_raw:
+            for chunk in guards_raw.split(_GUARD_SEP):
+                _, _, canon = chunk.partition(_GUARD_PAIR_SEP)
+                if canon:
+                    call.guard_predicates.append(canon)
         parent_id = parents.get(node_id)
         if (parent_id and syntax(parent_id) in {"BinaryOperator", "AssignmentExpression"}
                 and props(by_id[parent_id]).get("operator", "=") == "="):
@@ -545,6 +748,11 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
     if keep_node is None and prune is not None:
         keep_node = lambda node: not (prune and node.get("kind") in {"token", "source-span"})
     kept_ids = set()
+    # Size-guard facts depend on branches the copy pass has not yet seen when it
+    # must emit a call node, so compute them up front from a bounded replay.  Empty
+    # when the frontend emits no branch-region edges -- an honest absence that keeps
+    # this path a no-op for such builds.  See _streaming_guard_map.
+    guard_map = _streaming_guard_map(reader)
     target = Path(graph_path)
     pass2_target = pass2_input_cache_path(target)
     fd, pass2_temp = tempfile.mkstemp(
@@ -610,22 +818,32 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
                         continue
                     node_id = node.get("id")
                     kept_ids.add(node_id)
+                    guard_fact = guard_map.get(node_id)
                     # Shard payloads already use the canonical NodeRecord wire
                     # format.  Copy them directly into the complete Pass-2
                     # stream; the decoded dict remains available for pruning and
-                    # the compact Pass-3 projection below.
-                    write_frame(pass2, b"N" +
-                                (payload if payload is not None else encode_node(node)))
+                    # the compact Pass-3 projection below.  A guarded call site
+                    # gets its scalar guard properties merged in -- for a native
+                    # payload by appending a NodeRecord fragment (protobuf merges
+                    # the repeated properties losslessly, so the original record
+                    # is never re-encoded); otherwise straight from the dict.
+                    node_bytes = payload if payload is not None else encode_node(node)
+                    if guard_fact:
+                        node_bytes = node_bytes + _guard_property_fragment(guard_fact)
+                    write_frame(pass2, b"N" + node_bytes)
                     props = node.get("properties") or {}
                     syntax_kind = props.get("syntax_kind") or node.get("kind")
                     if syntax_kind not in _SUBSTRATE_NODE_KINDS:
                         continue
+                    compact_props = {
+                        key: value for key, value in props.items()
+                        if key in _SUBSTRATE_PROPERTY_KEYS
+                        and isinstance(value, (str, int, float, bool, type(None)))
+                    }
+                    if guard_fact:
+                        compact_props.update(guard_fact)
                     compact = _CompactNode(
-                        node_id, node.get("kind"), node.get("label"), {
-                            key: value for key, value in props.items()
-                            if key in _SUBSTRATE_PROPERTY_KEYS
-                            and isinstance(value, (str, int, float, bool, type(None)))
-                        })
+                        node_id, node.get("kind"), node.get("label"), compact_props)
                     write_frame(node_stage, b"N" + encode_node(compact))
                     substrate_node_count += 1
                     if syntax_kind == "MemberExpr":
@@ -766,6 +984,12 @@ def write_substrate_cache(graph, graph_path, *, manifest=None):
     # retains the stronger validation used by the normal Pass-1 writer.
     node_ids = ({node.get("id") for node in nodes}
                 if "nodes" in graph else None)
+    # Compute the branch-region guard facts here, over the still-complete graph:
+    # the region edges the classifier needs survive only until the pruning below
+    # drops them.  Stamping onto the shared node dicts before the copy means both
+    # the lossless Pass-2 input (full nodes) and the filtered Pass-3 substrate
+    # (allowlisted scalar copy) carry the facts downstream.
+    _stamp_call_guard_facts(nodes, graph.get("edges", ()))
     records, cached_nodes, member_nodes = [], [], []
     for node in nodes:
         props = node.get("properties") or {}
