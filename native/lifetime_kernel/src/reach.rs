@@ -61,7 +61,8 @@ fn sink_token(
     // merely because a call site happens to have a guard.
     let bound = (!truncated && catalog.pattern_catalog.as_ref()
         .and_then(|catalog| catalog.kind_evaluator.get(&family))
-        .is_some_and(|evaluator| evaluator == "relational"))
+        .is_some_and(|recipe| recipe.split(',')
+            .any(|evaluator| evaluator.trim() == "relational")))
         .then(|| if guarded { "bounded" } else { "unbounded" })
         .unwrap_or_default()
         .to_owned();
@@ -362,6 +363,9 @@ mod tests {
         };
         assert_eq!(sink_token(&flow, "c", &catalog, 0, false, false).bound, "unbounded");
         assert!(sink_token(&flow, "c", &catalog, 0, false, true).bound.is_empty());
+        catalog.pattern_catalog.get_or_insert_with(Default::default).kind_evaluator.insert(
+            "buffer-size".into(), "relational,missing-guard".into());
+        assert_eq!(sink_token(&flow, "c", &catalog, 0, true, false).bound, "bounded");
         catalog.pattern_catalog.get_or_insert_with(Default::default).kind_evaluator.insert(
             "buffer-size".into(), "presence".into());
         assert!(sink_token(&flow, "c", &catalog, 0, true, false).bound.is_empty());
