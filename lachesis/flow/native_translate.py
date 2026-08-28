@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .atropos import flow_pattern_id
 from .native_lifetime import match_semantic_path, write_semantic_path
 from lachesis.core import lifetime_pb2
 from lachesis.nav.dataflow.substrate import (
@@ -102,9 +101,7 @@ def native_match_leads(result) -> list[dict[str, Any]]:
             rendered = path.root if path is not None else "unknown"
             if path is not None and path.selectors:
                 rendered += "".join(path.selectors)
-            witness = (list(finding.source_witness_nodes)
-                       if finding.source_witness_nodes
-                       else list(finding.witness_nodes))
+            witness = list(finding.witness_nodes)
             lead = {
                 "pattern": finding.pattern,
                 "object": rendered,
@@ -124,9 +121,14 @@ def native_match_leads(result) -> list[dict[str, Any]]:
                 lead["source_witness"] = list(finding.source_witness_nodes)
             if finding.HasField("source_reachable"):
                 lead["source_reachable"] = finding.source_reachable
-            pattern_id = flow_pattern_id(finding.pattern)
-            if pattern_id:
-                lead["pattern_id"] = pattern_id
+            if finding.family:
+                lead["family"] = finding.family
+            if finding.pattern_id:
+                lead["pattern_id"] = finding.pattern_id
+            if finding.evaluator:
+                lead["evaluator"] = finding.evaluator
+            if finding.tier:
+                lead["tier"] = finding.tier
             leads.append(lead)
     return leads
 

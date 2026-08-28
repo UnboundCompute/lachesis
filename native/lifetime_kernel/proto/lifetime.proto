@@ -383,6 +383,10 @@ message NativeTemporalFinding {
   optional bool source_reachable = 10;
   repeated GuardProof guards = 11;
   bool guarded = 12;
+  string family = 13;
+  string pattern_id = 14;
+  string evaluator = 15;
+  uint32 tier = 16;
 }
 message NativeTemporalFunction {
   string id = 1;

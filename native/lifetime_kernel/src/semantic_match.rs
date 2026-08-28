@@ -174,6 +174,7 @@ fn add_finding(
         source_reachable: node.source_reachable,
         guards: Vec::new(),
         guarded: false,
+        family: String::new(), pattern_id: String::new(), evaluator: String::new(), tier: 0,
     });
 }
 
@@ -662,6 +663,14 @@ pub(crate) fn match_result_with_catalog(
     if enabled.is_empty() { return matched; }
     for function in &mut matched.functions {
         function.findings.retain(|finding| enabled.contains(finding.pattern.as_str()));
+        for finding in &mut function.findings {
+            if let Some(pattern) = catalog.patterns.iter()
+                .find(|pattern| pattern.matcher_pattern == finding.pattern) {
+                finding.pattern_id = pattern.id.clone();
+                finding.evaluator = pattern.evaluator.clone();
+                finding.tier = pattern.tier;
+            }
+        }
     }
     matched
 }
@@ -677,25 +686,27 @@ fn match_reach_skeleton(
     let mut findings = Vec::new();
     for token in &skeleton.tokens {
         if token.kind != "sink" || token.family.is_empty() { continue; }
-        let mut evaluators = Vec::new();
-        if let Some(recipe) = catalog.kind_evaluator.get(&token.family) {
-            evaluators.extend(recipe.split(',').filter(|item| !item.is_empty()));
-        }
+        let recipe = catalog.kind_evaluator.get(&token.family)
+            .map(String::as_str).unwrap_or_default();
         for pattern in &catalog.patterns {
             if pattern.matcher_pattern.is_empty() || pattern.evaluator.is_empty() { continue; }
-            if pattern.matcher_families.iter().any(|family| family == &token.family)
-                && !evaluators.iter().any(|name| *name == pattern.evaluator.as_str())
-            {
-                evaluators.push(pattern.evaluator.as_str());
+            if pattern.matcher_families.is_empty()
+                || !pattern.matcher_families.iter().any(|family| family == &token.family) {
+                continue;
             }
-        }
-        evaluators.sort_unstable();
-        evaluators.dedup();
-        for evaluator in evaluators {
-            if !reach_evaluator(evaluator, token) { continue; }
+            if !recipe.split(',').any(|name| name == pattern.evaluator) { continue; }
+            let required_control = pattern.requires.iter()
+                .filter(|required| matches!(required.as_str(), "if" | "else" | "for" |
+                    "while" | "switch" | "case" | "default" | "do"));
+            let controls: Vec<&String> = required_control.collect();
+            if !controls.is_empty()
+                && !controls.iter().any(|required| token.control.contains(required)) {
+                continue;
+            }
+            if !reach_evaluator(&pattern.evaluator, token) { continue; }
             findings.push(lifetime_proto::NativeTemporalFinding {
                 function: skeleton.source_function.clone(),
-                pattern: evaluator.to_owned(),
+                pattern: pattern.matcher_pattern.clone(),
                 path: Some(lifetime_proto::Path {
                     root: token.object_root.clone(),
                     selectors: token.object_selectors.clone(),
@@ -709,6 +720,8 @@ fn match_reach_skeleton(
                 source_reachable: token.source_reachable,
                 guards: token.guards.clone(),
                 guarded: token.guarded,
+                family: token.family.clone(), pattern_id: pattern.id.clone(),
+                evaluator: pattern.evaluator.clone(), tier: pattern.tier,
             });
         }
     }
