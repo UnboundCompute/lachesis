@@ -428,7 +428,7 @@ fn match_function(
             },
             "ORIGIN" => if let Some(object) = object_id {
                 released.remove(object);
-                nulls.remove(object);
+                nulls.remove(raw_object_id.unwrap_or(object));
                 if node.access == "return-may-null" {
                     nullable.insert(object);
                     nonnull.remove(object);
@@ -445,7 +445,7 @@ fn match_function(
                 // A release through a slot proven to contain null is a no-op.
                 // Keep this check before adding the object to the released set;
                 // otherwise a later valid release would be misclassified.
-                if !nulls.contains(object) {
+                if !raw_object_id.is_some_and(|slot| nulls.contains(slot)) {
                     if released.contains(object) {
                         add_finding(&mut findings, &function.id, "double-free",
                                     &objects[object as usize], node, witness, &returns, &path_guards);
@@ -463,7 +463,7 @@ fn match_function(
                 escaped.insert(object);
             },
             "LOST_FROM_SLOT" => if let Some(object) = object_id {
-                nulls.insert(object);
+                nulls.insert(raw_object_id.unwrap_or(object));
                 realloc_lost.insert(object);
             },
             "READ_STORAGE" | "memory.deref" => if let Some(object) = object_id {
@@ -471,7 +471,7 @@ fn match_function(
                     add_finding(&mut findings, &function.id, "uaf.deref",
                                 &objects[object as usize], node, witness, &returns, &path_guards);
                 }
-                if nulls.contains(object) {
+                if raw_object_id.is_some_and(|slot| nulls.contains(slot)) {
                     add_finding(&mut findings, &function.id, "null-deref",
                                 &objects[object as usize], node, witness, &returns, &path_guards);
                 }
@@ -494,7 +494,7 @@ fn match_function(
                     add_finding(&mut findings, &function.id, "uaf.deref",
                                 &objects[object as usize], node, witness, &returns, &path_guards);
                 }
-                if nulls.contains(object) {
+                if raw_object_id.is_some_and(|slot| nulls.contains(slot)) {
                     add_finding(&mut findings, &function.id, "null-deref",
                                 &objects[object as usize], node, witness, &returns, &path_guards);
                 }
@@ -504,8 +504,10 @@ fn match_function(
                                 &returns, &path_guards);
                 }
                 if let Some(value) = value_id {
-                    bindings.retain(|(source, _)| *source != object);
-                    bindings.push((object, value));
+                    let slot = raw_object_id.unwrap_or(object);
+                    bindings.retain(|(source, _)| *source != slot);
+                    bindings.push((slot, value));
+                    nulls.remove(slot);
                 }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
@@ -525,9 +527,12 @@ fn match_function(
                     escaped.insert(object);
                 }
             },
-            "WRITE_STORAGE_NULL" => if let Some(object) = object_id {
-                nulls.insert(object);
-                nonnull.remove(object);
+            "WRITE_STORAGE_NULL" => if let Some(slot) = raw_object_id {
+                // Null is a value in this storage slot. Aliases captured from
+                // its former pointee remain valid independent identities.
+                bindings.retain(|(source, _)| *source != slot);
+                nulls.insert(slot);
+                nonnull.remove(slot);
             },
             "UNINITIALIZED" => if let Some(object) = object_id {
                 uninitialized.insert(object);
@@ -579,6 +584,7 @@ fn match_function(
                     }
                 }
             }
+            let mut returned_slot_binding = None;
             if seam_kind == "return" && !return_to.is_empty() {
                 if let (Some(source), Some(target_object)) = (
                     node_object_ids[index],
@@ -590,6 +596,7 @@ fn match_function(
                     // destination to the callee-side returned object so
                     // released/escaped state follows the returned value.
                     next_bindings.push((target_object as u32, source));
+                    returned_slot_binding = Some((target_object as u32, source));
                 }
             }
             next_bindings.sort_unstable();
@@ -597,6 +604,12 @@ fn match_function(
             let mut next_nulls = nulls.clone();
             let mut next_nonnull = nonnull.clone();
             let mut next_nullable = nullable.clone();
+            if let Some((receiver, returned)) = returned_slot_binding {
+                // Null/non-null are storage-slot facts and therefore flow
+                // opposite to the receiver->returned identity binding.
+                if next_nulls.contains(returned) { next_nulls.insert(receiver); }
+                if next_nonnull.contains(returned) { next_nonnull.insert(receiver); }
+            }
             let mut next_guards = path_guards.clone();
             let mut contradiction = false;
             for guard in guards {
