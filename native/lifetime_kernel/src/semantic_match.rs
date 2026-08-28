@@ -428,6 +428,7 @@ fn match_function(
             "DERIVE" => if let (Some(target), Some(value)) = (raw_object_id, value_id) {
                 bindings.retain(|(source, _)| *source != target);
                 bindings.push((target, value));
+                uninitialized.remove(target);
                 if node.access == "aggregate-copy" {
                     add_finding(&mut findings, &function.id, "aggregate-copy-alias",
                                 &objects[target as usize], node, witness, &returns, &path_guards);
@@ -515,6 +516,7 @@ fn match_function(
                     bindings.retain(|(source, _)| *source != slot);
                     bindings.push((slot, value));
                     nulls.remove(slot);
+                    uninitialized.remove(slot);
                 }
             },
             "PASS_VALUE" | "COMPARE_VALUE" | "RETURN_VALUE" => if let Some(object) = object_id {
