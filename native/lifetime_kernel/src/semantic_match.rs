@@ -684,7 +684,7 @@ fn match_stitched_result(result: lifetime_proto::NativeSemanticResult)
     edges.extend(result.seams);
     let function = lifetime_proto::NativeSemanticFunction {
         id: "native:stitched".into(), entry, exits, nodes, edges,
-        language: "mixed".into(),
+        language: "mixed".into(), source_launch_nodes: Vec::new(),
     };
     let matched = match_function(&function);
     lifetime_proto::NativeTemporalResult { functions: vec![matched] }
@@ -746,7 +746,7 @@ fn match_skeleton(
     if exits.is_empty() { exits.push(nodes.last()?.id.clone()); }
     Some(match_function(&lifetime_proto::NativeSemanticFunction {
         id: format!("native:skeleton:{ordinal}:{}", skeleton.context),
-        entry, exits, nodes, edges, language: String::new(),
+        entry, exits, nodes, edges, language: String::new(), source_launch_nodes: Vec::new(),
     }))
 }
 
@@ -786,7 +786,7 @@ mod tests {
         }).collect();
         lifetime_proto::NativeSemanticFunction {
             id: "f".to_owned(), entry: ids[0].clone(), exits: vec![ids[ids.len() - 1].clone()],
-            nodes, edges, language: "c".to_owned(),
+            nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
         }
     }
 
@@ -985,7 +985,7 @@ mod tests {
         let result = match_result(lifetime_proto::NativeSemanticResult {
             functions: vec![lifetime_proto::NativeSemanticFunction {
                 id: "f".to_owned(), entry: "n".to_owned(), exits: vec!["r".to_owned()],
-                nodes, edges, language: "c".to_owned(),
+                nodes, edges, language: "c".to_owned(), source_launch_nodes: Vec::new(),
             }],
             complete: true,
             ..Default::default()
@@ -1017,7 +1017,7 @@ mod tests {
             functions: vec![
                 lifetime_proto::NativeSemanticFunction {
                     id: "a".into(), entry: "a-origin".into(), exits: vec!["a-origin".into()],
-                    nodes: vec![origin], edges: Vec::new(), language: "c".into(),
+                    nodes: vec![origin], edges: Vec::new(), language: "c".into(), source_launch_nodes: Vec::new(),
                 },
                 lifetime_proto::NativeSemanticFunction {
                     id: "b".into(), entry: "b-release".into(), exits: vec!["b-read".into()],
@@ -1025,7 +1025,7 @@ mod tests {
                     edges: vec![lifetime_proto::NativeSemanticEdge {
                         source: "b-release".into(), target: "b-read".into(), kind: "normal".into(),
                         ..Default::default()
-                    }], language: "c".into(),
+                    }], language: "c".into(), source_launch_nodes: Vec::new(),
                 },
             ],
             complete: true, seams: vec![seam], ..Default::default()
@@ -1074,10 +1074,12 @@ mod tests {
                 lifetime_proto::NativeSemanticFunction {
                     id: "a".into(), entry: "a-origin".into(), exits: vec!["a-read".into()],
                     nodes: vec![origin, caller_read], edges: Vec::new(), language: "c".into(),
+                    source_launch_nodes: Vec::new(),
                 },
                 lifetime_proto::NativeSemanticFunction {
                     id: "b".into(), entry: "b-release".into(), exits: vec!["b-return".into()],
                     nodes: vec![release, returned], edges: Vec::new(), language: "c".into(),
+                    source_launch_nodes: Vec::new(),
                 },
             ], complete: true, seams: edges, ..Default::default()
         });

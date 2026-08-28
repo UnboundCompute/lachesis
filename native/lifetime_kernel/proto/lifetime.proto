@@ -437,6 +437,9 @@ message NativeSemanticFunction {
   repeated NativeSemanticNode nodes = 4;
   repeated NativeSemanticEdge edges = 5;
   string language = 6;
+  // Compiler-resolved source launch anchors.  These are the source contexts
+  // used by the old Claus scheduler; taint witness nodes are not contexts.
+  repeated string source_launch_nodes = 7;
 }
 // A source-rooted Claus work region. Function order is stable so cached
 // fragments can be reused without depending on hash-map iteration order.

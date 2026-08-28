@@ -1938,8 +1938,12 @@ pub(crate) fn semantic_request(
                 .cmp(&(&right.source, &right.target, &right.kind))
         });
         let language = function_languages.get(&id).cloned().unwrap_or_default();
+        let source_launch_nodes = function.calls.iter()
+            .filter(|call| call.is_source)
+            .map(|call| call.node.clone())
+            .collect();
         Ok(lifetime_proto::NativeSemanticFunction {
-            id, entry, exits, nodes, edges, language,
+            id, entry, exits, nodes, edges, language, source_launch_nodes,
         })
     }).collect::<Result<Vec<_>, String>>()?;
     // Seam endpoints must survive the compact event projection. Resolve the

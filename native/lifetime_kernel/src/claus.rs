@@ -83,6 +83,16 @@ pub(crate) fn pick_regions(
     let (callees, callers) = call_graph(result);
     let mut source_nodes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for function in &result.functions {
+        // Source contexts come from compiler-resolved source call sites, just
+        // like CoverageScheduler._source_contexts in the old engine.  A taint
+        // witness is evidence attached to a reached value, not a new launch
+        // context; treating every witness as one caused a full cone walk per
+        // reached node on large graphs.
+        if !function.source_launch_nodes.is_empty() {
+            source_nodes.entry(function.id.clone()).or_default()
+                .extend(function.source_launch_nodes.iter().cloned());
+            continue;
+        }
         for node in &function.nodes {
             if node.source_reachable != Some(true) { continue; }
             let source_function = node.source_witness_nodes.first()
@@ -191,5 +201,21 @@ mod tests {
         let regions = pick_regions(&result);
         let functions: BTreeSet<_> = regions.iter().flat_map(|region| region.functions.iter()).collect();
         assert_eq!(functions, BTreeSet::from([&"a".to_owned(), &"b".to_owned()]));
+    }
+
+    #[test]
+    fn taint_witnesses_do_not_become_duplicate_source_contexts() {
+        let result = lifetime_proto::NativeSemanticResult {
+            functions: vec![lifetime_proto::NativeSemanticFunction {
+                id: "source".into(),
+                source_launch_nodes: vec!["source-call".into()],
+                nodes: (0..100).map(|index| node(&format!("w{index}"), "source", Some(true))).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let regions = pick_regions(&result);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].contexts, vec!["source-call"]);
     }
 }
