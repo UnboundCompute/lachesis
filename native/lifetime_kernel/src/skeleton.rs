@@ -207,42 +207,37 @@ fn walk_region(
 pub(crate) fn build(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeFlowSkeleton> {
+    let (functions, nodes, adjacency) = semantic_indexes(result);
     let mut output = Vec::new();
-    for function in &result.functions {
-        let Some(compact) = crate::compact_event_function(function.clone()) else { continue; };
-        let language = compact.language.as_str();
-        let mut tokens = Vec::with_capacity(compact.nodes.len() + 2);
-        tokens.push(lifetime_proto::NativeSkeletonToken {
-            kind: "enter".into(), function: compact.id.clone(), depth: 0, ..Default::default()
-        });
-        for node in &compact.nodes {
-            let guards = compact.edges.iter()
-                .filter(|edge| edge.source == node.id)
-                .flat_map(|edge| edge.guards.iter().cloned())
-                .collect::<Vec<_>>();
+    for region in &result.regions {
+        let contexts = if region.contexts.is_empty() {
+            vec!["__entry__".to_owned()]
+        } else { region.contexts.clone() };
+        for context in contexts {
+            let (mut tokens, edges, complete) = walk_region(
+                result, region, &context, &functions, &nodes, &adjacency);
+            // The old renderer always has explicit boundaries around the root
+            // as well as every nested call.  Keep these even for a region with
+            // no event at its entry: an empty/unresolved fragment must remain
+            // distinguishable from a missing fragment.
+            tokens.insert(0, lifetime_proto::NativeSkeletonToken {
+                kind: "enter".into(), function: region.source_function.clone(),
+                depth: 0, ..Default::default()
+            });
             tokens.push(lifetime_proto::NativeSkeletonToken {
-                kind: if node.event_kind.is_empty() { "control".into() } else { "event".into() },
-                function: compact.id.clone(), node: node.id.clone(),
-                family: if node.event_kind.is_empty() { "control".into() }
-                    else { lifecycle_family(&node.event_kind, language) },
-                object_root: node.object_root.clone(), object_selectors: node.object_selectors.clone(),
-                line: node.line, has_line: node.has_line, depth: 1,
-                guarded: !guards.is_empty(), guards,
-                source_reachable: node.source_reachable,
-                source_witness_nodes: node.source_witness_nodes.clone(),
-                ..Default::default()
+                kind: "exit".into(), function: region.source_function.clone(),
+                depth: 0, ..Default::default()
+            });
+            output.push(lifetime_proto::NativeFlowSkeleton {
+                kind: "source-rooted".into(),
+                entry: region.source_function.clone(),
+                source_function: region.source_function.clone(),
+                context, complete, tokens, edges, is_source: true,
             });
         }
-        tokens.push(lifetime_proto::NativeSkeletonToken {
-            kind: "exit".into(), function: compact.id.clone(), depth: 0, ..Default::default()
-        });
-        output.push(lifetime_proto::NativeFlowSkeleton {
-            kind: "typestate".into(), entry: compact.id.clone(),
-            source_function: compact.id, context: "__entry__".into(), complete: true,
-            tokens, edges: compact.edges,
-            is_source: !function.source_launch_nodes.is_empty(),
-        });
     }
+    output.sort_by(|left, right| (&left.source_function, &left.context)
+        .cmp(&(&right.source_function, &right.context)));
     output
 }
 
@@ -275,11 +270,11 @@ mod tests {
         assert_eq!(skeletons.len(), 1);
         assert_eq!(skeletons[0].tokens[1].family, "memory.alloc");
         assert_eq!(skeletons[0].tokens[2].family, "memory.free");
-        assert!(skeletons[0].edges.len() >= 1);
+        assert_eq!(skeletons[0].edges.len(), 1);
     }
 
     #[test]
-    fn emits_compact_function_local_typestate_skeletons() {
+    fn follows_call_and_matching_return_instead_of_concatenating_functions() {
         let source = lifetime_proto::NativeSemanticFunction {
             id: "source".into(), entry: "s0".into(),
             nodes: vec![
@@ -320,12 +315,10 @@ mod tests {
             }], ..Default::default()
         };
         let skeletons = build(&result);
-        assert_eq!(skeletons.len(), 2);
         let kinds: Vec<_> = skeletons[0].tokens.iter().map(|token| token.kind.as_str()).collect();
-        assert!(kinds.windows(2).any(|pair| pair == ["enter", "event"]));
-        assert_eq!(skeletons[0].kind, "typestate");
-        assert_eq!(skeletons[0].context, "__entry__");
-        assert!(skeletons.iter().any(|skeleton| skeleton.entry == "callee"));
+        assert!(kinds.windows(2).any(|pair| pair == ["enter", "control"]));
+        assert!(skeletons[0].tokens.iter().any(|token| token.kind == "exit" && token.function == "callee"));
+        assert_eq!(skeletons[0].context, "s0");
         assert!(skeletons[0].complete);
     }
 }
