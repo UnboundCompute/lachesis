@@ -7,6 +7,14 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.4.1]
+
+Packaging fix. The `lachesis-mcp` console script was removed in favor of the
+`lachesis mcp` subcommand, but the Docker image entrypoint and the MCP registry
+launcher (`server.json`) still invoked the old name, so the published container
+failed to start and the registry entry pointed at a missing command. Both now
+call `lachesis mcp`. No engine changes from 0.4.0.
+
 ## [0.4.0]
 
 Engine-correctness release. The Rust matcher and flow substrate now report what
