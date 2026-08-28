@@ -722,7 +722,8 @@ fn match_skeleton(
             id: token.node.clone(), function: token.function.clone(),
             event_kind: skeleton_event_kind(&token.family, &token.kind),
             object_root: token.object_root.clone(), object_selectors: token.object_selectors.clone(),
-            generation: "g0".into(), line: token.line, has_line: token.has_line,
+            generation: if token.generation.is_empty() { "g0".into() } else { token.generation.clone() },
+            line: token.line, has_line: token.has_line,
             anchor: token.node.clone(), source_witness_nodes: token.source_witness_nodes.clone(),
             source_reachable: token.source_reachable, ..Default::default()
         });

@@ -160,6 +160,7 @@ fn walk_region(
                 guarded: !guards.is_empty(), guards,
                 source_reachable: node.source_reachable,
                 source_witness_nodes: node.source_witness_nodes.clone(),
+                generation: node.generation.clone(),
                 ..Default::default()
             });
         for edge in adjacency.get(state.node.as_str()).into_iter().flatten() {
@@ -249,7 +250,8 @@ fn build_typestate(
                 line: node.line, has_line: node.has_line, depth: 1,
                 guarded: !guards.is_empty(), guards,
                 source_reachable: node.source_reachable,
-                source_witness_nodes: node.source_witness_nodes.clone(), ..Default::default()
+                source_witness_nodes: node.source_witness_nodes.clone(),
+                generation: node.generation.clone(), ..Default::default()
             });
         }
         tokens.push(lifetime_proto::NativeSkeletonToken {
@@ -379,7 +381,7 @@ mod tests {
         let function = lifetime_proto::NativeSemanticFunction {
             id: "f".into(), language: "c".into(),
             nodes: vec![
-                lifetime_proto::NativeSemanticNode { id: "a".into(), event_kind: "ORIGIN".into(), ..Default::default() },
+                lifetime_proto::NativeSemanticNode { id: "a".into(), event_kind: "ORIGIN".into(), generation: "g1".into(), ..Default::default() },
                 lifetime_proto::NativeSemanticNode { id: "b".into(), event_kind: "RELEASE".into(), ..Default::default() },
             ],
             edges: vec![lifetime_proto::NativeSemanticEdge {
@@ -399,6 +401,7 @@ mod tests {
         assert_eq!(skeletons.len(), 1);
         assert_eq!(skeletons[0].tokens[0].family, "memory.alloc");
         assert_eq!(skeletons[0].tokens[1].family, "memory.free");
+        assert_eq!(skeletons[0].tokens[0].generation, "g1");
         assert!(skeletons[0].edges.len() >= 1);
     }
 

@@ -477,6 +477,8 @@ message NativeSkeletonToken {
   bool is_source = 23;
   bool truncated = 24;
   string guard_status = 25;
+  // Compiler-derived object generation; empty means the initial generation.
+  string generation = 26;
 }
 message NativeFlowSkeleton {
   string kind = 1;
