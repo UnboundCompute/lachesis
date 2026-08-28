@@ -54,10 +54,6 @@ fn semantic_indexes<'a>(
     for edge in &result.seams {
         adjacency.entry(edge.source.as_str()).or_insert_with(Vec::new).push(edge);
     }
-    for edges in adjacency.values_mut() {
-        edges.sort_by(|left, right| (&left.kind, &left.seam_kind, &left.target, &left.return_to)
-            .cmp(&(&right.kind, &right.seam_kind, &right.target, &right.return_to)));
-    }
     (functions, nodes, adjacency)
 }
 
