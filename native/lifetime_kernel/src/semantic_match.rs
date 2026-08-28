@@ -968,15 +968,17 @@ fn match_reach_skeleton(
     let mut findings = Vec::new();
     for token in &skeleton.tokens {
         if token.kind != "sink" || token.family.is_empty() { continue; }
-        let recipe = catalog.kind_evaluator.get(&token.family)
-            .map(String::as_str).unwrap_or_default();
         for pattern in &catalog.patterns {
             if pattern.matcher_pattern.is_empty() || pattern.evaluator.is_empty() { continue; }
             if pattern.matcher_families.is_empty()
                 || !pattern.matcher_families.iter().any(|family| family == &token.family) {
                 continue;
             }
-            if !recipe.split(',').any(|name| name == pattern.evaluator) { continue; }
+            // The family's primary recipe routes the ordinary one-fact
+            // evaluator. Independently, every declarative pattern explicitly
+            // bound to this family must be eligible for its generic evaluator;
+            // this is the old evaluate_all second pass and is what lets new
+            // structural patterns ship as catalog data alone.
             let required_control = pattern.requires.iter()
                 .filter(|required| matches!(required.as_str(), "if" | "else" | "for" |
                     "while" | "switch" | "case" | "default" | "do"));
@@ -1306,6 +1308,11 @@ mod tests {
                 // whose skeleton carries no loop control.
                 requires: vec!["for".into()],
                 ..Default::default()
+            }, crate::atropos_proto::Pattern {
+                matcher_pattern: "inverted-capacity-guard".into(),
+                matcher_families: vec!["buffer-size".into()],
+                evaluator: "inverted-capacity-guard".into(),
+                ..Default::default()
             }],
             kind_evaluator: [("buffer-size".into(), "relational".into())]
                 .into_iter().collect(),
@@ -1317,6 +1324,8 @@ mod tests {
             tokens: vec![lifetime_proto::NativeSkeletonToken {
                 kind: "sink".into(), family: "buffer-size".into(),
                 object_root: "input".into(), tainted: true, bound: "unbounded".into(),
+                size_expression: "length".into(),
+                control: vec!["length >= capacity".into()],
                 ..Default::default()
             }], ..Default::default()
         };
@@ -1324,8 +1333,10 @@ mod tests {
             lifetime_proto::NativeSemanticResult { skeletons: vec![skeleton], ..Default::default() },
             Some(&catalog));
         assert_eq!(matched.functions.len(), 1);
-        assert_eq!(matched.functions[0].findings.len(), 1);
-        assert_eq!(matched.functions[0].findings[0].pattern, "relational");
+        assert_eq!(matched.functions[0].findings.len(), 2);
+        assert_eq!(matched.functions[0].findings.iter().map(|finding|
+            finding.pattern.as_str()).collect::<Vec<_>>(),
+            vec!["inverted-capacity-guard", "relational"]);
     }
 
     #[test]
