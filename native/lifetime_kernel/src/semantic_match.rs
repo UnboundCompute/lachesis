@@ -118,6 +118,38 @@ impl MarkSet {
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         self.0.iter().copied()
     }
+
+    fn union(&self, other: &Self) -> Self {
+        let mut values = self.0.clone();
+        for value in other.iter() {
+            if let Err(index) = values.binary_search(&value) { values.insert(index, value); }
+        }
+        Self(values)
+    }
+}
+
+fn join_loop_states(left: &StateKey, right: &StateKey) -> StateKey {
+    let mut bindings = left.bindings.clone();
+    for (source, target) in &right.bindings {
+        if bindings.iter().all(|(existing, _)| existing != source) {
+            bindings.push((*source, *target));
+        }
+    }
+    bindings.sort_unstable();
+    let guards = left.guards.iter().filter(|guard| right.guards.contains(guard))
+        .cloned().collect();
+    StateKey {
+        node: right.node, returns: right.returns.clone(), bindings, guards,
+        released: left.released.union(&right.released),
+        origins: left.origins.union(&right.origins),
+        nulls: left.nulls.union(&right.nulls),
+        nonnull: left.nonnull.union(&right.nonnull),
+        nullable: left.nullable.union(&right.nullable),
+        uninitialized: left.uninitialized.union(&right.uninitialized),
+        pointer_arithmetic: left.pointer_arithmetic.union(&right.pointer_arithmetic),
+        escaped: left.escaped.union(&right.escaped),
+        realloc_lost: left.realloc_lost.union(&right.realloc_lost),
+    }
 }
 
 fn canonical(mut value: u32, bindings: &[(u32, u32)]) -> u32 {
@@ -399,6 +431,7 @@ fn match_function(
     let mut seen = HashSet::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut findings = HashMap::with_capacity_and_hasher(function.nodes.len(), Default::default());
     let mut traces = Vec::new();
+    let mut loop_buckets: HashMap<(usize, Vec<usize>), Vec<StateKey>> = HashMap::default();
     let mut transfers = 0u64;
     let mut widenings = 0u64;
     // A malformed or adversarial sidecar must not make a query process diverge.
@@ -431,7 +464,6 @@ fn match_function(
             // Predicates from one iteration are not stable facts for the
             // next. The old matcher clears them at its loop-widening boundary.
             path_guards.clear();
-            widenings += 1;
         }
         let raw_object_id = node_object_ids[index];
         let object_id = raw_object_id.map(|value| canonical(value, &bindings));
@@ -697,9 +729,35 @@ fn match_function(
                 }
             }
             if !contradiction {
-                queue.push_back((*target, Some(trace), next_returns, next_bindings, released.clone(), origins.clone(), next_nulls,
-                                 next_nonnull, next_nullable, uninitialized.clone(), pointer_arithmetic.clone(),
-                                 next_escaped, realloc_lost.clone(), next_guards));
+                let mut next_state = StateKey {
+                    node: *target, returns: next_returns, bindings: next_bindings,
+                    guards: next_guards.iter().map(|guard|
+                        (guard.kind.clone(), guard.value.clone())).collect(),
+                    released: released.clone(), origins: origins.clone(), nulls: next_nulls,
+                    nonnull: next_nonnull, nullable: next_nullable,
+                    uninitialized: uninitialized.clone(),
+                    pointer_arithmetic: pointer_arithmetic.clone(), escaped: next_escaped,
+                    realloc_lost: realloc_lost.clone(),
+                };
+                if function.nodes[*target].event_kind == "LOOP" {
+                    const LOOP_WIDEN_LIMIT: usize = 32;
+                    let key = (*target, next_state.returns.clone());
+                    let bucket = loop_buckets.entry(key).or_default();
+                    if bucket.len() >= LOOP_WIDEN_LIMIT {
+                        let prior = bucket.remove(0);
+                        next_state = join_loop_states(&prior, &next_state);
+                        widenings += 1;
+                    }
+                    bucket.push(next_state.clone());
+                }
+                let next_path_guards = next_state.guards.iter().map(|(kind, value)|
+                    lifetime_proto::GuardProof { kind: kind.clone(), value: value.clone() })
+                    .collect();
+                queue.push_back((next_state.node, Some(trace), next_state.returns,
+                    next_state.bindings, next_state.released, next_state.origins,
+                    next_state.nulls, next_state.nonnull, next_state.nullable,
+                    next_state.uninitialized, next_state.pointer_arithmetic,
+                    next_state.escaped, next_state.realloc_lost, next_path_guards));
             }
         }
     }
