@@ -59,7 +59,7 @@ fn sink_token(
     // The legacy renderer exposes a bound only for the relational evaluator.
     // Other sink families must not acquire synthetic bounded/unbounded state
     // merely because a call site happens to have a guard.
-    let bound = (catalog.pattern_catalog.as_ref()
+    let bound = (!truncated && catalog.pattern_catalog.as_ref()
         .and_then(|catalog| catalog.kind_evaluator.get(&family))
         .is_some_and(|evaluator| evaluator == "relational"))
         .then(|| if guarded { "bounded" } else { "unbounded" })
@@ -265,6 +265,7 @@ mod tests {
             sink: "sink_call.a0".into(), provenance: "source".into(), ..Default::default()
         };
         assert_eq!(sink_token(&flow, "c", &catalog, 0, false, false).bound, "unbounded");
+        assert!(sink_token(&flow, "c", &catalog, 0, false, true).bound.is_empty());
         catalog.pattern_catalog.get_or_insert_with(Default::default).kind_evaluator.insert(
             "buffer-size".into(), "presence".into());
         assert!(sink_token(&flow, "c", &catalog, 0, true, false).bound.is_empty());
