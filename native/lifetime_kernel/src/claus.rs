@@ -68,7 +68,6 @@ fn forward(start: &str, callees: &BTreeMap<String, BTreeSet<String>>) -> BTreeSe
 pub(crate) fn pick_regions(
     result: &lifetime_proto::NativeSemanticResult,
 ) -> Vec<lifetime_proto::NativeSourceRegion> {
-    let owners = node_functions(result);
     let (callees, callers) = call_graph(result);
     let mut source_nodes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for function in &result.functions {
@@ -82,18 +81,12 @@ pub(crate) fn pick_regions(
                 .extend(function.source_launch_nodes.iter().cloned());
             continue;
         }
-        for node in &function.nodes {
-            if node.source_reachable != Some(true) { continue; }
-            let source_function = node.source_witness_nodes.first()
-                .and_then(|id| owners.get(id.as_str()).copied())
-                .unwrap_or(function.id.as_str());
-            let entry = source_nodes.entry(source_function.to_owned()).or_default();
-            if node.source_witness_nodes.is_empty() {
-                entry.insert(node.anchor.clone());
-            } else {
-                entry.extend(node.source_witness_nodes.iter().cloned());
-            }
-        }
+        // Source reachability is evidence for matching, not a launch-site
+        // declaration.  In particular, do not turn every witnessed value into
+        // a new Claus root: that multiplies the same function cone once per
+        // sink/value on large graphs.  If a legacy/incomplete artifact has no
+        // compiler source anchors, the structural-root fallback below supplies
+        // the same conservative behavior as the old scheduler.
     }
     for (function, incoming) in &callers {
         if incoming.is_empty() { source_nodes.entry(function.clone()).or_default(); }
