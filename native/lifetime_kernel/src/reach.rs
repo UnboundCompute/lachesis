@@ -35,9 +35,10 @@ fn family_for(
     catalog.models.iter()
         .filter(|model| model.role == "sink"
             && (model.language.is_empty() || model.language == language)
-            && (model.package.is_empty() || model.package == "builtins"
+            && ((model.package.is_empty() || model.package == "builtins")
                 && model.method == canonical
                 || !model.package.is_empty()
+                    && model.package != "builtins"
                     && format!("{}.{}", model.package, model.method) == canonical))
         .filter(|model| model.access_path.contains(&format!("Argument[{position}]"))
             || model.access_path.contains("Argument[*]"))
@@ -236,5 +237,12 @@ mod tests {
         assert!(sink_nodes.contains("source-call"));
         assert!(sink_nodes.contains("sink-call"));
         assert!(sink_nodes.contains("sink-call-2"));
+    }
+
+    #[test]
+    fn empty_package_models_match_only_their_method() {
+        let catalog = sink_catalog();
+        assert_eq!(family_for("sink_call", "c", 0, &catalog), "buffer-size");
+        assert!(family_for("other_call", "c", 0, &catalog).is_empty());
     }
 }
