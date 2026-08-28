@@ -1578,7 +1578,8 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
                     if let Some(witness) = source_evidence.witnesses.get(&node.anchor) {
                         node.source_witness_nodes = witness.clone();
                         node.source_reachable = Some(true);
-                    } else if source_evidence.observed_sinks.contains(&node.anchor) {
+                    } else if !source_evidence.truncated
+                        && source_evidence.observed_sinks.contains(&node.anchor) {
                         node.source_reachable = Some(false);
                     }
                 }

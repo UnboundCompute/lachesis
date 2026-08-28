@@ -415,6 +415,7 @@ fn text_list_property(properties: &[graph_proto::Field], key: &str) -> Vec<Strin
 pub(crate) struct TaintEvidence {
     pub(crate) witnesses: HashMap<String, Vec<String>>,
     pub(crate) observed_sinks: std::collections::HashSet<String>,
+    pub(crate) truncated: bool,
 }
 
 pub(crate) fn read_taint_evidence_path(
@@ -434,6 +435,7 @@ pub(crate) fn read_taint_evidence_path(
         .map_err(|error| format!("invalid Pass-2 evidence envelope: {error}"))?;
     let mut result = HashMap::new();
     let mut observed_sinks = std::collections::HashSet::new();
+    let mut truncated = false;
     // `taint-reach.sink_id` stores the taint sink node id, while the semantic
     // event anchor is normally the sink's underlying value id.  Keep the
     // mapping in that direction; indexing value -> sink made witness
@@ -456,6 +458,8 @@ pub(crate) fn read_taint_evidence_path(
             if !witness.is_empty() {
                 reaches.push((sink.to_owned(), witness));
             }
+        } else if node.kind == "taint-truncation" {
+            truncated = true;
         }
     }
     for (sink, witness) in reaches {
@@ -464,7 +468,7 @@ pub(crate) fn read_taint_evidence_path(
             result.entry(value.clone()).or_insert(witness);
         }
     }
-    Ok(TaintEvidence { witnesses: result, observed_sinks })
+    Ok(TaintEvidence { witnesses: result, observed_sinks, truncated })
 }
 
 fn finish_graph(

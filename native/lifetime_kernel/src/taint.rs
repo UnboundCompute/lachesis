@@ -445,8 +445,9 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
             .map(|record| (record.value, record)).collect();
         let mut reaches: FxHashMap<u32, State> = FxHashMap::default();
+        let mut capped = false;
         while let Some(state) = queue.pop_front() {
-            if seen.len() > MAX_STATES_PER_SOURCE { break; }
+            if seen.len() > MAX_STATES_PER_SOURCE { capped = true; break; }
             if state != initial && sink_by_value.contains_key(&state.value) {
                 reaches.entry(state.value).or_insert_with(|| state.clone());
             }
@@ -479,6 +480,23 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                     output_edges.push(edge("TAINT_FLOWS_TO", &source_name, &target_name, properties));
                 }
             }
+        }
+        if capped {
+            let source_name = graph.id(source.value).to_owned();
+            let truncation_id = pass2::stable_id(
+                "core", "taint-propagation", "taint-truncation", &[&source_name]);
+            nodes.push(graph_proto::NodeRecord {
+                id: truncation_id,
+                kind: "taint-truncation".to_owned(),
+                label: format!("taint truncated at {} states", seen.len()),
+                properties: vec![
+                    pass2::text_field("source_id", &source.node),
+                    pass2::integer_field("states", seen.len() as i64),
+                    pass2::integer_field("state_cap", MAX_STATES_PER_SOURCE as i64),
+                    pass2::bool_field("truncated", true),
+                ],
+                tier: String::new(),
+            });
         }
         for sink_state in reaches.into_values() {
             let Some(sink) = sink_by_value.get(&sink_state.value) else { continue; };
