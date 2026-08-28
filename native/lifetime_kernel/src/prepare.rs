@@ -1678,6 +1678,10 @@ fn semantic_event_kind(kind: crate::Kind, access: &str) -> &'static str {
     }
 }
 
+fn declaration_root(root: &str) -> &str {
+    root.strip_prefix("decl:").unwrap_or(root)
+}
+
 fn semantic_node(id: String, function: &str, kind: &str, operation: &crate::Operation,
                  path: Option<&crate::Path>, generation: &str) -> lifetime_proto::NativeSemanticNode {
     lifetime_proto::NativeSemanticNode {
@@ -1812,6 +1816,10 @@ pub(crate) fn semantic_request(
     let functions: Vec<_> = prepared.into_iter().map(|function| {
         let id = function.id.clone();
         let parameter_roots = function.parameters.clone();
+        let parameter_root_set: HashSet<&str> = function.parameters.iter()
+            .map(String::as_str).collect();
+        let metadata_by_id: HashMap<&str, &lifetime_proto::SemanticNodeMetadata> =
+            function.metadata.iter().map(|item| (item.id.as_str(), item)).collect();
         let mut nodes = Vec::new();
         let mut by_anchor: HashMap<String, Vec<String>> = HashMap::new();
         let mut realloc_failures: Vec<(String, String, String)> = Vec::new();
@@ -1910,6 +1918,51 @@ pub(crate) fn semantic_request(
                 let event = semantic_node(node_id.clone(), &id, kind, &operation, path, event_generation);
                 by_anchor.entry(operation.node.clone()).or_default().push(node_id);
                 nodes.push(event);
+            }
+            if operation.kind == crate::Kind::Use && operation.access == "write" {
+                let target_id = path.map(|value| declaration_root(&value.root));
+                let source = operation.source.as_ref();
+                let source_id = source.map(|value| declaration_root(&value.root));
+                let source_is_local_address = source.zip(source_id).is_some_and(|(value, root)| {
+                    value.selectors.iter().any(|selector| selector == "&")
+                        && metadata_by_id.get(root).is_some_and(|metadata|
+                            metadata.owner == id)
+                });
+                let target_is_formal = target_id.is_some_and(|root|
+                    parameter_root_set.contains(root));
+                let target_is_persistent = target_id.is_some_and(|root|
+                    metadata_by_id.get(root).is_some_and(|metadata| metadata.owner.is_empty()));
+
+                if source_is_local_address {
+                    if let Some(source) = source {
+                        let mut returned = operation.clone();
+                        returned.target = Some(source.clone());
+                        returned.source = None;
+                        returned.access = "return-stack".to_owned();
+                        let node_id = format!("native:{}:{}:{}:stack-escape", id, operation.node, index);
+                        let event = semantic_node(node_id.clone(), &id, "RETURN_VALUE",
+                            &returned, returned.target.as_ref(), generation);
+                        by_anchor.entry(operation.node.clone()).or_default().push(node_id);
+                        nodes.push(event);
+                    }
+                }
+                if target_is_formal || target_is_persistent {
+                    if let Some(source) = source {
+                        let mut escape = operation.clone();
+                        escape.target = Some(source.clone());
+                        escape.source = None;
+                        escape.access = if target_is_persistent {
+                            "persistent-store".to_owned()
+                        } else {
+                            "out-parameter-store".to_owned()
+                        };
+                        let node_id = format!("native:{}:{}:{}:escape", id, operation.node, index);
+                        let event = semantic_node(node_id.clone(), &id, "ESCAPE",
+                            &escape, escape.target.as_ref(), generation);
+                        by_anchor.entry(operation.node.clone()).or_default().push(node_id);
+                        nodes.push(event);
+                    }
+                }
             }
             if operation.kind == crate::Kind::Realloc {
                 let failure_id = format!("native:{}:{}:{}:failure", id, operation.node, index);

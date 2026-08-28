@@ -454,6 +454,9 @@ fn match_function(
                     add_finding(&mut findings, &function.id, "use-after-return",
                                 &objects[object as usize], node, witness);
                 }
+                if node.event_kind == "RETURN_VALUE" {
+                    escaped.insert(object);
+                }
             },
             "WRITE_STORAGE_NULL" => if let Some(object) = object_id {
                 nulls.insert(object);
