@@ -1588,11 +1588,6 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
                 }
             }
         }
-        // Claus source selection is part of the binary semantic artifact.  The
-        // subsequent skeleton builder consumes these stable regions and can
-        // reuse a completed function/source/context fragment.
-        full.regions = claus::pick_regions(&full);
-        report_native_phase(timing_enabled, semantic_started, "claus regions", full.regions.len(), 0);
         // Match the old Python Pass-3 production flow: reach skeletons are
         // emitted once per native summary flow, while typestate skeletons are
         // emitted for each lifecycle stream.  The region-wide structural
