@@ -842,8 +842,12 @@ unsafe fn visit_one(
         field("end_line", integer(end_line as i64)),
         field("end_column", integer(end_column as i64)),
         field("syntax_kind", text(json_syntax_kind(&syntax_kind))),
-        field("type", text(&type_spelling)),
     ];
+    // The reference frontend omits `type` when clang spells nothing (e.g.
+    // statements), leaving it absent rather than an empty string.
+    if !type_spelling.is_empty() {
+        properties.push(field("type", text(&type_spelling)));
+    }
     let owner_id = function_owner(cursor, emitter);
     if matches!(
         syntax_kind.as_str(),
