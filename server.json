@@ -3,7 +3,7 @@
   "name": "io.github.UnboundCompute/lachesis",
   "title": "Lachesis",
   "description": "Compiler-precise code property graph for C, Python, and TypeScript, navigable over MCP.",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "repository": {
     "url": "https://github.com/UnboundCompute/lachesis",
     "source": "github"
@@ -13,11 +13,14 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "lachesis-cpg",
-      "version": "0.3.0",
+      "version": "0.4.2",
       "runtimeHint": "uvx",
       "runtimeArguments": [
         { "type": "named", "name": "--from", "value": "lachesis-cpg" },
-        { "type": "positional", "value": "lachesis-mcp" }
+        { "type": "positional", "value": "lachesis" }
+      ],
+      "packageArguments": [
+        { "type": "positional", "value": "mcp" }
       ],
       "transport": { "type": "stdio" }
     }

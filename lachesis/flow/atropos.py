@@ -28,10 +28,32 @@ import json
 import os
 
 # The Atropos catalog is a sibling repo of `arachne` (this package lives at
-# arachne/lachesis/flow/). Honor $ATROPOS_ROOT; otherwise fall back to that sibling.
+# arachne/lachesis/flow/). A source checkout finds it there; an installed wheel does
+# not, so the catalog is also bundled into the package tree at build time
+# (tools/vendor_atropos.py -> lachesis/_atropos_catalog). Resolution order: an explicit
+# $ATROPOS_ROOT always wins (honoured verbatim, even if it does not exist, so a caller
+# can point at a work-in-progress catalog); otherwise a real sibling checkout wins over
+# the bundled copy, so editing a live sibling still takes effect; the bundled copy is
+# the last resort that makes a standalone wheel self-contained.
 _DEFAULT_ATROPOS_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "atropos"))
-ATROPOS_ROOT = os.environ.get("ATROPOS_ROOT", _DEFAULT_ATROPOS_ROOT)
+_BUNDLED_ATROPOS_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_atropos_catalog"))
+
+
+def _resolve_atropos_root():
+    explicit = os.environ.get("ATROPOS_ROOT")
+    if explicit:
+        return explicit
+    for candidate in (_DEFAULT_ATROPOS_ROOT, _BUNDLED_ATROPOS_ROOT):
+        if os.path.isdir(os.path.join(candidate, "models")):
+            return candidate
+    # Nothing is installed; keep the historical default so error messages still point at
+    # the sibling location a developer is most likely to create.
+    return _DEFAULT_ATROPOS_ROOT
+
+
+ATROPOS_ROOT = _resolve_atropos_root()
 
 _EXT_LANG = {
     ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".cxx": "c", ".hpp": "c",

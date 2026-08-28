@@ -7,6 +7,27 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.4.2]
+
+Packaging fix. The Atropos catalog — the data every catalog-keyed judgement reads,
+including which calls are allocations and releases — was never bundled into the
+distribution. `ATROPOS_ROOT` defaulted to a sibling checkout that an installed wheel
+or the Docker image does not have beside it, so every catalog table read empty: the
+reader still parsed and navigated code, but the lifetime matcher saw nothing marked
+freed and reported no double-free or use-after-free. The catalog now ships inside the
+distribution (`lachesis/_atropos_catalog/`, staged by `tools/vendor_atropos.py` before
+a release build), and both catalog resolvers fall back to it. An explicit `$ATROPOS_ROOT`
+or a real sibling checkout still wins, so a source checkout is unchanged; a standalone
+wheel is now self-contained. No engine changes from 0.4.1.
+
+## [0.4.1]
+
+Packaging fix. The `lachesis-mcp` console script was removed in favor of the
+`lachesis mcp` subcommand, but the Docker image entrypoint and the MCP registry
+launcher (`server.json`) still invoked the old name, so the published container
+failed to start and the registry entry pointed at a missing command. Both now
+call `lachesis mcp`. No engine changes from 0.4.0.
+
 ## [0.4.0]
 
 Engine-correctness release. The Rust matcher and flow substrate now report what

@@ -58,6 +58,10 @@ jobs:
         run: |
           python3 tools/vendor_typescript.py
           python3 tools/vendor_typescript.py --check
+      - name: Bundle the Atropos catalog
+        run: |
+          python3 tools/vendor_atropos.py
+          python3 tools/vendor_atropos.py --check
       - name: Anchor release timestamps
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - name: Build the sdist
@@ -113,6 +117,12 @@ jobs:
         run: |
           python3 tools/vendor_typescript.py
           python3 tools/vendor_typescript.py --check
+      # The Atropos catalog is host-side package data too; stage it into the tree before
+      # cibuildwheel copies the project into its build environment.
+      - name: Bundle the Atropos catalog
+        run: |
+          python3 tools/vendor_atropos.py
+          python3 tools/vendor_atropos.py --check
       - name: Build the platform wheel
         uses: pypa/cibuildwheel@v2.21
       - uses: actions/upload-artifact@v4

@@ -22,6 +22,14 @@ The distribution is Python plus three things that are not:
 - **The TypeScript compiler** next to the Node frontend under `vendor/`. Also **not in
   version control** (see `.gitignore`); `tools/vendor_typescript.py` fetches the pinned
   version, and the release build vendors it on the host before packaging.
+- **The Atropos catalog** under `lachesis/_atropos_catalog/` — the sink models, syntactic
+  profiles and detection roles/patterns every catalog-keyed judgement reads. Without it an
+  installed wheel parses and navigates fine but finds no lifecycle bugs, because each
+  catalog table reads empty. Also **not in version control** (see `.gitignore`);
+  `tools/vendor_atropos.py` stages the pinned catalog version (from a matching sibling
+  checkout, else the pinned public tag), and the release build bundles it on the host
+  before packaging. At runtime an explicit `$ATROPOS_ROOT` or a sibling checkout still
+  wins; the bundled copy is the fallback that makes a standalone wheel self-contained.
 - the fixture corpora under each frontend, so the parity suite can run from an install.
 
 The C frontend degrades to "no C analysis" when there is no `clang` on the machine.
@@ -59,6 +67,7 @@ platform's wheel before spending a tag on it:
 
 ```
 python3.11 tools/vendor_typescript.py          # fetch the pinned compiler
+python3.11 tools/vendor_atropos.py             # bundle the pinned Atropos catalog
 python3.11 tools/stage_native.py --build        # compile + stage the native binaries
 python3.11 -m build --wheel                      # -> dist/lachesis_cpg-*-py3-none-<platform>.whl
 python3.11 -m twine check dist/*.whl

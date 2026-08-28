@@ -37,4 +37,4 @@ COPY packaging/docker-seed /opt/lachesis-seed
 
 # stdio MCP server. Point it at the seed so it starts immediately; build_graph
 # switches to the caller's source on demand.
-ENTRYPOINT ["lachesis-mcp", "/opt/lachesis-seed"]
+ENTRYPOINT ["lachesis", "mcp", "/opt/lachesis-seed"]
