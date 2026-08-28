@@ -119,15 +119,15 @@ fn walk_region(
     }
     if starts.is_empty() { return (Vec::new(), Vec::new(), false); }
 
-    let mut queue = VecDeque::new();
+    let mut stack = Vec::new();
     let mut seen = BTreeSet::new();
-    for start in starts {
-        queue.push_back(WalkState { node: start, stack: Vec::new() });
+    for start in starts.into_iter().rev() {
+        stack.push(WalkState { node: start, stack: Vec::new() });
     }
     let mut tokens = Vec::new();
     let mut edges_used = Vec::new();
     let mut complete = true;
-    while let Some(state) = queue.pop_front() {
+    while let Some(state) = stack.pop() {
         if !seen.insert(state.clone()) { continue; }
         let Some(node) = nodes.get(state.node.as_str())
             .filter(|node| node_allowed(node, &allowed))
@@ -163,7 +163,16 @@ fn walk_region(
                 generation: node.generation.clone(),
                 ..Default::default()
             });
-        for edge in adjacency.get(state.node.as_str()).into_iter().flatten() {
+        let outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
+            .copied().collect::<Vec<_>>();
+        // Claus is a nested flow renderer: a call seam is entered before the
+        // caller's continuation, and a return seam is handled before leaving
+        // the callee.  Preserve the sidecar order within each class while
+        // placing seams ahead of ordinary continuation edges.
+        let mut ordered = Vec::with_capacity(outgoing.len());
+        ordered.extend(outgoing.iter().copied().filter(|edge| !edge.seam_kind.is_empty()));
+        ordered.extend(outgoing.iter().copied().filter(|edge| edge.seam_kind.is_empty()));
+        for edge in ordered.iter().rev() {
             let target_allowed = nodes.get(edge.target.as_str())
                 .is_some_and(|target| node_allowed(target, &allowed));
             let seam_allowed = edge.seam_kind.is_empty()
@@ -200,7 +209,7 @@ fn walk_region(
                     continue;
                 }
             }
-            queue.push_back(WalkState { node: edge.target.clone(), stack: next_stack });
+            stack.push(WalkState { node: edge.target.clone(), stack: next_stack });
         }
     }
     (tokens, edges_used, complete && !seen.is_empty())
@@ -454,5 +463,12 @@ mod tests {
         assert_eq!(skeletons[0].context, "s0");
         assert!(skeletons[0].tokens.iter().any(|token| token.function == "callee"));
         assert!(skeletons[0].complete);
+        let callee_enter = skeletons[0].tokens.iter()
+            .position(|token| token.kind == "enter" && token.function == "callee").unwrap();
+        let callee_exit = skeletons[0].tokens.iter()
+            .position(|token| token.kind == "exit" && token.function == "callee").unwrap();
+        let continuation = skeletons[0].tokens.iter()
+            .position(|token| token.node == "s2").unwrap();
+        assert!(callee_enter < callee_exit && callee_exit < continuation);
     }
 }
