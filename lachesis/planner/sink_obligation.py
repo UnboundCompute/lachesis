@@ -167,7 +167,16 @@ class SinkObligation:
             idents = size_identifiers(expression)
             referencing, referencing_total = self._referencing_conditions(owner_id, idents)
             rank, reasons = self._rank(expression, shape, confidence)
-            loc_file = call_props.get("absolute_file") or call_props.get("file")
+            # Location falls back to the bound value node when the sink has no
+            # callsite. Call-expression sinks (memcpy, lodash.merge) carry the
+            # location on their call node; an assignment/subscript sink
+            # (object-integrity.prototype `obj[key] = value`) has no call node,
+            # so `call_props` is empty and file/line would be None -- but the
+            # value node that was bound carries a real location. Consult it.
+            value_props = (self.by_id.get(value_id or "", {}) or {}).get("properties") or {}
+            loc_file = (call_props.get("absolute_file") or call_props.get("file")
+                        or value_props.get("absolute_file") or value_props.get("file"))
+            loc_line = call_props.get("start_line") or value_props.get("start_line")
             language = props.get("language") or (languages[0] if languages else None)
             candidate = {
                 "candidate_id": _candidate_id(
@@ -181,7 +190,7 @@ class SinkObligation:
                 "observations": {
                     "callee": call_props.get("callee") or call_props.get("method_name"),
                     "site": call.get("label"), "file": loc_file,
-                    "line": call_props.get("start_line"),
+                    "line": loc_line,
                     # The argument the obligation is about, by its exact spelling.
                     # Named `size_expression` too so a harness (and the brief list
                     # projection) reads every family through one key; the neutral
