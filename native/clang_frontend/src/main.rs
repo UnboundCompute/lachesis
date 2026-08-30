@@ -166,8 +166,8 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32
 
     let end_location = clang_getRangeEnd(extent);
     let mut end_file = ptr::null_mut();
-    let mut end_line = 0;
-    let mut end_column = 0;
+    let mut end_line = line;
+    let mut end_column = column;
     let mut end_offset = offset;
     clang_getSpellingLocation(
         end_location,
@@ -176,6 +176,25 @@ unsafe fn cursor_file(cursor: CXCursor) -> (String, u32, u32, u32, u32, u32, u32
         &mut end_column,
         &mut end_offset,
     );
+    // `clang_getSpellingLocation` unwinds each endpoint of the extent to where its
+    // token was literally spelled, independently. For a macro-expanded declaration
+    // (pervasive in FFmpeg headers, absent in plain typedefs) the start can unwind
+    // to the macro invocation while the end unwinds into the macro definition -- a
+    // different file -- or the end location is builtin/invalid and yields offset 0.
+    // Either way `end_offset` is not a byte offset in the start's file and may fall
+    // before `offset`, producing a reversed span that fails provenance validation.
+    // Trust the end only when it shares the start's file and does not run backward;
+    // otherwise collapse the span onto the start, which is always valid.
+    let end_filename = if end_file.is_null() {
+        String::new()
+    } else {
+        cx_string(clang_getFileName(end_file))
+    };
+    if end_filename != filename || end_offset < offset {
+        end_offset = offset;
+        end_line = line;
+        end_column = column;
+    }
     (filename, line, column, offset, end_offset, end_line, end_column)
 }
 

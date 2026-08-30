@@ -1614,8 +1614,16 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         full.skeletons = skeleton::build(&full);
         report_native_phase(timing_enabled, semantic_started, "claus skeleton", full.regions.len(), full.skeletons.len());
         if let Some(catalog) = catalog.as_ref() {
+            // Read the FLAT TranslationResult facts sidecar (`.pass2.facts.pb`),
+            // not the framed length-prefixed translation cache
+            // (`.pass2.translation.pb`).  The framed cache is not a bare prost
+            // message; decoding it as TranslationResult misreads the leading
+            // frame-length/header bytes as protobuf tags ("invalid tag value:
+            // 0").  Unsharded/Python-streamed builds write both files; sharded
+            // raw-shard builds write only the flat facts.  Fall back to
+            // recomputing from the substrate when the facts file is absent.
             let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
-                .map(|base| format!("{base}.pass2.translation.pb"))
+                .map(|base| format!("{base}.pass2.facts.pb"))
                 .filter(|path| std::path::Path::new(path).is_file()) {
                 fs::read(path)
                     .map_err(|error| format!("cannot read native translation facts: {error}"))?

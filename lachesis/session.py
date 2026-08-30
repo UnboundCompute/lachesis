@@ -428,6 +428,22 @@ class Analysis:
             for node in delta_nodes
             if node.get("kind") == "sink"
         ]
+        # A sink's location lives on its callsite node.  Call-expression sinks bind a
+        # `call` node the Atropos projection already carries with its full span, but
+        # an assignment/subscript sink (object-integrity.prototype `obj[key]=value`)
+        # binds a `dynamic-behavior` write-site node that reaches the projection only
+        # as a position-less edge-endpoint stub (id/kind/label, empty properties),
+        # while its bound `value_id` is a synthetic access-path node with no span at
+        # all.  A stub already sits in ``nodes`` so it is not "missing" and the header
+        # warm below skips it, leaving the candidate with file/line=None even though
+        # the span is known to the index.  Collect every sink callsite so its header
+        # span can be merged in after the warm regardless of the stub.
+        sink_callsite_ids = {
+            (node.get("properties") or {}).get("callsite_id")
+            for node in delta_nodes
+            if node.get("kind") == "sink"
+            and (node.get("properties") or {}).get("callsite_id")
+        }
         seen = set()
         while work:
             batch = []
@@ -492,6 +508,32 @@ class Analysis:
                 node = index.nodes.get(node_id)
                 if node is not None:
                     nodes[node_id] = node
+
+        # Merge the source span onto every sink callsite that entered as a
+        # position-less stub (see the sink_callsite_ids comment above).  Fetch the
+        # full record rather than a header: the promoted-header map is deferred for
+        # this node kind, so only the warmed record carries the write site's real
+        # file/line.  Merge it without clobbering any property a full record already
+        # provided.  The set is one callsite per sink, so this is a small warm.
+        warmer = getattr(index, "_warm_nodes", None)
+        if sink_callsite_ids and warmer is not None:
+            warmer(sink_callsite_ids)
+            for callsite_id in sink_callsite_ids:
+                record = index.nodes.get(callsite_id)
+                if not record:
+                    continue
+                existing = nodes.get(callsite_id)
+                if existing is None:
+                    nodes[callsite_id] = record
+                    continue
+                merged = dict(existing.get("properties") or {})
+                for key, value in (record.get("properties") or {}).items():
+                    if value is not None and merged.get(key) is None:
+                        merged[key] = value
+                updated = dict(existing)
+                updated["properties"] = merged
+                nodes[callsite_id] = updated
+
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
             _LOGGER.info(
                 "pass2 structural phases: regions=%.3fs cone=%.3fs warm=%.3fs "
