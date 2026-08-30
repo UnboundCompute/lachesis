@@ -161,6 +161,18 @@ that `--prune` discards later.
 
 ## Three-pass resource and equivalence gate
 
+Production execution uses a 5 GiB total process-tree budget by default. Override it with
+`LACHESIS_MEMORY_BUDGET_MB`; values below 1024 MiB are rejected because the compiler and graph
+store cannot operate reliably inside that envelope. Compiler frontends run serially by default
+so independent C and TypeScript heaps cannot multiply past the shared budget. A runner with a
+larger configured budget can opt into output-identical compiler concurrency with
+`LACHESIS_FRONTEND_JOBS`.
+
+The TypeScript old-space ceiling is derived from 70% of the shared budget (3584 MiB at the
+default), reserving the remainder for Node native allocations and the parent process. An
+explicit `LACHESIS_TS_MAX_OLD_SPACE_MB` can lower this share but cannot raise it beyond the
+shared-budget ceiling.
+
 `tools/profile_pipeline.py` runs each production pass in a separate process, applies one
 aggregate process-tree RSS limit (5 GiB by default), and records attributable wall time and
 peak RSS. It also hashes every published binary boundary so optimization work cannot silently
