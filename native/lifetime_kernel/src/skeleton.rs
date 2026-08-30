@@ -5,6 +5,7 @@
 //! control markers, guards, and graph edges; no source text or JSON is needed.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use crate::lifetime_proto;
 
@@ -57,14 +58,22 @@ fn semantic_indexes<'a>(
     (functions, nodes, adjacency)
 }
 
+// The call stack and active-function list are shared behind `Rc`: a walk state
+// is cloned into `seen` and into every successor, but both lists change only at
+// call/return seams, so the common non-seam edge shares the parent's
+// allocations instead of copying them.  Mutation goes through `Rc::make_mut`
+// (copy-on-write), and `Rc<Vec<String>>` orders/compares/hashes by contents, so
+// the derived traits used for `seen` dedup keep their exact meaning.  A walk
+// state never leaves `walk_region`, so the non-atomic `Rc` never crosses the
+// rayon region-parallel boundary.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WalkState {
     node: String,
-    stack: Vec<String>,
+    stack: Rc<Vec<String>>,
     // Active function identities mirror the old Claus recursion guard.  A
     // return address alone is insufficient: mutually recursive calls can
     // keep producing distinct return-node stacks indefinitely.
-    active_functions: Vec<String>,
+    active_functions: Rc<Vec<String>>,
 }
 
 /// Render the same source-rooted composition boundary as the old Claus path.
@@ -129,7 +138,9 @@ fn walk_region(
         let active_functions = nodes.get(start.as_str())
             .map(|node| vec![node.function.clone()])
             .unwrap_or_default();
-        stack.push(WalkState { node: start, stack: Vec::new(), active_functions });
+        stack.push(WalkState {
+            node: start, stack: Rc::new(Vec::new()), active_functions: Rc::new(active_functions),
+        });
     }
     let mut tokens = Vec::new();
     let mut edges_used = Vec::new();
@@ -218,11 +229,11 @@ fn walk_region(
                         kind: "enter".into(), function: callee.to_owned(),
                         depth: depth + 1, ..Default::default()
                     });
-                    if !edge.return_to.is_empty() { next_stack.push(edge.return_to.clone()); }
-                    next_active_functions.push(callee.to_owned());
+                    if !edge.return_to.is_empty() { Rc::make_mut(&mut next_stack).push(edge.return_to.clone()); }
+                    Rc::make_mut(&mut next_active_functions).push(callee.to_owned());
                 }
             } else if edge.seam_kind == "return" {
-                if let Some(expected) = next_stack.pop() {
+                if let Some(expected) = Rc::make_mut(&mut next_stack).pop() {
                     if !edge.target.is_empty() && expected != edge.target {
                         complete = false;
                         continue;
@@ -231,7 +242,7 @@ fn walk_region(
                         kind: "exit".into(), function: node.function.clone(),
                         depth, ..Default::default()
                     });
-                    next_active_functions.pop();
+                    Rc::make_mut(&mut next_active_functions).pop();
                 } else {
                     complete = false;
                     continue;
