@@ -291,8 +291,13 @@ class ShardSetWriter:
         self._save()
         target = self.directory / relative
         target.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(nodes_path, target / "nodes.pb")
-        shutil.copyfile(edges_path, target / "edges.pb")
+        # Move rather than copy: the raw frontend bundle (shard-0) is a disposable
+        # handoff consumed only here, so renaming its payloads into the published
+        # shard-set avoids a transient second copy of the whole bundle on disk --
+        # the dominant transient-disk term at large graph scale. shutil.move falls
+        # back to copy+unlink when source and destination are on different volumes.
+        shutil.move(str(nodes_path), str(target / "nodes.pb"))
+        shutil.move(str(edges_path), str(target / "edges.pb"))
         shard_manifest = graph_pb2.ShardManifest(
             format_version=SHARD_FORMAT_VERSION,
             frontend_id=self.frontend_id, shard_id=str(shard_id),
