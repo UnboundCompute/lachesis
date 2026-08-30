@@ -148,6 +148,18 @@ pub(crate) struct Delta {
     pub(crate) edges: Vec<graph_proto::EdgeRecord>,
 }
 
+impl Delta {
+    pub(crate) fn canonicalize(&mut self) {
+        self.nodes.sort_by(|left, right| {
+            (&left.id, &left.kind, &left.label).cmp(&(&right.id, &right.kind, &right.label))
+        });
+        self.edges.sort_by(|left, right| {
+            (&left.kind, &left.source, &left.target)
+                .cmp(&(&right.kind, &right.source, &right.target))
+        });
+    }
+}
+
 impl Graph {
     pub(crate) fn kind(&self, symbol: u32) -> &str { self.symbols.get(symbol) }
 

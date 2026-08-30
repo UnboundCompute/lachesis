@@ -1503,7 +1503,11 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                 if let Some(nearest) = cfg_node_set.iter()
                     .filter(|candidate| graph.node(candidate)
                         .and_then(|node| integer_property(node, "start_line")) == Some(line))
-                    .min_by_key(|candidate| graph.offset(candidate).abs_diff(graph.offset(&item.node))) {
+                    .min_by(|left, right| {
+                        (graph.offset(left).abs_diff(graph.offset(&item.node)), left.as_str())
+                            .cmp(&(graph.offset(right).abs_diff(graph.offset(&item.node)),
+                                right.as_str()))
+                    }) {
                     anchor = nearest.clone();
                 }
             }
@@ -1516,7 +1520,8 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             let operation_offset = graph.offset(&item.node);
             if let Some(nearest) = cfg_node_set.iter()
                 .filter(|candidate| graph.offset(candidate) <= operation_offset)
-                .max_by_key(|candidate| graph.offset(candidate)) {
+                .max_by(|left, right| (graph.offset(left), left.as_str())
+                    .cmp(&(graph.offset(right), right.as_str()))) {
                 anchor = nearest.clone();
             }
         }

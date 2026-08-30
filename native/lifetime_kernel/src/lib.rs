@@ -54,9 +54,16 @@ mod reach;
 /// applied consistently.
 fn absorb_native_delta(
     graph: &mut pass2::Graph,
-    delta: pass2::Delta,
+    mut delta: pass2::Delta,
     writer: &mut pass2::DataflowStreamWriter,
 ) -> Result<(), String> {
+    // Several overlays naturally deduplicate through hash-backed sets. Their
+    // iteration order is not part of the semantic contract, but allowing it to
+    // reach the stream also changes adjacency insertion order for later passes.
+    // Canonicalize once at the common boundary so publication and absorption
+    // observe the identical, repeatable ordering without adding sorting work to
+    // every overlay implementation.
+    delta.canonicalize();
     writer.append(&delta)?;
     graph.absorb(delta)
 }

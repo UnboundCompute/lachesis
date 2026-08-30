@@ -960,7 +960,9 @@ fn sidecar_to_request_inner(
                 .cmp(&(&right.kind, &right.source, &right.target, right.position))
         });
     }
-    Ok(lifetime_proto::PrepareRequest { functions: functions.into_values().collect() })
+    let mut functions: Vec<_> = functions.into_values().collect();
+    functions.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(lifetime_proto::PrepareRequest { functions })
 }
 
 #[derive(Clone)]
@@ -1558,7 +1560,9 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
             }
         }
     }
-    let result = lifetime_proto::TranslationResult { functions: functions.into_values().collect() };
+    let mut functions: Vec<_> = functions.into_values().collect();
+    functions.sort_by(|left, right| left.id.cmp(&right.id));
+    let result = lifetime_proto::TranslationResult { functions };
     let mut output = Vec::new();
     result.encode(&mut output).map_err(|error| error.to_string())?;
     Ok(output)
