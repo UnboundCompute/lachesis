@@ -172,11 +172,13 @@ def main(argv: list[str] | None = None) -> int:
     resource_dir.mkdir(parents=True, exist_ok=True)
     stages = []
     if not args.reuse_pass1:
+        frontend_timeout = (str(int(args.timeout)) if args.timeout.is_integer()
+                            else str(max(1, int(args.timeout))))
         stages.append(_run_bounded(
             "pass1",
             [sys.executable, "-m", "lachesis.cli.main", "build",
              os.fspath(args.source), os.fspath(args.graph),
-             "--timeout", str(args.timeout)],
+             "--timeout", frontend_timeout],
             memory_mb=args.memory_mb, timeout=args.timeout, report_dir=resource_dir,
         ))
     for stage in ("pass2", "pass3"):
