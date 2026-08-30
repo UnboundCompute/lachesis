@@ -66,8 +66,8 @@ fn model_sinks(request: &crate::atropos_proto::Request,
     result.into_iter().map(|(name, positions)| (name, positions.into_iter().collect())).collect()
 }
 
-fn function_names(items: &[lifetime_proto::TranslationFunction])
-    -> (BTreeMap<String, lifetime_proto::TranslationFunction>, HashMap<String, String>, HashMap<String, String>) {
+fn function_names<'a>(items: &'a [lifetime_proto::TranslationFunction])
+    -> (BTreeMap<String, &'a lifetime_proto::TranslationFunction>, HashMap<String, String>, HashMap<String, String>) {
     let mut functions = BTreeMap::new();
     let mut by_base = HashMap::new();
     let mut by_id = HashMap::new();
@@ -77,7 +77,7 @@ fn function_names(items: &[lifetime_proto::TranslationFunction])
         let name = if functions.contains_key(&base) { format!("{}@{}", base, item.id) } else { base.clone() };
         by_base.entry(base).or_insert_with(|| name.clone());
         by_id.insert(item.id.clone(), name.clone());
-        functions.insert(name, item.clone());
+        functions.insert(name, item);
     }
     (functions, by_base, by_id)
 }
@@ -88,7 +88,7 @@ fn function_names(items: &[lifetime_proto::TranslationFunction])
 /// bottom-up summary schedule inverts.  Resolution matches `contribute` exactly
 /// so the schedule edges align with the flows they gate.
 fn call_successors(
-    functions: &BTreeMap<String, lifetime_proto::TranslationFunction>,
+    functions: &BTreeMap<String, &lifetime_proto::TranslationFunction>,
     by_id: &HashMap<String, String>,
     by_base: &HashMap<String, String>,
 ) -> BTreeMap<String, Vec<String>> {
@@ -115,7 +115,7 @@ fn call_successors(
 /// resolved callee.  Pure in `summaries`, so the caller controls the schedule.
 fn contribute(
     function: &lifetime_proto::TranslationFunction,
-    functions: &BTreeMap<String, lifetime_proto::TranslationFunction>,
+    functions: &BTreeMap<String, &lifetime_proto::TranslationFunction>,
     sinks: &HashMap<String, Vec<Option<u32>>>,
     by_id: &HashMap<String, String>,
     by_base: &HashMap<String, String>,
@@ -277,7 +277,7 @@ pub(crate) fn summarize_with_evidence(
             || succ.get(&component[0]).is_some_and(|callees| callees.contains(&component[0]));
         if !cyclic {
             let name = &component[0];
-            let function = functions.get(name).expect("component function");
+            let function = functions.get(name).copied().expect("component function");
             let additions = contribute(function, &functions, &sinks, &by_id, &by_base, &summaries);
             let target = summaries.get_mut(name).expect("summary entry");
             target.flows.extend(additions.flows);
@@ -296,7 +296,7 @@ pub(crate) fn summarize_with_evidence(
             iterations += 1;
             let mut changed = false;
             for name in &members {
-                let function = functions.get(name).expect("component function");
+                let function = functions.get(name).copied().expect("component function");
                 let additions = contribute(function, &functions, &sinks, &by_id, &by_base, &summaries);
                 let target = summaries.get_mut(name).expect("summary entry");
                 let before = (target.flows.len(), target.params.len());
