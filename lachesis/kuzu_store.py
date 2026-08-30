@@ -1448,19 +1448,28 @@ def _load_index_bulk(conn, table_name: str, columns: tuple, rows: list, *,
     if not rows:
         return
     codes = id_codes or {}
-    staged = {"seq": pa.array(list(range(len(rows))), pa.int64())}
-    for column in columns:
-        cells = [_index_cell(column, row.get(column), codes) for row in rows]
-        if column in _INDEX_BOOL_COLUMNS:
-            staged[column] = pa.array(cells, pa.bool_())
-        elif column in _INDEX_INT_COLUMNS:
-            staged[column] = pa.array(
-                [None if cell is None else int(cell) for cell in cells], pa.int64())
-        else:
-            staged[column] = _str_col(cells)
-    path = os.path.join(stage_dir, f"{table_name.lower()}.parquet")
-    pq.write_table(pa.table(staged), path)
-    conn.execute(f"COPY {table_name} FROM '{path}'")
+    # Partition the COPY the same way nodes and edges are: one COPY over the whole
+    # index overflows Kùzu's bounded buffer pool at multi-million-row scale.  ``seq``
+    # stays globally continuous across partitions so the loaded rows are identical.
+    total = len(rows)
+    for offset in range(0, total, STREAM_EDGE_COPY_PARTITION_ROWS):
+        chunk = rows[offset:offset + STREAM_EDGE_COPY_PARTITION_ROWS]
+        staged = {"seq": pa.array(
+            list(range(offset, offset + len(chunk))), pa.int64())}
+        for column in columns:
+            cells = [_index_cell(column, row.get(column), codes) for row in chunk]
+            if column in _INDEX_BOOL_COLUMNS:
+                staged[column] = pa.array(cells, pa.bool_())
+            elif column in _INDEX_INT_COLUMNS:
+                staged[column] = pa.array(
+                    [None if cell is None else int(cell) for cell in cells], pa.int64())
+            else:
+                staged[column] = _str_col(cells)
+        partition = offset // STREAM_EDGE_COPY_PARTITION_ROWS
+        path = os.path.join(stage_dir, f"{table_name.lower()}.{partition}.parquet")
+        pq.write_table(pa.table(staged), path)
+        conn.execute(f"COPY {table_name} FROM '{path}'")
+        os.unlink(path)
 
 
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
@@ -1723,6 +1732,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
     node_writer = None
     node_path = None
+    node_path_list: list[str] = []
+    node_row_count = 0
     edge_writers = {}
     edge_writer_paths = {}
     edge_path_lists = collections.defaultdict(list)
@@ -1742,20 +1753,34 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         edge_path_lists[kind].append(edge_writer_paths.pop(kind))
         edge_row_counts[kind] = 0
 
+    def flush_node_partition() -> None:
+        nonlocal node_writer, node_path, node_row_count
+        if node_writer is None:
+            return
+        node_writer.close()
+        node_path_list.append(node_path)
+        node_writer = None
+        node_path = None
+        node_row_count = 0
+
     def load_nodes(batch: list[dict]) -> None:
         if not batch:
             return
         if bulk:
-            nonlocal node_writer, node_path
+            nonlocal node_writer, node_path, node_row_count
             if isinstance(batch[0], graph_pb2.NodeRecord):
                 table = _node_table_proto(batch, elide=True, codec=codec,
                                           id_codes=id_codes)
             else:
                 table = _node_table(batch, elide=True, codec=codec, id_codes=id_codes)
             if node_writer is None:
-                node_path = os.path.join(stage.name, "node.parquet")
+                partition = len(node_path_list)
+                node_path = os.path.join(stage.name, f"node.{partition}.parquet")
                 node_writer = pq.ParquetWriter(node_path, table.schema)
             node_writer.write_table(table)
+            node_row_count += table.num_rows
+            if node_row_count >= STREAM_EDGE_COPY_PARTITION_ROWS:
+                flush_node_partition()
         else:
             if isinstance(batch[0], graph_pb2.NodeRecord):
                 batch = [decode_node(node.SerializeToString()) for node in batch]
@@ -1809,9 +1834,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             batch.clear()
     if batch:
         load_nodes(batch)
-    if bulk and node_writer is not None:
-        node_writer.close()
-        conn.execute(f"COPY Node FROM '{node_path}'")
+    if bulk:
+        flush_node_partition()
+        for path in node_path_list:
+            conn.execute(f"COPY Node FROM '{path}'")
+            os.unlink(path)
     timing("load nodes")
 
     batch = []
