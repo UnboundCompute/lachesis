@@ -79,6 +79,26 @@ except Exception:  # pragma: no cover - falls back to per-row inserts if absent
     pa = None
     pq = None
 
+_warned_missing_bulk = False
+
+
+def _warn_missing_bulk_dependency() -> None:
+    """Emit one stderr warning when the bounded bulk-COPY load path is unavailable.
+
+    ``pyarrow`` is an optional import, but it is the difference between the bounded
+    staged-Parquet ``COPY`` path and a row-wise fallback that costs far more memory
+    and time. Losing it silently reads as a build regression, so say so once."""
+    global _warned_missing_bulk
+    if _warned_missing_bulk:
+        return
+    _warned_missing_bulk = True
+    print(
+        "[lachesis] warning: pyarrow is not importable; the Kuzu store write is "
+        "falling back to the row-wise load path, which uses far more memory and "
+        "wall time than the bounded bulk COPY path. Install pyarrow to restore it.",
+        file=sys.stderr, flush=True,
+    )
+
 
 # -- schema shared with the read side (single source of truth) ----------------
 
@@ -1692,6 +1712,14 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     timing("create schema")
     codec = PropsCodec()
     bulk = pa is not None and pq is not None
+    if not bulk:
+        # The staged-Parquet COPY path is what makes this the bounded-memory build:
+        # without pyarrow the row-wise fallback holds the whole load in one growing
+        # transaction, which measured ~9x the peak RSS and ~10x the wall time on a
+        # mid-size tree (and OOMs where the bulk path stays well under budget). That
+        # is silent otherwise, so a run can look like a memory/latency problem in the
+        # build when it is really a missing optional dependency. Warn once.
+        _warn_missing_bulk_dependency()
     stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
     node_writer = None
     node_path = None
