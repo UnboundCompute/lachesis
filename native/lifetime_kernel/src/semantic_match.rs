@@ -855,12 +855,15 @@ fn match_function(
 }
 
 pub(crate) fn match_result(
-    result: lifetime_proto::NativeSemanticResult,
+    mut result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
-    let had_skeletons = !result.skeletons.is_empty();
-    let temporal_skeletons: Vec<_> = result.skeletons.iter()
+    // Take the skeletons by value: the temporal branch consumes them and the
+    // fall-through branches never read them, so moving avoids cloning every
+    // skeleton (each owning a token vector of strings) out of the result.
+    let skeletons = std::mem::take(&mut result.skeletons);
+    let had_skeletons = !skeletons.is_empty();
+    let temporal_skeletons: Vec<_> = skeletons.into_iter()
         .filter(|skeleton| skeleton.kind != "reach")
-        .cloned()
         .collect();
     if had_skeletons {
         let mut matched = match_skeletons(temporal_skeletons);
@@ -930,14 +933,22 @@ pub(crate) fn match_result_with_catalog(
     // path-sensitive temporal automaton.  Passing both kinds to
     // `match_result` makes a reach sink look like a lifecycle event and can
     // produce duplicate or spurious temporal findings.
-    let reach_skeletons: Vec<_> = result.skeletons.iter()
-        .filter(|skeleton| skeleton.kind == "reach")
-        .cloned().collect();
-    let sink_graphs: Vec<_> = result.skeletons.iter()
-        .filter(|skeleton| skeleton.kind == "reach-graph")
-        .cloned().collect();
-    result.skeletons.retain(|skeleton|
-        skeleton.kind != "reach" && skeleton.kind != "reach-graph");
+    // Partition the skeletons by moving them out of the result exactly once:
+    // reach and reach-graph skeletons go to their own matchers, the remainder
+    // stays in the result for the temporal automaton. Preserves per-bucket
+    // order (and therefore ordinals) while avoiding two cloned copies plus a
+    // retain realloc of the skeleton set.
+    let mut reach_skeletons = Vec::new();
+    let mut sink_graphs = Vec::new();
+    let mut temporal_skeletons = Vec::new();
+    for skeleton in std::mem::take(&mut result.skeletons) {
+        match skeleton.kind.as_str() {
+            "reach" => reach_skeletons.push(skeleton),
+            "reach-graph" => sink_graphs.push(skeleton),
+            _ => temporal_skeletons.push(skeleton),
+        }
+    }
+    result.skeletons = temporal_skeletons;
     let mut matched = match_result(result);
     matched.functions.extend(reach_skeletons.iter().enumerate()
         .filter_map(|(ordinal, skeleton)| match_reach_skeleton(skeleton, catalog, ordinal)));
