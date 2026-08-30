@@ -158,3 +158,28 @@ positive integer); this changes read parallelism, not graph facts.
 Use a clean output directory and monitor the process on very large trees. The command
 builds the complete C graph directly; the token/proof switches remove only lexical facts
 that `--prune` discards later.
+
+## Three-pass resource and equivalence gate
+
+`tools/profile_pipeline.py` runs each production pass in a separate process, applies one
+aggregate process-tree RSS limit (5 GiB by default), and records attributable wall time and
+peak RSS. It also hashes every published binary boundary so optimization work cannot silently
+change the graph, derived facts, semantic graph, or findings:
+
+```bash
+python tools/profile_pipeline.py /path/to/source /tmp/project.kuzu \
+  --report /tmp/project-profile.json
+```
+
+Use an existing Pass-1 store when iterating on Pass 2 or Pass 3:
+
+```bash
+python tools/profile_pipeline.py /tmp/project.kuzu --reuse-pass1 \
+  --report /tmp/candidate.json --baseline /tmp/baseline.json
+```
+
+The baseline comparison is deliberately byte-exact. A failure caused only by record order is
+still useful evidence that the producing pass is nondeterministic; stabilize that pass instead
+of weakening the equivalence gate. Resource enforcement is a safety net for profiling. Product
+passes must stay below the budget through bounded working sets and spill/backpressure rather
+than depending on the supervisor to terminate an oversized run.
