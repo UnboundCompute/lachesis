@@ -372,22 +372,25 @@ fn match_function(
     // Keep the metadata needed by seam traversal beside the adjacency entry.
     // Looking it up by scanning `function.edges` inside the state worklist made
     // stitched matching O(states * edges) on large functions/stitched graphs.
+    // Borrow the guard/binding/seam metadata from `function.edges`; the
+    // function is borrowed for the whole match and outlives the worklist, so a
+    // per-edge owned copy of every guard proof and seam binding is wasted.
     let mut guarded_outgoing: Vec<Vec<(
         usize,
-        Vec<lifetime_proto::GuardProof>,
-        Vec<lifetime_proto::NativeSeamBinding>,
-        String,
-        String,
+        &[lifetime_proto::GuardProof],
+        &[lifetime_proto::NativeSeamBinding],
+        &str,
+        &str,
     )>> = vec![Vec::new(); function.nodes.len()];
     for edge in &function.edges {
         if let (Some(source), Some(target)) = (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str())) {
             outgoing[*source].push(*target);
             guarded_outgoing[*source].push((
                 *target,
-                edge.guards.clone(),
-                edge.bindings.clone(),
-                edge.seam_kind.clone(),
-                edge.return_to.clone(),
+                edge.guards.as_slice(),
+                edge.bindings.as_slice(),
+                edge.seam_kind.as_str(),
+                edge.return_to.as_str(),
             ));
         }
     }
@@ -691,18 +694,18 @@ fn match_function(
                 }
             }
         }
-        for (target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
+        for &(target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
             let mut next_returns = returns.clone();
             if seam_kind == "call" {
                 if !return_to.is_empty() {
-                    let Some(continuation) = by_id.get(return_to.as_str()).copied() else {
+                    let Some(continuation) = by_id.get(return_to).copied() else {
                         continue;
                     };
                     next_returns.push(continuation);
                 }
             } else if seam_kind == "return" {
                 let Some(continuation) = next_returns.pop() else { continue };
-                if continuation != *target { continue; }
+                if continuation != target { continue; }
             }
             let mut next_bindings = bindings.clone();
             for binding in seam_bindings {
@@ -808,7 +811,7 @@ fn match_function(
             }
             if !contradiction {
                 let mut next_state = StateKey {
-                    node: *target, returns: next_returns, bindings: next_bindings,
+                    node: target, returns: next_returns, bindings: next_bindings,
                     guards: next_guards.iter().map(|guard|
                         (guard.kind.clone(), guard.value.clone())).collect(),
                     released: released.clone(), origins: next_origins, nulls: next_nulls,
@@ -817,9 +820,9 @@ fn match_function(
                     pointer_arithmetic: pointer_arithmetic.clone(), escaped: next_escaped,
                     realloc_lost: realloc_lost.clone(),
                 };
-                if function.nodes[*target].event_kind == "LOOP" {
+                if function.nodes[target].event_kind == "LOOP" {
                     const LOOP_WIDEN_LIMIT: usize = 32;
-                    let key = (*target, next_state.returns.clone());
+                    let key = (target, next_state.returns.clone());
                     let bucket = loop_buckets.entry(key).or_default();
                     if bucket.len() >= LOOP_WIDEN_LIMIT {
                         let prior = bucket.remove(0);
