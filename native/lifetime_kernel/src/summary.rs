@@ -243,22 +243,22 @@ fn tarjan_scc(nodes: &[String], succ: &BTreeMap<String, Vec<String>>) -> Vec<Vec
 }
 
 pub(crate) fn summarize(
-    translation: lifetime_proto::TranslationResult,
-    catalog: crate::atropos_proto::Request,
+    translation: &lifetime_proto::TranslationResult,
+    catalog: &crate::atropos_proto::Request,
 ) -> lifetime_proto::NativeSummaryResult {
     summarize_with_evidence(translation, catalog, None)
 }
 
 pub(crate) fn summarize_with_evidence(
-    translation: lifetime_proto::TranslationResult,
-    catalog: crate::atropos_proto::Request,
+    translation: &lifetime_proto::TranslationResult,
+    catalog: &crate::atropos_proto::Request,
     evidence: Option<&HashMap<String, Vec<String>>>,
 ) -> lifetime_proto::NativeSummaryResult {
     let (functions, by_base, by_id) = function_names(&translation.functions);
     let languages: BTreeSet<String> = translation.functions.iter()
         .filter_map(|function| (!function.language.is_empty()).then(|| function.language.clone()))
         .collect();
-    let sinks = model_sinks(&catalog, &languages);
+    let sinks = model_sinks(catalog, &languages);
     let mut summaries: BTreeMap<String, Summary> = functions.keys()
         .map(|name| (name.clone(), Summary::default())).collect();
 
@@ -388,7 +388,7 @@ mod tests {
             method: "sink_call".into(), role: "sink".into(), access_path: "Argument[0]".into(),
             ..Default::default()
         }], ..Default::default() };
-        let result = summarize(translation, catalog);
+        let result = summarize(&translation, &catalog);
         let caller = result.functions.iter().find(|item| item.name == "caller").unwrap();
         assert!(caller.sink_flows.iter().any(|flow| flow.via == "helper@helper-2"));
     }
@@ -428,7 +428,7 @@ mod tests {
                 parameter_names: vec!["p".into()], calls: vec![call], ..Default::default() }
         }).collect();
         let translation = lifetime_proto::TranslationResult { functions };
-        let result = summarize(translation, sink_catalog());
+        let result = summarize(&translation, &sink_catalog());
         assert!(result.complete, "deep acyclic chain must converge");
         let top = result.functions.iter().find(|item| item.name == "f0").unwrap();
         assert!(top.sink_flows.iter().any(|flow| flow.sink == "sink_call.a0"),
@@ -456,7 +456,7 @@ mod tests {
                     arguments: param_arg(), ..Default::default() },
             ], ..Default::default() };
         let translation = lifetime_proto::TranslationResult { functions: vec![a, b] };
-        let result = summarize(translation, sink_catalog());
+        let result = summarize(&translation, &sink_catalog());
         assert!(result.complete, "recursive component must reach a fixpoint");
         for name in ["a", "b"] {
             let function = result.functions.iter().find(|item| item.name == name).unwrap();

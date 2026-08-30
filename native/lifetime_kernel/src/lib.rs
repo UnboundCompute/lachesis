@@ -1540,7 +1540,7 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
             fs::read(catalog).map_err(|error| format!("cannot read binary catalog: {error}"))?.as_slice()
         ).map_err(|error| format!("invalid binary catalog: {error}"))?;
         native_graph::annotate_translation_roles(&mut translation, &catalog);
-        let result = summary::summarize(translation, catalog);
+        let result = summary::summarize(&translation, &catalog);
         let mut bytes = Vec::new();
         result.encode(&mut bytes).map_err(|error| format!("cannot encode summaries: {error}"))?;
         let temporary = format!("{output}.tmp.{}", std::process::id());
@@ -1642,7 +1642,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             ).map_err(|error| format!("invalid native translation facts: {error}"))?;
             native_graph::annotate_translation_roles(&mut translation, catalog);
             let summaries = summary::summarize_with_evidence(
-                translation.clone(), catalog.clone(),
+                &translation, catalog,
                 source_evidence.as_ref().map(|evidence| &evidence.witnesses));
             if !summaries.complete { full.complete = false; }
             full.skeletons.extend(reach::build_sink_graphs(

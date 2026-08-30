@@ -379,7 +379,7 @@ mod tests {
                 calls: vec![call("sink-call-2", false)], ..Default::default()
             },
         ]};
-        let summaries = crate::summary::summarize(translation.clone(), sink_catalog());
+        let summaries = crate::summary::summarize(&translation, &sink_catalog());
         let skeletons = build(&translation, &summaries, &sink_catalog());
         assert_eq!(skeletons.len(), 3);
         assert!(skeletons.iter().any(|item| item.entry == "public_entry" && item.is_source));
