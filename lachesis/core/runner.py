@@ -13,7 +13,7 @@ from typing import Callable, Optional, Sequence
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from . import graph_pb2
 from .graph_wire import WIRE_FORMAT_VERSION, decode_node, iter_tier_records
-from .shards import ShardSetWriter
+from .shards import ShardReader, ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
 
 
@@ -117,6 +117,47 @@ def _stream_bundle_to_shard(
     node_count = edge_count = 0
     retained_node_ids: set[str] = set()
     try:
+        if frontend_id == "clang-c" and raw_manifest_path.is_file():
+            # The native Clang frontend emits one raw shard (nodes.pb/edges.pb) that
+            # already carries each record's tier, not the per-tier files the loop below
+            # expects.  Its bundle manifest has no ``tiers`` entry, so that loop would
+            # iterate nothing and complete an empty shard -- the ownership-filtered path
+            # can therefore never reach the verbatim fast path above.  Read the raw shard
+            # directly and apply the filter here; surviving records are re-serialised
+            # unchanged, matching the fast path for everything that is kept.
+            reader = ShardReader(raw_shard)
+            for payload in reader.raw_nodes():
+                node = None
+                if keep_node is not None:
+                    # Applied while the protobuf record is live, so a package-sharded
+                    # build discards imported dependency views without materialising a
+                    # bundle -- the owning chunk emits the canonical record.
+                    node = decode_node(payload)
+                    if not keep_node(node):
+                        continue
+                message = graph_pb2.NodeRecord()
+                message.ParseFromString(payload)
+                node_id = node["id"] if node is not None else message.id
+                writer.add_node_payload(message.SerializeToString())
+                retained_node_ids.add(node_id)
+                node_count += 1
+            for payload in reader.raw_edges():
+                message = graph_pb2.EdgeRecord()
+                message.ParseFromString(payload)
+                if keep_node is not None and message.source not in retained_node_ids:
+                    continue
+                writer.add_edge_payload(message.SerializeToString())
+                edge_count += 1
+            shard_set.complete(str(shard_id), writer)
+            snapshot = FrontendSnapshot(
+                frontend_id=frontend_id,
+                contract_version=manifest.get("frontend_contract_version", manifest.get("version")),
+                languages=tuple(manifest.get("languages", ())),
+                capabilities=dict(manifest.get("capabilities", {})),
+                manifest=manifest, nodes=[], edges=[], stdout=stdout, stderr=stderr,
+                released=True, _released_node_count=node_count, _released_edge_count=edge_count,
+            )
+            return snapshot
         for tier_name, tier_path in ((item.get("tier"), os.path.join(output_dir, item.get("file", "")))
                                      for item in manifest.get("tiers", [])):
             for collection, payload in iter_tier_records(tier_path, raw=True):
