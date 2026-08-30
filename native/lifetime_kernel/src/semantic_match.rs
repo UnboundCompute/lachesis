@@ -6,6 +6,7 @@
 //! strings on every CFG transfer.
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -101,12 +102,23 @@ fn trace_witness(
 /// only a few objects.  Keeping sorted handles avoids cloning a dense bitset
 /// sized to every object in every worklist state and retains deterministic
 /// hashing/equality.
+// The handle vector is shared behind an `Rc` so cloning a worklist state is a
+// refcount bump, not a copy of all nine sorted-handle sets.  A state carries
+// eleven of these and up to `MAX_STATES` distinct states are retained in
+// `seen`; most transitions touch one or two sets, so the unchanged ones share
+// one allocation across every derived state.  Mutation goes through
+// `Rc::make_mut`, which copies on write only when a set is actually shared, so
+// contents - and therefore state equality, hashing and matcher output - are
+// unchanged.  `Rc<Vec<u32>>` compares and hashes by pointed-to contents, so the
+// derived `Eq`/`Hash` used for state dedup keep their exact meaning.  States
+// never leave a single `match_function` call, so the non-atomic `Rc` never
+// crosses the rayon function-parallel boundary.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct MarkSet(Vec<u32>);
+struct MarkSet(Rc<Vec<u32>>);
 
 impl MarkSet {
     fn empty(_object_count: usize) -> Self {
-        Self(Vec::new())
+        Self(Rc::new(Vec::new()))
     }
 
     #[inline]
@@ -117,14 +129,14 @@ impl MarkSet {
     #[inline]
     fn insert(&mut self, value: u32) {
         if let Err(index) = self.0.binary_search(&value) {
-            self.0.insert(index, value);
+            Rc::make_mut(&mut self.0).insert(index, value);
         }
     }
 
     #[inline]
     fn remove(&mut self, value: u32) {
         if let Ok(index) = self.0.binary_search(&value) {
-            self.0.remove(index);
+            Rc::make_mut(&mut self.0).remove(index);
         }
     }
 
@@ -133,11 +145,11 @@ impl MarkSet {
     }
 
     fn union(&self, other: &Self) -> Self {
-        let mut values = self.0.clone();
+        let mut values: Vec<u32> = (*self.0).clone();
         for value in other.iter() {
             if let Err(index) = values.binary_search(&value) { values.insert(index, value); }
         }
-        Self(values)
+        Self(Rc::new(values))
     }
 }
 
