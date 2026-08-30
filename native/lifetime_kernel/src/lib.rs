@@ -1640,6 +1640,11 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             let mut translation = lifetime_proto::TranslationResult::decode(
                 translation_bytes.as_slice(),
             ).map_err(|error| format!("invalid native translation facts: {error}"))?;
+            // The raw facts buffer (as large as `.pass2.facts.pb`) is dead once
+            // decoded.  Release it before the reach phase so peak memory is not
+            // the decoded translation + summaries + skeletons + the raw bytes at
+            // once, mirroring the `drop(result)` below.
+            drop(translation_bytes);
             native_graph::annotate_translation_roles(&mut translation, catalog);
             let summaries = summary::summarize_with_evidence(
                 &translation, catalog,
