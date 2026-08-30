@@ -37,6 +37,7 @@ GRAPH PIPELINE
   build      pass 1: create a named structural graph
   enrich     pass 2: warm native binary sidecars
   analyze    pass 3: inspect leads from a named graph
+  trace      export a lachesis-explorer bundle.json for a repository
 
 MORE
   candidates, query, plan, report, communities, doctor, cache, concept-model
@@ -119,7 +120,7 @@ def _native_status() -> str:
 
 def command_completion(args: argparse.Namespace) -> int:
     """Print a dependency-free completion script for the selected shell."""
-    commands = "scan explain mcp build enrich analyze candidates query plan report communities doctor cache completion"
+    commands = "scan explain mcp build enrich analyze candidates query plan trace report communities doctor cache completion"
     if args.shell == "bash":
         print(f'''_lachesis_complete() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}"
@@ -296,6 +297,87 @@ def command_scan(args: argparse.Namespace) -> int:
                     "agent that can\nanswer them against the same graph, run: lachesis mcp")
     if args.fail_on_findings and queue:
         return EXIT_FINDINGS
+    return EXIT_OK
+
+
+# ----------------------------------------------------------------------- trace
+
+def _repo_meta(source: Path) -> tuple[str | None, str | None]:
+    """Best-effort (repo, commit) from git; either may be None."""
+    import subprocess
+
+    def git(*a: str) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(source), *a],
+                                 capture_output=True, text=True, timeout=10)
+            return (out.stdout.strip() or None) if out.returncode == 0 else None
+        except Exception:
+            return None
+
+    commit = git("rev-parse", "--short", "HEAD")
+    remote = git("config", "--get", "remote.origin.url")
+    repo = None
+    if remote:
+        slug = remote.rstrip("/").removesuffix(".git")
+        parts = slug.replace(":", "/").split("/")
+        if len(parts) >= 2:
+            repo = "/".join(parts[-2:])
+    return repo, commit
+
+
+def command_trace(args: argparse.Namespace) -> int:
+    """Build (or reuse) a graph and export a lachesis-explorer bundle.json."""
+    from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
+                                      ensure_graph)
+    from lachesis.cli.progress import Progress
+    from lachesis.nav import bundle as bundle_mod
+
+    source = _resolved(args.repo)
+    progress = Progress(enabled=not args.quiet)
+    if not args.quiet:
+        _stderr(f"lachesis trace: {source}")
+    try:
+        is_graph = source.is_dir() and (
+            source.name.endswith(".kuzu")
+            or (source / "lachesis-manifest.pb").is_file()
+            or (source / "manifest.pb").is_file()
+        )
+        if is_graph and not args.refresh:
+            graph_path = source
+        else:
+            graph_path, _ = ensure_graph(source, refresh=args.refresh,
+                                         progress=progress,
+                                         timeout_seconds=args.timeout)
+    except EnvironmentProblem as error:
+        return _report_environment(error)
+    except NoSourceFound as error:
+        _stderr(f"lachesis trace: {error}")
+        return EXIT_USAGE
+
+    repo, commit = _repo_meta(source)
+    progress.phase("exporting bundle")
+    try:
+        bundle = bundle_mod.build_bundle(
+            str(graph_path),
+            repo=args.repo_name or repo,
+            commit=args.commit or commit,
+            lang=args.lang,
+            source_dir=str(source),
+            per_family=args.per_family,
+            max_flows=args.max_flows,
+        )
+    except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
+        _stderr(f"lachesis trace: {error}")
+        return EXIT_FAILURE
+    progress.done()
+
+    out = Path(args.out).expanduser()
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))
+    graph = bundle["graph"]
+    _stderr(f"wrote {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
+            f"{len(bundle['findings'])} findings -> {out}")
     return EXIT_OK
 
 
@@ -807,6 +889,34 @@ def build_parser() -> argparse.ArgumentParser:
                        help="stream frontend shards directly into the graph store")
     build.set_defaults(handler=command_build, no_prune=False)
 
+    trace = subcommands.add_parser(
+        "trace", help="build a graph and export a lachesis-explorer bundle.json",
+        description="Point at a repository (or an existing .kuzu graph) and write a "
+                    "lachesis-explorer bundle.json: the sink families the graph carries, "
+                    "each with the reachability cone that feeds it, in the shape the "
+                    "explorer renders. Every flow is a fact, not a verdict.")
+    trace.add_argument("repo", nargs="?", default=".",
+                       help="source tree or existing graph to trace (default: .)")
+    trace.add_argument("--repo", dest="repo", metavar="PATH",
+                       help="same as the positional repo argument")
+    trace.add_argument("-o", "--out", default="bundle.json", metavar="FILE",
+                       help="bundle path to write (default: bundle.json)")
+    trace.add_argument("--repo-name", metavar="OWNER/REPO",
+                       help="override the repo slug recorded in bundle meta")
+    trace.add_argument("--commit", metavar="SHA", help="override the commit in meta")
+    trace.add_argument("--lang", metavar="LANG", help="override the language in meta")
+    trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
+                       help="max leads to draw from each sink family (default: 6)")
+    trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",
+                       help="max flows in the bundle (default: 40)")
+    trace.add_argument("--timeout", type=_positive_seconds, default=600, metavar="SECONDS",
+                       help="maximum seconds per frontend when building (default: 600)")
+    trace.add_argument("--refresh", action="store_true",
+                       help="rebuild the graph even if a current cache exists")
+    trace.add_argument("--quiet", "-q", action="store_true",
+                       help="suppress progress narration on stderr")
+    trace.set_defaults(handler=command_trace)
+
     query = subcommands.add_parser(
         "query", help="ask a focused question of a named graph",
         description="Query a named graph with a bounded, structured question.")
@@ -869,7 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
 KNOWN_COMMANDS = {
     "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
-    "query", "plan", "completion",
+    "query", "plan", "completion", "trace",
 }
 
 
