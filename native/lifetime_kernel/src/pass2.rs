@@ -6,12 +6,13 @@
 //! while protobuf properties remain typed for overlay-specific accessors.
 
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use hashbrown::HashMap;
 use prost::Message;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use sha2::{Digest, Sha256};
 
 use crate::graph_proto;
@@ -79,17 +80,34 @@ impl Drop for DataflowStreamWriter {
 #[derive(Default)]
 pub(crate) struct Symbols {
     values: Vec<String>,
-    lookup: FxHashMap<String, u32>,
+    lookup: FxHashMap<u64, u32>,
+    collisions: FxHashMap<u64, Vec<u32>>,
 }
 
 impl Symbols {
+    #[inline]
+    fn hash(value: &str) -> u64 {
+        let mut hasher = FxHasher::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(crate) fn intern(&mut self, value: String) -> u32 {
-        if let Some(symbol) = self.lookup.get(&value) {
-            return *symbol;
+        let hash = Self::hash(&value);
+        if let Some(symbol) = self.lookup.get(&hash).copied() {
+            if self.get(symbol) == value { return symbol; }
+            if let Some(symbol) = self.collisions.get(&hash).into_iter().flatten()
+                .copied().find(|symbol| self.get(*symbol) == value) {
+                return symbol;
+            }
         }
         let symbol = self.values.len() as u32;
-        self.lookup.insert(value.clone(), symbol);
         self.values.push(value);
+        if self.lookup.contains_key(&hash) {
+            self.collisions.entry(hash).or_default().push(symbol);
+        } else {
+            self.lookup.insert(hash, symbol);
+        }
         symbol
     }
 
@@ -97,7 +115,13 @@ impl Symbols {
         self.values.get(symbol as usize).map(String::as_str).unwrap_or("")
     }
 
-    pub(crate) fn find(&self, value: &str) -> Option<u32> { self.lookup.get(value).copied() }
+    pub(crate) fn find(&self, value: &str) -> Option<u32> {
+        let hash = Self::hash(value);
+        let symbol = self.lookup.get(&hash).copied()?;
+        if self.get(symbol) == value { return Some(symbol); }
+        self.collisions.get(&hash).into_iter().flatten().copied()
+            .find(|symbol| self.get(*symbol) == value)
+    }
 }
 
 pub(crate) struct Node {
