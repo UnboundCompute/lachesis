@@ -131,7 +131,6 @@ pub(crate) struct Graph {
     pub(crate) edges: Vec<Edge>,
     pub(crate) node_by_id: FxHashMap<u32, usize>,
     pub(crate) outgoing: Vec<Vec<usize>>,
-    pub(crate) incoming: Vec<Vec<usize>>,
     /// Frequently queried structural fields, indexed by node position.  The
     /// original property vectors remain available to overlays that need richer
     /// fields, but control-flow no longer rescans them during every sort/walk.
@@ -139,7 +138,10 @@ pub(crate) struct Graph {
     /// Candidate edge indexes by triple.  Properties are compared only when a
     /// triple collides, matching composition's first-wins/different-properties
     /// behavior without serializing every edge during ingestion.
-    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>>,
+    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), usize>,
+    /// Additional same-triple edges are rare; keep their allocations out of
+    /// the common one-edge dedup entry.
+    pub(crate) edge_collisions: FxHashMap<(u32, u32, u32), Vec<usize>>,
 }
 
 #[derive(Clone)]
@@ -262,24 +264,25 @@ impl Graph {
             self.node_by_id.insert(id, self.nodes.len());
             self.nodes.push(node);
             self.outgoing.push(Vec::new());
-            self.incoming.push(Vec::new());
         }
         for record in delta.edges {
             let edge = make_edge(&mut self.symbols, record.kind, record.source, record.target, record.properties);
             let triple = (edge.kind, edge.source, edge.target);
-            let duplicate = self.edge_lookup.get(&triple).into_iter().flatten().any(|index| {
-                self.edges[*index].properties == edge.properties
-            });
+            let duplicate = self.edge_lookup.get(&triple).is_some_and(|index|
+                self.edges[*index].properties == edge.properties)
+                || self.edge_collisions.get(&triple).into_iter().flatten().any(|index|
+                    self.edges[*index].properties == edge.properties);
             if duplicate { continue; }
             let index = self.edges.len();
             if let Some(source) = self.node_by_id.get(&edge.source).copied() {
                 self.outgoing[source].push(index);
             }
-            if let Some(target) = self.node_by_id.get(&edge.target).copied() {
-                self.incoming[target].push(index);
-            }
             self.edges.push(edge);
-            self.edge_lookup.entry(triple).or_default().push(index);
+            if self.edge_lookup.contains_key(&triple) {
+                self.edge_collisions.entry(triple).or_default().push(index);
+            } else {
+                self.edge_lookup.insert(triple, index);
+            }
         }
         Ok(())
     }
@@ -489,14 +492,18 @@ fn finish_graph(
     let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
     for (index, node) in nodes.iter().enumerate() { node_by_id.insert(node.id, index); }
     let mut outgoing = vec![Vec::new(); nodes.len()];
-    let mut incoming = vec![Vec::new(); nodes.len()];
     for (index, edge) in edges.iter().enumerate() {
         if let Some(source) = node_by_id.get(&edge.source) { outgoing[*source].push(index); }
-        if let Some(target) = node_by_id.get(&edge.target) { incoming[*target].push(index); }
     }
-    let mut edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
+    let mut edge_lookup = FxHashMap::default();
+    let mut edge_collisions: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
     for (index, edge) in edges.iter().enumerate() {
-        edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
+        let triple = (edge.kind, edge.source, edge.target);
+        if edge_lookup.contains_key(&triple) {
+            edge_collisions.entry(triple).or_default().push(index);
+        } else {
+            edge_lookup.insert(triple, index);
+        }
     }
     let node_meta = nodes.iter().map(|node| {
         let text = |key: &str| node.properties.iter().find_map(|field| {
@@ -523,8 +530,8 @@ fn finish_graph(
             control_kind,
         }
     }).collect();
-    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing, incoming,
-               node_meta, edge_lookup })
+    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing,
+               node_meta, edge_lookup, edge_collisions })
 }
 
 fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
