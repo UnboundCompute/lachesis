@@ -100,8 +100,9 @@ fn walk_region(
             if id != context { continue; }
             if nodes.contains_key(id.as_str()) {
                 starts.push(id.clone());
-            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
-                && node_allowed(node, &allowed)) {
+            } else if let Some(node) = nodes.values()
+                .filter(|node| node.anchor == *id && node_allowed(node, &allowed))
+                .min_by(|a, b| a.id.cmp(&b.id)) {
                 starts.push(node.id.clone());
             }
         }
@@ -113,8 +114,9 @@ fn walk_region(
             if starts.iter().any(|start| start == id) { continue; }
             if nodes.contains_key(id.as_str()) {
                 starts.push(id.clone());
-            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
-                && node_allowed(node, &allowed)) {
+            } else if let Some(node) = nodes.values()
+                .filter(|node| node.anchor == *id && node_allowed(node, &allowed))
+                .min_by(|a, b| a.id.cmp(&b.id)) {
                 starts.push(node.id.clone());
             }
         }
@@ -189,8 +191,18 @@ fn walk_region(
                 ..Default::default()
             });
         }
-        let outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
+        let mut outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
             .copied().collect::<Vec<_>>();
+        // The semantic sidecar's edge list can arrive in a hasher-dependent
+        // order when it was materialised from a hash-indexed phase upstream, so
+        // impose a total, content-based tie-break here.  This only reorders
+        // otherwise-equivalent sibling edges; the seam/continuation split below
+        // still governs nesting, so branch/loop structure is unchanged.
+        outgoing.sort_by(|a, b| a.target.cmp(&b.target)
+            .then_with(|| a.seam_kind.cmp(&b.seam_kind))
+            .then_with(|| a.callee.cmp(&b.callee))
+            .then_with(|| a.return_to.cmp(&b.return_to))
+            .then_with(|| a.kind.cmp(&b.kind)));
         // Claus is a nested flow renderer: a call seam is entered before the
         // caller's continuation, and a return seam is handled before leaving
         // the callee.  Preserve the sidecar order within each class while
