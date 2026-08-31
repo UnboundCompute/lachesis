@@ -1647,6 +1647,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             unit_names.append(value)
         return code
     prefixes: set[str] = set()
+    # Cross-TU declaration->definition links (REFERS_TO reason=prototype-of) are
+    # emitted by the frontend's end-of-run pass over ONE process's accumulated USR
+    # map. Under sharding each frontend sees only its own TUs, so a prototype in one
+    # shard and the definition in another are never linked and the edge is lost.
+    # Rebuild those links globally here from the compiler USR carried on each
+    # function node. Only the clang-c frontend emits `usr`; other frontends leave
+    # these maps empty, so the reconstruction is inert for them. The maps are keyed
+    # by USR and hold only function ids -- a few thousand entries, not graph-sized.
+    usr_defs: dict[str, list[str]] = {}
+    usr_decls: dict[str, list[str]] = {}
+    existing_proto: set[tuple[str, str]] = set()
     # Index candidates are spilled while the large node/edge streams are loaded.
     # Keeping hundreds of thousands of full property dictionaries alive here was a
     # surprising multi-GB peak on Linux/net; the index builders only need them again
@@ -1824,10 +1835,24 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             node.ParseFromString(item)
             if prune and node.kind in PRUNE_NODE_KINDS:
                 continue
+            if node.kind == "function":
+                usr = _proto_promoted_value(node.properties, "usr")
+                if usr:
+                    decl_only = _proto_promoted_value(
+                        node.properties, "declaration_only") is True
+                    (usr_decls if decl_only else usr_defs).setdefault(
+                        usr, []).append(node.id)
         else:
             node = item
             if prune and node.get("kind") in PRUNE_NODE_KINDS:
                 continue
+            if node.get("kind") == "function":
+                props = node.get("properties") or {}
+                usr = props.get("usr")
+                if usr:
+                    decl_only = props.get("declaration_only") is True
+                    (usr_decls if decl_only else usr_defs).setdefault(
+                        usr, []).append(node["id"])
         batch.append(node)
         if len(batch) >= batch_rows:
             load_nodes(batch)
@@ -1856,6 +1881,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             hash_part(edge.kind)
             hash_part(edge.source)
             hash_part(edge.target)
+            if (edge.kind == "REFERS_TO"
+                    and _proto_promoted_value(edge.properties, "reason")
+                    == "prototype-of"):
+                existing_proto.add((edge.source, edge.target))
         else:
             edge = item
             if edge.get("kind") == "EXPORTS" and edge.get("target"):
@@ -1866,6 +1895,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             hash_part(edge.get("kind"))
             hash_part(edge.get("source"))
             hash_part(edge.get("target"))
+            if (edge.get("kind") == "REFERS_TO"
+                    and (edge.get("properties") or {}).get("reason")
+                    == "prototype-of"):
+                existing_proto.add((edge["source"], edge["target"]))
         batch.append(edge)
         kept_edge_count += 1
         if len(batch) >= edge_batch_rows:
@@ -1873,6 +1906,42 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             batch.clear()
     if batch:
         load_edges(batch)
+    # Replay the frontend's cross-TU prototype-of linking over the GLOBAL USR map.
+    # A single frontend run links every declaration of a function to its definition;
+    # sharding splits those across processes, so a decl in one shard and the def in
+    # another are only reunited here. Emitted after the shard edges in a deterministic
+    # (usr, def, decl) order so the core digest stays stable, deduped against the
+    # prototype-of links the shards already carried (existing_proto) and against ids
+    # that survived endpoint filtering (kept_ids). clang-c-only: usr maps are empty
+    # otherwise, so this loop is skipped. Bounded: iterates function ids, not edges.
+    if binary_edges and usr_defs:
+        recon: list = []
+        for usr in sorted(usr_defs):
+            defs = sorted(set(usr_defs[usr]))
+            decls = sorted(set(usr_decls.get(usr, ())))
+            for defn in defs:
+                if defn not in kept_ids:
+                    continue
+                for decl in decls:
+                    if (decl == defn or decl not in kept_ids
+                            or (decl, defn) in existing_proto):
+                        continue
+                    record = graph_pb2.EdgeRecord(
+                        kind="REFERS_TO", source=decl, target=defn,
+                        source_tier="T1", relationship_class="REFERS_TO")
+                    prop = record.properties.add()
+                    prop.key = "reason"
+                    prop.value.text = "prototype-of"
+                    hash_part(record.kind)
+                    hash_part(record.source)
+                    hash_part(record.target)
+                    recon.append(record)
+                    kept_edge_count += 1
+                    if len(recon) >= edge_batch_rows:
+                        load_edges(recon)
+                        recon.clear()
+        if recon:
+            load_edges(recon)
     if bulk:
         for kind in list(edge_writers):
             flush_edge_partition(kind)

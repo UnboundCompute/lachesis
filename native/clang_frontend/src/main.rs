@@ -1069,6 +1069,16 @@ unsafe fn visit_one(
     ) {
         let usr = cursor_usr(cursor);
         if !usr.is_empty() {
+            // Persist the compiler's canonical cross-TU key on the node.  Within a
+            // single run usr_ids/emit_cross_tu_links already collapse a
+            // prototype instance onto its definition, but those maps are per-run
+            // and are gone once independently-built shards are merged.  Carrying
+            // the USR as a property lets the merge replay that same cross-TU
+            // declaration->definition linking globally.  The USR does not enter
+            // any node id or edge key (stable_id is location-based) and the graph
+            // content hash excludes properties, so this is inert to existing
+            // outputs.
+            properties.push(field("usr", text(&usr)));
             if is_function_syntax(&syntax_kind) {
                 emitter.function_usrs.insert(id.clone(), usr.clone());
             }
