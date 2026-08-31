@@ -230,48 +230,6 @@ fn resolve_value_decl(
 /// an ordinary call.  Keep this entirely structural: follow references,
 /// children, and value-flow assignments, while never consulting a name list
 /// other than the catalog-derived release symbols.
-fn resolves_to_release(
-    start: &str,
-    release_symbols: &HashSet<String>,
-    edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
-    reverse_edges: &HashMap<String, Vec<lifetime_proto::GraphEdge>>,
-    seen: &mut HashSet<String>,
-    memo: &mut HashMap<String, bool>,
-) -> bool {
-    if let Some(result) = memo.get(start) { return *result; }
-    if release_symbols.contains(start) {
-        memo.insert(start.to_owned(), true);
-        return true;
-    }
-    if !seen.insert(start.to_owned()) {
-        return false;
-    }
-    let forward = edges.get(start).into_iter().flatten().filter(|edge| {
-        if edge.role == "ARGUMENT" {
-            return false;
-        }
-        matches!(edge.kind.as_str(), "AST_CHILD" | "REFERS_TO" | "VALUE_FLOWS_TO")
-    }).any(|edge| resolves_to_release(
-        &edge.target, release_symbols, edges, reverse_edges, seen, memo));
-    if forward {
-        seen.remove(start);
-        memo.insert(start.to_owned(), true);
-        return true;
-    }
-    // Compiler value-flow is directional (initializer -> destination).  A
-    // function-pointer variable therefore reaches a catalogued release
-    // symbol through an incoming VALUE_FLOWS_TO edge.  Follow only that
-    // reverse relation; reversing AST/reference edges would over-connect
-    // unrelated syntax nodes.
-    let reverse = reverse_edges.get(start).into_iter().flatten()
-        .filter(|edge| edge.kind == "VALUE_FLOWS_TO" && edge.role != "ARGUMENT")
-        .any(|edge| resolves_to_release(
-            &edge.source, release_symbols, edges, reverse_edges, seen, memo));
-    seen.remove(start);
-    memo.insert(start.to_owned(), forward || reverse);
-    forward || reverse
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SummaryEffect {
     kind: i32,
@@ -1141,17 +1099,54 @@ fn scan_lifetime_metadata(
     for edge in edges_by_source.values().flatten().filter(|edge| edge.kind == "AST_CHILD") {
         children.entry(edge.source.clone()).or_default().push(edge.target.clone());
     }
-    let mut reverse_edges: HashMap<String, Vec<lifetime_proto::GraphEdge>> = HashMap::new();
-    for edge in edges_by_source.values().flatten()
-        .filter(|edge| edge.kind == "VALUE_FLOWS_TO")
-    {
-        reverse_edges.entry(edge.target.clone()).or_default().push(edge.clone());
+    // A value resolves to a release symbol iff it can *reach* one through the
+    // compiler's neutral alias relation: forward along AST_CHILD / REFERS_TO /
+    // VALUE_FLOWS_TO out-edges, and along VALUE_FLOWS_TO in either direction (an
+    // aliased value and its initializer share a lifecycle), excluding ARGUMENT
+    // edges.  Compute that closure with one deterministic multi-source flood
+    // from the release symbols over the *reverse* of the resolution graph
+    // instead of a per-variable memoized DFS.  The old DFS shared a `memo`
+    // across every variable root and could cache a `false` that was really only
+    // cycle-truncated (a descendant hit the on-stack guard), poisoning later
+    // queries and making release classification depend on the randomly-seeded
+    // hash iteration order.  A reachability flood is pure set membership: its
+    // result is order-independent, and it runs in O(V + E).
+    let mut reach_pred: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges_by_source.values().flatten() {
+        if edge.role == "ARGUMENT" { continue; }
+        match edge.kind.as_str() {
+            "VALUE_FLOWS_TO" => {
+                // resolution treats value-flow as bidirectional: mark both ends
+                // from either end.
+                reach_pred.entry(edge.target.clone()).or_default().push(edge.source.clone());
+                reach_pred.entry(edge.source.clone()).or_default().push(edge.target.clone());
+            }
+            "AST_CHILD" | "REFERS_TO" => {
+                // resolves(source) depends on resolves(target); in reverse, from
+                // the target we can mark the source.
+                reach_pred.entry(edge.target.clone()).or_default().push(edge.source.clone());
+            }
+            _ => {}
+        }
     }
-    let mut release_memo = HashMap::new();
+    let mut resolved_set: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for symbol in release_symbol_ids.iter() {
+        if resolved_set.insert(symbol.clone()) {
+            queue.push_back(symbol.clone());
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        if let Some(preds) = reach_pred.get(&node) {
+            for pred in preds {
+                if resolved_set.insert(pred.clone()) {
+                    queue.push_back(pred.clone());
+                }
+            }
+        }
+    }
     let release_value_ids: HashSet<String> = variable_meta.keys()
-        .filter(|variable| resolves_to_release(
-            variable, &release_symbol_ids, &edges_by_source, &reverse_edges,
-            &mut HashSet::new(), &mut release_memo))
+        .filter(|variable| resolved_set.contains(*variable))
         .cloned()
         .collect();
     Ok((owners, function_names, call_ids, edges_by_source, initializer_targets,
@@ -1535,7 +1530,13 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         entry.calls.push(call);
     }
     for entry in functions.values_mut() {
-        for node_id in nodes_by_owner.get(&entry.id).into_iter().flatten() {
+        // `nodes_by_owner` was filled while iterating the `nodes` HashMap in
+        // random hasher order, so sort the owned ids before emitting returns —
+        // node ids are unique, giving a stable total order and byte-identical
+        // `returns` across runs (the values are otherwise pushed in hash order).
+        let mut owned_ids: Vec<&String> = nodes_by_owner.get(&entry.id).into_iter().flatten().collect();
+        owned_ids.sort();
+        for node_id in owned_ids {
             if !translation_return_kind(compact_kind(nodes.get(node_id).unwrap())) { continue; }
             let line = nodes.get(node_id).and_then(|node| compact_property(node, "start_line"))
                 .and_then(|value| value.parse::<i64>().ok());
@@ -1559,6 +1560,17 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                 entry.returns.push(lifetime_proto::FunctionReturn { kind: "var".to_owned(), callee: String::new(), root: path.root, selectors: path.selectors, line: line.unwrap_or_default(), has_line: line.is_some(), root_name, callee_function_id: String::new() });
             }
         }
+    }
+    for entry in functions.values_mut() {
+        // `calls` and `roots` were pushed while iterating the `nodes` HashMap in
+        // random hasher order.  Canonicalize them here — as `parameters` (above)
+        // and `functions` (below) already are — so the sidecar is byte-identical
+        // across runs and the first-match `.find()` in reach/summary picks the
+        // same call every time (that first-match is what turned the random order
+        // into flipped free/pass classification and differing skeleton edges).
+        // `call.node` and `root.id` are unique node ids, so each key is total.
+        entry.calls.sort_by(|a, b| (a.line, a.node.as_str()).cmp(&(b.line, b.node.as_str())));
+        entry.roots.sort_by(|a, b| a.id.cmp(&b.id));
     }
     let mut functions: Vec<_> = functions.into_values().collect();
     functions.sort_by(|left, right| left.id.cmp(&right.id));

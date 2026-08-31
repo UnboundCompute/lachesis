@@ -797,7 +797,13 @@ fn synthesize_cfg(graph: &GraphView, owned: &HashSet<String>) -> Option<(Vec<Str
         .min_by(|left, right| (graph.offset(left), *left).cmp(&(graph.offset(right), *right))).cloned();
     let mut params = owned.iter().filter(|node| matches!(graph.kind(node),
         "ParmVarDecl" | "parameter" | "arg")).cloned().collect::<Vec<_>>();
-    params.sort_by_key(|node| graph.offset(node));
+    // Total order: `owned` is a HashSet (random iteration) and `offset` falls
+    // back to i64::MAX when a node carries no `start_offset` — which every
+    // clang-c parameter does — so sorting on offset alone leaves equal-offset
+    // params in random hasher order and chains them differently each run,
+    // yielding non-deterministic parameter CFG edges.  Break ties on the node
+    // id, exactly as the `body` sort above does.
+    params.sort_by(|left, right| (graph.offset(left), left).cmp(&(graph.offset(right), right)));
     if let Some(exit) = cfg_exit.clone() {
         successors.entry(exit.clone()).or_default();
         for item in exits { successors.entry(item).or_default().push(cfg_exit.clone().unwrap()); }
