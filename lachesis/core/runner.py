@@ -17,6 +17,26 @@ from .shards import ShardReader, ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
 
 
+def _is_reference_read(message) -> bool:
+    """True for the reverse-direction dataflow read a reference emits.
+
+    A `DeclRefExpr`/`MemberRef` emits a pair over one seam: `REFERS_TO`
+    (use -> declaration) and `VALUE_FLOWS_TO(reason=read)` (declaration ->
+    use).  The ownership filter keeps an edge in the shard that owns its
+    *source*, which keeps the REFERS_TO (source is the local use) but drops
+    the read (source is the declaration, which lives in another shard when
+    the reference crosses a translation unit).  The read is nonetheless
+    emitted only by the frontend that sees the use, so the use shard is its
+    true owner: this predicate lets that shard retain it by *target*.
+    """
+    if message.kind != "VALUE_FLOWS_TO":
+        return False
+    for prop in message.properties:
+        if prop.key == "reason":
+            return prop.value.text == "read"
+    return False
+
+
 def _run_frontend_command(
     command: Sequence[str], *, cwd: str, env: dict[str, str], timeout: int,
 ) -> subprocess.CompletedProcess:
@@ -145,7 +165,11 @@ def _stream_bundle_to_shard(
                 message = graph_pb2.EdgeRecord()
                 message.ParseFromString(payload)
                 if keep_node is not None and message.source not in retained_node_ids:
-                    continue
+                    # A reference read is owned by the use site (its target), not
+                    # its source declaration, which may live in another shard.
+                    if not (_is_reference_read(message)
+                            and message.target in retained_node_ids):
+                        continue
                 writer.add_edge_payload(message.SerializeToString())
                 edge_count += 1
             shard_set.complete(str(shard_id), writer)
@@ -183,7 +207,11 @@ def _stream_bundle_to_shard(
                 message.source_tier = tier_name
                 message.relationship_class = collection
                 if keep_node is not None and message.source not in retained_node_ids:
-                    continue
+                    # A reference read is owned by the use site (its target), not
+                    # its source declaration, which may live in another shard.
+                    if not (_is_reference_read(message)
+                            and message.target in retained_node_ids):
+                        continue
                 writer.add_edge_payload(message.SerializeToString())
                 edge_count += 1
         shard_set.complete(str(shard_id), writer)

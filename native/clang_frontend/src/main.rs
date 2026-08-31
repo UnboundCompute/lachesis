@@ -558,6 +558,36 @@ fn json_syntax_kind(kind: &str) -> &str {
     }
 }
 
+/// Resolve the file-node id an `#include` depends on.
+///
+/// A file node's id is a pure function of its canonicalised absolute path
+/// (`emit_file_node`), so under sharding -- where the included file's node lives
+/// in another shard and is absent from this frontend's `file_ids` -- we can still
+/// name it, provided it is a project file the build gives a node to. The path is
+/// already canonicalised by `canonical_file`, so it hashes to the id the owning
+/// shard emitted, and the source file (the current unit) owns the edge, so the
+/// merge keeps it. A header outside the project root gets no node in either build
+/// (the single frontend's `file_ids` lookup misses it too), so it resolves to
+/// None and emits no dependency; and should a project file happen to have no node
+/// at all, the merge drops the edge on its absent endpoint. The result is the
+/// same dependency set a single-frontend build produces.
+fn include_target_id(emitter: &Emitter, included: &str) -> Option<String> {
+    if let Some(existing) = emitter.file_ids.get(included) {
+        return Some(existing.clone());
+    }
+    if included.is_empty() || emitter.project_root.is_empty() {
+        return None;
+    }
+    if Path::new(included)
+        .strip_prefix(Path::new(&emitter.project_root))
+        .is_ok()
+    {
+        Some(stable_id_parts("file", &[included.to_owned()]))
+    } else {
+        None
+    }
+}
+
 fn emit_file_node(emitter: &mut Emitter, path: &str, source_dir: &str) -> io::Result<()> {
     let absolute = Path::new(path)
         .canonicalize()
@@ -813,7 +843,7 @@ extern "C" fn collect_inclusion(
         let source_path = emitter.canonical_file(cx_string(clang_getFileName(source_file)));
         let (Some(source), Some(target)) = (
             emitter.file_ids.get(&source_path).cloned(),
-            emitter.file_ids.get(&included_path).cloned(),
+            include_target_id(emitter, &included_path),
         ) else {
             return;
         };
@@ -955,7 +985,7 @@ unsafe fn visit_one(
             let included_file = emitter.canonical_file(included_raw);
             if let (Some(source_id), Some(target_id)) = (
                 emitter.file_ids.get(&file).cloned(),
-                emitter.file_ids.get(&included_file).cloned(),
+                include_target_id(emitter, &included_file),
             ) {
                 emitter.edge(graph::EdgeRecord {
                     kind: "DEPENDS_ON".to_owned(), source: source_id, target: target_id,
