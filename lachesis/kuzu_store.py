@@ -1658,6 +1658,21 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     usr_defs: dict[str, list[str]] = {}
     usr_decls: dict[str, list[str]] = {}
     existing_proto: set[tuple[str, str]] = set()
+    # Cross-TU call-argument bindings (ARGUMENT_BINDS_PARAMETER and the paired
+    # VALUE_FLOWS_TO reason=call-argument) are emitted by the frontend only when it
+    # can see the callee's parameters in the SAME process as the call -- it pairs a
+    # call's arguments with the callee's formals by position. Under sharding the call
+    # site and the callee's parameter declarations can land in different shards, so
+    # that pairing never happens and both edges are lost. Rebuild them here from
+    # edges that all survive the split: INVOKES (call site -> callee), the callee's
+    # DECLARES_VALUE parameters ordered by the persisted param_index, and
+    # HAS_ARGUMENT (call site -> argument, by position). clang-c only; other
+    # frontends leave these maps empty. Bounded: keyed on call sites and callees.
+    invokes_target: dict[str, str] = {}
+    call_arguments: dict[str, list[tuple[int, str]]] = {}
+    declared_values: dict[str, list[str]] = {}
+    param_index: dict[str, int] = {}
+    existing_bind: set[tuple[str, str]] = set()
     # Index candidates are spilled while the large node/edge streams are loaded.
     # Keeping hundreds of thousands of full property dictionaries alive here was a
     # surprising multi-GB peak on Linux/net; the index builders only need them again
@@ -1842,6 +1857,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                         node.properties, "declaration_only") is True
                     (usr_decls if decl_only else usr_defs).setdefault(
                         usr, []).append(node.id)
+            elif node.kind == "parameter":
+                idx = _proto_promoted_value(node.properties, "param_index")
+                if isinstance(idx, int) and not isinstance(idx, bool):
+                    param_index[node.id] = idx
         else:
             node = item
             if prune and node.get("kind") in PRUNE_NODE_KINDS:
@@ -1853,6 +1872,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                     decl_only = props.get("declaration_only") is True
                     (usr_decls if decl_only else usr_defs).setdefault(
                         usr, []).append(node["id"])
+            elif node.get("kind") == "parameter":
+                idx = (node.get("properties") or {}).get("param_index")
+                if isinstance(idx, int) and not isinstance(idx, bool):
+                    param_index[node["id"]] = idx
         batch.append(node)
         if len(batch) >= batch_rows:
             load_nodes(batch)
@@ -1885,6 +1908,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                     and _proto_promoted_value(edge.properties, "reason")
                     == "prototype-of"):
                 existing_proto.add((edge.source, edge.target))
+            elif edge.kind == "INVOKES":
+                invokes_target[edge.source] = edge.target
+            elif edge.kind == "HAS_ARGUMENT":
+                pos = _proto_promoted_value(edge.properties, "position")
+                if isinstance(pos, int) and not isinstance(pos, bool):
+                    call_arguments.setdefault(edge.source, []).append(
+                        (pos, edge.target))
+            elif edge.kind == "DECLARES_VALUE":
+                declared_values.setdefault(edge.source, []).append(edge.target)
+            elif edge.kind == "ARGUMENT_BINDS_PARAMETER":
+                existing_bind.add((edge.source, edge.target))
         else:
             edge = item
             if edge.get("kind") == "EXPORTS" and edge.get("target"):
@@ -1895,10 +1929,21 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             hash_part(edge.get("kind"))
             hash_part(edge.get("source"))
             hash_part(edge.get("target"))
+            props = edge.get("properties") or {}
             if (edge.get("kind") == "REFERS_TO"
-                    and (edge.get("properties") or {}).get("reason")
-                    == "prototype-of"):
+                    and props.get("reason") == "prototype-of"):
                 existing_proto.add((edge["source"], edge["target"]))
+            elif edge.get("kind") == "INVOKES":
+                invokes_target[edge["source"]] = edge["target"]
+            elif edge.get("kind") == "HAS_ARGUMENT":
+                pos = props.get("position")
+                if isinstance(pos, int) and not isinstance(pos, bool):
+                    call_arguments.setdefault(edge["source"], []).append(
+                        (pos, edge["target"]))
+            elif edge.get("kind") == "DECLARES_VALUE":
+                declared_values.setdefault(edge["source"], []).append(edge["target"])
+            elif edge.get("kind") == "ARGUMENT_BINDS_PARAMETER":
+                existing_bind.add((edge["source"], edge["target"]))
         batch.append(edge)
         kept_edge_count += 1
         if len(batch) >= edge_batch_rows:
@@ -1942,6 +1987,64 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                         recon.clear()
         if recon:
             load_edges(recon)
+    # Replay cross-TU call-argument bindings (see the maps built above). For each
+    # call site, pair its arguments (by HAS_ARGUMENT position) with the callee's
+    # formals (DECLARES_VALUE parameters ordered by param_index) -- the same position
+    # pairing the frontend performs in-process, so a sharded build converges to the
+    # single-frontend one. Deterministic (call site, position) order; deduped against
+    # bindings a shard already carried (existing_bind) and endpoint-filtered against
+    # kept_ids. Two edges per pair, matching the frontend exactly: the typed
+    # ARGUMENT_BINDS_PARAMETER and the paired VALUE_FLOWS_TO reason=call-argument.
+    if binary_edges and invokes_target and param_index:
+        bindings: list = []
+        for callsite in sorted(call_arguments):
+            callee = invokes_target.get(callsite)
+            formals = declared_values.get(callee) if callee is not None else None
+            if not formals:
+                continue
+            by_position: dict[int, str] = {}
+            for value_id in formals:
+                idx = param_index.get(value_id)
+                if idx is not None:
+                    by_position[idx] = value_id
+            if not by_position:
+                continue
+            for position, argument in sorted(call_arguments[callsite]):
+                parameter = by_position.get(position)
+                if (parameter is None or argument not in kept_ids
+                        or parameter not in kept_ids
+                        or (argument, parameter) in existing_bind):
+                    continue
+                bind = graph_pb2.EdgeRecord(
+                    kind="ARGUMENT_BINDS_PARAMETER", source=argument,
+                    target=parameter, source_tier="T3",
+                    relationship_class="ARGUMENT_BINDS_PARAMETER")
+                p_pos = bind.properties.add()
+                p_pos.key = "position"
+                p_pos.value.integer = position
+                p_site = bind.properties.add()
+                p_site.key = "callsite"
+                p_site.value.text = callsite
+                flow = graph_pb2.EdgeRecord(
+                    kind="VALUE_FLOWS_TO", source=argument, target=parameter,
+                    source_tier="T3", relationship_class="VALUE_FLOWS_TO")
+                p_reason = flow.properties.add()
+                p_reason.key = "reason"
+                p_reason.value.text = "call-argument"
+                p_flowsite = flow.properties.add()
+                p_flowsite.key = "callsite"
+                p_flowsite.value.text = callsite
+                for rec in (bind, flow):
+                    hash_part(rec.kind)
+                    hash_part(rec.source)
+                    hash_part(rec.target)
+                    bindings.append(rec)
+                    kept_edge_count += 1
+                if len(bindings) >= edge_batch_rows:
+                    load_edges(bindings)
+                    bindings.clear()
+        if bindings:
+            load_edges(bindings)
     if bulk:
         for kind in list(edge_writers):
             flush_edge_partition(kind)

@@ -429,14 +429,24 @@ impl Emitter {
             index.entry(record.label.clone()).or_default().insert(record.id.clone());
         }
         if record.kind == "parameter" {
-            if let Some(owner) = record.properties.iter().find_map(|property| {
+            let owner = record.properties.iter().find_map(|property| {
                 if property.key != "owner_function_id" { return None; }
                 match property.value.as_ref()?.kind.as_ref()? {
                     graph::value::Kind::Text(value) => Some(value.clone()),
                     _ => None,
                 }
-            }) {
-                self.function_parameters.entry(owner).or_default().push(record.id.clone());
+            });
+            if let Some(owner) = owner {
+                let params = self.function_parameters.entry(owner).or_default();
+                // The push position is the parameter's ordinal in its function's
+                // signature -- exactly the index the call-site binder pairs against
+                // an argument's position. Persist it so a sharded merge, which sees
+                // the callee's parameters and the call's arguments in separate
+                // shards, can rebuild that pairing without re-parsing. Inert to
+                // existing outputs: a property enters no id, edge key, or content hash.
+                let param_index = params.len() as i64;
+                params.push(record.id.clone());
+                record.properties.push(field("param_index", integer(param_index)));
             }
         }
         frame(&mut self.nodes, &record.encode_to_vec())?;
