@@ -773,7 +773,10 @@ class Analysis:
         # path requires sorting roughly two million edge dictionaries before binding, which
         # can dominate Pass 2 and keep the graph-sized object peak alive.  The indexed
         # materializer below is bounded and was already the measured ~46s path on libxml2.
-        self.store.ensure_dataflow_tier()
+        # enrich only writes the sidecars to disk; it issues no queries against the tier
+        # afterwards. Skip decoding the dataflow overlay back into Python so its ~1 GB does
+        # not sit resident on top of the semantic Pass-3 native transient the bind runs next.
+        self.store.ensure_dataflow_tier(retain_materialized=False)
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
                                    deadline=self._resolve_deadline(hard_stop, deadline),
