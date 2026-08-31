@@ -393,6 +393,44 @@ def graph_content_hash(nodes: Sequence[dict], edges: Sequence[dict]) -> str:
     return digest.hexdigest()
 
 
+_CONTENT_HASH_MOD = 1 << 256
+
+
+def _content_record_digest(tag: bytes, *parts) -> int:
+    """One record's contribution to :func:`content_multiset_hash`, as an int.
+
+    The tag keeps the node record space (``b"N"``) disjoint from the edge record
+    space (``b"E"``) so a node id can never alias an edge whose fields happen to
+    concatenate to the same bytes.
+    """
+    h = hashlib.sha256()
+    h.update(tag)
+    h.update(b"\0")
+    for part in parts:
+        h.update(str(part or "").encode("utf-8"))
+        h.update(b"\0")
+    return int.from_bytes(h.digest(), "big")
+
+
+def content_multiset_hash(nodes: Sequence[dict], edges: Sequence[dict]) -> str:
+    """An order-independent digest of graph identity: node ids plus edge triples.
+
+    Same identity set as :func:`graph_content_hash`, but folded commutatively
+    (each record contributes a term summed mod 2**256) instead of sorted then
+    concatenated. That needs no graph-sized sort buffer, so a streaming writer
+    can fold it in shard order and still land the value a single-frontend build
+    does -- shard-count invariance is why this, not a stream-order digest, keys
+    the core store's cache.
+    """
+    acc = 0
+    for node in nodes:
+        acc = (acc + _content_record_digest(b"N", node["id"])) % _CONTENT_HASH_MOD
+    for e in edges:
+        acc = (acc + _content_record_digest(
+            b"E", e.get("kind"), e.get("source"), e.get("target"))) % _CONTENT_HASH_MOD
+    return format(acc, "064x")
+
+
 def _semantic_kind(edge: dict) -> str:
     kind = edge.get("kind")
     if kind == "EXPANDS_TO":
@@ -1101,7 +1139,7 @@ def write_kuzu_graph(
     # and a lossless one are different cores and must not share a derived cache.
     payload["core_content_hash"] = (
         core_content_hash if core_content_hash is not None
-        else (None if enriched else graph_content_hash(nodes, edges))
+        else (None if enriched else content_multiset_hash(nodes, edges))
     )
     _write_store_manifest(db_dir, payload)
     # The writer still owns the exact resident graph and its final manifest.
@@ -1627,13 +1665,20 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
 
     kept_ids: set[str] = set()
     # Streaming stores need a cache key before their Pass-1 sidecars are
-    # published. Hash retained record identity in deterministic shard order
-    # without building a graph-sized sort buffer.
-    core_digest = hashlib.sha256()
+    # published. Fold retained record identity commutatively so the key is
+    # invariant to shard count -- no graph-sized sort buffer, and a sharded
+    # build lands the same value a single-frontend build does.
+    core_acc = 0
 
-    def hash_part(value) -> None:
-        core_digest.update(str(value or "").encode("utf-8"))
-        core_digest.update(b"\0")
+    def hash_node(node_id) -> None:
+        nonlocal core_acc
+        core_acc = (core_acc
+                    + _content_record_digest(b"N", node_id)) % _CONTENT_HASH_MOD
+
+    def hash_edge(kind, source, target) -> None:
+        nonlocal core_acc
+        core_acc = (core_acc + _content_record_digest(
+            b"E", kind, source, target)) % _CONTENT_HASH_MOD
 
     node_units: dict[str, object] = {}
     unit_names: list[str] = []
@@ -1689,7 +1734,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 continue
             node_id = node.id
             kept_ids.add(node_id)
-            hash_part(node_id)
+            hash_node(node_id)
             file_value = _proto_promoted_value(node.properties, "file")
             compiler_id = _proto_promoted_value(node.properties, "compiler_node_id")
             if file_value:
@@ -1708,7 +1753,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             node_id = node["id"]
             props = node.get("properties") or {}
             kept_ids.add(node_id)
-            hash_part(node_id)
+            hash_node(node_id)
             if props.get("file"):
                 node_units[node_id] = props["file"]
             for value in (node_id, props.get("compiler_node_id")):
@@ -1901,9 +1946,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if edge.source not in kept_ids or edge.target not in kept_ids:
                 unresolved_count += 1
                 continue
-            hash_part(edge.kind)
-            hash_part(edge.source)
-            hash_part(edge.target)
+            hash_edge(edge.kind, edge.source, edge.target)
             if (edge.kind == "REFERS_TO"
                     and _proto_promoted_value(edge.properties, "reason")
                     == "prototype-of"):
@@ -1926,9 +1969,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
                 unresolved_count += 1
                 continue
-            hash_part(edge.get("kind"))
-            hash_part(edge.get("source"))
-            hash_part(edge.get("target"))
+            hash_edge(edge.get("kind"), edge.get("source"), edge.get("target"))
             props = edge.get("properties") or {}
             if (edge.get("kind") == "REFERS_TO"
                     and props.get("reason") == "prototype-of"):
@@ -1977,9 +2018,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                     prop = record.properties.add()
                     prop.key = "reason"
                     prop.value.text = "prototype-of"
-                    hash_part(record.kind)
-                    hash_part(record.source)
-                    hash_part(record.target)
+                    hash_edge(record.kind, record.source, record.target)
                     recon.append(record)
                     kept_edge_count += 1
                     if len(recon) >= edge_batch_rows:
@@ -2035,9 +2074,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 p_flowsite.key = "callsite"
                 p_flowsite.value.text = callsite
                 for rec in (bind, flow):
-                    hash_part(rec.kind)
-                    hash_part(rec.source)
-                    hash_part(rec.target)
+                    hash_edge(rec.kind, rec.source, rec.target)
                     bindings.append(rec)
                     kept_edge_count += 1
                 if len(bindings) >= edge_batch_rows:
@@ -2086,7 +2123,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         "streamed": True, "enriched": False, "pruned": bool(prune),
         PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
     })
-    payload["core_content_hash"] = core_digest.hexdigest()
+    payload["core_content_hash"] = format(core_acc, "064x")
     _write_store_manifest(db_dir, payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)
