@@ -542,7 +542,7 @@ class KuzuGraphIndex:
         # simply not populated when this is on, so their per-entry container overhead
         # (the dominant resident cost at kernel scale) disappears, and there is no
         # nid->row dict at all -- the sorted key array carries the mapping.
-        self._columnar = os.environ.get("LACHESIS_COLUMNAR") == "1"
+        self._columnar = os.environ.get("LACHESIS_COLUMNAR", "1") != "0"
         # Sorted array of the scanned nids, aligned to the columns (column row i is
         # `_scan_ids[i]`). Kept independent of `_ids` on purpose: overlay/graft append
         # derived nids to `_ids` and re-sort it, which would break column alignment, but
@@ -783,25 +783,50 @@ class KuzuGraphIndex:
         """
         if self._columnar:
             r = self._row(nid)
-            if r is None:
-                return {}
-            hv = self._hstr_vocab
-
-            def _s(code):
-                return None if code < 0 else hv[code]
-
-            def _i(v):
-                return None if v < 0 else v
-
-            return dict(zip(_HEADER_FIELDS, (
-                _s(self._h_file[r]), _s(self._h_absfile[r]),
-                _i(self._h_sl[r]), _i(self._h_el[r]),
-                _i(self._h_so[r]), _i(self._h_eo[r]),
-                _s(self._h_owner[r]), _s(self._h_fn[r]))))
+            return {} if r is None else self._header_row(r)
         row = self._header_by_id.get(nid)
         if row is None:
             return {}
         return dict(zip(_HEADER_FIELDS, row))
+
+    def _header_row(self, r) -> dict:
+        """Rebuild the header dict from an already-resolved columnar row ``r``.
+
+        Split out of ``_header`` so a projection that has already bisected for the
+        row (``_project``) rebuilds the header without bisecting again.
+        """
+        hv = self._hstr_vocab
+
+        def _s(code):
+            return None if code < 0 else hv[code]
+
+        def _i(v):
+            return None if v < 0 else v
+
+        return dict(zip(_HEADER_FIELDS, (
+            _s(self._h_file[r]), _s(self._h_absfile[r]),
+            _i(self._h_sl[r]), _i(self._h_el[r]),
+            _i(self._h_so[r]), _i(self._h_eo[r]),
+            _s(self._h_owner[r]), _s(self._h_fn[r]))))
+
+    def _project(self, nid) -> dict:
+        """``{id, kind, label, properties}`` for one node.
+
+        Byte-identical to building the dict from ``_kind``/``_label``/``_header``
+        separately, but in columnar mode it resolves the row once instead of
+        bisecting three times -- the shape every header projection returns.
+        """
+        if self._columnar:
+            r = self._row(nid)
+            if r is None:
+                return {"id": nid, "kind": None, "label": None, "properties": {}}
+            return {"id": nid,
+                    "kind": self._kind_vocab[self._kind_col[r]],
+                    "label": self._label_vocab[self._label_col[r]],
+                    "properties": self._header_row(r)}
+        return {"id": nid, "kind": self._kind_by_id.get(nid),
+                "label": self._label_by_id.get(nid),
+                "properties": self._header(nid)}
 
     def ensure_maps(self) -> None:
         """Build navigation buckets after a deferred whole-graph operation.
@@ -1111,16 +1136,10 @@ class KuzuGraphIndex:
         function projection.
         """
         owned = self.by_owner.get(owner_id, ())
-        return tuple({"id": nid, "kind": self._kind(nid),
-                      "label": self._label(nid),
-                      "properties": self._header(nid)}
-                     for nid in owned)
+        return tuple(self._project(nid) for nid in owned)
 
     def node_headers(self, node_ids) -> tuple[dict, ...]:
-        return tuple({"id": nid, "kind": self._kind(nid),
-                      "label": self._label(nid),
-                      "properties": self._header(nid)}
-                     for nid in node_ids)
+        return tuple(self._project(nid) for nid in node_ids)
 
     @timeit
     def metadata_by_kind(self, kinds) -> dict[str, dict]:
