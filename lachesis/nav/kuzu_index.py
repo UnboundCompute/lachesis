@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import os
 import zlib
+from array import array
+from bisect import bisect_left
 from collections import defaultdict
 from typing import Iterable, Optional, Sequence
 
@@ -457,7 +459,35 @@ class KuzuGraphIndex:
             raise RuntimeError(
                 "kuzu is not installed; the Kùzu index needs Python 3.10+ with `kuzu`."
             )
-        self._db = kuzu.Database(db_file(db_dir), read_only=True)
+        # Kùzu defaults its buffer pool to ~80% of system RAM, so the open-time
+        # `MATCH (n:Node)` scan (and every later page touch) can cache node pages up
+        # to that ceiling -- an O(nodes) page cache that, at kernel scale, dwarfs the
+        # Python navigation maps. This read-only index builds its own resident maps
+        # and then serves node/edge lookups through bounded caches, so a large page
+        # cache buys little. `LACHESIS_KUZU_BPS` (bytes) caps it; unset keeps Kùzu's
+        # default. Measured before making it a non-env default.
+        _bps = os.environ.get("LACHESIS_KUZU_BPS")
+        if _bps:
+            self._db = kuzu.Database(
+                db_file(db_dir), read_only=True, buffer_pool_size=int(_bps))
+        else:
+            self._db = kuzu.Database(db_file(db_dir), read_only=True)
+        # Capping the pool is only safe if the open-scan is *paged*: a single
+        # `MATCH (n:Node)` materializes its whole result in the pool (O(nodes)),
+        # so under a cap it overflows with "buffer pool is full". `_build_maps`
+        # instead walks half-open storage-offset windows (`offset(id(n))`), each
+        # of which materializes only its window -- bounded working set, no global
+        # ORDER BY (which would force a full sort/materialize) and no SKIP rescan
+        # (which is O(nodes^2)). `LACHESIS_KUZU_BATCH` sets the window size; if a
+        # pool cap is set without one, page at a safe default so the cap holds;
+        # with neither set the scan stays monolithic (unchanged default path).
+        _batch = os.environ.get("LACHESIS_KUZU_BATCH")
+        if _batch:
+            self._scan_batch = int(_batch)
+        elif _bps:
+            self._scan_batch = 100_000
+        else:
+            self._scan_batch = 0
         self._conn = kuzu.Connection(self._db)
         self._db_dir = db_dir
         set_threads = getattr(self._conn, "set_max_threads_for_exec", None)
@@ -505,6 +535,34 @@ class KuzuGraphIndex:
         self._derived_in: dict = {}
         self._overlay_argument_edges: dict = {}
         self._ids = []
+        # Columnar backend (prototype, env-gated LACHESIS_COLUMNAR=1): replace the
+        # three str-keyed value dicts with int-coded parallel columns held in
+        # sorted-nid order, plus one sorted key array (`_scan_ids`) that a lookup
+        # bisects to reach the row. Same byte-identical returns; the dicts below are
+        # simply not populated when this is on, so their per-entry container overhead
+        # (the dominant resident cost at kernel scale) disappears, and there is no
+        # nid->row dict at all -- the sorted key array carries the mapping.
+        self._columnar = os.environ.get("LACHESIS_COLUMNAR") == "1"
+        # Sorted array of the scanned nids, aligned to the columns (column row i is
+        # `_scan_ids[i]`). Kept independent of `_ids` on purpose: overlay/graft append
+        # derived nids to `_ids` and re-sort it, which would break column alignment, but
+        # they never touch `_scan_ids`, so a derived nid simply misses the bisect (None).
+        self._scan_ids: list = []
+        self._kind_col = array("i")
+        self._kind_vocab: list = []
+        self._label_col = array("i")
+        self._label_vocab: list = []
+        # Header string columns share one vocab (paths + function ids); -1 == None.
+        self._hstr_vocab: list = []
+        self._h_file = array("i")
+        self._h_absfile = array("i")
+        self._h_owner = array("i")
+        self._h_fn = array("i")
+        # Header int columns; -1 sentinel == None (lines >= 1, offsets >= 0).
+        self._h_sl = array("i")
+        self._h_el = array("i")
+        self._h_so = array("i")
+        self._h_eo = array("i")
         self._kind_by_id = {}
         self._label_by_id = {}
         self._header_by_id = {}
@@ -532,11 +590,22 @@ class KuzuGraphIndex:
         self.by_file: dict = defaultdict(list)
         self.by_owner: dict = defaultdict(list)
         self._ids: list[str] = []
+        if self._columnar:
+            # Re-entrant (ensure_maps re-runs this after a deferred build): reset the
+            # columns so a rebuild does not append onto stale rows.
+            self._scan_ids = []
+            self._kind_col = array("i"); self._kind_vocab = []
+            self._label_col = array("i"); self._label_vocab = []
+            self._hstr_vocab = []
+            self._h_file = array("i"); self._h_absfile = array("i")
+            self._h_owner = array("i"); self._h_fn = array("i")
+            self._h_sl = array("i"); self._h_el = array("i")
+            self._h_so = array("i"); self._h_eo = array("i")
         # Decoded here and nowhere below: every map this builds is keyed by, and holds,
         # the real id, so the coding stops at this loop and the rest of the index — and
         # every nav tool above it — never sees a coded value.
-        res = self._conn.execute(
-            "MATCH (n:Node) RETURN n.id, n.kind, n.label, n.file, n.absolute_file, "
+        _SELECT = (
+            "n.id, n.kind, n.label, n.file, n.absolute_file, "
             "n.start_line, n.end_line, n.start_offset, n.end_offset, "
             "n.owner_function_id, n.function_id"
         )
@@ -552,9 +621,28 @@ class KuzuGraphIndex:
         def _dedup(value):
             return value if value is None else pool.setdefault(value, value)
 
-        while res.has_next():
+        # Int-coding for the columnar backend: each distinct (already pooled) value is
+        # assigned a dense code the first time it is seen; the column stores the code,
+        # the vocab recovers the value. None -> -1. The code dicts are transient (build
+        # only); the vocabs stay resident to decode on lookup.
+        kcode: dict = {}
+        lcode: dict = {}
+        hcode: dict = {}
+        columnar = self._columnar
+
+        def _code(value, code, vocab):
+            if value is None:
+                return -1
+            c = code.get(value)
+            if c is None:
+                c = len(vocab)
+                code[value] = c
+                vocab.append(value)
+            return c
+
+        def _ingest(row) -> None:
             (nid, kind, label, file, abs_file, start_line, end_line,
-             start_offset, end_offset, owner, fn) = res.get_next()
+             start_offset, end_offset, owner, fn) = row
             nid = decode_id(nid, self._id_prefixes)
             kind = _dedup(kind)
             label = _dedup(label)
@@ -563,14 +651,30 @@ class KuzuGraphIndex:
             owner = _dedup(owner)
             fn = _dedup(fn)
             self._ids.append(nid)
-            self._kind_by_id[nid] = kind
-            self._label_by_id[nid] = label
-            # Stored as a positional tuple rather than an 8-key dict: over ~850k
-            # nodes the dict container alone cost ~262 MB (272 B/node) against ~88 MB
-            # for the tuple (104 B/node). `_header` rebuilds the dict, in this exact
-            # field order, only for the nodes a reader actually projects.
-            self._header_by_id[nid] = (file, abs_file, start_line, end_line,
-                                       start_offset, end_offset, owner, fn)
+            if columnar:
+                # Int-coded parallel columns replace the three str-keyed value dicts.
+                # Filled in scan order here, then reordered to sorted-nid order once the
+                # scan is done (see below), so a lookup can bisect `_scan_ids` for the
+                # row instead of holding a nid->row dict.
+                self._kind_col.append(_code(kind, kcode, self._kind_vocab))
+                self._label_col.append(_code(label, lcode, self._label_vocab))
+                self._h_file.append(_code(file, hcode, self._hstr_vocab))
+                self._h_absfile.append(_code(abs_file, hcode, self._hstr_vocab))
+                self._h_owner.append(_code(owner, hcode, self._hstr_vocab))
+                self._h_fn.append(_code(fn, hcode, self._hstr_vocab))
+                self._h_sl.append(start_line if start_line is not None else -1)
+                self._h_el.append(end_line if end_line is not None else -1)
+                self._h_so.append(start_offset if start_offset is not None else -1)
+                self._h_eo.append(end_offset if end_offset is not None else -1)
+            else:
+                self._kind_by_id[nid] = kind
+                self._label_by_id[nid] = label
+                # Stored as a positional tuple rather than an 8-key dict: over ~850k
+                # nodes the dict container alone cost ~262 MB (272 B/node) against
+                # ~88 MB for the tuple (104 B/node). `_header` rebuilds the dict, in
+                # this exact field order, only for nodes a reader actually projects.
+                self._header_by_id[nid] = (file, abs_file, start_line, end_line,
+                                           start_offset, end_offset, owner, fn)
             self.by_kind[kind].append(nid)
             self.by_label[label].append(nid)
             path = abs_file or file
@@ -579,6 +683,60 @@ class KuzuGraphIndex:
             owner_key = owner or fn
             if owner_key:
                 self.by_owner[owner_key].append(nid)
+
+        batch = self._scan_batch
+        if batch:
+            # Paged scan: storage offsets are dense 0..N-1 for a build-once, read-only
+            # store, so half-open [lo, lo+batch) windows partition every node exactly
+            # once. `ORDER BY` is deliberately absent (it forces a global sort that
+            # materializes all rows and defeats the pool cap); the final maps are
+            # sorted below, so per-window order does not affect the result. The first
+            # empty window is past the last offset, which ends the walk. Every window
+            # keyed and held on the real id exactly as the monolithic path.
+            lo = 0
+            while True:
+                res = self._conn.execute(
+                    "MATCH (n:Node) "
+                    "WHERE offset(id(n)) >= $lo AND offset(id(n)) < $hi "
+                    f"RETURN {_SELECT}",
+                    {"lo": lo, "hi": lo + batch},
+                )
+                got = 0
+                while res.has_next():
+                    _ingest(res.get_next())
+                    got += 1
+                if got == 0:
+                    break
+                lo += batch
+        else:
+            res = self._conn.execute(f"MATCH (n:Node) RETURN {_SELECT}")
+            while res.has_next():
+                _ingest(res.get_next())
+        if self._columnar:
+            # Reorder the scan-order columns into sorted-nid order so a lookup can
+            # `bisect_left(_scan_ids, nid)` for the row rather than carry a nid->row
+            # dict (which cost ~63 B/node -- a hash table plus a boxed int per node).
+            # `order` is the argsort of the scanned nids; it is transient and dropped
+            # here, leaving only `_scan_ids` (pointers to nid strings already resident
+            # in `_ids`, ~9 B/node) as new resident state. `_scan_ids` is built here
+            # and never mutated again, so it stays column-aligned across overlay/graft.
+            order = sorted(range(len(self._ids)), key=self._ids.__getitem__)
+            self._scan_ids = [self._ids[p] for p in order]
+
+            def _reorder(col):
+                return array("i", (col[p] for p in order))
+
+            self._kind_col = _reorder(self._kind_col)
+            self._label_col = _reorder(self._label_col)
+            self._h_file = _reorder(self._h_file)
+            self._h_absfile = _reorder(self._h_absfile)
+            self._h_owner = _reorder(self._h_owner)
+            self._h_fn = _reorder(self._h_fn)
+            self._h_sl = _reorder(self._h_sl)
+            self._h_el = _reorder(self._h_el)
+            self._h_so = _reorder(self._h_so)
+            self._h_eo = _reorder(self._h_eo)
+            del order
         # The scan used to arrive in id order from `ORDER BY n.id`, which every bucket
         # inherited by construction; the stored id is coded now and that order is not
         # the real one, so sort what the order was doing for us. Buckets included: a
@@ -588,6 +746,33 @@ class KuzuGraphIndex:
             for ids in buckets.values():
                 ids.sort()
 
+    def _row(self, nid):
+        """Column row for a scanned nid via bisect on sorted ``_scan_ids``, else None.
+
+        Derived/overlay nids are never scanned, so they are absent from ``_scan_ids``,
+        miss the exact-match check, and read as None -- exactly as they missed the
+        ``_row_by_id`` dict this replaced.
+        """
+        ids = self._scan_ids
+        i = bisect_left(ids, nid)
+        if i < len(ids) and ids[i] == nid:
+            return i
+        return None
+
+    def _kind(self, nid):
+        """A node's kind, from the dict or the columnar backend (byte-identical)."""
+        if self._columnar:
+            r = self._row(nid)
+            return None if r is None else self._kind_vocab[self._kind_col[r]]
+        return self._kind_by_id.get(nid)
+
+    def _label(self, nid):
+        """A node's label, from the dict or the columnar backend (byte-identical)."""
+        if self._columnar:
+            r = self._row(nid)
+            return None if r is None else self._label_vocab[self._label_col[r]]
+        return self._label_by_id.get(nid)
+
     def _header(self, nid) -> dict:
         """Rebuild a node's promoted-scalar header dict from its stored tuple.
 
@@ -596,6 +781,23 @@ class KuzuGraphIndex:
         serialization stays byte-identical. Missing nodes read as an empty dict,
         matching the previous ``_header_by_id.get(nid, {})``.
         """
+        if self._columnar:
+            r = self._row(nid)
+            if r is None:
+                return {}
+            hv = self._hstr_vocab
+
+            def _s(code):
+                return None if code < 0 else hv[code]
+
+            def _i(v):
+                return None if v < 0 else v
+
+            return dict(zip(_HEADER_FIELDS, (
+                _s(self._h_file[r]), _s(self._h_absfile[r]),
+                _i(self._h_sl[r]), _i(self._h_el[r]),
+                _i(self._h_so[r]), _i(self._h_eo[r]),
+                _s(self._h_owner[r]), _s(self._h_fn[r]))))
         row = self._header_by_id.get(nid)
         if row is None:
             return {}
@@ -909,14 +1111,14 @@ class KuzuGraphIndex:
         function projection.
         """
         owned = self.by_owner.get(owner_id, ())
-        return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
-                      "label": self._label_by_id.get(nid),
+        return tuple({"id": nid, "kind": self._kind(nid),
+                      "label": self._label(nid),
                       "properties": self._header(nid)}
                      for nid in owned)
 
     def node_headers(self, node_ids) -> tuple[dict, ...]:
-        return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
-                      "label": self._label_by_id.get(nid),
+        return tuple({"id": nid, "kind": self._kind(nid),
+                      "label": self._label(nid),
                       "properties": self._header(nid)}
                      for nid in node_ids)
 
