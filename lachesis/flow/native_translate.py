@@ -6,6 +6,7 @@ needed by the public SDK.
 """
 from __future__ import annotations
 
+import mmap
 import os
 from pathlib import Path
 
@@ -74,9 +75,17 @@ def _sidecar_stale(output: Path, *inputs: Path) -> bool:
         return True
 
 
-def build_native_match_result(semantic_path: str | os.PathLike[str],
-                              catalog_path: str | os.PathLike[str] | None = None):
-    """Build or load the Rust-owned final matcher result."""
+def ensure_native_match_sidecar(
+        semantic_path: str | os.PathLike[str],
+        catalog_path: str | os.PathLike[str] | None = None) -> Path:
+    """Publish the final Pass-3 matcher sidecar and return its path.
+
+    Resolves the compact event sibling as the matcher input when present, then
+    runs the Rust matcher only when the sidecar is stale.  This is the shared
+    first half of ``build_native_match_result``; callers that need only a
+    summary of the result (see ``native_match_any_capped``) use this without
+    parsing the whole findings protobuf into Python.
+    """
     source = Path(semantic_path)
     event_source = native_semantic_events_path(source)
     if event_source.is_file():
@@ -84,12 +93,91 @@ def build_native_match_result(semantic_path: str | os.PathLike[str],
     output = native_match_sidecar_path(source)
     if _sidecar_stale(output, source):
         match_semantic_path(source, output, catalog_path)
+    return output
+
+
+def build_native_match_result(semantic_path: str | os.PathLike[str],
+                              catalog_path: str | os.PathLike[str] | None = None):
+    """Build or load the Rust-owned final matcher result."""
+    output = ensure_native_match_sidecar(semantic_path, catalog_path)
     try:
         result = lifetime_pb2.NativeTemporalResult()
         result.ParseFromString(output.read_bytes())
     except (OSError, ValueError) as error:
         raise RuntimeError("native Pass-3 matcher sidecar is invalid") from error
     return result
+
+
+def _read_varint(buf, pos: int) -> tuple[int, int]:
+    """Decode one base-128 varint from ``buf`` at ``pos``; return (value, next)."""
+    result = shift = 0
+    while True:
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+
+
+def _skip_field(buf, pos: int, wire_type: int) -> int:
+    """Advance ``pos`` past one field payload of the given wire type."""
+    if wire_type == 0:            # varint
+        _, pos = _read_varint(buf, pos)
+        return pos
+    if wire_type == 2:            # length-delimited
+        length, pos = _read_varint(buf, pos)
+        return pos + length
+    if wire_type == 1:            # 64-bit
+        return pos + 8
+    if wire_type == 5:            # 32-bit
+        return pos + 4
+    raise ValueError(f"unsupported protobuf wire type {wire_type}")
+
+
+def native_match_any_capped(match_path: str | os.PathLike[str]) -> bool:
+    """Return whether any function in the match sidecar was capped.
+
+    The bind's convergence check needs only this one bit, but the sidecar is
+    dominated by per-finding witnesses (~160 MB on suricata) that a full
+    ``NativeTemporalResult`` parse would materialize into ~350 MB of Python
+    objects.  Scan the protobuf wire form over a read-only mmap instead: walk
+    the top-level ``functions`` (field 1) and, inside each, read only ``capped``
+    (field 5, a varint), skipping the ``findings`` bytes without decoding them.
+    Nothing but the file-backed mapping is held resident, and the answer is
+    byte-identical to ``any(f.capped for f in result.functions)``.
+    """
+    with open(match_path, "rb") as handle:
+        # An empty sidecar carries no functions, so nothing is capped; mmap also
+        # rejects a zero-length mapping, so short-circuit before mapping.
+        if os.fstat(handle.fileno()).st_size == 0:
+            return False
+        mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
+        buf = memoryview(mapped)
+        pos, end = 0, len(buf)
+        while pos < end:
+            tag, pos = _read_varint(buf, pos)
+            field, wire_type = tag >> 3, tag & 7
+            if field == 1 and wire_type == 2:
+                length, pos = _read_varint(buf, pos)
+                fn_end = pos + length
+                while pos < fn_end:
+                    inner_tag, pos = _read_varint(buf, pos)
+                    inner_field, inner_wire = inner_tag >> 3, inner_tag & 7
+                    if inner_field == 5 and inner_wire == 0:
+                        value, pos = _read_varint(buf, pos)
+                        if value:
+                            return True
+                    else:
+                        pos = _skip_field(buf, pos, inner_wire)
+                pos = fn_end
+            else:
+                pos = _skip_field(buf, pos, wire_type)
+        return False
+    finally:
+        buf.release()
+        mapped.close()
 
 
 def native_match_leads(result) -> list[dict[str, Any]]:

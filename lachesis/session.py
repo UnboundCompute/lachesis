@@ -626,7 +626,8 @@ class Analysis:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import (
-            build_native_match_result, ensure_native_semantic_sidecar,
+            ensure_native_match_sidecar, ensure_native_semantic_sidecar,
+            native_match_any_capped,
         )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
@@ -637,10 +638,15 @@ class Analysis:
         # honestly so the caller drops the partial skeleton (structural families only)
         # rather than caching a misleadingly thin temporal set as a complete run. The
         # match sidecar is content-addressed, so the later flow pass reuses it.
-        match_result = build_native_match_result(
+        #
+        # Convergence needs only the "any function capped" bit, so publish the match
+        # sidecar and scan it for that flag rather than parsing the whole findings
+        # protobuf -- the full parse would materialize ~350 MB of witnesses this path
+        # never reads. The flow pass still builds the complete result from the same
+        # content-addressed sidecar.
+        match_sidecar = ensure_native_match_sidecar(
             native_sidecar, summary.get("catalog_path"))
-        converged = not any(getattr(function, "capped", False)
-                            for function in match_result.functions)
+        converged = not native_match_any_capped(match_sidecar)
         stamped["semantic_graph"] = {
             "native_sidecar": str(native_sidecar),
             "coverage": {"converged": converged},
