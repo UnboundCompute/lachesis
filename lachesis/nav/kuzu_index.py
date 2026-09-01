@@ -188,6 +188,12 @@ _MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
 _CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
                       if c in CODED_PROP_COLUMNS)
 
+# Field order of the promoted-scalar node header, stored positionally in
+# ``_header_by_id`` (see ``KuzuGraphIndex._build_maps`` / ``_header``). This order is
+# the dict insertion order readers used to see, so header serialization stays stable.
+_HEADER_FIELDS = ("file", "absolute_file", "start_line", "end_line",
+                  "start_offset", "end_offset", "owner_function_id", "function_id")
+
 
 def _restore_node_props(columns, props_blob: Optional[bytes],
                         zdict: bytes, prefixes: Sequence[str], *,
@@ -534,19 +540,37 @@ class KuzuGraphIndex:
             "n.start_line, n.end_line, n.start_offset, n.end_offset, "
             "n.owner_function_id, n.function_id"
         )
+        # Kùzu hands back a fresh str object per cell, so the same kind/file/owner
+        # spelled on 850k nodes arrives as 850k copies. These columns are low
+        # cardinality (13 kinds, ~2.4k files, ~9k owners over ~850k nodes), so
+        # collapsing equal spellings to one shared object is a large, value-preserving
+        # cut to the resident maps -- ~355 MB on suricata. `pool.setdefault(s, s)`
+        # returns the first object seen for a spelling and keeps only that one alive;
+        # the transient pool is dropped when the scan ends.
+        pool: dict = {}
+
+        def _dedup(value):
+            return value if value is None else pool.setdefault(value, value)
+
         while res.has_next():
             (nid, kind, label, file, abs_file, start_line, end_line,
              start_offset, end_offset, owner, fn) = res.get_next()
             nid = decode_id(nid, self._id_prefixes)
+            kind = _dedup(kind)
+            label = _dedup(label)
+            file = _dedup(file)
+            abs_file = _dedup(abs_file)
+            owner = _dedup(owner)
+            fn = _dedup(fn)
             self._ids.append(nid)
             self._kind_by_id[nid] = kind
             self._label_by_id[nid] = label
-            self._header_by_id[nid] = {
-                "file": file, "absolute_file": abs_file,
-                "start_line": start_line, "end_line": end_line,
-                "start_offset": start_offset, "end_offset": end_offset,
-                "owner_function_id": owner, "function_id": fn,
-            }
+            # Stored as a positional tuple rather than an 8-key dict: over ~850k
+            # nodes the dict container alone cost ~262 MB (272 B/node) against ~88 MB
+            # for the tuple (104 B/node). `_header` rebuilds the dict, in this exact
+            # field order, only for the nodes a reader actually projects.
+            self._header_by_id[nid] = (file, abs_file, start_line, end_line,
+                                       start_offset, end_offset, owner, fn)
             self.by_kind[kind].append(nid)
             self.by_label[label].append(nid)
             path = abs_file or file
@@ -563,6 +587,19 @@ class KuzuGraphIndex:
         for buckets in (self.by_kind, self.by_label, self.by_file, self.by_owner):
             for ids in buckets.values():
                 ids.sort()
+
+    def _header(self, nid) -> dict:
+        """Rebuild a node's promoted-scalar header dict from its stored tuple.
+
+        The map holds tuples to stay compact (see ``_build_maps``); readers still
+        want the ``{field: value}`` shape, in the original insertion order so any
+        serialization stays byte-identical. Missing nodes read as an empty dict,
+        matching the previous ``_header_by_id.get(nid, {})``.
+        """
+        row = self._header_by_id.get(nid)
+        if row is None:
+            return {}
+        return dict(zip(_HEADER_FIELDS, row))
 
     def ensure_maps(self) -> None:
         """Build navigation buckets after a deferred whole-graph operation.
@@ -874,13 +911,13 @@ class KuzuGraphIndex:
         owned = self.by_owner.get(owner_id, ())
         return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
                       "label": self._label_by_id.get(nid),
-                      "properties": self._header_by_id.get(nid, {})}
+                      "properties": self._header(nid)}
                      for nid in owned)
 
     def node_headers(self, node_ids) -> tuple[dict, ...]:
         return tuple({"id": nid, "kind": self._kind_by_id.get(nid),
                       "label": self._label_by_id.get(nid),
-                      "properties": self._header_by_id.get(nid, {})}
+                      "properties": self._header(nid)}
                      for nid in node_ids)
 
     @timeit
@@ -1118,7 +1155,7 @@ class KuzuGraphIndex:
                 kind = edge.get("kind")
                 if kind not in accepted:
                     continue
-                target = self._header_by_id.get(edge.get("target"), {})
+                target = self._header(edge.get("target"))
                 rows.append((source, edge.get("target"), kind, {
                     "file": target.get("file"),
                     "absolute_file": target.get("absolute_file"),
