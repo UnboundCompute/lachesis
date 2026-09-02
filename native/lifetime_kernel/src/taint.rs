@@ -27,7 +27,14 @@ struct RoleRecord {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct State {
     value: u32,
-    contexts: Vec<String>,
+    // The call-context stack is stored as interned ordinals rather than the
+    // raw `context_id` strings.  The flood never reads a stack entry's string
+    // value -- the stack only drives push/pop matching and State identity, and
+    // the emitted edges carry the transition's own `context_id` string, not the
+    // stack -- so any bijection string<->ordinal preserves behaviour exactly
+    // while making a State clone a small `memcpy` and its hash/eq integer work
+    // instead of per-element String clones and string hashing on the hot path.
+    contexts: Vec<u32>,
 }
 
 fn value_text(value: &graph_proto::Value) -> Option<&str> {
@@ -315,15 +322,25 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
 }
 
 pub(crate) fn enrich(graph: &Graph) -> Delta {
-    let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>, Option<String>)>> = FxHashMap::default();
+    // Each adjacency entry carries both the raw `context_id` string (emitted
+    // verbatim on the flow edge) and its interned ordinal (the value pushed on
+    // the traversal's context stack).  Interning is a bijection over the strings
+    // seen while building adjacency, so two stacks are equal iff they are the
+    // same string sequence -- identical State identity to comparing the strings.
+    let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>, Option<String>, Option<u32>)>> = FxHashMap::default();
     let mut evidence: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
+    let mut context_interner: FxHashMap<String, u32> = FxHashMap::default();
     for item in &graph.edges {
         let kind = graph.edge_kind(item);
         if !FLOW_KINDS.contains(&kind) { continue; }
         let transition = kind.to_owned();
         let reason = graph.edge_property_text(item, "reason").map(str::to_owned);
         let context_id = graph.edge_property_text(item, "context_id").map(str::to_owned);
-        adjacency.entry(item.source).or_default().push((item.target, transition, reason, context_id));
+        let context_ord = context_id.as_ref().map(|context| {
+            let next = context_interner.len() as u32;
+            *context_interner.entry(context.clone()).or_insert(next)
+        });
+        adjacency.entry(item.source).or_default().push((item.target, transition, reason, context_id, context_ord));
         evidence.entry((item.source, item.target)).or_insert_with(|| vec![
             graph.id(item.source).to_owned(), graph.id(item.target).to_owned(),
         ]);
@@ -349,7 +366,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             for call in calls {
                 adjacency.entry(returned).or_default()
                     .push((*call, "VALUE_FLOWS_TO".to_owned(),
-                           Some("c-return-to-callsite".to_owned()), None));
+                           Some("c-return-to-callsite".to_owned()), None, None));
                 evidence.entry((returned, *call)).or_insert_with(|| vec![
                     graph.id(returned).to_owned(), graph.id(*call).to_owned(),
                 ]);
@@ -376,7 +393,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let Some(result) = call_result.get(call) else { continue; };
         for argument in arguments {
             adjacency.entry(*argument).or_default()
-                .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None));
+                .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None, None));
             evidence.entry((*argument, *result)).or_insert_with(|| vec![
                 graph.id(*argument).to_owned(), graph.id(*call).to_owned(), graph.id(*result).to_owned(),
             ]);
@@ -388,7 +405,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             .and_then(|value| graph.symbol(value)) else { continue; };
         let Some(result) = call_result.get(&node.id) else { continue; };
         adjacency.entry(receiver).or_default()
-            .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None));
+            .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None, None));
         evidence.entry((receiver, *result)).or_insert_with(|| vec![
             graph.id(receiver).to_owned(), graph.id(node.id).to_owned(), graph.id(*result).to_owned(),
         ]);
@@ -446,7 +463,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         for variable in referenced_variables(graph, source.value) {
             adjacency.entry(source.value).or_default()
                 .push((variable, "VALUE_FLOWS_TO".to_owned(),
-                       Some("c-out-param-writeback".to_owned()), None));
+                       Some("c-out-param-writeback".to_owned()), None, None));
             evidence.entry((source.value, variable)).or_insert_with(|| vec![
                 graph.id(source.value).to_owned(), graph.id(variable).to_owned(),
             ]);
@@ -459,7 +476,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         for variable in referenced_variables(graph, sink.value) {
             adjacency.entry(variable).or_default()
                 .push((sink.value, "VALUE_FLOWS_TO".to_owned(),
-                       Some("referenced-variable".to_owned()), None));
+                       Some("referenced-variable".to_owned()), None, None));
             evidence.entry((variable, sink.value)).or_insert_with(|| vec![
                 graph.id(variable).to_owned(), graph.id(sink.value).to_owned(),
             ]);
@@ -490,15 +507,15 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             if state != initial && sink_by_value.contains_key(&state.value) {
                 reaches.entry(state.value).or_insert_with(|| state.clone());
             }
-            for (target, transition, reason, context_id) in adjacency.get(&state.value).into_iter().flatten() {
+            for (target, transition, reason, context_id, context_ord) in adjacency.get(&state.value).into_iter().flatten() {
                 let mut contexts = state.contexts.clone();
                 if reason.as_deref() == Some("context-parameter") {
-                    let Some(context) = context_id.as_ref() else { continue; };
+                    let Some(ord) = *context_ord else { continue; };
                     if contexts.len() >= 12 { continue; }
-                    contexts.push(context.clone());
+                    contexts.push(ord);
                 } else if reason.as_deref() == Some("context-return") {
-                    let Some(context) = context_id.as_ref() else { continue; };
-                    if contexts.last() != Some(context) { continue; }
+                    let Some(ord) = *context_ord else { continue; };
+                    if contexts.last() != Some(&ord) { continue; }
                     contexts.pop();
                 }
                 let next = State { value: *target, contexts };
