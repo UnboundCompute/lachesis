@@ -224,6 +224,19 @@ _DEFAULT_NAV_BUFFER_POOL = 512 << 20
 _DEFAULT_SCAN_BATCH = 100_000
 
 
+def _istr(value):
+    """Intern a driver string that repeats across the graph, pass anything else through.
+
+    ``kind`` (13 distinct values over the whole store) and ``label`` (~74% duplicate)
+    arrive fresh from the Kuzu driver at every node/edge built here, so without
+    interning each of the tens of thousands of records holds its own copy of one of a
+    small set of strings. Interning collapses them to one object per distinct value; a
+    ``None``/empty label is left untouched. Byte-neutral -- an interned string is == and
+    hash-equal to the original, so the record is indistinguishable.
+    """
+    return sys.intern(value) if type(value) is str else value
+
+
 def _restore_node_props(columns, props_blob: Optional[bytes],
                         zdict: bytes, prefixes: Sequence[str], *,
                         restore_defaults: bool = True) -> dict:
@@ -1785,7 +1798,7 @@ class KuzuGraphIndex:
         while res.has_next():
             src, tgt, kind, props = res.get_next()
             edges.append({"source": decode_id(src, self._id_prefixes),
-                          "target": decode_id(tgt, self._id_prefixes), "kind": kind,
+                          "target": decode_id(tgt, self._id_prefixes), "kind": _istr(kind),
                           "properties": _restore(props, self._props_dict)})
         if self._overlay is not None:
             edges.extend(dict(e) for e in self._overlay.derived_edges
@@ -1842,7 +1855,7 @@ class KuzuGraphIndex:
                 result.append({
                     "source": decode_id(source, self._id_prefixes),
                     "target": decode_id(target, self._id_prefixes),
-                    "kind": kind or edge_kind,
+                    "kind": _istr(kind or edge_kind),
                     "properties": _restore(props, self._props_dict),
                 })
         if self._overlay is not None:
@@ -1879,7 +1892,7 @@ class KuzuGraphIndex:
             target = decode_id(target, self._id_prefixes)
             indexed[source].append({
                 "source": source, "target": target,
-                "kind": semantic_kind or kind or "HAS_ARGUMENT",
+                "kind": _istr(semantic_kind or kind or "HAS_ARGUMENT"),
                 "properties": _restore(props, self._props_dict),
             })
         for source, edges in self._overlay_argument_edges.items():
@@ -1912,7 +1925,7 @@ class KuzuGraphIndex:
             row = res.get_next()
             nid = decode_id(row[0], self._id_prefixes)
             nodes[nid] = {
-                "id": nid, "kind": row[1], "label": row[2],
+                "id": nid, "kind": _istr(row[1]), "label": _istr(row[2]),
                 "properties": _restore_node_props(
                     row[3:-1], row[-1], self._props_dict, self._id_prefixes),
             }
@@ -1937,8 +1950,8 @@ class KuzuGraphIndex:
             while res.has_next():
                 coded_id, kind, label = res.get_next()
                 nid = decode_id(coded_id, self._id_prefixes)
-                nodes.setdefault(nid, {"id": nid, "kind": kind, "label": label,
-                                       "properties": {}})
+                nodes.setdefault(nid, {"id": nid, "kind": _istr(kind),
+                                       "label": _istr(label), "properties": {}})
         return {"nodes": tuple(nodes.values()), "edges": tuple(edges)}
 
     @timeit
