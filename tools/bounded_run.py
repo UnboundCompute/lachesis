@@ -33,8 +33,13 @@ def _process_table() -> dict[int, tuple[int, int]]:
     return table
 
 
-def _tree_rss_kib(root: int) -> int:
-    table = _process_table()
+def _descendants(root: int, table: dict[int, tuple[int, int]] | None = None) -> set[int]:
+    """Every process transitively parented by root, discovered by walking ppid
+    (NOT process group). A child that opened its own session -- e.g. a build
+    frontend worker that calls setsid -- leaves root's process group but keeps
+    root somewhere on its ppid chain, so a ppid walk still finds it where a
+    killpg would miss it."""
+    table = _process_table() if table is None else table
     descendants = {root}
     changed = True
     while changed:
@@ -43,21 +48,49 @@ def _tree_rss_kib(root: int) -> int:
             if parent in descendants and pid not in descendants:
                 descendants.add(pid)
                 changed = True
-    return sum(table.get(pid, (0, 0))[1] for pid in descendants)
+    return descendants
+
+
+def _tree_rss_kib(root: int) -> int:
+    table = _process_table()
+    return sum(table.get(pid, (0, 0))[1] for pid in _descendants(root, table))
 
 
 def _terminate_group(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    """Kill the ENTIRE descendant tree, not just the process group. killpg
+    reaches only same-session children; a frontend worker that setsid'd into its
+    own group would survive a killpg and keep running -- concurrently with the
+    NEXT bounded_run, which risks the OOM the memory cap exists to prevent. So we
+    snapshot the whole tree by ppid BEFORE signalling (after the root dies its
+    children reparent to init and the chain is lost), then signal the group AND
+    every snapshot pid individually."""
+    root = process.pid
+    victims = _descendants(root)
+
+    def _signal_all(sig: int) -> None:
+        try:
+            os.killpg(root, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for pid in victims:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    _signal_all(signal.SIGTERM)
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pass
+    # SIGKILL the original snapshot plus anything newly spawned that is still
+    # reachable by ppid, then reap the root.
+    victims |= _descendants(root)
+    _signal_all(signal.SIGKILL)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
