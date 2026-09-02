@@ -66,8 +66,8 @@ fn model_sinks(request: &crate::atropos_proto::Request,
     result.into_iter().map(|(name, positions)| (name, positions.into_iter().collect())).collect()
 }
 
-fn function_names(items: &[lifetime_proto::TranslationFunction])
-    -> (BTreeMap<String, lifetime_proto::TranslationFunction>, HashMap<String, String>, HashMap<String, String>) {
+fn function_names<'a>(items: &'a [lifetime_proto::TranslationFunction])
+    -> (BTreeMap<String, &'a lifetime_proto::TranslationFunction>, HashMap<String, String>, HashMap<String, String>) {
     let mut functions = BTreeMap::new();
     let mut by_base = HashMap::new();
     let mut by_id = HashMap::new();
@@ -77,7 +77,7 @@ fn function_names(items: &[lifetime_proto::TranslationFunction])
         let name = if functions.contains_key(&base) { format!("{}@{}", base, item.id) } else { base.clone() };
         by_base.entry(base).or_insert_with(|| name.clone());
         by_id.insert(item.id.clone(), name.clone());
-        functions.insert(name, item.clone());
+        functions.insert(name, item);
     }
     (functions, by_base, by_id)
 }
@@ -88,7 +88,7 @@ fn function_names(items: &[lifetime_proto::TranslationFunction])
 /// bottom-up summary schedule inverts.  Resolution matches `contribute` exactly
 /// so the schedule edges align with the flows they gate.
 fn call_successors(
-    functions: &BTreeMap<String, lifetime_proto::TranslationFunction>,
+    functions: &BTreeMap<String, &lifetime_proto::TranslationFunction>,
     by_id: &HashMap<String, String>,
     by_base: &HashMap<String, String>,
 ) -> BTreeMap<String, Vec<String>> {
@@ -115,7 +115,7 @@ fn call_successors(
 /// resolved callee.  Pure in `summaries`, so the caller controls the schedule.
 fn contribute(
     function: &lifetime_proto::TranslationFunction,
-    functions: &BTreeMap<String, lifetime_proto::TranslationFunction>,
+    functions: &BTreeMap<String, &lifetime_proto::TranslationFunction>,
     sinks: &HashMap<String, Vec<Option<u32>>>,
     by_id: &HashMap<String, String>,
     by_base: &HashMap<String, String>,
@@ -243,22 +243,22 @@ fn tarjan_scc(nodes: &[String], succ: &BTreeMap<String, Vec<String>>) -> Vec<Vec
 }
 
 pub(crate) fn summarize(
-    translation: lifetime_proto::TranslationResult,
-    catalog: crate::atropos_proto::Request,
+    translation: &lifetime_proto::TranslationResult,
+    catalog: &crate::atropos_proto::Request,
 ) -> lifetime_proto::NativeSummaryResult {
     summarize_with_evidence(translation, catalog, None)
 }
 
 pub(crate) fn summarize_with_evidence(
-    translation: lifetime_proto::TranslationResult,
-    catalog: crate::atropos_proto::Request,
+    translation: &lifetime_proto::TranslationResult,
+    catalog: &crate::atropos_proto::Request,
     evidence: Option<&HashMap<String, Vec<String>>>,
 ) -> lifetime_proto::NativeSummaryResult {
     let (functions, by_base, by_id) = function_names(&translation.functions);
     let languages: BTreeSet<String> = translation.functions.iter()
         .filter_map(|function| (!function.language.is_empty()).then(|| function.language.clone()))
         .collect();
-    let sinks = model_sinks(&catalog, &languages);
+    let sinks = model_sinks(catalog, &languages);
     let mut summaries: BTreeMap<String, Summary> = functions.keys()
         .map(|name| (name.clone(), Summary::default())).collect();
 
@@ -277,7 +277,7 @@ pub(crate) fn summarize_with_evidence(
             || succ.get(&component[0]).is_some_and(|callees| callees.contains(&component[0]));
         if !cyclic {
             let name = &component[0];
-            let function = functions.get(name).expect("component function");
+            let function = functions.get(name).copied().expect("component function");
             let additions = contribute(function, &functions, &sinks, &by_id, &by_base, &summaries);
             let target = summaries.get_mut(name).expect("summary entry");
             target.flows.extend(additions.flows);
@@ -296,7 +296,7 @@ pub(crate) fn summarize_with_evidence(
             iterations += 1;
             let mut changed = false;
             for name in &members {
-                let function = functions.get(name).expect("component function");
+                let function = functions.get(name).copied().expect("component function");
                 let additions = contribute(function, &functions, &sinks, &by_id, &by_base, &summaries);
                 let target = summaries.get_mut(name).expect("summary entry");
                 let before = (target.flows.len(), target.params.len());
@@ -388,7 +388,7 @@ mod tests {
             method: "sink_call".into(), role: "sink".into(), access_path: "Argument[0]".into(),
             ..Default::default()
         }], ..Default::default() };
-        let result = summarize(translation, catalog);
+        let result = summarize(&translation, &catalog);
         let caller = result.functions.iter().find(|item| item.name == "caller").unwrap();
         assert!(caller.sink_flows.iter().any(|flow| flow.via == "helper@helper-2"));
     }
@@ -428,7 +428,7 @@ mod tests {
                 parameter_names: vec!["p".into()], calls: vec![call], ..Default::default() }
         }).collect();
         let translation = lifetime_proto::TranslationResult { functions };
-        let result = summarize(translation, sink_catalog());
+        let result = summarize(&translation, &sink_catalog());
         assert!(result.complete, "deep acyclic chain must converge");
         let top = result.functions.iter().find(|item| item.name == "f0").unwrap();
         assert!(top.sink_flows.iter().any(|flow| flow.sink == "sink_call.a0"),
@@ -456,7 +456,7 @@ mod tests {
                     arguments: param_arg(), ..Default::default() },
             ], ..Default::default() };
         let translation = lifetime_proto::TranslationResult { functions: vec![a, b] };
-        let result = summarize(translation, sink_catalog());
+        let result = summarize(&translation, &sink_catalog());
         assert!(result.complete, "recursive component must reach a fixpoint");
         for name in ["a", "b"] {
             let function = result.functions.iter().find(|item| item.name == name).unwrap();

@@ -287,16 +287,17 @@ def run_project_streaming(
                 frontend, source_dir, frontend_output, timeout_seconds, roots=roots,
             )
 
-        # Frontends are isolated subprocesses and publish disjoint shard sets.  Run
-        # them concurrently so the slowest compiler, rather than the sum of all
-        # compiler times, sets the Pass-1 wall clock.  The Kuzu materializer still
-        # starts only after all snapshots are released, preserving its memory cap.
-        if len(frontend_jobs) > 1:
+        # Compiler heaps share one process-tree budget. Serial execution is the
+        # safe default; an explicitly larger LACHESIS_FRONTEND_JOBS retains the
+        # output-identical parallel schedule for runners with a larger budget.
+        from .resources import frontend_jobs as configured_frontend_jobs
+        workers = min(len(frontend_jobs), configured_frontend_jobs())
+        if workers > 1:
             from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=len(frontend_jobs)) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 frontend_snapshots = list(pool.map(run_frontend_job, frontend_jobs))
         else:
-            frontend_snapshots = [run_frontend_job(frontend_jobs[0])]
+            frontend_snapshots = [run_frontend_job(job) for job in frontend_jobs]
 
         for (frontend_id, _frontend, _frontend_output, _roots), snapshot in zip(
                 frontend_jobs, frontend_snapshots):

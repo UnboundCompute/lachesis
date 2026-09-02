@@ -6,12 +6,13 @@
 //! while protobuf properties remain typed for overlay-specific accessors.
 
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use hashbrown::HashMap;
 use prost::Message;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use sha2::{Digest, Sha256};
 
 use crate::graph_proto;
@@ -79,17 +80,34 @@ impl Drop for DataflowStreamWriter {
 #[derive(Default)]
 pub(crate) struct Symbols {
     values: Vec<String>,
-    lookup: FxHashMap<String, u32>,
+    lookup: FxHashMap<u64, u32>,
+    collisions: FxHashMap<u64, Vec<u32>>,
 }
 
 impl Symbols {
+    #[inline]
+    fn hash(value: &str) -> u64 {
+        let mut hasher = FxHasher::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(crate) fn intern(&mut self, value: String) -> u32 {
-        if let Some(symbol) = self.lookup.get(&value) {
-            return *symbol;
+        let hash = Self::hash(&value);
+        if let Some(symbol) = self.lookup.get(&hash).copied() {
+            if self.get(symbol) == value { return symbol; }
+            if let Some(symbol) = self.collisions.get(&hash).into_iter().flatten()
+                .copied().find(|symbol| self.get(*symbol) == value) {
+                return symbol;
+            }
         }
         let symbol = self.values.len() as u32;
-        self.lookup.insert(value.clone(), symbol);
         self.values.push(value);
+        if self.lookup.contains_key(&hash) {
+            self.collisions.entry(hash).or_default().push(symbol);
+        } else {
+            self.lookup.insert(hash, symbol);
+        }
         symbol
     }
 
@@ -97,7 +115,13 @@ impl Symbols {
         self.values.get(symbol as usize).map(String::as_str).unwrap_or("")
     }
 
-    pub(crate) fn find(&self, value: &str) -> Option<u32> { self.lookup.get(value).copied() }
+    pub(crate) fn find(&self, value: &str) -> Option<u32> {
+        let hash = Self::hash(value);
+        let symbol = self.lookup.get(&hash).copied()?;
+        if self.get(symbol) == value { return Some(symbol); }
+        self.collisions.get(&hash).into_iter().flatten().copied()
+            .find(|symbol| self.get(*symbol) == value)
+    }
 }
 
 pub(crate) struct Node {
@@ -131,7 +155,6 @@ pub(crate) struct Graph {
     pub(crate) edges: Vec<Edge>,
     pub(crate) node_by_id: FxHashMap<u32, usize>,
     pub(crate) outgoing: Vec<Vec<usize>>,
-    pub(crate) incoming: Vec<Vec<usize>>,
     /// Frequently queried structural fields, indexed by node position.  The
     /// original property vectors remain available to overlays that need richer
     /// fields, but control-flow no longer rescans them during every sort/walk.
@@ -139,13 +162,28 @@ pub(crate) struct Graph {
     /// Candidate edge indexes by triple.  Properties are compared only when a
     /// triple collides, matching composition's first-wins/different-properties
     /// behavior without serializing every edge during ingestion.
-    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>>,
+    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), usize>,
+    /// Additional same-triple edges are rare; keep their allocations out of
+    /// the common one-edge dedup entry.
+    pub(crate) edge_collisions: FxHashMap<(u32, u32, u32), Vec<usize>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct Delta {
     pub(crate) nodes: Vec<graph_proto::NodeRecord>,
     pub(crate) edges: Vec<graph_proto::EdgeRecord>,
+}
+
+impl Delta {
+    pub(crate) fn canonicalize(&mut self) {
+        self.nodes.sort_by(|left, right| {
+            (&left.id, &left.kind, &left.label).cmp(&(&right.id, &right.kind, &right.label))
+        });
+        self.edges.sort_by(|left, right| {
+            (&left.kind, &left.source, &left.target)
+                .cmp(&(&right.kind, &right.source, &right.target))
+        });
+    }
 }
 
 impl Graph {
@@ -250,24 +288,25 @@ impl Graph {
             self.node_by_id.insert(id, self.nodes.len());
             self.nodes.push(node);
             self.outgoing.push(Vec::new());
-            self.incoming.push(Vec::new());
         }
         for record in delta.edges {
             let edge = make_edge(&mut self.symbols, record.kind, record.source, record.target, record.properties);
             let triple = (edge.kind, edge.source, edge.target);
-            let duplicate = self.edge_lookup.get(&triple).into_iter().flatten().any(|index| {
-                self.edges[*index].properties == edge.properties
-            });
+            let duplicate = self.edge_lookup.get(&triple).is_some_and(|index|
+                self.edges[*index].properties == edge.properties)
+                || self.edge_collisions.get(&triple).into_iter().flatten().any(|index|
+                    self.edges[*index].properties == edge.properties);
             if duplicate { continue; }
             let index = self.edges.len();
             if let Some(source) = self.node_by_id.get(&edge.source).copied() {
                 self.outgoing[source].push(index);
             }
-            if let Some(target) = self.node_by_id.get(&edge.target).copied() {
-                self.incoming[target].push(index);
-            }
             self.edges.push(edge);
-            self.edge_lookup.entry(triple).or_default().push(index);
+            if self.edge_lookup.contains_key(&triple) {
+                self.edge_collisions.entry(triple).or_default().push(index);
+            } else {
+                self.edge_lookup.insert(triple, index);
+            }
         }
         Ok(())
     }
@@ -346,9 +385,10 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
 }
 
 pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
-    let file = File::open(path.as_ref())
-        .map_err(|error| format!("cannot open Pass-2 input: {error}"))?;
-    let mut input = BufReader::with_capacity(1024 * 1024, file);
+    // The Pass-2 input sidecar may be gzip-framed (see sidecar_project::publish);
+    // open_frames sniffs the magic and streams the decode, so the reader never
+    // holds the whole graph in memory whether the file is raw or compressed.
+    let mut input = crate::native_graph::open_frames(path.as_ref())?;
     let header = read_stream_frame(&mut input)?;
     let document: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 input header: {error}"))?;
@@ -477,14 +517,18 @@ fn finish_graph(
     let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
     for (index, node) in nodes.iter().enumerate() { node_by_id.insert(node.id, index); }
     let mut outgoing = vec![Vec::new(); nodes.len()];
-    let mut incoming = vec![Vec::new(); nodes.len()];
     for (index, edge) in edges.iter().enumerate() {
         if let Some(source) = node_by_id.get(&edge.source) { outgoing[*source].push(index); }
-        if let Some(target) = node_by_id.get(&edge.target) { incoming[*target].push(index); }
     }
-    let mut edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
+    let mut edge_lookup = FxHashMap::default();
+    let mut edge_collisions: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
     for (index, edge) in edges.iter().enumerate() {
-        edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
+        let triple = (edge.kind, edge.source, edge.target);
+        if edge_lookup.contains_key(&triple) {
+            edge_collisions.entry(triple).or_default().push(index);
+        } else {
+            edge_lookup.insert(triple, index);
+        }
     }
     let node_meta = nodes.iter().map(|node| {
         let text = |key: &str| node.properties.iter().find_map(|field| {
@@ -511,8 +555,8 @@ fn finish_graph(
             control_kind,
         }
     }).collect();
-    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing, incoming,
-               node_meta, edge_lookup })
+    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing,
+               node_meta, edge_lookup, edge_collisions })
 }
 
 fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {

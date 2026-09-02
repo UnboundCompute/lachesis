@@ -7,6 +7,7 @@ produce/consume the same shards.
 """
 from __future__ import annotations
 
+import gzip
 import struct
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -452,8 +453,19 @@ def write_frame(handle, payload: bytes) -> None:
     handle.write(FRAME.pack(len(payload)) + payload)
 
 
+_FRAME_GZIP_MAGIC = b"\x1f\x8b"
+
+
 def read_frames(path: Path) -> Iterator[bytes]:
-    with path.open("rb") as handle:
+    # The sidecar may be gzip-framed (the native writer compresses it); the gzip
+    # magic cannot collide with a raw frame's 4-byte big-endian length prefix,
+    # whose leading byte is 0x00 for any frame under 16 MiB.  gzip.open streams
+    # the decode, so a compressed sidecar is read with the same bounded memory as
+    # the raw one.
+    with path.open("rb") as probe:
+        compressed = probe.read(2) == _FRAME_GZIP_MAGIC
+    opener = gzip.open if compressed else (lambda p, mode: Path(p).open(mode))
+    with opener(path, "rb") as handle:
         while True:
             header = handle.read(FRAME.size)
             if not header:

@@ -54,9 +54,16 @@ mod reach;
 /// applied consistently.
 fn absorb_native_delta(
     graph: &mut pass2::Graph,
-    delta: pass2::Delta,
+    mut delta: pass2::Delta,
     writer: &mut pass2::DataflowStreamWriter,
 ) -> Result<(), String> {
+    // Several overlays naturally deduplicate through hash-backed sets. Their
+    // iteration order is not part of the semantic contract, but allowing it to
+    // reach the stream also changes adjacency insertion order for later passes.
+    // Canonicalize once at the common boundary so publication and absorption
+    // observe the identical, repeatable ordering without adding sorting work to
+    // every overlay implementation.
+    delta.canonicalize();
     writer.append(&delta)?;
     graph.absorb(delta)
 }
@@ -1221,7 +1228,7 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_write_path(
         let output = CStr::from_ptr(output_path)
             .to_str().map_err(|error| format!("invalid output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let payload = native_graph::sidecar_to_translation(&bytes)?;
+        let payload = native_graph::gzip_flat(&native_graph::sidecar_to_translation(&bytes)?)?;
         let output_path = std::path::Path::new(output);
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -1533,7 +1540,7 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
             fs::read(catalog).map_err(|error| format!("cannot read binary catalog: {error}"))?.as_slice()
         ).map_err(|error| format!("invalid binary catalog: {error}"))?;
         native_graph::annotate_translation_roles(&mut translation, &catalog);
-        let result = summary::summarize(translation, catalog);
+        let result = summary::summarize(&translation, &catalog);
         let mut bytes = Vec::new();
         result.encode(&mut bytes).map_err(|error| format!("cannot encode summaries: {error}"))?;
         let temporary = format!("{output}.tmp.{}", std::process::id());
@@ -1625,17 +1632,21 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
                 .map(|base| format!("{base}.pass2.facts.pb"))
                 .filter(|path| std::path::Path::new(path).is_file()) {
-                fs::read(path)
-                    .map_err(|error| format!("cannot read native translation facts: {error}"))?
+                native_graph::read_maybe_gzip(&path)?
             } else {
                 native_graph::sidecar_to_translation(&bytes)?
             };
             let mut translation = lifetime_proto::TranslationResult::decode(
                 translation_bytes.as_slice(),
             ).map_err(|error| format!("invalid native translation facts: {error}"))?;
+            // The raw facts buffer (as large as `.pass2.facts.pb`) is dead once
+            // decoded.  Release it before the reach phase so peak memory is not
+            // the decoded translation + summaries + skeletons + the raw bytes at
+            // once, mirroring the `drop(result)` below.
+            drop(translation_bytes);
             native_graph::annotate_translation_roles(&mut translation, catalog);
             let summaries = summary::summarize_with_evidence(
-                translation.clone(), catalog.clone(),
+                &translation, catalog,
                 source_evidence.as_ref().map(|evidence| &evidence.witnesses));
             if !summaries.complete { full.complete = false; }
             full.skeletons.extend(reach::build_sink_graphs(

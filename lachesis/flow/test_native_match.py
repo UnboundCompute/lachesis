@@ -1,0 +1,87 @@
+"""The convergence scanner reads the same ``capped`` bit the full protobuf parse
+would, without decoding the findings.
+
+``_enrich_and_merge`` only needs "did any function cap?" to decide whether the
+temporal skeleton converged. Parsing the whole match sidecar to answer that
+materializes every finding and witness (~350 MB on a large graph), so the bind
+scans the protobuf wire form for field-1 ``functions`` / field-5 ``capped``
+instead. These tests pin that scan to the full-parse answer across the cases
+that matter: no functions, none capped, some capped, and -- critically -- with
+findings and witnesses present, since the scan's correctness rests on skipping
+those length-delimited fields without decoding them.
+"""
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from lachesis.core import lifetime_pb2
+from lachesis.flow.native_translate import native_match_any_capped
+
+
+def _result(*capped_flags: bool, with_findings: bool = False):
+    """A ``NativeTemporalResult`` with one function per flag. When
+    ``with_findings`` is set, every function also carries a finding with a
+    multi-node witness and guards, so the scanner must skip real
+    length-delimited payloads to reach ``capped``."""
+    result = lifetime_pb2.NativeTemporalResult()
+    for index, capped in enumerate(capped_flags):
+        function = result.functions.add()
+        function.id = f"fn:{index}"
+        function.transfers = 1234 + index
+        function.widenings = index
+        function.capped = capped
+        if with_findings:
+            finding = function.findings.add()
+            finding.function = f"fn:{index}"
+            finding.pattern = "use-after-free"
+            finding.node = f"n:{index}"
+            finding.line = 40 + index
+            finding.has_line = True
+            finding.witness_nodes.extend(
+                [f"w:{index}:{step}" for step in range(6)])
+            finding.witness_complete = True
+            guard = finding.guards.add()
+            guard.kind = "null-check"
+            guard.value = "ptr != NULL"
+            finding.guarded = True
+    return result
+
+
+class NativeMatchConvergenceScanTest(unittest.TestCase):
+    def _roundtrip(self, result) -> bool:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.match.pb"
+            path.write_bytes(result.SerializeToString())
+            return native_match_any_capped(path)
+
+    def _assert_matches_full_parse(self, result) -> None:
+        expected = any(f.capped for f in result.functions)
+        self.assertEqual(expected, self._roundtrip(result))
+
+    def test_empty_result_is_converged(self):
+        self.assertFalse(self._roundtrip(_result()))
+
+    def test_none_capped(self):
+        self._assert_matches_full_parse(_result(False, False, False))
+
+    def test_some_capped(self):
+        self._assert_matches_full_parse(_result(False, True, False))
+
+    def test_last_function_capped(self):
+        self._assert_matches_full_parse(_result(False, False, True))
+
+    def test_all_capped(self):
+        self._assert_matches_full_parse(_result(True, True))
+
+    def test_findings_and_witnesses_are_skipped(self):
+        # The scan must reach ``capped`` past real findings/witness/guard bytes.
+        self._assert_matches_full_parse(
+            _result(False, True, False, with_findings=True))
+        self._assert_matches_full_parse(
+            _result(False, False, False, with_findings=True))
+
+
+if __name__ == "__main__":
+    unittest.main()

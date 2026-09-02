@@ -626,7 +626,8 @@ class Analysis:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import (
-            build_native_match_result, ensure_native_semantic_sidecar,
+            ensure_native_match_sidecar, ensure_native_semantic_sidecar,
+            native_match_any_capped,
         )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
@@ -637,10 +638,15 @@ class Analysis:
         # honestly so the caller drops the partial skeleton (structural families only)
         # rather than caching a misleadingly thin temporal set as a complete run. The
         # match sidecar is content-addressed, so the later flow pass reuses it.
-        match_result = build_native_match_result(
+        #
+        # Convergence needs only the "any function capped" bit, so publish the match
+        # sidecar and scan it for that flag rather than parsing the whole findings
+        # protobuf -- the full parse would materialize ~350 MB of witnesses this path
+        # never reads. The flow pass still builds the complete result from the same
+        # content-addressed sidecar.
+        match_sidecar = ensure_native_match_sidecar(
             native_sidecar, summary.get("catalog_path"))
-        converged = not any(getattr(function, "capped", False)
-                            for function in match_result.functions)
+        converged = not native_match_any_capped(match_sidecar)
         stamped["semantic_graph"] = {
             "native_sidecar": str(native_sidecar),
             "coverage": {"converged": converged},
@@ -773,7 +779,10 @@ class Analysis:
         # path requires sorting roughly two million edge dictionaries before binding, which
         # can dominate Pass 2 and keep the graph-sized object peak alive.  The indexed
         # materializer below is bounded and was already the measured ~46s path on libxml2.
-        self.store.ensure_dataflow_tier()
+        # enrich only writes the sidecars to disk; it issues no queries against the tier
+        # afterwards. Skip decoding the dataflow overlay back into Python so its ~1 GB does
+        # not sit resident on top of the semantic Pass-3 native transient the bind runs next.
+        self.store.ensure_dataflow_tier(retain_materialized=False)
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
                                    deadline=self._resolve_deadline(hard_stop, deadline),

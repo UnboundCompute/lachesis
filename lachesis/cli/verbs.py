@@ -74,7 +74,14 @@ def _open(args, *, progress=None, defer_maps=False):
 def command_enrich(args: argparse.Namespace) -> int:
     """Pass 2: materialize the dataflow tier and the catalog bind to disk (``.dataflow.pb`` /
     ``.bind.pb``), so later ``analyze``/``candidates``/``explain`` on a fresh process are warm."""
+    import os
     from lachesis.cli.progress import Progress
+
+    # Run each whole-graph native pass (Pass-2 enrich, the Pass-3 semantic sidecar) in a
+    # short-lived child so its native arena is returned to the OS on exit instead of
+    # stacking with the next pass's transient. Bounds the enrich peak to the largest
+    # single pass rather than their sum; `setdefault` lets an explicit override win.
+    os.environ.setdefault("LACHESIS_ISOLATE_NATIVE", "1")
 
     with Progress(enabled=not args.json and not args.quiet) as progress:
         _native_note(progress, args)

@@ -79,6 +79,26 @@ except Exception:  # pragma: no cover - falls back to per-row inserts if absent
     pa = None
     pq = None
 
+_warned_missing_bulk = False
+
+
+def _warn_missing_bulk_dependency() -> None:
+    """Emit one stderr warning when the bounded bulk-COPY load path is unavailable.
+
+    ``pyarrow`` is an optional import, but it is the difference between the bounded
+    staged-Parquet ``COPY`` path and a row-wise fallback that costs far more memory
+    and time. Losing it silently reads as a build regression, so say so once."""
+    global _warned_missing_bulk
+    if _warned_missing_bulk:
+        return
+    _warned_missing_bulk = True
+    print(
+        "[lachesis] warning: pyarrow is not importable; the Kuzu store write is "
+        "falling back to the row-wise load path, which uses far more memory and "
+        "wall time than the bounded bulk COPY path. Install pyarrow to restore it.",
+        file=sys.stderr, flush=True,
+    )
+
 
 # -- schema shared with the read side (single source of truth) ----------------
 
@@ -371,6 +391,44 @@ def graph_content_hash(nodes: Sequence[dict], edges: Sequence[dict]) -> str:
         digest.update("\0".join(triple).encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+_CONTENT_HASH_MOD = 1 << 256
+
+
+def _content_record_digest(tag: bytes, *parts) -> int:
+    """One record's contribution to :func:`content_multiset_hash`, as an int.
+
+    The tag keeps the node record space (``b"N"``) disjoint from the edge record
+    space (``b"E"``) so a node id can never alias an edge whose fields happen to
+    concatenate to the same bytes.
+    """
+    h = hashlib.sha256()
+    h.update(tag)
+    h.update(b"\0")
+    for part in parts:
+        h.update(str(part or "").encode("utf-8"))
+        h.update(b"\0")
+    return int.from_bytes(h.digest(), "big")
+
+
+def content_multiset_hash(nodes: Sequence[dict], edges: Sequence[dict]) -> str:
+    """An order-independent digest of graph identity: node ids plus edge triples.
+
+    Same identity set as :func:`graph_content_hash`, but folded commutatively
+    (each record contributes a term summed mod 2**256) instead of sorted then
+    concatenated. That needs no graph-sized sort buffer, so a streaming writer
+    can fold it in shard order and still land the value a single-frontend build
+    does -- shard-count invariance is why this, not a stream-order digest, keys
+    the core store's cache.
+    """
+    acc = 0
+    for node in nodes:
+        acc = (acc + _content_record_digest(b"N", node["id"])) % _CONTENT_HASH_MOD
+    for e in edges:
+        acc = (acc + _content_record_digest(
+            b"E", e.get("kind"), e.get("source"), e.get("target"))) % _CONTENT_HASH_MOD
+    return format(acc, "064x")
 
 
 def _semantic_kind(edge: dict) -> str:
@@ -1081,7 +1139,7 @@ def write_kuzu_graph(
     # and a lossless one are different cores and must not share a derived cache.
     payload["core_content_hash"] = (
         core_content_hash if core_content_hash is not None
-        else (None if enriched else graph_content_hash(nodes, edges))
+        else (None if enriched else content_multiset_hash(nodes, edges))
     )
     _write_store_manifest(db_dir, payload)
     # The writer still owns the exact resident graph and its final manifest.
@@ -1428,19 +1486,28 @@ def _load_index_bulk(conn, table_name: str, columns: tuple, rows: list, *,
     if not rows:
         return
     codes = id_codes or {}
-    staged = {"seq": pa.array(list(range(len(rows))), pa.int64())}
-    for column in columns:
-        cells = [_index_cell(column, row.get(column), codes) for row in rows]
-        if column in _INDEX_BOOL_COLUMNS:
-            staged[column] = pa.array(cells, pa.bool_())
-        elif column in _INDEX_INT_COLUMNS:
-            staged[column] = pa.array(
-                [None if cell is None else int(cell) for cell in cells], pa.int64())
-        else:
-            staged[column] = _str_col(cells)
-    path = os.path.join(stage_dir, f"{table_name.lower()}.parquet")
-    pq.write_table(pa.table(staged), path)
-    conn.execute(f"COPY {table_name} FROM '{path}'")
+    # Partition the COPY the same way nodes and edges are: one COPY over the whole
+    # index overflows Kùzu's bounded buffer pool at multi-million-row scale.  ``seq``
+    # stays globally continuous across partitions so the loaded rows are identical.
+    total = len(rows)
+    for offset in range(0, total, STREAM_EDGE_COPY_PARTITION_ROWS):
+        chunk = rows[offset:offset + STREAM_EDGE_COPY_PARTITION_ROWS]
+        staged = {"seq": pa.array(
+            list(range(offset, offset + len(chunk))), pa.int64())}
+        for column in columns:
+            cells = [_index_cell(column, row.get(column), codes) for row in chunk]
+            if column in _INDEX_BOOL_COLUMNS:
+                staged[column] = pa.array(cells, pa.bool_())
+            elif column in _INDEX_INT_COLUMNS:
+                staged[column] = pa.array(
+                    [None if cell is None else int(cell) for cell in cells], pa.int64())
+            else:
+                staged[column] = _str_col(cells)
+        partition = offset // STREAM_EDGE_COPY_PARTITION_ROWS
+        path = os.path.join(stage_dir, f"{table_name.lower()}.{partition}.parquet")
+        pq.write_table(pa.table(staged), path)
+        conn.execute(f"COPY {table_name} FROM '{path}'")
+        os.unlink(path)
 
 
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
@@ -1598,13 +1665,20 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
 
     kept_ids: set[str] = set()
     # Streaming stores need a cache key before their Pass-1 sidecars are
-    # published. Hash retained record identity in deterministic shard order
-    # without building a graph-sized sort buffer.
-    core_digest = hashlib.sha256()
+    # published. Fold retained record identity commutatively so the key is
+    # invariant to shard count -- no graph-sized sort buffer, and a sharded
+    # build lands the same value a single-frontend build does.
+    core_acc = 0
 
-    def hash_part(value) -> None:
-        core_digest.update(str(value or "").encode("utf-8"))
-        core_digest.update(b"\0")
+    def hash_node(node_id) -> None:
+        nonlocal core_acc
+        core_acc = (core_acc
+                    + _content_record_digest(b"N", node_id)) % _CONTENT_HASH_MOD
+
+    def hash_edge(kind, source, target) -> None:
+        nonlocal core_acc
+        core_acc = (core_acc + _content_record_digest(
+            b"E", kind, source, target)) % _CONTENT_HASH_MOD
 
     node_units: dict[str, object] = {}
     unit_names: list[str] = []
@@ -1618,6 +1692,32 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             unit_names.append(value)
         return code
     prefixes: set[str] = set()
+    # Cross-TU declaration->definition links (REFERS_TO reason=prototype-of) are
+    # emitted by the frontend's end-of-run pass over ONE process's accumulated USR
+    # map. Under sharding each frontend sees only its own TUs, so a prototype in one
+    # shard and the definition in another are never linked and the edge is lost.
+    # Rebuild those links globally here from the compiler USR carried on each
+    # function node. Only the clang-c frontend emits `usr`; other frontends leave
+    # these maps empty, so the reconstruction is inert for them. The maps are keyed
+    # by USR and hold only function ids -- a few thousand entries, not graph-sized.
+    usr_defs: dict[str, list[str]] = {}
+    usr_decls: dict[str, list[str]] = {}
+    existing_proto: set[tuple[str, str]] = set()
+    # Cross-TU call-argument bindings (ARGUMENT_BINDS_PARAMETER and the paired
+    # VALUE_FLOWS_TO reason=call-argument) are emitted by the frontend only when it
+    # can see the callee's parameters in the SAME process as the call -- it pairs a
+    # call's arguments with the callee's formals by position. Under sharding the call
+    # site and the callee's parameter declarations can land in different shards, so
+    # that pairing never happens and both edges are lost. Rebuild them here from
+    # edges that all survive the split: INVOKES (call site -> callee), the callee's
+    # DECLARES_VALUE parameters ordered by the persisted param_index, and
+    # HAS_ARGUMENT (call site -> argument, by position). clang-c only; other
+    # frontends leave these maps empty. Bounded: keyed on call sites and callees.
+    invokes_target: dict[str, str] = {}
+    call_arguments: dict[str, list[tuple[int, str]]] = {}
+    declared_values: dict[str, list[str]] = {}
+    param_index: dict[str, int] = {}
+    existing_bind: set[tuple[str, str]] = set()
     # Index candidates are spilled while the large node/edge streams are loaded.
     # Keeping hundreds of thousands of full property dictionaries alive here was a
     # surprising multi-GB peak on Linux/net; the index builders only need them again
@@ -1634,7 +1734,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 continue
             node_id = node.id
             kept_ids.add(node_id)
-            hash_part(node_id)
+            hash_node(node_id)
             file_value = _proto_promoted_value(node.properties, "file")
             compiler_id = _proto_promoted_value(node.properties, "compiler_node_id")
             if file_value:
@@ -1653,7 +1753,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             node_id = node["id"]
             props = node.get("properties") or {}
             kept_ids.add(node_id)
-            hash_part(node_id)
+            hash_node(node_id)
             if props.get("file"):
                 node_units[node_id] = props["file"]
             for value in (node_id, props.get("compiler_node_id")):
@@ -1692,9 +1792,19 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     timing("create schema")
     codec = PropsCodec()
     bulk = pa is not None and pq is not None
+    if not bulk:
+        # The staged-Parquet COPY path is what makes this the bounded-memory build:
+        # without pyarrow the row-wise fallback holds the whole load in one growing
+        # transaction, which measured ~9x the peak RSS and ~10x the wall time on a
+        # mid-size tree (and OOMs where the bulk path stays well under budget). That
+        # is silent otherwise, so a run can look like a memory/latency problem in the
+        # build when it is really a missing optional dependency. Warn once.
+        _warn_missing_bulk_dependency()
     stage = tempfile.TemporaryDirectory(prefix="kuzu_stream_stage_") if bulk else None
     node_writer = None
     node_path = None
+    node_path_list: list[str] = []
+    node_row_count = 0
     edge_writers = {}
     edge_writer_paths = {}
     edge_path_lists = collections.defaultdict(list)
@@ -1714,20 +1824,34 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         edge_path_lists[kind].append(edge_writer_paths.pop(kind))
         edge_row_counts[kind] = 0
 
+    def flush_node_partition() -> None:
+        nonlocal node_writer, node_path, node_row_count
+        if node_writer is None:
+            return
+        node_writer.close()
+        node_path_list.append(node_path)
+        node_writer = None
+        node_path = None
+        node_row_count = 0
+
     def load_nodes(batch: list[dict]) -> None:
         if not batch:
             return
         if bulk:
-            nonlocal node_writer, node_path
+            nonlocal node_writer, node_path, node_row_count
             if isinstance(batch[0], graph_pb2.NodeRecord):
                 table = _node_table_proto(batch, elide=True, codec=codec,
                                           id_codes=id_codes)
             else:
                 table = _node_table(batch, elide=True, codec=codec, id_codes=id_codes)
             if node_writer is None:
-                node_path = os.path.join(stage.name, "node.parquet")
+                partition = len(node_path_list)
+                node_path = os.path.join(stage.name, f"node.{partition}.parquet")
                 node_writer = pq.ParquetWriter(node_path, table.schema)
             node_writer.write_table(table)
+            node_row_count += table.num_rows
+            if node_row_count >= STREAM_EDGE_COPY_PARTITION_ROWS:
+                flush_node_partition()
         else:
             if isinstance(batch[0], graph_pb2.NodeRecord):
                 batch = [decode_node(node.SerializeToString()) for node in batch]
@@ -1771,19 +1895,43 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             node.ParseFromString(item)
             if prune and node.kind in PRUNE_NODE_KINDS:
                 continue
+            if node.kind == "function":
+                usr = _proto_promoted_value(node.properties, "usr")
+                if usr:
+                    decl_only = _proto_promoted_value(
+                        node.properties, "declaration_only") is True
+                    (usr_decls if decl_only else usr_defs).setdefault(
+                        usr, []).append(node.id)
+            elif node.kind == "parameter":
+                idx = _proto_promoted_value(node.properties, "param_index")
+                if isinstance(idx, int) and not isinstance(idx, bool):
+                    param_index[node.id] = idx
         else:
             node = item
             if prune and node.get("kind") in PRUNE_NODE_KINDS:
                 continue
+            if node.get("kind") == "function":
+                props = node.get("properties") or {}
+                usr = props.get("usr")
+                if usr:
+                    decl_only = props.get("declaration_only") is True
+                    (usr_decls if decl_only else usr_defs).setdefault(
+                        usr, []).append(node["id"])
+            elif node.get("kind") == "parameter":
+                idx = (node.get("properties") or {}).get("param_index")
+                if isinstance(idx, int) and not isinstance(idx, bool):
+                    param_index[node["id"]] = idx
         batch.append(node)
         if len(batch) >= batch_rows:
             load_nodes(batch)
             batch.clear()
     if batch:
         load_nodes(batch)
-    if bulk and node_writer is not None:
-        node_writer.close()
-        conn.execute(f"COPY Node FROM '{node_path}'")
+    if bulk:
+        flush_node_partition()
+        for path in node_path_list:
+            conn.execute(f"COPY Node FROM '{path}'")
+            os.unlink(path)
     timing("load nodes")
 
     batch = []
@@ -1798,9 +1946,22 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if edge.source not in kept_ids or edge.target not in kept_ids:
                 unresolved_count += 1
                 continue
-            hash_part(edge.kind)
-            hash_part(edge.source)
-            hash_part(edge.target)
+            hash_edge(edge.kind, edge.source, edge.target)
+            if (edge.kind == "REFERS_TO"
+                    and _proto_promoted_value(edge.properties, "reason")
+                    == "prototype-of"):
+                existing_proto.add((edge.source, edge.target))
+            elif edge.kind == "INVOKES":
+                invokes_target[edge.source] = edge.target
+            elif edge.kind == "HAS_ARGUMENT":
+                pos = _proto_promoted_value(edge.properties, "position")
+                if isinstance(pos, int) and not isinstance(pos, bool):
+                    call_arguments.setdefault(edge.source, []).append(
+                        (pos, edge.target))
+            elif edge.kind == "DECLARES_VALUE":
+                declared_values.setdefault(edge.source, []).append(edge.target)
+            elif edge.kind == "ARGUMENT_BINDS_PARAMETER":
+                existing_bind.add((edge.source, edge.target))
         else:
             edge = item
             if edge.get("kind") == "EXPORTS" and edge.get("target"):
@@ -1808,9 +1969,22 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if edge.get("source") not in kept_ids or edge.get("target") not in kept_ids:
                 unresolved_count += 1
                 continue
-            hash_part(edge.get("kind"))
-            hash_part(edge.get("source"))
-            hash_part(edge.get("target"))
+            hash_edge(edge.get("kind"), edge.get("source"), edge.get("target"))
+            props = edge.get("properties") or {}
+            if (edge.get("kind") == "REFERS_TO"
+                    and props.get("reason") == "prototype-of"):
+                existing_proto.add((edge["source"], edge["target"]))
+            elif edge.get("kind") == "INVOKES":
+                invokes_target[edge["source"]] = edge["target"]
+            elif edge.get("kind") == "HAS_ARGUMENT":
+                pos = props.get("position")
+                if isinstance(pos, int) and not isinstance(pos, bool):
+                    call_arguments.setdefault(edge["source"], []).append(
+                        (pos, edge["target"]))
+            elif edge.get("kind") == "DECLARES_VALUE":
+                declared_values.setdefault(edge["source"], []).append(edge["target"])
+            elif edge.get("kind") == "ARGUMENT_BINDS_PARAMETER":
+                existing_bind.add((edge["source"], edge["target"]))
         batch.append(edge)
         kept_edge_count += 1
         if len(batch) >= edge_batch_rows:
@@ -1818,6 +1992,96 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             batch.clear()
     if batch:
         load_edges(batch)
+    # Replay the frontend's cross-TU prototype-of linking over the GLOBAL USR map.
+    # A single frontend run links every declaration of a function to its definition;
+    # sharding splits those across processes, so a decl in one shard and the def in
+    # another are only reunited here. Emitted after the shard edges in a deterministic
+    # (usr, def, decl) order so the core digest stays stable, deduped against the
+    # prototype-of links the shards already carried (existing_proto) and against ids
+    # that survived endpoint filtering (kept_ids). clang-c-only: usr maps are empty
+    # otherwise, so this loop is skipped. Bounded: iterates function ids, not edges.
+    if binary_edges and usr_defs:
+        recon: list = []
+        for usr in sorted(usr_defs):
+            defs = sorted(set(usr_defs[usr]))
+            decls = sorted(set(usr_decls.get(usr, ())))
+            for defn in defs:
+                if defn not in kept_ids:
+                    continue
+                for decl in decls:
+                    if (decl == defn or decl not in kept_ids
+                            or (decl, defn) in existing_proto):
+                        continue
+                    record = graph_pb2.EdgeRecord(
+                        kind="REFERS_TO", source=decl, target=defn,
+                        source_tier="T1", relationship_class="REFERS_TO")
+                    prop = record.properties.add()
+                    prop.key = "reason"
+                    prop.value.text = "prototype-of"
+                    hash_edge(record.kind, record.source, record.target)
+                    recon.append(record)
+                    kept_edge_count += 1
+                    if len(recon) >= edge_batch_rows:
+                        load_edges(recon)
+                        recon.clear()
+        if recon:
+            load_edges(recon)
+    # Replay cross-TU call-argument bindings (see the maps built above). For each
+    # call site, pair its arguments (by HAS_ARGUMENT position) with the callee's
+    # formals (DECLARES_VALUE parameters ordered by param_index) -- the same position
+    # pairing the frontend performs in-process, so a sharded build converges to the
+    # single-frontend one. Deterministic (call site, position) order; deduped against
+    # bindings a shard already carried (existing_bind) and endpoint-filtered against
+    # kept_ids. Two edges per pair, matching the frontend exactly: the typed
+    # ARGUMENT_BINDS_PARAMETER and the paired VALUE_FLOWS_TO reason=call-argument.
+    if binary_edges and invokes_target and param_index:
+        bindings: list = []
+        for callsite in sorted(call_arguments):
+            callee = invokes_target.get(callsite)
+            formals = declared_values.get(callee) if callee is not None else None
+            if not formals:
+                continue
+            by_position: dict[int, str] = {}
+            for value_id in formals:
+                idx = param_index.get(value_id)
+                if idx is not None:
+                    by_position[idx] = value_id
+            if not by_position:
+                continue
+            for position, argument in sorted(call_arguments[callsite]):
+                parameter = by_position.get(position)
+                if (parameter is None or argument not in kept_ids
+                        or parameter not in kept_ids
+                        or (argument, parameter) in existing_bind):
+                    continue
+                bind = graph_pb2.EdgeRecord(
+                    kind="ARGUMENT_BINDS_PARAMETER", source=argument,
+                    target=parameter, source_tier="T3",
+                    relationship_class="ARGUMENT_BINDS_PARAMETER")
+                p_pos = bind.properties.add()
+                p_pos.key = "position"
+                p_pos.value.integer = position
+                p_site = bind.properties.add()
+                p_site.key = "callsite"
+                p_site.value.text = callsite
+                flow = graph_pb2.EdgeRecord(
+                    kind="VALUE_FLOWS_TO", source=argument, target=parameter,
+                    source_tier="T3", relationship_class="VALUE_FLOWS_TO")
+                p_reason = flow.properties.add()
+                p_reason.key = "reason"
+                p_reason.value.text = "call-argument"
+                p_flowsite = flow.properties.add()
+                p_flowsite.key = "callsite"
+                p_flowsite.value.text = callsite
+                for rec in (bind, flow):
+                    hash_edge(rec.kind, rec.source, rec.target)
+                    bindings.append(rec)
+                    kept_edge_count += 1
+                if len(bindings) >= edge_batch_rows:
+                    load_edges(bindings)
+                    bindings.clear()
+        if bindings:
+            load_edges(bindings)
     if bulk:
         for kind in list(edge_writers):
             flush_edge_partition(kind)
@@ -1859,7 +2123,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         "streamed": True, "enriched": False, "pruned": bool(prune),
         PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
     })
-    payload["core_content_hash"] = core_digest.hexdigest()
+    payload["core_content_hash"] = format(core_acc, "064x")
     _write_store_manifest(db_dir, payload)
     if os.path.exists(target_db_dir):
         shutil.rmtree(target_db_dir) if os.path.isdir(target_db_dir) else os.remove(target_db_dir)

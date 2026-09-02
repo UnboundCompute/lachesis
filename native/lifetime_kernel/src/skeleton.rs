@@ -5,6 +5,7 @@
 //! control markers, guards, and graph edges; no source text or JSON is needed.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use crate::lifetime_proto;
 
@@ -57,14 +58,22 @@ fn semantic_indexes<'a>(
     (functions, nodes, adjacency)
 }
 
+// The call stack and active-function list are shared behind `Rc`: a walk state
+// is cloned into `seen` and into every successor, but both lists change only at
+// call/return seams, so the common non-seam edge shares the parent's
+// allocations instead of copying them.  Mutation goes through `Rc::make_mut`
+// (copy-on-write), and `Rc<Vec<String>>` orders/compares/hashes by contents, so
+// the derived traits used for `seen` dedup keep their exact meaning.  A walk
+// state never leaves `walk_region`, so the non-atomic `Rc` never crosses the
+// rayon region-parallel boundary.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WalkState {
     node: String,
-    stack: Vec<String>,
+    stack: Rc<Vec<String>>,
     // Active function identities mirror the old Claus recursion guard.  A
     // return address alone is insufficient: mutually recursive calls can
     // keep producing distinct return-node stacks indefinitely.
-    active_functions: Vec<String>,
+    active_functions: Rc<Vec<String>>,
 }
 
 /// Render the same source-rooted composition boundary as the old Claus path.
@@ -91,8 +100,9 @@ fn walk_region(
             if id != context { continue; }
             if nodes.contains_key(id.as_str()) {
                 starts.push(id.clone());
-            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
-                && node_allowed(node, &allowed)) {
+            } else if let Some(node) = nodes.values()
+                .filter(|node| node.anchor == *id && node_allowed(node, &allowed))
+                .min_by(|a, b| a.id.cmp(&b.id)) {
                 starts.push(node.id.clone());
             }
         }
@@ -104,8 +114,9 @@ fn walk_region(
             if starts.iter().any(|start| start == id) { continue; }
             if nodes.contains_key(id.as_str()) {
                 starts.push(id.clone());
-            } else if let Some(node) = nodes.values().find(|node| node.anchor == *id
-                && node_allowed(node, &allowed)) {
+            } else if let Some(node) = nodes.values()
+                .filter(|node| node.anchor == *id && node_allowed(node, &allowed))
+                .min_by(|a, b| a.id.cmp(&b.id)) {
                 starts.push(node.id.clone());
             }
         }
@@ -129,7 +140,9 @@ fn walk_region(
         let active_functions = nodes.get(start.as_str())
             .map(|node| vec![node.function.clone()])
             .unwrap_or_default();
-        stack.push(WalkState { node: start, stack: Vec::new(), active_functions });
+        stack.push(WalkState {
+            node: start, stack: Rc::new(Vec::new()), active_functions: Rc::new(active_functions),
+        });
     }
     let mut tokens = Vec::new();
     let mut edges_used = Vec::new();
@@ -178,8 +191,18 @@ fn walk_region(
                 ..Default::default()
             });
         }
-        let outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
+        let mut outgoing = adjacency.get(state.node.as_str()).into_iter().flatten()
             .copied().collect::<Vec<_>>();
+        // The semantic sidecar's edge list can arrive in a hasher-dependent
+        // order when it was materialised from a hash-indexed phase upstream, so
+        // impose a total, content-based tie-break here.  This only reorders
+        // otherwise-equivalent sibling edges; the seam/continuation split below
+        // still governs nesting, so branch/loop structure is unchanged.
+        outgoing.sort_by(|a, b| a.target.cmp(&b.target)
+            .then_with(|| a.seam_kind.cmp(&b.seam_kind))
+            .then_with(|| a.callee.cmp(&b.callee))
+            .then_with(|| a.return_to.cmp(&b.return_to))
+            .then_with(|| a.kind.cmp(&b.kind)));
         // Claus is a nested flow renderer: a call seam is entered before the
         // caller's continuation, and a return seam is handled before leaving
         // the callee.  Preserve the sidecar order within each class while
@@ -218,11 +241,11 @@ fn walk_region(
                         kind: "enter".into(), function: callee.to_owned(),
                         depth: depth + 1, ..Default::default()
                     });
-                    if !edge.return_to.is_empty() { next_stack.push(edge.return_to.clone()); }
-                    next_active_functions.push(callee.to_owned());
+                    if !edge.return_to.is_empty() { Rc::make_mut(&mut next_stack).push(edge.return_to.clone()); }
+                    Rc::make_mut(&mut next_active_functions).push(callee.to_owned());
                 }
             } else if edge.seam_kind == "return" {
-                if let Some(expected) = next_stack.pop() {
+                if let Some(expected) = Rc::make_mut(&mut next_stack).pop() {
                     if !edge.target.is_empty() && expected != edge.target {
                         complete = false;
                         continue;
@@ -231,7 +254,7 @@ fn walk_region(
                         kind: "exit".into(), function: node.function.clone(),
                         depth, ..Default::default()
                     });
-                    next_active_functions.pop();
+                    Rc::make_mut(&mut next_active_functions).pop();
                 } else {
                     complete = false;
                     continue;

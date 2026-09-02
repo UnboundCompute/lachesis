@@ -64,12 +64,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, required=True, help="wall seconds")
     parser.add_argument("--memory-mb", type=float, required=True, help="process-tree RSS")
+    parser.add_argument("--sample-ms", type=float, default=50.0,
+                        help="RSS sampling interval in milliseconds (default: 50)")
     parser.add_argument("--report", type=Path, help="optional JSON report path")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a command is required after --")
+    if args.timeout <= 0 or args.memory_mb <= 0 or args.sample_ms <= 0:
+        parser.error("limits and --sample-ms must be greater than zero")
 
     started = time.monotonic()
     process = subprocess.Popen(command, start_new_session=True)
@@ -82,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     peak_kib = 0
     reason = "exit"
     try:
-        while process.poll() is None:
+        while True:
             elapsed = time.monotonic() - started
             rss_kib = _tree_rss_kib(process.pid)
             peak_kib = max(peak_kib, rss_kib)
@@ -94,7 +98,9 @@ def main(argv: list[str] | None = None) -> int:
                 reason = "timeout"
                 _terminate_group(process)
                 break
-            time.sleep(0.25)
+            if process.poll() is not None:
+                break
+            time.sleep(args.sample_ms / 1000)
     except KeyboardInterrupt:
         reason = "interrupted"
         _terminate_group(process)
@@ -107,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         "peak_rss_mb": round(peak_kib / 1024, 3),
         "limit_rss_mb": args.memory_mb,
         "timeout_seconds": args.timeout,
+        "sample_interval_ms": args.sample_ms,
         "termination": reason,
         "returncode": returncode,
     }

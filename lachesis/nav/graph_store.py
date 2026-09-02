@@ -412,7 +412,7 @@ class GraphStore:
         cache ``store.index`` can watch this to tell when they have gone stale."""
         return bool(getattr(self, "_enriched", True))
 
-    def ensure_dataflow_tier(self, *, retain_materialized: bool = False) -> "GraphStore":
+    def ensure_dataflow_tier(self, *, retain_materialized: bool = True) -> "GraphStore":
         """Guarantee the overlay dataflow tier is present, building it if needed.
 
         Idempotent, and a no-op for a store that was built with ``--enrich`` or for an
@@ -466,12 +466,28 @@ class GraphStore:
                 timing("native Pass-2 starting")
                 run_pass2_path(native_input, native_cache, catalog_path)
                 timing("native Pass-2 published")
-            dataflow_overlay = _load_dataflow_overlay(native_cache)
-            merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
-            self.index.attach_overlay(merged_overlay)
-            self.overlay = merged_overlay
+            if retain_materialized:
+                # Rebind the open index onto the decoded dataflow overlay so in-process
+                # query/bind consumers see the tier. This pins the whole overlay
+                # (node/edge props + derived nodes/edges, ~1 GB on a large graph) in
+                # Python for the life of the store -- the price of answering queries
+                # from RAM. Every no-arg caller (nav queries, planners) wants this.
+                dataflow_overlay = _load_dataflow_overlay(native_cache)
+                merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+                self.index.attach_overlay(merged_overlay)
+                self.overlay = merged_overlay
+                self.gl = GraphLib.from_index(self.index)
+                timing("dataflow overlay attached")
+            else:
+                # The tier is fully persisted to `.dataflow.pb`; a caller that only
+                # needs the sidecars on disk (enrich) skips decoding it back into
+                # Python, keeping the dataflow overlay out of the cold-materialization
+                # peak. It never coexists with the semantic Pass-3 native transient
+                # that the bind runs next. The tier is reconstructable on demand from
+                # `native_cache` via `_load_dataflow_overlay`, so a later query path
+                # must call `ensure_dataflow_tier()` (retaining) before touching it.
+                timing("dataflow overlay materialized (not retained)")
             self.graph = None
-            self.gl = GraphLib.from_index(self.index)
             self._retained_enriched_graph = None
             self._entries = None
             self._enriched = True
