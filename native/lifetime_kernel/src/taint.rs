@@ -227,6 +227,22 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
     }
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
+    // Index catalog models by their method segment so each callsite consults
+    // only the models whose method could possibly match, instead of scanning
+    // the whole catalog once per call (an O(calls × models) sweep). A model can
+    // match a callee only when its `method` equals the callee or the callee's
+    // last dotted segment: `model_matches` compares a builtins/empty-package
+    // model against either, and a packaged `pkg.method` matches only when the
+    // callee is exactly `pkg.method`, i.e. its last segment is `method`. Buckets
+    // hold catalog indices in ascending order, so iterating the union of the two
+    // relevant buckets visits the very same models the full scan would have, in
+    // the same catalog order, and the full predicate still runs per candidate —
+    // the surviving set and its emission order are unchanged.
+    let mut models_by_method: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    for (idx, model) in catalog.models.iter().enumerate() {
+        models_by_method.entry(model.method.as_str()).or_default().push(idx);
+    }
+    let empty_bucket: Vec<usize> = Vec::new();
     for call in &graph.nodes {
         if !matches!(graph.kind(call.kind), "call" | "construct") { continue; }
         let Some(callee) = graph.node_property_text(call, "callee")
@@ -236,7 +252,25 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
         let argument_count = arguments.get(&call.id).map(Vec::len);
         let receiver_type = graph.node_property_text(call, "receiver_type")
             .or_else(|| graph.node_property_text(call, "type"));
-        for model in &catalog.models {
+        let last_segment = callee.rsplit('.').next();
+        let primary = models_by_method.get(callee).unwrap_or(&empty_bucket);
+        let secondary = match last_segment {
+            Some(seg) if seg != callee => models_by_method.get(seg).unwrap_or(&empty_bucket),
+            _ => &empty_bucket,
+        };
+        // Merge the two ascending, disjoint index lists so candidate models are
+        // still visited in catalog order — the surviving models and the order
+        // they are emitted in are byte-identical to the full catalog scan.
+        let mut pi = 0usize;
+        let mut si = 0usize;
+        loop {
+            let idx = match (primary.get(pi), secondary.get(si)) {
+                (Some(&a), Some(&b)) => if a <= b { pi += 1; a } else { si += 1; b },
+                (Some(&a), None) => { pi += 1; a }
+                (None, Some(&b)) => { si += 1; b }
+                (None, None) => break,
+            };
+            let model = &catalog.models[idx];
             if !model_matches(model, language, callee, argument_count, receiver_type) { continue; }
             if model.role == "summary" {
                 let mut endpoints = model.access_path.split("->").map(str::trim);
