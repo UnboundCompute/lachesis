@@ -97,25 +97,23 @@ class TemporalLifecycle:
                                    for node_id, node in semantic_nodes.items()])
             else:
                 self.nodes.extend(semantic_nodes)
-        # The native migration seam publishes compact findings instead of a
-        # graph of snapshots.  Represent those validated temporal sites as
-        # read-only candidate observations until the Rust matcher owns the
-        # complete temporal relation.  This branch is intentionally additive
-        # and is only populated by the opt-in native bind path.
-        for function in graph.get("native_temporal", {}).get("functions", ()):
-            for finding in function.get("findings", ()):
-                pattern = finding.get("pattern") or ""
-                event_kind = "release" if pattern == "double-free" else "read_storage"
-                self.nodes.append({
-                    "id": f"native:{function.get('id')}:{finding.get('node')}:{finding.get('line')}",
-                    "event": {"kind": event_kind, "line": finding.get("line")},
-                    "fragment": function.get("id"),
-                    "metadata": {
-                        "owner_function_id": function.get("id"),
-                        "native_pattern": pattern,
-                        "native_path": finding.get("path"),
-                    },
-                })
+        # When the native matcher has run its findings are authoritative for this
+        # family: it has already related the temporal events across a reachable
+        # path on one object, which the per-node inventory below cannot do.  Route
+        # its findings to the right family by matcher pattern -- the same string
+        # the Atropos declaration carries as ``matcher_pattern`` -- and let
+        # ``enumerate`` surface those confirmed relations while suppressing the
+        # pre-matcher inventory, so the census stops emitting one not-queried row
+        # per dereference.  The key is present only on the converged native bind;
+        # its absence (the fast structural path) keeps the inventory fallback.
+        self.native_ran = "native_temporal" in graph
+        pattern = self.metadata.get("matcher_pattern")
+        self.native_findings = [
+            (function.get("id"), finding)
+            for function in graph.get("native_temporal", {}).get("functions", ())
+            for finding in function.get("findings", ())
+            if finding.get("pattern") == pattern
+        ]
 
     def _language(self, node):
         props = node.get("properties") or {}
@@ -167,21 +165,84 @@ class TemporalLifecycle:
             "next_op": {"tool": "skeleton", "why": "inspect compatible temporal context"},
         }
 
+    def _native_candidate(self, function_id, finding):
+        """Render one matcher-confirmed temporal finding as a resolved candidate.
+
+        The blanket per-node candidate leaves the temporal relation ``not-queried``;
+        here the native matcher has proven it, so the relation facts are resolved
+        (same object, same generation, reachable path).  This is still a lead for
+        the judge to adjudicate, not a safety verdict: it reports what the matcher
+        computed, and points at ``skeleton`` for the guards it does not weigh.
+        """
+        pattern_id = self.metadata["id"]
+        node_id = finding.get("node") or ""
+        line = finding.get("line")
+        obj = finding.get("path") or None
+        site = f"native:{function_id}:{node_id}:{line}"
+        raw = f"{pattern_id}\0{site}"
+        return {
+            "candidate_id": "temporal_" + hashlib.sha256(raw.encode()).hexdigest()[:20],
+            "constructor": pattern_id,
+            "domain": "lifecycle",
+            "language": self.language or "c",
+            "obligation": self.metadata["obligation"],
+            "handles": {
+                "site_node_id": node_id,
+                "enclosing_function_id": function_id,
+                "obligation_value_ids": [obj] if obj else [],
+            },
+            "observations": {
+                "site": node_id,
+                "event_kind": None,
+                "object_id": obj,
+                "file": None,
+                "line": line,
+                "pattern": self.metadata["matcher_pattern"],
+                "requires": list(self.metadata["requires"]),
+                "native_path": obj,
+            },
+            "inferences": {
+                "path_relation": "reachable",
+                "same_object": "same",
+                "same_generation": "same",
+            },
+            "rank": 1.0,
+            "rank_reasons": [{
+                "term": "native-matcher",
+                "why": ("the native temporal matcher related the "
+                        f"{self.metadata['matcher_pattern']} events across a "
+                        "reachable path on one object"),
+            }],
+            "completeness": "COMPLETE",
+            "next_op": {"tool": "skeleton",
+                        "why": "inspect the confirmed temporal context and its guards"},
+        }
+
     def enumerate(self):
-        rows = [self._candidate(node) for node in self.nodes
-                if _event_kind(node) in self.trigger]
+        if self.native_ran:
+            # The matcher is authoritative: emit its confirmed findings (possibly
+            # none) and suppress the pre-matcher inventory rather than drown the
+            # confirmed relation in one not-queried row per dereference.
+            rows = [self._native_candidate(fid, finding)
+                    for fid, finding in self.native_findings]
+        else:
+            rows = [self._candidate(node) for node in self.nodes
+                    if _event_kind(node) in self.trigger]
         rows.sort(key=lambda row: (row["observations"].get("file") or "",
                                    row["observations"].get("line") or 0,
                                    row["handles"]["site_node_id"]))
         uncovered = (len(self.coverage.get("uncovered_states", ()))
                      + len(self.coverage.get("uncovered_contexts", ())))
+        by_status: dict[str, int] = {}
+        for row in rows:
+            status = row["inferences"].get("path_relation", "not-queried")
+            by_status[status] = by_status.get(status, 0) + 1
         return {
             "constructor": self.metadata["id"],
             "domain": "lifecycle",
             "metadata": dict(self.metadata),
             "candidates": rows,
-            "census": {"enumerated": len(rows),
-                       "by_status": {"not-queried": len(rows)}},
+            "census": {"enumerated": len(rows), "by_status": by_status},
             "frontiers": {"unresolved_calls": uncovered, "unbound_models": 0,
                            "unbound_sinks": [], "truncated_walks": 0,
                            "missing_optional_capabilities": [],
