@@ -556,14 +556,24 @@ def encode_id(value: Optional[str], codes: dict) -> Optional[str]:
 
 
 def decode_id(value: Optional[str], prefixes: Sequence[str]) -> Optional[str]:
-    """Undo ``encode_id``. Exactly inverse, including for values it did not code."""
+    """Undo ``encode_id``. Exactly inverse, including for values it did not code.
+
+    The decoded id is interned. One id is reconstructed independently many times over
+    a whole-graph materialization -- once as a node's own id, then again for every
+    edge that names it as source or target and every id-typed property that points at
+    it -- so without interning the same short string is allocated four or five times
+    and every copy is retained inside the graph dicts. ``sys.intern`` collapses them to
+    one object per distinct id, which only removes duplicate allocations: an interned
+    string is equal (and hashes) identically to the string it replaces, so every
+    downstream ``==``/dict-key/JSON/digest result is unchanged.
+    """
     if value is None or not prefixes:
         return value
     if value.startswith(_ID_ESCAPE):
-        return value[1:]
+        return sys.intern(value[1:])
     code, _, packed = value[1:].partition(":")
     suffix = base64.urlsafe_b64decode(packed + "==").hex()
-    return f"{prefixes[int(code, 36)]}:{suffix}"
+    return sys.intern(f"{prefixes[int(code, 36)]}:{suffix}")
 
 
 def _coded_cell(column: str, value, codes: dict):
