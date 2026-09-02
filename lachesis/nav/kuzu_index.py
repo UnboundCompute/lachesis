@@ -376,7 +376,7 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
         )
         while res.has_next():
             row = res.get_next()
-            nid, kind, label = row[:3]
+            nid, kind, label = row[0], _istr(row[1]), _istr(row[2])
             nid = decode_id(nid, prefixes)
             if keep is not None and nid not in keep:
                 continue
@@ -1345,7 +1345,7 @@ class KuzuGraphIndex:
         node = None
         if res.has_next():
             row = res.get_next()
-            kind, label = row[:2]
+            kind, label = _istr(row[0]), _istr(row[1])
             properties = _restore_node_props(row[2:-1], row[-1], self._props_dict,
                                              self._id_prefixes)
             if self._overlay is not None:
@@ -1600,7 +1600,7 @@ class KuzuGraphIndex:
         while res.has_next():
             row = res.get_next()
             node_id = decode_id(row[0], self._id_prefixes)
-            kind, label = row[1:3]
+            kind, label = _istr(row[1]), _istr(row[2])
             properties = _restore_node_props(row[3:-1], row[-1], self._props_dict,
                                              self._id_prefixes)
             if self._overlay is not None:
@@ -1637,7 +1637,7 @@ class KuzuGraphIndex:
         while res.has_next():
             row = res.get_next()
             node_id = decode_id(row[0], self._id_prefixes)
-            kind, label = row[1:3]
+            kind, label = _istr(row[1]), _istr(row[2])
             properties = _restore_node_props(
                 row[3:-1], row[-1], self._props_dict, self._id_prefixes)
             if self._overlay is not None:
@@ -1688,7 +1688,7 @@ class KuzuGraphIndex:
                 flush()
                 current_owner = owner
             node_id = decode_id(row[1], self._id_prefixes)
-            kind, label = row[2:4]
+            kind, label = _istr(row[2]), _istr(row[3])
             selected = iter(row[4:-1])
             columns = [row[0] if column == "owner_function_id" else next(selected)
                        for column in _MERGED_COLUMNS]
@@ -2018,7 +2018,7 @@ class KuzuGraphIndex:
             row = res.get_next()
             target = decode_id(row[0], self._id_prefixes)
             source = decode_id(row[1], self._id_prefixes)
-            kind, label = row[2:4]
+            kind, label = _istr(row[2]), _istr(row[3])
             properties = _restore_node_props(row[4:-1], row[-1], self._props_dict,
                                              self._id_prefixes)
             indexed[target].append({"id": source, "kind": kind, "label": label,
@@ -2132,7 +2132,7 @@ class KuzuGraphIndex:
                                              self._id_prefixes)
             if properties.get("syntax_kind") != "MemberExpr":
                 continue
-            node = {"id": node_id, "kind": row[1], "label": row[2],
+            node = {"id": node_id, "kind": _istr(row[1]), "label": _istr(row[2]),
                     "properties": properties}
             self._node_cache[node_id] = node
             members.append(node)
