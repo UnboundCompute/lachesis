@@ -576,7 +576,7 @@ class KuzuGraphIndex:
             # public attributes initialized for the shared accessor surface while
             # avoiding four graph-sized bucket maps and their sort pass.
             self.by_kind = defaultdict(list)
-            self.by_label = defaultdict(list)
+            self._init_by_label()
             self.by_file = defaultdict(list)
             self.by_owner = defaultdict(list)
         else:
@@ -586,7 +586,7 @@ class KuzuGraphIndex:
 
     def _build_maps(self) -> None:
         self.by_kind: dict = defaultdict(list)
-        self.by_label: dict = defaultdict(list)
+        self._init_by_label()
         self.by_file: dict = defaultdict(list)
         self.by_owner: dict = defaultdict(list)
         self._ids: list[str] = []
@@ -676,7 +676,12 @@ class KuzuGraphIndex:
                 self._header_by_id[nid] = (file, abs_file, start_line, end_line,
                                            start_offset, end_offset, owner, fn)
             self.by_kind[kind].append(nid)
-            self.by_label[label].append(nid)
+            if not columnar:
+                # Columnar defers `by_label` entirely: every base label already lives
+                # in `_label_col`/`_label_vocab`, so the inverted map is rebuilt on
+                # demand (see the `by_label` property) instead of held resident through
+                # the memory-critical build. In dict mode it is populated eagerly here.
+                self._bl_store[label].append(nid)
             path = abs_file or file
             if path:
                 self.by_file[path].append(nid)
@@ -742,9 +747,65 @@ class KuzuGraphIndex:
         # the real one, so sort what the order was doing for us. Buckets included: a
         # tool that lists a file's nodes should list them the same way twice.
         self._ids.sort()
-        for buckets in (self.by_kind, self.by_label, self.by_file, self.by_owner):
+        # `by_label` is intentionally absent in columnar mode (materialized lazily, and
+        # it sorts its own buckets there); sort only the resident dicts.
+        resident = (self.by_kind, self.by_file, self.by_owner)
+        if self._bl_store is not None:
+            resident = (*resident, self._bl_store)
+        for buckets in resident:
             for ids in buckets.values():
                 ids.sort()
+
+    def _init_by_label(self) -> None:
+        """Set up ``by_label`` storage for whichever backend is active.
+
+        Dict mode holds the inverted map resident (``_bl_store``) and populates it
+        during the scan. Columnar mode leaves it unbuilt (``_bl_store is None``) and
+        collects only overlay/graft-derived (nid, label) pairs in ``_bl_pending``; the
+        full map is reconstructed on first access from the label column. This keeps the
+        61 MB inverted map (452k tiny per-label lists at ~37 B/node) off the
+        memory-critical build path, which never reads it -- only interactive navigation
+        does.
+        """
+        if self._columnar:
+            self._bl_store = None
+            self._bl_pending: list = []
+        else:
+            self._bl_store = defaultdict(list)
+            self._bl_pending = None
+
+    @property
+    def by_label(self) -> dict:
+        """Label -> sorted nids. Resident in dict mode; lazily rebuilt in columnar mode.
+
+        Byte-identical to the eagerly built map: base nids grouped from the label column
+        (each bucket ascending-nid, as the old sort pass left them), then overlay/graft
+        additions appended in arrival order -- exactly what ``attach_overlay``/``graft``
+        did to the live dict, which were never re-sorted after append.
+        """
+        if self._bl_store is None:
+            self._bl_store = self._materialize_by_label()
+        return self._bl_store
+
+    def _materialize_by_label(self) -> dict:
+        d: dict = defaultdict(list)
+        vocab, lc = self._label_vocab, self._label_col
+        for i, nid in enumerate(self._scan_ids):
+            d[vocab[lc[i]]].append(nid)
+        for ids in d.values():
+            ids.sort()
+        for nid, label in self._bl_pending:
+            d[label].append(nid)
+        return d
+
+    def _bl_add(self, nid, label) -> None:
+        """Record a derived node's label for ``by_label`` under either backend."""
+        if self._bl_pending is not None:  # columnar: stash; fold into a live map if any
+            self._bl_pending.append((nid, label))
+            if self._bl_store is not None:
+                self._bl_store[label].append(nid)
+        else:
+            self._bl_store[label].append(nid)
 
     def _row(self, nid):
         """Column row for a scanned nid via bisect on sorted ``_scan_ids``, else None.
@@ -882,7 +943,7 @@ class KuzuGraphIndex:
                 continue
             self._ids.append(nid)
             self.by_kind[node.get("kind")].append(nid)
-            self.by_label[node.get("label")].append(nid)
+            self._bl_add(nid, node.get("label"))
             props = node.get("properties") or {}
             path = props.get("absolute_file") or props.get("file")
             if path:
@@ -1007,7 +1068,7 @@ class KuzuGraphIndex:
                 self._grafted_nodes.add(nid)
                 self._ids.append(nid)
                 self.by_kind[node.get("kind")].append(nid)
-                self.by_label[node.get("label")].append(nid)
+                self._bl_add(nid, node.get("label"))
                 props = node.get("properties") or {}
                 path = props.get("absolute_file") or props.get("file")
                 if path:
