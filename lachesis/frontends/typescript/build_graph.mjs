@@ -1569,6 +1569,17 @@ function exportMetadata(statement) {
   };
 }
 
+// Import provenance for sink qualification. Atropos sink models are keyed by an
+// npm package (`got.get`, `child_process.exec`, `undici.fetch`); the native binder
+// rejects a callsite whose `module` property does not match the model's package.
+// Without a real module, a bare `get(...)` (lodash) or `exec(...)` (a local helper)
+// would either spuriously match a package model or a genuine `exec` from
+// `child_process` would fail to match. This per-file map records, for each locally
+// bound import name, the bare package it came from (symbol-text based, so it holds
+// even under firstPartyOnly external erasure). callMetadata consults it to stamp
+// `module` on each call node so the package check binds on real provenance.
+const importPackageByFile = new Map();
+
 for (const fileName of analysisFileNames) {
   const sf = program.getSourceFile(fileName);
   if (!sf) continue;
@@ -1606,6 +1617,16 @@ for (const fileName of analysisFileNames) {
         targetProperties.provenance === "workspace-library" ? "local" : "package",
       ...metadata,
     });
+    if (ts.isImportDeclaration(statement) && !specifier.startsWith(".") && metadata.bindings) {
+      const importedPackage = specifier.startsWith("@")
+        ? specifier.split("/").slice(0, 2).join("/") : specifier.split("/")[0];
+      const key = normalize(sf.fileName);
+      let fileMap = importPackageByFile.get(key);
+      if (!fileMap) { fileMap = new Map(); importPackageByFile.set(key, fileMap); }
+      for (const binding of metadata.bindings) {
+        if (binding.local) fileMap.set(binding.local, importedPackage);
+      }
+    }
     const runtime = runtimeResolution(sf.fileName, specifier);
     const runtimeSource = runtime ? program.getSourceFile(runtime) : null;
     const runtimeTargetId = runtimeSource
@@ -1894,8 +1915,22 @@ function callMetadata(node) {
     if (key.literal && typeof key.value === "string") methodName = key.value;
   }
   const receiverSymbolId = receiverNode ? targetForValueNode(receiverNode) : null;
+  // Bind the callsite to the npm package it was imported from, when the call's
+  // callee (bare call) or receiver root (member call) is a locally bound import.
+  // The native binder reads this `module` property to gate package-qualified sink
+  // models, preferring it over its receiver-text fallback.
+  let moduleName = null;
+  const fileImports = importPackageByFile.get(normalize(node.getSourceFile().fileName));
+  if (fileImports) {
+    if (receiverNode && ts.isIdentifier(receiverNode)) {
+      moduleName = fileImports.get(receiverNode.text) || null;
+    } else if (ts.isIdentifier(expression)) {
+      moduleName = fileImports.get(expression.text) || null;
+    }
+  }
   return {
     callee,
+    module: moduleName,
     form: ts.isNewExpression(node) ? "constructor" :
       receiverExpression ? "method" : "call",
     receiver_expression: receiverExpression,

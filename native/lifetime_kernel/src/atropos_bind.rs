@@ -211,8 +211,22 @@ fn matches(model: &Model, callee: &Callee) -> bool {
     if model.method.as_deref() != Some(callee.name.as_str()) {
         return false;
     }
-    if let (Some(expected), Some(actual)) = (model.package.as_ref(), callee.module.as_ref()) {
-        if expected != actual { return false; }
+    // A model that pins a `package` must bind to a callsite whose callee is
+    // actually resolved to that package. The old `if let (Some, Some)` made the
+    // package check fire only when the callsite happened to carry a module, so
+    // any receiver that is not a bare package-named identifier (a member chain
+    // like `this.kv.get`, or a bare `get(obj, path)` lodash-style call) had
+    // `callee.module == None` and matched on METHOD NAME ALONE -- e.g. the got
+    // SSRF sink `{package:"got", method:"get"}` bound to every `.get(...)` in the
+    // tree. Requiring the module to be present and equal whenever the model pins
+    // a package makes package-qualified sinks (got/axios/request/superagent/
+    // node-fetch, ...) sound: an unresolved receiver is a conservative miss, not
+    // a false SSRF. `receiver_type` stays optional on purpose -- the TS frontend
+    // does not emit it, so gating on it would drop every type-qualified model.
+    if let Some(expected) = model.package.as_ref() {
+        if callee.module.as_deref() != Some(expected.as_str()) {
+            return false;
+        }
     }
     if let (Some(expected), Some(actual)) =
         (model.receiver_type.as_ref(), callee.receiver_type.as_ref())
