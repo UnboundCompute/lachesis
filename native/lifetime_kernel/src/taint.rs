@@ -436,14 +436,19 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     // match another flow.  Collapsing on only (source, target) loses call-stack
     // evidence and changes the query-visible graph.
     let mut emitted: HashSet<(u32, u32, Option<String>)> = HashSet::new();
+    // The sink-value lookup is a function of `sink_records` alone, not of the
+    // source being flooded, so it is identical on every iteration.  Building it
+    // once above the per-source loop drops an O(sources × sinks) rebuild while
+    // producing byte-identical lookups (only the last sink per value is kept in
+    // either form, and the source scan does not mutate `sink_records`).
+    let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
+        .map(|record| (record.value, record)).collect();
     for source in source_records {
         let initial = State { value: source.value, contexts: Vec::new() };
         let mut queue = VecDeque::from([initial.clone()]);
         let mut seen: HashSet<State> = HashSet::new();
         seen.insert(initial.clone());
         let mut predecessor: HashMap<State, State> = HashMap::new();
-        let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
-            .map(|record| (record.value, record)).collect();
         let mut reaches: FxHashMap<u32, State> = FxHashMap::default();
         let mut capped = false;
         while let Some(state) = queue.pop_front() {
