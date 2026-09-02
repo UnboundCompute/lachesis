@@ -6,9 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use hashbrown::{HashMap, HashSet};
 use memmap2::{Mmap, MmapOptions};
 
@@ -293,6 +295,34 @@ fn open_frames_bytes(input: &[u8]) -> Box<dyn Read + '_> {
         Box::new(MultiGzDecoder::new(input))
     } else {
         Box::new(input)
+    }
+}
+
+/// Gzip a flat (unframed) sidecar payload at level 1.  The flat facts sidecar is
+/// a bare prost message rather than a length-prefixed frame stream, so it cannot
+/// use the framed `publish` writer; compressing the whole buffer keeps its
+/// on-disk cost in line with the framed sidecars.
+pub(crate) fn gzip_flat(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(1));
+    encoder.write_all(payload).map_err(|error| format!("cannot compress flat sidecar: {error}"))?;
+    encoder.finish().map_err(|error| format!("cannot finish flat sidecar compression: {error}"))
+}
+
+/// Read a possibly-gzip-compressed flat sidecar fully into memory.  A bare
+/// protobuf message can never begin with the gzip magic (0x1f is an invalid
+/// leading tag byte -- wire type 7), so a raw sidecar is returned unchanged and
+/// old caches still read.  The decode consumes a contiguous buffer, so the
+/// decompressed bytes are materialized here; the caller drops them right after.
+pub(crate) fn read_maybe_gzip(path: &str) -> Result<Vec<u8>, String> {
+    let raw = std::fs::read(path).map_err(|error| format!("cannot read flat sidecar {path}: {error}"))?;
+    if raw.len() >= 2 && raw[..2] == GZIP_MAGIC {
+        let mut out = Vec::new();
+        MultiGzDecoder::new(raw.as_slice())
+            .read_to_end(&mut out)
+            .map_err(|error| format!("cannot decompress flat sidecar {path}: {error}"))?;
+        Ok(out)
+    } else {
+        Ok(raw)
     }
 }
 

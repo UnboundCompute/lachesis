@@ -1228,7 +1228,7 @@ pub unsafe extern "C" fn lachesis_lifetime_translate_graph_write_path(
         let output = CStr::from_ptr(output_path)
             .to_str().map_err(|error| format!("invalid output path: {error}"))?;
         let bytes = native_graph::map_path(input)?;
-        let payload = native_graph::sidecar_to_translation(&bytes)?;
+        let payload = native_graph::gzip_flat(&native_graph::sidecar_to_translation(&bytes)?)?;
         let output_path = std::path::Path::new(output);
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -1632,8 +1632,7 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
                 .map(|base| format!("{base}.pass2.facts.pb"))
                 .filter(|path| std::path::Path::new(path).is_file()) {
-                fs::read(path)
-                    .map_err(|error| format!("cannot read native translation facts: {error}"))?
+                native_graph::read_maybe_gzip(&path)?
             } else {
                 native_graph::sidecar_to_translation(&bytes)?
             };
