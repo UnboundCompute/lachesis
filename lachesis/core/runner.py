@@ -16,6 +16,64 @@ from .graph_wire import WIRE_FORMAT_VERSION, decode_node, iter_tier_records
 from .shards import ShardReader, ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
 
+try:  # POSIX only; supported deployments are POSIX runners.
+    import resource as _resource
+except ImportError:  # pragma: no cover - non-POSIX
+    _resource = None
+
+# Target OS stack for a frontend child. A recursive compiler descent over a
+# very large single source file needs more than the default 8 MiB; this backs
+# the raised V8 --stack-size so the parse unwinds instead of hitting the guard
+# page. Clamped to the hard limit; macOS ignores it for the main thread (its
+# 8 MiB is fixed), so it is a Linux-facing lever, harmless where it has no effect.
+_FRONTEND_STACK_TARGET_BYTES = 256 * 1024 * 1024
+
+
+def _raise_frontend_stack_limit() -> None:
+    """Raise the soft RLIMIT_STACK toward a large ceiling in the forked child.
+
+    Runs as a ``preexec_fn`` (after fork, before exec). Uses only the
+    module-level ``_resource`` handle and no imports, so it is safe to call in
+    the child of a multi-threaded parent. Best-effort: any failure leaves the
+    default stack, and --stack-size still stays within its conservative ceiling.
+    """
+    if _resource is None:
+        return
+    try:
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_STACK)
+        target = _FRONTEND_STACK_TARGET_BYTES
+        if hard != _resource.RLIM_INFINITY:
+            target = min(target, hard)
+        if soft == _resource.RLIM_INFINITY or soft >= target:
+            return
+        _resource.setrlimit(_resource.RLIMIT_STACK, (target, hard))
+    except (ValueError, OSError):
+        pass
+
+
+def _describe_exit(returncode: int) -> str:
+    """Human-readable classification of a nonzero frontend exit.
+
+    A negative return code is death by signal. SIGABRT (from V8's fatal
+    handler on a native stack overflow) is the giant-single-file failure mode,
+    so it gets an actionable hint instead of an opaque ``exited -6``.
+    """
+    if returncode >= 0:
+        return f"exited {returncode}"
+    signum = -returncode
+    try:
+        signame = signal.Signals(signum).name
+    except ValueError:
+        signame = f"signal {signum}"
+    detail = f"killed by {signame}"
+    if signum == int(signal.SIGABRT):
+        detail += (
+            " (likely a native stack overflow parsing a very large single "
+            "source file; raise LACHESIS_TS_STACK_KB or scope the build to a "
+            "subdirectory)"
+        )
+    return detail
+
 
 def _is_reference_read(message) -> bool:
     """True for the reverse-direction dataflow read a reference emits.
@@ -49,6 +107,7 @@ def _run_frontend_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=(os.name == "posix"),
+        preexec_fn=_raise_frontend_stack_limit if os.name == "posix" else None,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -313,7 +372,8 @@ def run_frontend(
         )
         if completed.returncode != 0:
             raise ContractError(
-                f"frontend {frontend.frontend_id} exited {completed.returncode}\n"
+                f"frontend {frontend.frontend_id} "
+                f"{_describe_exit(completed.returncode)}\n"
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
         shard_root = environment.get("LACHESIS_SHARD_ROOT")
