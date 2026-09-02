@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import zlib
 from array import array
 from bisect import bisect_left
@@ -57,7 +58,7 @@ from lachesis.kuzu_store import (
     manifest_props_dictionary,
     read_store_manifest,
 )
-from lachesis.core.graph_wire import decode_document, encode_document
+from lachesis.core.graph_wire import _INTERN_VALUE_KEYS, decode_document, encode_document
 from lachesis.nav.overlay import edge_key
 from lachesis.timeit import timeit
 
@@ -193,6 +194,16 @@ _MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
 _CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
                       if c in CODED_PROP_COLUMNS)
 
+# Promoted-column positions whose text value is drawn from a small vocabulary and
+# repeats across the whole graph (``file``/``absolute_file`` -- one path per source
+# file shared by every node in it -- and enum-like ``type``/``language``). These
+# arrive as their own Kùzu columns, bypassing the props-blob decode that already
+# interns such values, so intern them here too. Coded id columns are excluded: they
+# route through ``decode_id``, which interns already. Like ``_CODED_AT``, resolved
+# once so the per-column test on the ~245k-row materialize is an int-set lookup.
+_INTERN_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
+                       if c in _INTERN_VALUE_KEYS and i not in _CODED_AT)
+
 # Field order of the promoted-scalar node header, stored positionally in
 # ``_header_by_id`` (see ``KuzuGraphIndex._build_maps`` / ``_header``). This order is
 # the dict insertion order readers used to see, so header serialization stays stable.
@@ -233,7 +244,9 @@ def _restore_node_props(columns, props_blob: Optional[bytes],
     """
     props_type = dict if restore_defaults else _LazyDefaultProps
     properties = props_type(
-        {name: (decode_id(value, prefixes) if i in _CODED_AT else value)
+        {name: (decode_id(value, prefixes) if i in _CODED_AT
+                else sys.intern(value) if i in _INTERN_AT
+                else value)
          for i, (name, value) in enumerate(zip(_MERGED_COLUMNS, columns))
          if value is not None}
     )
