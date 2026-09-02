@@ -178,7 +178,7 @@ def _restore(
         return _LazyDefaultProps(props)
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
-            props[key] = list(default) if isinstance(default, list) else default
+            props[key] = _default_fill(default)
     return props
 
 
@@ -222,6 +222,23 @@ _DEFAULT_NAV_BUFFER_POOL = 512 << 20
 # the scan into storage-offset windows keeps the working set bounded and returns byte-
 # identical rows. `LACHESIS_KUZU_BATCH` overrides the window.
 _DEFAULT_SCAN_BATCH = 100_000
+
+
+# A single shared empty list backs every defaulted list-valued constant property.
+# The only such default is ``evidence_ids: []`` (CONSTANT_PROP_DEFAULTS), filled on the
+# ~280k nodes that carry no evidence -- previously one freshly-allocated ``[]`` each.
+# Sharing one object is safe because a node's ``evidence_ids`` is never mutated in place:
+# the sole builder (reasoning/query.py::_evidence) accumulates into its OWN local list and
+# only ``.get()``-reads the node's list to extend from it. Byte-identical -- an empty list
+# equals an empty list under ==, JSON and the candidate digest. A non-empty list default
+# (none exist today) still gets its own copy, preserving mutable-default isolation.
+_SHARED_EMPTY_LIST: list = []
+
+
+def _default_fill(default):
+    if isinstance(default, list):
+        return _SHARED_EMPTY_LIST if not default else list(default)
+    return default
 
 
 def _istr(value):
