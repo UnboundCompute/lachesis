@@ -180,6 +180,121 @@ def native_match_any_capped(match_path: str | os.PathLike[str]) -> bool:
         mapped.close()
 
 
+def _read_path_message(buf, pos: int, end: int) -> str:
+    """Render a ``Path`` (field 1 root, field 2 repeated selectors) as root+selectors."""
+    root, selectors = "", []
+    while pos < end:
+        tag, pos = _read_varint(buf, pos)
+        field, wire = tag >> 3, tag & 7
+        if field == 1 and wire == 2:            # root
+            length, pos = _read_varint(buf, pos)
+            root = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
+            pos += length
+        elif field == 2 and wire == 2:          # selectors
+            length, pos = _read_varint(buf, pos)
+            selectors.append(bytes(buf[pos:pos + length]).decode("utf-8", "replace"))
+            pos += length
+        else:
+            pos = _skip_field(buf, pos, wire)
+    return (root + "".join(selectors)) if root else ""
+
+
+def _read_temporal_finding(buf, pos: int, end: int) -> dict[str, Any]:
+    """Read one ``NativeTemporalFinding``, keeping only the census-relevant fields.
+
+    The matcher's per-finding CFG witnesses (fields 7+) dominate the sidecar and
+    are never consulted by the candidate census, so they are skipped: only
+    ``pattern`` (2), ``path`` (3), ``line`` (4, a zig-zag ``sint64`` gated by
+    ``has_line`` field 5) and ``node`` (6) are decoded.
+    """
+    pattern = node = ""
+    rendered_path = ""
+    line_raw = None
+    has_line = False
+    while pos < end:
+        tag, pos = _read_varint(buf, pos)
+        field, wire = tag >> 3, tag & 7
+        if field == 2 and wire == 2:            # pattern
+            length, pos = _read_varint(buf, pos)
+            pattern = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
+            pos += length
+        elif field == 3 and wire == 2:          # path
+            length, pos = _read_varint(buf, pos)
+            rendered_path = _read_path_message(buf, pos, pos + length)
+            pos += length
+        elif field == 4 and wire == 0:          # line (sint64, zig-zag)
+            raw, pos = _read_varint(buf, pos)
+            line_raw = (raw >> 1) ^ -(raw & 1)
+        elif field == 5 and wire == 0:          # has_line
+            value, pos = _read_varint(buf, pos)
+            has_line = bool(value)
+        elif field == 6 and wire == 2:          # node
+            length, pos = _read_varint(buf, pos)
+            node = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
+            pos += length
+        else:
+            pos = _skip_field(buf, pos, wire)
+    return {"pattern": pattern, "node": node, "path": rendered_path,
+            "line": line_raw if has_line else None}
+
+
+def load_native_temporal(match_path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Project the Rust matcher's correlated findings into the census bind shape.
+
+    The candidate census only needs each temporal finding's pattern, node, line
+    and object path to route it to a family and render a confirmed candidate; the
+    per-finding witnesses (~160 MB on suricata) that dominate the match sidecar
+    are never read here.  Scan the ``NativeTemporalResult`` wire form over a
+    read-only mmap -- mirroring :func:`native_match_any_capped` -- walking
+    ``functions`` (field 1) and, inside each, ``id`` (field 1) and ``findings``
+    (field 2).  The returned ``{"functions": [{"id", "findings": [...]}]}`` is
+    exactly what :class:`~lachesis.planner.temporal_obligation.TemporalLifecycle`
+    consumes, so the matcher's confirmed temporal relation replaces the vacuous
+    per-dereference inventory in the census.
+    """
+    functions: list[dict[str, Any]] = []
+    result = {"functions": functions}
+    path = Path(match_path)
+    try:
+        if path.stat().st_size == 0:
+            return result
+    except OSError:
+        return result
+    with open(path, "rb") as handle:
+        mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
+        buf = memoryview(mapped)
+        pos, end = 0, len(buf)
+        while pos < end:
+            tag, pos = _read_varint(buf, pos)
+            field, wire = tag >> 3, tag & 7
+            if field == 1 and wire == 2:                # NativeTemporalFunction
+                length, pos = _read_varint(buf, pos)
+                fn_end = pos + length
+                fn_id, findings = "", []
+                while pos < fn_end:
+                    inner_tag, pos = _read_varint(buf, pos)
+                    inner_field, inner_wire = inner_tag >> 3, inner_tag & 7
+                    if inner_field == 1 and inner_wire == 2:      # function id
+                        n, pos = _read_varint(buf, pos)
+                        fn_id = bytes(buf[pos:pos + n]).decode("utf-8", "replace")
+                        pos += n
+                    elif inner_field == 2 and inner_wire == 2:    # findings
+                        n, pos = _read_varint(buf, pos)
+                        findings.append(_read_temporal_finding(buf, pos, pos + n))
+                        pos += n
+                    else:
+                        pos = _skip_field(buf, pos, inner_wire)
+                pos = fn_end
+                functions.append({"id": fn_id, "findings": findings})
+            else:
+                pos = _skip_field(buf, pos, wire)
+    finally:
+        buf.release()
+        mapped.close()
+    return result
+
+
 def native_match_leads(result) -> list[dict[str, Any]]:
     """Project compact native findings into the public lead record shape."""
     leads = []

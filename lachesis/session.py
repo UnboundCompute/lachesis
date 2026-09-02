@@ -321,7 +321,11 @@ class Analysis:
                 # A truncated semantic skeleton would emit partial temporal observations that
                 # read as fewer bugs, not as an incomplete run. Drop it and report structural
                 # families only -- honest under-coverage beats a misleadingly thin temporal set.
+                # The correlated matcher findings ride the same truncation: without a converged
+                # skeleton they are incomplete, so drop them too rather than present a thin
+                # confirmed set as authoritative.
                 stamped.pop("semantic_graph", None)
+                stamped.pop("native_temporal", None)
         return {
             "registry": default_candidate_registry(stamped, summary),
             "stamped": stamped,
@@ -627,7 +631,7 @@ class Analysis:
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import (
             ensure_native_match_sidecar, ensure_native_semantic_sidecar,
-            native_match_any_capped,
+            load_native_temporal, native_match_any_capped,
         )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
@@ -651,6 +655,15 @@ class Analysis:
             "native_sidecar": str(native_sidecar),
             "coverage": {"converged": converged},
         }
+        # The Rust matcher has already related the temporal events (a free reached
+        # twice, a use of a freed object on a reachable path) into correlated
+        # findings; the analyze pass surfaces them as leads. Publish the same
+        # findings on the bind so the candidate census renders the matcher's
+        # confirmed temporal relation instead of one not-queried candidate per
+        # dereference. This reads only the compact fields (pattern/node/line/path)
+        # from the content-addressed match sidecar -- the witness bytes that
+        # dominate it are never materialized here.
+        stamped["native_temporal"] = load_native_temporal(match_sidecar)
         return stamped, summary, converged
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------

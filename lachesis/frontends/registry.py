@@ -65,8 +65,9 @@ def _workspace_root(workspace_root: Optional[str]) -> Path:
 
 def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     root = _workspace_root(workspace_root)
-    from ..resources import typescript_heap_mb
+    from ..resources import typescript_heap_mb, typescript_stack_kb
     heap_mb = typescript_heap_mb()
+    stack_kb = typescript_stack_kb()
     return FrontendSpec(
         frontend_id="typescript-compiler-api",
         languages=("typescript", "javascript"),
@@ -76,6 +77,11 @@ def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> Fronte
             # allocations and the Python parent. The flag is spelled here rather
             # than in NODE_OPTIONS so the effective ceiling is visible in `ps`.
             "node", f"--max-old-space-size={heap_mb}",
+            # Raise V8's call-stack ceiling so the recursive AST descent does not
+            # SIGABRT on very large single bundled files (the default ~984 KiB
+            # stack overflows on deep nesting). The frontend child also raises
+            # RLIMIT_STACK (core/runner.py) so this larger stack is OS-backed.
+            f"--stack-size={stack_kb}",
             str(root / "lachesis" / "frontends" / "typescript" / "build_graph.mjs"),
             "{source_dir}", "{output_dir}",
         ),

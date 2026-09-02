@@ -27,7 +27,14 @@ struct RoleRecord {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct State {
     value: u32,
-    contexts: Vec<String>,
+    // The call-context stack is stored as interned ordinals rather than the
+    // raw `context_id` strings.  The flood never reads a stack entry's string
+    // value -- the stack only drives push/pop matching and State identity, and
+    // the emitted edges carry the transition's own `context_id` string, not the
+    // stack -- so any bijection string<->ordinal preserves behaviour exactly
+    // while making a State clone a small `memcpy` and its hash/eq integer work
+    // instead of per-element String clones and string hashing on the hot path.
+    contexts: Vec<u32>,
 }
 
 fn value_text(value: &graph_proto::Value) -> Option<&str> {
@@ -227,6 +234,22 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
     }
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
+    // Index catalog models by their method segment so each callsite consults
+    // only the models whose method could possibly match, instead of scanning
+    // the whole catalog once per call (an O(calls × models) sweep). A model can
+    // match a callee only when its `method` equals the callee or the callee's
+    // last dotted segment: `model_matches` compares a builtins/empty-package
+    // model against either, and a packaged `pkg.method` matches only when the
+    // callee is exactly `pkg.method`, i.e. its last segment is `method`. Buckets
+    // hold catalog indices in ascending order, so iterating the union of the two
+    // relevant buckets visits the very same models the full scan would have, in
+    // the same catalog order, and the full predicate still runs per candidate —
+    // the surviving set and its emission order are unchanged.
+    let mut models_by_method: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    for (idx, model) in catalog.models.iter().enumerate() {
+        models_by_method.entry(model.method.as_str()).or_default().push(idx);
+    }
+    let empty_bucket: Vec<usize> = Vec::new();
     for call in &graph.nodes {
         if !matches!(graph.kind(call.kind), "call" | "construct") { continue; }
         let Some(callee) = graph.node_property_text(call, "callee")
@@ -236,7 +259,25 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
         let argument_count = arguments.get(&call.id).map(Vec::len);
         let receiver_type = graph.node_property_text(call, "receiver_type")
             .or_else(|| graph.node_property_text(call, "type"));
-        for model in &catalog.models {
+        let last_segment = callee.rsplit('.').next();
+        let primary = models_by_method.get(callee).unwrap_or(&empty_bucket);
+        let secondary = match last_segment {
+            Some(seg) if seg != callee => models_by_method.get(seg).unwrap_or(&empty_bucket),
+            _ => &empty_bucket,
+        };
+        // Merge the two ascending, disjoint index lists so candidate models are
+        // still visited in catalog order — the surviving models and the order
+        // they are emitted in are byte-identical to the full catalog scan.
+        let mut pi = 0usize;
+        let mut si = 0usize;
+        loop {
+            let idx = match (primary.get(pi), secondary.get(si)) {
+                (Some(&a), Some(&b)) => if a <= b { pi += 1; a } else { si += 1; b },
+                (Some(&a), None) => { pi += 1; a }
+                (None, Some(&b)) => { si += 1; b }
+                (None, None) => break,
+            };
+            let model = &catalog.models[idx];
             if !model_matches(model, language, callee, argument_count, receiver_type) { continue; }
             if model.role == "summary" {
                 let mut endpoints = model.access_path.split("->").map(str::trim);
@@ -281,15 +322,25 @@ pub(crate) fn catalog_delta(graph: &Graph, catalog: &crate::atropos_proto::Reque
 }
 
 pub(crate) fn enrich(graph: &Graph) -> Delta {
-    let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>, Option<String>)>> = FxHashMap::default();
+    // Each adjacency entry carries both the raw `context_id` string (emitted
+    // verbatim on the flow edge) and its interned ordinal (the value pushed on
+    // the traversal's context stack).  Interning is a bijection over the strings
+    // seen while building adjacency, so two stacks are equal iff they are the
+    // same string sequence -- identical State identity to comparing the strings.
+    let mut adjacency: FxHashMap<u32, Vec<(u32, String, Option<String>, Option<String>, Option<u32>)>> = FxHashMap::default();
     let mut evidence: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
+    let mut context_interner: FxHashMap<String, u32> = FxHashMap::default();
     for item in &graph.edges {
         let kind = graph.edge_kind(item);
         if !FLOW_KINDS.contains(&kind) { continue; }
         let transition = kind.to_owned();
         let reason = graph.edge_property_text(item, "reason").map(str::to_owned);
         let context_id = graph.edge_property_text(item, "context_id").map(str::to_owned);
-        adjacency.entry(item.source).or_default().push((item.target, transition, reason, context_id));
+        let context_ord = context_id.as_ref().map(|context| {
+            let next = context_interner.len() as u32;
+            *context_interner.entry(context.clone()).or_insert(next)
+        });
+        adjacency.entry(item.source).or_default().push((item.target, transition, reason, context_id, context_ord));
         evidence.entry((item.source, item.target)).or_insert_with(|| vec![
             graph.id(item.source).to_owned(), graph.id(item.target).to_owned(),
         ]);
@@ -315,7 +366,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             for call in calls {
                 adjacency.entry(returned).or_default()
                     .push((*call, "VALUE_FLOWS_TO".to_owned(),
-                           Some("c-return-to-callsite".to_owned()), None));
+                           Some("c-return-to-callsite".to_owned()), None, None));
                 evidence.entry((returned, *call)).or_insert_with(|| vec![
                     graph.id(returned).to_owned(), graph.id(*call).to_owned(),
                 ]);
@@ -342,7 +393,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let Some(result) = call_result.get(call) else { continue; };
         for argument in arguments {
             adjacency.entry(*argument).or_default()
-                .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None));
+                .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None, None));
             evidence.entry((*argument, *result)).or_insert_with(|| vec![
                 graph.id(*argument).to_owned(), graph.id(*call).to_owned(), graph.id(*result).to_owned(),
             ]);
@@ -354,7 +405,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             .and_then(|value| graph.symbol(value)) else { continue; };
         let Some(result) = call_result.get(&node.id) else { continue; };
         adjacency.entry(receiver).or_default()
-            .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None));
+            .push((*result, "CALL_PASSTHROUGH".to_owned(), None, None, None));
         evidence.entry((receiver, *result)).or_insert_with(|| vec![
             graph.id(receiver).to_owned(), graph.id(node.id).to_owned(), graph.id(*result).to_owned(),
         ]);
@@ -412,7 +463,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         for variable in referenced_variables(graph, source.value) {
             adjacency.entry(source.value).or_default()
                 .push((variable, "VALUE_FLOWS_TO".to_owned(),
-                       Some("c-out-param-writeback".to_owned()), None));
+                       Some("c-out-param-writeback".to_owned()), None, None));
             evidence.entry((source.value, variable)).or_insert_with(|| vec![
                 graph.id(source.value).to_owned(), graph.id(variable).to_owned(),
             ]);
@@ -425,7 +476,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         for variable in referenced_variables(graph, sink.value) {
             adjacency.entry(variable).or_default()
                 .push((sink.value, "VALUE_FLOWS_TO".to_owned(),
-                       Some("referenced-variable".to_owned()), None));
+                       Some("referenced-variable".to_owned()), None, None));
             evidence.entry((variable, sink.value)).or_insert_with(|| vec![
                 graph.id(variable).to_owned(), graph.id(sink.value).to_owned(),
             ]);
@@ -436,14 +487,19 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     // match another flow.  Collapsing on only (source, target) loses call-stack
     // evidence and changes the query-visible graph.
     let mut emitted: HashSet<(u32, u32, Option<String>)> = HashSet::new();
+    // The sink-value lookup is a function of `sink_records` alone, not of the
+    // source being flooded, so it is identical on every iteration.  Building it
+    // once above the per-source loop drops an O(sources × sinks) rebuild while
+    // producing byte-identical lookups (only the last sink per value is kept in
+    // either form, and the source scan does not mutate `sink_records`).
+    let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
+        .map(|record| (record.value, record)).collect();
     for source in source_records {
         let initial = State { value: source.value, contexts: Vec::new() };
         let mut queue = VecDeque::from([initial.clone()]);
         let mut seen: HashSet<State> = HashSet::new();
         seen.insert(initial.clone());
         let mut predecessor: HashMap<State, State> = HashMap::new();
-        let sink_by_value: FxHashMap<u32, &RoleRecord> = sink_records.iter()
-            .map(|record| (record.value, record)).collect();
         let mut reaches: FxHashMap<u32, State> = FxHashMap::default();
         let mut capped = false;
         while let Some(state) = queue.pop_front() {
@@ -451,15 +507,15 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             if state != initial && sink_by_value.contains_key(&state.value) {
                 reaches.entry(state.value).or_insert_with(|| state.clone());
             }
-            for (target, transition, reason, context_id) in adjacency.get(&state.value).into_iter().flatten() {
+            for (target, transition, reason, context_id, context_ord) in adjacency.get(&state.value).into_iter().flatten() {
                 let mut contexts = state.contexts.clone();
                 if reason.as_deref() == Some("context-parameter") {
-                    let Some(context) = context_id.as_ref() else { continue; };
+                    let Some(ord) = *context_ord else { continue; };
                     if contexts.len() >= 12 { continue; }
-                    contexts.push(context.clone());
+                    contexts.push(ord);
                 } else if reason.as_deref() == Some("context-return") {
-                    let Some(context) = context_id.as_ref() else { continue; };
-                    if contexts.last() != Some(context) { continue; }
+                    let Some(ord) = *context_ord else { continue; };
+                    if contexts.last() != Some(&ord) { continue; }
                     contexts.pop();
                 }
                 let next = State { value: *target, contexts };

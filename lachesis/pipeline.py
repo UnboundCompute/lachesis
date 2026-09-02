@@ -97,12 +97,26 @@ def _combine_graphs(
     }, len(dangling)
 
 
-def source_inventory(source_dir: str, include_tests: bool = True) -> List[str]:
+def source_inventory(
+    source_dir: str,
+    include_tests: bool = True,
+    include_paths: Sequence[str] = (),
+) -> List[str]:
     """Discover every supported source file, including tests and specifications.
 
     Complete compiler coverage is the default: a function must not disappear merely
     because its path looks like a test. Callers that explicitly need a production-only
     inventory may still pass ``include_tests=False``.
+
+    ``include_paths`` names extra files or directories to fold into the inventory even
+    when they lie *outside* ``source_dir``. This is the guided-scope guarantee: when a
+    build is deliberately narrowed to a sub-tree to fit a time budget, the advisory's
+    vulnerable file can be scoped down to yet be sure it is analysed, so scoping never
+    silently excludes the one file the run exists to reach. An explicitly named file is
+    always kept (the test-path heuristic never drops it); an explicitly named directory
+    is walked with the same ignore rules as ``source_dir``. Paths already discovered
+    under ``source_dir`` are not duplicated. With no ``include_paths`` the result is
+    byte-for-byte the historical inventory of ``source_dir`` alone.
     """
     # node_modules has a Python counterpart in every direction: an installed
     # virtualenv, a build cache, and a tool cache. Walking any of them analyses
@@ -140,31 +154,63 @@ def source_inventory(source_dir: str, include_tests: bool = True) -> List[str]:
     is_test = None
     if not include_tests:
         from lachesis.nav.symbol_index import is_test_path as is_test
-    source_root = os.path.realpath(os.path.abspath(source_dir))
-    result = []
-    for root, directories, files in os.walk(os.path.abspath(source_dir)):
-        directories[:] = sorted(
-            name for name in directories
-            if name not in ignored
-            and os.path.realpath(os.path.join(root, name)) != vendored_typescript
-        )
-        for name in sorted(files):
-            path = os.path.join(root, name)
-            # Directory links are not traversed by os.walk, but file links are
-            # returned as ordinary files and the compiler follows them. Keep a
-            # link that resolves inside the requested project, while refusing to
-            # pull arbitrary files from outside it into the graph or its cache key.
-            if os.path.islink(path):
-                target = os.path.realpath(path)
-                try:
-                    inside = os.path.commonpath((source_root, target)) == source_root
-                except ValueError:  # different drives on Windows
-                    inside = False
-                if not inside:
+
+    def _walk(base_dir: str, containment_root: str) -> List[str]:
+        collected = []
+        for root, directories, files in os.walk(base_dir):
+            directories[:] = sorted(
+                name for name in directories
+                if name not in ignored
+                and os.path.realpath(os.path.join(root, name)) != vendored_typescript
+            )
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                # Directory links are not traversed by os.walk, but file links are
+                # returned as ordinary files and the compiler follows them. Keep a
+                # link that resolves inside the requested project, while refusing to
+                # pull arbitrary files from outside it into the graph or its cache key.
+                if os.path.islink(path):
+                    target = os.path.realpath(path)
+                    try:
+                        inside = os.path.commonpath((containment_root, target)) == containment_root
+                    except ValueError:  # different drives on Windows
+                        inside = False
+                    if not inside:
+                        continue
+                if is_test is not None and is_test(path):
                     continue
-            if is_test is not None and is_test(path):
+                collected.append(path)
+        return collected
+
+    source_root = os.path.realpath(os.path.abspath(source_dir))
+    result = _walk(os.path.abspath(source_dir), source_root)
+    if not include_paths:
+        return result
+    # Fold in the explicitly requested paths, deduplicating against what the walk of
+    # ``source_dir`` already found (by resolved identity, so a symlink or a `.` prefix
+    # cannot smuggle a file in twice). An explicit *file* is kept unconditionally --
+    # the caller has named it, so the test-path heuristic must not veto it -- while an
+    # explicit *directory* is walked under the same rules as ``source_dir`` with itself
+    # as the containment root, so its own in-tree links resolve. Extras are appended
+    # after the base inventory in sorted order, leaving the empty-``include_paths`` case
+    # (handled by the early return above) exactly as it was.
+    seen = {os.path.realpath(path) for path in result}
+    extra = []
+    for raw in include_paths:
+        target = os.path.abspath(raw)
+        if os.path.isdir(target):
+            candidates = _walk(target, os.path.realpath(target))
+        elif os.path.isfile(target):
+            candidates = [target]
+        else:
+            raise FrontendError(f"included path does not exist: {raw}")
+        for path in candidates:
+            resolved = os.path.realpath(path)
+            if resolved in seen:
                 continue
-            result.append(path)
+            seen.add(resolved)
+            extra.append(path)
+    result.extend(sorted(extra))
     return result
 
 
@@ -211,6 +257,7 @@ def run_project(
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
     include_tests: bool = True,
+    include_paths: Sequence[str] = (),
     *,
     enrich: bool = False,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
@@ -218,7 +265,9 @@ def run_project(
 
     Discovery includes test/specification files by default; the complete per-frontend
     file list is handed to each frontend as its explicit root set, so a frontend that
-    re-walks the tree cannot silently change the inventory.
+    re-walks the tree cannot silently change the inventory. ``include_paths`` folds
+    extra files or directories (e.g. an advisory's file outside a narrowed scope) into
+    that inventory.
 
     The removed ``enrich=True`` build-time overlay mode is rejected; native Pass 2
     runs only after the binary store has been written.
@@ -226,7 +275,8 @@ def run_project(
     _reject_removed_enrich(enrich)
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
-    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    groups = registry.partition(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     snapshots = []
     for frontend_id in sorted(groups):
         frontend = registry.get(frontend_id)
@@ -257,18 +307,21 @@ def run_project_streaming(
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
     include_tests: bool = True,
+    include_paths: Sequence[str] = (),
 ):
     """Run frontends one at a time and return shard readers plus metadata.
 
     This core-only path deliberately never composes frontend payloads. Each validated
     snapshot is persisted by the common runner, released, and represented afterward
-    only by its shard-set reader and manifest metadata.
+    only by its shard-set reader and manifest metadata. ``include_paths`` folds extra
+    files or directories into the discovered inventory (the guided-scope guarantee).
     """
     source_dir = os.path.abspath(source_dir)
     shard_root = os.path.abspath(shard_root)
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry()
-    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    groups = registry.partition(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     snapshots = []
     readers = []
     previous = os.environ.get("LACHESIS_SHARD_ROOT")
@@ -433,7 +486,11 @@ def _group_digests(files: Iterable[str], source_dir: str) -> Dict[str, str]:
             for path in sorted(files)}
 
 
-def source_content_hash(source_dir: str, include_tests: bool = True) -> str:
+def source_content_hash(
+    source_dir: str,
+    include_tests: bool = True,
+    include_paths: Sequence[str] = (),
+) -> str:
     """One digest over every source file a build of ``source_dir`` would see.
 
     The validity key for anything derived from a compile of this tree. A reduced store
@@ -443,8 +500,9 @@ def source_content_hash(source_dir: str, include_tests: bool = True) -> str:
     and unlike an mtime it does not go stale in either direction: a touched file with
     unchanged content keeps the cache, and a restored older file loses it.
     """
-    digests = _group_digests(source_inventory(source_dir, include_tests=include_tests),
-                            os.path.abspath(source_dir))
+    digests = _group_digests(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths),
+        os.path.abspath(source_dir))
     digest = hashlib.sha256()
     for path in sorted(digests):
         digest.update(path.encode("utf-8"))
@@ -534,6 +592,7 @@ def run_project_incremental(
     timeout_seconds: int = 300,
     include_tests: bool = True,
     manifest_path: Optional[str] = None,
+    include_paths: Sequence[str] = (),
     *,
     enrich: bool = True,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
@@ -551,7 +610,8 @@ def run_project_incremental(
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry()
     manifest_path = manifest_path or default_manifest_path(output_root)
-    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    groups = registry.partition(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     prior = _load_manifest(manifest_path)
 
     snapshots: List[FrontendSnapshot] = []
