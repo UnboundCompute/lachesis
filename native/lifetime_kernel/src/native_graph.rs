@@ -240,20 +240,6 @@ struct SummaryEffect {
     is_return: bool,
 }
 
-fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
-    if input.len().saturating_sub(*offset) < FRAME_HEADER {
-        return Err("truncated graph sidecar frame header".to_owned());
-    }
-    let length = u32::from_be_bytes(input[*offset..*offset + FRAME_HEADER].try_into().unwrap()) as usize;
-    *offset += FRAME_HEADER;
-    if length > input.len().saturating_sub(*offset) {
-        return Err("truncated graph sidecar frame".to_owned());
-    }
-    let payload = &input[*offset..*offset + length];
-    *offset += length;
-    Ok(payload)
-}
-
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// Open a framed Pass-1 sidecar for a single forward pass, transparently
@@ -1297,26 +1283,20 @@ fn compact_owner(node: &CompactNode) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn scan_compact_records<FN, FE>(input: &[u8], on_node: FN, on_edge: FE) -> Result<(), String>
+// The substrate writer emits one contiguous node section followed by one
+// contiguous edge section.  Both scanners read strictly forward through a
+// `Read`, so a gzip-framed substrate (see sidecar_project::publish) is decoded
+// incrementally without ever seeking -- the reader stays gzip-friendly and the
+// whole graph is never mapped into a single buffer.
+fn scan_compact_records_stream<R, FN, FE>(reader: &mut R, mut on_node: FN, mut on_edge: FE) -> Result<(), String>
 where
+    R: Read,
     FN: FnMut(graph_proto::NodeRecord),
     FE: FnMut(CompactEdge),
 {
-    let mut offset = 0;
-    let header = frame(input, &mut offset)?;
-    let _: graph_proto::Document = graph_proto::Document::decode(header)
-        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    scan_compact_records_at(input, offset, on_node, on_edge)
-}
-
-fn scan_compact_records_at<FN, FE>(input: &[u8], mut offset: usize,
-                                   mut on_node: FN, mut on_edge: FE) -> Result<(), String>
-where
-    FN: FnMut(graph_proto::NodeRecord),
-    FE: FnMut(CompactEdge),
-{
-    while offset < input.len() {
-        let payload = frame(input, &mut offset)?;
+    let _ = frame_stream(reader)?
+        .ok_or_else(|| "missing graph sidecar header".to_owned())?;
+    while let Some(payload) = frame_stream(reader)? {
         if payload.is_empty() { continue; }
         match payload[0] {
             b'N' => on_node(graph_proto::NodeRecord::decode(&payload[1..])
@@ -1334,20 +1314,26 @@ where
     Ok(())
 }
 
-// The substrate writer emits one contiguous node section followed by one
-// contiguous edge section.  Find that boundary without decoding protobufs so
-// later edge-only passes do not repeatedly walk the million-node prefix.
-fn compact_edge_offset(input: &[u8]) -> Result<usize, String> {
-    let mut offset = 0;
-    let header = frame(input, &mut offset)?;
-    let _: graph_proto::Document = graph_proto::Document::decode(header)
-        .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    while offset < input.len() {
-        let record_offset = offset;
-        let payload = frame(input, &mut offset)?;
-        if payload.first() == Some(&b'E') { return Ok(record_offset); }
+/// Stream only the node section forward and stop at the first edge frame.  The
+/// node section is contiguous and precedes the edge section, so this reaches
+/// every node without decoding the edge tail a second time on the re-read pass.
+fn scan_compact_nodes_stream<R, FN>(reader: &mut R, mut on_node: FN) -> Result<(), String>
+where
+    R: Read,
+    FN: FnMut(graph_proto::NodeRecord),
+{
+    let _ = frame_stream(reader)?
+        .ok_or_else(|| "missing graph sidecar header".to_owned())?;
+    while let Some(payload) = frame_stream(reader)? {
+        if payload.is_empty() { continue; }
+        match payload[0] {
+            b'N' => on_node(graph_proto::NodeRecord::decode(&payload[1..])
+                .map_err(|error| format!("invalid graph node frame: {error}"))?),
+            b'E' => break,
+            _ => return Err("unknown graph sidecar record prefix".to_owned()),
+        }
     }
-    Ok(input.len())
+    Ok(())
 }
 
 fn sidecar_language(input: &[u8]) -> Result<Option<String>, String> {
@@ -1374,66 +1360,81 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     // Keep only the records needed to seed relevance.  The previous version
     // retained every compact node before filtering edges, which defeated the
     // purpose of the compact ABI on million-node graphs.
+    // One forward pass collects the seed node subset and buffers every
+    // relevance-bearing edge in file order.  The node section precedes the edge
+    // section, so a single pass sees all seeds before any edge; buffering only
+    // the four relevance kinds (the scanner already filters them) keeps the
+    // working set far below the whole graph -- the million compact nodes are
+    // never retained -- while removing the mid-file edge re-reads the old mmap
+    // path needed.  The buffer is iterated, not re-decoded, so the two-hop
+    // closure and the keep filter run over the identical file-ordered edge
+    // sequence as before, giving a byte-identical projection.
     let mut seed_nodes = HashMap::new();
-    scan_compact_records(input, |record| {
-        if function_kind(record_kind(&record))
-            || translation_call_kind(record_kind(&record))
-            || translation_return_kind(record_kind(&record))
-            || record_kind(&record) == "ParmVarDecl" {
-            let node = compact_node(record);
-            seed_nodes.insert(node.id.clone(), node);
-        }
-    }, |_| {})?;
-    let edge_offset = compact_edge_offset(input)?;
+    let mut all_edges: Vec<CompactEdge> = Vec::new();
+    {
+        let mut reader = open_frames_bytes(input);
+        scan_compact_records_stream(&mut reader, |record| {
+            if function_kind(record_kind(&record))
+                || translation_call_kind(record_kind(&record))
+                || translation_return_kind(record_kind(&record))
+                || record_kind(&record) == "ParmVarDecl" {
+                let node = compact_node(record);
+                seed_nodes.insert(node.id.clone(), node);
+            }
+        }, |edge| all_edges.push(edge))?;
+    }
     let call_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_call_kind(compact_kind(node)))
         .map(|node| node.id.clone()).collect();
     let return_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_return_kind(compact_kind(node)))
         .map(|node| node.id.clone()).collect();
     let mut relevant = call_ids.union(&return_ids).cloned().collect::<HashSet<_>>();
     for _ in 0..2 {
-        scan_compact_records_at(input, edge_offset, |_| {}, |edge| {
+        for edge in &all_edges {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
                     if call_ids.contains(&edge.source) || return_ids.contains(&edge.source)
                         || relevant.contains(&edge.source) || call_ids.contains(&edge.target) {
-                        relevant.insert(edge.source);
-                        relevant.insert(edge.target);
+                        relevant.insert(edge.source.clone());
+                        relevant.insert(edge.target.clone());
                     }
                 }
                 "HAS_ARGUMENT" if call_ids.contains(&edge.source) || relevant.contains(&edge.source) => {
-                    relevant.insert(edge.source);
-                    relevant.insert(edge.target);
+                    relevant.insert(edge.source.clone());
+                    relevant.insert(edge.target.clone());
                 }
                 "REFERS_TO" if relevant.contains(&edge.source) => {
-                    relevant.insert(edge.target);
+                    relevant.insert(edge.target.clone());
                 }
                 "VALUE_FLOWS_TO" if call_ids.contains(&edge.source) => {
-                    relevant.insert(edge.target);
+                    relevant.insert(edge.target.clone());
                 }
                 _ => {}
             }
+        }
+    }
+    // Filter to kept edges in file order (index-stable for argument_edges), then
+    // drop the full buffer so peak resident state falls back to the kept subset
+    // before the map-building phase.
+    let edges: Vec<CompactEdge> = all_edges.into_iter().filter(|edge| match edge.kind.as_str() {
+        "AST_CHILD" => relevant.contains(&edge.source) || relevant.contains(&edge.target),
+        "HAS_ARGUMENT" => relevant.contains(&edge.source),
+        "REFERS_TO" => relevant.contains(&edge.source),
+        "VALUE_FLOWS_TO" => call_ids.contains(&edge.source),
+        _ => false,
+    }).collect();
+    let mut nodes = seed_nodes;
+    // Second forward pass over the node section only, adding relevant
+    // intermediates; it stops at the first edge frame so the edge tail is not
+    // decoded twice.
+    {
+        let mut reader = open_frames_bytes(input);
+        scan_compact_nodes_stream(&mut reader, |record| {
+            if relevant.contains(&record.id) {
+                let node = compact_node(record);
+                nodes.insert(node.id.clone(), node);
+            }
         })?;
     }
-    let mut nodes = seed_nodes;
-    let mut edges = Vec::new();
-    // Re-read only the node section to add relevant intermediates; the edge
-    // section is scanned independently from its known boundary below.
-    scan_compact_records(input, |record| {
-        if relevant.contains(&record.id) {
-            let node = compact_node(record);
-            nodes.insert(node.id.clone(), node);
-        }
-    }, |_| {})?;
-    scan_compact_records_at(input, edge_offset, |_| {}, |edge| {
-        let keep = match edge.kind.as_str() {
-            "AST_CHILD" => relevant.contains(&edge.source) || relevant.contains(&edge.target),
-            "HAS_ARGUMENT" => relevant.contains(&edge.source),
-            "REFERS_TO" => relevant.contains(&edge.source),
-            "VALUE_FLOWS_TO" => call_ids.contains(&edge.source),
-            _ => false,
-        };
-        if keep { edges.push(edge); }
-    })?;
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     let mut parents = HashMap::new();
     let mut refers = HashMap::new();

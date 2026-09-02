@@ -332,12 +332,13 @@ pub(crate) fn project_shards(
             optional_text_field("source_content_hash", source_content_hash),
             optional_text_field("build_fingerprint", build_fingerprint),
         ]);
-        // Pass-2 input (the lossless full graph) is the largest sidecar and is
-        // only ever read front-to-back by the sequential native consumers, so it
-        // is gzip-compressed.  Pass-3 substrate keeps a random-access reader
-        // (sidecar_to_translation) and stays uncompressed for now.
+        // Both sidecars are framed protobuf read strictly front-to-back by their
+        // native consumers -- Pass-2 input by the sequential graph readers, Pass-3
+        // substrate by the forward-streaming translation scan -- so both are
+        // gzip-compressed.  The frame sequence is unchanged; only the container
+        // gains a gzip wrapper, which the readers auto-detect by magic.
         publish(&pass2_header, &pass2_nodes, &pass2_edges, pass2_output, true)?;
-        publish(&pass3_header, &pass3_nodes, &pass3_edges, pass3_output, false)?;
+        publish(&pass3_header, &pass3_nodes, &pass3_edges, pass3_output, true)?;
         Ok(())
     })();
     cleanup();
