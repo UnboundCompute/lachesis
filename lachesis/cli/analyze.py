@@ -134,6 +134,15 @@ def _run(argv: list[str] | None = None) -> None:
         "--stream-shards", metavar="DIR", default=None,
         help="stream core-only frontend shards directly into Kùzu",
     )
+    parser.add_argument(
+        "--include", metavar="PATH", action="append", default=None, dest="include_paths",
+        help="also analyse this file or directory, even when it lies outside "
+             "source_dir. Repeatable. This is the guided-scope guarantee: when a build "
+             "is narrowed to a sub-tree to fit the time budget, point --include at the "
+             "advisory's vulnerable file (or its directory) so the one file the run "
+             "exists to reach is never scoped out. An explicitly named file is always "
+             "kept; a directory is walked with the same ignore rules as source_dir.",
+    )
     args = parser.parse_args(argv)
     if args.output_flag is not None:
         args.output_path = args.output_flag
@@ -152,6 +161,15 @@ def _run(argv: list[str] | None = None) -> None:
         parser.error("--reduced/--layered-out are not available in the native-only build path")
     if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
         parser.error("streamed package shards are serialized; use --max-workers 1")
+    include_paths = args.include_paths or []
+    if include_paths and args.parallel_packages:
+        parser.error("--include is not supported with --parallel-packages: the package "
+            "partition keys jobs by their path under source_dir, so a path outside it "
+            "has no package to join. Scope with a sub-directory (the serial path) and "
+            "point --include at the advisory file instead")
+    for included in include_paths:
+        if not os.path.exists(included):
+            parser.error(f"--include path does not exist: {included}")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
     # same output defaults before the streaming branch as the ordinary path below.
     # Previously the early return skipped this block and made --stream-shards run
@@ -170,7 +188,7 @@ def _run(argv: list[str] | None = None) -> None:
         else:
             readers, snapshots = run_project_streaming(
                 args.source_dir, args.stream_shards, frontend_out,
-                timeout_seconds=args.timeout,
+                timeout_seconds=args.timeout, include_paths=include_paths,
             )
         stored = write_kuzu_shards(
             CompositeShardReader(readers), args.output_path, snapshots,
@@ -213,7 +231,7 @@ def _run(argv: list[str] | None = None) -> None:
             frontend_out = args.frontend_out or os.path.join(stream_root, "frontends")
             readers, snapshots = run_project_streaming(
                 args.source_dir, stream_root, frontend_out,
-                timeout_seconds=args.timeout,
+                timeout_seconds=args.timeout, include_paths=include_paths,
             )
             stored = write_kuzu_shards(
                 CompositeShardReader(readers), args.output_path, snapshots,
@@ -241,11 +259,13 @@ def _run(argv: list[str] | None = None) -> None:
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, frontend_out,
                                                    enrich=compile_enrich,
-                                                   timeout_seconds=args.timeout)
+                                                   timeout_seconds=args.timeout,
+                                                   include_paths=include_paths)
     else:
         graph, snapshots = run_project(args.source_dir, frontend_out,
                                        enrich=compile_enrich,
-                                       timeout_seconds=args.timeout)
+                                       timeout_seconds=args.timeout,
+                                       include_paths=include_paths)
     build_fingerprint = None
     if args.incremental and frontend_out:
         manifest_path = default_manifest_path(frontend_out)
@@ -277,7 +297,7 @@ def _run(argv: list[str] | None = None) -> None:
         source_dir=args.source_dir if args.reduced else None,
         # Hashed rather than assumed: the store records what the tree was at build time,
         # so a load can tell whether an already-joined cache still describes it.
-        source_content_hash=(source_content_hash(args.source_dir)
+        source_content_hash=(source_content_hash(args.source_dir, include_paths=include_paths)
                              if args.reduced else None),
         build_fingerprint=build_fingerprint,
     )

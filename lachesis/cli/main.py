@@ -616,6 +616,8 @@ def command_build(args: argparse.Namespace) -> int:
         forwarded.extend(["--shard-large-packages", str(args.shard_large_packages)])
     if args.stream_shards:
         forwarded.extend(["--stream-shards", args.stream_shards])
+    for included in getattr(args, "include_paths", None) or []:
+        forwarded.extend(["--include", included])
     return analyze.main(forwarded)
 
 
@@ -887,6 +889,10 @@ def build_parser() -> argparse.ArgumentParser:
                        metavar="FILES", help="split large packages into bounded jobs")
     build.add_argument("--stream-shards", metavar="DIR",
                        help="stream frontend shards directly into the graph store")
+    build.add_argument("--include", metavar="PATH", action="append", dest="include_paths",
+                       help="also analyse this file or directory even if it is outside "
+                            "source_dir (repeatable); point it at an advisory's file so a "
+                            "narrowed scope never excludes the file the run must reach")
     build.set_defaults(handler=command_build, no_prune=False)
 
     trace = subcommands.add_parser(
