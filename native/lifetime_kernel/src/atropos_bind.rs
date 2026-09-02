@@ -6,8 +6,8 @@
 //! values.  The output is the existing `atropos-binding-report` contract.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs;
+use std::io::Read;
 use std::path::Path;
 use hashbrown::HashMap;
 use prost::Message;
@@ -397,7 +397,7 @@ fn simple_identifier(value: &str) -> bool {
         else { ch == '_' || ch.is_ascii_alphanumeric() })
 }
 
-fn framed_record(reader: &mut BufReader<File>) -> Result<Option<Vec<u8>>, String> {
+fn framed_record<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header) {
         Ok(()) => {},
@@ -458,8 +458,9 @@ fn string_field<'a>(bytes: &'a [u8], wanted: u32) -> Option<&'a str> {
 /// million-node graph never becomes a Python object graph and the full edge
 /// stream is not retained in Rust either.
 fn index_from_path(path: &Path) -> Result<Index, String> {
-    let file = File::open(path).map_err(|error| format!("cannot open Pass-1 input: {error}"))?;
-    let mut reader = BufReader::new(file);
+    // The Pass-1 input sidecar may be gzip-framed; open_frames sniffs the magic
+    // and streams the decode, keeping the catalog binder single-pass either way.
+    let mut reader = crate::native_graph::open_frames(path)?;
     let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
     // Property-write and computed-property-write nodes are not calls, but a
     // catalog sink can still name them: `el.innerHTML = tainted` (a static

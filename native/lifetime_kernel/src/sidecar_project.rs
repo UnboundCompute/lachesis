@@ -8,6 +8,8 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use hashbrown::HashSet;
 use prost::Message;
 
@@ -206,7 +208,7 @@ fn document(fields: Vec<graph_proto::Field>) -> Vec<u8> {
     }.encode_to_vec()
 }
 
-fn copy_frames(source: &Path, output: &mut BufWriter<File>) -> Result<(), String> {
+fn copy_frames<W: Write>(source: &Path, output: &mut W) -> Result<(), String> {
     let mut input = BufReader::new(File::open(source)
         .map_err(|error| format!("cannot open staged sidecar: {error}"))?);
     let mut buffer = [0u8; 1024 * 1024];
@@ -330,8 +332,12 @@ pub(crate) fn project_shards(
             optional_text_field("source_content_hash", source_content_hash),
             optional_text_field("build_fingerprint", build_fingerprint),
         ]);
-        publish(&pass2_header, &pass2_nodes, &pass2_edges, pass2_output)?;
-        publish(&pass3_header, &pass3_nodes, &pass3_edges, pass3_output)?;
+        // Pass-2 input (the lossless full graph) is the largest sidecar and is
+        // only ever read front-to-back by the sequential native consumers, so it
+        // is gzip-compressed.  Pass-3 substrate keeps a random-access reader
+        // (sidecar_to_translation) and stays uncompressed for now.
+        publish(&pass2_header, &pass2_nodes, &pass2_edges, pass2_output, true)?;
+        publish(&pass3_header, &pass3_nodes, &pass3_edges, pass3_output, false)?;
         Ok(())
     })();
     cleanup();
@@ -356,16 +362,33 @@ pub(crate) fn project_shard(
     )
 }
 
-fn publish(header: &[u8], nodes: &Path, edges: &Path, output: &Path) -> Result<(), String> {
+fn publish(header: &[u8], nodes: &Path, edges: &Path, output: &Path, compress: bool) -> Result<(), String> {
     let temporary = output.with_file_name(format!(".{}-{}", output.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
     let result = (|| {
         let file = File::create(&temporary)
             .map_err(|error| format!("cannot create native sidecar: {error}"))?;
-        let mut output_file = BufWriter::new(file);
-        frame_write(&mut output_file, header)?;
-        copy_frames(nodes, &mut output_file)?;
-        copy_frames(edges, &mut output_file)?;
-        output_file.flush().map_err(|error| format!("cannot flush native sidecar: {error}"))?;
+        let output_file = BufWriter::new(file);
+        // The immutable Pass-1 sidecars are framed protobuf.  Gzip is a lossless
+        // container around the identical frame byte stream, so the decoded frame
+        // sequence -- and therefore every downstream reader's result -- is
+        // unchanged; only on-disk size differs.  Level 1 keeps the large Pass-2
+        // input write fast while still shrinking it ~10x.  Sequential readers
+        // detect the gzip magic and stream-decode; see native_graph::open_frames.
+        if compress {
+            let mut encoder = GzEncoder::new(output_file, Compression::new(1));
+            frame_write(&mut encoder, header)?;
+            copy_frames(nodes, &mut encoder)?;
+            copy_frames(edges, &mut encoder)?;
+            encoder.finish()
+                .map_err(|error| format!("cannot finish native sidecar gzip: {error}"))?
+                .flush().map_err(|error| format!("cannot flush native sidecar: {error}"))?;
+        } else {
+            let mut output_file = output_file;
+            frame_write(&mut output_file, header)?;
+            copy_frames(nodes, &mut output_file)?;
+            copy_frames(edges, &mut output_file)?;
+            output_file.flush().map_err(|error| format!("cannot flush native sidecar: {error}"))?;
+        }
         fs::rename(&temporary, output)
             .map_err(|error| format!("cannot publish native sidecar: {error}"))?;
         Ok(())

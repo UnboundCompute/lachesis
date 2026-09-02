@@ -385,9 +385,10 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
 }
 
 pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
-    let file = File::open(path.as_ref())
-        .map_err(|error| format!("cannot open Pass-2 input: {error}"))?;
-    let mut input = BufReader::with_capacity(1024 * 1024, file);
+    // The Pass-2 input sidecar may be gzip-framed (see sidecar_project::publish);
+    // open_frames sniffs the magic and streams the decode, so the reader never
+    // holds the whole graph in memory whether the file is raw or compressed.
+    let mut input = crate::native_graph::open_frames(path.as_ref())?;
     let header = read_stream_frame(&mut input)?;
     let document: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 input header: {error}"))?;

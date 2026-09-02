@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use flate2::read::MultiGzDecoder;
 use hashbrown::{HashMap, HashSet};
 use memmap2::{Mmap, MmapOptions};
 
@@ -250,6 +252,62 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
     let payload = &input[*offset..*offset + length];
     *offset += length;
     Ok(payload)
+}
+
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Open a framed Pass-1 sidecar for a single forward pass, transparently
+/// decoding gzip.  The sidecars are framed protobuf; when the writer gzips one
+/// (see sidecar_project::publish) the first two bytes carry the gzip magic,
+/// which cannot collide with a raw frame's 4-byte big-endian length prefix
+/// (whose leading byte is 0x00 for any frame under 16 MiB).  A gzip stream is
+/// decoded incrementally, so the whole file is never held in memory -- the
+/// bounded-RSS property of the old mmap scan is preserved.
+pub(crate) fn open_frames(path: impl AsRef<Path>) -> Result<Box<dyn Read>, String> {
+    let mut file = File::open(path.as_ref())
+        .map_err(|error| format!("cannot open native graph sidecar: {error}"))?;
+    let mut magic = [0u8; 2];
+    let read = file.read(&mut magic)
+        .map_err(|error| format!("cannot read native graph sidecar: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("cannot rewind native graph sidecar: {error}"))?;
+    let reader = BufReader::new(file);
+    if read == 2 && magic == GZIP_MAGIC {
+        Ok(Box::new(MultiGzDecoder::new(reader)))
+    } else {
+        Ok(Box::new(reader))
+    }
+}
+
+/// Read the next length-prefixed frame from a streaming reader, or None at EOF.
+/// Mirrors `frame` (the mmap stepper) but consumes an owning `Read`, so it works
+/// identically over a raw file or a gzip decoder.
+fn frame_stream<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
+    let mut header = [0u8; FRAME_HEADER];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(format!("cannot read graph sidecar frame header: {error}")),
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)
+        .map_err(|error| format!("truncated graph sidecar frame: {error}"))?;
+    Ok(Some(payload))
+}
+
+/// Build a gzip-tolerant frame reader over an already-mapped sidecar slice.
+/// The FFI boundary still mmaps the sidecar (now the compressed file, so its
+/// resident cost falls with the on-disk size), and the gzip decoder streams the
+/// decode over that slice one window at a time -- the full decompressed graph is
+/// never materialized, so peak RSS stays bounded exactly as with the raw mmap.
+/// A raw (uncompressed) slice is framed directly, so old sidecars still read.
+fn open_frames_bytes(input: &[u8]) -> Box<dyn Read + '_> {
+    if input.len() >= 2 && input[..2] == GZIP_MAGIC {
+        Box::new(MultiGzDecoder::new(input))
+    } else {
+        Box::new(input)
+    }
 }
 
 fn owner_ref<'a>(node: &'a graph_proto::NodeRecord) -> Option<&'a str> {
@@ -505,9 +563,10 @@ fn sidecar_to_request_inner(
         .filter(|(_, role)| role.as_str() == "release")
         .map(|((_, name), _)| name.clone())
         .collect();
+    let mut reader = open_frames_bytes(input);
     let (owners, function_names, call_ids, edges_by_source, initializer_targets,
          release_value_ids, refs, children) = scan_lifetime_metadata(
-        input, selected_ids, &release_names, |item| {
+        &mut reader, selected_ids, &release_names, |item| {
             let item_id = item.id.clone();
             let syntax = record_text(&item, "syntax_kind").unwrap_or(item.kind.as_str());
             let function = if function_kind(&syntax) {
@@ -1003,8 +1062,8 @@ fn input_edge(record: graph_proto::EdgeRecord) -> lifetime_proto::GraphEdge {
     }
 }
 
-fn scan_lifetime_metadata(
-    input: &[u8],
+fn scan_lifetime_metadata<R: Read>(
+    reader: &mut R,
     selected_ids: Option<&HashSet<String>>,
     release_names: &HashSet<String>,
     mut on_node: impl FnMut(graph_proto::NodeRecord),
@@ -1018,11 +1077,10 @@ fn scan_lifetime_metadata(
     HashMap<String, String>,
     HashMap<String, Vec<String>>,
 ), String> {
-    let mut offset = 0;
-    let header = frame(input, &mut offset)?;
-    let _: graph_proto::Document = graph_proto::Document::decode(header)
+    let header = frame_stream(reader)?
+        .ok_or_else(|| "missing graph sidecar header".to_owned())?;
+    let _: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
         .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
-    let mut offset = offset;
     let mut owners = HashMap::new();
     let mut function_names = HashMap::new();
     let mut call_ids = HashSet::new();
@@ -1033,8 +1091,7 @@ fn scan_lifetime_metadata(
     let timing_enabled = std::env::var("LACHESIS_TIMINGS").ok().as_deref() == Some("1");
     let started = std::time::Instant::now();
     let mut record_count = 0usize;
-    while offset < input.len() {
-        let payload = frame(input, &mut offset)?;
+    while let Some(payload) = frame_stream(reader)? {
         if payload.is_empty() { continue; }
         record_count += 1;
         if timing_enabled && record_count % 100_000 == 0 {
@@ -1294,9 +1351,10 @@ fn compact_edge_offset(input: &[u8]) -> Result<usize, String> {
 }
 
 fn sidecar_language(input: &[u8]) -> Result<Option<String>, String> {
-    let mut offset = 0;
-    let header = frame(input, &mut offset)?;
-    let document = graph_proto::Document::decode(header)
+    let mut reader = open_frames_bytes(input);
+    let header = frame_stream(&mut reader)?
+        .ok_or_else(|| "missing graph sidecar header".to_owned())?;
+    let document = graph_proto::Document::decode(header.as_slice())
         .map_err(|error| format!("invalid graph sidecar header: {error}"))?;
     let Some(fields) = document.fields else { return Ok(None) };
     let Some(field) = fields.fields.iter().find(|field| field.key == "languages") else {
