@@ -196,6 +196,19 @@ _CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
 _HEADER_FIELDS = ("file", "absolute_file", "start_line", "end_line",
                   "start_offset", "end_offset", "owner_function_id", "function_id")
 
+# Default bound on the read-only nav buffer pool. Kùzu auto-sizes its pool to ~80% of
+# host RAM, which at kernel scale dominates RSS (measured ~824 MB resident on a 1.76M-node
+# store, over half of the index's footprint) for a page cache this index barely needs --
+# it builds its own resident maps and serves lookups through bounded caches. 512 MB is the
+# ceiling the write path already defaults to (`kuzu_store._kuzu_buffer_pool_size(512<<20)`),
+# so the whole stack now bounds the pool consistently. `LACHESIS_KUZU_BPS` overrides it.
+_DEFAULT_NAV_BUFFER_POOL = 512 << 20
+# A bounded pool REQUIRES a paged open-scan: a monolithic `MATCH (n:Node)` materializes all
+# nodes in the pool at once and overflows a small ceiling ("buffer pool is full"). Paging
+# the scan into storage-offset windows keeps the working set bounded and returns byte-
+# identical rows. `LACHESIS_KUZU_BATCH` overrides the window.
+_DEFAULT_SCAN_BATCH = 100_000
+
 
 def _restore_node_props(columns, props_blob: Optional[bytes],
                         zdict: bytes, prefixes: Sequence[str], *,
@@ -464,30 +477,23 @@ class KuzuGraphIndex:
         # to that ceiling -- an O(nodes) page cache that, at kernel scale, dwarfs the
         # Python navigation maps. This read-only index builds its own resident maps
         # and then serves node/edge lookups through bounded caches, so a large page
-        # cache buys little. `LACHESIS_KUZU_BPS` (bytes) caps it; unset keeps Kùzu's
-        # default. Measured before making it a non-env default.
-        _bps = os.environ.get("LACHESIS_KUZU_BPS")
-        if _bps:
-            self._db = kuzu.Database(
-                db_file(db_dir), read_only=True, buffer_pool_size=int(_bps))
-        else:
-            self._db = kuzu.Database(db_file(db_dir), read_only=True)
-        # Capping the pool is only safe if the open-scan is *paged*: a single
-        # `MATCH (n:Node)` materializes its whole result in the pool (O(nodes)),
-        # so under a cap it overflows with "buffer pool is full". `_build_maps`
-        # instead walks half-open storage-offset windows (`offset(id(n))`), each
-        # of which materializes only its window -- bounded working set, no global
-        # ORDER BY (which would force a full sort/materialize) and no SKIP rescan
-        # (which is O(nodes^2)). `LACHESIS_KUZU_BATCH` sets the window size; if a
-        # pool cap is set without one, page at a safe default so the cap holds;
-        # with neither set the scan stays monolithic (unchanged default path).
+        # cache buys little. Default the pool to a bounded ceiling instead;
+        # `LACHESIS_KUZU_BPS` (bytes) overrides. Byte-identical: the pool is only a
+        # page cache, so bounding it changes no returned row (measured -- Pass-3
+        # candidate counts unchanged, ~568 MB off resident on a 1.76M-node store).
+        _bps_env = os.environ.get("LACHESIS_KUZU_BPS")
+        _bps = int(_bps_env) if _bps_env else _DEFAULT_NAV_BUFFER_POOL
+        self._db = kuzu.Database(
+            db_file(db_dir), read_only=True, buffer_pool_size=_bps)
+        # The pool is always bounded now, so the open-scan must be *paged*: a single
+        # `MATCH (n:Node)` materializes its whole result in the pool (O(nodes)) and
+        # overflows the ceiling with "buffer pool is full". `_build_maps` instead walks
+        # half-open storage-offset windows (`offset(id(n))`), each materializing only
+        # its window -- bounded working set, no global ORDER BY (which would force a
+        # full sort/materialize) and no SKIP rescan (which is O(nodes^2)). The paged
+        # scan returns byte-identical rows. `LACHESIS_KUZU_BATCH` sets the window size.
         _batch = os.environ.get("LACHESIS_KUZU_BATCH")
-        if _batch:
-            self._scan_batch = int(_batch)
-        elif _bps:
-            self._scan_batch = 100_000
-        else:
-            self._scan_batch = 0
+        self._scan_batch = int(_batch) if _batch else _DEFAULT_SCAN_BATCH
         self._conn = kuzu.Connection(self._db)
         self._db_dir = db_dir
         set_threads = getattr(self._conn, "set_max_threads_for_exec", None)
