@@ -29,6 +29,7 @@ exactly, and an elided build reconstructs them identically for navigation.
 """
 from __future__ import annotations
 
+import base64
 import os
 import zlib
 from array import array
@@ -45,6 +46,8 @@ from lachesis.kuzu_store import (
     _CALLSITE_INDEX_COLUMNS,
     _DECL_INDEX_COLUMNS,
     _HOT_SET,
+    _ID_CODED,
+    _ID_ESCAPE,
     _INDEX_ID_COLUMNS,
     _prefix_code,
     db_file,
@@ -464,6 +467,104 @@ class _Adjacency:
                 for nid in self._index._all_ids())
 
 
+_TEN_ZEROS = bytes(10)  # suffix placeholder for an escaped/uncoded scanned id
+
+
+def _code_array() -> "array":
+    """A fresh empty signed-int code array -- the per-key value factory for `_CodedBucket`."""
+    return array("i")
+
+
+class _ScanIds:
+    """A read-only sorted view of the scanned node ids that reconstructs each id string
+    on demand rather than holding 1.76M str objects resident.
+
+    Every scanned nid decodes to ``prefix:suffix`` where ``suffix`` is a 20-hex-char
+    (10-byte) content hash and ``prefix`` is one of a small, code-tabled set. Storing the
+    prefix code (a 2-byte int) and the raw 10 suffix bytes costs ~12 B/node against ~98 B
+    for the string, and the string is rebuilt only when a reader crosses the index
+    boundary (a projection, an edge endpoint, a bucket read). Because prefix codes are
+    assigned in sorted-prefix order and hex order equals raw-byte order, the compact
+    ``(pcode, suffix_bytes)`` key sorts byte-identically to the decoded string, so this
+    view answers ``bisect_left``/iteration in exactly the order the old ``list[str]`` did.
+    Ids that do not fit the shape (rare; escaped at store time) are held verbatim in an
+    overflow map and reconstructed from it.
+    """
+    __slots__ = ("_idx",)
+
+    def __init__(self, idx: "KuzuGraphIndex") -> None:
+        self._idx = idx
+
+    def __len__(self) -> int:
+        return self._idx._scan_n
+
+    def __getitem__(self, i: int) -> str:
+        return self._idx._scan_id(i)
+
+    def __iter__(self):
+        scan_id = self._idx._scan_id
+        for i in range(self._idx._scan_n):
+            yield scan_id(i)
+
+
+class _CodedBucket:
+    """A ``kind``/``file``/``owner`` -> node-ids navigation bucket that stores compact
+    int *codes* instead of the id strings, reconstructing the strings only when a reader
+    asks for a key. A base (scanned) node is stored as its row index in the sorted scan
+    columns (``code >= 0``); a derived (overlay/graft) node as ``-(j + 1)`` into
+    ``_derived_ids``. Reconstruction reproduces the exact list the old string-keyed
+    ``defaultdict(list)`` held: base rows are inserted in ascending-nid order at build so
+    each bucket is already nid-sorted, and derived codes are appended in arrival order,
+    exactly as ``attach_overlay``/``graft`` appended to the live dict without re-sorting.
+    ``.get()`` returning the reconstructed string list keeps every reader -- internal and
+    external -- byte-identical with no change at the call site.
+    """
+    __slots__ = ("_idx", "_map")
+
+    def __init__(self, idx: "KuzuGraphIndex") -> None:
+        self._idx = idx
+        # Codes are held in a typed `array('i')` per key, not a `list`: a row index runs
+        # to ~1.76M and is well outside CPython's small-int cache, so a `list` would box a
+        # fresh 28-byte int per membership (~3 per node across the three buckets) and cost
+        # more than the id strings this whole change removes. A 4-byte signed int cell
+        # holds every row index and every negative derived code with no boxing.
+        self._map: dict = defaultdict(_code_array)
+
+    def add(self, key, code: int) -> None:
+        self._map[key].append(code)
+
+    def _strs(self, codes) -> list:
+        at = self._idx._id_at
+        return [at(c) for c in codes]
+
+    def get(self, key, default=None):
+        codes = self._map.get(key)
+        return self._strs(codes) if codes is not None else default
+
+    def __getitem__(self, key):
+        return self._strs(self._map[key])
+
+    def __contains__(self, key) -> bool:
+        return key in self._map
+
+    def __iter__(self):
+        return iter(self._map)
+
+    def __len__(self) -> int:
+        return len(self._map)
+
+    def keys(self):
+        return self._map.keys()
+
+    def items(self):
+        for key, codes in self._map.items():
+            yield key, self._strs(codes)
+
+    def values(self):
+        for codes in self._map.values():
+            yield self._strs(codes)
+
+
 class KuzuGraphIndex:
     semantic_edge_kind = staticmethod(GraphIndex.semantic_edge_kind)
 
@@ -549,11 +650,25 @@ class KuzuGraphIndex:
         # (the dominant resident cost at kernel scale) disappears, and there is no
         # nid->row dict at all -- the sorted key array carries the mapping.
         self._columnar = os.environ.get("LACHESIS_COLUMNAR", "1") != "0"
-        # Sorted array of the scanned nids, aligned to the columns (column row i is
-        # `_scan_ids[i]`). Kept independent of `_ids` on purpose: overlay/graft append
-        # derived nids to `_ids` and re-sort it, which would break column alignment, but
-        # they never touch `_scan_ids`, so a derived nid simply misses the bisect (None).
+        # Sorted view of the scanned nids, aligned to the columns (column row i is
+        # `_scan_ids[i]`). In columnar mode this is a `_ScanIds` view backed by the
+        # compact `(pcode, suffix)` store below, not a resident `list[str]`: the id
+        # strings are rebuilt on demand, so the ~173 MB of scanned nid strings never live
+        # resident. Overlay/graft-derived nids are never scanned, so they miss the
+        # bisect (None), exactly as before.
         self._scan_ids: list = []
+        # Compact scanned-id store (columnar). `_scan_pcode` holds each row's prefix code
+        # (a 2-byte int; -1 for an escaped id), `_scan_suffix` the raw 10 hash bytes per
+        # row packed end to end, and `_scan_escaped` maps a row to its verbatim string for
+        # the rare id that did not fit the coded shape. `_scan_n` is the scanned count.
+        self._scan_pcode = array("h")
+        self._scan_suffix = bytearray()
+        self._scan_escaped: dict = {}
+        self._scan_n = 0
+        # Overlay/graft-derived nids, held as strings (few) and addressed by the negative
+        # codes stored in the coded buckets. Replaces the base nids' former residence in
+        # `_ids`, which columnar mode no longer populates.
+        self._derived_ids: list = []
         self._kind_col = array("i")
         self._kind_vocab: list = []
         self._label_col = array("i")
@@ -600,6 +715,9 @@ class KuzuGraphIndex:
             # Re-entrant (ensure_maps re-runs this after a deferred build): reset the
             # columns so a rebuild does not append onto stale rows.
             self._scan_ids = []
+            self._scan_pcode = array("h"); self._scan_suffix = bytearray()
+            self._scan_escaped = {}; self._scan_n = 0
+            self._derived_ids = []
             self._kind_col = array("i"); self._kind_vocab = []
             self._label_col = array("i"); self._label_vocab = []
             self._hstr_vocab = []
@@ -646,22 +764,45 @@ class KuzuGraphIndex:
                 vocab.append(value)
             return c
 
+        prefixes = self._id_prefixes
+
+        def _capture_compact(raw) -> None:
+            # Store the scanned id compactly instead of as a resident string. `raw` is
+            # exactly what `decode_id` consumes: `~<code>:<b64>` for a coded id, `=<value>`
+            # for an escaped one, and the value verbatim when the store is uncoded. Pull
+            # the prefix code + 10 hash bytes straight from the coded form so no string is
+            # allocated; stash escaped/uncoded ids verbatim in the overflow map. Reordered
+            # into sorted-nid order after the scan; `_scan_id` inverts this exactly.
+            if not prefixes:
+                self._scan_escaped[len(self._scan_pcode)] = raw
+                self._scan_pcode.append(-1)
+                self._scan_suffix += _TEN_ZEROS
+                return
+            if raw[0] == _ID_ESCAPE:
+                self._scan_escaped[len(self._scan_pcode)] = raw[1:]
+                self._scan_pcode.append(-1)
+                self._scan_suffix += _TEN_ZEROS
+                return
+            code, _, packed = raw[1:].partition(":")
+            self._scan_pcode.append(int(code, 36))
+            self._scan_suffix += base64.urlsafe_b64decode(packed + "==")
+
         def _ingest(row) -> None:
             (nid, kind, label, file, abs_file, start_line, end_line,
              start_offset, end_offset, owner, fn) = row
-            nid = decode_id(nid, self._id_prefixes)
             kind = _dedup(kind)
             label = _dedup(label)
             file = _dedup(file)
             abs_file = _dedup(abs_file)
             owner = _dedup(owner)
             fn = _dedup(fn)
-            self._ids.append(nid)
             if columnar:
-                # Int-coded parallel columns replace the three str-keyed value dicts.
-                # Filled in scan order here, then reordered to sorted-nid order once the
-                # scan is done (see below), so a lookup can bisect `_scan_ids` for the
-                # row instead of holding a nid->row dict.
+                # Int-coded parallel columns replace the three str-keyed value dicts, and
+                # the id is stored compactly (see `_capture_compact`) rather than as a
+                # resident string. Filled in scan order here, then reordered to
+                # sorted-nid order once the scan is done; the navigation buckets are built
+                # from the sorted columns afterwards, so nothing here holds an id string.
+                _capture_compact(nid)
                 self._kind_col.append(_code(kind, kcode, self._kind_vocab))
                 self._label_col.append(_code(label, lcode, self._label_vocab))
                 self._h_file.append(_code(file, hcode, self._hstr_vocab))
@@ -672,22 +813,19 @@ class KuzuGraphIndex:
                 self._h_el.append(end_line if end_line is not None else -1)
                 self._h_so.append(start_offset if start_offset is not None else -1)
                 self._h_eo.append(end_offset if end_offset is not None else -1)
-            else:
-                self._kind_by_id[nid] = kind
-                self._label_by_id[nid] = label
-                # Stored as a positional tuple rather than an 8-key dict: over ~850k
-                # nodes the dict container alone cost ~262 MB (272 B/node) against
-                # ~88 MB for the tuple (104 B/node). `_header` rebuilds the dict, in
-                # this exact field order, only for nodes a reader actually projects.
-                self._header_by_id[nid] = (file, abs_file, start_line, end_line,
-                                           start_offset, end_offset, owner, fn)
+                return
+            nid = decode_id(nid, self._id_prefixes)
+            self._ids.append(nid)
+            self._kind_by_id[nid] = kind
+            self._label_by_id[nid] = label
+            # Stored as a positional tuple rather than an 8-key dict: over ~850k
+            # nodes the dict container alone cost ~262 MB (272 B/node) against
+            # ~88 MB for the tuple (104 B/node). `_header` rebuilds the dict, in
+            # this exact field order, only for nodes a reader actually projects.
+            self._header_by_id[nid] = (file, abs_file, start_line, end_line,
+                                       start_offset, end_offset, owner, fn)
             self.by_kind[kind].append(nid)
-            if not columnar:
-                # Columnar defers `by_label` entirely: every base label already lives
-                # in `_label_col`/`_label_vocab`, so the inverted map is rebuilt on
-                # demand (see the `by_label` property) instead of held resident through
-                # the memory-critical build. In dict mode it is populated eagerly here.
-                self._bl_store[label].append(nid)
+            self._bl_store[label].append(nid)
             path = abs_file or file
             if path:
                 self.by_file[path].append(nid)
@@ -724,43 +862,130 @@ class KuzuGraphIndex:
             while res.has_next():
                 _ingest(res.get_next())
         if self._columnar:
-            # Reorder the scan-order columns into sorted-nid order so a lookup can
-            # `bisect_left(_scan_ids, nid)` for the row rather than carry a nid->row
-            # dict (which cost ~63 B/node -- a hash table plus a boxed int per node).
-            # `order` is the argsort of the scanned nids; it is transient and dropped
-            # here, leaving only `_scan_ids` (pointers to nid strings already resident
-            # in `_ids`, ~9 B/node) as new resident state. `_scan_ids` is built here
-            # and never mutated again, so it stays column-aligned across overlay/graft.
-            order = sorted(range(len(self._ids)), key=self._ids.__getitem__)
-            self._scan_ids = [self._ids[p] for p in order]
-
-            def _reorder(col):
-                return array("i", (col[p] for p in order))
-
-            self._kind_col = _reorder(self._kind_col)
-            self._label_col = _reorder(self._label_col)
-            self._h_file = _reorder(self._h_file)
-            self._h_absfile = _reorder(self._h_absfile)
-            self._h_owner = _reorder(self._h_owner)
-            self._h_fn = _reorder(self._h_fn)
-            self._h_sl = _reorder(self._h_sl)
-            self._h_el = _reorder(self._h_el)
-            self._h_so = _reorder(self._h_so)
-            self._h_eo = _reorder(self._h_eo)
-            del order
+            self._finalize_columnar()
+            return
         # The scan used to arrive in id order from `ORDER BY n.id`, which every bucket
         # inherited by construction; the stored id is coded now and that order is not
         # the real one, so sort what the order was doing for us. Buckets included: a
         # tool that lists a file's nodes should list them the same way twice.
         self._ids.sort()
-        # `by_label` is intentionally absent in columnar mode (materialized lazily, and
-        # it sorts its own buckets there); sort only the resident dicts.
-        resident = (self.by_kind, self.by_file, self.by_owner)
-        if self._bl_store is not None:
-            resident = (*resident, self._bl_store)
+        resident = (self.by_kind, self.by_file, self.by_owner, self._bl_store)
         for buckets in resident:
             for ids in buckets.values():
                 ids.sort()
+
+    def _finalize_columnar(self) -> None:
+        """Sort the scan-order columns + compact id store into sorted-nid order and build
+        the navigation buckets from them.
+
+        `order` is the argsort of the scanned nids. In the common case (no escaped ids) it
+        is computed from the compact ``(pcode, suffix_bytes)`` key, which sorts
+        byte-identically to the decoded ``prefix:suffix`` string -- so the sort never
+        materializes an id string. When escaped ids are present they carry no compact key,
+        so the key falls back to the reconstructed string (a transient, freed here). The
+        columns and the compact store are reordered in place; `_scan_ids` becomes a lazy
+        view over the compact store, and the three buckets are rebuilt from the sorted
+        columns holding row indices, so each bucket is nid-sorted by construction and no id
+        string stays resident.
+        """
+        n = len(self._scan_pcode)
+        suffix = self._scan_suffix
+        if self._scan_escaped:
+            order = sorted(range(n), key=self._scan_key)
+        else:
+            # Argsort on a packed 2-byte-prefix + 10-byte-suffix key per row. Prefix codes
+            # are big-endian so their byte order is their numeric order, and prefix codes
+            # are already assigned in sorted-prefix order while hex order equals byte
+            # order -- so this 12-byte key sorts byte-identically to the decoded
+            # `prefix:suffix` string. Sorting the packed `bytes` (a C-level compare) avoids
+            # materializing a boxed `(int, bytes)` tuple per row, which is the dominant
+            # transient at open; `key=packed.__getitem__` reuses the stored bytes rather
+            # than copying a slice per comparison.
+            pcode = self._scan_pcode
+            packed = [pcode[i].to_bytes(2, "big") + suffix[10 * i:10 * i + 10]
+                      for i in range(n)]
+            order = sorted(range(n), key=packed.__getitem__)
+            del packed
+
+        def _reorder(col):
+            return array("i", (col[p] for p in order))
+
+        self._kind_col = _reorder(self._kind_col)
+        self._label_col = _reorder(self._label_col)
+        self._h_file = _reorder(self._h_file)
+        self._h_absfile = _reorder(self._h_absfile)
+        self._h_owner = _reorder(self._h_owner)
+        self._h_fn = _reorder(self._h_fn)
+        self._h_sl = _reorder(self._h_sl)
+        self._h_el = _reorder(self._h_el)
+        self._h_so = _reorder(self._h_so)
+        self._h_eo = _reorder(self._h_eo)
+        # Reorder the compact id store the same way. Suffix is a flat 10-bytes-per-row
+        # blob; rebuild it row by row. Escaped ids remap their row keys through `order`.
+        self._scan_pcode = array("h", (self._scan_pcode[p] for p in order))
+        new_suffix = bytearray(10 * n)
+        for i, p in enumerate(order):
+            new_suffix[10 * i:10 * i + 10] = suffix[10 * p:10 * p + 10]
+        self._scan_suffix = new_suffix
+        if self._scan_escaped:
+            old_escaped = self._scan_escaped
+            self._scan_escaped = {i: old_escaped[p]
+                                  for i, p in enumerate(order) if p in old_escaped}
+        self._scan_n = n
+        self._scan_ids = _ScanIds(self)
+        del order
+        # Rebuild the navigation buckets from the sorted columns, holding row indices
+        # (`_CodedBucket` reconstructs the id string on read). Iterating rows in sorted-nid
+        # order makes every bucket ascending by nid with no per-bucket sort, matching the
+        # order the old string buckets were left in.
+        by_kind = _CodedBucket(self)
+        by_file = _CodedBucket(self)
+        by_owner = _CodedBucket(self)
+        kv, hv = self._kind_vocab, self._hstr_vocab
+        hf, ha, ho, hfn = self._h_file, self._h_absfile, self._h_owner, self._h_fn
+        kc = self._kind_col
+        for i in range(n):
+            by_kind.add(kv[kc[i]], i)
+            absf = ha[i]
+            filec = hf[i]
+            path = (hv[absf] if absf >= 0 else None) or (hv[filec] if filec >= 0 else None)
+            if path:
+                by_file.add(path, i)
+            ownc = ho[i]
+            fnc = hfn[i]
+            owner_key = (hv[ownc] if ownc >= 0 else None) or (hv[fnc] if fnc >= 0 else None)
+            if owner_key:
+                by_owner.add(owner_key, i)
+        self.by_kind = by_kind
+        self.by_file = by_file
+        self.by_owner = by_owner
+
+    def _scan_id(self, i: int) -> str:
+        """Reconstruct the sorted scanned nid at row ``i`` from the compact store.
+
+        Exactly inverse to `_capture_compact` + `kuzu_store.decode_id`: an escaped/uncoded
+        id comes back verbatim from the overflow map; a coded id is
+        ``f"{prefix}:{20-hex-suffix}"``. Called on every crossing of the index boundary
+        that needs an id string (projection, edge endpoint, bucket read, bisect compare).
+        """
+        esc = self._scan_escaped.get(i)
+        if esc is not None:
+            return esc
+        suf = self._scan_suffix[10 * i:10 * i + 10]
+        return f"{self._id_prefixes[self._scan_pcode[i]]}:{suf.hex()}"
+
+    def _scan_key(self, i: int):
+        """Sort key for scan row ``i`` -- the reconstructed id string. Used only when
+        escaped ids are present (they carry no compact key); the all-coded path sorts on
+        the compact ``(pcode, suffix)`` tuple directly and never calls this."""
+        return self._scan_id(i)
+
+    def _id_at(self, code: int) -> str:
+        """Reconstruct the nid a bucket code addresses: a scan row (``code >= 0``) or a
+        derived nid (``-(j + 1)`` into ``_derived_ids``)."""
+        if code >= 0:
+            return self._scan_id(code)
+        return self._derived_ids[-code - 1]
 
     def _init_by_label(self) -> None:
         """Set up ``by_label`` storage for whichever backend is active.
@@ -947,18 +1172,47 @@ class KuzuGraphIndex:
             nid = node["id"]
             if nid in self._node_cache:
                 continue
-            self._ids.append(nid)
-            self.by_kind[node.get("kind")].append(nid)
-            self._bl_add(nid, node.get("label"))
             props = node.get("properties") or {}
-            path = props.get("absolute_file") or props.get("file")
+            self._register_derived(
+                nid, node.get("kind"), node.get("label"),
+                props.get("absolute_file") or props.get("file"),
+                props.get("owner_function_id") or props.get("function_id"))
+            self._node_cache[nid] = node
+        self._sort_ids_if_dict()
+
+    def _register_derived(self, nid, kind, label, path, owner) -> None:
+        """Add one overlay/graft-derived node to the navigation buckets and ``by_label``.
+
+        Columnar buckets hold row codes, so a derived nid is appended as a negative code
+        into ``_derived_ids`` and reconstructed on read; dict-mode buckets -- and a
+        columnar index whose maps are still deferred (plain ``defaultdict``s not yet built
+        by ``_build_maps``) -- hold the id string directly, exactly as before.
+        """
+        if isinstance(self.by_kind, _CodedBucket):
+            code = -(len(self._derived_ids) + 1)
+            self._derived_ids.append(nid)
+            self.by_kind.add(kind, code)
+            self._bl_add(nid, label)
+            if path:
+                self.by_file.add(path, code)
+            if owner:
+                self.by_owner.add(owner, code)
+        else:
+            self._ids.append(nid)
+            self.by_kind[kind].append(nid)
+            self._bl_add(nid, label)
             if path:
                 self.by_file[path].append(nid)
-            owner = props.get("owner_function_id") or props.get("function_id")
             if owner:
                 self.by_owner[owner].append(nid)
-            self._node_cache[nid] = node
-        self._ids.sort()
+
+    def _sort_ids_if_dict(self) -> None:
+        """Keep ``_ids`` sorted for the string backends. Columnar mode holds no base id in
+        ``_ids`` and reconstructs a sorted ``_all_ids`` on demand, so there is nothing to
+        sort; the coded buckets already carry derived nids in arrival order after the
+        sorted base rows, matching the old append-without-resort behavior."""
+        if not isinstance(self.by_kind, _CodedBucket):
+            self._ids.sort()
 
     def _node_count(self) -> int:
         if self._maps_deferred:
@@ -966,9 +1220,17 @@ class KuzuGraphIndex:
             count = int(result.get_next()[0]) if result.has_next() else 0
             overlay = getattr(self, "_overlay", None)
             return count + len(overlay.derived_nodes) if overlay is not None else count
+        if self._columnar:
+            return self._scan_n + len(self._derived_ids)
         return len(self._ids)
 
     def _all_ids(self):
+        if self._columnar:
+            # Base ids reconstructed from the compact store, merged with the few derived
+            # nids, in the same sorted order the old resident `_ids` list held. Only the
+            # whole-graph node iterator asks for this, never the candidate hot path.
+            return sorted(self._derived_ids + [self._scan_id(i)
+                                               for i in range(self._scan_n)])
         return list(self._ids)
 
     # -- primitives ---------------------------------------------------------
@@ -1072,16 +1334,11 @@ class KuzuGraphIndex:
             self._node_cache[nid] = node
             if nid not in self._grafted_nodes:
                 self._grafted_nodes.add(nid)
-                self._ids.append(nid)
-                self.by_kind[node.get("kind")].append(nid)
-                self._bl_add(nid, node.get("label"))
                 props = node.get("properties") or {}
-                path = props.get("absolute_file") or props.get("file")
-                if path:
-                    self.by_file[path].append(nid)
-                owner = props.get("owner_function_id") or props.get("function_id")
-                if owner:
-                    self.by_owner[owner].append(nid)
+                self._register_derived(
+                    nid, node.get("kind"), node.get("label"),
+                    props.get("absolute_file") or props.get("file"),
+                    props.get("owner_function_id") or props.get("function_id"))
         added = 0
         for edge in edges:
             key = (edge["source"], edge["target"], edge["kind"],
@@ -1098,7 +1355,7 @@ class KuzuGraphIndex:
         self._out_cache.clear()
         self._in_cache.clear()
         self._kind_ids.clear()
-        self._ids.sort()
+        self._sort_ids_if_dict()
         return added
 
     def degrees(self) -> dict:
