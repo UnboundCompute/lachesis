@@ -1218,8 +1218,8 @@ class IndexBackedGraph:
         canonical materialized order. Cached: the constructors read the sequence
         several times (reverse adjacency, AST children, the capability scan)."""
         if self._edges_cache is None:
-            from ..nav.kuzu_index import materialize_graph
-            self._edges_cache = materialize_graph(self._index)["edges"]
+            from ..nav.kuzu_index import materialize_edges
+            self._edges_cache = materialize_edges(self._index)
         return self._edges_cache
 
     # -- index-native accessors the disk branches reach for -----------------

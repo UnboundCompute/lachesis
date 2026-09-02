@@ -275,8 +275,38 @@ def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True,
                         sort_output=sort_output)
 
 
+def materialize_edges(index: "KuzuGraphIndex", *, restore_defaults: bool = True,
+                      sort_output: bool = True) -> list:
+    """The ``edges`` of :func:`materialize_graph`, without building the node dicts.
+
+    A caller that needs only the edge sequence (the ``IndexBackedGraph`` edge cache)
+    would otherwise materialize every node's property dict through
+    ``materialize_graph(index)["edges"]`` and immediately discard it. The edge queries
+    do not read node rows, so the returned list is byte-identical to that slice; the
+    node scan is simply skipped (see ``want_nodes`` in :func:`_materialize`)."""
+    return _materialize(index, None, restore_defaults=restore_defaults,
+                        sort_output=sort_output, want_nodes=False)["edges"]
+
+
+def _scan_node_ids(index: "KuzuGraphIndex", keep) -> set:
+    """The decoded id of every resident node, and nothing else.
+
+    Edge materialization needs the set of resident ids to reject dangling deferred /
+    overlay edges, but not the node properties. When the caller wants edges only, an
+    id-only scan replaces the whole-node property materialization that would otherwise
+    be built purely to read ``node["id"]`` off it and thrown away.
+    """
+    ids = set()
+    res = index._conn.execute("MATCH (n:Node) RETURN n.id")
+    while res.has_next():
+        nid = decode_id(res.get_next()[0], index._id_prefixes)
+        if keep is None or nid in keep:
+            ids.add(nid)
+    return ids
+
+
 def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True,
-                 sort_output: bool = True) -> dict:
+                 sort_output: bool = True, want_nodes: bool = True) -> dict:
     """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
 
     One body rather than two because a subgraph that restored props even slightly
@@ -284,26 +314,33 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
     surface as a dataflow edge that appears only when the cone is small -- which is
     indistinguishable from the semantic loss cone-scoping is *expected* to have, and so
     would hide inside it forever.
+
+    ``want_nodes=False`` returns edges only (``nodes`` empty). The edge queries never
+    read node rows, so the edges are byte-identical to the full run; the only node
+    dependency -- the resident-id set that rejects dangling deferred/overlay edges -- is
+    served by a light id-only scan instead of the full property materialization, which
+    an edges-only caller would build and immediately discard.
     """
-    nodes = []
-    # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
-    # order is not the real one — the prefix sorts as a base36 code and the hash as
-    # base64, neither of which is order-preserving. Sorting the decoded ids in Python
-    # is what keeps this equal to ``combine_graphs``, and it also drops the Cypher sort.
-    res = index._conn.execute(
-        f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props"
-    )
-    while res.has_next():
-        row = res.get_next()
-        nid, kind, label = row[:3]
-        nid = decode_id(nid, index._id_prefixes)
-        if keep is not None and nid not in keep:
-            continue
-        nodes.append({"id": nid, "kind": kind, "label": label,
-                      "properties": _restore_node_props(
-                          row[3:-1], row[-1], index._props_dict, index._id_prefixes,
-                          restore_defaults=restore_defaults)})
     prefixes = index._id_prefixes
+    nodes = []
+    if want_nodes:
+        # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
+        # order is not the real one — the prefix sorts as a base36 code and the hash as
+        # base64, neither of which is order-preserving. Sorting the decoded ids in Python
+        # is what keeps this equal to ``combine_graphs``, and it also drops the Cypher sort.
+        res = index._conn.execute(
+            f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props"
+        )
+        while res.has_next():
+            row = res.get_next()
+            nid, kind, label = row[:3]
+            nid = decode_id(nid, prefixes)
+            if keep is not None and nid not in keep:
+                continue
+            nodes.append({"id": nid, "kind": kind, "label": label,
+                          "properties": _restore_node_props(
+                              row[3:-1], row[-1], index._props_dict, prefixes,
+                              restore_defaults=restore_defaults)})
     edges = []
     for kind in HOT_REL_KINDS:
         res = index._conn.execute(
@@ -337,7 +374,8 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
     # second set of every node id in that common case; it is needed only when one of
     # the following edge sources must be checked for resident endpoints.
     overlay = getattr(index, "_overlay", None)
-    resident = ({node["id"] for node in nodes}
+    resident = (({node["id"] for node in nodes} if want_nodes
+                 else _scan_node_ids(index, keep))
                 if deferred or (overlay is not None and overlay.derived_edges)
                 else None)
     # ``keep`` can contain an id named by a deferred edge even though no Node row for
@@ -369,11 +407,16 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
                     properties = dict(edge.get("properties") or {})
                     properties.update(extra)
                     edges[position] = {**edge, "properties": properties}
-        nodes.extend(
-            node for node in overlay.derived_nodes
-            if keep is None or node.get("id") in keep
-        )
-        resident = {node["id"] for node in nodes}
+        derived_nodes = [node for node in overlay.derived_nodes
+                         if keep is None or node.get("id") in keep]
+        if want_nodes:
+            nodes.extend(derived_nodes)
+            resident = {node["id"] for node in nodes}
+        elif overlay.derived_edges and keep is not None:
+            # Edges-only, scoped: the derived-edge filter needs base+derived ids, but
+            # no node dicts. Reuse the base id set already scanned for deferred edges.
+            base = resident if resident is not None else _scan_node_ids(index, keep)
+            resident = base | {node["id"] for node in derived_nodes}
         edges.extend(
             edge for edge in overlay.derived_edges
             if (keep is None or
