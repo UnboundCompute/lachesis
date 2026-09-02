@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import struct
+import sys
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -134,14 +135,22 @@ def _from_value(value: graph_pb2.Value) -> Any:
     if kind == "list":
         return [_from_value(item) for item in value.list.values]
     if kind == "object":
-        return {field.key: _from_value(field.value) for field in value.object.fields}
+        # Intern the property key: a graph holds the same few dozen field names
+        # (``file``, ``start_line``, ``event_kind`` ...) once per node, so without
+        # interning the same key string is reallocated hundreds of thousands of times
+        # and every copy is retained inside the property dicts. Interning collapses
+        # them to one object per name; a dict is unchanged by whether its keys are
+        # interned, so lookups, iteration order, equality, JSON and digests all match.
+        return {sys.intern(field.key): _from_value(field.value)
+                for field in value.object.fields}
     raise ValueError("protobuf graph value has no kind")
 
 
 def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
     if wanted is None:
-        return {field.key: _from_value(field.value) for field in fields}
-    return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
+        return {sys.intern(field.key): _from_value(field.value) for field in fields}
+    return {sys.intern(field.key): _from_value(field.value)
+            for field in fields if field.key in wanted}
 
 
 def _node_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):
