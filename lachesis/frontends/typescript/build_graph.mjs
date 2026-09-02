@@ -3151,10 +3151,18 @@ for (const edge of [...edges]) {
 }
 
 // Compiler diagnostics are proof-tier facts, not fatal extraction failures.
+// getSemanticDiagnostics() forces a COMPLETE semantic check of every root file's
+// body — flow analysis, assignability, every signature — and on a large first-party
+// tree it dominates build wall-time (empirically ~1.2s/file on Directus). It feeds
+// only T4 "diagnostic" proof-nodes; the structural + type graph the analysis walk
+// builds does not depend on it (per-node getTypeAtLocation stays lazy and already ran
+// above). Set LACHESIS_TS_SKIP_SEMANTIC_DIAGNOSTICS=1 to drop it and keep only the
+// cheap syntactic (parse-error) diagnostics — no loss to candidate detection.
+const skipSemanticDiagnostics = process.env.LACHESIS_TS_SKIP_SEMANTIC_DIAGNOSTICS === "1";
 const diagnostics = [
   ...config.configErrors,
   ...program.getSyntacticDiagnostics(),
-  ...program.getSemanticDiagnostics(),
+  ...(skipSemanticDiagnostics ? [] : program.getSemanticDiagnostics()),
 ].filter((diagnostic) => !diagnostic.file || compilerRootSet.has(normalize(diagnostic.file.fileName)));
 for (const diagnostic of diagnostics) {
   const fileName = diagnostic.file?.fileName;
