@@ -27,6 +27,7 @@ from lachesis.core.graph_wire import (
 )
 from lachesis.core import graph_pb2, lifetime_pb2
 from lachesis.planner.unbounded_copy import BranchRegions, _REGION_EDGE_KINDS
+from lachesis import resources
 
 from lachesis.timeit import timeit
 
@@ -741,10 +742,18 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
             manifest, prune=bool(prune),
         )
         # Rust owns the binary translation projection as well.  The Python
-        # process only passes paths and does not reconstruct the substrate.
-        from lachesis.flow.native_lifetime import write_translation_facts_path
-        write_translation_facts_path(
-            substrate_cache_path(target), translation_facts_path(target))
+        # process only passes paths and does not reconstruct the substrate.  On a
+        # large graph the projection's whole-graph map is the dominant build
+        # spike, so defer it: the semantic pass recomputes the facts from this
+        # same substrate with the identical producer when the file is absent
+        # (byte-for-byte equivalent), moving the cost to the first isolated
+        # ``enrich`` instead of stacking it on the store-write transients.
+        substrate_path = substrate_cache_path(target)
+        substrate_bytes = substrate_path.stat().st_size if substrate_path.is_file() else 0
+        if not resources.defer_translation_facts(substrate_bytes):
+            from lachesis.flow.native_lifetime import write_translation_facts_path
+            write_translation_facts_path(
+                substrate_path, translation_facts_path(target))
         return
     if keep_node is None and prune is not None:
         keep_node = lambda node: not (prune and node.get("kind") in {"token", "source-span"})

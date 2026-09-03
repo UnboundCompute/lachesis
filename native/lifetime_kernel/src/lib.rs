@@ -1626,13 +1626,27 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             // (`.pass2.translation.pb`).  The framed cache is not a bare prost
             // message; decoding it as TranslationResult misreads the leading
             // frame-length/header bytes as protobuf tags ("invalid tag value:
-            // 0").  Unsharded/Python-streamed builds write both files; sharded
-            // raw-shard builds write only the flat facts.  Fall back to
-            // recomputing from the substrate when the facts file is absent.
-            let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
+            // 0").  Unsharded/Python-streamed builds write both files; a
+            // large-graph build defers the flat facts to keep the translation
+            // projection's O(graph) map off the build peak.  Recompute from the
+            // *substrate* (`.pass3.substrate.pb`) when the facts file is absent
+            // -- NOT from `bytes` (the Pass-2 input mapped above).  The two
+            // sidecars are different files and `sidecar_to_translation` yields
+            // different facts from each (verified: substrate -> 571a245e...,
+            // pass2-input -> 06834283...); the build-time producer
+            // (`translate_graph_write_path`) reads the substrate, so recomputing
+            // from the substrate is what keeps the deferred facts byte-identical
+            // to the build-time-written facts.
+            let base = input.strip_suffix(".pass2.input.pb");
+            let facts_path = base
                 .map(|base| format!("{base}.pass2.facts.pb"))
-                .filter(|path| std::path::Path::new(path).is_file()) {
+                .filter(|path| std::path::Path::new(path).is_file());
+            let translation_bytes = if let Some(path) = facts_path {
                 native_graph::read_maybe_gzip(&path)?
+            } else if let Some(base) = base {
+                let substrate_path = format!("{base}.pass3.substrate.pb");
+                let substrate_bytes = native_graph::map_path(&substrate_path)?;
+                native_graph::sidecar_to_translation(&substrate_bytes)?
             } else {
                 native_graph::sidecar_to_translation(&bytes)?
             };

@@ -14,6 +14,7 @@ from .native_lifetime import match_semantic_path, write_semantic_path
 from lachesis.core import lifetime_pb2
 from lachesis.nav.dataflow.substrate import (
     pass2_input_cache_path,
+    substrate_cache_path,
     translation_facts_path,
 )
 
@@ -25,10 +26,18 @@ def _base(store):
 
 
 def native_semantic_capable(store, languages=None) -> bool:
-    """Return whether the store has the complete binary Pass-2 substrate."""
+    """Return whether the store has the complete binary Pass-2 substrate.
+
+    The translation facts (`.pass2.facts.pb`) are *not* required here: a
+    large-graph build defers them to keep the projection off the build peak, and
+    the semantic pass recomputes them from the substrate when absent (see
+    ``lachesis_lifetime_semantic_path``).  Capability therefore turns on the two
+    sidecars the pass actually consumes -- the Pass-2 input and the substrate the
+    recompute reads -- not on the derived facts file.
+    """
     base = _base(store)
-    return bool(base and translation_facts_path(base).is_file()
-                and pass2_input_cache_path(base).is_file())
+    return bool(base and pass2_input_cache_path(base).is_file()
+                and substrate_cache_path(base).is_file())
 
 
 def native_semantic_sidecar_path(store) -> Path:

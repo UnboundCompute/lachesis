@@ -126,6 +126,41 @@ def kuzu_buffer_pool_bytes() -> int:
     return max(256, derived) << 20
 
 
+def defer_translation_facts(substrate_bytes: int) -> bool:
+    """Return whether to skip writing ``.pass2.facts.pb`` at build time.
+
+    The translation-facts projection (``sidecar_to_translation``) rebuilds a
+    whole-graph, string-keyed map of every node/edge in the substrate, so its
+    peak resident set grows O(graph) -- on a Linux-scale tree it is the dominant
+    build spike and an OOM risk. The file is redundant on disk for correctness:
+    the native semantic pass recomputes it from the substrate with the *identical*
+    producer when it is absent (byte-for-byte equivalent), so deferring only moves
+    the cost out of the build and into the first ``enrich``, where it runs in an
+    isolated worker instead of stacking on the store-write transients.
+
+    ``LACHESIS_DEFER_TRANSLATION_FACTS`` forces the choice (``1``/``0``); unset
+    auto-defers once the projection's *estimated* peak would exceed the build
+    budget, so small builds keep writing the file exactly as before (their build
+    artifacts stay byte-identical) while a large graph defers before it can OOM.
+    The estimate scales the on-disk substrate size by a measured blow-up factor:
+    the string-keyed whole-graph map peaks at ~26x the framed substrate (3449 MiB
+    resident over a 134 MiB substrate, t4000). The factor is rounded up to bias
+    toward deferring rather than OOMing, and is only a trigger heuristic -- the
+    emitted graph and recomputed facts are byte-identical either way.
+    """
+    raw = os.environ.get("LACHESIS_DEFER_TRANSLATION_FACTS", "")
+    if raw:
+        if raw in {"0", "false", "no"}:
+            return False
+        if raw in {"1", "true", "yes"}:
+            return True
+        raise ValueError(
+            "LACHESIS_DEFER_TRANSLATION_FACTS must be one of 1/0/true/false/yes/no")
+    translate_blowup = 28  # substrate bytes -> translate-map peak, rounded up from ~26x
+    estimated_peak_mb = (substrate_bytes >> 20) * translate_blowup
+    return estimated_peak_mb > memory_budget_mb()
+
+
 def frontend_jobs() -> int:
     """Return bounded compiler concurrency; serial is the memory-safe default."""
     raw = os.environ.get("LACHESIS_FRONTEND_JOBS", "1")
