@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import struct
+import sys
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -117,6 +118,32 @@ def _properties(
     return fields
 
 
+# Property keys whose text values are drawn from a small vocabulary and repeat
+# across the whole graph -- file paths (one per source file, shared by every node
+# in it), enum-like kinds, and id references (which also coincide with the node ids
+# decode_id already interns, so interning here shares those objects too). Interning
+# their values collapses the duplicates to one object per distinct string. Keys with
+# per-node-unique values (value_id ...) are deliberately absent: interning a string
+# that never repeats only adds it to the intern table for nothing. This is a
+# correctness-neutral dedup hint -- a value is unchanged by being interned, so a key
+# missing here forgoes a saving, never a result.
+_INTERN_VALUE_KEYS = frozenset({
+    "file", "absolute_file", "unit", "language",
+    "type", "kind", "syntax_kind", "event_kind", "sink_kind", "source_kind",
+    "fact_origin", "resolution", "confidence", "access_path", "model_id",
+    "owner_function_id", "enclosing_function_id", "primary_target_id",
+    "target_id", "callee", "receiver_member_id", "callsite_id",
+})
+
+
+def _intern_field(key: str, value: graph_pb2.Value) -> Any:
+    """Decode one field, interning the value when its key draws from a small vocabulary."""
+    out = _from_value(value)
+    if key in _INTERN_VALUE_KEYS and type(out) is str:
+        return sys.intern(out)
+    return out
+
+
 def _from_value(value: graph_pb2.Value) -> Any:
     kind = value.WhichOneof("kind")
     if kind == "null_value":
@@ -134,14 +161,22 @@ def _from_value(value: graph_pb2.Value) -> Any:
     if kind == "list":
         return [_from_value(item) for item in value.list.values]
     if kind == "object":
-        return {field.key: _from_value(field.value) for field in value.object.fields}
+        # Intern the property key: a graph holds the same few dozen field names
+        # (``file``, ``start_line``, ``event_kind`` ...) once per node, so without
+        # interning the same key string is reallocated hundreds of thousands of times
+        # and every copy is retained inside the property dicts. Interning collapses
+        # them to one object per name; a dict is unchanged by whether its keys are
+        # interned, so lookups, iteration order, equality, JSON and digests all match.
+        return {sys.intern(field.key): _intern_field(field.key, field.value)
+                for field in value.object.fields}
     raise ValueError("protobuf graph value has no kind")
 
 
 def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
     if wanted is None:
-        return {field.key: _from_value(field.value) for field in fields}
-    return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
+        return {sys.intern(field.key): _intern_field(field.key, field.value) for field in fields}
+    return {sys.intern(field.key): _intern_field(field.key, field.value)
+            for field in fields if field.key in wanted}
 
 
 def _node_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):

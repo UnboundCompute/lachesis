@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import zlib
 from array import array
 from bisect import bisect_left
@@ -57,7 +58,7 @@ from lachesis.kuzu_store import (
     manifest_props_dictionary,
     read_store_manifest,
 )
-from lachesis.core.graph_wire import decode_document, encode_document
+from lachesis.core.graph_wire import _INTERN_VALUE_KEYS, decode_document, encode_document
 from lachesis.nav.overlay import edge_key
 from lachesis.timeit import timeit
 
@@ -177,7 +178,7 @@ def _restore(
         return _LazyDefaultProps(props)
     for key, default in CONSTANT_PROP_DEFAULTS.items():
         if key not in props:
-            props[key] = list(default) if isinstance(default, list) else default
+            props[key] = _default_fill(default)
     return props
 
 
@@ -192,6 +193,16 @@ _MERGED_SELECT = ", ".join(f"n.{c}" for c in _MERGED_COLUMNS)
 # free at that count.
 _CODED_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
                       if c in CODED_PROP_COLUMNS)
+
+# Promoted-column positions whose text value is drawn from a small vocabulary and
+# repeats across the whole graph (``file``/``absolute_file`` -- one path per source
+# file shared by every node in it -- and enum-like ``type``/``language``). These
+# arrive as their own Kùzu columns, bypassing the props-blob decode that already
+# interns such values, so intern them here too. Coded id columns are excluded: they
+# route through ``decode_id``, which interns already. Like ``_CODED_AT``, resolved
+# once so the per-column test on the ~245k-row materialize is an int-set lookup.
+_INTERN_AT = frozenset(i for i, c in enumerate(_MERGED_COLUMNS)
+                       if c in _INTERN_VALUE_KEYS and i not in _CODED_AT)
 
 # Field order of the promoted-scalar node header, stored positionally in
 # ``_header_by_id`` (see ``KuzuGraphIndex._build_maps`` / ``_header``). This order is
@@ -211,6 +222,36 @@ _DEFAULT_NAV_BUFFER_POOL = 512 << 20
 # the scan into storage-offset windows keeps the working set bounded and returns byte-
 # identical rows. `LACHESIS_KUZU_BATCH` overrides the window.
 _DEFAULT_SCAN_BATCH = 100_000
+
+
+# A single shared empty list backs every defaulted list-valued constant property.
+# The only such default is ``evidence_ids: []`` (CONSTANT_PROP_DEFAULTS), filled on the
+# ~280k nodes that carry no evidence -- previously one freshly-allocated ``[]`` each.
+# Sharing one object is safe because a node's ``evidence_ids`` is never mutated in place:
+# the sole builder (reasoning/query.py::_evidence) accumulates into its OWN local list and
+# only ``.get()``-reads the node's list to extend from it. Byte-identical -- an empty list
+# equals an empty list under ==, JSON and the candidate digest. A non-empty list default
+# (none exist today) still gets its own copy, preserving mutable-default isolation.
+_SHARED_EMPTY_LIST: list = []
+
+
+def _default_fill(default):
+    if isinstance(default, list):
+        return _SHARED_EMPTY_LIST if not default else list(default)
+    return default
+
+
+def _istr(value):
+    """Intern a driver string that repeats across the graph, pass anything else through.
+
+    ``kind`` (13 distinct values over the whole store) and ``label`` (~74% duplicate)
+    arrive fresh from the Kuzu driver at every node/edge built here, so without
+    interning each of the tens of thousands of records holds its own copy of one of a
+    small set of strings. Interning collapses them to one object per distinct value; a
+    ``None``/empty label is left untouched. Byte-neutral -- an interned string is == and
+    hash-equal to the original, so the record is indistinguishable.
+    """
+    return sys.intern(value) if type(value) is str else value
 
 
 def _restore_node_props(columns, props_blob: Optional[bytes],
@@ -233,7 +274,9 @@ def _restore_node_props(columns, props_blob: Optional[bytes],
     """
     props_type = dict if restore_defaults else _LazyDefaultProps
     properties = props_type(
-        {name: (decode_id(value, prefixes) if i in _CODED_AT else value)
+        {name: (decode_id(value, prefixes) if i in _CODED_AT
+                else sys.intern(value) if i in _INTERN_AT
+                else value)
          for i, (name, value) in enumerate(zip(_MERGED_COLUMNS, columns))
          if value is not None}
     )
@@ -275,8 +318,38 @@ def materialize_graph(index: "KuzuGraphIndex", *, restore_defaults: bool = True,
                         sort_output=sort_output)
 
 
+def materialize_edges(index: "KuzuGraphIndex", *, restore_defaults: bool = True,
+                      sort_output: bool = True) -> list:
+    """The ``edges`` of :func:`materialize_graph`, without building the node dicts.
+
+    A caller that needs only the edge sequence (the ``IndexBackedGraph`` edge cache)
+    would otherwise materialize every node's property dict through
+    ``materialize_graph(index)["edges"]`` and immediately discard it. The edge queries
+    do not read node rows, so the returned list is byte-identical to that slice; the
+    node scan is simply skipped (see ``want_nodes`` in :func:`_materialize`)."""
+    return _materialize(index, None, restore_defaults=restore_defaults,
+                        sort_output=sort_output, want_nodes=False)["edges"]
+
+
+def _scan_node_ids(index: "KuzuGraphIndex", keep) -> set:
+    """The decoded id of every resident node, and nothing else.
+
+    Edge materialization needs the set of resident ids to reject dangling deferred /
+    overlay edges, but not the node properties. When the caller wants edges only, an
+    id-only scan replaces the whole-node property materialization that would otherwise
+    be built purely to read ``node["id"]`` off it and thrown away.
+    """
+    ids = set()
+    res = index._conn.execute("MATCH (n:Node) RETURN n.id")
+    while res.has_next():
+        nid = decode_id(res.get_next()[0], index._id_prefixes)
+        if keep is None or nid in keep:
+            ids.add(nid)
+    return ids
+
+
 def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True,
-                 sort_output: bool = True) -> dict:
+                 sort_output: bool = True, want_nodes: bool = True) -> dict:
     """Both of the above. ``keep`` is a container of surviving ids, or ``None`` for all.
 
     One body rather than two because a subgraph that restored props even slightly
@@ -284,26 +357,33 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
     surface as a dataflow edge that appears only when the cone is small -- which is
     indistinguishable from the semantic loss cone-scoping is *expected* to have, and so
     would hide inside it forever.
+
+    ``want_nodes=False`` returns edges only (``nodes`` empty). The edge queries never
+    read node rows, so the edges are byte-identical to the full run; the only node
+    dependency -- the resident-id set that rejects dangling deferred/overlay edges -- is
+    served by a light id-only scan instead of the full property materialization, which
+    an edges-only caller would build and immediately discard.
     """
-    nodes = []
-    # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
-    # order is not the real one — the prefix sorts as a base36 code and the hash as
-    # base64, neither of which is order-preserving. Sorting the decoded ids in Python
-    # is what keeps this equal to ``combine_graphs``, and it also drops the Cypher sort.
-    res = index._conn.execute(
-        f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props"
-    )
-    while res.has_next():
-        row = res.get_next()
-        nid, kind, label = row[:3]
-        nid = decode_id(nid, index._id_prefixes)
-        if keep is not None and nid not in keep:
-            continue
-        nodes.append({"id": nid, "kind": kind, "label": label,
-                      "properties": _restore_node_props(
-                          row[3:-1], row[-1], index._props_dict, index._id_prefixes,
-                          restore_defaults=restore_defaults)})
     prefixes = index._id_prefixes
+    nodes = []
+    if want_nodes:
+        # No `ORDER BY n.id`: the stored id is coded (``kuzu_store.encode_id``) and its
+        # order is not the real one — the prefix sorts as a base36 code and the hash as
+        # base64, neither of which is order-preserving. Sorting the decoded ids in Python
+        # is what keeps this equal to ``combine_graphs``, and it also drops the Cypher sort.
+        res = index._conn.execute(
+            f"MATCH (n:Node) RETURN n.id, n.kind, n.label, {_MERGED_SELECT}, n.props"
+        )
+        while res.has_next():
+            row = res.get_next()
+            nid, kind, label = row[0], _istr(row[1]), _istr(row[2])
+            nid = decode_id(nid, prefixes)
+            if keep is not None and nid not in keep:
+                continue
+            nodes.append({"id": nid, "kind": kind, "label": label,
+                          "properties": _restore_node_props(
+                              row[3:-1], row[-1], index._props_dict, prefixes,
+                              restore_defaults=restore_defaults)})
     edges = []
     for kind in HOT_REL_KINDS:
         res = index._conn.execute(
@@ -337,7 +417,8 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
     # second set of every node id in that common case; it is needed only when one of
     # the following edge sources must be checked for resident endpoints.
     overlay = getattr(index, "_overlay", None)
-    resident = ({node["id"] for node in nodes}
+    resident = (({node["id"] for node in nodes} if want_nodes
+                 else _scan_node_ids(index, keep))
                 if deferred or (overlay is not None and overlay.derived_edges)
                 else None)
     # ``keep`` can contain an id named by a deferred edge even though no Node row for
@@ -369,11 +450,16 @@ def _materialize(index: "KuzuGraphIndex", keep, *, restore_defaults: bool = True
                     properties = dict(edge.get("properties") or {})
                     properties.update(extra)
                     edges[position] = {**edge, "properties": properties}
-        nodes.extend(
-            node for node in overlay.derived_nodes
-            if keep is None or node.get("id") in keep
-        )
-        resident = {node["id"] for node in nodes}
+        derived_nodes = [node for node in overlay.derived_nodes
+                         if keep is None or node.get("id") in keep]
+        if want_nodes:
+            nodes.extend(derived_nodes)
+            resident = {node["id"] for node in nodes}
+        elif overlay.derived_edges and keep is not None:
+            # Edges-only, scoped: the derived-edge filter needs base+derived ids, but
+            # no node dicts. Reuse the base id set already scanned for deferred edges.
+            base = resident if resident is not None else _scan_node_ids(index, keep)
+            resident = base | {node["id"] for node in derived_nodes}
         edges.extend(
             edge for edge in overlay.derived_edges
             if (keep is None or
@@ -1259,7 +1345,7 @@ class KuzuGraphIndex:
         node = None
         if res.has_next():
             row = res.get_next()
-            kind, label = row[:2]
+            kind, label = _istr(row[0]), _istr(row[1])
             properties = _restore_node_props(row[2:-1], row[-1], self._props_dict,
                                              self._id_prefixes)
             if self._overlay is not None:
@@ -1514,7 +1600,7 @@ class KuzuGraphIndex:
         while res.has_next():
             row = res.get_next()
             node_id = decode_id(row[0], self._id_prefixes)
-            kind, label = row[1:3]
+            kind, label = _istr(row[1]), _istr(row[2])
             properties = _restore_node_props(row[3:-1], row[-1], self._props_dict,
                                              self._id_prefixes)
             if self._overlay is not None:
@@ -1551,7 +1637,7 @@ class KuzuGraphIndex:
         while res.has_next():
             row = res.get_next()
             node_id = decode_id(row[0], self._id_prefixes)
-            kind, label = row[1:3]
+            kind, label = _istr(row[1]), _istr(row[2])
             properties = _restore_node_props(
                 row[3:-1], row[-1], self._props_dict, self._id_prefixes)
             if self._overlay is not None:
@@ -1602,7 +1688,7 @@ class KuzuGraphIndex:
                 flush()
                 current_owner = owner
             node_id = decode_id(row[1], self._id_prefixes)
-            kind, label = row[2:4]
+            kind, label = _istr(row[2]), _istr(row[3])
             selected = iter(row[4:-1])
             columns = [row[0] if column == "owner_function_id" else next(selected)
                        for column in _MERGED_COLUMNS]
@@ -1729,7 +1815,7 @@ class KuzuGraphIndex:
         while res.has_next():
             src, tgt, kind, props = res.get_next()
             edges.append({"source": decode_id(src, self._id_prefixes),
-                          "target": decode_id(tgt, self._id_prefixes), "kind": kind,
+                          "target": decode_id(tgt, self._id_prefixes), "kind": _istr(kind),
                           "properties": _restore(props, self._props_dict)})
         if self._overlay is not None:
             edges.extend(dict(e) for e in self._overlay.derived_edges
@@ -1786,7 +1872,7 @@ class KuzuGraphIndex:
                 result.append({
                     "source": decode_id(source, self._id_prefixes),
                     "target": decode_id(target, self._id_prefixes),
-                    "kind": kind or edge_kind,
+                    "kind": _istr(kind or edge_kind),
                     "properties": _restore(props, self._props_dict),
                 })
         if self._overlay is not None:
@@ -1823,7 +1909,7 @@ class KuzuGraphIndex:
             target = decode_id(target, self._id_prefixes)
             indexed[source].append({
                 "source": source, "target": target,
-                "kind": semantic_kind or kind or "HAS_ARGUMENT",
+                "kind": _istr(semantic_kind or kind or "HAS_ARGUMENT"),
                 "properties": _restore(props, self._props_dict),
             })
         for source, edges in self._overlay_argument_edges.items():
@@ -1856,7 +1942,7 @@ class KuzuGraphIndex:
             row = res.get_next()
             nid = decode_id(row[0], self._id_prefixes)
             nodes[nid] = {
-                "id": nid, "kind": row[1], "label": row[2],
+                "id": nid, "kind": _istr(row[1]), "label": _istr(row[2]),
                 "properties": _restore_node_props(
                     row[3:-1], row[-1], self._props_dict, self._id_prefixes),
             }
@@ -1881,8 +1967,8 @@ class KuzuGraphIndex:
             while res.has_next():
                 coded_id, kind, label = res.get_next()
                 nid = decode_id(coded_id, self._id_prefixes)
-                nodes.setdefault(nid, {"id": nid, "kind": kind, "label": label,
-                                       "properties": {}})
+                nodes.setdefault(nid, {"id": nid, "kind": _istr(kind),
+                                       "label": _istr(label), "properties": {}})
         return {"nodes": tuple(nodes.values()), "edges": tuple(edges)}
 
     @timeit
@@ -1932,7 +2018,7 @@ class KuzuGraphIndex:
             row = res.get_next()
             target = decode_id(row[0], self._id_prefixes)
             source = decode_id(row[1], self._id_prefixes)
-            kind, label = row[2:4]
+            kind, label = _istr(row[2]), _istr(row[3])
             properties = _restore_node_props(row[4:-1], row[-1], self._props_dict,
                                              self._id_prefixes)
             indexed[target].append({"id": source, "kind": kind, "label": label,
@@ -2046,7 +2132,7 @@ class KuzuGraphIndex:
                                              self._id_prefixes)
             if properties.get("syntax_kind") != "MemberExpr":
                 continue
-            node = {"id": node_id, "kind": row[1], "label": row[2],
+            node = {"id": node_id, "kind": _istr(row[1]), "label": _istr(row[2]),
                     "properties": properties}
             self._node_cache[node_id] = node
             members.append(node)

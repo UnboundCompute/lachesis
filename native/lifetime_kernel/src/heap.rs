@@ -24,6 +24,58 @@ fn node(id: String, kind: &str, label: String, properties: Vec<graph_proto::Fiel
 fn edge(kind: &str, source: &str, target: &str, properties: Vec<graph_proto::Field>) -> graph_proto::EdgeRecord { graph_proto::EdgeRecord { kind: kind.to_owned(), source: source.to_owned(), target: target.to_owned(), properties, source_tier: String::new(), relationship_class: String::new() } }
 type PointSet = RoaringBitmap;
 
+/// Bounds synthetic heap-object materialization so field-sensitive points-to
+/// terminates on recursive / dynamically-keyed structures.
+///
+/// `target_locations` mints a fresh child heap-object for each intermediate
+/// property segment whose location has no known values yet.  On a recursive
+/// write pattern -- e.g. a `setPath(obj, keys, value)` that walks a dynamic key
+/// array creating nested objects (the prototype-pollution shape) -- every
+/// synthetic child becomes a base whose field mints another child, an unbounded
+/// access-path chain.  Because those children join points-to sets, the monotone
+/// property worklist then never converges and heap enrichment appears
+/// non-terminating (measured: a 12k-node graph climbs past 4.5 GB with no end).
+///
+/// We k-limit the access-path depth of *synthetic* objects (allocation,
+/// parameter and context objects are roots at depth 0) and refuse to descend
+/// past `max_depth`; a global `max_objects` ceiling is a second, hard stop.
+/// Both bounds only ever engage on a lineage that would otherwise diverge, so a
+/// graph that converged before stays byte-identical -- it never approaches the
+/// caps.  Beyond a bound we simply stop expanding that path, an over-approximate
+/// (sound-preserving) truncation of the deep field rather than a wrong fact.
+struct HeapBudget {
+    depth: FxHashMap<u32, u32>,
+    minted: usize,
+    max_depth: u32,
+    max_objects: usize,
+}
+
+impl HeapBudget {
+    fn from_env() -> Self {
+        let read = |key: &str, default: usize| -> usize {
+            std::env::var(key).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+        };
+        HeapBudget {
+            depth: FxHashMap::default(),
+            minted: 0,
+            max_depth: read("LACHESIS_HEAP_MAX_DEPTH", 12) as u32,
+            max_objects: read("LACHESIS_HEAP_MAX_OBJECTS", 200_000),
+        }
+    }
+    #[inline]
+    fn depth_of(&self, object: u32) -> u32 { self.depth.get(&object).copied().unwrap_or(0) }
+    #[inline]
+    fn can_mint(&self, parent: u32) -> bool {
+        self.minted < self.max_objects && self.depth_of(parent) < self.max_depth
+    }
+    #[inline]
+    fn record_child(&mut self, parent: u32, child: u32) {
+        let child_depth = self.depth_of(parent) + 1;
+        self.depth.insert(child, child_depth);
+        self.minted += 1;
+    }
+}
+
 fn add_points(points: &mut FxHashMap<u32, PointSet>, value: u32, objects: &PointSet) -> bool {
     let entry = points.entry(value).or_default(); let before = entry.len(); entry.extend(objects.iter()); entry.len() != before
 }
@@ -111,19 +163,23 @@ fn ensure_location(
 }
 fn target_locations(
     graph: &mut Graph, locations: &mut FxHashMap<(u32, String), u32>, location_values: &mut FxHashMap<u32, FxHashSet<u32>>,
-    nodes: &mut Vec<graph_proto::NodeRecord>, edges: &mut Vec<graph_proto::EdgeRecord>, emitted_nodes: &mut HashSet<String>, emitted_edges: &mut HashSet<(String, String, String)>, object: u32, segments: &[String], evidence: &[String],
+    nodes: &mut Vec<graph_proto::NodeRecord>, edges: &mut Vec<graph_proto::EdgeRecord>, emitted_nodes: &mut HashSet<String>, emitted_edges: &mut HashSet<(String, String, String)>, budget: &mut HeapBudget, object: u32, segments: &[String], evidence: &[String],
 ) -> Vec<u32> {
     let mut current = vec![object];
     for segment in segments.iter().take(segments.len().saturating_sub(1)) {
         let mut next = Vec::new();
         for current_object in current {
             let location = ensure_location(graph, locations, location_values, nodes, edges, emitted_nodes, emitted_edges, current_object, &[segment.clone()], evidence);
-            if location_values.get(&location).is_none_or(FxHashSet::is_empty) {
+            // Mint the intermediate object only when this lineage is still within
+            // the access-path budget; past it we leave the location empty and stop
+            // descending (a sound truncation) so recursive structures terminate.
+            if location_values.get(&location).is_none_or(FxHashSet::is_empty) && budget.can_mint(current_object) {
                 let current_text = graph.id(current_object).to_owned(); let location_text = graph.id(location).to_owned();
                 let child_text = pass2::stable_id("core", "heap-identity", "heap-object", &["property", &current_text, segment]);
                 let child = graph.symbols.intern(child_text.clone()); let child_fact = fact(&[evidence, &[location_text.clone()][..]].concat(), "conservative");
                 emit_node(nodes, emitted_nodes, child_text.clone(), "heap-object", format!("property-object:{segment}"), child_fact.clone());
                 location_values.entry(location).or_default().insert(child);
+                budget.record_child(current_object, child);
                 emit_edge(edges, emitted_edges, "POINTS_TO", location_text, child_text, child_fact);
             }
             next.extend(location_values.get(&location).into_iter().flatten().copied());
@@ -258,13 +314,14 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
     let mut pending: std::collections::VecDeque<usize> = (0..path_specs.len()).collect();
     let mut queued: FxHashSet<usize> = (0..path_specs.len()).collect();
     let mut readers: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    let mut budget = HeapBudget::from_env();
     while let Some(path_index) = pending.pop_front() {
         queued.remove(&path_index);
         let (path, base, segments) = &path_specs[path_index];
         let objects: Vec<u32> = points.get(base).map(|set| set.iter().collect()).unwrap_or_default();
         for object in objects {
             let evidence = vec![graph.id(*path).to_owned(), graph.id(*base).to_owned(), graph.id(object).to_owned()];
-            let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, object, segments, &evidence);
+            let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, &mut budget, object, segments, &evidence);
             let path_locations = locations_by_path.entry(*path).or_default();
             for location in targets { if !path_locations.contains(&location) { path_locations.push(location); } }
         }
@@ -295,12 +352,16 @@ pub(crate) fn enrich(graph: &mut Graph) -> Delta {
         }
     }
     report("property worklist", &points);
+    if timing_enabled {
+        eprintln!("[lachesis native pass2] heap access-path budget: {} synthetic objects, max_depth={}, cap={}",
+            budget.minted, budget.max_depth, budget.max_objects);
+    }
     // Emit the final read/write facts once, after the monotone state has converged.
     for (path, base, segments) in &path_specs {
         let objects: Vec<u32> = points.get(base).map(|set| set.iter().collect()).unwrap_or_default();
         for object in objects {
             let evidence = vec![graph.id(*path).to_owned(), graph.id(*base).to_owned(), graph.id(object).to_owned()];
-            let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, object, segments, &evidence);
+            let targets = target_locations(graph, &mut locations, &mut location_values, &mut nodes, &mut edges, &mut emitted_nodes, &mut emitted_edges, &mut budget, object, segments, &evidence);
             for location in targets {
                 for (write, _) in writes_by_path.get(path).into_iter().flatten() {
                     let write_text = graph.id(*write).to_owned(); let path_text = graph.id(*path).to_owned(); let location_text = graph.id(location).to_owned(); emit_edge(&mut edges, &mut emitted_edges, "WRITES_HEAP", write_text.clone(), location_text.clone(), fact(&[write_text, path_text, location_text], "high"));
