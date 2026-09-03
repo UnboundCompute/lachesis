@@ -349,6 +349,36 @@ def native_match_leads(result) -> list[dict[str, Any]]:
     return leads
 
 
+def _semantic_shard_count() -> int:
+    """Batch count for WCC-cohesive semantic sharding, or 1 (whole-graph in-process).
+
+    Opt-in via ``LACHESIS_SEMANTIC_SHARDS`` so small/interactive callers keep the
+    single-pass path; a Linux-scale caller sets it to bound the O(graph) semantic
+    prepare+encode floor to ~1/k of the whole-graph peak (see
+    :func:`lachesis.flow.shard_enrich.run_semantic_sharded`).
+    """
+    try:
+        k = int(os.environ.get("LACHESIS_SEMANTIC_SHARDS", "1"))
+    except ValueError:
+        return 1
+    return k if k > 1 else 1
+
+
+def _publish_semantic(input_path, output_path, catalog_path) -> None:
+    """Produce the semantic sidecar + its compact event sibling at ``output_path``.
+
+    Sharded (WCC-cohesive, content-equivalent) when ``LACHESIS_SEMANTIC_SHARDS`` >
+    1, else the unchanged whole-graph in-process/isolated native pass. Both
+    branches publish ``output_path`` and ``output_path.events.pb``.
+    """
+    k = _semantic_shard_count()
+    if k > 1:
+        from lachesis.flow.shard_enrich import run_semantic_sharded
+        run_semantic_sharded(input_path, output_path, catalog_path, k=k)
+    else:
+        write_semantic_path(input_path, output_path, catalog_path)
+
+
 def ensure_native_semantic_sidecar(store, catalog_path=None):
     """Publish the Rust semantic sidecar without materializing the graph in Python."""
     base = _base(store)
@@ -360,7 +390,7 @@ def ensure_native_semantic_sidecar(store, catalog_path=None):
         # The Rust path publishes both the full semantic sidecar and its
         # compact event sibling in one invocation.  Do not immediately invoke
         # it a second time below on a cold cache.
-        write_semantic_path(input_path, output_path, catalog_path)
+        _publish_semantic(input_path, output_path, catalog_path)
     else:
         events_path = Path(f"{output_path}.events.pb")
         if not _sidecar_stale(events_path, input_path, output_path):
@@ -368,7 +398,7 @@ def ensure_native_semantic_sidecar(store, catalog_path=None):
         # Regenerate through Rust so the event-only sibling is published atomically.
         temporary = Path(f"{output_path}.events-migrate.{os.getpid()}.pb")
         try:
-            write_semantic_path(input_path, temporary, catalog_path)
+            _publish_semantic(input_path, temporary, catalog_path)
             generated = Path(f"{temporary}.events.pb")
             os.replace(generated, events_path)
         finally:

@@ -327,6 +327,402 @@ def _merge_records(shard_output_paths: list[str], owned: dict[int, set[str]]
                 # header frame (first per shard) is neither 'N' nor 'E'; skipped implicitly
 
 
+# ---------------------------------------------------------------------------
+# M8g part 2 -- WCC-cohesive sharding for the interprocedural semantic (Pass-3)
+# ---------------------------------------------------------------------------
+#
+# The semantic pass (``lachesis_lifetime_semantic_path``) holds every prepared
+# function AND the final ``NativeSemanticFunction`` vector resident at once (see
+# ``prepare.rs::semantic_request``); on a Linux-scale tree that O(graph) floor is
+# the last enrich OOM frontier after M8f bounded the split and the encode.
+#
+# Unlike Pass-2's hash sharding, the semantic pass is interprocedural -- a region
+# cone and its call seams span multiple functions -- so a hash split would sever
+# cones and lose coverage. Instead we shard by *weakly-connected component* of the
+# input graph: union every function whose nodes are joined by ANY cross-function
+# edge (a safe superset of the call/seam edges the semantic pass walks). Because a
+# WCC is closed under every cross-function edge, every call seam and every region
+# cone lies wholly inside one component, so:
+#
+#   * batching whole components together loses NO coverage -- each batch is a
+#     self-contained subgraph the unchanged native pass analyzes exactly as it
+#     would inside the whole graph (``pick_regions``/``call_graph``/``skeleton``
+#     see the identical induced call graph; the seeded shuffle only permutes the
+#     order regions are emitted, never the set);
+#   * components are disjoint, so the merge is a plain concatenation of the four
+#     repeated result fields (functions/seams/regions/skeletons) -- no function
+#     dedup, no signature replication, no body-drop that Pass-2's merge needed
+#     (both endpoints of every cross-function edge already co-locate in a batch);
+#   * peak residency tracks one batch (~total/k), and each subprocess ``prepare``s
+#     only its batch, so the O(graph) prepare floor falls ~1/k as well.
+#
+# Measured on a 678k-node C graph: 6000 components, max component 113 nodes
+# (0.02% of the graph) -- granular enough to bin-pack into k balanced batches with
+# per-batch peak ~1/k and zero coverage loss.
+
+
+def _uf_find(parent: dict[str, str], node: str) -> str:
+    root = node
+    while parent[root] != root:
+        root = parent[root]
+    while parent[node] != root:
+        parent[node], node = root, parent[node]
+    return root
+
+
+def _uf_union(parent: dict[str, str], a: str, b: str) -> None:
+    ra, rb = _uf_find(parent, a), _uf_find(parent, b)
+    if ra != rb:
+        parent[ra] = rb
+
+
+def partition_input_cohesive(input_path: str | os.PathLike[str], k: int,
+                             outdir: str | os.PathLike[str]
+                             ) -> tuple[list[str], dict[str, Any]]:
+    """Partition a Pass-2 input sidecar into ``k`` WCC-cohesive semantic batches.
+
+    Each batch is a union of whole weakly-connected components of the graph's
+    cross-function edge relation, so every call seam and region cone stays intra
+    batch and the unchanged semantic pass reproduces each function's result
+    byte-for-byte. Global/file nodes (and global-only edges) are replicated to
+    every batch so each batch sees the complete global substructure. Returns the
+    batch input paths and a stats dict.
+
+    The split is streaming: four seeking scans of the uncompressed input holding
+    only compact ``id -> owner`` / ``owner -> batch`` maps (sized by node/function
+    count), never the graph's frame bytes.
+    """
+    if k < 1:
+        raise ValueError("batch count k must be >= 1")
+    os.makedirs(outdir, exist_ok=True)
+    _ensure_fd_limit(k + 8)
+    src_path, is_temp = _decompress_to(input_path, outdir)
+
+    # id -> owning function id (a function node maps to itself); absent => global.
+    node_owner: dict[str, str] = {}
+    owner_count: dict[str, int] = {}   # function id -> owned node count (bin-pack weight)
+    node_total = 0
+    global_total = 0
+    writers: list[Any] = []
+    paths = [os.path.join(os.fspath(outdir), f"batch_{b}.pass2.input.pb") for b in range(k)]
+    try:
+        # Pass A -- nodes: owner map + per-function node weight.
+        with open(src_path, "rb") as fh:
+            first = True
+            for _off, payload in _iter_frames(fh):
+                if first:
+                    first = False
+                    continue
+                if payload[0:1] != b"N":
+                    continue
+                rec = graph_pb2.NodeRecord()
+                rec.ParseFromString(payload[1:])
+                node_total += 1
+                owner = _node_owner(rec)
+                if owner is not None:
+                    node_owner[rec.id] = owner
+                    owner_count[owner] = owner_count.get(owner, 0) + 1
+                elif rec.kind == "function":
+                    node_owner[rec.id] = rec.id
+                    owner_count[rec.id] = owner_count.get(rec.id, 0) + 1
+                else:
+                    global_total += 1
+
+        # Pass B -- edges: union owners joined by any cross-function edge.
+        parent: dict[str, str] = {fid: fid for fid in owner_count}
+        edge_total = 0
+        with open(src_path, "rb") as fh:
+            first = True
+            for _off, payload in _iter_frames(fh):
+                if first:
+                    first = False
+                    continue
+                if payload[0:1] != b"E":
+                    continue
+                rec = graph_pb2.EdgeRecord()
+                rec.ParseFromString(payload[1:])
+                edge_total += 1
+                o1 = node_owner.get(rec.source)
+                o2 = node_owner.get(rec.target)
+                if o1 is not None and o2 is not None and o1 != o2 \
+                        and o1 in parent and o2 in parent:
+                    _uf_union(parent, o1, o2)
+
+        # Components -> greedy bin-pack into k batches balanced by node weight.
+        components: dict[str, list[str]] = {}
+        for fid in owner_count:
+            components.setdefault(_uf_find(parent, fid), []).append(fid)
+        weighted = sorted(
+            ((sum(owner_count[m] for m in members), members)
+             for members in components.values()),
+            key=lambda item: -item[0])
+        import heapq
+        heap = [(0, b) for b in range(k)]
+        heapq.heapify(heap)
+        owner_batch: dict[str, int] = {}
+        batch_weight = [0] * k
+        for weight, members in weighted:
+            cur, b = heapq.heappop(heap)
+            for m in members:
+                owner_batch[m] = b
+            heapq.heappush(heap, (cur + weight, b))
+            batch_weight[b] += weight
+        max_wcc = weighted[0][0] if weighted else 0
+
+        # Pass C -- nodes: write each node to its batch; globals to every batch.
+        writers = [open(p, "wb") for p in paths]
+        batch_node_counts = [0] * k
+        with open(src_path, "rb") as fh:
+            first = True
+            for _off, payload in _iter_frames(fh):
+                if first:  # Document header frame -> every batch
+                    for w in writers:
+                        write_frame(w, payload)
+                    first = False
+                    continue
+                if payload[0:1] != b"N":
+                    continue
+                rec = graph_pb2.NodeRecord()
+                rec.ParseFromString(payload[1:])
+                owner = node_owner.get(rec.id)
+                if owner is None:  # global/file node -> every batch
+                    for w in writers:
+                        write_frame(w, payload)
+                    for b in range(k):
+                        batch_node_counts[b] += 1
+                else:
+                    b = owner_batch[owner]
+                    write_frame(writers[b], payload)
+                    batch_node_counts[b] += 1
+
+        # Pass D -- edges: route to the (single) batch owning a non-global
+        # endpoint; both function endpoints agree by WCC closure. A global-only
+        # edge goes to every batch so no batch loses global structure.
+        with open(src_path, "rb") as fh:
+            first = True
+            for _off, payload in _iter_frames(fh):
+                if first:
+                    first = False
+                    continue
+                if payload[0:1] != b"E":
+                    continue
+                rec = graph_pb2.EdgeRecord()
+                rec.ParseFromString(payload[1:])
+                o1 = node_owner.get(rec.source)
+                owner = o1 if o1 is not None else node_owner.get(rec.target)
+                if owner is None:
+                    for w in writers:
+                        write_frame(w, payload)
+                else:
+                    write_frame(writers[owner_batch[owner]], payload)
+    finally:
+        for w in writers:
+            w.close()
+        if is_temp:
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
+
+    return paths, {
+        "funcs": len(owner_count),
+        "nodes": node_total,
+        "global_nodes": global_total,
+        "edges": edge_total,
+        "batches": k,
+        "components": len(components),
+        "max_wcc_nodes": max_wcc,
+        "batch_weight": batch_weight,
+        "batch_node_counts": batch_node_counts,
+        "owner_batch": owner_batch,
+    }
+
+
+def _read_varint_fh(fh) -> tuple[int | None, bytes]:
+    """Decode one base-128 varint from a binary handle; return (value, raw_bytes).
+
+    ``(None, b"")`` signals a clean EOF at a field boundary.
+    """
+    raw = bytearray()
+    value = shift = 0
+    while True:
+        byte = fh.read(1)
+        if not byte:
+            if raw:
+                raise ValueError("truncated varint in semantic sidecar")
+            return None, b""
+        raw += byte
+        value |= (byte[0] & 0x7F) << shift
+        if not byte[0] & 0x80:
+            return value, bytes(raw)
+        shift += 7
+
+
+def _merge_semantic_sidecars(batch_paths: list[str], output_path: str) -> None:
+    """Wire-level streaming merge of per-batch ``NativeSemanticResult`` sidecars.
+
+    Concatenating serialized protobuf messages merges their fields, so the union
+    of disjoint batches is a byte concatenation of every length-delimited field
+    (functions=1, seams=3, regions=4, skeletons=5) with the scalar ``complete``
+    (field 2) recombined as a logical AND. Copies one field element at a time, so
+    residency stays bounded by the largest single element -- never a whole batch.
+    """
+    complete_all = True
+    tmp = f"{output_path}.merge.{os.getpid()}.tmp"
+    with open(tmp, "wb") as out:
+        for path in batch_paths:
+            batch_complete = False
+            with open(path, "rb") as fh:
+                while True:
+                    tag, tag_raw = _read_varint_fh(fh)
+                    if tag is None:
+                        break
+                    field, wire = tag >> 3, tag & 7
+                    if wire == 0:  # varint
+                        val, val_raw = _read_varint_fh(fh)
+                        if field == 2:  # complete: recombine as AND, don't copy
+                            batch_complete = bool(val)
+                        else:
+                            out.write(tag_raw)
+                            out.write(val_raw)
+                    elif wire == 2:  # length-delimited: copy tag+len+payload verbatim
+                        length, len_raw = _read_varint_fh(fh)
+                        out.write(tag_raw)
+                        out.write(len_raw)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = fh.read(min(1 << 20, remaining))
+                            if not chunk:
+                                raise ValueError("truncated field in semantic sidecar")
+                            out.write(chunk)
+                            remaining -= len(chunk)
+                    elif wire == 1:  # 64-bit
+                        out.write(tag_raw)
+                        out.write(fh.read(8))
+                    elif wire == 5:  # 32-bit
+                        out.write(tag_raw)
+                        out.write(fh.read(4))
+                    else:
+                        raise ValueError(f"unsupported wire type {wire}")
+            complete_all = complete_all and batch_complete
+        if complete_all:
+            out.write(b"\x10\x01")  # field 2 (complete) = true
+    os.replace(tmp, output_path)
+
+
+def _split_translation_facts(facts_src: str, owner_batch: dict[str, int],
+                             k: int, batch_bases: list[str]) -> None:
+    """Split a flat ``TranslationResult`` facts sidecar into per-batch siblings.
+
+    The facts must be the batch SUBSET -- ``reach`` emits a skeleton per
+    translation function, so passing the whole facts to every batch would emit
+    each non-batch function's reach skeletons k times. A function's facts entry
+    goes to the batch owning it; a facts function absent from the owner map
+    (should not happen -- facts functions are a subset of the graph's) falls to
+    batch 0 so nothing is dropped. Reads gzip or raw.
+    """
+    from lachesis.core import lifetime_pb2
+    whole = lifetime_pb2.TranslationResult()
+    whole.ParseFromString(_read_maybe_gzip_bytes(facts_src))
+    batches = [lifetime_pb2.TranslationResult() for _ in range(k)]
+    for function in whole.functions:
+        batches[owner_batch.get(function.id, 0)].functions.append(function)
+    for base, result in zip(batch_bases, batches):
+        with open(f"{base}.pass2.facts.pb", "wb") as fh:
+            fh.write(result.SerializeToString())
+
+
+def _read_maybe_gzip_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        head = fh.read(2)
+    if head == b"\x1f\x8b":
+        import gzip
+        with gzip.open(path, "rb") as fh:
+            return fh.read()
+    return Path(path).read_bytes()
+
+
+def run_semantic_sharded(input_path: str | os.PathLike[str],
+                         output_path: str | os.PathLike[str],
+                         catalog_path: str | os.PathLike[str] | None,
+                         *, k: int, workdir: str | os.PathLike[str] | None = None,
+                         keep_shards: bool = False) -> dict[str, Any]:
+    """Run the native semantic pass WCC-sharded and merge into one sidecar pair.
+
+    Publishes both ``output_path`` (the full ``NativeSemanticResult``) and its
+    compact ``output_path.events.pb`` sibling -- exactly what the whole-graph
+    ``write_semantic_path`` publishes -- by running each batch through the
+    unchanged native pass in an isolated subprocess (peak tracks one batch) and
+    concatenating the disjoint per-batch results. Returns the partition stats.
+
+    When a catalog is given the native pass reads two co-located siblings of the
+    input: the flat translation facts (``<base>.pass2.facts.pb``) and the taint
+    source-evidence overlay (``<base>.dataflow.pb``). Each batch is given the
+    batch-subset facts (split by the same WCC map) and a symlink to the WHOLE
+    dataflow overlay -- the overlay is keyed by node anchor, so a batch only ever
+    consults evidence for its own nodes, making the shared whole overlay
+    byte-equivalent to a per-batch split.
+    """
+    from lachesis.flow.native_lifetime import write_semantic_path
+
+    import tempfile
+    input_str = os.fspath(input_path)
+    owns_workdir = workdir is None
+    workdir = workdir or tempfile.mkdtemp(prefix="lachesis-shard-semantic-")
+    try:
+        batch_inputs, meta = partition_input_cohesive(input_path, k, workdir)
+        batch_bases = [p[: -len(".pass2.input.pb")] for p in batch_inputs]
+        owner_batch = meta.pop("owner_batch")
+
+        # Provision the sibling inputs the native pass resolves by input basename.
+        base_suffix = ".pass2.input.pb"
+        if catalog_path is not None and input_str.endswith(base_suffix):
+            src_base = input_str[: -len(base_suffix)]
+            facts_src = f"{src_base}.pass2.facts.pb"
+            substrate_src = f"{src_base}.pass3.substrate.pb"
+            if os.path.isfile(facts_src):
+                _split_translation_facts(facts_src, owner_batch, k, batch_bases)
+            elif os.path.isfile(substrate_src):
+                raise NotImplementedError(
+                    "semantic sharding needs the flat .pass2.facts.pb; substrate-"
+                    "only (deferred-facts) builds are not split yet")
+            dataflow_src = f"{src_base}.dataflow.pb"
+            if os.path.isfile(dataflow_src):
+                dataflow_abs = os.path.abspath(dataflow_src)
+                for base in batch_bases:
+                    link = f"{base}.dataflow.pb"
+                    try:
+                        os.symlink(dataflow_abs, link)
+                    except OSError:
+                        import shutil
+                        shutil.copy2(dataflow_abs, link)
+
+        semantic_outputs: list[str] = []
+        events_outputs: list[str] = []
+        for batch_in in batch_inputs:
+            batch_out = f"{batch_in}.pass3.semantic.pb"
+            write_semantic_path(batch_in, batch_out, catalog_path)
+            semantic_outputs.append(batch_out)
+            events_outputs.append(f"{batch_out}.events.pb")
+            if not keep_shards:
+                os.remove(batch_in)  # free the batch input as soon as it is consumed
+
+        _merge_semantic_sidecars(semantic_outputs, os.fspath(output_path))
+        _merge_semantic_sidecars(events_outputs, f"{os.fspath(output_path)}.events.pb")
+
+        if not keep_shards:
+            for path in (*semantic_outputs, *events_outputs):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        return meta
+    finally:
+        if owns_workdir and not keep_shards:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 def run_pass2_sharded(input_path: str | os.PathLike[str],
                       output_path: str | os.PathLike[str],
                       catalog_path: str | os.PathLike[str] | None,
