@@ -146,6 +146,12 @@ complete -c lachesis -n "__fish_seen_subcommand_from scan" -l json -l quiet -s q
 
 def command_query(args: argparse.Namespace) -> int:
     """Run the structured graph query parser without a REMAINDER passthrough."""
+    # Bind json at function entry. The except clause below references
+    # json.JSONDecodeError, and a later `import json` inside the format branch
+    # made json a function-local everywhere -- so a store-open failure hit the
+    # except with json unbound and raised UnboundLocalError instead of the clean
+    # one-line error every other verb gives on a bad graph path.
+    import json
     from lachesis.cli import query
     values = vars(args).copy()
     values["command"] = values.pop("query_command")
@@ -156,7 +162,6 @@ def command_query(args: argparse.Namespace) -> int:
         _stderr(json.dumps({"error": str(error), "query": query_args.command}))
         return EXIT_FAILURE
     if args.format == "json":
-        import json
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print(query.render_text(result), end="")
