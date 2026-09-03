@@ -289,10 +289,19 @@ def command_scan(args: argparse.Namespace) -> int:
                 rendered = _render(lead, position)
             else:
                 observations = lead.get("observations") or {}
+                # Always surface the file. The old form printed `{symbol}:{line}` from
+                # entry/callee only, so a temporal lead -- which carries no callee and no
+                # entry -- rendered as a location-less `:6`, dropping the one coordinate a
+                # reader needs to open it. Show `file:line` (the file is in observations),
+                # keeping the symbol ahead of it when there is one.
+                symbol = (lead.get("entry") or observations.get("callee")
+                          or observations.get("site") or "")
+                where = observations.get("file") or lead.get("file") or ""
+                line = lead.get("line") or observations.get("line") or ""
+                location = f"{where}:{line}" if where else f":{line}"
                 rendered = (f"{position:>3}. [{(lead.get('rank') or 0.0):.3f}] "
                             f"{lead.get('pattern') or lead.get('constructor') or 'lead'}  "
-                            f"{lead.get('entry') or observations.get('callee', '')}:"
-                            f"{lead.get('line') or observations.get('line', '')}")
+                            f"{symbol + '  ' if symbol else ''}{location}")
             print(_color(rendered, "cyan", args.color))
             print()
         if len(shown) < len(queue):
