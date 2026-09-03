@@ -300,6 +300,40 @@ def run_project(
     return graph, snapshots
 
 
+# Frontends whose one-process-per-invocation working set grows with the number of
+# translation units, so a Linux-scale tree must be split into bounded chunks. The
+# compiler-backed C frontend is the only one today; the TS/JS frontend bounds itself
+# through V8's heap ceiling and package sharding instead.
+_CHUNKED_FRONTENDS = frozenset({"clang-c"})
+
+
+def _include_directories(roots: Sequence[str]) -> List[str]:
+    """Every directory that holds a C source or header in ``roots``, sorted.
+
+    A chunk compiles only a subset of the tree's translation units, so the native
+    frontend's own include-path derivation (parent directories of the files it is
+    handed) would miss headers owned by another chunk. Handing it the whole tree's
+    directories restores single-process include resolution without a compile
+    database; with one the per-TU database arguments still take precedence.
+    """
+    directories = {os.path.dirname(os.path.abspath(path)) for path in roots}
+    return sorted(directory for directory in directories if directory)
+
+
+def _frontend_invocations(frontend_id, roots, chunk_size):
+    """Split one frontend's roots into ``(chunk_index, chunk_count, roots)`` units.
+
+    A frontend that is not memory-bound by translation-unit count, or a root set
+    that already fits one chunk, yields a single unit identical to the unchunked
+    build so small and mid-size projects are unaffected.
+    """
+    if frontend_id not in _CHUNKED_FRONTENDS or chunk_size < 1 or len(roots) <= chunk_size:
+        return [(0, 1, list(roots))]
+    chunks = [roots[start:start + chunk_size] for start in range(0, len(roots), chunk_size)]
+    count = len(chunks)
+    return [(index, count, list(chunk)) for index, chunk in enumerate(chunks)]
+
+
 def run_project_streaming(
     source_dir: str,
     shard_root: str,
@@ -324,26 +358,55 @@ def run_project_streaming(
         source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     snapshots = []
     readers = []
+    from .resources import c_chunk_files, frontend_jobs as configured_frontend_jobs
+    chunk_size = c_chunk_files()
     previous = os.environ.get("LACHESIS_SHARD_ROOT")
     os.environ["LACHESIS_SHARD_ROOT"] = shard_root
     try:
+        # Expand each frontend into one or more chunk invocations. A chunk streams
+        # into its own isolated shard set; the store-write pass stitches every set
+        # (cross-chunk symbol edges included) into one graph, so the emitted graph
+        # does not depend on where the chunk boundaries fall -- only the peak memory
+        # of the frontend process does. Unchunked frontends keep one invocation
+        # whose shard set lives at the historical <shard_root>/<frontend_id> path,
+        # leaving small and mid-size builds byte-for-byte unchanged.
         frontend_jobs = []
         for frontend_id in sorted(groups):
             frontend = registry.get(frontend_id)
-            frontend_output = os.path.join(output_root, frontend_id)
-            frontend_jobs.append((frontend_id, frontend, frontend_output,
-                                  groups[frontend_id]))
+            roots = groups[frontend_id]
+            units = _frontend_invocations(frontend_id, roots, chunk_size)
+            include_dirs = _include_directories(roots) if len(units) > 1 else None
+            for index, count, chunk_roots in units:
+                if count == 1:
+                    invocation_shard_root = shard_root
+                    frontend_output = os.path.join(output_root, frontend_id)
+                    extra_environment = None
+                else:
+                    invocation_shard_root = os.path.join(
+                        shard_root, f"{frontend_id}.chunk-{index:05d}")
+                    frontend_output = os.path.join(
+                        output_root, f"{frontend_id}.chunk-{index:05d}")
+                    extra_environment = {"LACHESIS_INCLUDE_DIRS_FILE": os.path.join(
+                        invocation_shard_root, "include-dirs.txt")}
+                    os.makedirs(invocation_shard_root, exist_ok=True)
+                    with open(extra_environment["LACHESIS_INCLUDE_DIRS_FILE"], "w") as handle:
+                        handle.write("\n".join(include_dirs or ()))
+                reader_path = os.path.join(invocation_shard_root, frontend_id, "shards.pb")
+                frontend_jobs.append((frontend, frontend_output, chunk_roots,
+                                      invocation_shard_root, extra_environment, reader_path))
 
         def run_frontend_job(job):
-            _frontend_id, frontend, frontend_output, roots = job
+            frontend, frontend_output, chunk_roots, invocation_shard_root, extra_environment, _ = job
             return run_frontend(
-                frontend, source_dir, frontend_output, timeout_seconds, roots=roots,
+                frontend, source_dir, frontend_output, timeout_seconds,
+                roots=chunk_roots, shard_root=invocation_shard_root,
+                extra_environment=extra_environment,
             )
 
         # Compiler heaps share one process-tree budget. Serial execution is the
-        # safe default; an explicitly larger LACHESIS_FRONTEND_JOBS retains the
-        # output-identical parallel schedule for runners with a larger budget.
-        from .resources import frontend_jobs as configured_frontend_jobs
+        # safe default -- it is exactly what bounds peak memory when a large tree
+        # is split into chunks; an explicitly larger LACHESIS_FRONTEND_JOBS retains
+        # the output-identical parallel schedule for runners with a larger budget.
         workers = min(len(frontend_jobs), configured_frontend_jobs())
         if workers > 1:
             from concurrent.futures import ThreadPoolExecutor
@@ -352,10 +415,10 @@ def run_project_streaming(
         else:
             frontend_snapshots = [run_frontend_job(job) for job in frontend_jobs]
 
-        for (frontend_id, _frontend, _frontend_output, _roots), snapshot in zip(
-                frontend_jobs, frontend_snapshots):
+        for job, snapshot in zip(frontend_jobs, frontend_snapshots):
+            reader_path = job[-1]
             snapshots.append(snapshot)
-            readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
+            readers.append(ShardSetReader(reader_path))
             snapshot.release()
     finally:
         if previous is None:

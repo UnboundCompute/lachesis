@@ -59,6 +59,41 @@ def typescript_stack_kb() -> int:
     return max(984, configured)
 
 
+def c_chunk_files() -> int:
+    """Translation units to compile per C-frontend process before starting a fresh one.
+
+    The native C frontend holds its whole invocation's symbol/edge working set in
+    memory, so a single process over a Linux-scale tree (tens of thousands of TUs)
+    exhausts RAM. Splitting the roots into bounded chunks and compiling each in a
+    fresh process caps the frontend's peak resident set at roughly one chunk's cost;
+    the store-write pass stitches the per-chunk shard sets back into one graph, so
+    the emitted graph is independent of the chunk boundary (only its peak memory is
+    not). ``LACHESIS_C_CHUNK_FILES`` overrides the derived value.
+
+    The default is derived from the process-tree memory budget using the measured
+    marginal cost of the C frontend (~1.15 MiB resident per TU over a ~350 MiB base).
+    The frontend is allotted ~55% of the budget so the store-write half and the
+    Python parent keep headroom, which is comfortably above the single-chunk size of
+    a typical project (so small and mid-size trees still build in one process,
+    byte-for-byte as before) while forcing a Linux-scale tree to split.
+    """
+    raw = os.environ.get("LACHESIS_C_CHUNK_FILES")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ValueError("LACHESIS_C_CHUNK_FILES must be a positive integer") from error
+        if value < 1:
+            raise ValueError("LACHESIS_C_CHUNK_FILES must be a positive integer")
+        return value
+    frontend_base_mb = 350.0
+    frontend_marginal_mb_per_tu = 1.15
+    frontend_share = 0.55
+    allotment = memory_budget_mb() * frontend_share - frontend_base_mb
+    derived = int(allotment / frontend_marginal_mb_per_tu)
+    return max(250, derived)
+
+
 def frontend_jobs() -> int:
     """Return bounded compiler concurrency; serial is the memory-safe default."""
     raw = os.environ.get("LACHESIS_FRONTEND_JOBS", "1")

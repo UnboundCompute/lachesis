@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from . import graph_pb2
@@ -325,7 +325,13 @@ def run_frontend(
     timeout_seconds: int = 300,
     roots: Optional[Sequence[str]] = None,
     keep_node: Optional[Callable[[dict], bool]] = None,
+    shard_root: Optional[str] = None,
+    extra_environment: Optional[Mapping[str, str]] = None,
 ) -> FrontendSnapshot:
+    # ``shard_root`` overrides LACHESIS_SHARD_ROOT for this one invocation without
+    # mutating the shared process environment, so a chunked build can stream each
+    # chunk into its own isolated shard set (and run chunks concurrently later)
+    # instead of every chunk racing on one global destination directory.
     started = time.perf_counter()
 
     def report(snapshot: FrontendSnapshot) -> FrontendSnapshot:
@@ -338,10 +344,10 @@ def run_frontend(
             )
         return snapshot
 
+    effective_shard_root = shard_root or os.environ.get("LACHESIS_SHARD_ROOT")
     if _in_process_applies(frontend, output_dir):
         snapshot = frontend.in_process(source_dir, roots)
-        _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"),
-                       keep_node=keep_node)
+        _persist_shard(snapshot, effective_shard_root, keep_node=keep_node)
         return report(snapshot)
     temporary = None
     if output_dir is None:
@@ -350,6 +356,10 @@ def run_frontend(
     os.makedirs(output_dir, exist_ok=True)
     environment = os.environ.copy()
     environment.update(frontend.environment)
+    if extra_environment:
+        environment.update(extra_environment)
+    if shard_root is not None:
+        environment["LACHESIS_SHARD_ROOT"] = shard_root
     # When discovery hands us an explicit root set (test files already excluded),
     # write it beside the output and point the frontend at it so a frontend that
     # re-walks the tree compiles exactly this list — one discovery, no drift.
@@ -376,10 +386,10 @@ def run_frontend(
                 f"{_describe_exit(completed.returncode)}\n"
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
-        shard_root = environment.get("LACHESIS_SHARD_ROOT")
-        if shard_root:
+        resolved_shard_root = environment.get("LACHESIS_SHARD_ROOT")
+        if resolved_shard_root:
             snapshot = _stream_bundle_to_shard(
-                output_dir, shard_root, completed.stdout, completed.stderr,
+                output_dir, resolved_shard_root, completed.stdout, completed.stderr,
                 keep_node=keep_node,
             )
         else:
