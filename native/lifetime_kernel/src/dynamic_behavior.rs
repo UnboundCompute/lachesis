@@ -9,23 +9,6 @@ use hashbrown::{HashMap, HashSet};
 use crate::graph_proto;
 use crate::pass2::{self, Delta, Graph};
 
-fn value_text(value: &graph_proto::Value) -> Option<&str> {
-    match value.kind.as_ref()? {
-        graph_proto::value::Kind::Text(value) => Some(value),
-        _ => None,
-    }
-}
-
-fn node_property<'a>(node: &'a pass2::Node, key: &str) -> Option<&'a graph_proto::Value> {
-    node.properties.iter().find_map(|field| {
-        (field.key == key).then(|| field.value.as_ref()).flatten()
-    })
-}
-
-fn text_property<'a>(node: &'a pass2::Node, key: &str) -> Option<&'a str> {
-    node_property(node, key).and_then(value_text)
-}
-
 fn fact(evidence: &[String], confidence: &str) -> Vec<graph_proto::Field> {
     vec![
         pass2::text_field("fact_origin", "core-inference"),
@@ -69,11 +52,11 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
         let kind = graph.kind(item.kind);
         if kind == "dynamic-behavior" {
             behavior_indices.push(index);
-            if let Some(site) = text_property(item, "site_id").and_then(|id| graph.symbol(id)) {
+            if let Some(site) = graph.node_property_text(item, "site_id").and_then(|id| graph.symbol(id)) {
                 explicit_by_site.entry(site).or_default().push(index);
             }
         } else if kind == "argument" {
-            if let Some(call) = text_property(item, "callsite_id").and_then(|id| graph.symbol(id)) {
+            if let Some(call) = graph.node_property_text(item, "callsite_id").and_then(|id| graph.symbol(id)) {
                 arguments_by_call.entry(call).or_default().push(item.id);
             }
         }
@@ -103,7 +86,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             }) },
             pass2::text_field("behavior_kind", "unresolved-call"),
             pass2::text_field("site_id", &call_id),
-            pass2::text_field("resolution", text_property(item, "resolution").unwrap_or("unresolved")),
+            pass2::text_field("resolution", graph.node_property_text(item, "resolution").unwrap_or("unresolved")),
         ];
         nodes.push(node(behavior_id.clone(), "dynamic-behavior", "unresolved-call".to_owned(), properties));
         edges.push(edge("DYNAMIC_BEHAVIOR_AT", &behavior_id, &call_id, fact(&[call_id.clone()], "unresolved")));
@@ -118,14 +101,14 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             unreachable!("generated behavior records are processed below")
         } else {
             let item = &graph.nodes[index];
-            let site = text_property(item, "site_id").and_then(|id| graph.symbol(id))
+            let site = graph.node_property_text(item, "site_id").and_then(|id| graph.symbol(id))
                 .or_else(|| graph.outgoing[graph.node_by_id[&item.id]].iter().find_map(|edge_index| {
                     let e = &graph.edges[*edge_index];
                     (graph.edge_kind(e) == "DYNAMIC_BEHAVIOR_AT").then_some(e.target)
                 }));
-            (graph.id(item.id).to_owned(), site, text_property(item, "behavior_kind").unwrap_or(graph.id(item.kind)),
-             text_property(item, "confidence").unwrap_or("unresolved"),
-             text_property(item, "key_value_id"), text_property(item, "target_id"))
+            (graph.id(item.id).to_owned(), site, graph.node_property_text(item, "behavior_kind").unwrap_or(graph.id(item.kind)),
+             graph.node_property_text(item, "confidence").unwrap_or("unresolved"),
+             graph.node_property_text(item, "key_value_id"), graph.node_property_text(item, "target_id"))
         };
         let site_text = site_id.map(|id| graph.id(id).to_owned());
         let mut evidence = vec![behavior_text.clone()];
