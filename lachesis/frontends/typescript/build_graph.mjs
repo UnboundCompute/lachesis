@@ -1580,6 +1580,17 @@ function exportMetadata(statement) {
 // `module` on each call node so the package check binds on real provenance.
 const importPackageByFile = new Map();
 
+// Locals aliased to a bare code-exec global -- `const f = Function`, `e = eval`,
+// or a later `x = Function` assignment. A call *through* the alias (`new f(src)`,
+// `e(code)`) is a code-injection sink exactly as the direct `Function(src)` would
+// be, but the callee text is the local name, so the std sink model never binds.
+// This per-file map lets the call-metadata extractor rewrite the effective callee
+// back to the global it aliases. Recorded name-level and flow-insensitively (any
+// assignment whose RHS is the `Function`/`eval` identifier), matching the engine's
+// conservative, over-approximate sink surfacing -- a lead for the judge, not a verdict.
+const execAliasByFile = new Map();
+const EXEC_GLOBALS = new Set(["Function", "eval"]);
+
 // CommonJS require() aliases resolve to the same bare package an ES import
 // would, so a call made *through* the alias must stamp `module` the same way.
 // Returns the bare package for `require('pkg')` or `require('pkg').member`
@@ -1685,6 +1696,36 @@ for (const fileName of analysisFileNames) {
       });
     }
   }
+}
+
+// Second pre-pass: collect locals aliased to a bare code-exec global anywhere in
+// the file body (nested, unlike the top-level import scan above). Two shapes:
+//   const/let/var f = Function;         (declarator initializer is the global)
+//   ctor = Function;  x = eval;         (plain assignment RHS is the global)
+// Recorded by name onto the file's alias map, consumed in extractCallMetadata.
+for (const fileName of analysisFileNames) {
+  const sf = program.getSourceFile(fileName);
+  if (!sf) continue;
+  const key = normalize(sf.fileName);
+  const record = (localName, globalName) => {
+    let m = execAliasByFile.get(key);
+    if (!m) { m = new Map(); execAliasByFile.set(key, m); }
+    m.set(localName, globalName);
+  };
+  const scan = (node) => {
+    if (ts.isVariableDeclaration(node) && node.initializer &&
+        ts.isIdentifier(node.initializer) && EXEC_GLOBALS.has(node.initializer.text) &&
+        ts.isIdentifier(node.name)) {
+      record(node.name.text, node.initializer.text);
+    } else if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left) && ts.isIdentifier(node.right) &&
+        EXEC_GLOBALS.has(node.right.text)) {
+      record(node.left.text, node.right.text);
+    }
+    ts.forEachChild(node, scan);
+  };
+  scan(sf);
 }
 
 function controlScopeKind(node) {
@@ -1961,7 +2002,8 @@ function callMetadata(node) {
   // The native binder reads this `module` property to gate package-qualified sink
   // models, preferring it over its receiver-text fallback.
   let moduleName = null;
-  const fileImports = importPackageByFile.get(normalize(node.getSourceFile().fileName));
+  const srcKey = normalize(node.getSourceFile().fileName);
+  const fileImports = importPackageByFile.get(srcKey);
   if (fileImports) {
     if (receiverNode && ts.isIdentifier(receiverNode)) {
       moduleName = fileImports.get(receiverNode.text) || null;
@@ -1969,8 +2011,18 @@ function callMetadata(node) {
       moduleName = fileImports.get(expression.text) || null;
     }
   }
+  // Resolve a bare-identifier callee that is a local alias of a code-exec global
+  // (`const f = Function; f(src)` / `new ctor(src)` where `ctor = Function`) back
+  // to the global, so the std code-injection sink model binds. The adapter reads
+  // `callee` first, so rewrite both it and `method_name`; only for a bare call/new
+  // (no receiver), never a member access, and never over an existing package bind.
+  let effectiveCallee = callee;
+  if (!receiverExpression && !moduleName && ts.isIdentifier(expression)) {
+    const g = execAliasByFile.get(srcKey)?.get(expression.text);
+    if (g) { effectiveCallee = g; methodName = g; }
+  }
   return {
-    callee,
+    callee: effectiveCallee,
     module: moduleName,
     form: ts.isNewExpression(node) ? "constructor" :
       receiverExpression ? "method" : "call",
