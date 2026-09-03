@@ -1737,10 +1737,20 @@ pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
             ).map_err(|error| format!("invalid binary pattern catalog: {error}"))?.pattern_catalog
         };
         let mapped = native_graph::map_path(input)?;
-        let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
-            .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
-        let matched = semantic_match::match_result_with_catalog(result, catalog.as_ref())
-            .encode_to_vec();
+        // The common skeleton path matches every skeleton independently and never
+        // reads the functions/seams payload, so stream the sidecar one skeleton at
+        // a time to bound the peak by the largest skeleton instead of the whole
+        // graph. Only when the sidecar takes the (rarer) stitched or per-function
+        // branch -- signalled by `None` -- do we decode it whole and run the
+        // original matcher, keeping that path byte-for-byte unchanged.
+        let matched = match semantic_match::match_streaming(mapped.as_ref(), catalog.as_ref()) {
+            Some(result) => result,
+            None => {
+                let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
+                    .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
+                semantic_match::match_result_with_catalog(result, catalog.as_ref())
+            }
+        }.encode_to_vec();
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, matched)
             .map_err(|error| format!("cannot write native match result: {error}"))?;
