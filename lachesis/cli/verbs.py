@@ -242,6 +242,15 @@ def command_analyze(args: argparse.Namespace) -> int:
                   f".dataflow.pb sidecar so analyze skips the tier), or raise --hard-stop.")
         else:
             print(f"  ! partial run: {len(summary['truncated_functions'])} functions truncated")
+    if summary["total"] == 0 and not summary["timed_out"]:
+        # analyze runs the interprocedural flow families only; a complete run that finds
+        # nothing is not "clean" -- the structural taxonomy (bounds/size/guard families) is
+        # a different pass. Point the reader there so a documented build->enrich->analyze
+        # walk does not end at a false zero when `candidates`/`scan` see 20-50 leads.
+        print(f"  0 flow leads is not 'clean': analyze covers the interprocedural flow "
+              f"families only. Run `lachesis candidates {args.graph}` (or "
+              f"`lachesis scan {args.graph}`) for the structural taxonomy those passes "
+              f"do not.")
     if summary["by_pattern"]:
         print("  by pattern: " + ", ".join(f"{name}={count}"
               for name, count in sorted(summary["by_pattern"].items())))
