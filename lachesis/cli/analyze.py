@@ -63,6 +63,68 @@ def _reap_stale_stream_temp(min_age_hours: float = 2.0) -> None:
             continue
 
 
+def _pid_is_live(pid: int) -> bool:
+    """True if a process with ``pid`` currently exists (signal 0 probes, kills nothing)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — treat as live, never reap its scratch.
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _reap_inplace_build_scratch(output_path: str, min_age_hours: float = 2.0) -> None:
+    """Remove orphaned build scratch left *beside the target graph* by a SIGKILLed run.
+
+    Unlike the system-temp scratch swept by :func:`_reap_stale_stream_temp`, several build
+    stages stage multi-GB intermediates in the *output directory itself* (next to the
+    ``.kuzu`` target): the native Pass-1 sidecar projector writes ``.pass1-<label>-<pid>``
+    node/edge files (``sidecar_project.rs``) and the Kùzu store stages ``.lachesis-stream-*``
+    / ``.lachesis-nodeunits-*`` directories there (``kuzu_store.py``). Their cleanup runs
+    only on a normal exit, so an OOM kill, an RSS/disk watchdog, or a hard ``^C^C`` orphans
+    them in place — this session saw ~8.4 GB of ``.pass1-*`` plus a 554 MB ``.lachesis-*``
+    survive a single killed build, exactly defeating the disk-health invariant.
+
+    The ``.pass1-*-<pid>`` names carry the producing PID, so those are reaped precisely: an
+    entry is removed only when its PID is no longer live, which is safe even while another
+    build runs concurrently (its files carry a different, live PID). The PID-less
+    ``.lachesis-*`` entries fall back to the same ``min_age_hours`` mtime gate used for the
+    temp sweep. Best-effort and silent: an entry that cannot be read or removed is skipped.
+    """
+    import shutil
+    import time
+
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    cutoff = time.time() - min_age_hours * 3600.0
+    try:
+        entries = os.listdir(out_dir)
+    except OSError:
+        return
+    for name in entries:
+        path = os.path.join(out_dir, name)
+        try:
+            if name.startswith(".pass1-"):
+                # ".pass1-<label>-<pid>": reap only if the producing process is gone.
+                tail = name.rsplit("-", 1)[-1]
+                if not tail.isdigit() or _pid_is_live(int(tail)):
+                    continue
+            elif name.startswith(".lachesis-stream-") or name.startswith(".lachesis-nodeunits-"):
+                if os.path.getmtime(path) > cutoff:
+                    continue
+            else:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            continue
+
+
 def _positive_int(value: str) -> int:
     """Argparse type that prevents silently useless zero/negative limits."""
     try:
@@ -291,6 +353,13 @@ def _run(argv: list[str] | None = None) -> None:
     # separate values. The compile runs unenriched and this folds the overlay itself.
     compile_enrich = False
 
+    # Reap orphaned scratch from any prior build that was SIGKILLed (OOM/watchdog/^C^C)
+    # before it could self-clean, so neither the system temp dir nor the output directory
+    # accumulates multi-GB leftovers run over run. Covers every build mode: the streamed,
+    # parallel, and incremental paths all stage intermediates that a hard kill orphans.
+    _reap_stale_stream_temp()
+    _reap_inplace_build_scratch(args.output_path)
+
     # Core-only builds do not need a materialized Python graph. Keep frontend
     # records in binary shards and stream them directly into Kùzu to bound RSS.
     if (
@@ -300,10 +369,6 @@ def _run(argv: list[str] | None = None) -> None:
         and not args.parallel_packages
         and not args.layered_out
     ):
-        # Reap orphaned scratch from any prior streamed build that was SIGKILLed
-        # (OOM/watchdog) before its TemporaryDirectory could self-clean, so the temp
-        # dir does not accumulate multi-GB leftovers run over run.
-        _reap_stale_stream_temp()
         with tempfile.TemporaryDirectory(prefix="lachesis-stream-") as stream_root:
             frontend_out = args.frontend_out or os.path.join(stream_root, "frontends")
             readers, snapshots = run_project_streaming(
