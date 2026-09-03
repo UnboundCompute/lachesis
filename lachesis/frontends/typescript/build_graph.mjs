@@ -1580,11 +1580,52 @@ function exportMetadata(statement) {
 // `module` on each call node so the package check binds on real provenance.
 const importPackageByFile = new Map();
 
+// CommonJS require() aliases resolve to the same bare package an ES import
+// would, so a call made *through* the alias must stamp `module` the same way.
+// Returns the bare package for `require('pkg')` or `require('pkg').member`
+// (a relative `require('./x')` is a local module, not a package -> null).
+function requirePackage(expr) {
+  let e = expr;
+  if (e && ts.isPropertyAccessExpression(e)) e = e.expression;   // `.member` of require
+  if (e && ts.isCallExpression(e) && ts.isIdentifier(e.expression) &&
+      e.expression.text === "require" && e.arguments.length === 1 &&
+      ts.isStringLiteralLike(e.arguments[0])) {
+    const spec = e.arguments[0].text;
+    if (spec.startsWith(".")) return null;
+    return spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+  }
+  return null;
+}
+
 for (const fileName of analysisFileNames) {
   const sf = program.getSourceFile(fileName);
   if (!sf) continue;
   const fileId = sourceFileIds.get(normalize(fileName));
   for (const statement of sf.statements) {
+    // record CommonJS require()-alias locals into the same map, mirroring the
+    // named-import binding below (local name is assumed to preserve the member
+    // name, exactly as `import { x }` binding does). Three shapes:
+    //   const cp  = require('m');       -> cp -> m   (whole module; cp.x(...) )
+    //   const {a} = require('m');       -> a  -> m
+    //   const a   = require('m').a;     -> a  -> m   (member alias; a(...) )
+    if (ts.isVariableStatement(statement)) {
+      for (const decl of statement.declarationList.declarations) {
+        if (!decl.initializer) continue;
+        const pkg = requirePackage(decl.initializer);
+        if (!pkg) continue;
+        const key = normalize(sf.fileName);
+        let fileMap = importPackageByFile.get(key);
+        if (!fileMap) { fileMap = new Map(); importPackageByFile.set(key, fileMap); }
+        if (ts.isIdentifier(decl.name)) {
+          fileMap.set(decl.name.text, pkg);
+        } else if (ts.isObjectBindingPattern(decl.name)) {
+          for (const el of decl.name.elements) {
+            if (ts.isIdentifier(el.name)) fileMap.set(el.name.text, pkg);
+          }
+        }
+      }
+      continue;
+    }
     if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
     if (!statement.moduleSpecifier || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
     const specifier = statement.moduleSpecifier.text;
