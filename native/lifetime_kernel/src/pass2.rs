@@ -450,7 +450,9 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
                     .map_err(|error| format!("invalid Pass-2 node frame: {error}"))?;
                 let id = symbols.intern(record.id);
                 let kind = symbols.intern(record.kind);
-                let properties = intern_node_props(&mut symbols, record.properties);
+                let mut raw = record.properties;
+                raw.retain(|field| !drop_node_property(&field.key));
+                let properties = intern_node_props(&mut symbols, raw);
                 nodes.push(Node { id, kind, label: record.label, properties });
             }
             b'E' => {
@@ -615,6 +617,33 @@ fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
     reader.read_exact(&mut payload)
         .map_err(|error| format!("cannot read Pass-2 frame: {error}"))?;
     Ok(payload)
+}
+
+/// Node-property keys never read by any Pass-2 overlay (`control_flow` …
+/// `taint` — the only consumers of the graph `read_path` builds) and never
+/// emitted into a derived record.  They are large per-node source metadata
+/// (`absolute_file`, `syntax_kind`, line/column spans, symbol form/linkage, …)
+/// consumed only by the *independent raw-frame readers* — `sidecar_project`
+/// (Pass-3 substrate) and `native_graph`/`prepare` (the semantic pass) — which
+/// decode the input sidecar directly and never touch this Graph, so pruning them
+/// here leaves the substrate and semantic outputs untouched.  Dropping them
+/// before `intern_node_props` bounds the Pass-2 arena (~40% of node-property
+/// value bytes on the cS corpus) with byte-exact `dataflow.pb` output.
+///
+/// This is a DENY-list, not the `retain_*` keep-list below (which is incomplete
+/// for the live chain — it omits e.g. `language`/`callee_name`/`receiver_type`
+/// that the taint overlay reads — and is applied only in the dead `read_bytes`
+/// path).  A deny-list is fail-safe: a forgotten dead key merely stays resident,
+/// never a dropped live key.  Every entry is proven absent from every overlay
+/// source and from `pass2.rs`, so no overlay can name it in any language.
+fn drop_node_property(key: &str) -> bool {
+    matches!(key,
+        "absolute_file" | "syntax_kind" | "usr" |
+        "start_line" | "end_line" | "start_column" | "end_column" |
+        "form" | "linkage" | "param_index" | "declaration_only" |
+        "content_hash" | "provenance" | "included_because" |
+        "lines" | "is_external" | "is_system"
+    )
 }
 
 fn retain_node_property(field: &graph_proto::Field) -> bool {
