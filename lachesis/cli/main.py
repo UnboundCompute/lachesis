@@ -600,6 +600,8 @@ def command_build(args: argparse.Namespace) -> int:
     from lachesis.cli import analyze
 
     forwarded = [args.source_dir, args.output_path, "--timeout", str(args.timeout)]
+    if args.memory_budget_mb is not None:
+        forwarded.extend(["--memory-budget-mb", str(args.memory_budget_mb)])
     if args.output_flag:
         forwarded.extend(["--output", args.output_flag])
     if args.frontend_out:
@@ -879,6 +881,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="keep lexical token/proof records (pruned by default)")
     build.add_argument("--timeout", type=_positive_seconds, default=300, metavar="SECONDS",
                        help="maximum seconds per frontend (default: 300)")
+    build.add_argument("--memory-budget-mb", type=_positive_int, default=None, metavar="MiB",
+                       help="total memory budget for the build process tree (default 5120). "
+                            "Sizes the frontend chunking so a Linux-scale tree builds without "
+                            "OOM; the emitted graph is identical at any budget. Same as "
+                            "LACHESIS_MEMORY_BUDGET_MB; the flag wins.")
     build.add_argument("--incremental", action="store_true",
                        help="reuse unchanged frontend bundles")
     build.add_argument("--parallel-packages", action="store_true",

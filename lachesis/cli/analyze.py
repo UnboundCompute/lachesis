@@ -135,6 +135,18 @@ def _run(argv: list[str] | None = None) -> None:
         help="stream core-only frontend shards directly into Kùzu",
     )
     parser.add_argument(
+        "--memory-budget-mb", type=_positive_int, default=None, metavar="MiB",
+        help="total memory budget for the whole build process tree, in MiB. The C "
+             "frontend is compiled in bounded per-chunk processes and the store is "
+             "written with bounded RSS, so a Linux-scale tree builds without OOM; this "
+             "is the single knob that sizes the chunking. The default (5120) suits a "
+             "laptop; raise it on a big box to compile more translation units per chunk "
+             "(fewer, larger frontend processes) and lower it on a constrained runner. "
+             "Equivalent to setting LACHESIS_MEMORY_BUDGET_MB; the flag wins if both "
+             "are given. The emitted graph is identical at any budget -- only where the "
+             "chunk boundaries fall, and thus peak memory, changes.",
+    )
+    parser.add_argument(
         "--include", metavar="PATH", action="append", default=None, dest="include_paths",
         help="also analyse this file or directory, even when it lies outside "
              "source_dir. Repeatable. This is the guided-scope guarantee: when a build "
@@ -146,6 +158,14 @@ def _run(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.output_flag is not None:
         args.output_path = args.output_flag
+    # The memory budget drives frontend chunk sizing (resources.c_chunk_files) and the
+    # TypeScript heap ceiling, both of which read the environment at build time. Setting
+    # it here -- before any pipeline call -- lets the flag stand in for the env var; the
+    # flag wins so an explicit `--memory-budget-mb` is never silently shadowed by an
+    # inherited LACHESIS_MEMORY_BUDGET_MB. An explicit LACHESIS_C_CHUNK_FILES still
+    # overrides the derived chunk size, exactly as it does without the flag.
+    if args.memory_budget_mb is not None:
+        os.environ["LACHESIS_MEMORY_BUDGET_MB"] = str(args.memory_budget_mb)
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
             "incremental manifest keys bundles by frontend, not by package")
