@@ -1587,6 +1587,61 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
     }
 }
 
+/// Serialize a `NativeSemanticResult` straight to `path` without ever holding its
+/// whole encoded byte buffer in memory.
+///
+/// `encode_to_vec` allocates one contiguous Vec the size of the entire sidecar
+/// (measured: 512 MB semantic + 350 MB events on a 678k-node graph) that coexists
+/// with the in-memory `full` graph at the serialize peak. This writes each field
+/// element into a small reusable scratch buffer and flushes it to a BufWriter, so
+/// only the largest single element is resident. The output is *byte-identical* to
+/// `result.encode_to_vec()`: prost's derived `encode_raw` emits fields in ascending
+/// tag order (functions=1, complete=2, seams=3, regions=4, skeletons=5), repeated
+/// elements in slice order, and omits a false `complete` -- this mirrors that
+/// exactly via the same `prost::encoding` primitives the derive calls.
+fn write_semantic_result_streaming(
+    result: &lifetime_proto::NativeSemanticResult, path: &str,
+) -> Result<(), String> {
+    use prost::encoding;
+    use std::io::Write;
+    let temporary = format!("{path}.tmp.{}", std::process::id());
+    let file = fs::File::create(&temporary)
+        .map_err(|error| format!("cannot create {path}: {error}"))?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut flush = |tag: u32, buf: &mut Vec<u8>, w: &mut std::io::BufWriter<fs::File>|
+        -> Result<(), String> {
+        w.write_all(buf).map_err(|error| format!("cannot write {path} field {tag}: {error}"))?;
+        buf.clear();
+        Ok(())
+    };
+    for function in &result.functions {
+        encoding::message::encode(1, function, &mut scratch);
+        flush(1, &mut scratch, &mut writer)?;
+    }
+    if result.complete {
+        encoding::bool::encode(2, &result.complete, &mut scratch);
+        flush(2, &mut scratch, &mut writer)?;
+    }
+    for seam in &result.seams {
+        encoding::message::encode(3, seam, &mut scratch);
+        flush(3, &mut scratch, &mut writer)?;
+    }
+    for region in &result.regions {
+        encoding::message::encode(4, region, &mut scratch);
+        flush(4, &mut scratch, &mut writer)?;
+    }
+    for skeleton in &result.skeletons {
+        encoding::message::encode(5, skeleton, &mut scratch);
+        flush(5, &mut scratch, &mut writer)?;
+    }
+    writer.flush().map_err(|error| format!("cannot flush {path}: {error}"))?;
+    drop(writer);
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("cannot publish {path}: {error}"))?;
+    Ok(())
+}
+
 /// Build a compact Rust-owned semantic event graph from the framed substrate.
 /// Only event nodes and control-flow edges are written to the output sidecar.
 #[no_mangle]
@@ -1709,17 +1764,13 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
-        let result = full.encode_to_vec();
-        report_native_phase(timing_enabled, semantic_started, "semantic serialize", 0, result.len());
-        let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, &result)
-            .map_err(|error| format!("cannot write semantic result: {error}"))?;
-        fs::rename(&temporary, output)
-            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
-        // The full sidecar is already durable. Release its encoded byte
-        // buffer before building the compact event projection so peak memory
-        // is not graph + full bytes + event bytes at once.
-        drop(result);
+        report_native_phase(timing_enabled, semantic_started, "semantic serialize", 0, full.encoded_len());
+        // Stream the sidecar to disk instead of building a whole-sidecar-sized Vec
+        // (encode_to_vec) that would coexist with `full` at the serialize peak.
+        // Byte-identical to `full.encode_to_vec()` (see write_semantic_result_streaming).
+        write_semantic_result_streaming(&full, output)?;
+        // The full sidecar is already durable. Build the compact event projection by
+        // MOVING full's fields (so the graph is not duplicated) and stream it too.
         let events = lifetime_proto::NativeSemanticResult {
             functions: full.functions.into_iter()
                 .filter_map(compact_event_function).collect(),
@@ -1727,13 +1778,9 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             seams: full.seams,
             regions: full.regions,
             skeletons: full.skeletons,
-        }.encode_to_vec();
+        };
         let events_output = format!("{output}.events.pb");
-        let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
-        fs::write(&events_temporary, events)
-            .map_err(|error| format!("cannot write semantic events: {error}"))?;
-        fs::rename(&events_temporary, events_output)
-            .map_err(|error| format!("cannot publish semantic events: {error}"))?;
+        write_semantic_result_streaming(&events, &events_output)?;
         Ok::<(), String>(())
     })();
     match result {
