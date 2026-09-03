@@ -2011,31 +2011,49 @@ function callMetadata(node) {
       moduleName = fileImports.get(expression.text) || null;
     }
   }
-  // Resolve a bare-identifier callee that is a local alias of a code-exec global
-  // (`const f = Function; f(src)` / `new ctor(src)` where `ctor = Function`) back
-  // to the global, so the std code-injection sink model binds. The adapter reads
-  // `callee` first, so rewrite both it and `method_name`; only for a bare call/new
-  // (no receiver), never a member access, and never over an existing package bind.
+  // Resolve a callee that is (or reflectively invokes) a code-exec global back to
+  // that global, so the std code-injection sink model binds. Two forms:
+  //   bare alias    `const f = Function; f(src)` / `new ctor(src)`  (ctor = Function)
+  //   reflective    `Function.apply(this, params)` / `eval.call(...)` -- and the
+  //                 same over a local alias of the global.
+  // The adapter reads `callee` first, so rewrite both it and `method_name`. The
+  // reflective form is normalized to a bare call (receiver nulled) so it matches
+  // the receiver-null std model exactly as a direct `Function(src)` would. Guarded
+  // to never override an existing package binding, so package-qualified sinks and
+  // ordinary member calls are untouched.
   let effectiveCallee = callee;
+  let effReceiverExpr = receiverExpression;
+  let effReceiverNode = receiverNode;
+  let effReceiverSymbolId = receiverSymbolId;
   if (!receiverExpression && !moduleName && ts.isIdentifier(expression)) {
     const g = execAliasByFile.get(srcKey)?.get(expression.text);
     if (g) { effectiveCallee = g; methodName = g; }
+  } else if (!moduleName && (methodName === "apply" || methodName === "call") &&
+             ts.isPropertyAccessExpression(expression) &&
+             ts.isIdentifier(expression.expression)) {
+    const recv = expression.expression.text;
+    const g = EXEC_GLOBALS.has(recv) ? recv : (execAliasByFile.get(srcKey)?.get(recv) || null);
+    if (g) {
+      effectiveCallee = g; methodName = g;
+      effReceiverExpr = null; effReceiverNode = null; effReceiverSymbolId = null;
+    }
   }
   return {
     callee: effectiveCallee,
     module: moduleName,
     form: ts.isNewExpression(node) ? "constructor" :
-      receiverExpression ? "method" : "call",
-    receiver_expression: receiverExpression,
-    receiver_symbol_id: receiverSymbolId,
-    receiver_value_id: receiverSymbolId || (receiverNode ? pathForNode(receiverNode) : null),
+      effReceiverExpr ? "method" : "call",
+    receiver_expression: effReceiverExpr,
+    receiver_symbol_id: effReceiverSymbolId,
+    receiver_value_id: effReceiverSymbolId || (effReceiverNode ? pathForNode(effReceiverNode) : null),
     receiver_call_id: (
+      effReceiverNode &&
       (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) &&
       ts.isCallExpression(expression.expression)
     ) ? bodyForNode(expression.expression) : null,
     method_name: methodName,
     computed_key_expression: computedKeyExpression,
-    receiver_type_facts: typeMetadata(receiverNode),
+    receiver_type_facts: typeMetadata(effReceiverNode),
     frontend_extensions: {
       typescript: callTypeExtensions(node),
     },
