@@ -190,8 +190,19 @@ def command_enrich(args: argparse.Namespace) -> int:
     print(f"catalog bind:  {report['bind_sidecar']}  "
           f"({'written' if report['bind_written'] else 'not cached'})")
     if not report["temporal_evaluated"]:
-        print("  ! temporal families were not evaluated within the budget -- the bind was not "
-              "fully warmed; rerun `lachesis enrich --hard-stop 0` to finish it unbounded")
+        if args.hard_stop == 0:
+            # The caller already ran unbounded (--hard-stop 0) and the temporal families
+            # still did not evaluate -- telling them to rerun the same command is the
+            # no-op they just ran. This is not a budget shortfall: the temporal pass did
+            # not complete on this graph. Say so, and do not point back at --hard-stop 0.
+            print("  ! temporal families were not evaluated even unbounded (--hard-stop 0): "
+                  "the temporal pass did not complete on this graph, so those families "
+                  "remain not-evaluated (not 'clean'). Reduce scope, or wait for the "
+                  "lifetime pass to land.")
+        else:
+            print("  ! temporal families were not evaluated within the budget -- the bind was "
+                  "not fully warmed; rerun `lachesis enrich --hard-stop 0` to finish it "
+                  "unbounded")
     return EXIT_OK
 
 
