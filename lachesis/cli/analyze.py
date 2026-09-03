@@ -156,6 +156,16 @@ def _run(argv: list[str] | None = None) -> None:
              "kept; a directory is walked with the same ignore rules as source_dir.",
     )
     args = parser.parse_args(argv)
+    # Validate the source tree up front. Without this the streaming build path
+    # happily runs against a nonexistent path or a single file, finds no frontend
+    # to stream, and still exits 0 with "Streamed 0 frontends" -- a silent empty
+    # graph that every later verb then "succeeds" against. Fail here the way the
+    # scan/index path already does (cli/indexer.py: "is not a directory").
+    if not os.path.isdir(args.source_dir):
+        parser.error(
+            f"source_dir is not a directory: {args.source_dir}\n"
+            "  build reads a source tree; point it at an existing directory "
+            "(a single file or a typo'd path cannot be built).")
     if args.output_flag is not None:
         args.output_path = args.output_flag
     # The memory budget drives frontend chunk sizing (resources.c_chunk_files) and the
@@ -210,6 +220,11 @@ def _run(argv: list[str] | None = None) -> None:
                 args.source_dir, args.stream_shards, frontend_out,
                 timeout_seconds=args.timeout, include_paths=include_paths,
             )
+        if not snapshots:
+            parser.error(
+                f"no supported source files under {args.source_dir}: refusing "
+                "to write an empty graph. Point build at a tree containing C, "
+                "Python, or TypeScript sources.")
         stored = write_kuzu_shards(
             CompositeShardReader(readers), args.output_path, snapshots,
             prune=args.prune,
@@ -253,6 +268,11 @@ def _run(argv: list[str] | None = None) -> None:
                 args.source_dir, stream_root, frontend_out,
                 timeout_seconds=args.timeout, include_paths=include_paths,
             )
+            if not snapshots:
+                parser.error(
+                    f"no supported source files under {args.source_dir}: refusing "
+                    "to write an empty graph. Point build at a tree containing C, "
+                    "Python, or TypeScript sources.")
             stored = write_kuzu_shards(
                 CompositeShardReader(readers), args.output_path, snapshots,
                 prune=args.prune,
