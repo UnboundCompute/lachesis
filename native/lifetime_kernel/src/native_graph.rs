@@ -1003,7 +1003,15 @@ struct CompactNode {
     id: String,
     kind: String,
     label: String,
-    properties: HashMap<String, String>,
+    // Whitelisted node properties as a compact linear slice.  Keys are the
+    // 18 static literals accepted by `compact_node`, so they carry no heap and
+    // no per-key allocation; values are boxed strings (16B fat pointer vs a
+    // 24B `String`).  Replaces a per-node `HashMap<String, String>` -- at
+    // Linux scale that was ~1.5M tiny, over-allocated hash tables dominating
+    // the translation-projection peak.  Lookups (`compact_property`) scan this
+    // slice, which holds at most ~8 entries, and preserve the original
+    // last-write-wins semantics of the map insert, so results are byte-exact.
+    properties: Box<[(&'static str, Box<str>)]>,
 }
 
 fn compact_path_name(nodes: &HashMap<String, CompactNode>, root: &str) -> String {
@@ -1024,25 +1032,52 @@ struct CompactEdge {
 }
 
 fn compact_node(record: graph_proto::NodeRecord) -> CompactNode {
-    let properties = record.properties.into_iter().filter_map(|field| {
-        if !matches!(field.key.as_str(),
-            "syntax_kind" | "owner_function_id" | "function_id" | "start_line" |
-            "start_offset" | "primary_target_id" | "callee" | "receiver" |
-            "is_alloc" | "is_release" | "is_realloc" | "is_aggregate_copy" |
-            "type" | "operator" | "storage_class" | "linkage" | "exported" | "file") {
-            return None;
-        }
-        let value = field.value?.kind?;
-        let value = match value {
-            graph_proto::value::Kind::Text(value) => value,
-            graph_proto::value::Kind::Integer(value) => value.to_string(),
-            graph_proto::value::Kind::Real(value) => value.to_string(),
-            graph_proto::value::Kind::Boolean(value) => value.to_string(),
-            _ => return None,
+    let mut properties: Vec<(&'static str, Box<str>)> = Vec::new();
+    for field in record.properties {
+        // Intern the key to its static literal; anything off the whitelist is
+        // dropped exactly as before.
+        let key: &'static str = match field.key.as_str() {
+            "syntax_kind" => "syntax_kind",
+            "owner_function_id" => "owner_function_id",
+            "function_id" => "function_id",
+            "start_line" => "start_line",
+            "start_offset" => "start_offset",
+            "primary_target_id" => "primary_target_id",
+            "callee" => "callee",
+            "receiver" => "receiver",
+            "is_alloc" => "is_alloc",
+            "is_release" => "is_release",
+            "is_realloc" => "is_realloc",
+            "is_aggregate_copy" => "is_aggregate_copy",
+            "type" => "type",
+            "operator" => "operator",
+            "storage_class" => "storage_class",
+            "linkage" => "linkage",
+            "exported" => "exported",
+            "file" => "file",
+            _ => continue,
         };
-        Some((field.key, value))
-    }).collect();
-    CompactNode { id: record.id, kind: record.kind, label: record.label, properties }
+        let value = match field.value.and_then(|value| value.kind) {
+            Some(graph_proto::value::Kind::Text(value)) => value,
+            Some(graph_proto::value::Kind::Integer(value)) => value.to_string(),
+            Some(graph_proto::value::Kind::Real(value)) => value.to_string(),
+            Some(graph_proto::value::Kind::Boolean(value)) => value.to_string(),
+            _ => continue,
+        };
+        // Preserve the map's last-write-wins on a repeated key so lookups stay
+        // byte-identical even if the substrate ever emits a key twice.
+        if let Some(slot) = properties.iter_mut().find(|(existing, _)| *existing == key) {
+            slot.1 = value.into_boxed_str();
+        } else {
+            properties.push((key, value.into_boxed_str()));
+        }
+    }
+    CompactNode {
+        id: record.id,
+        kind: record.kind,
+        label: record.label,
+        properties: properties.into_boxed_slice(),
+    }
 }
 
 fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
@@ -1227,7 +1262,9 @@ fn scan_lifetime_metadata<R: Read>(
 }
 
 fn compact_property<'a>(node: &'a CompactNode, key: &str) -> Option<&'a str> {
-    node.properties.get(key).map(String::as_str)
+    node.properties.iter()
+        .find(|(existing, _)| *existing == key)
+        .map(|(_, value)| value.as_ref())
 }
 
 fn compact_kind(node: &CompactNode) -> &str {
