@@ -47,6 +47,7 @@ import base64
 import collections
 import hashlib
 import itertools
+import json
 import os
 import re
 import shutil
@@ -66,6 +67,7 @@ from lachesis.core import graph_pb2
 from lachesis.indices import (
     CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
     build_decl_and_callsite_index, exported_ids, index_rows,
+    stream_decl_and_callsite_rows,
 )
 
 try:  # optional dependency; only needed to actually write a DB (3.10+ venv)
@@ -1492,17 +1494,22 @@ def _index_cell(column: str, value, codes: dict):
     return value
 
 
-def _load_index_bulk(conn, table_name: str, columns: tuple, rows: list, *,
+def _load_index_bulk(conn, table_name: str, columns: tuple, rows, *,
                      stage_dir: str, id_codes: Optional[dict] = None) -> None:
-    if not rows:
-        return
     codes = id_codes or {}
     # Partition the COPY the same way nodes and edges are: one COPY over the whole
     # index overflows Kùzu's bounded buffer pool at multi-million-row scale.  ``seq``
     # stays globally continuous across partitions so the loaded rows are identical.
-    total = len(rows)
-    for offset in range(0, total, STREAM_EDGE_COPY_PARTITION_ROWS):
-        chunk = rows[offset:offset + STREAM_EDGE_COPY_PARTITION_ROWS]
+    # ``rows`` is consumed once as an iterable -- a list still works (the
+    # non-streaming writer passes one), but a spill iterator never materializes the
+    # whole index in memory.
+    row_iter = iter(rows)
+    offset = 0
+    partition = 0
+    while True:
+        chunk = list(itertools.islice(row_iter, STREAM_EDGE_COPY_PARTITION_ROWS))
+        if not chunk:
+            break
         staged = {"seq": pa.array(
             list(range(offset, offset + len(chunk))), pa.int64())}
         for column in columns:
@@ -1514,11 +1521,12 @@ def _load_index_bulk(conn, table_name: str, columns: tuple, rows: list, *,
                     [None if cell is None else int(cell) for cell in cells], pa.int64())
             else:
                 staged[column] = _str_col(cells)
-        partition = offset // STREAM_EDGE_COPY_PARTITION_ROWS
         path = os.path.join(stage_dir, f"{table_name.lower()}.{partition}.parquet")
         pq.write_table(pa.table(staged), path)
         conn.execute(f"COPY {table_name} FROM '{path}'")
         os.unlink(path)
+        offset += len(chunk)
+        partition += 1
 
 
 # -- per-row fallback (no pyarrow): same output, one CREATE per row ------------
@@ -1621,10 +1629,8 @@ def _load_deferred_rowwise(conn, deferred: list[dict], *, elide: bool,
         raise
 
 
-def _load_index_rowwise(conn, table_name: str, columns: tuple, rows: list, *,
+def _load_index_rowwise(conn, table_name: str, columns: tuple, rows, *,
                         id_codes: Optional[dict] = None) -> None:
-    if not rows:
-        return
     codes = id_codes or {}
     placeholders = ", ".join(["seq: $seq"] + [f"{c}: ${c}" for c in columns])
     stmt = f"CREATE (r:{table_name} {{{placeholders}}})"
@@ -1719,6 +1725,95 @@ class _NodeUnitStore:
 
     def count(self) -> int:
         return self._count
+
+    def close(self) -> None:
+        try:
+            self._db.close()
+        finally:
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+
+
+class _IndexSpill:
+    """Disk-backed accumulator for one persisted index (DeclIndex or CallsiteIndex).
+
+    ``build_decl_and_callsite_index`` grouped every index row by name in Python
+    dicts and sorted them in place -- a third O(nodes) peak (~71 KB/TU, ~2 GiB at
+    30k TUs), the store-write's ceiling once the node maps moved to disk. This
+    holds the rows in SQLite instead and reproduces the exact same ordering on the
+    way out.
+
+    The final order ``index_rows(_ordered(index))`` is a total sort by
+    ``(name, file, line, node_id)`` -- names grouped and sorted, rows within a name
+    sorted by ``(file or "", line or 0, node_id or "")``. ``node_id`` is unique
+    within one index, so the key never ties and the order is fully determined. The
+    normalized sort keys are stored as their own columns (the same ``or ""``/``or 0``
+    coalescing Python applied) and a covering index makes ``ORDER BY`` stream them
+    straight from the B-tree, so neither the rows nor the sort buffer live in RAM.
+    The full row is preserved verbatim as a JSON payload, so every value -- ``None``,
+    booleans, strings -- round-trips exactly.
+    """
+
+    _INSERT_BATCH = 20_000
+
+    def __init__(self, directory: str, name_field: str) -> None:
+        self._name_field = name_field
+        self._path = os.path.join(directory, f"index_{name_field}.sqlite")
+        self._db = sqlite3.connect(self._path)
+        self._db.execute("PRAGMA journal_mode=OFF")
+        self._db.execute("PRAGMA synchronous=OFF")
+        # The ORDER BY may external-sort while the covering index is built; keep that
+        # spill on disk (not MEMORY) so the sort cannot become the RSS this replaces.
+        self._db.execute("PRAGMA temp_store=FILE")
+        self._db.execute("PRAGMA cache_size=-65536")  # ~64 MiB page cache
+        self._db.execute(
+            "CREATE TABLE row(skname TEXT, skfile TEXT, skline INTEGER, "
+            "sknode TEXT, payload TEXT)")
+        self._pending: list = []
+        self._count = 0
+        self._sealed = False
+
+    def add(self, row: dict) -> None:
+        self._pending.append((
+            row.get(self._name_field),
+            row.get("file") or "",
+            row.get("line") or 0,
+            row.get("node_id") or "",
+            json.dumps(row),
+        ))
+        self._count += 1
+        if len(self._pending) >= self._INSERT_BATCH:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        self._db.executemany(
+            "INSERT INTO row(skname, skfile, skline, sknode, payload) "
+            "VALUES (?, ?, ?, ?, ?)", self._pending)
+        self._pending.clear()
+
+    def _seal(self) -> None:
+        if self._sealed:
+            return
+        self._flush()
+        self._db.execute(
+            "CREATE INDEX row_order ON row(skname, skfile, skline, sknode)")
+        self._db.commit()
+        self._sealed = True
+
+    def count(self) -> int:
+        return self._count
+
+    def ordered(self):
+        """Yield the rows in ``index_rows(_ordered(...))`` order, one at a time."""
+        self._seal()
+        cursor = self._db.execute(
+            "SELECT payload FROM row ORDER BY skname, skfile, skline, sknode")
+        for (payload,) in cursor:
+            yield json.loads(payload)
 
     def close(self) -> None:
         try:
@@ -2262,21 +2357,38 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         store = None
         shutil.rmtree(store_dir, ignore_errors=True)
     index_stage.close()
+    # Spill the declaration/callsite index rows to disk instead of grouping them in
+    # Python dicts.  ``build_decl_and_callsite_index`` held every row in memory and
+    # sorted in place -- the third O(nodes) peak (~71 KB/TU, ~2 GiB at 30k TUs) and,
+    # once the node maps moved to disk, the store-write's ceiling.  Each row is
+    # streamed straight into an ``_IndexSpill``, which reproduces the exact
+    # ``index_rows(_ordered(...))`` order with an index-backed ``ORDER BY`` so neither
+    # the rows nor the sort buffer live in RAM.  Output is byte-identical: the same
+    # ``_decl_row``/``_callsite_row`` per node in the same order, the same total sort.
+    index_spill_dir = tempfile.mkdtemp(
+        prefix=".lachesis-indexspill-", dir=os.path.dirname(target_db_dir))
+    decl_spill = _IndexSpill(index_spill_dir, "name")
+    callsite_spill = _IndexSpill(index_spill_dir, "callee_name")
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
-    decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
-    decl_rows = index_rows(decl_index)
-    callsite_rows = index_rows(callsite_index)
+    stream_decl_and_callsite_rows(
+        indexed_nodes, exported,
+        on_decl=decl_spill.add, on_callsite=callsite_spill.add)
     os.unlink(index_stage.name)
+    decl_index_count = decl_spill.count()
+    callsite_index_count = callsite_spill.count()
     if bulk:
-        _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
+        _load_index_bulk(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_spill.ordered(),
                          stage_dir=stage.name, id_codes=id_codes)
         _load_index_bulk(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
-                         callsite_rows, stage_dir=stage.name, id_codes=id_codes)
+                         callsite_spill.ordered(), stage_dir=stage.name, id_codes=id_codes)
     else:
-        _load_index_rowwise(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_rows,
+        _load_index_rowwise(conn, "DeclIndex", _DECL_INDEX_COLUMNS, decl_spill.ordered(),
                             id_codes=id_codes)
         _load_index_rowwise(conn, "CallsiteIndex", _CALLSITE_INDEX_COLUMNS,
-                            callsite_rows, id_codes=id_codes)
+                            callsite_spill.ordered(), id_codes=id_codes)
+    decl_spill.close()
+    callsite_spill.close()
+    shutil.rmtree(index_spill_dir, ignore_errors=True)
     timing("build and load indices")
     if stage is not None:
         stage.cleanup()
@@ -2285,7 +2397,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         "node_count": kept_node_count, "edge_count": kept_edge_count,
         "unresolved_edge_count": unresolved_count,
         "dropped_node_count": 0, "deferred_edge_count": 0,
-        "decl_index_count": len(decl_rows), "callsite_index_count": len(callsite_rows),
+        "decl_index_count": decl_index_count, "callsite_index_count": callsite_index_count,
         "streamed": True, "enriched": False, "pruned": bool(prune),
         PROPS_DICT_KEY: "", ID_PREFIX_KEY: sorted(prefixes),
     })
