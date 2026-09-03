@@ -84,13 +84,28 @@ fn append_native_delta(
     writer.append(&delta)
 }
 
+fn current_rss_mb() -> i64 {
+    // Measurement-only: shell out to `ps` for this process' RSS. Cheap enough at
+    // ~a dozen calls per run and avoids adding a mach/libc dependency. Returns -1
+    // if unavailable so the timeline line still prints.
+    let pid = std::process::id();
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|kb| kb / 1024)
+        .unwrap_or(-1)
+}
+
 fn report_native_phase(
     enabled: bool, started: std::time::Instant, name: &str,
     nodes: usize, edges: usize,
 ) {
     if enabled {
-        eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges)",
-            started.elapsed().as_secs_f64(), nodes, edges);
+        eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges) rss={}MB",
+            started.elapsed().as_secs_f64(), nodes, edges, current_rss_mb());
     }
 }
 
@@ -285,8 +300,8 @@ fn run_native_overlay_chain(
     let started = std::time::Instant::now();
     let mut graph = pass2::read_path(input)?;
     if timing_enabled {
-        eprintln!("[lachesis native pass2] read graph: {:.3}s ({} nodes, {} edges)",
-            started.elapsed().as_secs_f64(), graph.nodes.len(), graph.edges.len());
+        eprintln!("[lachesis native pass2] read graph: {:.3}s ({} nodes, {} edges) rss={}MB",
+            started.elapsed().as_secs_f64(), graph.nodes.len(), graph.edges.len(), current_rss_mb());
     }
     let mut writer = pass2::DataflowStreamWriter::begin(
         output, &input.to_string_lossy(), &graph.core_content_hash,
