@@ -30,9 +30,18 @@ emitting every edge from exactly one shard):
   ``taint``) are empty or file-local, so their union is exact. A projection-based global
   step for languages that exercise them is future work (see the M8B design note).
 
+The split itself is *streaming*: :func:`partition_input` decompresses the gzip input to a
+temp file once, then makes two seeking passes holding only a compact ``id -> (offset, len,
+shard, is_body)`` index -- never the graph's frame bytes -- writing each node straight to
+its shard and re-reading a foreign edge endpoint by ``seek`` when it must be replicated.
+The merge streams each shard output frame-by-frame too. So neither the whole input nor a
+whole shard ever lands in RAM; Python residency scales with node *count* (a small index),
+not input size.
+
 Verified content-set exact (0 missing / 0 extra nodes and edges) versus the whole-graph
 baseline on two C graphs (6.3k and 678k input nodes); per-shard peak RSS ~10x below the
-whole-graph peak on the larger one.
+whole-graph peak on the larger one, and the partition step's own residency cut from
+~1.9 GB (whole-input buffering) to the index alone.
 """
 
 from __future__ import annotations
@@ -68,26 +77,51 @@ _LOCAL_EDGE_KINDS = frozenset({
 _FRAME = struct.Struct(">I")
 
 
-def _read_framed(path: str | os.PathLike[str], *, magic: bytes | None = None) -> list[bytes]:
-    """Read a length-prefixed frame file into a list of raw frame payloads.
+def _iter_frames(fh, *, magic: bytes | None = None) -> Iterator[tuple[int, bytes]]:
+    """Stream ``(payload_offset, payload)`` frames from a seekable binary handle.
 
-    ``magic`` (when given) is stripped from the front first; the Pass-2 *input* sidecar
-    has no magic, the dataflow *output* stream has ``DATAFLOW_STREAM_MAGIC``.
+    ``magic`` (when given) is consumed from the front if present. This holds only one
+    frame at a time -- the whole point of the streaming split -- so a Linux-scale input
+    never lands in RAM. The offset lets a later pass re-read one node frame by ``seek``
+    (used to replicate a foreign edge endpoint without buffering the graph).
     """
-    raw = Path(path).read_bytes()
-    if raw[:2] == b"\x1f\x8b":  # gzip-wrapped sidecar
-        import gzip
-        raw = gzip.decompress(raw)
-    if magic is not None and raw[: len(magic)] == magic:
-        raw = raw[len(magic):]
-    frames: list[bytes] = []
-    off, n = 0, len(raw)
-    while off + 4 <= n:
-        (ln,) = _FRAME.unpack_from(raw, off)
-        off += 4
-        frames.append(raw[off: off + ln])
-        off += ln
-    return frames
+    if magic is not None:
+        head = fh.read(len(magic))
+        if head[: len(magic)] != magic:
+            fh.seek(0)
+    while True:
+        lb = fh.read(4)
+        if len(lb) < 4:
+            break
+        (ln,) = _FRAME.unpack(lb)
+        off = fh.tell()
+        payload = fh.read(ln)
+        if len(payload) < ln:
+            break
+        yield off, payload
+
+
+def _decompress_to(input_path: str | os.PathLike[str], workdir: str | os.PathLike[str]
+                   ) -> tuple[str, bool]:
+    """Return a seekable *uncompressed* copy of ``input_path`` and whether it is temporary.
+
+    The Pass-2 input sidecar is gzip-wrapped; random ``seek`` for endpoint replication
+    needs an uncompressed, seekable file. Decompression streams in fixed-size chunks, so
+    peak stays bounded regardless of input size. A non-gzip input is used in place.
+    """
+    with open(input_path, "rb") as fh:
+        head = fh.read(2)
+    if head != b"\x1f\x8b":
+        return os.fspath(input_path), False
+    import gzip
+    tmp = os.path.join(os.fspath(workdir), "_input.uncompressed.pb")
+    with gzip.open(input_path, "rb") as src, open(tmp, "wb") as dst:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            dst.write(chunk)
+    return tmp, True
 
 
 def _node_owner(record: graph_pb2.NodeRecord) -> str | None:
@@ -111,6 +145,21 @@ def _shard_of_owner(owner: str, k: int) -> int:
     return zlib.crc32(owner.encode("utf-8")) % k
 
 
+def _ensure_fd_limit(needed: int) -> None:
+    """Raise the soft open-file limit if a large ``k`` needs more handles than allowed.
+
+    All ``k`` shard writers stay open across both partition passes; on macOS the default
+    soft limit is 256, so a big shard count would otherwise hit EMFILE. Best-effort.
+    """
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY and soft < needed:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(needed, soft), hard), hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def partition_input(input_path: str | os.PathLike[str], k: int,
                     outdir: str | os.PathLike[str]) -> tuple[list[str], dict[str, Any]]:
     """Partition a Pass-2 input sidecar into ``k`` self-sufficient shards.
@@ -123,84 +172,111 @@ def partition_input(input_path: str | os.PathLike[str], k: int,
     """
     if k < 1:
         raise ValueError("shard count k must be >= 1")
-    frames = _read_framed(input_path)
-    header = frames[0]
-
-    frame_of: dict[str, bytes] = {}
-    kind_of: dict[str, str] = {}
-    id_shard: dict[str, int | None] = {}
-    owner_shard: dict[str, int] = {}
-    edges: list[tuple[str, str, bytes]] = []
-
-    for fr in frames[1:]:
-        if not fr:
-            continue
-        tag = fr[0:1]
-        if tag == b"N":
-            rec = graph_pb2.NodeRecord()
-            rec.ParseFromString(fr[1:])
-            frame_of[rec.id] = fr
-            kind_of[rec.id] = rec.kind
-            owner = _node_owner(rec)
-            if owner is not None:
-                id_shard[rec.id] = _shard_of_owner(owner, k)
-                owner_shard.setdefault(owner, id_shard[rec.id])
-            elif rec.kind == "function":
-                s = _shard_of_owner(rec.id, k)
-                id_shard[rec.id] = s
-                owner_shard.setdefault(rec.id, s)
-            else:
-                id_shard[rec.id] = None  # global/file -> replicate to all shards
-        elif tag == b"E":
-            rec = graph_pb2.EdgeRecord()
-            rec.ParseFromString(fr[1:])
-            edges.append((rec.source, rec.target, fr))
-
-    shard_nodes: list[set[str]] = [set() for _ in range(k)]
-    shard_edges: list[list[bytes]] = [[] for _ in range(k)]
-    for nid, s in id_shard.items():
-        if s is None:
-            for a in range(k):
-                shard_nodes[a].add(nid)
-        else:
-            shard_nodes[s].add(nid)
-
-    repl = 0
-    for src, tgt, fr in edges:
-        ss = id_shard.get(src)
-        ts = id_shard.get(tgt)
-        canon = ss if ss is not None else (ts if ts is not None else 0)
-        skip = False
-        for nid in (src, tgt):
-            if nid in frame_of and nid not in shard_nodes[canon] and kind_of.get(nid) in _BODY_KINDS:
-                skip = True
-                break
-        if skip:
-            continue
-        for nid in (src, tgt):
-            if nid in frame_of and nid not in shard_nodes[canon]:
-                shard_nodes[canon].add(nid)
-                repl += 1
-        shard_edges[canon].append(fr)
-
     os.makedirs(outdir, exist_ok=True)
-    paths: list[str] = []
-    for s in range(k):
-        p = os.path.join(os.fspath(outdir), f"shard_{s}.pass2.input.pb")
-        with open(p, "wb") as fh:
-            write_frame(fh, header)
-            for nid in shard_nodes[s]:
-                write_frame(fh, frame_of[nid])
-            for fr in shard_edges[s]:
-                write_frame(fh, fr)
-        paths.append(p)
+    _ensure_fd_limit(k + 8)
+    src_path, is_temp = _decompress_to(input_path, outdir)
+
+    _GLOBAL = -1  # present in every shard (global/file node), never replicated per-edge
+    # id -> (payload_offset, payload_len, shard, is_body); NO frame bytes retained.
+    info: dict[str, tuple[int, int, int, bool]] = {}
+    owner_shard: dict[str, int] = {}
+    shard_counts = [0] * k
+    node_total = 0
+
+    paths = [os.path.join(os.fspath(outdir), f"shard_{s}.pass2.input.pb") for s in range(k)]
+    writers = [open(p, "wb") for p in paths]
+    try:
+        # Pass 1 -- stream nodes: index each node, write it straight to its shard(s).
+        with open(src_path, "rb") as fh:
+            first = True
+            for off, payload in _iter_frames(fh):
+                if first:  # the Document header frame
+                    for w in writers:
+                        write_frame(w, payload)
+                    first = False
+                    continue
+                if payload[0:1] != b"N":
+                    continue
+                rec = graph_pb2.NodeRecord()
+                rec.ParseFromString(payload[1:])
+                node_total += 1
+                is_body = rec.kind in _BODY_KINDS
+                owner = _node_owner(rec)
+                if owner is not None:
+                    shard = _shard_of_owner(owner, k)
+                    owner_shard.setdefault(owner, shard)
+                elif rec.kind == "function":
+                    shard = _shard_of_owner(rec.id, k)
+                    owner_shard.setdefault(rec.id, shard)
+                else:
+                    shard = _GLOBAL
+                info[rec.id] = (off, len(payload), shard, is_body)
+                if shard == _GLOBAL:
+                    for w in writers:
+                        write_frame(w, payload)
+                    for s in range(k):
+                        shard_counts[s] += 1
+                else:
+                    write_frame(writers[shard], payload)
+                    shard_counts[shard] += 1
+
+        # Pass 2 -- stream edges: place each edge in one shard, replicating a foreign
+        # (non-global, non-body) endpoint by seeking its node frame back out of src_path.
+        repl = 0
+        edge_total = 0
+        repl_sets: list[set[str]] = [set() for _ in range(k)]
+        with open(src_path, "rb") as fh, open(src_path, "rb") as rf:
+            first = True
+            for _off, payload in _iter_frames(fh):
+                if first:
+                    first = False
+                    continue
+                if payload[0:1] != b"E":
+                    continue
+                rec = graph_pb2.EdgeRecord()
+                rec.ParseFromString(payload[1:])
+                edge_total += 1
+                sm = info.get(rec.source)
+                tm = info.get(rec.target)
+                ss = None if (sm is None or sm[2] == _GLOBAL) else sm[2]
+                ts = None if (tm is None or tm[2] == _GLOBAL) else tm[2]
+                canon = ss if ss is not None else (ts if ts is not None else 0)
+                # Never drag a foreign function BODY across a shard seam.
+                skip = False
+                for m in (sm, tm):
+                    if m is None or m[2] == _GLOBAL or m[2] == canon:
+                        continue
+                    if m[3]:  # is_body
+                        skip = True
+                        break
+                if skip:
+                    continue
+                for nid, m in ((rec.source, sm), (rec.target, tm)):
+                    if m is None or m[2] == _GLOBAL or m[2] == canon:
+                        continue
+                    if nid in repl_sets[canon]:
+                        continue
+                    rf.seek(m[0])
+                    write_frame(writers[canon], rf.read(m[1]))
+                    repl_sets[canon].add(nid)
+                    repl += 1
+                    shard_counts[canon] += 1
+                write_frame(writers[canon], payload)
+    finally:
+        for w in writers:
+            w.close()
+        if is_temp:
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
 
     return paths, {
         "funcs": len(owner_shard),
-        "nodes": len(frame_of),
-        "edges": len(edges),
+        "nodes": node_total,
+        "edges": edge_total,
         "repl_node_insertions": repl,
-        "shard_node_counts": [len(shard_nodes[s]) for s in range(k)],
+        "shard_node_counts": shard_counts,
         "owner_shard": owner_shard,
     }
 
@@ -225,29 +301,30 @@ def _merge_records(shard_output_paths: list[str], owned: dict[int, set[str]]
     for i, path in enumerate(shard_output_paths):
         own = owned.get(i, set())
         cfg_owner: dict[str, str] = {}  # local-overlay node id -> function id
-        for fr in _read_framed(path, magic=DATAFLOW_STREAM_MAGIC):
-            if not fr:
-                continue
-            tag = fr[0:1]
-            if tag == b"N":
-                rec = graph_pb2.NodeRecord()
-                rec.ParseFromString(fr[1:])
-                if rec.kind in _LOCAL_NODE_KINDS:
-                    fid = _local_owner(rec)
-                    if fid is not None:
-                        cfg_owner[rec.id] = fid
-                        if fid not in own:
+        with open(path, "rb") as fh:
+            for _off, fr in _iter_frames(fh, magic=DATAFLOW_STREAM_MAGIC):
+                if not fr:
+                    continue
+                tag = fr[0:1]
+                if tag == b"N":
+                    rec = graph_pb2.NodeRecord()
+                    rec.ParseFromString(fr[1:])
+                    if rec.kind in _LOCAL_NODE_KINDS:
+                        fid = _local_owner(rec)
+                        if fid is not None:
+                            cfg_owner[rec.id] = fid
+                            if fid not in own:
+                                continue
+                    yield fr
+                elif tag == b"E":
+                    rec = graph_pb2.EdgeRecord()
+                    rec.ParseFromString(fr[1:])
+                    if rec.kind in _LOCAL_EDGE_KINDS:
+                        fid = cfg_owner.get(rec.source) or cfg_owner.get(rec.target)
+                        if fid is not None and fid not in own:
                             continue
-                yield fr
-            elif tag == b"E":
-                rec = graph_pb2.EdgeRecord()
-                rec.ParseFromString(fr[1:])
-                if rec.kind in _LOCAL_EDGE_KINDS:
-                    fid = cfg_owner.get(rec.source) or cfg_owner.get(rec.target)
-                    if fid is not None and fid not in own:
-                        continue
-                yield fr
-            # header frames (first per shard) are neither 'N' nor 'E'; skipped implicitly
+                    yield fr
+                # header frame (first per shard) is neither 'N' nor 'E'; skipped implicitly
 
 
 def run_pass2_sharded(input_path: str | os.PathLike[str],
