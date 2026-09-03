@@ -950,7 +950,11 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("graph", help="path to a .kuzu graph")
     query.add_argument("--budget-tokens", type=_positive_int, default=12000,
                        metavar="N", help="approximate answer budget")
-    query.add_argument("--format", choices=("json", "text"), default="json")
+    # Default to text like every other verb (scan/analyze/candidates emit text unless
+    # --json). query alone used to default to json, which surprised a reader who ran it
+    # after the others; pass --format json to restore the machine-readable document.
+    query.add_argument("--format", choices=("json", "text"), default="text",
+                       help="output format (default: text; use json for a machine-readable slice)")
     query_commands = query.add_subparsers(dest="query_command", metavar="<question>",
                                           required=True)
     query_commands.add_parser("overview", help="summarize the graph")
