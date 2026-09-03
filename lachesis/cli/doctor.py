@@ -105,6 +105,26 @@ def check_kuzu() -> Check:
                      "python -m pip install --force-reinstall lachesis-cpg")
 
 
+def _from_wheel(lib_path: Path) -> bool:
+    """True when the native kernel was loaded out of an installed wheel.
+
+    A wheel unpacks under ``site-packages`` / ``dist-packages``; a source checkout loads
+    the same library out of the repo's ``native/`` build tree or an editable install.
+    The distinction decides which remedy to name: ``pip install`` fixes a wheel, but a
+    source checkout has no wheel to reinstall -- it rebuilds the kernel with cargo.
+    """
+    parts = {part.lower() for part in lib_path.parts}
+    return "site-packages" in parts or "dist-packages" in parts
+
+
+def _rebuild_fix(lib_path: Path) -> str:
+    """The remedy for a native/Python version mismatch, phrased for the actual install."""
+    if _from_wheel(lib_path):
+        return "reinstall the platform wheel: python -m pip install --force-reinstall lachesis-cpg"
+    return ("source checkout: rebuild the kernel with `cargo build --release` in "
+            "native/lifetime_kernel, then reinstall editable (pip install -e .)")
+
+
 def check_native_kernel() -> Check:
     """Verify that the one analysis kernel used by every scan can be loaded."""
     try:
@@ -136,7 +156,7 @@ def check_native_kernel() -> Check:
                 return Check(
                     "native-kernel", False,
                     f"kernel {stamp} does not match package {_version()}",
-                    "reinstall the platform wheel so Python and Rust versions match",
+                    _rebuild_fix(existing[0]),
                     required=False,
                 )
         elif loaded:
@@ -147,7 +167,7 @@ def check_native_kernel() -> Check:
         return Check("native-kernel", True, detail)
     return Check(
         "native-kernel", False, detail,
-        "reinstall the platform wheel or run cargo build --release in native/lifetime_kernel",
+        _rebuild_fix(existing[0]),
     )
 
 
