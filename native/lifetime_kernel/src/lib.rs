@@ -68,6 +68,22 @@ fn absorb_native_delta(
     graph.absorb(delta)
 }
 
+/// Publish a terminal overlay's delta to the stream without absorbing it back into
+/// the in-RAM graph.  The stream is written from the canonicalized `Delta` here,
+/// exactly as `absorb_native_delta` does before it calls `absorb`, so the emitted
+/// bytes are identical.  `absorb` only mutates the resident graph so that a *later*
+/// overlay can observe the facts; the final overlay in the chain has no later
+/// reader, so absorbing its delta merely grows the arena at the chain's peak moment
+/// (the graph is dropped immediately after `finish`).  Skipping that absorb removes
+/// the last, largest delta's retained cost from the peak with zero output change.
+fn append_native_delta(
+    mut delta: pass2::Delta,
+    writer: &mut pass2::DataflowStreamWriter,
+) -> Result<(), String> {
+    delta.canonicalize();
+    writer.append(&delta)
+}
+
 fn report_native_phase(
     enabled: bool, started: std::time::Instant, name: &str,
     nodes: usize, edges: usize,
@@ -314,7 +330,9 @@ fn run_native_overlay_chain(
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "async-events", writer.nodes, writer.edges);
     let delta = taint::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    // Terminal overlay: publish to the stream but do not absorb — nothing reads
+    // taint's facts, and this is the chain's peak, so absorbing here is pure cost.
+    append_native_delta(delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "taint-propagation", writer.nodes, writer.edges);
     writer.finish()
 }
