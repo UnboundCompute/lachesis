@@ -50,6 +50,7 @@ import itertools
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -1644,6 +1645,91 @@ def _load_index_rowwise(conn, table_name: str, columns: tuple, rows: list, *,
         raise
 
 
+class _NodeUnitStore:
+    """Disk-backed replacement for the two graph-sized maps of the streamed load.
+
+    The streamed materialization kept ``kept_ids`` (every retained node id) and
+    ``node_units`` (node id -> unit code) as Python containers. Both are O(nodes)
+    and, unlike the Kùzu buffer pool and the batched Arrow staging, unbounded --
+    so at Linux-kernel scale they, not the native working set, become the peak and
+    the OOM. This holds the same two facts in one SQLite table keyed by node id:
+    a row's presence means "kept", its ``unit`` column carries the unit code (NULL
+    for a kept node with no ``file``, exactly as an absent ``node_units`` entry did).
+
+    Callers no longer probe one id at a time. ``lookup(ids)`` answers a whole edge
+    batch's endpoints in one query, returning ``{id: unit}`` for the present ones --
+    membership is ``id in result`` and the unit is ``result.get(id)``, byte-for-byte
+    the decisions ``id in kept_ids`` and ``node_units.get(id)`` made before. The
+    commutative content hash is order-invariant, so batching the lookups cannot move
+    the digest.
+    """
+
+    _INSERT_BATCH = 50_000
+
+    def __init__(self, directory: str) -> None:
+        self._path = os.path.join(directory, "node_units.sqlite")
+        self._db = sqlite3.connect(self._path)
+        # Ephemeral, single-writer, rebuilt from shards on every run: durability is
+        # irrelevant, so trade all of it for load speed. WITHOUT ROWID keeps the id
+        # in the primary index only, halving the per-row footprint on disk.
+        self._db.execute("PRAGMA journal_mode=OFF")
+        self._db.execute("PRAGMA synchronous=OFF")
+        self._db.execute("PRAGMA temp_store=MEMORY")
+        self._db.execute("PRAGMA cache_size=-262144")  # ~256 MiB page cache
+        self._db.execute(
+            "CREATE TABLE node(id TEXT PRIMARY KEY, unit INTEGER) WITHOUT ROWID")
+        self._pending: list[tuple[str, object]] = []
+        self._count = 0
+
+    def add(self, node_id: str, unit: Optional[int]) -> None:
+        self._pending.append((node_id, unit))
+        self._count += 1
+        if len(self._pending) >= self._INSERT_BATCH:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        self._db.executemany(
+            "INSERT OR REPLACE INTO node(id, unit) VALUES (?, ?)", self._pending)
+        self._pending.clear()
+
+    def seal(self) -> None:
+        """Finish inserts before the lookup phase begins."""
+        self._flush()
+        self._db.commit()
+
+    def lookup(self, ids) -> dict:
+        """Map every present id in ``ids`` to its unit code (NULL -> None).
+
+        One query per call; the caller passes a whole batch's endpoint ids. The
+        returned dict's keys are exactly the ids that are present, so ``in`` on it
+        reproduces ``in kept_ids`` and ``.get`` reproduces ``node_units.get``.
+        """
+        result: dict = {}
+        ids = list(ids)
+        # SQLite caps a statement at 999 host parameters by default; chunk under it.
+        for start in range(0, len(ids), 900):
+            chunk = ids[start:start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            for row_id, unit in self._db.execute(
+                    f"SELECT id, unit FROM node WHERE id IN ({placeholders})", chunk):
+                result[row_id] = unit
+        return result
+
+    def count(self) -> int:
+        return self._count
+
+    def close(self) -> None:
+        try:
+            self._db.close()
+        finally:
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+
+
 def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool = True,
                       overwrite: bool = True) -> str:
     """Materialize a streaming shard reader without a whole graph dictionary."""
@@ -1735,7 +1821,18 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     index_stage = tempfile.NamedTemporaryFile(mode="wb", prefix="lachesis-index-",
                                                delete=False)
     binary_shards = callable(getattr(shard_reader, "raw_nodes", None))
+    # The streamed binary path is the Linux-scale path, and ``kept_ids`` +
+    # ``node_units`` are its only unbounded terms -- back them with a disk store
+    # instead of RAM. The legacy dict path keeps the in-memory maps unchanged: it
+    # is the small/non-streaming build and not where scale bites, so it stays
+    # byte-identical with no rewrite. ``store`` is populated only for the binary
+    # path; the maps below stay empty there.
+    store: Optional[_NodeUnitStore] = None
+    store_dir: Optional[str] = None
     if binary_shards:
+        store_dir = tempfile.mkdtemp(prefix=".lachesis-nodeunits-",
+                                     dir=os.path.dirname(target_db_dir))
+        store = _NodeUnitStore(store_dir)
         for payload in shard_reader.raw_nodes():
             node = graph_pb2.NodeRecord()
             node.ParseFromString(payload)
@@ -1743,18 +1840,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if prune and kind in PRUNE_NODE_KINDS:
                 continue
             node_id = node.id
-            kept_ids.add(node_id)
             hash_node(node_id)
             file_value = _proto_promoted_value(node.properties, "file")
             compiler_id = _proto_promoted_value(node.properties, "compiler_node_id")
-            if file_value:
-                node_units[node_id] = unit_code(file_value)
+            store.add(node_id, unit_code(file_value) if file_value else None)
             for value in (node_id, compiler_id):
                 match = _ID_SHAPE.match(value) if isinstance(value, str) else None
                 if match:
                     prefixes.add(match.group(1))
             if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
                 write_frame(index_stage, payload)
+        store.seal()
     else:
         for node in shard_reader.nodes(headers_only=True):
             kind = node.get("kind")
@@ -1867,16 +1963,22 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 batch = [decode_node(node.SerializeToString()) for node in batch]
             _load_nodes_rowwise(conn, batch, elide=True, codec=codec, id_codes=id_codes)
 
-    def load_edges(batch: list[dict]) -> None:
+    def load_edges(batch: list[dict], units: Optional[dict] = None) -> None:
+        # The binary path no longer keeps a graph-sized ``node_units`` map; it hands
+        # in the small per-batch ``units`` dict (the same edge endpoints just looked
+        # up from the disk store). ``units.get(source)`` returns the identical unit
+        # code the global map held, so the emitted ``unit`` column is unchanged. The
+        # dict path passes nothing and keeps using the in-memory ``node_units``.
         if not batch:
             return
+        edge_units = node_units if units is None else units
         if bulk:
             table_builder = (_edge_tables_proto if isinstance(
                 batch[0], graph_pb2.EdgeRecord) else _edge_tables)
             table_kwargs = ({"unit_names": unit_names}
                             if isinstance(batch[0], graph_pb2.EdgeRecord) else {})
             for kind, table in table_builder(
-                batch, elide=True, node_units=node_units,
+                batch, elide=True, node_units=edge_units,
                 **table_kwargs,
                 codec=codec, id_codes=id_codes,
             ).items():
@@ -1894,7 +1996,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         else:
             if isinstance(batch[0], graph_pb2.EdgeRecord):
                 batch = [decode_edge(edge.SerializeToString()) for edge in batch]
-            _load_edges_rowwise(conn, batch, elide=True, node_units=node_units,
+            _load_edges_rowwise(conn, batch, elide=True, node_units=edge_units,
                                 codec=codec, id_codes=id_codes)
 
     batch = []
@@ -1944,35 +2046,65 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             os.unlink(path)
     timing("load nodes")
 
-    batch = []
     kept_edge_count = 0
-    edge_records = shard_reader.raw_edges() if binary_edges else shard_reader.edges()
-    for item in edge_records:
-        if binary_edges:
+    if binary_edges:
+        # Endpoint filtering used to probe the graph-sized ``kept_ids`` set once per
+        # edge. With that set on disk, probe a whole batch's endpoints in one store
+        # query instead: buffer raw edges, resolve every endpoint's presence+unit in
+        # ``present``, then make the identical per-edge decisions over it. The content
+        # hash is commutative, so folding edges batch-by-batch lands the same digest a
+        # single-edge stream did; ``present`` doubles as the per-batch unit map handed
+        # to ``load_edges``. The reconstruction bookkeeping below is unchanged.
+        raw_edges: list = []
+
+        def flush_binary_edges() -> None:
+            nonlocal unresolved_count, kept_edge_count
+            if not raw_edges:
+                return
+            endpoint_ids = set()
+            for e in raw_edges:
+                endpoint_ids.add(e.source)
+                endpoint_ids.add(e.target)
+            present = store.lookup(endpoint_ids)
+            survivors: list = []
+            for edge in raw_edges:
+                if edge.kind == "EXPORTS" and edge.target:
+                    exported.add(edge.target)
+                if edge.source not in present or edge.target not in present:
+                    unresolved_count += 1
+                    continue
+                hash_edge(edge.kind, edge.source, edge.target)
+                if (edge.kind == "REFERS_TO"
+                        and _proto_promoted_value(edge.properties, "reason")
+                        == "prototype-of"):
+                    existing_proto.add((edge.source, edge.target))
+                elif edge.kind == "INVOKES":
+                    invokes_target[edge.source] = edge.target
+                elif edge.kind == "HAS_ARGUMENT":
+                    pos = _proto_promoted_value(edge.properties, "position")
+                    if isinstance(pos, int) and not isinstance(pos, bool):
+                        call_arguments.setdefault(edge.source, []).append(
+                            (pos, edge.target))
+                elif edge.kind == "DECLARES_VALUE":
+                    declared_values.setdefault(edge.source, []).append(edge.target)
+                elif edge.kind == "ARGUMENT_BINDS_PARAMETER":
+                    existing_bind.add((edge.source, edge.target))
+                survivors.append(edge)
+                kept_edge_count += 1
+            if survivors:
+                load_edges(survivors, present)
+            raw_edges.clear()
+
+        for item in shard_reader.raw_edges():
             edge = graph_pb2.EdgeRecord()
             edge.ParseFromString(item)
-            if edge.kind == "EXPORTS" and edge.target:
-                exported.add(edge.target)
-            if edge.source not in kept_ids or edge.target not in kept_ids:
-                unresolved_count += 1
-                continue
-            hash_edge(edge.kind, edge.source, edge.target)
-            if (edge.kind == "REFERS_TO"
-                    and _proto_promoted_value(edge.properties, "reason")
-                    == "prototype-of"):
-                existing_proto.add((edge.source, edge.target))
-            elif edge.kind == "INVOKES":
-                invokes_target[edge.source] = edge.target
-            elif edge.kind == "HAS_ARGUMENT":
-                pos = _proto_promoted_value(edge.properties, "position")
-                if isinstance(pos, int) and not isinstance(pos, bool):
-                    call_arguments.setdefault(edge.source, []).append(
-                        (pos, edge.target))
-            elif edge.kind == "DECLARES_VALUE":
-                declared_values.setdefault(edge.source, []).append(edge.target)
-            elif edge.kind == "ARGUMENT_BINDS_PARAMETER":
-                existing_bind.add((edge.source, edge.target))
-        else:
+            raw_edges.append(edge)
+            if len(raw_edges) >= edge_batch_rows:
+                flush_binary_edges()
+        flush_binary_edges()
+    else:
+        batch = []
+        for item in shard_reader.edges():
             edge = item
             if edge.get("kind") == "EXPORTS" and edge.get("target"):
                 exported.add(edge["target"])
@@ -1995,13 +2127,13 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 declared_values.setdefault(edge["source"], []).append(edge["target"])
             elif edge.get("kind") == "ARGUMENT_BINDS_PARAMETER":
                 existing_bind.add((edge["source"], edge["target"]))
-        batch.append(edge)
-        kept_edge_count += 1
-        if len(batch) >= edge_batch_rows:
+            batch.append(edge)
+            kept_edge_count += 1
+            if len(batch) >= edge_batch_rows:
+                load_edges(batch)
+                batch.clear()
+        if batch:
             load_edges(batch)
-            batch.clear()
-    if batch:
-        load_edges(batch)
     # Replay the frontend's cross-TU prototype-of linking over the GLOBAL USR map.
     # A single frontend run links every declaration of a function to its definition;
     # sharding splits those across processes, so a decl in one shard and the def in
@@ -2011,15 +2143,24 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # that survived endpoint filtering (kept_ids). clang-c-only: usr maps are empty
     # otherwise, so this loop is skipped. Bounded: iterates function ids, not edges.
     if binary_edges and usr_defs:
+        # Membership (and unit) for just the function ids these bounded maps touch,
+        # pulled from the store in one shot -- the same ``in kept_ids`` decision, and
+        # the unit map ``load_edges`` needs for each reconstructed edge's source.
+        proto_ids = set()
+        for _usr, _defs in usr_defs.items():
+            proto_ids.update(_defs)
+        for _decls in usr_decls.values():
+            proto_ids.update(_decls)
+        proto_present = store.lookup(proto_ids)
         recon: list = []
         for usr in sorted(usr_defs):
             defs = sorted(set(usr_defs[usr]))
             decls = sorted(set(usr_decls.get(usr, ())))
             for defn in defs:
-                if defn not in kept_ids:
+                if defn not in proto_present:
                     continue
                 for decl in decls:
-                    if (decl == defn or decl not in kept_ids
+                    if (decl == defn or decl not in proto_present
                             or (decl, defn) in existing_proto):
                         continue
                     record = graph_pb2.EdgeRecord(
@@ -2032,10 +2173,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                     recon.append(record)
                     kept_edge_count += 1
                     if len(recon) >= edge_batch_rows:
-                        load_edges(recon)
+                        load_edges(recon, proto_present)
                         recon.clear()
         if recon:
-            load_edges(recon)
+            load_edges(recon, proto_present)
     # Replay cross-TU call-argument bindings (see the maps built above). For each
     # call site, pair its arguments (by HAS_ARGUMENT position) with the callee's
     # formals (DECLARES_VALUE parameters ordered by param_index) -- the same position
@@ -2045,6 +2186,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # kept_ids. Two edges per pair, matching the frontend exactly: the typed
     # ARGUMENT_BINDS_PARAMETER and the paired VALUE_FLOWS_TO reason=call-argument.
     if binary_edges and invokes_target and param_index:
+        # Same bounded store probe for the call-argument reconstruction: every
+        # argument id (HAS_ARGUMENT targets) and every formal id (DECLARES_VALUE
+        # targets) these maps reference. Serves both the ``in kept_ids`` filter and
+        # the per-edge source unit for the emitted bind/flow edges.
+        bind_ids = set()
+        for _args in call_arguments.values():
+            for _pos, _arg in _args:
+                bind_ids.add(_arg)
+        for _formals in declared_values.values():
+            bind_ids.update(_formals)
+        bind_present = store.lookup(bind_ids)
         bindings: list = []
         for callsite in sorted(call_arguments):
             callee = invokes_target.get(callsite)
@@ -2060,8 +2212,8 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 continue
             for position, argument in sorted(call_arguments[callsite]):
                 parameter = by_position.get(position)
-                if (parameter is None or argument not in kept_ids
-                        or parameter not in kept_ids
+                if (parameter is None or argument not in bind_present
+                        or parameter not in bind_present
                         or (argument, parameter) in existing_bind):
                     continue
                 bind = graph_pb2.EdgeRecord(
@@ -2088,10 +2240,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                     bindings.append(rec)
                     kept_edge_count += 1
                 if len(bindings) >= edge_batch_rows:
-                    load_edges(bindings)
+                    load_edges(bindings, bind_present)
                     bindings.clear()
         if bindings:
-            load_edges(bindings)
+            load_edges(bindings, bind_present)
     if bulk:
         for kind in list(edge_writers):
             flush_edge_partition(kind)
@@ -2100,11 +2252,15 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 conn.execute(f"COPY {kind} FROM '{path}'")
                 os.unlink(path)
     timing("load edges")
-    kept_node_count = len(kept_ids)
+    kept_node_count = store.count() if store is not None else len(kept_ids)
     # Endpoint filtering and edge unit attribution are complete.  The index rows
     # and manifest need only the count, not these graph-sized lookup maps; release
     # them before rebuilding the declaration/callsite indexes.
     del kept_ids, node_units, unit_codes, unit_names
+    if store is not None:
+        store.close()
+        store = None
+        shutil.rmtree(store_dir, ignore_errors=True)
     index_stage.close()
     indexed_nodes = (decode_node(payload) for payload in read_frames(Path(index_stage.name)))
     decl_index, callsite_index = build_decl_and_callsite_index(indexed_nodes, exported)
