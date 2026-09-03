@@ -25,6 +25,44 @@ from lachesis.pipeline import (run_project,
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
+def _reap_stale_stream_temp(min_age_hours: float = 2.0) -> None:
+    """Remove orphaned streamed-build scratch from a prior run that died before cleanup.
+
+    A streamed build stages its frontend shards under a ``lachesis-stream-*`` /
+    ``kuzu_stream_stage_*`` directory in the system temp dir, held by a
+    :class:`~tempfile.TemporaryDirectory` that deletes it on normal exit. But a build
+    killed by SIGKILL -- an OOM kill, an RSS watchdog, a hard ``^C^C`` -- never runs that
+    cleanup, so its multi-GB scratch is orphaned in place and accumulates across runs.
+
+    This reaps only entries older than ``min_age_hours``: a concurrently running build's
+    scratch has a fresh mtime and is left untouched, so the age gate makes the sweep safe
+    without inspecting open file handles. Best-effort and silent -- a temp dir that cannot
+    be read or removed (a race with another reaper, a permission quirk) is skipped, never
+    fatal to the build that triggered the sweep.
+    """
+    import shutil
+    import time
+
+    root = tempfile.gettempdir()
+    cutoff = time.time() - min_age_hours * 3600.0
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for name in entries:
+        if not (name.startswith("lachesis-stream-")
+                or name.startswith(".lachesis-stream-")
+                or name.startswith("kuzu_stream_stage_")):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isdir(path) or os.path.getmtime(path) > cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def _positive_int(value: str) -> int:
     """Argparse type that prevents silently useless zero/negative limits."""
     try:
@@ -262,6 +300,10 @@ def _run(argv: list[str] | None = None) -> None:
         and not args.parallel_packages
         and not args.layered_out
     ):
+        # Reap orphaned scratch from any prior streamed build that was SIGKILLed
+        # (OOM/watchdog) before its TemporaryDirectory could self-clean, so the temp
+        # dir does not accumulate multi-GB leftovers run over run.
+        _reap_stale_stream_temp()
         with tempfile.TemporaryDirectory(prefix="lachesis-stream-") as stream_root:
             frontend_out = args.frontend_out or os.path.join(stream_root, "frontends")
             readers, snapshots = run_project_streaming(
