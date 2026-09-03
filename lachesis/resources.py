@@ -94,6 +94,38 @@ def c_chunk_files() -> int:
     return max(250, derived)
 
 
+def kuzu_buffer_pool_bytes() -> int:
+    """Return a bounded Kùzu buffer-pool size in bytes derived from the budget.
+
+    Kùzu's ``0`` default auto-sizes the buffer pool from *host* physical memory,
+    so the store-write phase of a build grabs a fixed fraction of the machine's
+    RAM regardless of the configured budget -- the pool becomes the dominant,
+    host-scaled term of the build's peak and, on a Linux-scale graph, an OOM
+    risk on a large host. The pool is a page cache over the on-disk store, not a
+    correctness input: bounding it only trades some eviction/I/O for a hard RSS
+    ceiling, and the emitted graph is byte-for-byte identical (verified: the
+    store manifest content hash is unchanged when the pool is capped).
+
+    The pool is allotted ~40% of the process-tree budget so the store-write
+    half's Arrow/protobuf staging transients and the Python parent keep headroom
+    under the same budget. ``LACHESIS_KUZU_BUFFER_POOL_SIZE`` (an explicit byte
+    count) overrides the derived value, exactly as ``LACHESIS_C_CHUNK_FILES``
+    overrides the derived chunk size.
+    """
+    raw = os.environ.get("LACHESIS_KUZU_BUFFER_POOL_SIZE", "")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ValueError(
+                "LACHESIS_KUZU_BUFFER_POOL_SIZE must be an integer byte count") from error
+        if value < 0:
+            raise ValueError("LACHESIS_KUZU_BUFFER_POOL_SIZE must be non-negative")
+        return value
+    derived = memory_budget_mb() * 4 // 10
+    return max(256, derived) << 20
+
+
 def frontend_jobs() -> int:
     """Return bounded compiler concurrency; serial is the memory-safe default."""
     raw = os.environ.get("LACHESIS_FRONTEND_JOBS", "1")

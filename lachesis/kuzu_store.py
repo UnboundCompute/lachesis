@@ -64,6 +64,7 @@ from lachesis.core.graph_wire import (
     write_frame,
 )
 from lachesis.core import graph_pb2
+from lachesis import resources
 from lachesis.indices import (
     CALLSITE_KINDS, INDEXED_KINDS, build_callsite_index, build_decl_index,
     build_decl_and_callsite_index, exported_ids, index_rows,
@@ -993,7 +994,8 @@ def write_kuzu_graph(
     db = kuzu.Database(
         db_file(db_dir),
         buffer_pool_size=(
-            _kuzu_buffer_pool_size() if buffer_pool_size is None else buffer_pool_size
+            resources.kuzu_buffer_pool_bytes()
+            if buffer_pool_size is None else buffer_pool_size
         ),
         checkpoint_threshold=(
             _kuzu_checkpoint_threshold()
