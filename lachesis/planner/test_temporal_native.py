@@ -167,6 +167,40 @@ class MatcherAuthoritativeTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]["observations"]["file"])
 
+    def test_unvalidated_family_surfaces_partial_not_complete(self):
+        # uninitialized-use is declared ``confirmable: false`` -- its native
+        # detector raises nothing on its own positive control, so a real-code hit
+        # is an unproven lead, never a COMPLETE verdict a reviewer would trust.
+        graph = {
+            "native_temporal": {
+                "functions": [{"id": "w", "findings": [
+                    {"pattern": "uninitialized-use", "node": "read#1", "line": 49,
+                     "path": "result", "function": "decl:util:lookup"},
+                ]}],
+                "locations": {
+                    "decl:util:lookup": {"file": "/src/util.c", "line": 40},
+                },
+            },
+        }
+        rows = _constructor("uninitialized-use")(graph).enumerate()["candidates"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["completeness"], "PARTIAL")
+        self.assertEqual(row["rank"], 0.4)
+        self.assertEqual(row["rank_reasons"][0]["term"], "unvalidated-detector")
+        self.assertEqual(row["inferences"]["same_generation"], "not-queried")
+        # It still reports where it fired, so the lead is triage-able.
+        self.assertEqual(row["observations"]["file"], "/src/util.c")
+        self.assertEqual(row["observations"]["line"], 49)
+
+    def test_validated_family_stays_complete(self):
+        # A ``confirmable`` (validated) family is untouched by the downgrade: its
+        # matcher-confirmed relation is still a COMPLETE rank-1.0 verdict.
+        row = _constructor("double-free")(_graph_with_matcher()).enumerate()["candidates"][0]
+        self.assertEqual(row["completeness"], "COMPLETE")
+        self.assertEqual(row["rank"], 1.0)
+        self.assertEqual(row["inferences"]["same_generation"], "same")
+
     def test_without_the_matcher_the_inventory_still_stands(self):
         graph = {"nodes": [{"id": "blanket",
                             "event": {"kind": "read_storage", "line": 9}}]}

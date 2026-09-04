@@ -203,6 +203,52 @@ class TemporalLifecycle:
             return None
         site = f"native:{function_id}:{node_id}:{line}"
         raw = f"{pattern_id}\0{site}"
+        # An unvalidated family (``confirmable`` is false in its Atropos declaration
+        # -- its native detector raises nothing on its own positive control) may
+        # over-fire on real code: its soundness is unproven.  Surface its findings as
+        # PARTIAL triage leads with the temporal relation left un-asserted, so an
+        # unproven detector never lands a COMPLETE row a reviewer would trust as a
+        # verdict.  When the detector earns confirmation (its control flips to
+        # ``detected``), dropping the flag restores COMPLETE with no engine change.
+        if not self.metadata.get("confirmable", True):
+            return {
+                "candidate_id": "temporal_" + hashlib.sha256(raw.encode()).hexdigest()[:20],
+                "constructor": pattern_id,
+                "domain": "lifecycle",
+                "language": self.language or "c",
+                "obligation": self.metadata["obligation"],
+                "handles": {
+                    "site_node_id": node_id,
+                    "enclosing_function_id": decl_id,
+                    "obligation_value_ids": [obj] if obj else [],
+                },
+                "observations": {
+                    "site": node_id,
+                    "event_kind": None,
+                    "object_id": obj,
+                    "file": location.get("file"),
+                    "line": line if line is not None else location.get("line"),
+                    "pattern": self.metadata["matcher_pattern"],
+                    "requires": list(self.metadata["requires"]),
+                    "native_path": obj,
+                },
+                "inferences": {
+                    "path_relation": "reachable",
+                    "same_object": "same",
+                    "same_generation": "not-queried",
+                },
+                "rank": 0.4,
+                "rank_reasons": [{
+                    "term": "unvalidated-detector",
+                    "why": ("this family's native detector raises nothing on its own "
+                            "positive control, so its matches are unproven triage "
+                            "leads a reviewer must confirm, not standalone verdicts"),
+                }],
+                "completeness": "PARTIAL",
+                "next_op": {"tool": "skeleton",
+                            "why": "confirm the temporal relation the unvalidated "
+                                   "detector could not prove"},
+            }
         # A lead pattern records an ownership shape (a field alias from an
         # aggregate copy), not a temporal violation: the matcher has related no
         # release/use pair, only observed the copy.  Surface it as a PARTIAL lead
@@ -352,5 +398,12 @@ def temporal_constructor(spec):
                         # its rows PARTIAL so a benign struct copy is a triage lead,
                         # not a confirmed bug.
                         "lead": bool(entry.get("lead")),
+                        # A family whose native detector raises nothing on its own
+                        # positive control is unvalidated: it may over-fire on real
+                        # code (its soundness is unproven), so its findings are
+                        # surfaced as PARTIAL triage leads, never COMPLETE verdicts,
+                        # until the detector earns confirmation.  Absence defaults to
+                        # confirmable so validated families are unaffected.
+                        "confirmable": entry.get("confirmable", True),
                     },
                 })
