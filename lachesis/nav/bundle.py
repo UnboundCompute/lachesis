@@ -478,7 +478,8 @@ def _capsule_findings(source_graph_path: str, asm: _Assembler, *,
 
 
 def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
-                        lang: Optional[str], indexed_nodes: int) -> dict:
+                        lang: Optional[str], indexed_nodes: int,
+                        source_url_template: Optional[str] = None) -> dict:
     """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
 
     The security envelope remains available under ``security.findings``.  The
@@ -530,10 +531,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         "paths": {"values": values},
         "security": {"findings": findings},
     }
-    if repository.count("/") == 1:
-        v2["meta"]["source_url_template"] = (
-            f"https://github.com/{repository}/blob/{{revision}}/{{file}}#L{{line}}-L{{end_line}}"
-        )
+    if source_url_template:
+        v2["meta"]["source_url_template"] = source_url_template
     _validate_graph_first(v2)
     return v2
 
@@ -564,7 +563,8 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  loc: Optional[int] = None, source_dir: Optional[str] = None,
                  per_family: int = 6, max_flows: int = 40, cone_limit: int = 80,
                  planner_depth: int = 6, planner_entrypoints: int = 0,
-                 schema_version: str = "1.0") -> dict:
+                 schema_version: str = "1.0",
+                 source_url_template: Optional[str] = None) -> dict:
     """Build an explorer bundle (schema 1.0) from a built+enriched graph."""
     load = _call("load_graph", {"path": graph_path, "profile": "all"})
     census = _call("candidate_census", {})
@@ -635,7 +635,8 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
     if schema_version == "2.0":
         return _graph_first_bundle(bundle, repo=repo,
                                    commit=commit or prov.get("commit_sha"), lang=lang,
-                                   indexed_nodes=int(load.get("nodes") or 0))
+                                   indexed_nodes=int(load.get("nodes") or 0),
+                                   source_url_template=source_url_template)
     if schema_version != "1.0":
         raise ValueError(f"unsupported Explorer schema version: {schema_version}")
     return bundle

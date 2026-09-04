@@ -399,6 +399,7 @@ def command_trace(args: argparse.Namespace) -> int:
             per_family=args.per_family,
             max_flows=args.max_flows,
             schema_version=args.schema_version,
+            source_url_template=args.source_url_template,
         )
     except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
         _stderr(f"lachesis trace: {error}")
@@ -965,6 +966,8 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("--lang", metavar="LANG", help="override the language in meta")
     trace.add_argument("--schema-version", choices=("1.0", "2.0"), default="2.0",
                        help="Explorer bundle contract to emit (default: 2.0 graph-first)")
+    trace.add_argument("--source-url-template", metavar="URL_TEMPLATE",
+                       help="explicit HTTP(S) source template using {file}, {line}, {end_line}, {revision}")
     trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
                        help="max leads to draw from each sink family (default: 6)")
     trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",

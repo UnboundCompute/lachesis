@@ -250,13 +250,19 @@ class GraphFirstBundleTests(unittest.TestCase):
 
     def test_graph_first_uses_v2_contract_and_supported_source_placeholders(self):
         result = bundle._graph_first_bundle(
-            self._legacy_bundle(), repo="GNOME/libxml2", commit="abc", lang="c", indexed_nodes=99)
+            self._legacy_bundle(), repo="GNOME/libxml2", commit="abc", lang="c", indexed_nodes=99,
+            source_url_template="https://github.com/GNOME/libxml2/blob/{revision}/{file}#L{line}")
         self.assertEqual(result["schema_version"], "2.0")
         self.assertEqual(result["meta"]["indexed_nodes"], 99)
         self.assertEqual(len(result["paths"]["values"]), 1)
         self.assertIn("{revision}", result["meta"]["source_url_template"])
         self.assertNotIn("{owner}", result["meta"]["source_url_template"])
         self.assertNotIn("{repo}", result["meta"]["source_url_template"])
+
+    def test_graph_first_does_not_guess_source_host(self):
+        result = bundle._graph_first_bundle(
+            self._legacy_bundle(), repo="group/project", commit="abc", lang="c", indexed_nodes=2)
+        self.assertNotIn("source_url_template", result["meta"])
 
     def test_graph_first_rejects_invalid_path_reference(self):
         legacy = self._legacy_bundle()
