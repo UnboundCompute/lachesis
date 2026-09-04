@@ -5,6 +5,14 @@ When the Rust matcher has run (its correlated findings ride the bind under
 relations and suppress the pre-matcher per-dereference inventory that otherwise
 emits one ``not-queried`` row per deref.  When the matcher has not run (the fast
 structural path), the inventory still stands as the honest fallback.
+
+A COMPLETE rank-1.0 verdict is reserved for a *confirmable* family (one whose
+native detector is validated); a family flagged ``confirmable: false`` in its
+Atropos declaration -- its detector is unproven, so it over-fires on real code
+-- surfaces its matcher findings as PARTIAL rank-0.4 triage leads instead.  Most
+of the C lifecycle families are currently non-confirmable (guard/identity
+insensitivity in the native kernel), so ``leak`` stands in here as the validated
+COMPLETE exemplar.
 """
 import unittest
 
@@ -32,6 +40,19 @@ def _graph_with_matcher():
     }
 
 
+def _graph_with_confirmable():
+    # A confirmable family (leak) whose matcher-confirmed finding is a COMPLETE
+    # rank-1.0 verdict -- the exemplar for the resolved/complete contract now that
+    # the guard/identity-dependent families are leads-only.
+    return {
+        "native_temporal": {"functions": [
+            {"id": "fn_l", "findings": [
+                {"pattern": "leak", "node": "exit#3", "line": 70, "path": "buf"},
+            ]},
+        ]},
+    }
+
+
 class MatcherAuthoritativeTest(unittest.TestCase):
     def test_confirmed_finding_replaces_the_blanket_inventory(self):
         rows = _constructor("use-after-free")(_graph_with_matcher()).enumerate()["candidates"]
@@ -43,8 +64,8 @@ class MatcherAuthoritativeTest(unittest.TestCase):
         self.assertEqual(row["observations"]["line"], 60)
         self.assertEqual(row["observations"]["native_path"], "obj->x")
 
-    def test_confirmed_relation_is_resolved_not_queried(self):
-        row = _constructor("use-after-free")(_graph_with_matcher()).enumerate()["candidates"][0]
+    def test_confirmable_relation_is_resolved_and_complete(self):
+        row = _constructor("leak")(_graph_with_confirmable()).enumerate()["candidates"][0]
         self.assertEqual(row["inferences"], {
             "path_relation": "reachable", "same_object": "same",
             "same_generation": "same"})
@@ -149,7 +170,9 @@ class MatcherAuthoritativeTest(unittest.TestCase):
         rows = _constructor("double-free")(graph).enumerate()["candidates"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["observations"]["file"], "/src/bugs.c")
-        self.assertEqual(rows[0]["completeness"], "COMPLETE")
+        # double-free is currently non-confirmable, so the surviving C site is a
+        # PARTIAL lead; the point of this test is that the non-C collision dropped.
+        self.assertEqual(rows[0]["completeness"], "PARTIAL")
 
     def test_finding_with_an_unresolved_location_is_not_dropped(self):
         # A ``None`` file is merely unresolved (no location row), not a proven
@@ -196,7 +219,7 @@ class MatcherAuthoritativeTest(unittest.TestCase):
     def test_validated_family_stays_complete(self):
         # A ``confirmable`` (validated) family is untouched by the downgrade: its
         # matcher-confirmed relation is still a COMPLETE rank-1.0 verdict.
-        row = _constructor("double-free")(_graph_with_matcher()).enumerate()["candidates"][0]
+        row = _constructor("leak")(_graph_with_confirmable()).enumerate()["candidates"][0]
         self.assertEqual(row["completeness"], "COMPLETE")
         self.assertEqual(row["rank"], 1.0)
         self.assertEqual(row["inferences"]["same_generation"], "same")
