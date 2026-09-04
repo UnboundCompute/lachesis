@@ -2038,6 +2038,15 @@ function callMetadata(node) {
       effReceiverExpr = null; effReceiverNode = null; effReceiverSymbolId = null;
     }
   }
+  // Surface the type checker's own name for the receiver as ``receiver_type``,
+  // the same node property Python's frontend stamps and the native binder reads
+  // to gate a type-keyed sink model (``type=Database`` etc.).  Without it a bare
+  // leaf name that merely collides with a type-keyed method binds spuriously:
+  // ``Promise.all`` -> sql ``all``, ``JSON.parse`` -> xxe ``parse``.  Only a
+  // concrete symbol is adopted -- a receiver the checker widens to ``any`` (an
+  // untyped ``fs``/``path`` namespace) has no symbol, so real sinks keep
+  // ``receiver_type`` unset and bind exactly as before (no false negatives).
+  const receiverTypeFacts = typeMetadata(effReceiverNode);
   return {
     callee: effectiveCallee,
     module: moduleName,
@@ -2053,7 +2062,8 @@ function callMetadata(node) {
     ) ? bodyForNode(expression.expression) : null,
     method_name: methodName,
     computed_key_expression: computedKeyExpression,
-    receiver_type_facts: typeMetadata(effReceiverNode),
+    receiver_type: receiverTypeFacts ? (receiverTypeFacts.symbol || null) : null,
+    receiver_type_facts: receiverTypeFacts,
     frontend_extensions: {
       typescript: callTypeExtensions(node),
     },
