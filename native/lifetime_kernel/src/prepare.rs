@@ -1006,7 +1006,19 @@ fn assign_generations(
             history.entry(key).or_default().push((position, operations[index].node.clone(), generation));
         } else if matches!(kind, Kind::Realloc) {
             operations[index].generation = Some(current.clone());
-            let fresh = next_generation(&current);
+            // A realloc that stores into a *distinct* slot (`tmp = realloc(buf,n)`)
+            // creates the target's FIRST live cell, not a successor generation of
+            // it: the fresh block is `tmp`'s generation-0, which is exactly what
+            // the semantic emitter stamps on the ORIGIN in its non-`overwrites_slot`
+            // branch, and what the hardcoded `!tmp` guard references (`tmp#g0`). A
+            // self-assigning realloc (`buf = realloc(buf,n)`) instead advances the
+            // slot to its next generation. Recording the matching fresh generation
+            // here keeps every downstream use of the target on the same generation
+            // as its origin and guard, so the clean idiom no longer strands a
+            // phantom g0 origin unmatched at the exit and reports a spurious leak.
+            let distinct_slot = operations[index].source.as_ref().is_some_and(|source|
+                source.root != key.root || source.selectors != key.selectors);
+            let fresh = if distinct_slot { current.clone() } else { next_generation(&current) };
             operations[index].fresh_generation = Some(fresh.clone());
             history.entry(key).or_default().push((position, operations[index].node.clone(), fresh));
         } else {
@@ -1420,9 +1432,23 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                         && (text_property(root, "type").is_some_and(|value| value.contains('['))
                             || path.selectors.iter().any(|selector| selector == "&"))
                 });
+            // Anchor the return use on the returned VALUE node, not the return
+            // statement.  synthesize_cfg models a return by streaming its value
+            // expression and using that expression node as the CFG anchor (the
+            // branch target of an enclosing `if`), while the statement node is a
+            // parent the nearest-CFG up-walk below can never reach downward into.
+            // Anchoring on the statement therefore forces the line-based fallback,
+            // and on a crowded line -- e.g. `if (!tmp) return buf;`, where the
+            // guard's `tmp` reference and the returned `buf` share the line -- it
+            // snaps the use onto the nearest same-line node by offset, which is
+            // the guard operand rather than the returned value.  That mis-anchor
+            // hoists the return above its own branch, so both arms of a preceding
+            // realloc reach it and the clean safe-realloc idiom reports a spurious
+            // dangling-use and leak.  The value node walks up through any implicit
+            // casts to the same CFG anchor with no ambiguity.
             operations.push(raw_operation(
                 Kind::Use,
-                node_id,
+                &peeled,
                 Some(path.clone()),
                 None,
                 line,
@@ -2217,8 +2243,15 @@ pub(crate) fn semantic_request(
                     push_event(&mut nodes, &mut by_anchor,
                         semantic_node(slot_id.clone(), &id, "WRITE_STORAGE", &operation, path, fresh_generation));
                 }
+                // A failed realloc loses the old block only when the fresh cell
+                // overwrites the very slot that held it (`buf = realloc(buf,n)`).
+                // When the destination is a distinct slot (`tmp = realloc(buf,n)`)
+                // the old pointer is untouched on failure, so the failure arm
+                // marks nothing lost; it stays a bare branch node for topology.
                 push_event(&mut nodes, &mut by_anchor,
-                    semantic_node(failure_id.clone(), &id, "REALLOC_FAILED", &old_op, old_ref, old_generation));
+                    semantic_node(failure_id.clone(), &id,
+                        if overwrites_slot { "REALLOC_FAILED" } else { "" },
+                        &old_op, old_ref, old_generation));
                 if let Some(null_id) = &null_id {
                     push_event(&mut nodes, &mut by_anchor,
                         semantic_node(null_id.clone(), &id, "WRITE_STORAGE_NULL", &null_op, old_ref, old_generation));
@@ -2233,11 +2266,28 @@ pub(crate) fn semantic_request(
                     edges.push(semantic_edge(previous.clone(), attempt_id.clone(), "normal", Vec::new()));
                 }
                 edges.push(semantic_edge(attempt_id, branch_id.clone(), "normal", Vec::new()));
-                // The realloc predicate guards are named after the result, not a
-                // storage object, matching the Python emitter; the matcher reads
-                // them as branch provenance without binding a null fact.
+                // Name the SUCCESS predicate after the reallocation result object
+                // (the destination that receives realloc's return) with its
+                // generation, exactly as the allocation diamond names its guards
+                // (`{obj}#{gen}`).  This lets the matcher correlate the success arm
+                // with a later nullness check on the result, e.g. the idiomatic
+                // `char *tmp = realloc(buf, n); if (!tmp) return buf;`: success
+                // proves the result non-null, so the null-true arm (`return buf`)
+                // is contradictory and the infeasible "realloc succeeded yet the
+                // failure branch runs" path is pruned.  Without a `#generation`
+                // the old opaque `realloc_result` token was split-on-`#` skipped
+                // by the matcher and bound no fact, so that infeasible path stayed
+                // live and reported a dangling-use of the old pointer plus a leak
+                // of the fresh block on this clean idiom.
+                let result_guard = format!("{}#{fresh_generation}", target.root);
                 edges.push(semantic_edge(branch_id.clone(), success_id.clone(), "normal",
-                    vec![lifetime_proto::GuardProof { kind: "NONNULL".into(), value: "realloc_result".into() }]));
+                    vec![lifetime_proto::GuardProof { kind: "NONNULL".into(), value: result_guard }]));
+                // The FAILURE arm keeps an opaque, fact-free token.  When realloc
+                // overwrites its own slot (`buf = realloc(buf, n)`) the result and
+                // the leaked old block share a label, and a *bound* ISNULL on that
+                // label would resolve (by label + max generation-rank) to the old
+                // block and cancel the genuine realloc-failure leak.  Branch
+                // provenance only; it binds no null fact.
                 edges.push(semantic_edge(branch_id, failure_id.clone(), "normal",
                     vec![lifetime_proto::GuardProof { kind: "ISNULL".into(), value: "realloc_result".into() }]));
                 edges.push(semantic_edge(success_id, origin_id.clone(), "normal", Vec::new()));
