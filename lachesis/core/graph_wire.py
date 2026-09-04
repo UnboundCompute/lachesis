@@ -51,7 +51,18 @@ def _value(value: Any) -> graph_pb2.Value:
     elif isinstance(value, bytes):
         result.binary = value
     elif isinstance(value, str):
-        result.text = value
+        try:
+            result.text = value
+        except (UnicodeEncodeError, ValueError):
+            # A proto ``string`` field requires valid UTF-8, but a source file
+            # can legally hold a string literal with an unpaired UTF-16
+            # surrogate (a common malformed-unicode test fixture); the parser
+            # hands it to us as a ``str`` carrying that code point, and a raw
+            # assignment raises UnicodeEncodeError and aborts the whole build.
+            # Scrub only the offending code points at the wire boundary and
+            # keep the rest of the literal intact -- one bad char must not lose
+            # the file, or the repo.
+            result.text = value.encode("utf-8", "replace").decode("utf-8")
     elif isinstance(value, (list, tuple)):
         result.list.values.extend((_value(item) for item in value))
         result.list.SetInParent()
