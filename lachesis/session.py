@@ -344,6 +344,13 @@ class Analysis:
         from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
         started = perf_counter()
+        # Make the control-flow branch substrate (cfg-condition nodes + branch-region
+        # edges) visible to the index before the bind reads it. On the retain=False
+        # path (`enrich`) the full dataflow overlay is deliberately never decoded into
+        # RAM, so without this the census has no conditions to classify guard dominance
+        # against. This attaches only the tiny branch slice (bounded by control
+        # structure), and is a no-op when a full overlay is already attached.
+        self.store.ensure_branch_substrate()
         index = getattr(self.store, "index", None)
         projection_fn = getattr(index, "atropos_projection", None)
         if projection_fn is not None:
@@ -422,6 +429,33 @@ class Analysis:
         materialize_started = perf_counter()
         region_edges = list(index.edges_of_kind(*_REGION_EDGE_KINDS))
         edges.extend(region_edges)
+        # Region-edge ENDPOINTS carry the two facts the guard adjudicator reads: the
+        # cfg-condition SOURCE (which size variable a branch tests) and the branch-body
+        # TARGET span (which a copy call site is placed inside for `guarded-region`).
+        # The header warm below cannot supply either. The sources are overlay-derived
+        # -- absent from Kùzu -- so ``node_headers`` returns them as empty stubs. And on
+        # the deferred-maps bind path (``enrich`` opens with ``defer_maps=True``) the
+        # promoted-header columns are never built, so ``node_headers`` returns the Kùzu
+        # body targets span-less too. Either stubbing collapses a genuinely guarded copy
+        # to a spurious ``none-observed``/``fall-through``. Warm both endpoints straight
+        # from Kùzu (batched; ``_warm_nodes`` skips ids already resident, so the
+        # overlay-cached cfg-condition sources are left intact) and seat the full,
+        # span-bearing records through the overlay-aware accessor before the
+        # ``difference`` so no stubbing path runs on them. Bounded by the program's
+        # control structure, never by its size.
+        node_getter = getattr(index, "nodes", None)
+        region_endpoints = {edge.get("source") for edge in region_edges}
+        region_endpoints.update(edge.get("target") for edge in region_edges)
+        region_endpoints.discard(None)
+        region_endpoints.difference_update(nodes)
+        if region_endpoints and node_getter is not None:
+            warmer = getattr(index, "_warm_nodes", None)
+            if warmer is not None:
+                warmer(region_endpoints)
+            for endpoint_id in region_endpoints:
+                record = node_getter.get(endpoint_id)
+                if record is not None:
+                    nodes[record["id"]] = record
         region_done = perf_counter()
         needed = {edge.get("source") for edge in region_edges}
         needed.update(edge.get("target") for edge in region_edges)

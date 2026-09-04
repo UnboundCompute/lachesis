@@ -38,8 +38,8 @@ from lachesis.nav.graphlib import GraphLib
 from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
 from lachesis.core.graph_wire import (
-    decode_overlay, is_dataflow_stream, read_dataflow_stream,
-    read_dataflow_stream_header,
+    decode_overlay, is_dataflow_stream, read_dataflow_branch_substrate,
+    read_dataflow_stream, read_dataflow_stream_header,
 )
 
 
@@ -152,6 +152,39 @@ def _load_dataflow_overlay(path: str) -> Overlay:
     sidecar = Path(path)
     payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
                else decode_overlay(sidecar.read_bytes()))
+    return Overlay.from_dict(payload)
+
+
+# The control-flow branch substrate the guard adjudicator reads: the cfg-condition
+# nodes it keys guards on (cfg-merge kept alongside as their tiny counterpart), and
+# the branch-region edges the control-flow overlay re-sources from those conditions.
+# The edge kinds mirror ``lachesis.planner.unbounded_copy._REGION_EDGE_KINDS``; they
+# are duplicated here so the loader stays free of a planner import.
+_BRANCH_NODE_KINDS = frozenset({"cfg-condition", "cfg-merge"})
+_BRANCH_EDGE_KINDS = frozenset({
+    "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_TRUE",
+    "SWITCH_CASE", "EXCEPTION_BRANCH", "SHORT_CIRCUIT_RIGHT",
+})
+
+
+def _load_branch_substrate_overlay(core_path: str) -> Overlay | None:
+    """A bounded overlay carrying only the control-flow branch substrate.
+
+    The persisted dataflow sidecar is the whole value-flow overlay (~1 GB on a large
+    graph). The guard adjudicator needs a sliver of it -- the cfg-condition nodes and
+    the branch-region edges re-sourced from them -- to classify guard dominance. This
+    streams the sidecar and keeps only that sliver, so the substrate can be attached to
+    the in-process index without ever decoding the full overlay into RAM. Returns
+    ``None`` when no sidecar exists yet or it carries no branch substrate.
+    """
+    path = dataflow_overlay_path(core_path)
+    sidecar = Path(path)
+    if not sidecar.is_file() or not is_dataflow_stream(sidecar):
+        return None
+    payload = read_dataflow_branch_substrate(
+        sidecar, node_kinds=_BRANCH_NODE_KINDS, edge_kinds=_BRANCH_EDGE_KINDS)
+    if not payload.get("derived_nodes") and not payload.get("derived_edges"):
+        return None
     return Overlay.from_dict(payload)
 
 
@@ -543,6 +576,40 @@ class GraphStore:
         raise RuntimeError(
             "Pass 2 requires the binary sidecar emitted by a fresh Pass 1; "
             "rebuild this graph with `lachesis build`")
+
+    def ensure_branch_substrate(self) -> "GraphStore":
+        """Make the control-flow branch substrate visible to the open index cheaply.
+
+        The guard adjudicator classifies dominance from cfg-condition nodes and the
+        branch-region edges re-sourced from them. Those records are overlay-derived --
+        they live in the ``.dataflow.pb`` sidecar, never the core Kùzu store -- so on
+        the ``retain_materialized=False`` bind path (``enrich``), where the full overlay
+        is deliberately never decoded into RAM, the census has no branch substrate to
+        classify against and every guarded copy reads ``none-observed``.
+
+        This attaches a *branch-only* overlay: cfg-condition/cfg-merge nodes plus
+        region edges, streamed out of the sidecar with bounded memory (see
+        :func:`_load_branch_substrate_overlay`). Peak stays proportional to the
+        program's control structure, not its size, so it is safe to run inside the
+        cold-materialization/bind window that the full overlay must stay out of.
+
+        A no-op when an overlay is already attached (a retaining tier load, or a prior
+        call), when there is no core path (an in-memory graph), or when no dataflow
+        sidecar has been built yet. Idempotent. If a later
+        ``ensure_dataflow_tier(retain_materialized=True)`` runs, it merges from
+        ``self.overlay`` and rebinds from scratch, so it cleanly supersedes this
+        branch-only attachment without double-counting.
+        """
+        index = getattr(self, "index", None)
+        if index is None or getattr(index, "_overlay", None) is not None:
+            return self
+        core_path = getattr(self, "_core_path", None)
+        if not core_path:
+            return self
+        overlay = _load_branch_substrate_overlay(core_path)
+        if overlay is not None:
+            index.attach_overlay(overlay)
+        return self
 
     def take_retained_enriched_graph(self):
         """Return the one-shot graph retained for the immediately following bind."""

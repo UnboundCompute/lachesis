@@ -1090,6 +1090,24 @@ unsafe fn visit_one(
     {
         properties.push(field("operator", text(&operator)));
     }
+    // A control-flow statement carries a `control_kind` the CFG overlay keys on to
+    // synthesize its cfg-condition node and branch-region edges. Without it the C
+    // `if`/loop/switch statements -- which arrive only as generic "statement"
+    // nodes -- are invisible to the overlay, so guard/dominance reasoning has no
+    // substrate and every copy reads `none-observed`. The node's label is the full
+    // statement source (condition included); the reader's `condition_head` isolates
+    // the parenthesised head, so the whole-statement label does not leak body
+    // identifiers into the guard test.
+    if let Some(control_kind) = match syntax_kind.as_str() {
+        "IfStmt" => Some("if"),
+        "ForStmt" => Some("for"),
+        "WhileStmt" => Some("while"),
+        "DoStmt" => Some("do-while"),
+        "SwitchStmt" => Some("switch"),
+        _ => None,
+    } {
+        properties.push(field("control_kind", text(control_kind)));
+    }
     let owner_id = function_owner(cursor, emitter);
     if matches!(
         syntax_kind.as_str(),
@@ -1332,6 +1350,35 @@ unsafe fn visit_one(
                         source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
                     })?;
                 }
+            }
+        } else if syntax_kind == "IfStmt" {
+            // Branch-region substrate for the CFG overlay. libclang yields an
+            // IfStmt's direct children in source order; for C (which has no
+            // condition-variable declarations) that is [condition, then, else?],
+            // so `cursors[1]` is the then-body and `cursors[2]`, when present, the
+            // else-body. The overlay turns these into TRUE_BRANCH/FALSE_BRANCH
+            // region edges whose target spans decide whether a copy call site is
+            // dominated by the (size-)testing branch. The condition itself needs no
+            // edge: with no CONDITION edge the overlay defaults the condition target
+            // to the statement, whose label already carries the guard head. When the
+            // else arm is absent the overlay synthesizes the fall-through itself.
+            if let Some(then_id) = children.cursors.get(1)
+                .and_then(|child| cursor_graph_id(*child, emitter))
+            {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "TRUE_BRANCH".to_owned(), source: id.clone(), target: then_id,
+                    properties: Vec::new(), source_tier: tier.clone(),
+                    relationship_class: "TRUE_BRANCH".to_owned(),
+                })?;
+            }
+            if let Some(else_id) = children.cursors.get(2)
+                .and_then(|child| cursor_graph_id(*child, emitter))
+            {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "FALSE_BRANCH".to_owned(), source: id.clone(), target: else_id,
+                    properties: Vec::new(), source_tier: tier.clone(),
+                    relationship_class: "FALSE_BRANCH".to_owned(),
+                })?;
             }
         } else if syntax_kind == "ReturnStmt" {
             if let (Some(value_id), Some(owner)) = (child_ids.first(), owner_id.clone()) {
