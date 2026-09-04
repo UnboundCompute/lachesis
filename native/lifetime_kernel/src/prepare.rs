@@ -2650,4 +2650,93 @@ mod tests {
     fn empty_canon_yields_no_proof() {
         assert!(ir_guard_proofs(&call_with_guard("", "")).is_empty());
     }
+
+    fn text_prop(key: &str, value: &str) -> lifetime_proto::ScalarProperty {
+        lifetime_proto::ScalarProperty {
+            key: key.into(),
+            value: Some(lifetime_proto::scalar_property::Value::Text(value.into())),
+        }
+    }
+
+    fn int_prop(key: &str, value: i64) -> lifetime_proto::ScalarProperty {
+        lifetime_proto::ScalarProperty {
+            key: key.into(),
+            value: Some(lifetime_proto::scalar_property::Value::Integer(value)),
+        }
+    }
+
+    fn graph_node(id: &str, kind: &str, offset: i64,
+                  extra: Vec<lifetime_proto::ScalarProperty>) -> lifetime_proto::GraphNode {
+        let mut properties = vec![int_prop("start_offset", offset)];
+        properties.extend(extra);
+        lifetime_proto::GraphNode { id: id.into(), kind: kind.into(), label: String::new(), properties }
+    }
+
+    fn cfg_next(source: &str, target: &str) -> lifetime_proto::GraphEdge {
+        lifetime_proto::GraphEdge {
+            kind: "CFG_NEXT".into(), source: source.into(), target: target.into(),
+            role: String::new(), position: 0, has_position: false,
+        }
+    }
+
+    // Regression guard for the leading-declaration exit bypass. A `T *p =
+    // alloc();` that precedes every persisted CFG statement and carries no
+    // AST-parent edge is spliced into the CFG as its own entry anchor. The
+    // synthetic-exit terminal pass runs first and, seeing that declaration
+    // still successor-less, wires it straight to the function exit. Left in
+    // place, that edge lets the allocation reach exit without traversing the
+    // body, so the object is later reported leaked though it is freed on every
+    // path. This builds exactly that shape -- a parentless allocation
+    // declaration ahead of an explicit two-statement CFG body -- and asserts
+    // the prepared declaration's only successor is the body entry, never the
+    // synthetic exit. Removing the retain in the splice regresses this test.
+    #[test]
+    fn leading_declaration_does_not_bypass_the_body_to_the_exit() {
+        let input = lifetime_proto::FunctionInput {
+            id: "fn-under-test".into(),
+            nodes: vec![
+                // The allocation declaration: parentless, earlier in source than
+                // any CFG statement, and never itself a CFG node.
+                graph_node("alloc-decl", "definition", 10,
+                    vec![text_prop("target_id", "obj"), text_prop("value_id", "malloc-call")]),
+                graph_node("obj", "VarDecl", 11, vec![]),
+                graph_node("malloc-call", "call", 12, vec![]),
+                // The persisted CFG body: guard then release, in source order.
+                graph_node("stmt-guard", "statement", 20, vec![]),
+                graph_node("stmt-free", "statement", 30, vec![]),
+            ],
+            // Only the body carries CFG_NEXT edges; the declaration is spliced in.
+            edges: vec![cfg_next("stmt-guard", "stmt-free")],
+            parameters: vec![],
+            calls: vec![lifetime_proto::FunctionCall {
+                node: "malloc-call".into(), is_alloc: true, ..Default::default()
+            }],
+            summaries: vec![],
+            returns: vec![],
+        };
+
+        let prepared = prepare_function(input);
+
+        // The declaration must have been recognised as an allocation and spliced
+        // into the CFG; otherwise the test exercises nothing.
+        assert!(
+            prepared.operations.iter().any(|operation| operation.node == "alloc-decl"
+                && operation.kind == lifetime_proto::operation::Kind::Alloc as i32),
+            "the leading declaration must yield an allocation operation",
+        );
+        let successors = prepared.successors.iter()
+            .find(|entry| entry.node == "alloc-decl")
+            .expect("the spliced leading declaration must have CFG successors");
+
+        assert!(
+            !successors.targets.iter().any(|target| target == "native-exit:fn-under-test"),
+            "the leading declaration must not fall through to the synthetic exit; \
+             got {:?}", successors.targets,
+        );
+        assert!(
+            successors.targets.iter().any(|target| target == "stmt-guard"),
+            "the leading declaration's successor must be the body entry; got {:?}",
+            successors.targets,
+        );
+    }
 }
