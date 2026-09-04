@@ -47,6 +47,22 @@ def _candidate_id(constructor_id: str, model_id: str,
     return "obl_" + hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
+# A call is *validation-shaped* when its callee name carries one of these stems.
+# This is a lexical prior, not a proof: a call named ``validate_redirect_uri`` or
+# ``sanitize`` is a place a guard commonly lives, so a sink whose argument passes
+# through one is worth reading. It never asserts the guard is correct or that it
+# discharges the obligation -- that judgment is deliberately left to the reader.
+# Stems are matched case-insensitively as substrings of the callee's spelling.
+_VALIDATION_STEMS = (
+    "validat", "verif", "sanitiz", "sanitis", "authoriz", "authoris",
+    "authenticat", "allowlist", "whitelist", "canonicaliz", "canonicalis",
+    "is_valid", "isvalid", "ensure", "require", "assert", "reject",
+    "escap", "guard", "check_",
+)
+_VALIDATION_CALLEE = re.compile(
+    "|".join(re.escape(stem) for stem in _VALIDATION_STEMS), re.IGNORECASE)
+
+
 class SinkObligation:
     """Base enumerator for single-argument sink obligations.
 
@@ -77,15 +93,27 @@ class SinkObligation:
         # copy constructor's index so an argument can ask "does any branch in my
         # function test me?" without a graph walk per candidate.
         self._conditions_by_function: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        # function_id -> [(callee, label, node_id, line)], the call sites in each
+        # function, built once. Lets an argument ask "does a validation-shaped
+        # call in my function name me?" -- a guard that lives in a call, not a
+        # branch condition -- without a graph walk per candidate.
+        self._calls_by_function: dict[str, list[tuple[str, str, str, object]]] = defaultdict(list)
         for node in stamped_graph.get("nodes", ()):
-            if node.get("kind") != "cfg-condition":
-                continue
+            kind = node.get("kind")
             props = node.get("properties") or {}
-            fn = props.get("function_id")
-            head = condition_head(node.get("label"))
-            if fn and head:
-                self._conditions_by_function[fn].append(
-                    (props.get("control_kind") or "if", head))
+            if kind == "cfg-condition":
+                fn = props.get("function_id")
+                head = condition_head(node.get("label"))
+                if fn and head:
+                    self._conditions_by_function[fn].append(
+                        (props.get("control_kind") or "if", head))
+            elif kind == "call":
+                fn = props.get("owner_function_id")
+                callee = props.get("callee") or props.get("method_name")
+                if fn:
+                    self._calls_by_function[fn].append(
+                        (callee, node.get("label") or "", node.get("id") or "",
+                         props.get("start_line")))
 
     def _referencing_conditions(self, function_id: str | None,
                                 idents: set[str]) -> tuple[list[dict], int]:
@@ -100,6 +128,29 @@ class SinkObligation:
             named = sorted(i for i, p in patterns.items() if p.search(head))
             if named:
                 hits.append({"control": control, "condition": head, "names": named})
+        return hits[:self._MAX_CONDITIONS], len(hits)
+
+    def _guarding_calls(self, function_id: str | None, idents: set[str],
+                        exclude_callsite_id: str | None) -> tuple[list[dict], int]:
+        """Validation-shaped calls in the enclosing function that name an argument
+        identifier. Neutral -- presence of a call whose name (``validate_*``,
+        ``sanitize``, ``verify``, ...) marks it as a common guard site, never proof
+        the guard dominates the sink, constrains the value, or is even correct. The
+        sink's own callsite is excluded so a sink never reports itself as its guard.
+        Returns (capped rows, total count)."""
+        if not function_id or not idents:
+            return [], 0
+        patterns = {i: re.compile(r"\b" + re.escape(i) + r"\b") for i in idents}
+        hits = []
+        for callee, label, node_id, line in self._calls_by_function.get(function_id, ()):
+            if node_id and node_id == exclude_callsite_id:
+                continue
+            if not callee or not _VALIDATION_CALLEE.search(callee):
+                continue
+            named = sorted(i for i, p in patterns.items() if label and p.search(label))
+            if named:
+                hits.append({"callee": callee, "site": label,
+                             "line": line, "names": named})
         return hits[:self._MAX_CONDITIONS], len(hits)
 
     def _label(self, node_id: str | None) -> str | None:
@@ -166,6 +217,7 @@ class SinkObligation:
             model_cwe = props.get("cwe", [])
             idents = size_identifiers(expression)
             referencing, referencing_total = self._referencing_conditions(owner_id, idents)
+            guarding, guarding_total = self._guarding_calls(owner_id, idents, callsite_id)
             rank, reasons = self._rank(expression, shape, confidence)
             # Location falls back to the bound value node when the sink has no
             # callsite. Call-expression sinks (memcpy, lodash.merge) carry the
@@ -228,6 +280,20 @@ class SinkObligation:
                         "referencing_condition_count": referencing_total,
                         "dominance": self._regions.classify(
                             owner_id, idents, _node_span(call)),
+                    },
+                    # Does a validation-shaped call in the enclosing function name
+                    # the argument? A guard that lives in a call
+                    # (``redirect_uri = validate_redirect_uri(raw)``) rather than a
+                    # branch condition -- the reader was previously blind to it, so
+                    # such a sink read as `none-observed` and ranked as unguarded.
+                    # Neutral presence, never a verdict and never fed to the rank:
+                    # it marks a place worth reading, not a discharged obligation.
+                    "guard_calls": {
+                        "status": "observed" if guarding_total else "none-observed",
+                        "basis": "syntactic: a validation-shaped call in the "
+                                 "enclosing function names an argument variable",
+                        "validation_calls": guarding,
+                        "validation_call_count": guarding_total,
                     },
                     # Where the sink argument was last written -- its reaching
                     # definition -- so a guard's bound can be read against the value

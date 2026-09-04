@@ -1135,6 +1135,87 @@ class GenericSinkObligationTest(unittest.TestCase):
         self.assertEqual([u["model_id"] for u in unbound], ["c.kernel.kvmalloc.a0"])
 
 
+class ValidationGuardCallTest(unittest.TestCase):
+    """The generic enumerator observes a validation-shaped call that names the
+    sink argument -- a guard that lives in a call, not a branch condition.
+
+    This is the exact shape that made a real OAuth ``RedirectResponse`` lead read
+    as `none-observed` (its redirect_uri passes through ``validate_redirect_uri``,
+    which raises on a bad value) and rank as if unguarded. The observation is
+    neutral: presence of a guard-shaped call worth reading, never a verdict."""
+
+    def setUp(self):
+        from lachesis.planner import taxonomy
+        from lachesis.planner.sink_obligation import sink_constructor
+        self.ctor = sink_constructor(next(
+            s for s in taxonomy.family_specs()
+            if s["id"] == "navigation.redirect.destination"))
+
+    def _graph(self, *, sink_call=("call:redirect", "RedirectResponse(redirect_uri)",
+                                    "RedirectResponse"),
+               extra_calls=()):
+        sink_id, sink_label, sink_callee = sink_call
+        nodes = [
+            _node(sink_id, "call", sink_label, callee=sink_callee,
+                  owner_function_id="fn:authorize", file="authorize.py",
+                  start_line=131),
+            _node("v:redirect_uri", "expression", "redirect_uri"),
+            _role("sink:redirect", "sink", "py.starlette.RedirectResponse.a0",
+                  "v:redirect_uri", sink_id, "Argument[0]", "open-redirect"),
+        ]
+        for cid, label, callee in extra_calls:
+            nodes.append(_node(cid, "call", label, callee=callee,
+                               owner_function_id="fn:authorize",
+                               file="authorize.py", start_line=120))
+        return {"nodes": nodes, "edges": []}
+
+    def _guard(self, graph):
+        row = self.ctor(graph).enumerate()["candidates"][0]
+        return row["inferences"]["guard_calls"]
+
+    def test_validation_call_naming_the_argument_is_observed(self):
+        graph = self._graph(extra_calls=[(
+            "call:validate",
+            "redirect_uri = client.validate_redirect_uri(raw_redirect_uri)",
+            "validate_redirect_uri")])
+        guard = self._guard(graph)
+        self.assertEqual(guard["status"], "observed")
+        self.assertEqual(guard["validation_call_count"], 1)
+        self.assertEqual(guard["validation_calls"][0]["callee"],
+                         "validate_redirect_uri")
+        self.assertIn("redirect_uri", guard["validation_calls"][0]["names"])
+
+    def test_non_validation_call_naming_the_argument_is_not_a_guard(self):
+        # A plain call that names the arg but is not validation-shaped (a log,
+        # a passthrough) must not be reported -- only guard-shaped callees count.
+        graph = self._graph(extra_calls=[(
+            "call:log", "log.info(redirect_uri)", "info")])
+        self.assertEqual(self._guard(graph)["status"], "none-observed")
+
+    def test_validation_call_not_naming_the_argument_is_not_a_guard(self):
+        # A validation call for a *different* variable is not this argument's guard.
+        graph = self._graph(extra_calls=[(
+            "call:validate-scope", "validate_scope(scopes)", "validate_scope")])
+        self.assertEqual(self._guard(graph)["status"], "none-observed")
+
+    def test_sink_callsite_is_never_its_own_guard(self):
+        # Even when the sink's own callee matches a validation stem, the sink must
+        # not report itself as the guard that protects it.
+        graph = self._graph(sink_call=(
+            "call:redirect", "assert_redirect(redirect_uri)", "assert_redirect"))
+        self.assertEqual(self._guard(graph)["status"], "none-observed")
+
+    def test_guard_calls_does_not_change_the_rank(self):
+        # The observation orders nothing: a guarded and an unguarded sink of the
+        # same argument shape rank identically -- guard_calls is never a verdict.
+        guarded = self.ctor(self._graph(extra_calls=[(
+            "call:validate",
+            "redirect_uri = validate_redirect_uri(raw)",
+            "validate_redirect_uri")])).enumerate()["candidates"][0]
+        plain = self.ctor(self._graph()).enumerate()["candidates"][0]
+        self.assertEqual(guarded["rank"], plain["rank"])
+
+
 class AllFamilyRegistryTest(unittest.TestCase):
     """The default registry spans every taxonomy family, no hardcoded list."""
 
