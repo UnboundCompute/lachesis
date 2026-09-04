@@ -207,6 +207,33 @@ class BindCacheTests(unittest.TestCase):
         self.assertFalse(os.path.isfile(self.bind_cache.sidecar_path(self.graph)))
 
 
+class GuardViewTests(unittest.TestCase):
+    """`_guard_view` folds two independent guard channels -- branch conditions and
+    validation-shaped calls -- into one neutral observation. Pure over a dict, so it
+    needs no built graph."""
+
+    def test_guard_view_folds_validation_calls(self):
+        # A sink with no branch condition but a validation call it passes through
+        # reads as `observed` (the guard was previously invisible), and the call
+        # rows ride along -- neutral presence, never a "safe" verdict.
+        view = Analysis._guard_view({
+            "conditions": {"status": "none-observed", "dominance": "none-observed",
+                           "referencing_conditions": []},
+            "guard_calls": {"status": "observed",
+                            "validation_calls": [{"callee": "validate_redirect_uri"}]},
+        })
+        self.assertEqual(view["status"], "observed")
+        self.assertEqual(view["dominance"], "none-observed")
+        self.assertEqual(view["validation_calls"][0]["callee"], "validate_redirect_uri")
+
+    def test_guard_view_stays_none_observed_without_either_guard(self):
+        view = Analysis._guard_view({
+            "conditions": {"status": "none-observed", "dominance": "none-observed"},
+            "guard_calls": {"status": "none-observed", "validation_calls": []},
+        })
+        self.assertEqual(view["status"], "none-observed")
+
+
 class FixtureIntegrationTests(unittest.TestCase):
     """The whole warm path over a real built graph, when one is present locally."""
 

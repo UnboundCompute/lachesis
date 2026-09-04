@@ -975,12 +975,20 @@ class Analysis:
     @staticmethod
     def _guard_view(inferences: dict) -> dict:
         """The guard the enclosing function places over the sink -- read straight from the
-        registry's condition inference, so ``none-observed`` stays ``none-observed`` and never
-        quietly reads as safe."""
+        registry's inferences. A guard may be a branch *condition* that names the argument
+        (``conditions``) or a validation-shaped *call* the argument passes through
+        (``guard_calls``, e.g. ``validate_redirect_uri``); either one counts as observed.
+        Absent both it stays ``none-observed`` and never quietly reads as safe. Presence is
+        neutral throughout -- a place worth reading, never a verdict that the sink is safe."""
         conditions = inferences.get("conditions") or {}
-        return {"status": conditions.get("status"),
+        guard_calls = inferences.get("guard_calls") or {}
+        statuses = (conditions.get("status"), guard_calls.get("status"))
+        status = "observed" if "observed" in statuses else (
+            conditions.get("status") or guard_calls.get("status"))
+        return {"status": status,
                 "dominance": conditions.get("dominance"),
-                "referencing_conditions": conditions.get("referencing_conditions")}
+                "referencing_conditions": conditions.get("referencing_conditions"),
+                "validation_calls": guard_calls.get("validation_calls")}
 
     def _provenance(self, sink_value: str | None, limit: int) -> dict:
         """The bounded reverse value-flow cone into the sink.
