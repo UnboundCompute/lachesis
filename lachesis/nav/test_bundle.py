@@ -223,5 +223,48 @@ class ValidateTests(unittest.TestCase):
             bundle.validate(b)
 
 
+class GraphFirstBundleTests(unittest.TestCase):
+    def _legacy_bundle(self):
+        return {
+            "meta": {"repo": "GNOME/libxml2", "lang": "c", "commit": "abc", "loc": 42},
+            "graph": {
+                "nodes": [
+                    {"id": "source", "kind": "parameter", "file": "src/a.c",
+                     "line": 3, "label": "input", "snippet": "input"},
+                    {"id": "sink", "kind": "call", "file": "src/a.c",
+                     "line": 8, "label": "execute", "snippet": "execute(input)"},
+                ],
+                "edges": [{"source": "source", "target": "sink", "kind": "VALUE_FLOWS_TO"}],
+            },
+            "findings": [{
+                "finding_id": "a" * 64,
+                "display_name": "input → execute",
+                "result_summary": "A value reaches the call.",
+                "analysis": {"confidence": "high", "limitations": []},
+                "witness": {"steps": [
+                    {"node_id": "source", "role": "origin"},
+                    {"node_id": "sink", "role": "sink"},
+                ]},
+            }],
+        }
+
+    def test_graph_first_uses_v2_contract_and_supported_source_placeholders(self):
+        result = bundle._graph_first_bundle(
+            self._legacy_bundle(), repo="GNOME/libxml2", commit="abc", lang="c", indexed_nodes=99)
+        self.assertEqual(result["schema_version"], "2.0")
+        self.assertEqual(result["meta"]["indexed_nodes"], 99)
+        self.assertEqual(len(result["paths"]["values"]), 1)
+        self.assertIn("{revision}", result["meta"]["source_url_template"])
+        self.assertNotIn("{owner}", result["meta"]["source_url_template"])
+        self.assertNotIn("{repo}", result["meta"]["source_url_template"])
+
+    def test_graph_first_rejects_invalid_path_reference(self):
+        legacy = self._legacy_bundle()
+        legacy["findings"][0]["witness"]["steps"][1]["node_id"] = "missing"
+        with self.assertRaises(ValueError):
+            bundle._graph_first_bundle(
+                legacy, repo="GNOME/libxml2", commit="abc", lang="c", indexed_nodes=2)
+
+
 if __name__ == "__main__":
     unittest.main()
