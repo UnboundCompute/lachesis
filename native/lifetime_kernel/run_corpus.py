@@ -15,6 +15,31 @@ run outright.  Families the reader cannot yet confirm end to end are declared
 the reader learns them this runner flips to red and the expectation is updated
 deliberately rather than drifting silently.
 
+Known limitation, out of scope of this corpus (a narrow *false positive*, tracked
+here rather than encoded as a fixture because encoding it would forfeit the
+no-FP-on-clean invariant above).  One contrived same-function idiom still yields a
+spurious `leak`:
+
+    char *p = malloc(n);   /* origin recorded on `p`            */
+    char **pp = &p;        /* value-flow p -> &p -> pp          */
+    free(*pp);             /* RELEASE recorded on `*pp`, a       *
+                            * different object id than `p`       */
+    /* fallthrough exit, no return */
+
+The allocation *is* freed, but through the double-pointer spelling `*pp` the
+frontend roots the release on the pointee object (`*pp`), which it cannot fold
+back to `p` -- it emits the forward value-flow chain `p -> &p -> pp -> *pp` but no
+must-alias fact unifying `*(&p)` with `p`.  The exit leak scan then sees `p`'s
+origin undischarged and reports a leak.  The fix belongs upstream (fold `*(&x)`
+-> x in the frontend / native translation, or emit a must-alias binding the
+kernel's `canonical()` can follow); it is deliberately NOT patched in the kernel
+leak scan, where following arbitrary value-flow bindings would trade this
+contrived FP for real *missed* leaks on non-alias flows.  Real code frees through
+`*pp` only in a separate `free(char **)` helper -- which carries no allocation and
+so no leak obligation -- so this idiom does not arise in practice and is not a
+hand-over blocker; it is recorded so a future frontend must-alias pass flips it
+green deliberately.
+
 Each fixture is a single translation unit written to exhibit exactly one defect:
 allocations in a bug that targets some *other* family are guarded (to suppress an
 incidental null-deref) and freed (to suppress an incidental leak), so the target
