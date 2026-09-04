@@ -130,12 +130,28 @@ def canonical_index(graph: Dict[str, Any], *, language: str,
         module = props.get("module")
         if module is None and receiver_root:
             module = receiver_root.group(0)
+        # Receiver type gates a type-keyed sink model (``type=Database`` etc.)
+        # against the callee's actual receiver.  Python stamps ``receiver_type``
+        # directly; the TypeScript/JavaScript frontend instead carries the type
+        # checker's verdict in ``receiver_type_facts`` (``.symbol`` is the type's
+        # own name, e.g. ``PromiseConstructor`` for ``Promise.all`` or ``JSON``
+        # for ``JSON.parse``).  Surface that symbol as the receiver type so the
+        # native binder's loose type gate rejects builtins whose leaf method
+        # merely collides with a type-keyed model (``all`` -> sql, ``parse`` ->
+        # xxe).  Only a concrete symbol is adopted: a receiver the checker widens
+        # to ``any`` (e.g. an untyped ``fs``/``path`` namespace) reports no
+        # symbol, so real sinks keep ``receiver_type=None`` and bind as before.
+        receiver_type = props.get("receiver_type")
+        if not receiver_type:
+            facts = props.get("receiver_type_facts")
+            if isinstance(facts, dict):
+                receiver_type = facts.get("symbol") or None
         callsites.append({
             "id": node["id"],
             "callee": {
                 "name": name,
                 "module": module,
-                "receiver_type": props.get("receiver_type"),
+                "receiver_type": receiver_type,
                 "arity": len(ordered),
                 "static": props.get("receiver_value_id") is None,
             },

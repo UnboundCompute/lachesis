@@ -2095,6 +2095,40 @@ fn automatic_include_arguments(files: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// Extra `-I` search paths for a directory-mode build, read from a newline-delimited
+/// file named by ``LACHESIS_INCLUDE_DIRS_FILE``.
+///
+/// A chunked build compiles only a subset of the tree's translation units per process
+/// to bound peak memory, so ``automatic_include_arguments`` -- which derives search
+/// paths from the parent directories of the files it is handed -- would see only that
+/// chunk's directories and fail to resolve an angle-include of a header living in a
+/// sibling chunk. The Python driver writes the whole tree's include directories here
+/// once, so every chunk resolves cross-chunk headers identically to a single-process
+/// build. When a compile database supplies per-TU arguments those win (they are tried
+/// first at the call site); this only augments the shared fallback arguments, so an
+/// unchunked build with the variable unset is byte-for-byte unaffected.
+fn include_dir_arguments_from_env() -> Vec<String> {
+    let Some(path) = env::var_os("LACHESIS_INCLUDE_DIRS_FILE") else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut seen = FxHashSet::default();
+    let mut arguments = Vec::new();
+    for line in text.lines() {
+        let directory = line.trim();
+        if directory.is_empty() {
+            continue;
+        }
+        if seen.insert(directory.to_owned()) {
+            arguments.push("-I".to_owned());
+            arguments.push(directory.to_owned());
+        }
+    }
+    arguments
+}
+
 /// Read the compiler database through libclang rather than making the Python
 /// boundary parse or rewrite build configuration. The returned arguments are
 /// the compiler's own per-TU arguments, minus argv[0], the source filename, and
@@ -2283,6 +2317,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Python to inspect or translate any source/configuration data.
                 clang_arguments = automatic_include_arguments(&files);
             }
+            // Fold in the whole-tree include directories (empty unless the driver
+            // chunked the build), so a chunk resolves headers owned by a sibling
+            // chunk exactly as a single-process build would.
+            clang_arguments.extend(include_dir_arguments_from_env());
             for source in parse_files {
                 let unit = graph::NativeTranslationUnit {
                     path: source.to_string_lossy().into_owned(),

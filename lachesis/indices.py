@@ -160,6 +160,34 @@ def build_decl_and_callsite_index(
     return _ordered(declarations), _ordered(callsites)
 
 
+def stream_decl_and_callsite_rows(
+    nodes: Iterable[Mapping],
+    exported: Sequence | frozenset | set = frozenset(),
+    *,
+    on_decl=None,
+    on_callsite=None,
+) -> None:
+    """One forward pass over ``nodes``, handing each index row to a callback.
+
+    Same per-node work as ``build_decl_and_callsite_index`` -- ``_decl_row`` then
+    ``_callsite_row`` per node, in that order -- but instead of accumulating grouped
+    dicts in memory it emits each row immediately. Callers that must not hold the
+    whole index in RAM (large-scale streamed publication) spill each row to disk and
+    reproduce ``_ordered`` on the way out; the produced rows are byte-identical to
+    ``build_decl_and_callsite_index``'s, only the retention differs.
+    """
+    exported = frozenset(exported)
+    for node in nodes:
+        if on_decl is not None:
+            decl = _decl_row(node, exported)
+            if decl is not None:
+                on_decl(decl)
+        if on_callsite is not None:
+            callsite = _callsite_row(node)
+            if callsite is not None:
+                on_callsite(callsite)
+
+
 def _decl_row(node: Mapping, exported: frozenset) -> dict | None:
     kind = node.get("kind")
     granularity = INDEXED_KINDS.get(kind)

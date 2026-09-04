@@ -87,6 +87,44 @@ def dataflow_overlay_path(graph_path: str) -> str:
     return str(graph_path).rstrip("/") + ".dataflow.pb"
 
 
+def _choose_enrich_shards(input_path: Path) -> int:
+    """How many shards to split the native Pass-2 input into (1 = whole-graph).
+
+    The whole-graph runner holds the entire input plus every overlay delta in RAM, so its
+    peak is roughly an order of magnitude above the on-disk (gzipped) input. On a large
+    tree that OOMs. Sharding by owner function bounds the peak to one shard, at a small
+    replication overhead, and is content-equivalent (see :mod:`lachesis.flow.shard_enrich`).
+
+    Control:
+      * ``LACHESIS_ENRICH_SHARDS`` -- explicit shard count; ``1`` forces the whole-graph
+        path, any value > 1 forces exactly that many shards.
+      * otherwise auto: estimate peak as ``PEAK_PER_INPUT_MB * gzipped-input-MB`` and pick
+        the fewest shards that keep it under ``LACHESIS_MEMORY_BUDGET_MB`` (default 4096),
+        never splitting until the estimated peak exceeds the budget.
+    """
+    explicit = os.environ.get("LACHESIS_ENRICH_SHARDS")
+    if explicit:
+        try:
+            return max(1, int(explicit))
+        except ValueError:
+            pass
+    try:
+        size_mb = input_path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return 1
+    # Measured on a 678k-node C graph: 61 MB gzipped input -> ~1510 MB whole-graph peak.
+    PEAK_PER_INPUT_MB = 25.0
+    try:
+        budget_mb = float(os.environ.get("LACHESIS_MEMORY_BUDGET_MB", "4096"))
+    except ValueError:
+        budget_mb = 4096.0
+    est_peak = PEAK_PER_INPUT_MB * size_mb
+    if est_peak <= budget_mb or budget_mb <= 0:
+        return 1
+    import math
+    return max(2, math.ceil(est_peak / budget_mb))
+
+
 def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
     if not core_hash or not os.path.isfile(path):
         return False
@@ -464,8 +502,18 @@ class GraphStore:
                 catalog_path = compiled_catalog(atropos_root, core_path)
             if not _dataflow_cache_matches(native_cache, manifest.get("core_content_hash")):
                 timing("native Pass-2 starting")
-                run_pass2_path(native_input, native_cache, catalog_path)
-                timing("native Pass-2 published")
+                shards = _choose_enrich_shards(native_input)
+                if shards > 1:
+                    from lachesis.flow.shard_enrich import run_pass2_sharded
+                    stats = run_pass2_sharded(
+                        native_input, native_cache, catalog_path, k=shards,
+                        core_content_hash=manifest.get("core_content_hash") or "",
+                        source=str(native_input))
+                    timing(f"native Pass-2 published (sharded k={shards}, "
+                           f"repl {stats['repl_node_insertions']}/{stats['nodes']})")
+                else:
+                    run_pass2_path(native_input, native_cache, catalog_path)
+                    timing("native Pass-2 published")
             if retain_materialized:
                 # Rebind the open index onto the decoded dataflow overlay so in-process
                 # query/bind consumers see the tier. This pins the whole overlay

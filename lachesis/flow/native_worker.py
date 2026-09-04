@@ -29,6 +29,8 @@ def main(argv: list[str]) -> int:
             nl.run_pass2_path(input_path, output_path, catalog_path)
         elif op == "semantic":
             nl.write_semantic_path(input_path, output_path, catalog_path)
+        elif op == "match":
+            nl.match_semantic_path(input_path, output_path, catalog_path)
         else:
             print(f"unknown native pass {op!r}", file=sys.stderr)
             return 2

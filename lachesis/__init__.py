@@ -1,6 +1,6 @@
 """The small, first-class Python front door to native Lachesis analysis."""
 
-__all__ = ["scan", "Analysis", "LeadSet", "Deadline", "AnalysisError"]
+__all__ = ["scan", "Analysis", "LeadSet", "Deadline", "AnalysisError", "__version__"]
 
 # The warm session lives in `lachesis.session`, which pulls in the heavy `nav.graph_store`
 # and `flow.pipeline` trees. Export the three names lazily (PEP 562) so `import lachesis`
@@ -20,6 +20,16 @@ _MOVED = {
 
 
 def __getattr__(name):
+    if name == "__version__":
+        # Match what the CLI's --version reports (see cache._version): read it from
+        # installed package metadata rather than hard-coding it here, so the library
+        # attribute can never drift from pyproject's version. Resolved lazily on first
+        # access to keep `import lachesis` free of the importlib.metadata cost.
+        try:
+            from importlib.metadata import version
+            return version("lachesis-cpg")
+        except Exception:  # noqa: BLE001 - metadata is absent in a source checkout
+            return "0+unknown"
     if name in _MOVED:
         raise AttributeError(
             f"{name} moved to lachesis.graph.{name}; import it from there")

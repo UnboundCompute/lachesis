@@ -270,7 +270,17 @@ def match_semantic_path(input_path: str | os.PathLike[str],
     Only filenames cross this boundary.  Rust maps the input and writes a
     ``NativeTemporalResult`` protobuf; Python callers can decode that result
     without reconstructing the semantic graph or invoking the legacy matcher.
+
+    The Pass-3 matcher is the largest native pass on the enrich path -- it walks
+    the whole semantic graph's temporal families -- and its native arena stays
+    resident in-process after the FFI returns.  Run it in a short-lived child
+    when isolation is requested, exactly as ``run_pass2_path`` and
+    ``write_semantic_path`` do, so that arena is handed back to the OS on child
+    exit instead of stacking on the Python parent's peak.  The child writes the
+    identical sidecar, so isolation is byte-transparent.
     """
+    if _run_isolated("match", input_path, output_path, catalog_path):
+        return
     library = _require_library()
     function = library.lachesis_lifetime_match_semantic_path
     function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]

@@ -27,7 +27,7 @@ to get them would trade a bounded second parse for unbounded memory.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .declarations import declaration_id, declaration_kind, FUNCTION_LIKE_NODES
 from .emit import Graph, SourceFile, compact, stable_id
@@ -103,6 +103,10 @@ class Frame(NamedTuple):
     # is how a name is resolved to the node that binds it. Spans rather than AST
     # nodes because the table they key was built during a different parse.
     scope_spans: Tuple[Tuple[int, int], ...] = ()
+    # The AST node of this scope, kept so a local variable's constructor origin
+    # can be recovered lazily (a variable bound to ``Client(...)`` carries that
+    # library onto its method calls). None for the module frame.
+    scope_node: Optional[ast.AST] = None
 
 
 class BodyWalk:
@@ -135,6 +139,12 @@ class BodyWalk:
         # be two chances for the attribution to disagree with itself.
         self.values = ValueWalk(graph, source, file_id, facts)
         self.values.bodies = self._bodies
+        # local name -> catalog module, resolved through the import table.
+        self._import_by_name: Optional[Dict[str, "ImportRecord"]] = None
+        # id(scope AST node) -> {local variable name: constructor-origin module}.
+        self._local_modules_cache: Dict[int, Dict[str, str]] = {}
+        # id(scope AST node) -> {local name: receiver type} (constructors + params).
+        self._local_types_cache: Dict[int, Dict[str, str]] = {}
 
     def __getattr__(self, name: str) -> int:
         # The value counters live on the collaborator; the manifest sums them off
@@ -211,7 +221,7 @@ class BodyWalk:
         )
         return Frame(
             kind, graph_id, owner_function_id, class_id, self_name,
-            locals_of_scope, declarations, spans,
+            locals_of_scope, declarations, spans, node,
         )
 
     def _visit(self, node: ast.AST, frame: Frame, parent: Optional[str]) -> None:
@@ -610,6 +620,24 @@ class BodyWalk:
             callee_name=_callee_name(callee),
             callee_form=_callee_form(callee),
             receiver=_receiver_text(self.source, callee),
+            # The dotted package/module the callee originates from, resolved
+            # through this file's import table. A catalog sink model is keyed by
+            # its library (`httpx`, `os`, `urllib.request`), and without this the
+            # only module a call carries is a bare-identifier receiver -- so an
+            # aliased import (`import httpx as hx`), a named import
+            # (`from os import system`) or an instance method on a constructor
+            # result (`AsyncClient(...).get(url)`) resolved to nothing and the
+            # sink never bound. Stamping the resolved module here lets the neutral
+            # binder match those the same way it already matches `httpx.get(...)`.
+            module=self._canonical_module(callee, frame),
+            # The class of the receiver, when the layout reveals it: a variable
+            # bound to a constructor (``client = AsyncClient()``), a parameter with
+            # a type annotation (``arguments: dict``), or ``self``. A catalog model
+            # keyed by receiver type (``{type: ClientSession}``) then binds only on
+            # a receiver of that type, so a bare ``dict.get(...)`` no longer
+            # matches an HTTP client's ``.get`` -- the loose type check needs a
+            # real receiver type present to reject the mismatch.
+            receiver_type=self._receiver_type_of(callee, frame),
             argument_count=len(node.args),
             keyword_count=len(keywords),
             has_star_arguments=any(
@@ -820,6 +848,262 @@ class BodyWalk:
                 )
         return NOTHING
 
+    # -- catalog module canonicalization ------------------------------------
+
+    def _import_index(self) -> Dict[str, List["ImportRecord"]]:
+        """This file's ``local name -> import clauses`` map, absolute imports only.
+
+        Relative imports (``level > 0``) name in-tree modules, never the external
+        libraries a catalog sink model is keyed by, so they are skipped. A name can
+        carry several clauses (the deferred-import idiom repeats the same
+        ``from lib import X`` inside more than one function), so every clause is
+        kept and ``_active_import`` picks the one in force at a given call.
+        """
+        cache = self._import_by_name
+        if cache is None:
+            cache = {}
+            for record in self.facts.imports:
+                if record.level:
+                    continue
+                cache.setdefault(record.alias, []).append(record)
+            self._import_by_name = cache
+        return cache
+
+    def _active_import(self, name: str, frame: Frame) -> Optional["ImportRecord"]:
+        """The import clause that binds ``name`` at a call inside ``frame``.
+
+        A clause written inside this very scope (a deferred ``from lib import X``)
+        is authoritative even though the name then counts as a local. Otherwise the
+        name resolves to an outer/module-level clause only when nothing local
+        shadows it, so a parameter or reassignment named after a module does not
+        masquerade as that module.
+        """
+        records = self._import_index().get(name)
+        if not records:
+            return None
+        span = frame.scope_spans[0] if frame.scope_spans else None
+        if span is not None:
+            low, high = span
+            for record in records:
+                start = record.position.get("start_offset")
+                if start is not None and low <= start < high:
+                    return record
+        if self._shadowed(frame, name):
+            return None
+        for record in records:
+            if record.module_level:
+                return record
+        return records[0]
+
+    def _root_binding(self, name: str, frame: Frame) -> Optional[str]:
+        """The dotted module the *root* name of a reference denotes.
+
+        ``import a.b`` binds the top name ``a``, which denotes package ``a`` (the
+        ``.b`` shows up as an attribute on the reference, not in the binding).
+        ``import a.b as c`` binds ``c`` to the whole ``a.b``. ``from a import b``
+        binds ``b`` to the submodule/attribute ``a.b``.
+        """
+        record = self._active_import(name, frame)
+        if record is None:
+            return None
+        if record.statement_form == "from-import":
+            if record.module and record.name:
+                return f"{record.module}.{record.name}"
+            return record.module or record.name or None
+        # plain ``import`` clause
+        module = record.module or ""
+        if not module:
+            return None
+        top = module.split(".", 1)[0]
+        # ``import a.b`` (no ``as``) -> the bound name is the top package ``a``.
+        if record.alias == top and module != top:
+            return top
+        # ``import a`` or ``import a.b as c`` -> the name denotes the full module.
+        return module
+
+    def _package_of_name(self, name: str, frame: Frame) -> Optional[str]:
+        """The package a bare callable name (a function or class) *lives in*."""
+        record = self._active_import(name, frame)
+        if record is None:
+            return None
+        # ``from a import f`` / ``from a import Cls`` -> lives in package ``a``.
+        # A plain ``import a`` never binds a callable, so ``module`` is the answer
+        # only for the from-import form; fall back to it either way.
+        return record.module or None
+
+    def _canonical_module(self, callee: ast.expr, frame: Frame) -> Optional[str]:
+        """Resolve a callee to the dotted library/module a sink model is keyed by.
+
+        The module is the root name's binding with any intermediate attribute
+        segments of the receiver appended, so ``urllib.parse.quote`` keys on
+        ``urllib.parse`` and ``os.path.basename`` on ``os.path``. Returns None
+        when the import table does not decide it -- a conservative miss (the sink
+        stays unbound), never a guess at the wrong library.
+        """
+        # ``func(...)`` after ``from httpx import get`` -> the package ``get`` lives in.
+        if isinstance(callee, ast.Name):
+            return self._package_of_name(callee.id, frame)
+        if not isinstance(callee, ast.Attribute):
+            return None
+        receiver = callee.value
+        # ``Ctor(...).method(...)`` -> the sink lives in the package the receiver's
+        # class comes from. This is the instance-method case (a client's ``.get``)
+        # that a bare receiver identifier could never reach.
+        if isinstance(receiver, ast.Call):
+            constructor = receiver.func
+            if isinstance(constructor, ast.Name):
+                return self._package_of_name(constructor.id, frame)
+            if isinstance(constructor, ast.Attribute) and isinstance(
+                constructor.value, ast.Name
+            ):
+                base = self._root_binding(constructor.value.id, frame)
+                return f"{base}.{constructor.attr}" if base else None
+            return None
+        # ``X.method`` / ``a.b.method`` -> the module the receiver chain denotes.
+        chain = _dotted_chain(receiver)
+        if chain is None:
+            return None
+        # A bare receiver that is a local variable bound to a constructor result
+        # (``client = AsyncClient(...)`` then ``client.get(...)``) carries that
+        # library, not an import binding.
+        if len(chain) == 1:
+            local = self._local_modules(frame).get(chain[0])
+            if local is not None:
+                return local
+        base = self._root_binding(chain[0], frame)
+        if base is None:
+            return None
+        rest = chain[1:]
+        return ".".join([base, *rest]) if rest else base
+
+    def _local_modules(self, frame: Frame) -> Dict[str, str]:
+        """This function body's ``local variable -> constructor-origin module``.
+
+        Populated from ``x = Ctor(...)`` assignments and ``with Ctor(...) as x``
+        items whose constructor the import table can place in a library. Scoped to
+        the frame's own regions -- nested function and class bodies are not
+        descended into, so a variable of the same name inside one does not leak
+        out. Built once per scope and cached.
+        """
+        node = frame.scope_node
+        if node is None:
+            return {}
+        cached = self._local_modules_cache.get(id(node))
+        if cached is not None:
+            return cached
+        # Seed the cache before filling it: resolving a constructor's own module
+        # can re-enter this method for the same frame, and the empty in-progress
+        # table breaks that cycle (later reads still see earlier entries).
+        table: Dict[str, str] = {}
+        self._local_modules_cache[id(node)] = table
+        for statement in _own_body_statements(node):
+            targets: List[ast.expr] = []
+            value: Optional[ast.expr] = None
+            if isinstance(statement, ast.Assign):
+                targets, value = list(statement.targets), statement.value
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                targets, value = [statement.target], statement.value
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    if item.optional_vars is not None:
+                        module = self._construct_origin_module(item.context_expr, frame)
+                        if module and isinstance(item.optional_vars, ast.Name):
+                            table[item.optional_vars.id] = module
+                continue
+            if value is None:
+                continue
+            module = self._construct_origin_module(value, frame)
+            if not module:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    table[target.id] = module
+        return table
+
+    def _construct_origin_module(
+        self, value: ast.expr, frame: Frame,
+    ) -> Optional[str]:
+        """The library an expression's *value* belongs to, if it is a construction.
+
+        Only a call is treated as producing a library-owned instance; the module
+        is the package the called constructor lives in. ``await Ctor(...)`` is
+        unwrapped so an async factory is handled the same way.
+        """
+        while isinstance(value, ast.Await):
+            value = value.value
+        if isinstance(value, ast.Call):
+            return self._canonical_module(value.func, frame)
+        return None
+
+    def _receiver_type_of(
+        self, callee: ast.expr, frame: Frame,
+    ) -> Optional[str]:
+        """The receiver's class name for a ``receiver.method(...)`` call.
+
+        Only a bare-name receiver is resolved -- that is what a type-keyed catalog
+        model is about. ``self`` resolves to the enclosing class; every other name
+        is looked up in this frame's constructor/parameter type table. None when
+        the layout does not reveal a type, which keeps a type-keyed model matching
+        by method name (the pre-existing behaviour) rather than mis-rejecting.
+        """
+        if not isinstance(callee, ast.Attribute):
+            return None
+        receiver = callee.value
+        if not isinstance(receiver, ast.Name):
+            return None
+        if frame.self_name is not None and receiver.id == frame.self_name:
+            owner = self.graph.nodes.get(frame.class_id) if frame.class_id else None
+            if owner is not None:
+                return owner.get("label")
+            return None
+        return self._local_types(frame).get(receiver.id)
+
+    def _local_types(self, frame: Frame) -> Dict[str, str]:
+        """This body's ``local name -> receiver type`` map.
+
+        Two sources, both read straight off the layout: a variable assigned or
+        ``with``-bound from a constructor call takes that constructor's class name,
+        and a parameter with a type annotation takes that annotation's base name.
+        Scoped to the frame's own regions and built once per scope.
+        """
+        node = frame.scope_node
+        if node is None:
+            return {}
+        cached = self._local_types_cache.get(id(node))
+        if cached is not None:
+            return cached
+        table: Dict[str, str] = {}
+        self._local_types_cache[id(node)] = table
+        if isinstance(node, FUNCTION_LIKE_NODES):
+            for slot in _all_parameters(node.args):
+                if slot.annotation is not None:
+                    base = _annotation_base(slot.annotation)
+                    if base:
+                        table[slot.arg] = base
+        for statement in _own_body_statements(node):
+            targets: List[ast.expr] = []
+            value: Optional[ast.expr] = None
+            if isinstance(statement, ast.Assign):
+                targets, value = list(statement.targets), statement.value
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                targets, value = [statement.target], statement.value
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    if isinstance(item.optional_vars, ast.Name):
+                        name = _constructor_class(item.context_expr)
+                        if name:
+                            table[item.optional_vars.id] = name
+                continue
+            if value is None:
+                continue
+            name = _constructor_class(value)
+            if not name:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    table[target.id] = name
+        return table
+
     @staticmethod
     def _local_declaration(frame: Frame, name: str) -> Optional[str]:
         return frame.declarations.get(name)
@@ -827,6 +1111,80 @@ class BodyWalk:
     @staticmethod
     def _shadowed(frame: Frame, name: str) -> bool:
         return name in frame.locals
+
+
+def _own_body_statements(scope: ast.AST) -> Iterator[ast.stmt]:
+    """Every statement in a scope's own body, not descending into nested scopes.
+
+    A nested ``def``/``class``/``lambda``/comprehension opens its own variable
+    namespace, so an assignment inside one must not be attributed to the enclosing
+    frame. Control statements (``if``/``for``/``with``/``try`` ...) are descended
+    into because they share the frame's namespace.
+    """
+    stack: List[ast.AST] = list(own_regions(scope))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.stmt):
+            yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, SCOPE_NODES):
+                continue
+            stack.append(child)
+
+
+def _dotted_chain(node: ast.expr) -> Optional[List[str]]:
+    """The dotted name segments of a pure ``a.b.c`` reference, root first.
+
+    Returns None the moment the chain hits anything that is not a plain name or
+    attribute (a call, a subscript), because such a reference does not denote a
+    module the import table can canonicalize.
+    """
+    parts: List[str] = []
+    cursor: ast.expr = node
+    while isinstance(cursor, ast.Attribute):
+        parts.append(cursor.attr)
+        cursor = cursor.value
+    if not isinstance(cursor, ast.Name):
+        return None
+    parts.append(cursor.id)
+    parts.reverse()
+    return parts
+
+
+def _annotation_base(node: ast.expr) -> Optional[str]:
+    """The base class name of a parameter annotation.
+
+    ``dict`` -> "dict", ``Dict[str, int]`` -> "Dict", ``mod.Client`` -> "Client".
+    A subscript is unwrapped to its container, an attribute to its leaf; anything
+    else (a string forward-ref, a Union literal) yields None.
+    """
+    cursor = node
+    while isinstance(cursor, ast.Subscript):
+        cursor = cursor.value
+    if isinstance(cursor, ast.Attribute):
+        return cursor.attr
+    if isinstance(cursor, ast.Name):
+        return cursor.id
+    return None
+
+
+def _constructor_class(value: ast.expr) -> Optional[str]:
+    """The class name a constructor call yields, or None if not a constructor call.
+
+    ``Client(...)`` -> "Client", ``httpx.AsyncClient(...)`` -> "AsyncClient".
+    Awaits are unwrapped first, so ``await Client(...)`` still resolves. Only the
+    call's own callee names the type; arguments are never inspected.
+    """
+    while isinstance(value, ast.Await):
+        value = value.value
+    if not isinstance(value, ast.Call):
+        return None
+    func = value.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
 
 
 def _all_parameters(arguments: ast.arguments) -> List[ast.arg]:

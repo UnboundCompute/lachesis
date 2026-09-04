@@ -68,13 +68,44 @@ fn absorb_native_delta(
     graph.absorb(delta)
 }
 
+/// Publish a terminal overlay's delta to the stream without absorbing it back into
+/// the in-RAM graph.  The stream is written from the canonicalized `Delta` here,
+/// exactly as `absorb_native_delta` does before it calls `absorb`, so the emitted
+/// bytes are identical.  `absorb` only mutates the resident graph so that a *later*
+/// overlay can observe the facts; the final overlay in the chain has no later
+/// reader, so absorbing its delta merely grows the arena at the chain's peak moment
+/// (the graph is dropped immediately after `finish`).  Skipping that absorb removes
+/// the last, largest delta's retained cost from the peak with zero output change.
+fn append_native_delta(
+    mut delta: pass2::Delta,
+    writer: &mut pass2::DataflowStreamWriter,
+) -> Result<(), String> {
+    delta.canonicalize();
+    writer.append(&delta)
+}
+
+fn current_rss_mb() -> i64 {
+    // Measurement-only: shell out to `ps` for this process' RSS. Cheap enough at
+    // ~a dozen calls per run and avoids adding a mach/libc dependency. Returns -1
+    // if unavailable so the timeline line still prints.
+    let pid = std::process::id();
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|kb| kb / 1024)
+        .unwrap_or(-1)
+}
+
 fn report_native_phase(
     enabled: bool, started: std::time::Instant, name: &str,
     nodes: usize, edges: usize,
 ) {
     if enabled {
-        eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges)",
-            started.elapsed().as_secs_f64(), nodes, edges);
+        eprintln!("[lachesis native pass2] {name}: {:.3}s (+{} nodes, +{} edges) rss={}MB",
+            started.elapsed().as_secs_f64(), nodes, edges, current_rss_mb());
     }
 }
 
@@ -269,8 +300,8 @@ fn run_native_overlay_chain(
     let started = std::time::Instant::now();
     let mut graph = pass2::read_path(input)?;
     if timing_enabled {
-        eprintln!("[lachesis native pass2] read graph: {:.3}s ({} nodes, {} edges)",
-            started.elapsed().as_secs_f64(), graph.nodes.len(), graph.edges.len());
+        eprintln!("[lachesis native pass2] read graph: {:.3}s ({} nodes, {} edges) rss={}MB",
+            started.elapsed().as_secs_f64(), graph.nodes.len(), graph.edges.len(), current_rss_mb());
     }
     let mut writer = pass2::DataflowStreamWriter::begin(
         output, &input.to_string_lossy(), &graph.core_content_hash,
@@ -314,7 +345,9 @@ fn run_native_overlay_chain(
     absorb_native_delta(&mut graph, delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "async-events", writer.nodes, writer.edges);
     let delta = taint::enrich(&graph);
-    absorb_native_delta(&mut graph, delta, &mut writer)?;
+    // Terminal overlay: publish to the stream but do not absorb — nothing reads
+    // taint's facts, and this is the chain's peak, so absorbing here is pure cost.
+    append_native_delta(delta, &mut writer)?;
     report_native_phase(timing_enabled, started, "taint-propagation", writer.nodes, writer.edges);
     writer.finish()
 }
@@ -1554,6 +1587,61 @@ pub unsafe extern "C" fn lachesis_lifetime_summaries_path(
     }
 }
 
+/// Serialize a `NativeSemanticResult` straight to `path` without ever holding its
+/// whole encoded byte buffer in memory.
+///
+/// `encode_to_vec` allocates one contiguous Vec the size of the entire sidecar
+/// (measured: 512 MB semantic + 350 MB events on a 678k-node graph) that coexists
+/// with the in-memory `full` graph at the serialize peak. This writes each field
+/// element into a small reusable scratch buffer and flushes it to a BufWriter, so
+/// only the largest single element is resident. The output is *byte-identical* to
+/// `result.encode_to_vec()`: prost's derived `encode_raw` emits fields in ascending
+/// tag order (functions=1, complete=2, seams=3, regions=4, skeletons=5), repeated
+/// elements in slice order, and omits a false `complete` -- this mirrors that
+/// exactly via the same `prost::encoding` primitives the derive calls.
+fn write_semantic_result_streaming(
+    result: &lifetime_proto::NativeSemanticResult, path: &str,
+) -> Result<(), String> {
+    use prost::encoding;
+    use std::io::Write;
+    let temporary = format!("{path}.tmp.{}", std::process::id());
+    let file = fs::File::create(&temporary)
+        .map_err(|error| format!("cannot create {path}: {error}"))?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut flush = |tag: u32, buf: &mut Vec<u8>, w: &mut std::io::BufWriter<fs::File>|
+        -> Result<(), String> {
+        w.write_all(buf).map_err(|error| format!("cannot write {path} field {tag}: {error}"))?;
+        buf.clear();
+        Ok(())
+    };
+    for function in &result.functions {
+        encoding::message::encode(1, function, &mut scratch);
+        flush(1, &mut scratch, &mut writer)?;
+    }
+    if result.complete {
+        encoding::bool::encode(2, &result.complete, &mut scratch);
+        flush(2, &mut scratch, &mut writer)?;
+    }
+    for seam in &result.seams {
+        encoding::message::encode(3, seam, &mut scratch);
+        flush(3, &mut scratch, &mut writer)?;
+    }
+    for region in &result.regions {
+        encoding::message::encode(4, region, &mut scratch);
+        flush(4, &mut scratch, &mut writer)?;
+    }
+    for skeleton in &result.skeletons {
+        encoding::message::encode(5, skeleton, &mut scratch);
+        flush(5, &mut scratch, &mut writer)?;
+    }
+    writer.flush().map_err(|error| format!("cannot flush {path}: {error}"))?;
+    drop(writer);
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("cannot publish {path}: {error}"))?;
+    Ok(())
+}
+
 /// Build a compact Rust-owned semantic event graph from the framed substrate.
 /// Only event nodes and control-flow edges are written to the output sidecar.
 #[no_mangle]
@@ -1626,13 +1714,27 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             // (`.pass2.translation.pb`).  The framed cache is not a bare prost
             // message; decoding it as TranslationResult misreads the leading
             // frame-length/header bytes as protobuf tags ("invalid tag value:
-            // 0").  Unsharded/Python-streamed builds write both files; sharded
-            // raw-shard builds write only the flat facts.  Fall back to
-            // recomputing from the substrate when the facts file is absent.
-            let translation_bytes = if let Some(path) = input.strip_suffix(".pass2.input.pb")
+            // 0").  Unsharded/Python-streamed builds write both files; a
+            // large-graph build defers the flat facts to keep the translation
+            // projection's O(graph) map off the build peak.  Recompute from the
+            // *substrate* (`.pass3.substrate.pb`) when the facts file is absent
+            // -- NOT from `bytes` (the Pass-2 input mapped above).  The two
+            // sidecars are different files and `sidecar_to_translation` yields
+            // different facts from each (verified: substrate -> 571a245e...,
+            // pass2-input -> 06834283...); the build-time producer
+            // (`translate_graph_write_path`) reads the substrate, so recomputing
+            // from the substrate is what keeps the deferred facts byte-identical
+            // to the build-time-written facts.
+            let base = input.strip_suffix(".pass2.input.pb");
+            let facts_path = base
                 .map(|base| format!("{base}.pass2.facts.pb"))
-                .filter(|path| std::path::Path::new(path).is_file()) {
+                .filter(|path| std::path::Path::new(path).is_file());
+            let translation_bytes = if let Some(path) = facts_path {
                 native_graph::read_maybe_gzip(&path)?
+            } else if let Some(base) = base {
+                let substrate_path = format!("{base}.pass3.substrate.pb");
+                let substrate_bytes = native_graph::map_path(&substrate_path)?;
+                native_graph::sidecar_to_translation(&substrate_bytes)?
             } else {
                 native_graph::sidecar_to_translation(&bytes)?
             };
@@ -1662,17 +1764,13 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
         // Temporal candidate enumeration only needs operation-derived event
         // nodes. Publish that compact view beside the full semantic graph so
         // Python queries never parse the large anchor/control-flow payload.
-        let result = full.encode_to_vec();
-        report_native_phase(timing_enabled, semantic_started, "semantic serialize", 0, result.len());
-        let temporary = format!("{output}.tmp.{}", std::process::id());
-        fs::write(&temporary, &result)
-            .map_err(|error| format!("cannot write semantic result: {error}"))?;
-        fs::rename(&temporary, output)
-            .map_err(|error| format!("cannot publish semantic result: {error}"))?;
-        // The full sidecar is already durable. Release its encoded byte
-        // buffer before building the compact event projection so peak memory
-        // is not graph + full bytes + event bytes at once.
-        drop(result);
+        report_native_phase(timing_enabled, semantic_started, "semantic serialize", 0, full.encoded_len());
+        // Stream the sidecar to disk instead of building a whole-sidecar-sized Vec
+        // (encode_to_vec) that would coexist with `full` at the serialize peak.
+        // Byte-identical to `full.encode_to_vec()` (see write_semantic_result_streaming).
+        write_semantic_result_streaming(&full, output)?;
+        // The full sidecar is already durable. Build the compact event projection by
+        // MOVING full's fields (so the graph is not duplicated) and stream it too.
         let events = lifetime_proto::NativeSemanticResult {
             functions: full.functions.into_iter()
                 .filter_map(compact_event_function).collect(),
@@ -1680,13 +1778,9 @@ pub unsafe extern "C" fn lachesis_lifetime_semantic_path(
             seams: full.seams,
             regions: full.regions,
             skeletons: full.skeletons,
-        }.encode_to_vec();
+        };
         let events_output = format!("{output}.events.pb");
-        let events_temporary = format!("{events_output}.tmp.{}", std::process::id());
-        fs::write(&events_temporary, events)
-            .map_err(|error| format!("cannot write semantic events: {error}"))?;
-        fs::rename(&events_temporary, events_output)
-            .map_err(|error| format!("cannot publish semantic events: {error}"))?;
+        write_semantic_result_streaming(&events, &events_output)?;
         Ok::<(), String>(())
     })();
     match result {
@@ -1723,10 +1817,20 @@ pub unsafe extern "C" fn lachesis_lifetime_match_semantic_path(
             ).map_err(|error| format!("invalid binary pattern catalog: {error}"))?.pattern_catalog
         };
         let mapped = native_graph::map_path(input)?;
-        let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
-            .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
-        let matched = semantic_match::match_result_with_catalog(result, catalog.as_ref())
-            .encode_to_vec();
+        // The common skeleton path matches every skeleton independently and never
+        // reads the functions/seams payload, so stream the sidecar one skeleton at
+        // a time to bound the peak by the largest skeleton instead of the whole
+        // graph. Only when the sidecar takes the (rarer) stitched or per-function
+        // branch -- signalled by `None` -- do we decode it whole and run the
+        // original matcher, keeping that path byte-for-byte unchanged.
+        let matched = match semantic_match::match_streaming(mapped.as_ref(), catalog.as_ref()) {
+            Some(result) => result,
+            None => {
+                let result = lifetime_proto::NativeSemanticResult::decode(mapped.as_ref())
+                    .map_err(|error| format!("invalid semantic sidecar: {error}"))?;
+                semantic_match::match_result_with_catalog(result, catalog.as_ref())
+            }
+        }.encode_to_vec();
         let temporary = format!("{output}.tmp.{}", std::process::id());
         fs::write(&temporary, matched)
             .map_err(|error| format!("cannot write native match result: {error}"))?;

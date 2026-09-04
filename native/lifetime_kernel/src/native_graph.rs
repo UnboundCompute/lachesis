@@ -1003,7 +1003,15 @@ struct CompactNode {
     id: String,
     kind: String,
     label: String,
-    properties: HashMap<String, String>,
+    // Whitelisted node properties as a compact linear slice.  Keys are the
+    // 18 static literals accepted by `compact_node`, so they carry no heap and
+    // no per-key allocation; values are boxed strings (16B fat pointer vs a
+    // 24B `String`).  Replaces a per-node `HashMap<String, String>` -- at
+    // Linux scale that was ~1.5M tiny, over-allocated hash tables dominating
+    // the translation-projection peak.  Lookups (`compact_property`) scan this
+    // slice, which holds at most ~8 entries, and preserve the original
+    // last-write-wins semantics of the map insert, so results are byte-exact.
+    properties: Box<[(&'static str, Box<str>)]>,
 }
 
 fn compact_path_name(nodes: &HashMap<String, CompactNode>, root: &str) -> String {
@@ -1024,25 +1032,52 @@ struct CompactEdge {
 }
 
 fn compact_node(record: graph_proto::NodeRecord) -> CompactNode {
-    let properties = record.properties.into_iter().filter_map(|field| {
-        if !matches!(field.key.as_str(),
-            "syntax_kind" | "owner_function_id" | "function_id" | "start_line" |
-            "start_offset" | "primary_target_id" | "callee" | "receiver" |
-            "is_alloc" | "is_release" | "is_realloc" | "is_aggregate_copy" |
-            "type" | "operator" | "storage_class" | "linkage" | "exported" | "file") {
-            return None;
-        }
-        let value = field.value?.kind?;
-        let value = match value {
-            graph_proto::value::Kind::Text(value) => value,
-            graph_proto::value::Kind::Integer(value) => value.to_string(),
-            graph_proto::value::Kind::Real(value) => value.to_string(),
-            graph_proto::value::Kind::Boolean(value) => value.to_string(),
-            _ => return None,
+    let mut properties: Vec<(&'static str, Box<str>)> = Vec::new();
+    for field in record.properties {
+        // Intern the key to its static literal; anything off the whitelist is
+        // dropped exactly as before.
+        let key: &'static str = match field.key.as_str() {
+            "syntax_kind" => "syntax_kind",
+            "owner_function_id" => "owner_function_id",
+            "function_id" => "function_id",
+            "start_line" => "start_line",
+            "start_offset" => "start_offset",
+            "primary_target_id" => "primary_target_id",
+            "callee" => "callee",
+            "receiver" => "receiver",
+            "is_alloc" => "is_alloc",
+            "is_release" => "is_release",
+            "is_realloc" => "is_realloc",
+            "is_aggregate_copy" => "is_aggregate_copy",
+            "type" => "type",
+            "operator" => "operator",
+            "storage_class" => "storage_class",
+            "linkage" => "linkage",
+            "exported" => "exported",
+            "file" => "file",
+            _ => continue,
         };
-        Some((field.key, value))
-    }).collect();
-    CompactNode { id: record.id, kind: record.kind, label: record.label, properties }
+        let value = match field.value.and_then(|value| value.kind) {
+            Some(graph_proto::value::Kind::Text(value)) => value,
+            Some(graph_proto::value::Kind::Integer(value)) => value.to_string(),
+            Some(graph_proto::value::Kind::Real(value)) => value.to_string(),
+            Some(graph_proto::value::Kind::Boolean(value)) => value.to_string(),
+            _ => continue,
+        };
+        // Preserve the map's last-write-wins on a repeated key so lookups stay
+        // byte-identical even if the substrate ever emits a key twice.
+        if let Some(slot) = properties.iter_mut().find(|(existing, _)| *existing == key) {
+            slot.1 = value.into_boxed_str();
+        } else {
+            properties.push((key, value.into_boxed_str()));
+        }
+    }
+    CompactNode {
+        id: record.id,
+        kind: record.kind,
+        label: record.label,
+        properties: properties.into_boxed_slice(),
+    }
 }
 
 fn compact_edge(record: graph_proto::EdgeRecord) -> CompactEdge {
@@ -1227,7 +1262,9 @@ fn scan_lifetime_metadata<R: Read>(
 }
 
 fn compact_property<'a>(node: &'a CompactNode, key: &str) -> Option<&'a str> {
-    node.properties.get(key).map(String::as_str)
+    node.properties.iter()
+        .find(|(existing, _)| *existing == key)
+        .map(|(_, value)| value.as_ref())
 }
 
 fn compact_kind(node: &CompactNode) -> &str {
@@ -1366,6 +1403,36 @@ where
     Ok(())
 }
 
+/// Stream only the relevance-bearing edges, in file order, skipping the node
+/// section without decoding it.  The four kinds delivered here are exactly those
+/// the record scanner buffers, so a caller can re-derive the identical file-ordered
+/// edge sequence on demand instead of holding the whole-graph edge buffer resident.
+/// Node frames precede the edges and are cheap to walk past (length-prefixed, no
+/// protobuf decode); only edge frames are decoded and filtered.
+fn scan_compact_edges_stream<R, FE>(reader: &mut R, mut on_edge: FE) -> Result<(), String>
+where
+    R: Read,
+    FE: FnMut(CompactEdge),
+{
+    let _ = frame_stream(reader)?
+        .ok_or_else(|| "missing graph sidecar header".to_owned())?;
+    while let Some(payload) = frame_stream(reader)? {
+        if payload.is_empty() { continue; }
+        match payload[0] {
+            b'N' => {}  // node section precedes edges; walk past without decoding
+            b'E' => {
+                let record = graph_proto::EdgeRecord::decode(&payload[1..])
+                    .map_err(|error| format!("invalid graph edge frame: {error}"))?;
+                if matches!(record.kind.as_str(), "AST_CHILD" | "HAS_ARGUMENT" | "REFERS_TO" | "VALUE_FLOWS_TO") {
+                    on_edge(compact_edge(record));
+                }
+            }
+            _ => return Err("unknown graph sidecar record prefix".to_owned()),
+        }
+    }
+    Ok(())
+}
+
 fn sidecar_language(input: &[u8]) -> Result<Option<String>, String> {
     let mut reader = open_frames_bytes(input);
     let header = frame_stream(&mut reader)?
@@ -1390,20 +1457,25 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
     // Keep only the records needed to seed relevance.  The previous version
     // retained every compact node before filtering edges, which defeated the
     // purpose of the compact ABI on million-node graphs.
-    // One forward pass collects the seed node subset and buffers every
-    // relevance-bearing edge in file order.  The node section precedes the edge
-    // section, so a single pass sees all seeds before any edge; buffering only
-    // the four relevance kinds (the scanner already filters them) keeps the
-    // working set far below the whole graph -- the million compact nodes are
-    // never retained -- while removing the mid-file edge re-reads the old mmap
-    // path needed.  The buffer is iterated, not re-decoded, so the two-hop
-    // closure and the keep filter run over the identical file-ordered edge
-    // sequence as before, giving a byte-identical projection.
+    //
+    // The input is an mmap, so the relevance-bearing edges are re-derivable from
+    // the file on demand.  Rather than buffer every AST_CHILD/HAS_ARGUMENT/
+    // REFERS_TO/VALUE_FLOWS_TO edge of the whole graph in `all_edges` (the peak
+    // driver -- effectively the entire AST, at ~5 heap strings per edge), each of
+    // the two closure hops and the final keep-filter re-streams the edge section
+    // from the mmap.  The scanner yields the identical file-ordered edge sequence,
+    // so `relevant` evolves and `edges` is collected exactly as before -- the
+    // projection is byte-identical -- while peak resident state drops from the
+    // whole-graph edge buffer to just the kept subset.  The trade is a few extra
+    // demand-paged scans (node frames walked past without decoding) for a
+    // multi-gigabyte allocation removed, which is what lets translation scale.
+    //
+    // Seeds are nodes only, and the node section precedes the edges, so the seed
+    // pass stops at the first edge frame.
     let mut seed_nodes = HashMap::new();
-    let mut all_edges: Vec<CompactEdge> = Vec::new();
     {
         let mut reader = open_frames_bytes(input);
-        scan_compact_records_stream(&mut reader, |record| {
+        scan_compact_nodes_stream(&mut reader, |record| {
             if function_kind(record_kind(&record))
                 || translation_call_kind(record_kind(&record))
                 || translation_return_kind(record_kind(&record))
@@ -1411,7 +1483,7 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                 let node = compact_node(record);
                 seed_nodes.insert(node.id.clone(), node);
             }
-        }, |edge| all_edges.push(edge))?;
+        })?;
     }
     let call_ids: HashSet<String> = seed_nodes.values().filter(|node| translation_call_kind(compact_kind(node)))
         .map(|node| node.id.clone()).collect();
@@ -1419,7 +1491,8 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
         .map(|node| node.id.clone()).collect();
     let mut relevant = call_ids.union(&return_ids).cloned().collect::<HashSet<_>>();
     for _ in 0..2 {
-        for edge in &all_edges {
+        let mut reader = open_frames_bytes(input);
+        scan_compact_edges_stream(&mut reader, |edge| {
             match edge.kind.as_str() {
                 "AST_CHILD" => {
                     if call_ids.contains(&edge.source) || return_ids.contains(&edge.source)
@@ -1440,18 +1513,25 @@ pub(crate) fn sidecar_to_translation(input: &[u8]) -> Result<Vec<u8>, String> {
                 }
                 _ => {}
             }
-        }
+        })?;
     }
-    // Filter to kept edges in file order (index-stable for argument_edges), then
-    // drop the full buffer so peak resident state falls back to the kept subset
-    // before the map-building phase.
-    let edges: Vec<CompactEdge> = all_edges.into_iter().filter(|edge| match edge.kind.as_str() {
-        "AST_CHILD" => relevant.contains(&edge.source) || relevant.contains(&edge.target),
-        "HAS_ARGUMENT" => relevant.contains(&edge.source),
-        "REFERS_TO" => relevant.contains(&edge.source),
-        "VALUE_FLOWS_TO" => call_ids.contains(&edge.source),
-        _ => false,
-    }).collect();
+    // Collect the kept edges in file order (index-stable for argument_edges) by
+    // re-streaming once more; only this relevant subset is held resident for the
+    // map-building phase.
+    let mut edges: Vec<CompactEdge> = Vec::new();
+    {
+        let mut reader = open_frames_bytes(input);
+        scan_compact_edges_stream(&mut reader, |edge| {
+            let keep = match edge.kind.as_str() {
+                "AST_CHILD" => relevant.contains(&edge.source) || relevant.contains(&edge.target),
+                "HAS_ARGUMENT" => relevant.contains(&edge.source),
+                "REFERS_TO" => relevant.contains(&edge.source),
+                "VALUE_FLOWS_TO" => call_ids.contains(&edge.source),
+                _ => false,
+            };
+            if keep { edges.push(edge); }
+        })?;
+    }
     let mut nodes = seed_nodes;
     // Second forward pass over the node section only, adding relevant
     // intermediates; it stops at the first edge frame so the edge tail is not

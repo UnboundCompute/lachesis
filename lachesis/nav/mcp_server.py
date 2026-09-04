@@ -1067,6 +1067,22 @@ def _emit(name, result, fmt, offset=0, limit=render_mod.DEFAULT_LIMIT):
 
 def _tool_error(name, error):
     """Return a recoverable, agent-readable error envelope for one tool call."""
+    if isinstance(error, KeyError):
+        # A missing required argument reaches here as `KeyError('name')`, whose str() is
+        # the bare repr `'name'` -- opaque to a caller who cannot tell it names an absent
+        # argument. Rewrite it into a self-describing message + fix so the agent knows to
+        # resupply the argument rather than guessing at an internal lookup failure.
+        missing = error.args[0] if error.args else "argument"
+        return {
+            "move": name,
+            "ok": False,
+            "error": {
+                "type": "MissingArgument",
+                "message": f"missing required argument: {missing!r}",
+                "fix": f"call {name!r} again with {missing!r} supplied",
+            },
+            "partial_leads": [],
+        }
     message = str(error) or type(error).__name__
     lowered = message.lower()
     if "native" in lowered and ("kernel" in lowered or "rust" in lowered):
@@ -1518,7 +1534,16 @@ def call_tool(name, args, format=None):
                               min_size=int(args.get("min_size", 2)))
         return _emit(name, {"move": "communities", **result}, fmt, offset, limit)
     if name == "search":
-        page = si.search_page(store.entries, args["name"], "fuzzy",
+        # A tool literally called `search` invites `query`/`q` -- an LLM client reaches
+        # for those before the schema's `name`, and `args["name"]` then raised a bare
+        # KeyError on every such call. Accept the natural synonyms so the intended query
+        # lands, and give a clean, self-describing error when the term is truly absent
+        # rather than leaking the raw key miss.
+        term = args.get("name") or args.get("query") or args.get("q")
+        if not term:
+            return _emit(name, {"error": "search needs a symbol name to resolve; pass "
+                                         "it as `name` (aliases: `query`, `q`)"}, fmt)
+        page = si.search_page(store.entries, term, "fuzzy",
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
         return _emit(name, page, fmt, offset, limit)
     if name in ("callers", "callees"):

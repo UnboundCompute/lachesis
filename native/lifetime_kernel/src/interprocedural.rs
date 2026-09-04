@@ -4,22 +4,6 @@ use hashbrown::{HashMap, HashSet};
 use crate::graph_proto;
 use crate::pass2::{self, Delta, Graph};
 
-fn text<'a>(node: &'a pass2::Node, key: &str) -> Option<&'a str> {
-    node.properties.iter().find_map(|field| {
-        if field.key != key { return None; }
-        match field.value.as_ref()?.kind.as_ref()? {
-            graph_proto::value::Kind::Text(value) => Some(value.as_str()), _ => None,
-        }
-    })
-}
-fn integer(node: &pass2::Node, key: &str) -> Option<i64> {
-    node.properties.iter().find_map(|field| {
-        if field.key != key { return None; }
-        match field.value.as_ref()?.kind.as_ref()? {
-            graph_proto::value::Kind::Integer(value) => Some(*value), _ => None,
-        }
-    })
-}
 fn edge_text<'a>(edge: &'a pass2::Edge, key: &str) -> Option<&'a str> {
     edge.properties.iter().find_map(|field| {
         if field.key != key { return None; }
@@ -59,7 +43,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
     let mut bindings_by_call: HashMap<u32, Vec<usize>> = HashMap::new();
     for node in &graph.nodes {
         if graph.kind(node.kind) == "argument" {
-            if let Some(call) = text(node, "callsite_id").and_then(|id| graph.symbol(id)) { arguments_by_call.entry(call).or_default().push(node.id); }
+            if let Some(call) = graph.node_property_text(node, "callsite_id").and_then(|id| graph.symbol(id)) { arguments_by_call.entry(call).or_default().push(node.id); }
         }
     }
     for (edge_index, item) in graph.edges.iter().enumerate() {
@@ -67,14 +51,14 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             "RETURNS_VALUE" => { returns_by_function.entry(item.target).or_default().push(item.source); }
             "ARGUMENT_BINDS_PARAMETER" => {
                 if let Some(argument) = graph.node_by_id.get(&item.source).map(|index| &graph.nodes[*index]) {
-                    if let Some(call) = text(argument, "callsite_id").and_then(|id| graph.symbol(id)) {
+                    if let Some(call) = graph.node_property_text(argument, "callsite_id").and_then(|id| graph.symbol(id)) {
                         bindings_by_call.entry(call).or_default().push(edge_index);
                     }
                 }
             }
             "DEFINES" => {
                 let target = graph.node_by_id.get(&item.target).map(|index| &graph.nodes[*index]);
-                if target.is_some_and(|node| text(node, "origin") == Some("parameter")) { parameter_defs.entry(item.source).or_default().push(item.target); }
+                if target.is_some_and(|node| graph.node_property_text(node, "origin") == Some("parameter")) { parameter_defs.entry(item.source).or_default().push(item.target); }
             }
             _ => {}
         }
@@ -103,7 +87,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 let binding = &graph.edges[*edge_index];
                 let parameter_id = binding.target;
                 let Some(parameter) = graph.node_by_id.get(&parameter_id).map(|index| &graph.nodes[*index]) else { continue };
-                if let Some(target) = target { if text(parameter, "owner_function_id").and_then(|id| graph.symbol(id)) != Some(target) { continue; } }
+                if let Some(target) = target { if graph.node_property_text(parameter, "owner_function_id").and_then(|id| graph.symbol(id)) != Some(target) { continue; } }
                 let argument_id = binding.source;
                 let argument_text = graph.id(argument_id).to_owned(); let parameter_text = graph.id(parameter_id).to_owned();
                 let binding_id = pass2::stable_id("core", "interprocedural-contexts", "context-parameter", &[&context_id, &argument_text, &parameter_text]);
@@ -120,7 +104,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                     edges.push(edge("VALUE_FLOWS_TO", &binding_id, &definition_text, [binding_fact.clone(), vec![pass2::text_field("reason", "context-parameter"), pass2::text_field("context_id", &context_id)]].concat()));
                 }
             }
-            let Some(call_value) = text(call, "value_id").and_then(|id| graph.symbol(id)) else { continue };
+            let Some(call_value) = graph.node_property_text(call, "value_id").and_then(|id| graph.symbol(id)) else { continue };
             let call_value_text = graph.id(call_value).to_owned();
             let return_id = pass2::stable_id("core", "interprocedural-contexts", "context-return", &[&context_id, &call_value_text]);
             let mut return_evidence = vec![call_id.clone(), call_value_text.clone()];

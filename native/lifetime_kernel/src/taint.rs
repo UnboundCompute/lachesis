@@ -53,10 +53,9 @@ fn object_field<'a>(value: &'a graph_proto::Value, key: &str) -> Option<&'a grap
     }
 }
 
-fn roles(graph: &pass2::Node, role_name: &str) -> Vec<(String, String)> {
-    let Some(value) = graph.properties.iter().find(|field| field.key == "roles")
-        .and_then(|field| field.value.as_ref()) else { return Vec::new(); };
-    let graph_proto::value::Kind::List(list) = value.kind.as_ref().unwrap() else { return Vec::new(); };
+fn roles(graph: &Graph, node: &pass2::Node, role_name: &str) -> Vec<(String, String)> {
+    let Some(value) = graph.node_property(node, "roles") else { return Vec::new(); };
+    let Some(graph_proto::value::Kind::List(list)) = value.kind.as_ref() else { return Vec::new(); };
     list.values.iter().filter_map(|role| {
         let role_value = object_field(role, "role").and_then(value_text)?;
         if !role_value.eq_ignore_ascii_case(role_name) { return None; }
@@ -426,7 +425,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             let record = RoleRecord { node: graph.id(node.id).to_owned(), value, confidence, subtype, label: node.label.clone() };
             if kind == "source" { source_records.push(record); } else { sink_records.push(record); }
         }
-        for (subtype, confidence) in roles(node, "source") {
+        for (subtype, confidence) in roles(graph, node, "source") {
             let source_id = pass2::stable_id("core", "taint-propagation", "source", &[graph.id(node.id), &subtype]);
             let value = node.id;
             let label = format!("source:{}", node.label);
@@ -440,7 +439,7 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
             source_records.push(RoleRecord { node: source_id, value,
                 confidence: confidence.clone(), subtype: subtype.clone(), label: label.clone() });
         }
-        for (subtype, confidence) in roles(node, "sink") {
+        for (subtype, confidence) in roles(graph, node, "sink") {
             let sink_id = pass2::stable_id("core", "taint-propagation", "sink", &[graph.id(node.id), &subtype]);
             let label = format!("sink:{}", node.label);
             let mut properties = fact(&[graph.id(node.id).to_owned()], &confidence);

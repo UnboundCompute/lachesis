@@ -227,7 +227,12 @@ class Analysis:
     def _pass2_timing(label: str, started: float) -> None:
         """Emit opt-in timings for the catalog/temporal half of Pass 2."""
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
-            _LOGGER.info("pass2 %s: %.3fs", label, perf_counter() - started)
+            import resource, sys as _sys
+            _sc = 1.0 if _sys.platform == "darwin" else 1024.0  # ru_maxrss bytes(mac)/KiB(linux)
+            _s = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _sc / 1048576
+            _k = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * _sc / 1048576
+            _LOGGER.info("pass2 %s: %.3fs  peakRSS self=%.0fMB kids=%.0fMB",
+                         label, perf_counter() - started, _s, _k)
 
     @staticmethod
     def _pass2_progress(label: str, elapsed: float) -> None:
@@ -1286,8 +1291,18 @@ class LeadSet:
 
     # -- filters (each returns a new LeadSet) ---------------------------------------
 
-    def by_pattern(self, pattern: str) -> "LeadSet":
-        """Return a new result containing only leads with this pattern name."""
+    def by_pattern(self, pattern: str | None = None):
+        """Filter to one pattern, or -- called with no argument -- return the
+        pattern -> count breakdown.
+
+        The name reads two ways: as a filter (``by_pattern("mem.copy...")`` -> a new
+        LeadSet with only that pattern) and as the grouping ``summary()["by_pattern"]``
+        exposes. A bare ``by_pattern()`` used to raise TypeError, colliding with that
+        summary key; it now returns the same ``{pattern: count}`` mapping, so the natural
+        call is no longer a dead end.
+        """
+        if pattern is None:
+            return dict(Counter(lead.get("pattern") for lead in self.leads))
         return self._with(lead for lead in self.leads if lead.get("pattern") == pattern)
 
     def by_function(self, name: str, lines: tuple[int, int] | None = None) -> "LeadSet":
@@ -1302,12 +1317,26 @@ class LeadSet:
         return self._with(lead for lead in self.leads if predicate(lead))
 
     def near(self, file: str, lines: tuple[int, int] | None = None) -> "LeadSet":
-        """Leads whose enclosing function resolves to ``file`` (path, suffix, or basename),
-        optionally within an inclusive ``(lo, hi)`` line window over the sink line."""
+        """Leads located in ``file`` (path, suffix, or basename), optionally within an
+        inclusive ``(lo, hi)`` line window over the sink line.
+
+        A lead's file comes from two places: the lead may carry its own file directly
+        (scan and candidate leads do), and a flow lead that carries only its enclosing
+        function resolves that function -> file(s) via the symbol index. Match either, so
+        ``near``/``at`` work for ``scan()`` output too -- previously they consulted only
+        the function index, and a lead with no ``entry`` (every scan lead) silently
+        matched nothing.
+        """
         index = self._index()
-        return self._with(lead for lead in self.leads
-                          if _file_matches(index.get(lead.get("entry"), ()), file)
-                          and self._in_lines(lead, lines))
+
+        def _here(lead) -> bool:
+            files = set(index.get(lead.get("entry"), ()))
+            own = lead.get("file")
+            if own:
+                files.add(own)
+            return _file_matches(files, file) and self._in_lines(lead, lines)
+
+        return self._with(lead for lead in self.leads if _here(lead))
 
     def at(self, file: str, line: int) -> "LeadSet":
         """Return leads whose source location matches one file and line."""

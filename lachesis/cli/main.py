@@ -146,6 +146,12 @@ complete -c lachesis -n "__fish_seen_subcommand_from scan" -l json -l quiet -s q
 
 def command_query(args: argparse.Namespace) -> int:
     """Run the structured graph query parser without a REMAINDER passthrough."""
+    # Bind json at function entry. The except clause below references
+    # json.JSONDecodeError, and a later `import json` inside the format branch
+    # made json a function-local everywhere -- so a store-open failure hit the
+    # except with json unbound and raised UnboundLocalError instead of the clean
+    # one-line error every other verb gives on a bad graph path.
+    import json
     from lachesis.cli import query
     values = vars(args).copy()
     values["command"] = values.pop("query_command")
@@ -156,7 +162,6 @@ def command_query(args: argparse.Namespace) -> int:
         _stderr(json.dumps({"error": str(error), "query": query_args.command}))
         return EXIT_FAILURE
     if args.format == "json":
-        import json
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print(query.render_text(result), end="")
@@ -284,10 +289,19 @@ def command_scan(args: argparse.Namespace) -> int:
                 rendered = _render(lead, position)
             else:
                 observations = lead.get("observations") or {}
+                # Always surface the file. The old form printed `{symbol}:{line}` from
+                # entry/callee only, so a temporal lead -- which carries no callee and no
+                # entry -- rendered as a location-less `:6`, dropping the one coordinate a
+                # reader needs to open it. Show `file:line` (the file is in observations),
+                # keeping the symbol ahead of it when there is one.
+                symbol = (lead.get("entry") or observations.get("callee")
+                          or observations.get("site") or "")
+                where = observations.get("file") or lead.get("file") or ""
+                line = lead.get("line") or observations.get("line") or ""
+                location = f"{where}:{line}" if where else f":{line}"
                 rendered = (f"{position:>3}. [{(lead.get('rank') or 0.0):.3f}] "
                             f"{lead.get('pattern') or lead.get('constructor') or 'lead'}  "
-                            f"{lead.get('entry') or observations.get('callee', '')}:"
-                            f"{lead.get('line') or observations.get('line', '')}")
+                            f"{symbol + '  ' if symbol else ''}{location}")
             print(_color(rendered, "cyan", args.color))
             print()
         if len(shown) < len(queue):
@@ -600,6 +614,8 @@ def command_build(args: argparse.Namespace) -> int:
     from lachesis.cli import analyze
 
     forwarded = [args.source_dir, args.output_path, "--timeout", str(args.timeout)]
+    if args.memory_budget_mb is not None:
+        forwarded.extend(["--memory-budget-mb", str(args.memory_budget_mb)])
     if args.output_flag:
         forwarded.extend(["--output", args.output_flag])
     if args.frontend_out:
@@ -879,6 +895,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="keep lexical token/proof records (pruned by default)")
     build.add_argument("--timeout", type=_positive_seconds, default=300, metavar="SECONDS",
                        help="maximum seconds per frontend (default: 300)")
+    build.add_argument("--memory-budget-mb", type=_positive_int, default=None, metavar="MiB",
+                       help="total memory budget for the build process tree (default 5120). "
+                            "Sizes the frontend chunking so a Linux-scale tree builds without "
+                            "OOM; the emitted graph is identical at any budget. Same as "
+                            "LACHESIS_MEMORY_BUDGET_MB; the flag wins.")
     build.add_argument("--incremental", action="store_true",
                        help="reuse unchanged frontend bundles")
     build.add_argument("--parallel-packages", action="store_true",
@@ -929,7 +950,11 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("graph", help="path to a .kuzu graph")
     query.add_argument("--budget-tokens", type=_positive_int, default=12000,
                        metavar="N", help="approximate answer budget")
-    query.add_argument("--format", choices=("json", "text"), default="json")
+    # Default to text like every other verb (scan/analyze/candidates emit text unless
+    # --json). query alone used to default to json, which surprised a reader who ran it
+    # after the others; pass --format json to restore the machine-readable document.
+    query.add_argument("--format", choices=("json", "text"), default="text",
+                       help="output format (default: text; use json for a machine-readable slice)")
     query_commands = query.add_subparsers(dest="query_command", metavar="<question>",
                                           required=True)
     query_commands.add_parser("overview", help="summarize the graph")
