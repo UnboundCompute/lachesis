@@ -410,8 +410,9 @@ def command_trace(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))
     graph = bundle["graph"]
+    findings = bundle.get("findings") or (bundle.get("security") or {}).get("findings") or []
     _stderr(f"wrote {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
-            f"{len(bundle['findings'])} findings -> {out}")
+            f"{len(findings)} findings -> {out}")
     return EXIT_OK
 
 

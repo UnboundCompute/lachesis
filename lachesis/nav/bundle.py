@@ -496,9 +496,10 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         steps = witness.get("steps") or []
         if not steps:
             continue
-        path_id = str(finding.get("finding_id") or "")
-        if not path_id:
+        finding_id = str(finding.get("finding_id") or "")
+        if not finding_id:
             continue
+        path_id = f"value:{finding_id}"
         values.append({
             "id": path_id,
             "kind": "value-flow",
