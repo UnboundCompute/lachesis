@@ -93,11 +93,20 @@ class SinkObligation:
         # copy constructor's index so an argument can ask "does any branch in my
         # function test me?" without a graph walk per candidate.
         self._conditions_by_function: dict[str, list[tuple[str, str]]] = defaultdict(list)
-        # function_id -> [(callee, label, node_id, line)], the call sites in each
-        # function, built once. Lets an argument ask "does a validation-shaped
-        # call in my function name me?" -- a guard that lives in a call, not a
-        # branch condition -- without a graph walk per candidate.
-        self._calls_by_function: dict[str, list[tuple[str, str, str, object]]] = defaultdict(list)
+        # function_id -> [(callee, node_id, line)], the call sites in each function,
+        # built once. Lets an argument ask "does a validation-shaped call in my
+        # function guard me?" -- a guard that lives in a call, not a branch
+        # condition -- without a graph walk per candidate. The callee *spelling*
+        # is the call node's label: the frontend leaves the structured
+        # ``callee``/``method_name`` props empty and carries the called name in the
+        # label (``client.validate_redirect_uri``), so fall back to it.
+        self._calls_by_function: dict[str, list[tuple[str, str, object]]] = defaultdict(list)
+        # (function_id, line) -> {written variable names}: the assignment targets on
+        # each source line. A validation call whose result is written to an argument
+        # variable (``uri = validate(raw)``) guards that variable even though the
+        # variable never appears in the call itself -- the write, co-located with the
+        # call, is how the guarded value reaches the sink.
+        self._writes_by_line: dict[tuple[str, object], set[str]] = defaultdict(set)
         for node in stamped_graph.get("nodes", ()):
             kind = node.get("kind")
             props = node.get("properties") or {}
@@ -109,11 +118,27 @@ class SinkObligation:
                         (props.get("control_kind") or "if", head))
             elif kind == "call":
                 fn = props.get("owner_function_id")
-                callee = props.get("callee") or props.get("method_name")
+                callee = (props.get("callee") or props.get("method_name")
+                          or node.get("label"))
                 if fn:
                     self._calls_by_function[fn].append(
-                        (callee, node.get("label") or "", node.get("id") or "",
-                         props.get("start_line")))
+                        (callee, node.get("id") or "", props.get("start_line")))
+            elif kind == "write":
+                fn = props.get("owner_function_id")
+                name = node.get("label")
+                if fn and name:
+                    self._writes_by_line[(fn, props.get("start_line"))].add(name)
+        # call_node_id -> [argument spellings]: the frontend links a call to its
+        # argument nodes with HAS_ARGUMENT edges, and the argument spelling lives on
+        # the argument node's label. A validation call *names* an argument variable
+        # when one of its own arguments is that variable (``validate(uri)``).
+        self._call_arguments: dict[str, list[str]] = defaultdict(list)
+        for edge in stamped_graph.get("edges", ()):
+            if edge.get("kind") != "HAS_ARGUMENT":
+                continue
+            label = self.by_id.get(edge.get("target"), {}).get("label")
+            if label:
+                self._call_arguments[edge.get("source")].append(label)
 
     def _referencing_conditions(self, function_id: str | None,
                                 idents: set[str]) -> tuple[list[dict], int]:
@@ -132,25 +157,50 @@ class SinkObligation:
 
     def _guarding_calls(self, function_id: str | None, idents: set[str],
                         exclude_callsite_id: str | None) -> tuple[list[dict], int]:
-        """Validation-shaped calls in the enclosing function that name an argument
-        identifier. Neutral -- presence of a call whose name (``validate_*``,
-        ``sanitize``, ``verify``, ...) marks it as a common guard site, never proof
-        the guard dominates the sink, constrains the value, or is even correct. The
-        sink's own callsite is excluded so a sink never reports itself as its guard.
-        Returns (capped rows, total count)."""
+        """Validation-shaped calls in the enclosing function that guard an argument
+        identifier. A call guards the argument when its callee spelling carries a
+        ``validate``/``sanitize``/``verify``/... stem *and* the argument value passes
+        through it -- observed two structural ways:
+
+          * the argument variable is *an argument of* the validation call
+            (``validate_redirect_uri(redirect_uri)``) -- read from the call's
+            HAS_ARGUMENT children; or
+          * the validation call's result is *written to* the argument variable at
+            the same statement (``redirect_uri = validate_redirect_uri(raw)``) --
+            read from a write co-located with the call.
+
+        Matching the callee spelling alone is not enough: on a real graph the call
+        node's label is the bare callee and never contains the argument, so a call
+        must be tied to the argument through its arguments or its co-located write.
+        Neutral throughout: presence of a guard-shaped call on the value's path,
+        never proof the guard dominates the sink, constrains the value, or is even
+        correct. The sink's own callsite is excluded so a sink never reports itself
+        as its guard. Returns (capped rows, total count)."""
         if not function_id or not idents:
             return [], 0
         patterns = {i: re.compile(r"\b" + re.escape(i) + r"\b") for i in idents}
         hits = []
-        for callee, label, node_id, line in self._calls_by_function.get(function_id, ()):
+        for callee, node_id, line in self._calls_by_function.get(function_id, ()):
             if node_id and node_id == exclude_callsite_id:
                 continue
             if not callee or not _VALIDATION_CALLEE.search(callee):
                 continue
-            named = sorted(i for i, p in patterns.items() if label and p.search(label))
+            named: set[str] = set()
+            channels: set[str] = set()
+            # the argument variable is passed to the validation call
+            for arg in self._call_arguments.get(node_id, ()):
+                matched = {i for i, p in patterns.items() if p.search(arg)}
+                if matched:
+                    named |= matched
+                    channels.add("argument")
+            # the validation call's result is written to the argument variable here
+            assigned = idents & self._writes_by_line.get((function_id, line), set())
+            if assigned:
+                named |= assigned
+                channels.add("assignment")
             if named:
-                hits.append({"callee": callee, "site": label,
-                             "line": line, "names": named})
+                hits.append({"callee": callee, "line": line,
+                             "names": sorted(named), "via": sorted(channels)})
         return hits[:self._MAX_CONDITIONS], len(hits)
 
     def _label(self, node_id: str | None) -> str | None:
@@ -290,8 +340,9 @@ class SinkObligation:
                     # it marks a place worth reading, not a discharged obligation.
                     "guard_calls": {
                         "status": "observed" if guarding_total else "none-observed",
-                        "basis": "syntactic: a validation-shaped call in the "
-                                 "enclosing function names an argument variable",
+                        "basis": "structural: a validation-shaped call in the "
+                                 "enclosing function takes an argument variable, or "
+                                 "assigns its result to one at the same statement",
                         "validation_calls": guarding,
                         "validation_call_count": guarding_total,
                     },
