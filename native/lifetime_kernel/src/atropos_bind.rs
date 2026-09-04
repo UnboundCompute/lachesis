@@ -207,6 +207,14 @@ fn canonicalize_callees(index: &mut Index, aliases: &HashMap<(String, String), S
     }
 }
 
+/// Whether this language's frontend stamps `receiver_type` on method-call nodes.
+/// Only the Python frontend does today, so only there is a missing receiver_type
+/// on a type-keyed callsite treated as a confirmed non-instance (a conservative
+/// miss) rather than an unknown. Extend as other frontends begin emitting it.
+fn language_emits_receiver_type(language: Option<&str>) -> bool {
+    matches!(language, Some("python"))
+}
+
 fn matches(model: &Model, callee: &Callee) -> bool {
     if model.method.as_deref() != Some(callee.name.as_str()) {
         return false;
@@ -232,6 +240,26 @@ fn matches(model: &Model, callee: &Callee) -> bool {
         (model.receiver_type.as_ref(), callee.receiver_type.as_ref())
     {
         if expected != actual { return false; }
+    }
+    // A model keyed purely by receiver type -- an instance method with no
+    // `package` (invoke.Context.run, requests.Session.get, aiohttp.ClientSession
+    // .get, ...) -- asserts the receiver is an instance of that class. The type
+    // gate above only fires when BOTH sides carry a receiver_type, so a callsite
+    // with no receiver_type (a module ref `asyncio.run`, a member chain
+    // `response.headers.get`, any unresolved value) used to match on METHOD NAME
+    // alone -- binding a Session.get SSRF sink to every dict-ish `.get(...)`.
+    // When the model's frontend emits receiver_type on method calls, that absence
+    // is meaningful: the receiver is not a confirmable instance of the model's
+    // class, so a type-keyed sink must be a conservative miss, not a name-only
+    // hit. Frontends that do not emit receiver_type stay loose (else every
+    // type-qualified model would drop); the gate is keyed on the model's language,
+    // which bind_model has already matched to the callsite's language.
+    if model.package.is_none()
+        && model.receiver_type.is_some()
+        && callee.receiver_type.is_none()
+        && language_emits_receiver_type(model.language.as_deref())
+    {
+        return false;
     }
     if let (Some(expected), Some(actual)) = (model.arity, callee.arity) {
         if expected != actual { return false; }
