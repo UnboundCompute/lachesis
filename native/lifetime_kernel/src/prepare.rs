@@ -1473,9 +1473,22 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             .collect::<Vec<_>>();
         leading.sort_by_key(|node| (graph.offset(node), node.clone()));
         leading.dedup();
+        // A leading declaration is a function ENTRY anchor, not a fall-through
+        // exit. The synthetic-exit terminal pass above runs before this splice
+        // and, seeing the declaration still successor-less, wires it straight to
+        // the synthetic exit. Left in place, that edge lets the allocation reach
+        // the function exit without traversing the body -- the alloc diamond's
+        // merge inherits it, so ORIGIN reaches exit with no intervening release
+        // and the object is spuriously reported leaked. Drop the synthetic-exit
+        // edge from every spliced declaration; its only correct successor is the
+        // next declaration or the earliest real CFG statement, added below.
+        let synthetic_exit = format!("native-exit:{}", input.id);
         let mut previous: Option<String> = None;
         for declaration in &leading {
             cfg_node_set.insert(declaration.clone());
+            if let Some(targets) = successor_map.get_mut(declaration) {
+                targets.retain(|target| target != &synthetic_exit);
+            }
             if let Some(previous) = previous.take() {
                 successor_map.entry(previous).or_default().push(declaration.clone());
             }
