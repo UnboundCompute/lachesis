@@ -477,11 +477,93 @@ def _capsule_findings(source_graph_path: str, asm: _Assembler, *,
     return findings
 
 
+def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
+                        lang: Optional[str], indexed_nodes: int) -> dict:
+    """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
+
+    The security envelope remains available under ``security.findings``.  The
+    navigable witness steps are also exposed as ordinary value paths so Explorer
+    can serve code comprehension without presenting every path as a verdict.
+    """
+    meta = bundle.get("meta") or {}
+    repository = str(repo or meta.get("repo") or "unknown")
+    language = str(lang or meta.get("lang") or "unknown")
+    revision = str(commit or meta.get("commit") or "unknown")
+    findings = bundle.get("findings") or []
+    values = []
+    for finding in findings:
+        witness = finding.get("witness") or {}
+        steps = witness.get("steps") or []
+        if not steps:
+            continue
+        path_id = str(finding.get("finding_id") or "")
+        if not path_id:
+            continue
+        values.append({
+            "id": path_id,
+            "kind": "value-flow",
+            "name": finding.get("display_name") or "value path",
+            "description": finding.get("result_summary") or "Exporter-provided value path",
+            "source_node": steps[0].get("node_id"),
+            "sink_node": steps[-1].get("node_id"),
+            "confidence": (finding.get("analysis") or {}).get("confidence"),
+            "limitations": list((finding.get("analysis") or {}).get("limitations") or []),
+            "steps": steps,
+        })
+    graph = bundle.get("graph") or {}
+    v2 = {
+        "format": "lachesis-explorer-bundle",
+        "schema_version": "2.0",
+        "analysis_projection": "code-understanding",
+        "meta": {
+            "repository": repository,
+            "language": language,
+            "revision": revision,
+            "lines": int(meta.get("loc") or 0),
+            "indexed_nodes": int(indexed_nodes),
+        },
+        "graph": {
+            "nodes": graph.get("nodes") or [],
+            "edges": graph.get("edges") or [],
+        },
+        "paths": {"values": values},
+        "security": {"findings": findings},
+    }
+    if repository.count("/") == 1:
+        v2["meta"]["source_url_template"] = (
+            f"https://github.com/{repository}/blob/{{revision}}/{{file}}#L{{line}}-L{{end_line}}"
+        )
+    _validate_graph_first(v2)
+    return v2
+
+
+def _validate_graph_first(bundle: dict) -> None:
+    """Validate the invariants needed before publishing a 2.0 artifact."""
+    if bundle.get("format") != "lachesis-explorer-bundle" or bundle.get("schema_version") != "2.0":
+        raise ValueError("graph-first bundle must use Explorer schema 2.0")
+    meta = bundle.get("meta") or {}
+    for key in ("repository", "language", "revision"):
+        if not isinstance(meta.get(key), str) or not meta[key].strip():
+            raise ValueError(f"graph-first meta missing {key}")
+    nodes = (bundle.get("graph") or {}).get("nodes") or []
+    node_ids = {node.get("id") for node in nodes}
+    if not nodes or None in node_ids:
+        raise ValueError("graph-first bundle has invalid nodes")
+    for edge in (bundle.get("graph") or {}).get("edges") or []:
+        if edge.get("source") not in node_ids or edge.get("target") not in node_ids:
+            raise ValueError("graph-first edge references unknown node")
+    for path in ((bundle.get("paths") or {}).get("values") or []):
+        steps = path.get("steps") or []
+        if not steps or any(step.get("node_id") not in node_ids for step in steps):
+            raise ValueError("graph-first path references invalid nodes")
+
+
 def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  commit: Optional[str] = None, lang: Optional[str] = None,
                  loc: Optional[int] = None, source_dir: Optional[str] = None,
                  per_family: int = 6, max_flows: int = 40, cone_limit: int = 80,
-                 planner_depth: int = 6, planner_entrypoints: int = 0) -> dict:
+                 planner_depth: int = 6, planner_entrypoints: int = 0,
+                 schema_version: str = "1.0") -> dict:
     """Build an explorer bundle (schema 1.0) from a built+enriched graph."""
     load = _call("load_graph", {"path": graph_path, "profile": "all"})
     census = _call("candidate_census", {})
@@ -549,6 +631,12 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
         "display_hints": {},
     }
     validate(bundle)
+    if schema_version == "2.0":
+        return _graph_first_bundle(bundle, repo=repo,
+                                   commit=commit or prov.get("commit_sha"), lang=lang,
+                                   indexed_nodes=int(load.get("nodes") or 0))
+    if schema_version != "1.0":
+        raise ValueError(f"unsupported Explorer schema version: {schema_version}")
     return bundle
 
 
