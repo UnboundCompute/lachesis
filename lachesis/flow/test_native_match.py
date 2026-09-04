@@ -18,7 +18,7 @@ from pathlib import Path
 
 from lachesis.core import lifetime_pb2
 from lachesis.flow.native_translate import (
-    load_native_temporal, native_match_any_capped)
+    drop_capped_functions, load_native_temporal, native_match_any_capped)
 
 
 def _result(*capped_flags: bool, with_findings: bool = False):
@@ -102,6 +102,60 @@ class LoadNativeTemporalTest(unittest.TestCase):
             self.assertEqual(finding["pattern"], "use-after-free")
             self.assertEqual(finding["node"], f"n:{index}")
             self.assertEqual(finding["line"], 40 + index)
+
+    def test_each_function_carries_its_capped_flag(self):
+        # ``load_native_temporal`` surfaces the per-function ``capped`` bit so
+        # cap truncation is handled per function, not as one graph-wide veto.
+        result = _result(False, True, False, with_findings=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.match.pb"
+            path.write_bytes(result.SerializeToString())
+            loaded = load_native_temporal(path)
+        self.assertEqual([fn["capped"] for fn in loaded["functions"]],
+                         [False, True, False])
+
+
+class DropCappedFunctionsTest(unittest.TestCase):
+    """A capped function taints only itself: its findings are dropped, every
+    converged function's confirmed findings survive. This is the regression
+    guard for the graph-wide-zeroing bug where one capped function discarded
+    the entire confirmed census."""
+
+    @staticmethod
+    def _temporal(*flags):
+        return {"functions": [
+            {"id": f"fn:{i}",
+             "findings": [{"pattern": "double-free", "function": f"fn:{i}"}],
+             "capped": capped}
+            for i, capped in enumerate(flags)]}
+
+    def test_no_capped_function_keeps_everything(self):
+        temporal = self._temporal(False, False, False)
+        capped = drop_capped_functions(temporal)
+        self.assertEqual(capped, [])
+        self.assertEqual(len(temporal["functions"]), 3)
+
+    def test_capped_function_dropped_converged_findings_survive(self):
+        # The whole point: a converged function's finding must NOT vanish just
+        # because a sibling function capped.
+        temporal = self._temporal(False, True, False)
+        capped = drop_capped_functions(temporal)
+        self.assertEqual(capped, ["fn:1"])
+        surviving = {fn["id"] for fn in temporal["functions"]}
+        self.assertEqual(surviving, {"fn:0", "fn:2"})
+        findings = [f for fn in temporal["functions"] for f in fn["findings"]]
+        self.assertEqual(len(findings), 2)
+
+    def test_all_capped_returns_all_ids_and_no_findings(self):
+        temporal = self._temporal(True, True)
+        capped = drop_capped_functions(temporal)
+        self.assertEqual(capped, ["fn:0", "fn:1"])
+        self.assertEqual(temporal["functions"], [])
+
+    def test_empty_bind_is_a_noop(self):
+        temporal = {"functions": []}
+        self.assertEqual(drop_capped_functions(temporal), [])
+        self.assertEqual(temporal, {"functions": []})
 
 
 if __name__ == "__main__":

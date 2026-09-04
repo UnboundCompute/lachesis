@@ -320,17 +320,15 @@ class Analysis:
         else:
             stamped, summary, complete = self._enrich_and_merge(
                 deadline=deadline, workers=workers)
+            # ``_enrich_and_merge`` now handles cap truncation per function --
+            # it drops only the capped functions' findings and reports them in
+            # ``coverage.truncated_functions``, so the returned bind is the
+            # complete, deterministic answer for this graph and is always safe
+            # to cache. (The old path treated any single capped function as a
+            # graph-wide veto and popped the whole temporal bind here, zeroing
+            # the confirmed census of an otherwise-clean graph.)
             if complete:
                 bind_cache.store(self.store, stamped, summary)
-            else:
-                # A truncated semantic skeleton would emit partial temporal observations that
-                # read as fewer bugs, not as an incomplete run. Drop it and report structural
-                # families only -- honest under-coverage beats a misleadingly thin temporal set.
-                # The correlated matcher findings ride the same truncation: without a converged
-                # skeleton they are incomplete, so drop them too rather than present a thin
-                # confirmed set as authoritative.
-                stamped.pop("semantic_graph", None)
-                stamped.pop("native_temporal", None)
         return {
             "registry": default_candidate_registry(stamped, summary),
             "stamped": stamped,
@@ -635,8 +633,8 @@ class Analysis:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import (
-            ensure_native_match_sidecar, ensure_native_semantic_sidecar,
-            load_native_temporal, native_match_any_capped,
+            drop_capped_functions, ensure_native_match_sidecar,
+            ensure_native_semantic_sidecar, load_native_temporal,
         )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
@@ -655,11 +653,6 @@ class Analysis:
         # content-addressed sidecar.
         match_sidecar = ensure_native_match_sidecar(
             native_sidecar, summary.get("catalog_path"))
-        converged = not native_match_any_capped(match_sidecar)
-        stamped["semantic_graph"] = {
-            "native_sidecar": str(native_sidecar),
-            "coverage": {"converged": converged},
-        }
         # The Rust matcher has already related the temporal events (a free reached
         # twice, a use of a freed object on a reachable path) into correlated
         # findings; the analyze pass surfaces them as leads. Publish the same
@@ -669,6 +662,26 @@ class Analysis:
         # from the content-addressed match sidecar -- the witness bytes that
         # dominate it are never materialized here.
         temporal = load_native_temporal(match_sidecar)
+        # Cap-truncation is per function, so treat it per function -- not as one
+        # graph-wide veto. A function is ``capped`` when its skeleton was
+        # truncated (state budget exhausted or partial), which makes only *that*
+        # function's findings unsound: a balancing free may lie past the cut, so
+        # a reported leak/UAF there could be spurious. Drop exactly those
+        # functions' findings (honest under-coverage, surfaced as
+        # ``truncated_functions``) and keep every converged function's confirmed
+        # findings. The previous behavior -- one capped function forcing the
+        # caller to discard the entire ``native_temporal`` bind -- silently
+        # zeroed the confirmed census of an otherwise-clean graph the moment it
+        # contained a single large function.
+        capped_functions = drop_capped_functions(temporal)
+        converged = not capped_functions
+        stamped["semantic_graph"] = {
+            "native_sidecar": str(native_sidecar),
+            "coverage": {
+                "converged": converged,
+                "truncated_functions": capped_functions,
+            },
+        }
         # The match sidecar carries each finding's enclosing declaration id but no
         # file: that lives only in the Pass-1 structural store, which the census
         # graph dict does not include. Resolve declaration id -> file:line here,
@@ -689,7 +702,12 @@ class Analysis:
         if locations:
             temporal["locations"] = locations
         stamped["native_temporal"] = temporal
-        return stamped, summary, converged
+        # Temporal was evaluated across the whole graph. Per-function cap
+        # truncation is reported in ``coverage.truncated_functions`` and the
+        # affected functions' findings were already dropped above; it is no
+        # longer a completeness veto, so the (filtered, deterministic) bind is
+        # always safe to cache and return.
+        return stamped, summary, True
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 
