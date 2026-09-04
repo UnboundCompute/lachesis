@@ -205,12 +205,31 @@ def command_plan(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- scan
 
 def command_scan(args: argparse.Namespace) -> int:
+    from lachesis.cli.source import resolve_source
+
+    # A source may be a local path or a remote git URL (optionally ``url#subdir``
+    # to scan one subtree of a monorepo). resolve_source fetches a URL into a
+    # managed temp clone and returns a cleanup hook; a local path resolves in
+    # place with a no-op cleanup. The analysis below only ever sees a local dir,
+    # and cleanup runs on every exit path (findings, error, or exception).
+    note = None if args.quiet else (lambda m: _stderr(f"  {m}"))
+    try:
+        resolved = resolve_source(args.path, note=note)
+    except (RuntimeError, ValueError) as error:
+        _stderr(f"lachesis: could not fetch source: {error}")
+        return EXIT_USAGE
+    try:
+        return _scan_source(args, resolved.path)
+    finally:
+        resolved.cleanup()
+
+
+def _scan_source(args: argparse.Namespace, source: Path) -> int:
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
                                       ensure_graph)
     from lachesis.cli.progress import Progress
     from lachesis.planner.cli import _census_line, _render
 
-    source = _resolved(args.path)
     # Progress narrates to stderr; with --json stdout has to stay a clean document, and
     # with --quiet the caller has said they want neither.
     progress = Progress(enabled=not args.quiet)
@@ -771,8 +790,18 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subcommands.add_parser(
         "scan", help="report what an attacker could reach in a codebase",
         description="Index the tree if needed, then rank the reachable sensitive "
-                    "effects that no recognised guard covers.")
+                    "effects that no recognised guard covers. The source may be a "
+                    "local path or a git URL (https://…, git@…, ….git), optionally "
+                    "with a #subdir fragment to scan one subtree of a monorepo; a "
+                    "URL is shallow-cloned to a temp dir and removed when done.")
     _add_source_flags(scan)
+    # scan additionally accepts a remote URL in the same positional slot; the
+    # other source commands stay local-only, so override just scan's help here.
+    for _action in scan._actions:
+        if _action.dest == "path":
+            _action.help = ("directory or git URL to analyse (default: the current "
+                            "directory); append #subdir to scan one subtree of a repo")
+            break
     scan.add_argument("--limit", type=_nonnegative_int, default=20, metavar="N",
                       help="how many findings to print (0 = all, default 20)")
     scan.add_argument("--min-rank", type=_rank, default=0.0, metavar="R",
