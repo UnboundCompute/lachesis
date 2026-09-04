@@ -1380,6 +1380,34 @@ unsafe fn visit_one(
                     relationship_class: "FALSE_BRANCH".to_owned(),
                 })?;
             }
+        } else if matches!(syntax_kind.as_str(), "ForStmt" | "WhileStmt" | "DoStmt" | "SwitchStmt") {
+            // Body-region substrate for loops and switch, the analogue of the IfStmt
+            // arm above. The CFG overlay synthesizes the cfg-condition node from
+            // `control_kind` on its own, but a copy call site is only classified as
+            // dominated by a (size-)testing head if a branch-region edge names the
+            // body it lives in. libclang orders these statements' children in source
+            // order, so the body is the single positional child that is always
+            // present: for `while`/`switch` ([cond, body]) and `for`
+            // ([init?, cond?, inc?, body]) it is the last child; for `do`
+            // ([body, cond]) it is the first. The overlay normalizes LOOP_TRUE to a
+            // TRUE_BRANCH region and keeps SWITCH_CASE, then synthesizes the loop
+            // back-edge and fall-through itself, matching the Python frontend's CFG.
+            let (edge_kind, body_cursor) = if syntax_kind == "DoStmt" {
+                ("LOOP_TRUE", children.cursors.first())
+            } else if syntax_kind == "SwitchStmt" {
+                ("SWITCH_CASE", children.cursors.last())
+            } else {
+                ("LOOP_TRUE", children.cursors.last())
+            };
+            if let Some(body_id) = body_cursor
+                .and_then(|child| cursor_graph_id(*child, emitter))
+            {
+                emitter.edge(graph::EdgeRecord {
+                    kind: edge_kind.to_owned(), source: id.clone(), target: body_id,
+                    properties: Vec::new(), source_tier: tier.clone(),
+                    relationship_class: edge_kind.to_owned(),
+                })?;
+            }
         } else if syntax_kind == "ReturnStmt" {
             if let (Some(value_id), Some(owner)) = (child_ids.first(), owner_id.clone()) {
                 emitter.edge(graph::EdgeRecord {
