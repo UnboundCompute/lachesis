@@ -1684,8 +1684,16 @@ class _NodeUnitStore:
         self._db.execute("PRAGMA synchronous=OFF")
         self._db.execute("PRAGMA temp_store=MEMORY")
         self._db.execute("PRAGMA cache_size=-262144")  # ~256 MiB page cache
+        # ``n`` counts how many shards emitted this id. A single frontend process
+        # merges content-identical entities before they are written, so within one
+        # shard an id is unique (n stays 1); an id with n>1 is one that independent
+        # shards each emitted a copy of -- a declaration in a header included from
+        # two chunks, content-hashed to the same id. Those are exactly the copies the
+        # streamed load must merge to one row so the Kùzu primary-key COPY does not
+        # reject the duplicate, and so the graph matches the single-frontend build.
         self._db.execute(
-            "CREATE TABLE node(id TEXT PRIMARY KEY, unit INTEGER) WITHOUT ROWID")
+            "CREATE TABLE node(id TEXT PRIMARY KEY, unit INTEGER, "
+            "n INTEGER NOT NULL DEFAULT 1) WITHOUT ROWID")
         self._pending: list[tuple[str, object]] = []
         self._count = 0
 
@@ -1698,14 +1706,28 @@ class _NodeUnitStore:
     def _flush(self) -> None:
         if not self._pending:
             return
+        # Keep the first unit seen for an id and bump its shard count on any repeat.
+        # Repeats are content-identical (same content-hash id), so the retained unit
+        # is the same value a replace would have written.
         self._db.executemany(
-            "INSERT OR REPLACE INTO node(id, unit) VALUES (?, ?)", self._pending)
+            "INSERT INTO node(id, unit) VALUES (?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET n = n + 1", self._pending)
         self._pending.clear()
 
     def seal(self) -> None:
         """Finish inserts before the lookup phase begins."""
         self._flush()
         self._db.commit()
+
+    def duplicated_ids(self) -> set:
+        """The set of ids more than one shard emitted (n > 1).
+
+        Bounded by the shared-header content of the tree, not by the number of TUs
+        or shards: adding more chunks of the same codebase does not grow it, so it
+        stays a small in-RAM working set at Linux scale. Empty for a single-frontend
+        build, which makes the caller's dedup inert and byte-for-byte unchanged there.
+        """
+        return {row[0] for row in self._db.execute("SELECT id FROM node WHERE n > 1")}
 
     def lookup(self, ids) -> dict:
         """Map every present id in ``ids`` to its unit code (NULL -> None).
@@ -1926,6 +1948,10 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     # path; the maps below stay empty there.
     store: Optional[_NodeUnitStore] = None
     store_dir: Optional[str] = None
+    # Cross-shard duplicate ids (populated for the binary path after its node scan).
+    # The dict path is the single-frontend build, which never emits a duplicate, so
+    # it keeps an empty set and every dedup guard below is inert there.
+    duplicated: set = set()
     if binary_shards:
         store_dir = tempfile.mkdtemp(prefix=".lachesis-nodeunits-",
                                      dir=os.path.dirname(target_db_dir))
@@ -1937,7 +1963,6 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             if prune and kind in PRUNE_NODE_KINDS:
                 continue
             node_id = node.id
-            hash_node(node_id)
             file_value = _proto_promoted_value(node.properties, "file")
             compiler_id = _proto_promoted_value(node.properties, "compiler_node_id")
             store.add(node_id, unit_code(file_value) if file_value else None)
@@ -1945,9 +1970,13 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 match = _ID_SHAPE.match(value) if isinstance(value, str) else None
                 if match:
                     prefixes.add(match.group(1))
-            if kind in INDEXED_KINDS or kind in CALLSITE_KINDS:
-                write_frame(index_stage, payload)
         store.seal()
+        # Ids emitted by more than one shard. The content hash and the index stage
+        # are folded in the load pass below rather than here, so that each distinct
+        # node is counted and indexed exactly once even when several shards carry a
+        # copy -- matching the single-frontend build and keeping the primary-key COPY
+        # duplicate-free. Bounded (shared-header content); empty for a lone frontend.
+        duplicated = store.duplicated_ids()
     else:
         for node in shard_reader.nodes(headers_only=True):
             kind = node.get("kind")
@@ -2097,6 +2126,18 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                                 codec=codec, id_codes=id_codes)
 
     batch = []
+    # First-occurrence tracker for the ids several shards duplicated. Only ids in
+    # ``duplicated`` are ever inserted, so this stays bounded by the shared-header
+    # content, not by the graph; it is empty (and this whole guard inert) for a
+    # single-frontend build.
+    emitted_dup: set = set()
+    # Count nodes actually written, not store add()s. ``store.count()`` totals every
+    # ``add`` call, so a cross-shard duplicate is counted once per shard that emitted
+    # it -- inflating the manifest node_count above the rows the primary-key COPY
+    # actually holds (edges already report the post-filter count). Counting the loop's
+    # kept nodes here -- after prune and after the first-occurrence dedup -- gives the
+    # exact number COPYd, matching the single-frontend manifest and the live store.
+    emitted_node_count = 0
     node_records = shard_reader.raw_nodes() if binary_shards else shard_reader.nodes()
     for item in node_records:
         if binary_shards:
@@ -2104,6 +2145,17 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
             node.ParseFromString(item)
             if prune and node.kind in PRUNE_NODE_KINDS:
                 continue
+            node_id = node.id
+            if node_id in duplicated:
+                # A copy of a content-identical node another shard already emitted:
+                # keep the first, drop the rest so the primary-key COPY stays unique
+                # and the hash/index count it once, exactly as a lone frontend would.
+                if node_id in emitted_dup:
+                    continue
+                emitted_dup.add(node_id)
+            hash_node(node_id)
+            if node.kind in INDEXED_KINDS or node.kind in CALLSITE_KINDS:
+                write_frame(index_stage, item)
             if node.kind == "function":
                 usr = _proto_promoted_value(node.properties, "usr")
                 if usr:
@@ -2131,6 +2183,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 if isinstance(idx, int) and not isinstance(idx, bool):
                     param_index[node["id"]] = idx
         batch.append(node)
+        emitted_node_count += 1
         if len(batch) >= batch_rows:
             load_nodes(batch)
             batch.clear()
@@ -2153,6 +2206,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
         # single-edge stream did; ``present`` doubles as the per-batch unit map handed
         # to ``load_edges``. The reconstruction bookkeeping below is unchanged.
         raw_edges: list = []
+        # First-occurrence tracker for edges several shards duplicated. An edge can
+        # only be a cross-shard duplicate when BOTH its endpoints are shared nodes
+        # (a TU-local endpoint pins the edge to one shard), so only those are tracked
+        # here -- bounded by the header-internal edge count, empty for a lone frontend.
+        emitted_dup_edges: set = set()
 
         def flush_binary_edges() -> None:
             nonlocal unresolved_count, kept_edge_count
@@ -2170,6 +2228,11 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 if edge.source not in present or edge.target not in present:
                     unresolved_count += 1
                     continue
+                if edge.source in duplicated and edge.target in duplicated:
+                    key = (edge.kind, edge.source, edge.target)
+                    if key in emitted_dup_edges:
+                        continue
+                    emitted_dup_edges.add(key)
                 hash_edge(edge.kind, edge.source, edge.target)
                 if (edge.kind == "REFERS_TO"
                         and _proto_promoted_value(edge.properties, "reason")
@@ -2349,7 +2412,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
                 conn.execute(f"COPY {kind} FROM '{path}'")
                 os.unlink(path)
     timing("load edges")
-    kept_node_count = store.count() if store is not None else len(kept_ids)
+    kept_node_count = emitted_node_count
     # Endpoint filtering and edge unit attribution are complete.  The index rows
     # and manifest need only the count, not these graph-sized lookup maps; release
     # them before rebuilding the declaration/callsite indexes.
