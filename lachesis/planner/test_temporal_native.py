@@ -107,6 +107,66 @@ class MatcherAuthoritativeTest(unittest.TestCase):
         self.assertEqual(row["observations"]["file"], "/src/bugs.c")
         self.assertEqual(row["observations"]["line"], 30)  # decl fallback
 
+    def test_finding_resolving_to_a_non_c_file_is_dropped(self):
+        # The native matcher is C-only, but semantic decl ids collide across
+        # languages (equally named functions), so a decl id can resolve through
+        # the store to a *non-C* declaration.  A C-memory verdict (double-free)
+        # located in a Python file is that collision, not a real site, and must
+        # not be surfaced -- it is a pure false positive to a reviewer.
+        graph = {
+            "native_temporal": {
+                "functions": [{"id": "w", "findings": [
+                    {"pattern": "double-free", "node": "free#2", "line": 38,
+                     "path": "tmp", "function": "decl:build_helper:check"},
+                ]}],
+                "locations": {
+                    "decl:build_helper:check":
+                        {"file": "/src/scripts/build_helper.py", "line": 33},
+                },
+            },
+        }
+        rows = _constructor("double-free")(graph).enumerate()["candidates"]
+        self.assertEqual(rows, [])
+
+    def test_c_and_non_c_collisions_coexist_only_the_c_one_survives(self):
+        # Two findings on one family: one resolves to a real C file (kept), one
+        # to a Python file via an id collision (dropped).  The census must keep
+        # exactly the C site.
+        graph = {
+            "native_temporal": {
+                "functions": [{"id": "w", "findings": [
+                    {"pattern": "double-free", "node": "free#c", "line": 10,
+                     "path": "buf", "function": "decl:bugs:real_c"},
+                    {"pattern": "double-free", "node": "free#py", "line": 38,
+                     "path": "tmp", "function": "decl:script:collide"},
+                ]}],
+                "locations": {
+                    "decl:bugs:real_c": {"file": "/src/bugs.c", "line": 5},
+                    "decl:script:collide": {"file": "/src/tool.py", "line": 33},
+                },
+            },
+        }
+        rows = _constructor("double-free")(graph).enumerate()["candidates"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["observations"]["file"], "/src/bugs.c")
+        self.assertEqual(rows[0]["completeness"], "COMPLETE")
+
+    def test_finding_with_an_unresolved_location_is_not_dropped(self):
+        # A ``None`` file is merely unresolved (no location row), not a proven
+        # cross-language mis-resolution, so the C-only guard must leave it alone.
+        graph = {
+            "native_temporal": {
+                "functions": [{"id": "w", "findings": [
+                    {"pattern": "double-free", "node": "free#2", "line": 10,
+                     "path": "buf", "function": "decl:bugs:unlocated"},
+                ]}],
+                "locations": {},
+            },
+        }
+        rows = _constructor("double-free")(graph).enumerate()["candidates"]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["observations"]["file"])
+
     def test_without_the_matcher_the_inventory_still_stands(self):
         graph = {"nodes": [{"id": "blanket",
                             "event": {"kind": "read_storage", "line": 9}}]}

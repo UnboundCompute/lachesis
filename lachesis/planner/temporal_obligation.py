@@ -188,6 +188,19 @@ class TemporalLifecycle:
         # declaration so the handle points at the function and its file resolves.
         decl_id = finding.get("function") or function_id
         location = self.native_locations.get(decl_id) or {}
+        # The native matcher is C-only: its findings can name only C declarations.
+        # But semantic decl ids are generated from function names and collide when
+        # a multi-language project holds equally named functions (see
+        # ``merge_semantic_nodes``), so ``decl_id`` can resolve through the store to
+        # a *non-C* declaration -- yielding a C-memory-model verdict (double-free,
+        # use-after-free) stamped onto a Python/JS file that has no such semantics.
+        # A resolved location whose file is not C is therefore a proven cross-language
+        # id collision, not a real site; drop the finding rather than surface an
+        # unreviewable false positive. (A ``None`` file is merely unresolved, not
+        # mis-resolved, so it is left to the normal path.)
+        loc_file = location.get("file")
+        if loc_file and atropos.lang_of(loc_file) != "c":
+            return None
         site = f"native:{function_id}:{node_id}:{line}"
         raw = f"{pattern_id}\0{site}"
         # A lead pattern records an ownership shape (a field alias from an
@@ -279,8 +292,11 @@ class TemporalLifecycle:
             # The matcher is authoritative: emit its confirmed findings (possibly
             # none) and suppress the pre-matcher inventory rather than drown the
             # confirmed relation in one not-queried row per dereference.
-            rows = [self._native_candidate(fid, finding)
-                    for fid, finding in self.native_findings]
+            # ``_native_candidate`` returns None for a finding whose decl id
+            # collided onto a non-C declaration (a cross-language id clash); those
+            # are dropped here so a C-memory verdict never lands on a non-C file.
+            rows = [row for fid, finding in self.native_findings
+                    if (row := self._native_candidate(fid, finding)) is not None]
         else:
             rows = [self._candidate(node) for node in self.nodes
                     if _event_kind(node) in self.trigger]
