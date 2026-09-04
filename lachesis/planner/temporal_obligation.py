@@ -190,6 +190,52 @@ class TemporalLifecycle:
         location = self.native_locations.get(decl_id) or {}
         site = f"native:{function_id}:{node_id}:{line}"
         raw = f"{pattern_id}\0{site}"
+        # A lead pattern records an ownership shape (a field alias from an
+        # aggregate copy), not a temporal violation: the matcher has related no
+        # release/use pair, only observed the copy.  Surface it as a PARTIAL lead
+        # for the judge -- so a benign `struct b = a` is never a COMPLETE verdict
+        # -- while the downstream double-free/UAF that composes through the alias
+        # remains the COMPLETE finding on its own row.
+        if self.metadata.get("lead"):
+            return {
+                "candidate_id": "temporal_" + hashlib.sha256(raw.encode()).hexdigest()[:20],
+                "constructor": pattern_id,
+                "domain": "lifecycle",
+                "language": self.language or "c",
+                "obligation": self.metadata["obligation"],
+                "handles": {
+                    "site_node_id": node_id,
+                    "enclosing_function_id": decl_id,
+                    "obligation_value_ids": [obj] if obj else [],
+                },
+                "observations": {
+                    "site": node_id,
+                    "event_kind": None,
+                    "object_id": obj,
+                    "file": location.get("file"),
+                    "line": line if line is not None else location.get("line"),
+                    "pattern": self.metadata["matcher_pattern"],
+                    "requires": list(self.metadata["requires"]),
+                    "native_path": obj,
+                },
+                "inferences": {
+                    "path_relation": "reachable",
+                    "same_object": "same",
+                    "same_generation": "not-queried",
+                },
+                "rank": 0.4,
+                "rank_reasons": [{
+                    "term": "ownership-shape-lead",
+                    "why": ("the native matcher recorded a field alias from an "
+                            f"{self.metadata['matcher_pattern']}; this is a lead a "
+                            "downstream release/use pattern must confirm, not a "
+                            "standalone verdict"),
+                }],
+                "completeness": "PARTIAL",
+                "next_op": {"tool": "skeleton",
+                            "why": "look for a downstream double-free/UAF that "
+                                   "composes through this alias"},
+            }
         return {
             "candidate_id": "temporal_" + hashlib.sha256(raw.encode()).hexdigest()[:20],
             "constructor": pattern_id,
@@ -284,5 +330,11 @@ def temporal_constructor(spec):
                         "obligation": spec["obligation"],
                         "matcher_pattern": pattern,
                         "requires": spec.get("requires", ()),
+                        # A `lead` pattern (e.g. aggregate-copy-alias) records an
+                        # ownership shape the downstream typestate verdicts compose
+                        # through; it is never a COMPLETE verdict on its own.  Keep
+                        # its rows PARTIAL so a benign struct copy is a triage lead,
+                        # not a confirmed bug.
+                        "lead": bool(entry.get("lead")),
                     },
                 })

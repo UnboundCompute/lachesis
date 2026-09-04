@@ -51,7 +51,7 @@ MANIFEST = {
     "realloc_failure_leak.c":   ("realloc-failure-leak", "detected"),
     "uninitialized_use.c":      ("uninitialized-use",    "known_fn"),
     "unchecked_return_deref.c": ("unchecked-return-deref", "known_fn"),
-    "aggregate_copy_alias.c":   ("aggregate-copy-alias", "known_fn"),
+    "aggregate_copy_alias.c":   ("double-free",          "detected"),
 }
 
 

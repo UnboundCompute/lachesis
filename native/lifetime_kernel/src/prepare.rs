@@ -207,6 +207,17 @@ impl<'a> GraphView<'a> {
             .is_some_and(|value| value.contains('*') || value.contains('['))
     }
 
+    /// A by-value aggregate (`struct`/`union`) that is neither a pointer nor an
+    /// array. A whole-object copy of such a value (`struct box b = a;`) aliases
+    /// every field of the destination onto the source, which the matcher rebases
+    /// through field prefixes -- see the aggregate-copy `Kind::Copy` emitted in
+    /// the VarDecl / assignment arms below.
+    fn is_record(&self, id: &str) -> bool {
+        self.node(id).and_then(|node| text_property(node, "type"))
+            .is_some_and(|value| !value.contains('*') && !value.contains('[')
+                && (value.contains("struct ") || value.contains("union ")))
+    }
+
     fn is_null(&self, id: &str) -> bool {
         let id = self.peel(id.to_owned());
         matches!(self.kind(&id), "GNUNullExpr" | "CXXNullPtrLiteralExpr")
@@ -272,8 +283,23 @@ impl<'a> GraphView<'a> {
                 let field = label[index + width..].split(['[', '(', ' ']).next().unwrap_or("");
                 if field.is_empty() { return Some(base); }
                 let mut selectors = Vec::with_capacity(base.selectors.len() + 2);
-                if is_arrow { selectors.push("*".to_owned()); }
-                selectors.push(field.to_owned());
+                // Every selector must be self-delimiting so a folded object label
+                // (`root` + `selectors.join("")`) reads back as an unambiguous
+                // access path: `selector_suffix` accepts a child suffix only when
+                // it opens with a separator byte. Arrow carries its own leading
+                // `*` (the implicit deref) ahead of the bare field, so `a->p`
+                // folds to `a*p` -- already delimited. A dot member has no such
+                // prefix, so a bare field folded to `ap` was indistinguishable
+                // from a sibling and `prefix_children` never linked `b.p` under
+                // `b`; give it a leading `.` so `a.p` folds to `a.p`. This is the
+                // latent defect that kept dot-field aggregate aliases (hence the
+                // struct-copy double-free) from ever composing.
+                if is_arrow {
+                    selectors.push("*".to_owned());
+                    selectors.push(field.to_owned());
+                } else {
+                    selectors.push(format!(".{field}"));
+                }
                 selectors.extend(base.selectors);
                 base.selectors = selectors;
                 Some(base)
@@ -1233,6 +1259,20 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
                         };
                         operations.push(raw_operation(kind, node_id, Some(target), source, line, is_null, "deref"));
                     }
+                } else if graph.is_record(lhs) {
+                    // The assignment form of a by-value aggregate copy
+                    // (`b = a;`). Same reasoning as the VarDecl arm below: the
+                    // struct copy is not a memcpy call and `b` is not a pointer,
+                    // so nothing was emitted and the field alias `b.p -> a.p`
+                    // was lost. Emit a whole-object Copy from the lvalue source.
+                    if let Some(target) = graph.access_path(lhs, 0) {
+                        let rhs_id = graph.peel(rhs.clone());
+                        if let Some(source) = graph.access_path(&rhs_id, 0) {
+                            operations.push(raw_operation(
+                                Kind::Copy, node_id, Some(target), Some(source),
+                                line, false, "aggregate-copy"));
+                        }
+                    }
                 }
             }
         } else if kind == "VarDecl" {
@@ -1272,6 +1312,28 @@ fn prepare_function(input: lifetime_proto::FunctionInput) -> lifetime_proto::Pre
             } else {
                 operations.push(raw_operation(Kind::Clobber, node_id, target, None, line, false, "uninitialized"));
             }
+            } else if graph.is_record(node_id) {
+                // A by-value aggregate copy `struct box b = a;`. The frontend
+                // lowers this as a plain VarDecl with an lvalue initializer --
+                // no memcpy call -- so the call-based aggregate-copy path
+                // (is_aggregate_copy) never sees it, and the pointer arm above
+                // is skipped because `b` is not a pointer. Left alone the copy
+                // produces zero events, so `b.p` and `a.p` stay unrelated and a
+                // later `free(b.p)` after `free(a.p)` is missed. Emit a
+                // whole-object Copy (DERIVE); the matcher's
+                // compose_prefix_bindings rebases it onto the field aliases
+                // (`b.p -> a.p`), so the second free is seen as a double-free.
+                // Gated on a resolvable lvalue source, so struct-returning calls
+                // and compound literals (no access path) fall through unchanged.
+                let line = graph.node(node_id).and_then(|node| integer_property(node, "start_line"));
+                if let Some(initializer) = graph.initializer_of(node_id) {
+                    let initializer = graph.peel(initializer.to_owned());
+                    if let Some(source) = graph.access_path(&initializer, 0) {
+                        operations.push(raw_operation(
+                            Kind::Copy, node_id, path(Some(node_id)), Some(source),
+                            line, false, "aggregate-copy"));
+                    }
+                }
             }
         }
 
