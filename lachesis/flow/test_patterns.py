@@ -18,7 +18,7 @@ positive these assert against.
 import unittest
 
 from lachesis.flow.patterns import (
-    substrate,
+    substrate, KIND_EVALUATOR, EVALUATORS,
     _reachability, _relational, _presence, _missing_guard,
     _inverted_capacity_guard, _arithmetic_overflow_guard,
     _allocation_overflow_size,
@@ -112,6 +112,23 @@ class AllocationOverflowSizeTest(unittest.TestCase):
             substrate("buffer-size", True, None, False, size_expr="n * width")))
         self.assertFalse(_allocation_overflow_size(
             substrate("alloc-size", False, None, False, size_expr="n * width")))
+
+
+class FallbackRoutingParityTest(unittest.TestCase):
+    """The public KIND_EVALUATOR is the no-Atropos fallback. Every recipe must
+    point at a real evaluator, and no injection sink kind may be silently
+    unrouted -- a missing route drops a whole class in degraded mode."""
+
+    def test_every_fallback_recipe_targets_a_real_evaluator(self):
+        for kind, recipe in KIND_EVALUATOR.items():
+            names = [recipe] if isinstance(recipe, str) else recipe
+            for name in names:
+                self.assertIn(name, EVALUATORS, f"{kind} routes to unknown {name}")
+
+    def test_unsafe_reflection_is_routed(self):
+        # regression: was catalogued as a Python sink but missing from the
+        # public fallback, silently dropping it when Atropos is not installed.
+        self.assertEqual(KIND_EVALUATOR.get("unsafe-reflection"), "reachability")
 
 
 if __name__ == "__main__":
