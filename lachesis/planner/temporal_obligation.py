@@ -114,6 +114,11 @@ class TemporalLifecycle:
             for finding in function.get("findings", ())
             if finding.get("pattern") == pattern
         ]
+        # Declaration id -> {file, line}, resolved from the Pass-1 store at bind
+        # time (the census graph dict has no function decl nodes). Lets a
+        # matcher-confirmed lead report its file:line instead of ``file: None``.
+        self.native_locations = dict(
+            graph.get("native_temporal", {}).get("locations") or {})
 
     def _language(self, node):
         props = node.get("properties") or {}
@@ -178,6 +183,11 @@ class TemporalLifecycle:
         node_id = finding.get("node") or ""
         line = finding.get("line")
         obj = finding.get("path") or None
+        # The finding names its enclosing declaration directly; the wrapper
+        # ``function_id`` is only the synthetic skeleton entry. Prefer the real
+        # declaration so the handle points at the function and its file resolves.
+        decl_id = finding.get("function") or function_id
+        location = self.native_locations.get(decl_id) or {}
         site = f"native:{function_id}:{node_id}:{line}"
         raw = f"{pattern_id}\0{site}"
         return {
@@ -188,15 +198,15 @@ class TemporalLifecycle:
             "obligation": self.metadata["obligation"],
             "handles": {
                 "site_node_id": node_id,
-                "enclosing_function_id": function_id,
+                "enclosing_function_id": decl_id,
                 "obligation_value_ids": [obj] if obj else [],
             },
             "observations": {
                 "site": node_id,
                 "event_kind": None,
                 "object_id": obj,
-                "file": None,
-                "line": line,
+                "file": location.get("file"),
+                "line": line if line is not None else location.get("line"),
                 "pattern": self.metadata["matcher_pattern"],
                 "requires": list(self.metadata["requires"]),
                 "native_path": obj,

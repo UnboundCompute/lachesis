@@ -668,7 +668,27 @@ class Analysis:
         # dereference. This reads only the compact fields (pattern/node/line/path)
         # from the content-addressed match sidecar -- the witness bytes that
         # dominate it are never materialized here.
-        stamped["native_temporal"] = load_native_temporal(match_sidecar)
+        temporal = load_native_temporal(match_sidecar)
+        # The match sidecar carries each finding's enclosing declaration id but no
+        # file: that lives only in the Pass-1 structural store, which the census
+        # graph dict does not include. Resolve declaration id -> file:line here,
+        # where the store is in hand, so a confirmed double-free/UAF lead is
+        # locatable rather than carrying ``file: None``. Purely additive to the
+        # bind: navigation facts for a lead already emitted, never a verdict.
+        locations: dict[str, dict] = {}
+        for function in temporal.get("functions", ()):
+            for finding in function.get("findings", ()):
+                decl = finding.get("function")
+                if not decl or decl in locations:
+                    continue
+                node = self.store.node(decl)
+                props = (node or {}).get("properties") or {}
+                file = props.get("absolute_file") or props.get("file")
+                if file or props.get("start_line") is not None:
+                    locations[decl] = {"file": file, "line": props.get("start_line")}
+        if locations:
+            temporal["locations"] = locations
+        stamped["native_temporal"] = temporal
         return stamped, summary, converged
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------

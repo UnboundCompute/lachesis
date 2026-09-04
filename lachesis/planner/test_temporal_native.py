@@ -71,6 +71,42 @@ class MatcherAuthoritativeTest(unittest.TestCase):
         rows = _constructor("null-deref")(_graph_with_matcher()).enumerate()["candidates"]
         self.assertEqual(rows, [])
 
+    def test_confirmed_finding_resolves_its_file_from_the_location_map(self):
+        # The bind attaches decl-id -> file:line (resolved from the Pass-1 store);
+        # the confirmed lead must report it instead of ``file: None``, and its
+        # handle must point at the real declaration, not the skeleton wrapper.
+        graph = {
+            "native_temporal": {
+                "functions": [{"id": "native:skeleton:0:__entry__", "findings": [
+                    {"pattern": "double-free", "node": "free#2", "line": 10,
+                     "path": "buf", "function": "decl:bugs:double_free_bug"},
+                ]}],
+                "locations": {
+                    "decl:bugs:double_free_bug": {"file": "/src/bugs.c", "line": 5},
+                },
+            },
+        }
+        row = _constructor("double-free")(graph).enumerate()["candidates"][0]
+        self.assertEqual(row["observations"]["file"], "/src/bugs.c")
+        self.assertEqual(row["observations"]["line"], 10)  # the free site, not decl
+        self.assertEqual(row["handles"]["enclosing_function_id"],
+                         "decl:bugs:double_free_bug")
+
+    def test_finding_without_a_line_falls_back_to_the_declaration_line(self):
+        graph = {
+            "native_temporal": {
+                "functions": [{"id": "w", "findings": [
+                    {"pattern": "leak", "node": "exit", "line": None,
+                     "path": "buf", "function": "decl:bugs:leak_fn"},
+                ]}],
+                "locations": {"decl:bugs:leak_fn": {"file": "/src/bugs.c",
+                                                     "line": 30}},
+            },
+        }
+        row = _constructor("leak")(graph).enumerate()["candidates"][0]
+        self.assertEqual(row["observations"]["file"], "/src/bugs.c")
+        self.assertEqual(row["observations"]["line"], 30)  # decl fallback
+
     def test_without_the_matcher_the_inventory_still_stands(self):
         graph = {"nodes": [{"id": "blanket",
                             "event": {"kind": "read_storage", "line": 9}}]}

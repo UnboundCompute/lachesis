@@ -17,7 +17,8 @@ import unittest
 from pathlib import Path
 
 from lachesis.core import lifetime_pb2
-from lachesis.flow.native_translate import native_match_any_capped
+from lachesis.flow.native_translate import (
+    load_native_temporal, native_match_any_capped)
 
 
 def _result(*capped_flags: bool, with_findings: bool = False):
@@ -81,6 +82,26 @@ class NativeMatchConvergenceScanTest(unittest.TestCase):
             _result(False, True, False, with_findings=True))
         self._assert_matches_full_parse(
             _result(False, False, False, with_findings=True))
+
+
+class LoadNativeTemporalTest(unittest.TestCase):
+    """``load_native_temporal`` must surface each finding's enclosing
+    declaration id (field 1), the key the census resolves to a file:line, past
+    the witness/guard bytes it deliberately skips."""
+
+    def test_finding_carries_its_enclosing_declaration(self):
+        result = _result(False, True, with_findings=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.match.pb"
+            path.write_bytes(result.SerializeToString())
+            loaded = load_native_temporal(path)
+        findings = [f for fn in loaded["functions"] for f in fn["findings"]]
+        self.assertEqual(len(findings), 2)
+        for index, finding in enumerate(findings):
+            self.assertEqual(finding["function"], f"fn:{index}")
+            self.assertEqual(finding["pattern"], "use-after-free")
+            self.assertEqual(finding["node"], f"n:{index}")
+            self.assertEqual(finding["line"], 40 + index)
 
 
 if __name__ == "__main__":

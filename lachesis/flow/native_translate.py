@@ -213,17 +213,22 @@ def _read_temporal_finding(buf, pos: int, end: int) -> dict[str, Any]:
 
     The matcher's per-finding CFG witnesses (fields 7+) dominate the sidecar and
     are never consulted by the candidate census, so they are skipped: only
-    ``pattern`` (2), ``path`` (3), ``line`` (4, a zig-zag ``sint64`` gated by
-    ``has_line`` field 5) and ``node`` (6) are decoded.
+    ``function`` (1, the enclosing declaration id the census resolves to a
+    file:line), ``pattern`` (2), ``path`` (3), ``line`` (4, a zig-zag ``sint64``
+    gated by ``has_line`` field 5) and ``node`` (6) are decoded.
     """
-    pattern = node = ""
+    function = pattern = node = ""
     rendered_path = ""
     line_raw = None
     has_line = False
     while pos < end:
         tag, pos = _read_varint(buf, pos)
         field, wire = tag >> 3, tag & 7
-        if field == 2 and wire == 2:            # pattern
+        if field == 1 and wire == 2:            # enclosing declaration id
+            length, pos = _read_varint(buf, pos)
+            function = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
+            pos += length
+        elif field == 2 and wire == 2:          # pattern
             length, pos = _read_varint(buf, pos)
             pattern = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
             pos += length
@@ -243,8 +248,8 @@ def _read_temporal_finding(buf, pos: int, end: int) -> dict[str, Any]:
             pos += length
         else:
             pos = _skip_field(buf, pos, wire)
-    return {"pattern": pattern, "node": node, "path": rendered_path,
-            "line": line_raw if has_line else None}
+    return {"function": function, "pattern": pattern, "node": node,
+            "path": rendered_path, "line": line_raw if has_line else None}
 
 
 def load_native_temporal(match_path: str | os.PathLike[str]) -> dict[str, Any]:
