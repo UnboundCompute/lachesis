@@ -194,18 +194,50 @@ def _shard_manifest_counts(store_path: str) -> tuple[int, int, str]:
     return node_count, edge_count, content_hash
 
 
+def _auto_parallelism(memory_budget_mb: int) -> int:
+    """Concurrent shard builds that fit RAM: min(cores, 70% of RAM / per-build budget).
+
+    Each concurrent ``lachesis build`` may use up to ``memory_budget_mb``, so the RAM
+    ceiling -- not the core count -- is the real cap. Reserve ~30% of physical RAM for
+    the OS and the driver process; never return less than 1 (serial). Falls back to the
+    core count if the host does not expose a physical-memory query.
+    """
+    cpu = os.cpu_count() or 1
+    try:
+        ram_mb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) // (1024 * 1024)
+        by_ram = int(ram_mb * 0.7) // max(1, memory_budget_mb)
+    except (ValueError, OSError, AttributeError):
+        by_ram = cpu
+    return max(1, min(cpu, by_ram))
+
+
 def build_shards(source_root: str | Path, out_dir: str | Path,
                  plan: Optional[list[tuple[str, list[str]]]] = None, *,
                  memory_budget_mb: int = 2048, max_files_per_shard: int = 3000,
                  lachesis_bin: Optional[str] = None, timeout_seconds: int = 21600,
-                 progress=None) -> FederationManifest:
+                 parallelism: int = 0, progress=None) -> FederationManifest:
     """Build one byte-identical ``lachesis build`` store per planned shard.
 
     Each shard is built by invoking the ``lachesis build`` CLI on a directory holding
     only that shard's subtrees. That path is exactly the bounded-RAM streaming build a
     user runs by hand, unchanged -- so per-shard output is byte-identical to a
-    single-directory build and there is no new build code to regress. Shards are built
-    one at a time, so peak RAM is one shard's build, not the whole tree's.
+    single-directory build and there is no new build code to regress.
+
+    ``parallelism`` bounds how many shard builds run at once. Shards are fully
+    independent (no shared state, no cross-shard reads at build time), so running them
+    concurrently is embarrassingly parallel and changes no per-shard output: each shard
+    still runs the identical ``lachesis build`` subprocess and yields a byte-identical
+    store, so its ``content_hash`` is unaffected by how many builds run alongside it.
+    The subprocess call releases the GIL, so a thread pool gives real parallelism
+    without pickling. The manifest lists shards in ``plan`` order regardless of
+    completion order, so the result is deterministic.
+
+    The default (``0``) is auto: parallel, bounded so it cannot exhaust RAM. Each
+    concurrent build may use up to ``memory_budget_mb``, so the auto value is
+    ``min(cpu_count, floor(0.7 * total_RAM / memory_budget_mb))`` (at least 1) -- it
+    fills the cores where RAM allows and degrades to serial on a small host. Pass an
+    explicit positive value to override; ``1`` forces the old serial behaviour where
+    peak RAM is a single shard's build.
     """
     root = Path(os.path.expanduser(str(source_root)))
     out = Path(os.path.expanduser(str(out_dir)))
@@ -214,8 +246,10 @@ def build_shards(source_root: str | Path, out_dir: str | Path,
     if plan is None:
         plan = plan_shards(root, max_files_per_shard=max_files_per_shard)
 
-    shards: list[ShardEntry] = []
-    for shard_id, dirs in plan:
+    if parallelism <= 0:
+        parallelism = _auto_parallelism(memory_budget_mb)
+
+    def _build_one(shard_id: str, dirs: list[str]) -> Optional[ShardEntry]:
         if progress is not None:
             progress(f"building {shard_id}: {', '.join(dirs)}")
         # Build the shard's subtrees at their real source paths: the first directory is
@@ -225,19 +259,32 @@ def build_shards(source_root: str | Path, out_dir: str | Path,
         # identical to a single-directory build of the same sources (zero regression).
         present = [root / name for name in dirs if (root / name).exists()]
         if not present:
-            continue
+            return None
         source_dir = str(present[0])
         include_paths = [str(p) for p in present[1:]]
         store_path = str(out / f"{shard_id}.kuzu")
         _run_build(binary, source_dir, store_path, memory_budget_mb,
                    timeout_seconds, include_paths=include_paths)
         node_count, edge_count, content_hash = _shard_manifest_counts(store_path)
-        shards.append(ShardEntry(
+        return ShardEntry(
             shard_id=shard_id, store_path=store_path, source_root=str(root),
             coverage=list(dirs), node_count=node_count, edge_count=edge_count,
             content_hash=content_hash,
-        ))
+        )
 
+    results: list[Optional[ShardEntry]]
+    if parallelism <= 1 or len(plan) <= 1:
+        results = [_build_one(shard_id, dirs) for shard_id, dirs in plan]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(parallelism, len(plan))) as pool:
+            # Index the futures so the manifest stays in plan order (deterministic),
+            # not in whichever order the builds happen to finish.
+            futures = {i: pool.submit(_build_one, shard_id, dirs)
+                       for i, (shard_id, dirs) in enumerate(plan)}
+            results = [futures[i].result() for i in range(len(plan))]
+
+    shards = [entry for entry in results if entry is not None]
     return FederationManifest(source_root=str(root), shards=shards)
 
 
