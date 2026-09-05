@@ -313,6 +313,7 @@ class ComprehensionProjectionTests(unittest.TestCase):
             "files": [{"id": "f1", "path": "src/flask/app.py"}],
             "concepts": [{"id": "concept.flask", "label": "flask", "description": "d",
                            "file_paths": ["src/flask/app.py"]}],
+            "core": [{"node_id": "n.a", "label": "wsgi_app", "degree": 4}],
         })
         self.assertEqual(result["meta"]["indexed_nodes"], 500)
         self.assertEqual(result["graph"]["coverage"]["included_nodes"],
@@ -336,6 +337,7 @@ class ComprehensionProjectionTests(unittest.TestCase):
         seen = [nid for m in result["graph"]["modules"] for nid in m["node_ids"]]
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(["n.a", "n.b"], result["graph"]["concepts"][0]["node_ids"])
+        self.assertEqual(["n.a"], [item["node_id"] for item in result["graph"]["core"]])
 
     def test_concept_without_included_nodes_is_dropped(self):
         result = self._bundle_with({

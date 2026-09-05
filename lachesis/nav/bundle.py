@@ -567,7 +567,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     never raises: a graph the comprehension layer cannot walk simply reads as a bare
     graph rather than failing the whole export.
     """
-    empty = {"entrypoints": [], "requests": [], "files": [], "modules": [], "concepts": []}
+    empty = {"entrypoints": [], "requests": [], "files": [], "modules": [], "concepts": [], "core": []}
     try:
         from lachesis.planner.entrypoints import EntryPoints, _anchor_strength
         ctx = M.ctx()
@@ -681,11 +681,44 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         concepts = []
 
+    # Add a small, source-backed architecture spine to the shared node pool. This
+    # is intentionally independent from security candidates: a newcomer needs the
+    # central control path even when no finding happens to touch it. Hubs ranks real
+    # call-graph declarations, and the walk below adds only real CALLS edges.
+    core: list[dict] = []
+    try:
+        from lachesis.nav.hubs import Hubs
+        hubs = Hubs(gl, resolved_only=True).top(8)
+        core_ids: set[str] = set()
+        for hub in hubs:
+            hub_id = hub.get("node_id")
+            node = gl.nodes.get(hub_id)
+            if node is None:
+                continue
+            chain = _call_chain(index, gl, hub_id, 4)
+            for nid in chain:
+                if len(core_ids) >= 32:
+                    break
+                cnode = gl.nodes.get(nid)
+                if cnode is None:
+                    continue
+                asm.add_node(_norm_node(gl, cnode), default_kind="function")
+                core_ids.add(nid)
+            for a, b in zip(chain, chain[1:]):
+                asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, set(asm.nodes))
+            if hub_id in core_ids:
+                file, line, _ = gl.loc(node)
+                core.append({"node_id": hub_id, "label": gl.label(node),
+                             "file": file, "line": line,
+                             "degree": int(hub.get("degree") or 0)})
+    except Exception:
+        core = []
+
     # Modules are not built here: they must partition the *final* included node
     # pool (one unambiguous module per node, keyed by that node's file), which is
     # only settled after candidate/capsule/entry nodes are all in and relativized.
     return {"entrypoints": entrypoints, "requests": requests, "files": files,
-            "concepts": concepts}
+            "concepts": concepts, "core": core}
 
 
 # ------------------------------------------------------- source / node enrichment
@@ -1017,6 +1050,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     requests = _finalize_requests(comp.get("requests") or [], node_map, edges_by_pair)
     modules = _partition_modules(nodes, entrypoints)
     concepts = _project_concepts(comp.get("concepts") or [], nodes)
+    core = [item for item in (comp.get("core") or [])
+            if item.get("node_id") in node_ids]
 
     coverage = {
         "scope": "repository-projection",
@@ -1054,6 +1089,7 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
             "modules": modules,
             "concepts": concepts,
             "entrypoints": entrypoints,
+            "core": core,
             "coverage": coverage,
         },
         "paths": {"requests": requests, "values": values},
