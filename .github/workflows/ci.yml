@@ -128,14 +128,15 @@ jobs:
       - name: Build and stage the native artifacts
         run: python3 tools/stage_native.py --build
 
-      # Kuzu reserves its database file sparsely at the 8 TiB default max size; the
-      # runner's default overcommit heuristic can reject that virtual reservation
-      # (Mmap for size 8796093022208 failed). Allow overcommit so the sparse mapping
-      # succeeds -- it costs no physical memory.
-      - name: Allow memory overcommit for the Kuzu store
-        run: sudo sysctl -w vm.overcommit_memory=1
-
+      # Kuzu reserves its store's address space by mmap-ing a sparse file at an 8 TiB
+      # default when a database opens; the runner cannot satisfy that mapping even
+      # with overcommit allowed (Mmap for size 8796093022208 failed), so cap the
+      # reservation for the tiny corpus/shard graphs. LACHESIS_KUZU_MAX_DB_SIZE is a
+      # power-of-two byte ceiling (2 GiB here) honoured at every store open; the
+      # graphs are kilobytes, so the emitted store is byte-identical to the default.
       - name: Run the native lifetime suite
+        env:
+          LACHESIS_KUZU_MAX_DB_SIZE: "2147483648"
         run: |
           python -m pytest -q \
             lachesis/planner/test_temporal_native.py \
