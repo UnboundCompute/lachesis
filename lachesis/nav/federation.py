@@ -395,6 +395,13 @@ class FederatedStore:
             self._symbol_index = SymbolIndex.build(self.manifest)
         return self._symbol_index
 
+    @property
+    def reachability(self) -> "FederatedReachability":
+        """Cross-shard value-flow reachability over this federation (built once)."""
+        if getattr(self, "_reachability", None) is None:
+            self._reachability = FederatedReachability(self)
+        return self._reachability
+
     # -- queries -----------------------------------------------------------------
 
     def search(self, name: str) -> list[FederatedNode]:
@@ -471,3 +478,326 @@ class FederatedStore:
     def close(self) -> None:
         self._open.clear()
         self._lru.clear()
+
+
+# ------------------------------------------------------- cross-shard reachability
+
+
+def _params_in_order(gl, fn_id: str) -> list[str]:
+    """A function's parameter node ids in positional order.
+
+    C carries an explicit ``param_index``; Python/TS/JS carry none, so fall back to
+    source position (the parameters as written, left to right) and finally the node
+    id, which is stable. The order only has to *agree with* the caller's argument
+    order for the positional seam binding to land arg i on param i.
+    """
+    idx = gl.index
+    rows = []
+    for p in idx.targets(fn_id, "DECLARES_VALUE"):
+        if p.get("kind") != "parameter":
+            continue
+        pr = p.get("properties") or {}
+        pi = pr.get("param_index")
+        _, line, col = gl.loc(p)
+        rows.append((pi is None, pi if pi is not None else 0,
+                     line or 0, col or 0, p["id"]))
+    rows.sort()
+    return [r[-1] for r in rows]
+
+
+def _flow_reps(gl, node_id: str) -> list[str]:
+    """A structural arg/return marker plus its immediate AST-child value nodes.
+
+    The clang C frontend attaches ``HAS_ARGUMENT``/``RETURNS_VALUE`` to an *outer*
+    expression node, while the value-flow edges (the param read, the returned read)
+    live on an inner ``AST_CHILD`` of it -- the two joined only structurally. So a
+    seam anchored on the marker alone never meets the value-flow graph in C. Including
+    the marker and its one-hop AST children lets the seam bind the node the value flow
+    actually traverses, whichever the frontend used, and is conservative: an argument's
+    sub-expressions are exactly the values it carries. TS/JS/Python attach the marker
+    directly to the value node, so the extra children are harmless there.
+    """
+    reps = [node_id]
+    for e in gl.index.outgoing_of_kind(node_id, "AST_CHILD"):
+        reps.append(e["target"])
+    return reps
+
+
+def _args_in_order(gl, call_id: str) -> list[str]:
+    """A call's argument value-node ids in positional order (``HAS_ARGUMENT.position``).
+
+    The ``HAS_ARGUMENT`` edges do not always hang off the same node the ``INVOKES``
+    edge does: the C frontend puts both on the ``call`` node, but the TypeScript/
+    JavaScript frontend puts ``INVOKES`` on the ``call`` node and ``HAS_ARGUMENT`` on
+    a sibling ``call-value`` node linked to it by ``EXPANDS_TO``. So gather arguments
+    from the call node *and* every node joined to it by ``EXPANDS_TO`` in either
+    direction, deduplicating by position, so the seam lands the same argument value
+    the single-store engine flows a passed value into.
+    """
+    idx = gl.index
+    anchors = {call_id}
+    for e in idx.outgoing_of_kind(call_id, "EXPANDS_TO"):
+        anchors.add(e["target"])
+    for e in idx.incoming_of_kind(call_id, "EXPANDS_TO"):
+        anchors.add(e["source"])
+    by_pos: dict = {}
+    fallback: list = []
+    for anchor in anchors:
+        for e in idx.outgoing_of_kind(anchor, "HAS_ARGUMENT"):
+            pos = (e.get("properties") or {}).get("position")
+            if pos is None:
+                fallback.append(e["target"])
+            else:
+                by_pos.setdefault(pos, e["target"])
+    ordered = [by_pos[p] for p in sorted(by_pos)]
+    ordered.extend(fallback)
+    return ordered
+
+
+class FederatedReachability:
+    """Value-flow reachability that crosses shard boundaries -- federated Pass 2/3.
+
+    Each shard already carries its own intraprocedural value-flow graph (the source
+    of a call flows to the call's argument node; a callee's parameter flows to its
+    sinks). What no single shard can carry is the hop *between* them when caller and
+    callee live in different shards: the arg->param binding that a within-tree build
+    would emit is exactly the edge the shard split removes. This composes the shards
+    by synthesizing that binding at every resolved cross-shard call -- the same
+    ``(kind, usr)`` seam :class:`FederatedStore` uses for calls, now carrying data:
+
+      * forward:  caller argument i  --VALUE_FLOWS_TO-->  callee parameter i
+      * forward:  callee return value --VALUE_FLOWS_TO-->  the caller's call node
+
+    With those seams a source in one shard reaches a sink in another exactly as it
+    would in a merged store. The within-shard flow adjacency (the large part) is
+    built lazily, one shard at a time as the traversal enters it, so peak residency
+    stays a handful of shards; the seam table (small) is built once up front, like
+    the symbol index, so reverse queries entering an owner shard first still see it.
+
+    This adds a *new* cross-shard query; it does not touch the single-store
+    :class:`~lachesis.nav.reachability.Reachability`, so per-shard query time is
+    unchanged.
+    """
+
+    def __init__(self, fed: FederatedStore) -> None:
+        from collections import defaultdict
+
+        self.fed = fed
+        self._fwd: dict = defaultdict(list)
+        self._rev: dict = defaultdict(list)
+        self._loaded: set[str] = set()
+        self._seams_built = False
+
+    # -- adjacency construction --------------------------------------------------
+
+    def _load_shard_flow(self, shard_id: str) -> None:
+        """Add one shard's intraprocedural value-flow edges to the adjacency (once)."""
+        from lachesis.nav.reachability import (
+            FLOW_EDGE_KINDS, _ALIAS_KIND, _synth_alias_edge,
+        )
+
+        if shard_id in self._loaded:
+            return
+        self._loaded.add(shard_id)
+        gl = self.fed._graphstore(shard_id).gl
+        idx = gl.index
+        for edge in idx.flow_edges(FLOW_EDGE_KINDS):
+            src, tgt = edge.get("source"), edge.get("target")
+            if src is None or tgt is None:
+                continue
+            reason = (edge.get("properties") or {}).get("reason")
+            self._fwd[(shard_id, src)].append(((shard_id, tgt), edge, reason))
+            self._rev[(shard_id, tgt)].append(((shard_id, src), edge, reason))
+            if idx.semantic_edge_kind(edge) == _ALIAS_KIND:
+                alias = _synth_alias_edge(tgt, src, edge)
+                self._fwd[(shard_id, tgt)].append(((shard_id, src), alias, "alias-via-heap"))
+                self._rev[(shard_id, src)].append(((shard_id, tgt), alias, "alias-via-heap"))
+
+    def _build_seams(self) -> None:
+        """Synthesize arg->param and return->call edges at every cross-shard call.
+
+        Built once over all shards (cheap: it scans only ``declaration_only`` symbols
+        and their call sites, like the symbol index). Populating both directions here
+        means a reverse ``sources_of`` that starts inside the defining shard still
+        finds the seam back to the referencing shard without having loaded it.
+        """
+        if self._seams_built:
+            return
+        self._seams_built = True
+        si = self.fed.symbol_index
+        owner_cache: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+        for shard in self.fed.manifest.shards:
+            sid = shard.shard_id
+            gl = self.fed._graphstore(sid).gl
+            idx = gl.index
+            for node in gl.nodes.values():
+                props = node.get("properties") or {}
+                usr = props.get("usr")
+                if not (usr and props.get("declaration_only")):
+                    continue
+                owner = si.resolve(node.get("kind", ""), usr)
+                if owner is None or owner.shard_id == sid:
+                    continue
+                key = (owner.shard_id, owner.node_id)
+                cached = owner_cache.get(key)
+                if cached is None:
+                    owner_gl = self.fed._graphstore(owner.shard_id).gl
+                    params = _params_in_order(owner_gl, owner.node_id)
+                    returns = [r["id"] for r in
+                               owner_gl.index.sources(owner.node_id, "RETURNS_VALUE")]
+                    cached = (params, returns)
+                    owner_cache[key] = cached
+                params, returns = cached
+                owner_gl = self.fed._graphstore(owner.shard_id).gl
+                for call in idx.sources(node["id"], "INVOKES"):
+                    call_id = call["id"]
+                    args = _args_in_order(gl, call_id)
+                    for i, arg in enumerate(args):
+                        if i >= len(params):
+                            break
+                        for arg_rep in _flow_reps(gl, arg):
+                            seam = {
+                                "source": arg_rep, "target": params[i],
+                                "kind": "VALUE_FLOWS_TO",
+                                "properties": {"reason": "cross-shard-argument",
+                                               "callsite": call_id, "position": i,
+                                               "usr": usr, "confidence": "conservative"},
+                            }
+                            self._fwd[(sid, arg_rep)].append(
+                                ((owner.shard_id, params[i]), seam, "cross-shard-argument"))
+                            self._rev[(owner.shard_id, params[i])].append(
+                                ((sid, arg_rep), seam, "cross-shard-argument"))
+                    for ret in returns:
+                        for ret_rep in _flow_reps(owner_gl, ret):
+                            seam = {
+                                "source": ret_rep, "target": call_id,
+                                "kind": "VALUE_FLOWS_TO",
+                                "properties": {"reason": "cross-shard-return",
+                                               "callsite": call_id, "usr": usr,
+                                               "confidence": "conservative"},
+                            }
+                            self._fwd[(owner.shard_id, ret_rep)].append(
+                                ((sid, call_id), seam, "cross-shard-return"))
+                            self._rev[(sid, call_id)].append(
+                                ((owner.shard_id, ret_rep), seam, "cross-shard-return"))
+
+    # -- traversal ---------------------------------------------------------------
+
+    # push/pop discipline at a cross-shard seam, as a function of direction. A call
+    # (arg->param) opens a context keyed by the call site; the matching return
+    # (return->call) closes it, so a value returned from a cross-shard callee flows
+    # back only to the call it came from -- interprocedural (Pass-3) sensitivity.
+    _SEAM_ACTION = {
+        (False, "cross-shard-argument"): "push",
+        (False, "cross-shard-return"): "pop",
+        (True, "cross-shard-argument"): "pop",
+        (True, "cross-shard-return"): "push",
+    }
+
+    def _walk(self, seed: tuple[str, str], reverse: bool, budget: int,
+              context_sensitive: bool = False):
+        from collections import deque
+
+        self._build_seams()
+        adjacency = self._rev if reverse else self._fwd
+        initial = (seed, ())
+        queue = deque([initial])
+        seen = {initial}
+        predecessor: dict = {}
+        reached: dict = {}
+        truncated = False
+        while queue:
+            if len(seen) > budget:
+                truncated = True
+                break
+            state = queue.popleft()
+            node, contexts = state
+            self._load_shard_flow(node[0])
+            if node not in reached:
+                reached[node] = state
+            for nxt, edge, reason in adjacency.get(node, []):
+                next_contexts = contexts
+                if context_sensitive:
+                    action = self._SEAM_ACTION.get((reverse, reason))
+                    if action:
+                        token = (edge.get("properties") or {}).get("callsite")
+                        if action == "push":
+                            if not token or len(contexts) >= 12:
+                                continue
+                            next_contexts = (*contexts, token)
+                        else:  # pop -- must match the open call
+                            if not token or not contexts or contexts[-1] != token:
+                                continue
+                            next_contexts = contexts[:-1]
+                nstate = (nxt, next_contexts)
+                if nstate not in seen:
+                    seen.add(nstate)
+                    predecessor[nstate] = (state, edge)
+                    queue.append(nstate)
+        return reached, predecessor, truncated
+
+    def _node(self, shard_id: str, node_id: str) -> dict:
+        return self.fed._graphstore(shard_id).gl.nodes.get(node_id) or {}
+
+    def _label(self, shard_id: str, node_id: str) -> Optional[str]:
+        n = self._node(shard_id, node_id)
+        return n.get("name") or n.get("label")
+
+    def reaches(self, src_shard: str, src_id: str,
+                sink_shard: str, sink_id: str, budget: int = 200_000,
+                context_sensitive: bool = False) -> dict:
+        """Whether a value in one shard reaches a value in another, with a witness path.
+
+        With ``context_sensitive=True`` the witness must balance cross-shard calls and
+        returns (a return flows back only to its originating call site) -- the Pass-3
+        interprocedural discipline over the seam. Left off, it is Pass-2 value-flow
+        reachability, matching the single-store engine's context-insensitive edges.
+        """
+        seed = (src_shard, src_id)
+        target = (sink_shard, sink_id)
+        reached, predecessor, truncated = self._walk(
+            seed, False, budget, context_sensitive)
+        sink_state = reached.get(target)
+        if sink_state is None:
+            return {"move": "reaches", "reachable": False, "truncated": truncated,
+                    "context_sensitive": context_sensitive,
+                    "src": [src_shard, src_id], "sink": [sink_shard, sink_id]}
+        # rebuild the witness path back to the seed, over (node, contexts) states
+        path = [target]
+        cursor = sink_state
+        initial = (seed, ())
+        while cursor != initial and cursor in predecessor:
+            prev, _edge = predecessor[cursor]
+            path.append(prev[0])
+            cursor = prev
+        path.reverse()
+        return {
+            "move": "reaches", "reachable": True, "truncated": truncated,
+            "context_sensitive": context_sensitive, "hops": len(path) - 1,
+            "src": [src_shard, src_id], "sink": [sink_shard, sink_id],
+            "path": [(sid, nid, self._label(sid, nid)) for sid, nid in path],
+        }
+
+    def flow(self, seed_shard: str, seed_id: str, budget: int = 200_000,
+             limit: int = 500, context_sensitive: bool = False) -> list[FederatedNode]:
+        """The forward cone of a value across shards (every node it can flow to)."""
+        reached, _pred, _trunc = self._walk(
+            (seed_shard, seed_id), False, budget, context_sensitive)
+        out: list[FederatedNode] = []
+        for (sid, nid) in list(reached)[:limit]:
+            node = self._node(sid, nid)
+            if node:
+                out.append(FederatedNode(sid, node))
+        return out
+
+    def sources_of(self, sink_shard: str, sink_id: str, budget: int = 200_000,
+                   limit: int = 500, context_sensitive: bool = False) -> list[FederatedNode]:
+        """The reverse cone of a sink across shards (every value that can feed it)."""
+        reached, _pred, _trunc = self._walk(
+            (sink_shard, sink_id), True, budget, context_sensitive)
+        out: list[FederatedNode] = []
+        for (sid, nid) in list(reached)[:limit]:
+            node = self._node(sid, nid)
+            if node:
+                out.append(FederatedNode(sid, node))
+        return out

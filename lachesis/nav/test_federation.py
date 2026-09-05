@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from lachesis.nav.federation import (
-    FederatedStore, FederationManifest, ShardEntry, SymbolIndex,
-    build_shards, plan_shards,
+    FederatedReachability, FederatedStore, FederationManifest, ShardEntry,
+    SymbolIndex, _args_in_order, _params_in_order, build_shards, plan_shards,
 )
 
 
@@ -240,3 +240,156 @@ class _FakeIndex:
 
     def nodes_of_kind(self, *kinds):
         return [n for n in self._nodes if n.get("kind") in kinds]
+
+
+# --------------------------------------------------------------- cross-shard dataflow
+#
+# Pass-1 proves a call *resolves* across shards. These prove a *value* moves across the
+# shard boundary: Pass-2 that an argument in the referencing shard reaches the callee's
+# parameter (and back), and Pass-3 that the crossing is context-sensitive -- a value
+# returned from a cross-shard callee flows back only to the call site it came from.
+# Both must hold for all four languages, which is the standing federation goal.
+
+# Each fixture: shard1 defines a passthrough function (param flows to the return);
+# shard2's caller passes a value across the shard boundary into it.
+_PASS2_FIXTURES = {
+    "c": dict(ext="c", pkg=False,
+              deff="char *target_fn(char *p){ char *q = p; return q; }\n",
+              use=("extern char *target_fn(char *p);\n"
+                   "char *caller(char *tainted){ return target_fn(tainted); }\n")),
+    "python": dict(ext="py", pkg=True,
+                   deff="def target_fn(p):\n    q = p\n    return q\n",
+                   use=("from shard1.lib import target_fn\n"
+                        "def caller(tainted):\n    return target_fn(tainted)\n")),
+    "typescript": dict(ext="ts", pkg=False,
+                       deff="export function target_fn(p){ let q = p; return q; }\n",
+                       use=("import { target_fn } from '../shard1/lib';\n"
+                            "export function caller(tainted){ return target_fn(tainted); }\n")),
+    "javascript": dict(ext="js", pkg=False,
+                       deff="export function target_fn(p){ let q = p; return q; }\n",
+                       use=("import { target_fn } from '../shard1/lib';\n"
+                            "export function caller(tainted){ return target_fn(tainted); }\n")),
+}
+
+# Two callers of one cross-shard passthrough, to exercise call/return context matching.
+_PASS3_FIXTURES = {
+    "c": dict(ext="c", pkg=False,
+              deff="char *id_fn(char *p){ return p; }\n",
+              use=("extern char *id_fn(char *p);\n"
+                   "char *callerA(char *a){ return id_fn(a); }\n"
+                   "char *callerB(char *b){ return id_fn(b); }\n")),
+    "python": dict(ext="py", pkg=True,
+                   deff="def id_fn(p):\n    return p\n",
+                   use=("from shard1.lib import id_fn\n"
+                        "def callerA(a):\n    return id_fn(a)\n"
+                        "def callerB(b):\n    return id_fn(b)\n")),
+    "typescript": dict(ext="ts", pkg=False,
+                       deff="export function id_fn(p){ return p; }\n",
+                       use=("import { id_fn } from '../shard1/lib';\n"
+                            "export function callerA(a){ return id_fn(a); }\n"
+                            "export function callerB(b){ return id_fn(b); }\n")),
+    "javascript": dict(ext="js", pkg=False,
+                       deff="export function id_fn(p){ return p; }\n",
+                       use=("import { id_fn } from '../shard1/lib';\n"
+                            "export function callerA(a){ return id_fn(a); }\n"
+                            "export function callerB(b){ return id_fn(b); }\n")),
+}
+
+
+def _build_dataflow_shards(root, out, spec, binary):
+    (root / "shard1").mkdir(parents=True)
+    (root / "shard2").mkdir(parents=True)
+    ext = spec["ext"]
+    if spec["pkg"]:
+        (root / "shard1" / "__init__.py").write_text("")
+        (root / "shard2" / "__init__.py").write_text("")
+        (root / "shard1" / "lib.py").write_text(spec["deff"])
+        (root / "shard2" / "use.py").write_text(spec["use"])
+    else:
+        (root / "shard1" / f"lib.{ext}").write_text(spec["deff"])
+        (root / "shard2" / f"use.{ext}").write_text(spec["use"])
+    plan = [("shard-0000", ["shard1"]), ("shard-0001", ["shard2"])]
+    return build_shards(root, out, plan, memory_budget_mb=2048, lachesis_bin=binary)
+
+
+def _cross_shard_calls(fed):
+    """Every cross-shard call in the referencing shard: (call_id, first_arg, owner)."""
+    gl = fed._graphstore("shard-0001").gl
+    si = fed.symbol_index
+    out = []
+    for node in gl.nodes.values():
+        props = node.get("properties") or {}
+        if not (props.get("usr") and props.get("declaration_only")):
+            continue
+        owner = si.resolve(node.get("kind", ""), props["usr"])
+        if owner is None:
+            continue
+        for call in gl.index.sources(node["id"], "INVOKES"):
+            args = _args_in_order(gl, call["id"])
+            if args:
+                out.append((call["id"], args[0], owner))
+    return out
+
+
+@pytest.mark.parametrize("lang", list(_PASS2_FIXTURES))
+def test_cross_shard_pass2_dataflow(tmp_path, lang):
+    """Pass-2: an argument passed across the shard boundary reaches the callee's
+    parameter in the defining shard, and the reverse cone from that parameter finds
+    its way back to the referencing shard."""
+    binary = _lachesis_bin()
+    src = tmp_path / "src"
+    manifest = _build_dataflow_shards(src, tmp_path / "fed",
+                                      _PASS2_FIXTURES[lang], binary)
+    fed = FederatedStore(manifest, symbol_index=SymbolIndex.build(manifest))
+    try:
+        calls = _cross_shard_calls(fed)
+        assert calls, f"{lang}: no cross-shard call with an argument found"
+        call_id, arg_id, owner = calls[0]
+        params = _params_in_order(fed._graphstore(owner.shard_id).gl, owner.node_id)
+        assert params, f"{lang}: callee has no parameter node"
+        param_id = params[0]
+
+        fr = fed.reachability
+        fwd = fr.reaches("shard-0001", arg_id, owner.shard_id, param_id)
+        assert fwd["reachable"], f"{lang}: argument did not reach callee param cross-shard"
+
+        cone = fr.flow("shard-0001", arg_id)
+        assert any(n.shard_id == owner.shard_id for n in cone), \
+            f"{lang}: forward cone never entered the defining shard"
+
+        rev = fr.sources_of(owner.shard_id, param_id)
+        assert any(n.shard_id == "shard-0001" for n in rev), \
+            f"{lang}: reverse cone from callee param never reached the referencing shard"
+    finally:
+        fed.close()
+
+
+@pytest.mark.parametrize("lang", list(_PASS3_FIXTURES))
+def test_cross_shard_pass3_context_sensitive(tmp_path, lang):
+    """Pass-3: with two callers of one cross-shard passthrough, a value from caller A
+    reaches A's own call result under context-sensitive traversal but NOT B's, whereas
+    the context-insensitive walk conflates them -- i.e. the seam matches calls to
+    returns by call site across the shard boundary."""
+    binary = _lachesis_bin()
+    src = tmp_path / "src"
+    manifest = _build_dataflow_shards(src, tmp_path / "fed",
+                                      _PASS3_FIXTURES[lang], binary)
+    fed = FederatedStore(manifest, symbol_index=SymbolIndex.build(manifest))
+    try:
+        calls = _cross_shard_calls(fed)
+        assert len(calls) >= 2, f"{lang}: expected two cross-shard calls, got {len(calls)}"
+        calls.sort(key=lambda c: c[0])
+        (callA, argA, _), (callB, _argB, _) = calls[0], calls[1]
+
+        fr = fed.reachability
+        aa = fr.reaches("shard-0001", argA, "shard-0001", callA,
+                        context_sensitive=True)["reachable"]
+        ab_ci = fr.reaches("shard-0001", argA, "shard-0001", callB)["reachable"]
+        ab_cs = fr.reaches("shard-0001", argA, "shard-0001", callB,
+                           context_sensitive=True)["reachable"]
+
+        assert aa, f"{lang}: A's argument did not reach A's own call result cross-shard"
+        assert ab_ci, f"{lang}: context-insensitive walk should conflate A and B's returns"
+        assert not ab_cs, f"{lang}: context-sensitive walk must not leak A's value to B's return"
+    finally:
+        fed.close()
