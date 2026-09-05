@@ -680,6 +680,8 @@ class BodyWalk:
                     callsite=node_id, confidence=resolution.confidence,
                 )
                 self.resolved_count += 1
+        if not resolution.targets:
+            self._external_call_ref(node_id, callee, frame)
         if constructed is not None:
             # There is no INSTANTIATES in the contract, and inventing one would put
             # a kind no reader knows into the store. REFERS_TO is the structural
@@ -930,6 +932,53 @@ class BodyWalk:
         # A plain ``import a`` never binds a callable, so ``module`` is the answer
         # only for the from-import form; fall back to it either way.
         return record.module or None
+
+    def _external_call_ref(
+        self, call_id: str, callee: ast.expr, frame: Frame,
+    ) -> None:
+        """Emit a placeholder callee for a call to a name imported from a module
+        absent from this build -- the Python analogue of a C ``extern`` reference.
+
+        In a whole-tree build every ``from lib import target`` resolves to the real
+        definition, so ``resolution.targets`` is non-empty and this path is never
+        taken: the store stays byte-identical. In a *federated shard* the defining
+        module lives in another shard, so the resolver finds nothing and the call
+        would otherwise drop its edge entirely -- leaving no reference for a
+        cross-shard join to recover. A declaration-only ``function`` node carrying
+        the same path-independent ``usr`` the definition carries (``py:<module>.
+        <name>``, matched by the def-side stamp in build_graph) lets the query-time
+        linker redirect the call to the defining shard, exactly as clang's extern
+        prototype does for C. Confidence is ``conservative``: the target is named
+        by its import, not proven present here.
+        """
+        if not isinstance(callee, ast.Name):
+            return
+        record = self._active_import(callee.id, frame)
+        if record is None or record.statement_form != "from-import":
+            return
+        # Only absolute from-imports carry a path-independent dotted module that a
+        # sibling shard's definition can be keyed by. Relative imports (level > 0)
+        # are already excluded by ``_import_index``; module/name must both be known.
+        if record.level or not record.module or not record.name:
+            return
+        usr = f"py:{record.module}.{record.name}"
+        # One placeholder per (file, usr): repeated call sites in this file to the
+        # same external share it, mirroring one extern decl per C translation unit.
+        placeholder_id = stable_id("external", self.source.display, usr)
+        self.graph.node(
+            placeholder_id, "function", record.name,
+            usr=usr, declaration_only=True,
+            fact_origin="compiler", confidence="conservative",
+            resolution="cross-shard-import",
+        )
+        self.graph.edge(
+            "INVOKES", call_id, placeholder_id,
+            confidence="conservative", resolution="cross-shard-import",
+        )
+        self.graph.edge(
+            "CALLS", frame.owner_function_id, placeholder_id,
+            callsite=call_id, confidence="conservative",
+        )
 
     def _canonical_module(self, callee: ast.expr, frame: Frame) -> Optional[str]:
         """Resolve a callee to the dotted library/module a sink model is keyed by.

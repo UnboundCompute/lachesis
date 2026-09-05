@@ -143,6 +143,17 @@ function relative(fileName) {
   return value.startsWith("..") ? normalize(fileName) : value || path.basename(fileName);
 }
 
+function moduleBasename(fileNameOrSpecifier) {
+  // The last path segment with any module extension stripped -- a path-independent
+  // module identity. `./lib`, `../pkg/lib`, `lib.ts`, `/abs/lib.mjs` all map to
+  // `lib`, so a relative import's specifier and the defining file's name agree on
+  // it across independently rooted shards. `index` is left as-is (a known limit:
+  // `from './lib'` resolving to `lib/index.ts` will not match).
+  const value = String(fileNameOrSpecifier || "").replace(/\\/g, "/");
+  const segment = value.split("/").filter(Boolean).pop() || value;
+  return segment.replace(/\.d\.ts$/i, "").replace(/\.(m|c)?[jt]sx?$/i, "");
+}
+
 function compact(text, limit = 240) {
   let value = "";
   let pendingSpace = false;
@@ -910,10 +921,92 @@ function hasModifier(node, kind) {
   return Boolean(node.modifiers?.some((modifier) => modifier.kind === kind));
 }
 
+function isExportedTopLevel(node) {
+  // `export function f`, `export class C`, `export const f = () => {}` (the export
+  // modifier sits on the variable statement for the arrow/function-expression
+  // forms). Default exports are excluded: a default import binds an arbitrary local
+  // name, so no name-based cross-shard key could agree between definition and use.
+  if (hasModifier(node, ts.SyntaxKind.DefaultKeyword)) return false;
+  if (hasModifier(node, ts.SyntaxKind.ExportKeyword)) return ts.isSourceFile(node.parent);
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    const decl = node.parent;
+    if (decl && ts.isVariableDeclaration(decl)) {
+      const stmt = decl.parent && decl.parent.parent;
+      if (stmt && ts.isVariableStatement(stmt) && ts.isSourceFile(stmt.parent)) {
+        return hasModifier(stmt, ts.SyntaxKind.ExportKeyword)
+          && !hasModifier(stmt, ts.SyntaxKind.DefaultKeyword);
+      }
+    }
+  }
+  return false;
+}
+
+function crossShardUsr(node, name) {
+  // A path-independent join key for a top-level exported declaration, matching the
+  // key an unresolved relative-import reference reconstructs in a sibling shard:
+  //   ts:<module-basename>.<name>
+  // Only exported, top-level, plainly-named declarations qualify -- those are the
+  // only ones a cross-shard `import { name } from './module'` can reach. This is a
+  // property annotation only; it leaves node ids and edge triples (hence
+  // graph_content_hash) unchanged, exactly as clang's USR rides C nodes.
+  if (!name || !/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+  if (!isExportedTopLevel(node)) return null;
+  const base = moduleBasename(node.getSourceFile().fileName);
+  return base ? `ts:${base}.${name}` : null;
+}
+
+function isRelativeImportCallee(node) {
+  const callee = node.expression;
+  if (!callee || !ts.isIdentifier(callee)) return false;
+  const fileMap = relativeNamedImportByFile.get(normalize(node.getSourceFile().fileName));
+  return Boolean(fileMap && fileMap.has(callee.text));
+}
+
+function resolvesOutsideRoot(resolved) {
+  const sf = resolved && resolved.getSourceFile && resolved.getSourceFile();
+  return Boolean(sf && !rootSet.has(normalize(sf.fileName)));
+}
+
+function emitCrossShardCallRef(node, callId, owningFunction) {
+  // The federated-shard analogue of a C `extern` reference: a call to a name
+  // imported from a RELATIVE module that is absent from this shard. In a whole-tree
+  // build the import resolves, primaryTarget is set, and this is never reached, so
+  // the store is byte-identical. Here the defining module lives in a sibling shard,
+  // so emit a declaration-only placeholder carrying the same ts:<base>.<name> key
+  // the definition carries -- the query-time linker joins them and redirects the
+  // call to the defining shard. Bare-package specifiers are deliberately excluded:
+  // they do not resolve even in a whole tree, so a placeholder for them would
+  // change the whole-tree store.
+  const callee = node.expression;
+  if (!callee || !ts.isIdentifier(callee)) return;
+  const fileMap = relativeNamedImportByFile.get(normalize(node.getSourceFile().fileName));
+  const ref = fileMap && fileMap.get(callee.text);
+  if (!ref) return;
+  const usr = `ts:${ref.base}.${ref.imported}`;
+  const placeholderId = stableId("external", usr);
+  if (!nodes.has(placeholderId)) {
+    addNode("T1", placeholderId, "function", ref.imported, {
+      usr,
+      declaration_only: true,
+      confidence: "conservative",
+      resolution: "cross-shard-import",
+    });
+  }
+  addEdge("INVOKES", callId, placeholderId, {
+    confidence: "conservative", resolution: "cross-shard-import",
+  });
+  if (owningFunction) {
+    addEdge("CALLS", owningFunction, placeholderId, {
+      callsite: callId, confidence: "conservative",
+    });
+  }
+}
+
 function registerEntity(node, ownerId = null) {
   if (entityByDeclaration.has(node)) return entityByDeclaration.get(node);
   const kind = entityKind(node);
   const name = declarationName(node);
+  const usr = crossShardUsr(node, name);
   const position = sourcePosition(node);
   const id = stableId(kind, ...nodeKey(node, name));
   const typeExtensions = declarationTypeExtensions(node);
@@ -947,6 +1040,7 @@ function registerEntity(node, ownerId = null) {
   addNode("T1", id, kind, name, {
     ...position,
     ...sourceProvenance(position.absolute_file),
+    ...(usr ? { usr } : {}),
     syntax_kind: ts.SyntaxKind[node.kind],
     type: safeType(node),
     signature,
@@ -1580,6 +1674,16 @@ function exportMetadata(statement) {
 // `module` on each call node so the package check binds on real provenance.
 const importPackageByFile = new Map();
 
+// Local name -> {base, imported} for a named import from a RELATIVE specifier
+// (`import { target_fn } from './lib'`). In a whole-tree build the specifier
+// resolves, the call carries a real INVOKES target, and this map is never
+// consulted. In a federated shard the defining module lives in a sibling shard and
+// does not resolve, so a call through such a local is redirected to a
+// declaration-only placeholder keyed by ts:<base>.<imported> -- the identical key
+// the definition carries in its own shard (see crossShardUsr). `base` is the
+// module basename of the specifier, path-independent so it agrees across shards.
+const relativeNamedImportByFile = new Map();
+
 // Locals aliased to a bare code-exec global -- `const f = Function`, `e = eval`,
 // or a later `x = Function` assignment. A call *through* the alias (`new f(src)`,
 // `e(code)`) is a code-injection sink exactly as the direct `Function(src)` would
@@ -1677,6 +1781,25 @@ for (const fileName of analysisFileNames) {
       if (!fileMap) { fileMap = new Map(); importPackageByFile.set(key, fileMap); }
       for (const binding of metadata.bindings) {
         if (binding.local) fileMap.set(binding.local, importedPackage);
+      }
+    }
+    if (ts.isImportDeclaration(statement) && specifier.startsWith(".") && metadata.bindings) {
+      // A relative import that resolves in a whole tree but not in this shard is
+      // the cross-shard case. Record its named bindings so an unresolved call
+      // through one can be redirected to the defining shard at query time. Only
+      // value named imports carry a name that a sibling shard's export can be keyed
+      // by; default/namespace/type-only bindings cannot be reconstructed by name.
+      const base = moduleBasename(specifier);
+      if (base) {
+        const key = normalize(sf.fileName);
+        let fileMap = relativeNamedImportByFile.get(key);
+        if (!fileMap) { fileMap = new Map(); relativeNamedImportByFile.set(key, fileMap); }
+        for (const binding of metadata.bindings) {
+          if (binding.local && binding.imported && !binding.type_only &&
+              binding.imported !== "default" && binding.imported !== "*") {
+            fileMap.set(binding.local, { base, imported: binding.imported });
+          }
+        }
       }
     }
     const runtime = runtimeResolution(sf.fileName, specifier);
@@ -3049,7 +3172,16 @@ for (const fileName of analysisFileNames) {
         callsite: callId,
       });
       const { resolved, candidates } = targetDeclarationsForCall(node);
-      const primaryTarget = resolved ? entityForDeclaration(resolved) : null;
+      // A call through a RELATIVE named import whose target file lies outside this
+      // shard's root set is a cross-shard reference: the sibling shard's source is
+      // reachable on disk (so the TS checker resolves it) but is not part of THIS
+      // shard. Treat it as unresolved so it federates by USR to the defining shard,
+      // instead of pulling the sibling's definition into this shard's store. In a
+      // whole-tree build every in-tree file is in the root set, so this is always
+      // false and the store is byte-identical.
+      const crossShard = isRelativeImportCallee(node) && resolvesOutsideRoot(resolved);
+      const primaryTarget = (resolved && !crossShard) ? entityForDeclaration(resolved) : null;
+      const effectiveCandidates = crossShard ? [] : candidates;
       if (resolved && primaryTarget) {
         addEdge("INVOKES", callId, primaryTarget, {
           resolution: resolved.getSourceFile() && rootSet.has(normalize(resolved.getSourceFile().fileName))
@@ -3060,7 +3192,7 @@ for (const fileName of analysisFileNames) {
         }
       }
       const candidateTargetIds = [];
-      for (const declaration of candidates) {
+      for (const declaration of effectiveCandidates) {
       const targetId = entityForDeclaration(declaration);
       if (!targetId || nodes.get(targetId)?.tier !== "T1") continue;
         candidateTargetIds.push(targetId);
@@ -3070,6 +3202,12 @@ for (const fileName of analysisFileNames) {
       }
       if (!primaryTarget) {
         nodes.get(callId).properties.resolution = "dynamic-or-unresolved";
+        // Emit the extern-like placeholder ONLY for a genuine cross-shard call --
+        // a relative import that resolves on disk but into a sibling shard outside
+        // this shard's root set. A truly unresolvable relative import (dangling or
+        // dynamic) is left exactly as before with no placeholder, so a whole-tree
+        // build stays byte-identical even when it contains a broken import.
+        if (crossShard) emitCrossShardCallRef(node, callId, owningFunction);
       } else {
         nodes.get(callId).properties.resolution = candidates.length > 1 ? "exact-overload" : "exact";
         nodes.get(callId).properties.primary_target_id = primaryTarget;
