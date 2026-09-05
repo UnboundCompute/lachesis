@@ -18,6 +18,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from lachesis.flow import native_lifetime
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "native" / "lifetime_kernel" / "run_corpus.py"
 
@@ -31,6 +33,7 @@ def _load_runner():
 
 @unittest.skipUnless(RUNNER.exists(), "corpus runner not present")
 @unittest.skipUnless(shutil.which("lachesis"), "lachesis build CLI not on PATH")
+@unittest.skipUnless(native_lifetime.available(), "native analysis kernel not built")
 class LifetimeCorpusTest(unittest.TestCase):
     """Compile the corpus once, adjudicate every family's controls."""
 

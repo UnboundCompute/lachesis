@@ -12,10 +12,20 @@ happen to land in the same shard.
 import pytest
 
 from .core.shards import ShardSetReader, ShardSetWriter
+from .flow import native_lifetime
 
 kuzu = pytest.importorskip("kuzu")
 
 from .kuzu_store import db_file, write_kuzu_shards  # noqa: E402
+
+# Every case here writes shards through ``write_kuzu_shards``, which loads the native
+# lifetime kernel during the merge. Without a staged/built kernel the whole module is
+# a toolchain gap, not a set of defects, so skip it exactly as the rest of the suite
+# skips its native-dependent tests.
+pytestmark = pytest.mark.skipif(
+    not native_lifetime.available(),
+    reason="native analysis kernel not built; shard merge unavailable",
+)
 
 
 def _fn(node_id, *, usr, declaration_only, file):
