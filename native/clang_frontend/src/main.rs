@@ -1090,6 +1090,24 @@ unsafe fn visit_one(
     {
         properties.push(field("operator", text(&operator)));
     }
+    // A control-flow statement carries a `control_kind` the CFG overlay keys on to
+    // synthesize its cfg-condition node and branch-region edges. Without it the C
+    // `if`/loop/switch statements -- which arrive only as generic "statement"
+    // nodes -- are invisible to the overlay, so guard/dominance reasoning has no
+    // substrate and every copy reads `none-observed`. The node's label is the full
+    // statement source (condition included); the reader's `condition_head` isolates
+    // the parenthesised head, so the whole-statement label does not leak body
+    // identifiers into the guard test.
+    if let Some(control_kind) = match syntax_kind.as_str() {
+        "IfStmt" => Some("if"),
+        "ForStmt" => Some("for"),
+        "WhileStmt" => Some("while"),
+        "DoStmt" => Some("do-while"),
+        "SwitchStmt" => Some("switch"),
+        _ => None,
+    } {
+        properties.push(field("control_kind", text(control_kind)));
+    }
     let owner_id = function_owner(cursor, emitter);
     if matches!(
         syntax_kind.as_str(),
@@ -1332,6 +1350,63 @@ unsafe fn visit_one(
                         source_tier: tier.clone(), relationship_class: "VALUE_FLOWS_TO".to_owned(),
                     })?;
                 }
+            }
+        } else if syntax_kind == "IfStmt" {
+            // Branch-region substrate for the CFG overlay. libclang yields an
+            // IfStmt's direct children in source order; for C (which has no
+            // condition-variable declarations) that is [condition, then, else?],
+            // so `cursors[1]` is the then-body and `cursors[2]`, when present, the
+            // else-body. The overlay turns these into TRUE_BRANCH/FALSE_BRANCH
+            // region edges whose target spans decide whether a copy call site is
+            // dominated by the (size-)testing branch. The condition itself needs no
+            // edge: with no CONDITION edge the overlay defaults the condition target
+            // to the statement, whose label already carries the guard head. When the
+            // else arm is absent the overlay synthesizes the fall-through itself.
+            if let Some(then_id) = children.cursors.get(1)
+                .and_then(|child| cursor_graph_id(*child, emitter))
+            {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "TRUE_BRANCH".to_owned(), source: id.clone(), target: then_id,
+                    properties: Vec::new(), source_tier: tier.clone(),
+                    relationship_class: "TRUE_BRANCH".to_owned(),
+                })?;
+            }
+            if let Some(else_id) = children.cursors.get(2)
+                .and_then(|child| cursor_graph_id(*child, emitter))
+            {
+                emitter.edge(graph::EdgeRecord {
+                    kind: "FALSE_BRANCH".to_owned(), source: id.clone(), target: else_id,
+                    properties: Vec::new(), source_tier: tier.clone(),
+                    relationship_class: "FALSE_BRANCH".to_owned(),
+                })?;
+            }
+        } else if matches!(syntax_kind.as_str(), "ForStmt" | "WhileStmt" | "DoStmt" | "SwitchStmt") {
+            // Body-region substrate for loops and switch, the analogue of the IfStmt
+            // arm above. The CFG overlay synthesizes the cfg-condition node from
+            // `control_kind` on its own, but a copy call site is only classified as
+            // dominated by a (size-)testing head if a branch-region edge names the
+            // body it lives in. libclang orders these statements' children in source
+            // order, so the body is the single positional child that is always
+            // present: for `while`/`switch` ([cond, body]) and `for`
+            // ([init?, cond?, inc?, body]) it is the last child; for `do`
+            // ([body, cond]) it is the first. The overlay normalizes LOOP_TRUE to a
+            // TRUE_BRANCH region and keeps SWITCH_CASE, then synthesizes the loop
+            // back-edge and fall-through itself, matching the Python frontend's CFG.
+            let (edge_kind, body_cursor) = if syntax_kind == "DoStmt" {
+                ("LOOP_TRUE", children.cursors.first())
+            } else if syntax_kind == "SwitchStmt" {
+                ("SWITCH_CASE", children.cursors.last())
+            } else {
+                ("LOOP_TRUE", children.cursors.last())
+            };
+            if let Some(body_id) = body_cursor
+                .and_then(|child| cursor_graph_id(*child, emitter))
+            {
+                emitter.edge(graph::EdgeRecord {
+                    kind: edge_kind.to_owned(), source: id.clone(), target: body_id,
+                    properties: Vec::new(), source_tier: tier.clone(),
+                    relationship_class: edge_kind.to_owned(),
+                })?;
             }
         } else if syntax_kind == "ReturnStmt" {
             if let (Some(value_id), Some(owner)) = (child_ids.first(), owner_id.clone()) {

@@ -213,17 +213,22 @@ def _read_temporal_finding(buf, pos: int, end: int) -> dict[str, Any]:
 
     The matcher's per-finding CFG witnesses (fields 7+) dominate the sidecar and
     are never consulted by the candidate census, so they are skipped: only
-    ``pattern`` (2), ``path`` (3), ``line`` (4, a zig-zag ``sint64`` gated by
-    ``has_line`` field 5) and ``node`` (6) are decoded.
+    ``function`` (1, the enclosing declaration id the census resolves to a
+    file:line), ``pattern`` (2), ``path`` (3), ``line`` (4, a zig-zag ``sint64``
+    gated by ``has_line`` field 5) and ``node`` (6) are decoded.
     """
-    pattern = node = ""
+    function = pattern = node = ""
     rendered_path = ""
     line_raw = None
     has_line = False
     while pos < end:
         tag, pos = _read_varint(buf, pos)
         field, wire = tag >> 3, tag & 7
-        if field == 2 and wire == 2:            # pattern
+        if field == 1 and wire == 2:            # enclosing declaration id
+            length, pos = _read_varint(buf, pos)
+            function = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
+            pos += length
+        elif field == 2 and wire == 2:          # pattern
             length, pos = _read_varint(buf, pos)
             pattern = bytes(buf[pos:pos + length]).decode("utf-8", "replace")
             pos += length
@@ -243,8 +248,8 @@ def _read_temporal_finding(buf, pos: int, end: int) -> dict[str, Any]:
             pos += length
         else:
             pos = _skip_field(buf, pos, wire)
-    return {"pattern": pattern, "node": node, "path": rendered_path,
-            "line": line_raw if has_line else None}
+    return {"function": function, "pattern": pattern, "node": node,
+            "path": rendered_path, "line": line_raw if has_line else None}
 
 
 def load_native_temporal(match_path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -280,7 +285,7 @@ def load_native_temporal(match_path: str | os.PathLike[str]) -> dict[str, Any]:
             if field == 1 and wire == 2:                # NativeTemporalFunction
                 length, pos = _read_varint(buf, pos)
                 fn_end = pos + length
-                fn_id, findings = "", []
+                fn_id, findings, capped = "", [], False
                 while pos < fn_end:
                     inner_tag, pos = _read_varint(buf, pos)
                     inner_field, inner_wire = inner_tag >> 3, inner_tag & 7
@@ -292,16 +297,44 @@ def load_native_temporal(match_path: str | os.PathLike[str]) -> dict[str, Any]:
                         n, pos = _read_varint(buf, pos)
                         findings.append(_read_temporal_finding(buf, pos, pos + n))
                         pos += n
+                    elif inner_field == 5 and inner_wire == 0:    # capped
+                        value, pos = _read_varint(buf, pos)
+                        capped = bool(value)
                     else:
                         pos = _skip_field(buf, pos, inner_wire)
                 pos = fn_end
-                functions.append({"id": fn_id, "findings": findings})
+                # ``capped`` marks a function whose skeleton was truncated (state
+                # budget exhausted or a partial skeleton). Its findings are
+                # unsound -- a balancing free may lie past the truncation, so a
+                # reported leak/UAF could be spurious -- so the caller drops
+                # them per function rather than trusting them or, as before,
+                # discarding every function's findings graph-wide.
+                functions.append({"id": fn_id, "findings": findings, "capped": capped})
             else:
                 pos = _skip_field(buf, pos, wire)
     finally:
         buf.release()
         mapped.close()
     return result
+
+
+def drop_capped_functions(temporal: dict[str, Any]) -> list[str]:
+    """Remove capped functions' findings from a loaded temporal bind, in place.
+
+    A capped function's skeleton was truncated (state budget exhausted or a
+    partial skeleton), so its findings are unsound -- a balancing free may lie
+    past the truncation, so a reported leak/UAF there could be spurious. Drop
+    exactly those functions and return their ids, sorted, so the caller can
+    report them as ``truncated_functions`` while keeping every converged
+    function's confirmed findings. This replaces the old graph-wide veto, under
+    which a single capped function discarded the entire temporal bind and zeroed
+    the confirmed census of an otherwise-clean graph.
+    """
+    functions = temporal.get("functions") or []
+    capped = sorted(fn.get("id", "") for fn in functions if fn.get("capped"))
+    if capped:
+        temporal["functions"] = [fn for fn in functions if not fn.get("capped")]
+    return capped
 
 
 def native_match_leads(result) -> list[dict[str, Any]]:

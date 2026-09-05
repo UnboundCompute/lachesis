@@ -320,17 +320,15 @@ class Analysis:
         else:
             stamped, summary, complete = self._enrich_and_merge(
                 deadline=deadline, workers=workers)
+            # ``_enrich_and_merge`` now handles cap truncation per function --
+            # it drops only the capped functions' findings and reports them in
+            # ``coverage.truncated_functions``, so the returned bind is the
+            # complete, deterministic answer for this graph and is always safe
+            # to cache. (The old path treated any single capped function as a
+            # graph-wide veto and popped the whole temporal bind here, zeroing
+            # the confirmed census of an otherwise-clean graph.)
             if complete:
                 bind_cache.store(self.store, stamped, summary)
-            else:
-                # A truncated semantic skeleton would emit partial temporal observations that
-                # read as fewer bugs, not as an incomplete run. Drop it and report structural
-                # families only -- honest under-coverage beats a misleadingly thin temporal set.
-                # The correlated matcher findings ride the same truncation: without a converged
-                # skeleton they are incomplete, so drop them too rather than present a thin
-                # confirmed set as authoritative.
-                stamped.pop("semantic_graph", None)
-                stamped.pop("native_temporal", None)
         return {
             "registry": default_candidate_registry(stamped, summary),
             "stamped": stamped,
@@ -346,6 +344,13 @@ class Analysis:
         from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
         started = perf_counter()
+        # Make the control-flow branch substrate (cfg-condition nodes + branch-region
+        # edges) visible to the index before the bind reads it. On the retain=False
+        # path (`enrich`) the full dataflow overlay is deliberately never decoded into
+        # RAM, so without this the census has no conditions to classify guard dominance
+        # against. This attaches only the tiny branch slice (bounded by control
+        # structure), and is a no-op when a full overlay is already attached.
+        self.store.ensure_branch_substrate()
         index = getattr(self.store, "index", None)
         projection_fn = getattr(index, "atropos_projection", None)
         if projection_fn is not None:
@@ -424,6 +429,33 @@ class Analysis:
         materialize_started = perf_counter()
         region_edges = list(index.edges_of_kind(*_REGION_EDGE_KINDS))
         edges.extend(region_edges)
+        # Region-edge ENDPOINTS carry the two facts the guard adjudicator reads: the
+        # cfg-condition SOURCE (which size variable a branch tests) and the branch-body
+        # TARGET span (which a copy call site is placed inside for `guarded-region`).
+        # The header warm below cannot supply either. The sources are overlay-derived
+        # -- absent from Kùzu -- so ``node_headers`` returns them as empty stubs. And on
+        # the deferred-maps bind path (``enrich`` opens with ``defer_maps=True``) the
+        # promoted-header columns are never built, so ``node_headers`` returns the Kùzu
+        # body targets span-less too. Either stubbing collapses a genuinely guarded copy
+        # to a spurious ``none-observed``/``fall-through``. Warm both endpoints straight
+        # from Kùzu (batched; ``_warm_nodes`` skips ids already resident, so the
+        # overlay-cached cfg-condition sources are left intact) and seat the full,
+        # span-bearing records through the overlay-aware accessor before the
+        # ``difference`` so no stubbing path runs on them. Bounded by the program's
+        # control structure, never by its size.
+        node_getter = getattr(index, "nodes", None)
+        region_endpoints = {edge.get("source") for edge in region_edges}
+        region_endpoints.update(edge.get("target") for edge in region_edges)
+        region_endpoints.discard(None)
+        region_endpoints.difference_update(nodes)
+        if region_endpoints and node_getter is not None:
+            warmer = getattr(index, "_warm_nodes", None)
+            if warmer is not None:
+                warmer(region_endpoints)
+            for endpoint_id in region_endpoints:
+                record = node_getter.get(endpoint_id)
+                if record is not None:
+                    nodes[record["id"]] = record
         region_done = perf_counter()
         needed = {edge.get("source") for edge in region_edges}
         needed.update(edge.get("target") for edge in region_edges)
@@ -635,8 +667,8 @@ class Analysis:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import (
-            ensure_native_match_sidecar, ensure_native_semantic_sidecar,
-            load_native_temporal, native_match_any_capped,
+            drop_capped_functions, ensure_native_match_sidecar,
+            ensure_native_semantic_sidecar, load_native_temporal,
         )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
@@ -655,11 +687,6 @@ class Analysis:
         # content-addressed sidecar.
         match_sidecar = ensure_native_match_sidecar(
             native_sidecar, summary.get("catalog_path"))
-        converged = not native_match_any_capped(match_sidecar)
-        stamped["semantic_graph"] = {
-            "native_sidecar": str(native_sidecar),
-            "coverage": {"converged": converged},
-        }
         # The Rust matcher has already related the temporal events (a free reached
         # twice, a use of a freed object on a reachable path) into correlated
         # findings; the analyze pass surfaces them as leads. Publish the same
@@ -668,8 +695,53 @@ class Analysis:
         # dereference. This reads only the compact fields (pattern/node/line/path)
         # from the content-addressed match sidecar -- the witness bytes that
         # dominate it are never materialized here.
-        stamped["native_temporal"] = load_native_temporal(match_sidecar)
-        return stamped, summary, converged
+        temporal = load_native_temporal(match_sidecar)
+        # Cap-truncation is per function, so treat it per function -- not as one
+        # graph-wide veto. A function is ``capped`` when its skeleton was
+        # truncated (state budget exhausted or partial), which makes only *that*
+        # function's findings unsound: a balancing free may lie past the cut, so
+        # a reported leak/UAF there could be spurious. Drop exactly those
+        # functions' findings (honest under-coverage, surfaced as
+        # ``truncated_functions``) and keep every converged function's confirmed
+        # findings. The previous behavior -- one capped function forcing the
+        # caller to discard the entire ``native_temporal`` bind -- silently
+        # zeroed the confirmed census of an otherwise-clean graph the moment it
+        # contained a single large function.
+        capped_functions = drop_capped_functions(temporal)
+        converged = not capped_functions
+        stamped["semantic_graph"] = {
+            "native_sidecar": str(native_sidecar),
+            "coverage": {
+                "converged": converged,
+                "truncated_functions": capped_functions,
+            },
+        }
+        # The match sidecar carries each finding's enclosing declaration id but no
+        # file: that lives only in the Pass-1 structural store, which the census
+        # graph dict does not include. Resolve declaration id -> file:line here,
+        # where the store is in hand, so a confirmed double-free/UAF lead is
+        # locatable rather than carrying ``file: None``. Purely additive to the
+        # bind: navigation facts for a lead already emitted, never a verdict.
+        locations: dict[str, dict] = {}
+        for function in temporal.get("functions", ()):
+            for finding in function.get("findings", ()):
+                decl = finding.get("function")
+                if not decl or decl in locations:
+                    continue
+                node = self.store.node(decl)
+                props = (node or {}).get("properties") or {}
+                file = props.get("absolute_file") or props.get("file")
+                if file or props.get("start_line") is not None:
+                    locations[decl] = {"file": file, "line": props.get("start_line")}
+        if locations:
+            temporal["locations"] = locations
+        stamped["native_temporal"] = temporal
+        # Temporal was evaluated across the whole graph. Per-function cap
+        # truncation is reported in ``coverage.truncated_functions`` and the
+        # affected functions' findings were already dropped above; it is no
+        # longer a completeness veto, so the (filtered, deterministic) bind is
+        # always safe to cache and return.
+        return stamped, summary, True
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 
@@ -975,12 +1047,20 @@ class Analysis:
     @staticmethod
     def _guard_view(inferences: dict) -> dict:
         """The guard the enclosing function places over the sink -- read straight from the
-        registry's condition inference, so ``none-observed`` stays ``none-observed`` and never
-        quietly reads as safe."""
+        registry's inferences. A guard may be a branch *condition* that names the argument
+        (``conditions``) or a validation-shaped *call* the argument passes through
+        (``guard_calls``, e.g. ``validate_redirect_uri``); either one counts as observed.
+        Absent both it stays ``none-observed`` and never quietly reads as safe. Presence is
+        neutral throughout -- a place worth reading, never a verdict that the sink is safe."""
         conditions = inferences.get("conditions") or {}
-        return {"status": conditions.get("status"),
+        guard_calls = inferences.get("guard_calls") or {}
+        statuses = (conditions.get("status"), guard_calls.get("status"))
+        status = "observed" if "observed" in statuses else (
+            conditions.get("status") or guard_calls.get("status"))
+        return {"status": status,
                 "dominance": conditions.get("dominance"),
-                "referencing_conditions": conditions.get("referencing_conditions")}
+                "referencing_conditions": conditions.get("referencing_conditions"),
+                "validation_calls": guard_calls.get("validation_calls")}
 
     def _provenance(self, sink_value: str | None, limit: int) -> dict:
         """The bounded reverse value-flow cone into the sink.

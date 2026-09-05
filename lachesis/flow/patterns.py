@@ -146,6 +146,7 @@ KIND_EVALUATOR = {
     "ssrf":               "reachability",
     "template-injection": "reachability",
     "deserialization":    "reachability",
+    "unsafe-reflection":  "reachability",
     "format-string":      "reachability",
     "xxe":                "reachability",
     "open-redirect":      "reachability",

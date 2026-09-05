@@ -577,7 +577,24 @@ fn match_function(
                 uninitialized.remove(object);
                 escaped.remove(object);
                 realloc_lost.remove(object);
-                origins.insert(object);
+                // A `return-may-null` origin is the fallback heuristic for an
+                // uncatalogued pointer-returning call (fopen, opendir, popen,
+                // SSL_new, a borrowed getter): we do not KNOW it returns an
+                // owned allocation, and its companion releaser (fclose, ...) is
+                // likewise uncatalogued, so it must not seed a leak obligation
+                // -- doing so flags every such value as leaked at exit even
+                // when it is released through its uncatalogued companion. The
+                // object still entered `nullable` above, so null-deref /
+                // unchecked-return-deref / use-after-free stay live for it;
+                // only confidently-owned origins (catalogued `Kind::Alloc`:
+                // malloc/calloc/strdup..., access "deref"; and taint `source`
+                // clobbers) reach the leak scan over `origins`. A resolved
+                // allocator wrapper is unaffected: it takes prepare.rs's
+                // summary path, emitting a real `Alloc` effect, not this
+                // heuristic.
+                if node.access != "return-may-null" {
+                    origins.insert(object);
+                }
             },
             "RELEASE" | "memory.free" => if let Some(object) = object_id {
                 // A release through a slot proven to contain null is a no-op.

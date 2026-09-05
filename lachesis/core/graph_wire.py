@@ -51,7 +51,18 @@ def _value(value: Any) -> graph_pb2.Value:
     elif isinstance(value, bytes):
         result.binary = value
     elif isinstance(value, str):
-        result.text = value
+        try:
+            result.text = value
+        except (UnicodeEncodeError, ValueError):
+            # A proto ``string`` field requires valid UTF-8, but a source file
+            # can legally hold a string literal with an unpaired UTF-16
+            # surrogate (a common malformed-unicode test fixture); the parser
+            # hands it to us as a ``str`` carrying that code point, and a raw
+            # assignment raises UnicodeEncodeError and aborts the whole build.
+            # Scrub only the offending code points at the wire boundary and
+            # keep the rest of the literal intact -- one bad char must not lose
+            # the file, or the repo.
+            result.text = value.encode("utf-8", "replace").decode("utf-8")
     elif isinstance(value, (list, tuple)):
         result.list.values.extend((_value(item) for item in value))
         result.list.SetInParent()
@@ -363,6 +374,70 @@ def read_dataflow_stream(path: Path) -> dict[str, Any]:
                 raise ValueError(f"unknown dataflow stream record {kind!r}")
     # The stream is written in deterministic overlay order.  Restore the same
     # canonical view ordering used by the legacy monolithic sidecar on load.
+    result["derived_nodes"].sort(key=lambda node: node["id"])
+    result["derived_edges"].sort(key=lambda edge: (
+        edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
+    ))
+    return result
+
+
+def read_dataflow_branch_substrate(path: Path, *, node_kinds, edge_kinds) -> dict[str, Any]:
+    """Stream a dataflow sidecar and keep only its control-flow branch substrate.
+
+    ``read_dataflow_stream`` retains every derived record -- the whole value-flow
+    overlay, ~1 GB on a large graph. The guard adjudicator needs only a tiny slice of
+    it: the derived nodes in ``node_kinds`` (the cfg-condition nodes it keys guards
+    on) and the derived edges in ``edge_kinds`` (the branch-region edges the
+    control-flow overlay re-sources from them). This scans the sidecar frame by frame
+    and keeps just those, so peak memory is proportional to the program's control
+    structure, never its size. The return shape matches ``read_dataflow_stream`` so
+    ``Overlay.from_dict`` builds an attachable overlay from it.
+
+    Decoding every record to test its kind costs one streaming pass -- the same CPU a
+    retaining load pays -- but, unlike that load, nothing but the branch slice stays
+    resident, which is the whole point on the ``retain_materialized=False`` path.
+    """
+    node_kinds = frozenset(node_kinds)
+    edge_kinds = frozenset(edge_kinds)
+    with path.open("rb") as handle:
+        if handle.read(len(DATAFLOW_STREAM_MAGIC)) != DATAFLOW_STREAM_MAGIC:
+            raise ValueError(f"not a dataflow stream: {path}")
+        header = handle.read(FRAME.size)
+        if len(header) != FRAME.size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        (size,) = FRAME.unpack(header)
+        payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        message = graph_pb2.DataflowOverlay()
+        message.ParseFromString(payload)
+        result = {
+            "overlay_id": message.overlay_id, "source": message.source,
+            "version": message.version, "core_content_hash": message.core_content_hash,
+            "node_props": {}, "edge_props": {},
+            "derived_nodes": [], "derived_edges": [],
+        }
+        while True:
+            header = handle.read(FRAME.size)
+            if not header:
+                break
+            if len(header) != FRAME.size:
+                raise ValueError(f"truncated dataflow stream frame header: {path}")
+            (size,) = FRAME.unpack(header)
+            frame = handle.read(size)
+            if len(frame) != size or not frame:
+                raise ValueError(f"truncated dataflow stream frame: {path}")
+            kind, record = frame[:1], frame[1:]
+            if kind == b"N":
+                node = decode_node(record)
+                if node.get("kind") in node_kinds:
+                    result["derived_nodes"].append(node)
+            elif kind == b"E":
+                edge = decode_edge(record)
+                if edge.get("kind") in edge_kinds:
+                    result["derived_edges"].append(edge)
+            else:
+                raise ValueError(f"unknown dataflow stream record {kind!r}")
     result["derived_nodes"].sort(key=lambda node: node["id"])
     result["derived_edges"].sort(key=lambda edge: (
         edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",

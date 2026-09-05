@@ -205,12 +205,31 @@ def command_plan(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- scan
 
 def command_scan(args: argparse.Namespace) -> int:
+    from lachesis.cli.source import resolve_source
+
+    # A source may be a local path or a remote git URL (optionally ``url#subdir``
+    # to scan one subtree of a monorepo). resolve_source fetches a URL into a
+    # managed temp clone and returns a cleanup hook; a local path resolves in
+    # place with a no-op cleanup. The analysis below only ever sees a local dir,
+    # and cleanup runs on every exit path (findings, error, or exception).
+    note = None if args.quiet else (lambda m: _stderr(f"  {m}"))
+    try:
+        resolved = resolve_source(args.path, note=note)
+    except (RuntimeError, ValueError) as error:
+        _stderr(f"lachesis: could not fetch source: {error}")
+        return EXIT_USAGE
+    try:
+        return _scan_source(args, resolved.path)
+    finally:
+        resolved.cleanup()
+
+
+def _scan_source(args: argparse.Namespace, source: Path) -> int:
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
                                       ensure_graph)
     from lachesis.cli.progress import Progress
     from lachesis.planner.cli import _census_line, _render
 
-    source = _resolved(args.path)
     # Progress narrates to stderr; with --json stdout has to stay a clean document, and
     # with --quiet the caller has said they want neither.
     progress = Progress(enabled=not args.quiet)
@@ -379,6 +398,8 @@ def command_trace(args: argparse.Namespace) -> int:
             source_dir=str(source),
             per_family=args.per_family,
             max_flows=args.max_flows,
+            schema_version=args.schema_version,
+            source_url_template=args.source_url_template,
         )
     except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
         _stderr(f"lachesis trace: {error}")
@@ -390,8 +411,9 @@ def command_trace(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))
     graph = bundle["graph"]
+    findings = bundle.get("findings") or (bundle.get("security") or {}).get("findings") or []
     _stderr(f"wrote {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
-            f"{len(bundle['findings'])} findings -> {out}")
+            f"{len(findings)} findings -> {out}")
     return EXIT_OK
 
 
@@ -771,8 +793,18 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subcommands.add_parser(
         "scan", help="report what an attacker could reach in a codebase",
         description="Index the tree if needed, then rank the reachable sensitive "
-                    "effects that no recognised guard covers.")
+                    "effects that no recognised guard covers. The source may be a "
+                    "local path or a git URL (https://…, git@…, ….git), optionally "
+                    "with a #subdir fragment to scan one subtree of a monorepo; a "
+                    "URL is shallow-cloned to a temp dir and removed when done.")
     _add_source_flags(scan)
+    # scan additionally accepts a remote URL in the same positional slot; the
+    # other source commands stay local-only, so override just scan's help here.
+    for _action in scan._actions:
+        if _action.dest == "path":
+            _action.help = ("directory or git URL to analyse (default: the current "
+                            "directory); append #subdir to scan one subtree of a repo")
+            break
     scan.add_argument("--limit", type=_nonnegative_int, default=20, metavar="N",
                       help="how many findings to print (0 = all, default 20)")
     scan.add_argument("--min-rank", type=_rank, default=0.0, metavar="R",
@@ -932,6 +964,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="override the repo slug recorded in bundle meta")
     trace.add_argument("--commit", metavar="SHA", help="override the commit in meta")
     trace.add_argument("--lang", metavar="LANG", help="override the language in meta")
+    trace.add_argument("--schema-version", choices=("1.0", "2.0"), default="2.0",
+                       help="Explorer bundle contract to emit (default: 2.0 graph-first)")
+    trace.add_argument("--source-url-template", metavar="URL_TEMPLATE",
+                       help="explicit HTTP(S) source template using {file}, {line}, {end_line}, {revision}")
     trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
                        help="max leads to draw from each sink family (default: 6)")
     trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",
