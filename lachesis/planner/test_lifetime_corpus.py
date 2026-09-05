@@ -3,7 +3,8 @@
 This is the integration counterpart to :mod:`test_temporal_native` (which drives
 the census with synthetic binds).  Here the real reader runs: the C fixtures in
 ``native/lifetime_kernel/corpus`` are compiled into a graph, the temporal census
-runs, and every COMPLETE lifetime finding is checked against the manifest in
+runs, and every lifetime detection -- a COMPLETE verdict or a PARTIAL lead on a
+real violation -- is checked against the manifest in
 ``native/lifetime_kernel/run_corpus.py`` -- positive controls must raise their
 one target family and negative controls must raise nothing.
 
