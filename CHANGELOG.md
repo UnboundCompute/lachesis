@@ -7,6 +7,43 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.5.1]
+
+Explorer-bundle comprehension release. The graph-first 2.0 Explorer bundle already
+carried nodes, edges, value paths and the security envelope, but nothing that let a
+reader who does not know the repository *start reading* it. This release adds that
+comprehension layer, projected entirely from the same loaded store the rest of the
+export uses, so every id it emits resolves to a real node it also includes. Version
+and metadata only otherwise: no engine, schema-store, or query behavior changes, and
+schema 1.0 bundle output is byte-for-byte unchanged.
+
+### Added
+
+- **Comprehension-first 2.0 Explorer bundle.** `graph.entrypoints` are derived from
+  the entrypoint-anchoring recognitions (route / callback / exported-entry), each
+  gated to a node with a real file and line so it is actually openable. For each
+  entry, `paths.requests` renders a guided walk down the real `CALLS` chain out of
+  the handler — every consecutive hop pair is a genuine edge, with stable hop ids,
+  edge labels, and explicit `source_node`/`sink_node` endpoints. Every featured node
+  carries real source (`end_line`, dotted `module`, `qualified_name`, and a bounded,
+  highlighted `source_window`), edges are promoted to first-class objects (stable id,
+  canonical kind plus a relation alias, confidence, dynamic flag, limitations),
+  `graph.modules` partition every file-bearing node by its file so no node lands in
+  two modules, and `graph.coverage` states included vs indexed node counts exactly.
+  `meta` gains `description` and `generated_at`. The projection degrades to a bare
+  graph on any failure, so the security bundle always stands.
+- **`trace --description TEXT`** records a one-line projection description in bundle
+  `meta` (2.0).
+- **`meta.loc`/`meta.lines`** are now populated from the loaded graph's files (a
+  cached read shared with the source windows, no extra pass), kept distinct from
+  `indexed_nodes`; an unreadable file contributes 0 rather than a guess.
+
+### Fixed
+
+- Snippet lookup and entrypoint enrichment silently degraded because the bundle
+  builder called a context accessor that did not exist; corrected so real snippets
+  and the comprehension surface populate.
+
 ## [0.5.0]
 
 Scale-and-lifetime release. Two engine capabilities headline it: the build now
