@@ -400,6 +400,7 @@ def command_trace(args: argparse.Namespace) -> int:
             max_flows=args.max_flows,
             schema_version=args.schema_version,
             source_url_template=args.source_url_template,
+            description=args.description,
         )
     except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
         _stderr(f"lachesis trace: {error}")
@@ -968,6 +969,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Explorer bundle contract to emit (default: 2.0 graph-first)")
     trace.add_argument("--source-url-template", metavar="URL_TEMPLATE",
                        help="explicit HTTP(S) source template using {file}, {line}, {end_line}, {revision}")
+    trace.add_argument("--description", metavar="TEXT",
+                       help="one-line projection description recorded in bundle meta (2.0)")
     trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
                        help="max leads to draw from each sink family (default: 6)")
     trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",
