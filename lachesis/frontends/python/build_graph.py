@@ -279,6 +279,25 @@ def analyze(source_dir: Path, roots: Optional[Sequence[str]] = None) -> Analysis
     # Pass two: everything that needs the whole tree. Module names come from the
     # directory layout only, never from the running interpreter's sys.path.
     index = ModuleIndex(sorted(facts_by_path), source_dir)
+    # Stamp a path-independent cross-shard key on module-level function definitions.
+    # ``usr = py:<dotted module>.<name>`` is derived from the __init__.py-anchored
+    # module layout alone (ModuleIndex.dotted_of), so an independently built shard
+    # computes the identical key for the same function -- the join the query-time
+    # federation linker uses to redirect a sibling shard's unresolved-import
+    # reference (BodyWalk._external_call_ref emits the matching placeholder) to this
+    # definition. Only a name uniquely bound at module level is stamped: a rebound
+    # name has no single definition that can own the key. This is a property
+    # annotation only -- node ids and edge triples are untouched, so
+    # graph_content_hash and every whole-tree content digest are unchanged.
+    for path in sorted(facts_by_path):
+        facts = facts_by_path[path]
+        dotted = index.dotted_of.get(path)
+        if not dotted:
+            continue
+        fn_ids = set(facts.function_ids)
+        for name, ids in facts.module_bindings.items():
+            if len(ids) == 1 and ids[0] in fn_ids:
+                graph.annotate(ids[0], usr=f"py:{dotted}.{name}")
     import_count = 0
     for path in sorted(facts_by_path):
         import_count += emit_imports(

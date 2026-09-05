@@ -113,6 +113,103 @@ def test_cross_shard_usr_join_resolves_to_definition(tmp_path):
         fed.close()
 
 
+def _assert_cross_shard_resolves(manifest, *, callee_name="target_fn",
+                                 caller_name="caller", def_shard="shard-0000",
+                                 ref_shard="shard-0001"):
+    """Shared cross-shard assertions: a call in the referencing shard resolves to the
+    real definition in the defining shard, and the reverse (callers of the def) sees it.
+
+    Frontends emit many nodes per name (e.g. TS identifier/definition/function/symbol),
+    so we filter to ``kind == "function"`` before picking the caller.
+    """
+    index = SymbolIndex.build(manifest)
+    assert index.stats()["cross_shard_symbols"] >= 1
+
+    fed = FederatedStore(manifest, symbol_index=index)
+    try:
+        callers = [c for c in fed.search(caller_name)
+                   if c.node.get("kind") == "function"]
+        assert callers, f"{caller_name} function should be found"
+        caller = callers[0]
+        assert caller.shard_id == ref_shard
+
+        callees = fed.callees(caller.shard_id, caller.node["id"])
+        resolved = [c for c in callees
+                    if (c.node.get("name") or c.node.get("label")) == callee_name]
+        assert resolved, f"{callee_name} callee must resolve cross-shard"
+        owner = resolved[0]
+        assert owner.shard_id == def_shard, \
+            f"expected definition shard {def_shard}, got {owner.shard_id}"
+        assert not (owner.node.get("properties") or {}).get("declaration_only"), \
+            "cross-shard callee must land on the definition, not the placeholder"
+
+        callers_of_def = fed.callers(owner.shard_id, owner.node["id"])
+        caller_names = {(c.shard_id, c.node.get("name") or c.node.get("label"))
+                        for c in callers_of_def}
+        assert (ref_shard, caller_name) in caller_names, caller_names
+    finally:
+        fed.close()
+
+
+def _write_python_cross_shard_fixture(root: Path) -> None:
+    # shard1 is a package DEFINING target_fn; shard2 imports it absolutely and calls it.
+    (root / "shard1").mkdir(parents=True)
+    (root / "shard2").mkdir(parents=True)
+    (root / "shard1" / "__init__.py").write_text("")
+    (root / "shard1" / "lib.py").write_text("def target_fn(n):\n    return n * 2\n")
+    (root / "shard2" / "__init__.py").write_text("")
+    (root / "shard2" / "use.py").write_text(
+        "from shard1.lib import target_fn\n"
+        "def caller(k):\n    return target_fn(k)\n"
+    )
+
+
+def test_cross_shard_usr_join_python(tmp_path):
+    _lachesis_bin_or_skip = _lachesis_bin()
+    src = tmp_path / "src"
+    _write_python_cross_shard_fixture(src)
+    plan = [("shard-0000", ["shard1"]), ("shard-0001", ["shard2"])]
+    manifest = build_shards(src, tmp_path / "fed", plan,
+                            memory_budget_mb=2048, lachesis_bin=_lachesis_bin_or_skip)
+    assert len(manifest.shards) == 2
+    _assert_cross_shard_resolves(manifest)
+
+
+def _write_ts_cross_shard_fixture(root: Path, ext: str) -> None:
+    # shard1 exports target_fn; shard2 imports it via a relative specifier and calls it.
+    (root / "shard1").mkdir(parents=True)
+    (root / "shard2").mkdir(parents=True)
+    (root / "shard1" / f"lib.{ext}").write_text(
+        "export function target_fn(n) { return n * 2; }\n"
+    )
+    (root / "shard2" / f"use.{ext}").write_text(
+        "import { target_fn } from '../shard1/lib';\n"
+        "export function caller(k) { return target_fn(k); }\n"
+    )
+
+
+def test_cross_shard_usr_join_typescript(tmp_path):
+    binary = _lachesis_bin()
+    src = tmp_path / "src"
+    _write_ts_cross_shard_fixture(src, "ts")
+    plan = [("shard-0000", ["shard1"]), ("shard-0001", ["shard2"])]
+    manifest = build_shards(src, tmp_path / "fed", plan,
+                            memory_budget_mb=2048, lachesis_bin=binary)
+    assert len(manifest.shards) == 2
+    _assert_cross_shard_resolves(manifest)
+
+
+def test_cross_shard_usr_join_javascript(tmp_path):
+    binary = _lachesis_bin()
+    src = tmp_path / "src"
+    _write_ts_cross_shard_fixture(src, "js")
+    plan = [("shard-0000", ["shard1"]), ("shard-0001", ["shard2"])]
+    manifest = build_shards(src, tmp_path / "fed", plan,
+                            memory_budget_mb=2048, lachesis_bin=binary)
+    assert len(manifest.shards) == 2
+    _assert_cross_shard_resolves(manifest)
+
+
 def test_symbol_index_prefers_definition_over_declaration():
     # Pure-logic check of the canonicalization rule (no build needed): a definition
     # wins over a declaration for the same (kind, usr), mirroring ShardMerger.
