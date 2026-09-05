@@ -321,6 +321,10 @@ class SymbolIndex:
     def resolve(self, kind: str, usr: str) -> Optional[SymbolSite]:
         return self._canonical.get((kind, usr))
 
+    def sites_for(self, kind: str, usr: str) -> list[SymbolSite]:
+        """Every site (definitions and declarations) of a symbol, across all shards."""
+        return list(self._sites.get((kind, usr), ()))
+
     def owner_of(self, kind: str, usr: str) -> Optional[tuple[str, str]]:
         site = self.resolve(kind, usr)
         return (site.shard_id, site.node_id) if site else None
@@ -426,6 +430,42 @@ class FederatedStore:
             if key not in seen:
                 seen.add(key)
                 out.append(resolved)
+        return out
+
+    def callers(self, shard_id: str, node_id: str) -> list[FederatedNode]:
+        """Callers of a function across shards.
+
+        A function's callers are its callers within its own shard plus, when it is a
+        definition, the callers of every ``extern`` declaration of the same USR in
+        other shards -- those call the symbol through a local prototype that resolves
+        here. This is the reverse of the forward linker hop: forward redirects a
+        reference to its definition; reverse gathers the references back to it.
+        """
+        from lachesis.nav.graphlib import CALL_EDGE_KINDS
+
+        gl = self._graphstore(shard_id).gl
+        node = gl.nodes.get(node_id)
+        out: list[FederatedNode] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(sid: str, caller: dict) -> None:
+            key = (sid, caller["id"])
+            if key not in seen:
+                seen.add(key)
+                out.append(FederatedNode(sid, caller))
+
+        for src in gl.index.sources(node_id, *CALL_EDGE_KINDS):
+            _add(shard_id, src)
+
+        props = (node or {}).get("properties") or {}
+        usr = props.get("usr")
+        if usr and not props.get("declaration_only"):
+            for site in self.symbol_index.sites_for(node.get("kind", ""), usr):
+                if not site.declaration_only:
+                    continue
+                other = self._graphstore(site.shard_id).gl
+                for src in other.index.sources(site.node_id, *CALL_EDGE_KINDS):
+                    _add(site.shard_id, src)
         return out
 
     def close(self) -> None:

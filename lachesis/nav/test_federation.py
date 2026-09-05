@@ -102,6 +102,13 @@ def test_cross_shard_usr_join_resolves_to_definition(tmp_path):
         assert owner.shard_id == "shard-0000", f"expected definition shard, got {owner.shard_id}"
         assert not (owner.node.get("properties") or {}).get("declaration_only"), \
             "cross-shard callee must land on the definition, not the extern declaration"
+
+        # Reverse direction: callers of the DEFINITION must include the cross-shard
+        # caller that reaches it through its extern prototype in the other shard.
+        callers_of_def = fed.callers(owner.shard_id, owner.node["id"])
+        caller_names = {(c.shard_id, c.node.get("name") or c.node.get("label"))
+                        for c in callers_of_def}
+        assert ("shard-0001", "caller") in caller_names, caller_names
     finally:
         fed.close()
 
