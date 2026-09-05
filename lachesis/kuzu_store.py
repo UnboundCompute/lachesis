@@ -229,6 +229,19 @@ def _kuzu_checkpoint_threshold(default: int = -1) -> int:
     return value
 
 
+def _kuzu_db_kwargs() -> dict:
+    """Optional ``max_db_size`` kwarg for a ``kuzu.Database`` open.
+
+    Kùzu reserves the store's address space by mmap-ing a sparse file at an 8 TiB
+    default; a constrained host (a CI runner in a VM/container) can fail that mmap
+    regardless of overcommit.  ``resources.kuzu_max_db_size()`` returns a lower
+    reservation when ``LACHESIS_KUZU_MAX_DB_SIZE`` is set and ``None`` otherwise,
+    so an unset run keeps Kùzu's default and its graph is byte-identical.
+    """
+    size = resources.kuzu_max_db_size()
+    return {"max_db_size": size} if size is not None else {}
+
+
 def _stream_batch_rows(default: int = 2_000) -> int:
     """Bound the number of records handed to each streamed Arrow batch.
 
@@ -1001,6 +1014,7 @@ def write_kuzu_graph(
             _kuzu_checkpoint_threshold()
             if checkpoint_threshold is None else checkpoint_threshold
         ),
+        **_kuzu_db_kwargs(),
     )
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())
@@ -2014,6 +2028,7 @@ def write_kuzu_shards(shard_reader, db_dir: str, snapshots=None, *, prune: bool 
     db = kuzu.Database(
         db_file(db_dir), buffer_pool_size=_kuzu_buffer_pool_size(512 << 20),
         checkpoint_threshold=_kuzu_checkpoint_threshold(256 << 20),
+        **_kuzu_db_kwargs(),
     )
     conn = kuzu.Connection(db)
     conn.execute(_node_ddl())

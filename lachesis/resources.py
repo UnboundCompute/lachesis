@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Optional
 
 
 DEFAULT_MEMORY_BUDGET_MB = 5120
@@ -124,6 +125,37 @@ def kuzu_buffer_pool_bytes() -> int:
         return value
     derived = memory_budget_mb() * 4 // 10
     return max(256, derived) << 20
+
+
+def kuzu_max_db_size() -> Optional[int]:
+    """Return an override for Kùzu's maximum on-disk database size, or ``None``.
+
+    Kùzu reserves its store's address space by ``mmap``-ing a sparse file at a
+    fixed maximum size (8 TiB by default) when the database is opened; the file
+    stays sparse, so this costs no physical memory and never limits a real graph.
+    Some constrained hosts -- notably CI runners inside a VM/container -- cannot
+    satisfy an ``mmap`` of that span regardless of overcommit settings, and the
+    open fails with ``Mmap for size 8796093022208 failed`` before a single row is
+    written. ``LACHESIS_KUZU_MAX_DB_SIZE`` (an explicit byte count, which Kùzu
+    requires to be a power of two) lowers the reservation to a size the host can
+    map. It is a reservation ceiling, not a correctness input: any value that
+    exceeds the store's actual footprint yields a byte-identical graph, so this
+    changes nothing for a run that never sets it.
+
+    Unset returns ``None`` so the open keeps Kùzu's own default -- production
+    behaviour is unchanged unless the env is deliberately provided.
+    """
+    raw = os.environ.get("LACHESIS_KUZU_MAX_DB_SIZE", "")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "LACHESIS_KUZU_MAX_DB_SIZE must be an integer byte count") from error
+    if value <= 0:
+        raise ValueError("LACHESIS_KUZU_MAX_DB_SIZE must be positive")
+    return value
 
 
 def defer_translation_facts(substrate_bytes: int) -> bool:

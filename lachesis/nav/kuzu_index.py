@@ -670,8 +670,15 @@ class KuzuGraphIndex:
         # candidate counts unchanged, ~568 MB off resident on a 1.76M-node store).
         _bps_env = os.environ.get("LACHESIS_KUZU_BPS")
         _bps = int(_bps_env) if _bps_env else _DEFAULT_NAV_BUFFER_POOL
+        # Kùzu reserves the store's address space by mmap-ing a sparse file at an
+        # 8 TiB default when the database opens; a constrained host (a CI runner in
+        # a VM/container) can fail that mmap regardless of overcommit. The env, when
+        # set, lowers the reservation to a mappable size -- a sparse ceiling, so the
+        # served rows are byte-identical. Unset keeps Kùzu's default.
+        _max_db_env = os.environ.get("LACHESIS_KUZU_MAX_DB_SIZE")
+        _db_kwargs = {"max_db_size": int(_max_db_env)} if _max_db_env else {}
         self._db = kuzu.Database(
-            db_file(db_dir), read_only=True, buffer_pool_size=_bps)
+            db_file(db_dir), read_only=True, buffer_pool_size=_bps, **_db_kwargs)
         # The pool is always bounded now, so the open-scan must be *paged*: a single
         # `MATCH (n:Node)` materializes its whole result in the pool (O(nodes)) and
         # overflows the ceiling with "buffer pool is full". `_build_maps` instead walks
