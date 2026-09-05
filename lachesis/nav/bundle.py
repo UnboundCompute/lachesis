@@ -695,21 +695,36 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
             node = gl.nodes.get(hub_id)
             if node is None:
                 continue
+            hub_file, hub_line, _ = gl.loc(node)
+            if (not hub_file or not isinstance(hub_line, int) or hub_line <= 0
+                    or re.search(r"(?:^|/)(?:tests?|examples?|fixtures?|benchmarks?|docs?)(?:/|$)",
+                                 str(hub_file), re.IGNORECASE)):
+                continue
             chain = _call_chain(index, gl, hub_id, 4)
-            for nid in chain:
-                if len(core_ids) >= 32:
+            chain_nodes = [gl.nodes.get(nid) for nid in chain]
+            # Do not remove a middle hop and then connect its neighbors: that
+            # would turn a real multi-hop walk into an invented relationship.
+            if any(
+                cnode is None
+                or not gl.loc(cnode)[0]
+                or not isinstance(gl.loc(cnode)[1], int)
+                or gl.loc(cnode)[1] <= 0
+                or re.search(r"(?:^|/)(?:tests?|examples?|fixtures?|benchmarks?|docs?)(?:/|$)",
+                             str(gl.loc(cnode)[0]), re.IGNORECASE)
+                for cnode in chain_nodes
+            ):
+                chain = [hub_id]
+                chain_nodes = [node]
+            for nid, cnode in zip(chain, chain_nodes):
+                if len(core_ids) >= 32 or cnode is None:
                     break
-                cnode = gl.nodes.get(nid)
-                if cnode is None:
-                    continue
                 asm.add_node(_norm_node(gl, cnode), default_kind="function")
                 core_ids.add(nid)
             for a, b in zip(chain, chain[1:]):
                 asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, set(asm.nodes))
             if hub_id in core_ids:
-                file, line, _ = gl.loc(node)
                 core.append({"node_id": hub_id, "label": gl.label(node),
-                             "file": file, "line": line,
+                             "file": hub_file, "line": hub_line,
                              "degree": int(hub.get("degree") or 0)})
     except Exception:
         core = []
