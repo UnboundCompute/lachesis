@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Tag matches pyproject version and has a changelog entry
@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -100,7 +100,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - uses: actions/setup-node@v4
@@ -153,7 +153,7 @@ jobs:
             echo "refusing to publish a platform-agnostic wheel:" dist/*-none-any.whl
             exit 1
           fi
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Check metadata on every distribution
