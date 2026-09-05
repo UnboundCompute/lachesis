@@ -567,7 +567,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     never raises: a graph the comprehension layer cannot walk simply reads as a bare
     graph rather than failing the whole export.
     """
-    empty = {"entrypoints": [], "requests": [], "files": [], "modules": []}
+    empty = {"entrypoints": [], "requests": [], "files": [], "modules": [], "concepts": []}
     try:
         from lachesis.planner.entrypoints import EntryPoints, _anchor_strength
         ctx = M.ctx()
@@ -660,10 +660,32 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         files = []
 
+    concepts: list[dict] = []
+    try:
+        architecture = comp.architecture_map(max_communities=8, max_files_per_community=20)
+        for index, community in enumerate(architecture.get("communities") or []):
+            paths = [str(path) for path in community.get("files") or [] if path]
+            if not paths:
+                continue
+            first = paths[0]
+            directory = first.rsplit("/", 1)[0] if "/" in first else first
+            if directory.startswith("src/"):
+                directory = directory[4:]
+            label = directory.replace("/", " · ") or first
+            concepts.append({
+                "id": f"concept.{_slug(community.get('id') or index)}",
+                "label": label,
+                "description": f"Connected code area spanning {len(paths)} file(s).",
+                "file_paths": paths,
+            })
+    except Exception:
+        concepts = []
+
     # Modules are not built here: they must partition the *final* included node
     # pool (one unambiguous module per node, keyed by that node's file), which is
     # only settled after candidate/capsule/entry nodes are all in and relativized.
-    return {"entrypoints": entrypoints, "requests": requests, "files": files}
+    return {"entrypoints": entrypoints, "requests": requests, "files": files,
+            "concepts": concepts}
 
 
 # ------------------------------------------------------- source / node enrichment
@@ -926,6 +948,24 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
     return modules
 
 
+def _project_concepts(raw_concepts: list[dict], nodes: list[dict]) -> list[dict]:
+    """Keep architecture concepts honest to the final included node pool."""
+    out: list[dict] = []
+    for concept in raw_concepts or []:
+        paths = {str(path) for path in concept.get("file_paths") or [] if path}
+        node_ids = [node["id"] for node in nodes
+                    if isinstance(node.get("file"), str) and node.get("file") in paths]
+        if not node_ids:
+            continue
+        out.append({
+            "id": str(concept.get("id") or f"concept.{len(out)}"),
+            "label": str(concept.get("label") or "Code area"),
+            "description": str(concept.get("description") or "Connected code area."),
+            "node_ids": node_ids[:20],
+        })
+    return out
+
+
 def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
                         lang: Optional[str], indexed_nodes: int,
                         source_url_template: Optional[str] = None,
@@ -976,6 +1016,7 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
                    if e.get("node_id") in node_ids]
     requests = _finalize_requests(comp.get("requests") or [], node_map, edges_by_pair)
     modules = _partition_modules(nodes, entrypoints)
+    concepts = _project_concepts(comp.get("concepts") or [], nodes)
 
     coverage = {
         "scope": "repository-projection",
@@ -1011,6 +1052,7 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
             "edges": edges,
             "files": comp.get("files") or [],
             "modules": modules,
+            "concepts": concepts,
             "entrypoints": entrypoints,
             "coverage": coverage,
         },

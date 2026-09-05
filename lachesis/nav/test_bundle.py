@@ -311,6 +311,8 @@ class ComprehensionProjectionTests(unittest.TestCase):
                           "hops": [{"node_id": "n.a", "caption": "receives"},
                                    {"node_id": "n.b", "caption": "dispatches"}]}],
             "files": [{"id": "f1", "path": "src/flask/app.py"}],
+            "concepts": [{"id": "concept.flask", "label": "flask", "description": "d",
+                           "file_paths": ["src/flask/app.py"]}],
         })
         self.assertEqual(result["meta"]["indexed_nodes"], 500)
         self.assertEqual(result["graph"]["coverage"]["included_nodes"],
@@ -333,6 +335,15 @@ class ComprehensionProjectionTests(unittest.TestCase):
         self.assertEqual(by_path["src/flask/app.py"]["anchor_node_id"], "n.a")
         seen = [nid for m in result["graph"]["modules"] for nid in m["node_ids"]]
         self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(["n.a", "n.b"], result["graph"]["concepts"][0]["node_ids"])
+
+    def test_concept_without_included_nodes_is_dropped(self):
+        result = self._bundle_with({
+            "entrypoints": [], "requests": [],
+            "concepts": [{"id": "concept.missing", "label": "missing",
+                           "file_paths": ["src/other/missing.py"]}],
+        })
+        self.assertEqual([], result["graph"]["concepts"])
 
     def test_request_with_unsourced_hop_is_dropped(self):
         # n.ghost has no source; the guided path must not be emitted.
