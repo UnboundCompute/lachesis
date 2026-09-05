@@ -737,6 +737,40 @@ def _source_window(gl, node: dict) -> Optional[dict]:
     }
 
 
+def _count_source_lines(index, gl) -> int:
+    """Physical source lines across the indexed files, for ``meta.loc``/``lines``.
+
+    Counts each distinct file once. The count is the file's real line count read
+    off disk (via the graph library's cached reader, so it shares reads with the
+    source windows and adds no second pass); when a file cannot be read we fall
+    back to its file-node span end, which the frontends record as the last line.
+    Returns 0 when the graph carries no readable file nodes -- honest, not a guess.
+    """
+    total = 0
+    seen: set[str] = set()
+    for node in index.nodes_of_kind("file"):
+        props = node.get("properties") or {}
+        abs_path = props.get("absolute_file") or props.get("file")
+        key = abs_path or props.get("file")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        count = 0
+        if abs_path:
+            try:
+                text = gl._read_file(abs_path)
+            except Exception:
+                text = None
+            if text:
+                count = len(text.splitlines())
+        if count == 0:
+            end = props.get("end_line")
+            if isinstance(end, int) and end > 0:
+                count = end
+        total += count
+    return total
+
+
 def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
     """Attach comprehension detail (end_line, qualified_name, module, source window).
 
@@ -1065,6 +1099,16 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
     census = _call("candidate_census", {})
     snippet_of = _snippet_lookup(graph_path)
     asm = _Assembler(snippet_of)
+
+    # Line count: derive it from the loaded graph's files when the caller did not
+    # pass one, so meta.loc/lines is a real figure rather than 0. Independent of
+    # indexed_nodes (a node count), which it must never be conflated with.
+    if loc is None:
+        try:
+            _ctx = M.ctx()
+            loc = _count_source_lines(_ctx.store.index, _ctx.store.gl)
+        except Exception:
+            loc = None
 
     manifest_lang = None
     langs = ((census.get("atropos") or {}).get("languages")) or []

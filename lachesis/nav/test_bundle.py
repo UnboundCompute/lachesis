@@ -387,6 +387,35 @@ class ComprehensionHelperTests(unittest.TestCase):
         self.assertTrue(bundle._has_source(
             {"file": "a.py", "line": 3, "source_window": {"lines": ["x"]}}))
 
+    def test_count_source_lines_sums_physical_lines_dedups_and_falls_back(self):
+        # a.py: 3 physical lines read off disk; b.py: unreadable, falls back to
+        # its file-node span end (2); the duplicate a.py node is counted once.
+        files = {
+            "/abs/a.py": "one\ntwo\nthree\n",   # 3 lines
+            "/abs/b.py": None,                    # unreadable -> span fallback
+        }
+
+        class _Node(dict):
+            pass
+
+        def _f(abs_path, end):
+            return {"kind": "file",
+                    "properties": {"absolute_file": abs_path, "file": abs_path,
+                                   "end_line": end}}
+
+        class _Index:
+            def nodes_of_kind(self, *kinds):
+                return [_f("/abs/a.py", 3), _f("/abs/a.py", 3), _f("/abs/b.py", 2)]
+
+        class _GL:
+            def _read_file(self, path):
+                text = files.get(path)
+                if text is None:
+                    raise OSError("nope")
+                return text
+
+        self.assertEqual(bundle._count_source_lines(_Index(), _GL()), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
