@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from lachesis.nav import mcp_server as M
@@ -159,7 +160,7 @@ def _snippet_lookup(graph_path: str):
     fall back to the node label.
     """
     try:
-        ctx = M._get_ctx()
+        ctx = M.ctx()
         idx = ctx.store.index
         from lachesis.nav.graph_store import GraphIndex
     except Exception:
@@ -477,9 +478,425 @@ def _capsule_findings(source_graph_path: str, asm: _Assembler, *,
     return findings
 
 
+# ----------------------------------------------------------- comprehension layer
+#
+# The graph-first 2.0 bundle is a *reading* aid first and a finding envelope second.
+# A developer opening a repository they do not know needs three things the security
+# projection never surfaced: where control legitimately enters (`graph.entrypoints`),
+# a few honest walks *through* the code from those entries (`paths.requests`), and the
+# file/module scaffolding to place any node (`graph.files`, `graph.modules`).
+#
+# Everything here is derived from the same loaded store the rest of the export uses,
+# and everything it references is a real node it also adds to the shared pool, so the
+# graph-first invariant (every id resolves) holds. Nothing is invented: entrypoints
+# come from the public entrypoint-anchoring recognitions (route / callback / exported),
+# a guided path is the real CALLS chain out of an entry, and the modules are the
+# comprehension layer's own call/dependency communities. If any of it cannot be built
+# the whole projection degrades to empty lists -- the security bundle still stands.
+
+_ENTRY_KIND = {
+    "route": "http-handler",
+    "callback-registration": "callback",
+    "object-literal-registration": "callback",
+    "exported-entry": "exported-entry",
+}
+
+
+def _slug(text: str) -> str:
+    """A stable, id-safe slug from a symbol label (never empty)."""
+    keep = [c.lower() if (c.isalnum() or c == ".") else "." for c in str(text or "")]
+    s = "".join(keep).strip(".")
+    while ".." in s:
+        s = s.replace("..", ".")
+    return s or "anon"
+
+
+def _norm_node(gl, node: dict) -> dict:
+    """Project a graph-library node into the flat shape ``_Assembler.add_node`` reads."""
+    file, line = None, None
+    try:
+        loc = gl.loc(node)
+        file, line = loc[0], loc[1]
+    except Exception:
+        pass
+    return {"id": node.get("id"), "name": gl.label(node),
+            "kind": gl.kind(node.get("id")), "file": file, "line": line}
+
+
+def _call_chain(index, gl, start_id: str, depth: int) -> list[str]:
+    """A single deterministic CALLS chain out of ``start_id`` (source order).
+
+    At each hop we descend into the callee that itself calls the most -- the branch
+    most likely to keep telling the request's story -- breaking ties by label so the
+    walk is reproducible. Cycles are cut by the visited set; a leaf ends the chain.
+    This invents no ordering: every consecutive pair is a real ``CALLS`` edge.
+    """
+    chain = [start_id]
+    seen = {start_id}
+    cur = start_id
+    for _ in range(max(0, depth - 1)):
+        nxt: list[dict] = []
+        try:
+            nxt = [n for n in index.targets(cur, "CALLS")
+                   if n.get("id") and n["id"] not in seen]
+        except Exception:
+            break
+        if not nxt:
+            break
+
+        def out_degree(node: dict) -> int:
+            try:
+                return len(index.targets(node["id"], "CALLS"))
+            except Exception:
+                return 0
+
+        pick = min(nxt, key=lambda n: (-out_degree(n), gl.label(n), n["id"]))
+        cur = pick["id"]
+        seen.add(cur)
+        chain.append(cur)
+    return chain
+
+
+def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
+                              chain_depth: int, max_files: int) -> dict:
+    """Entrypoints, guided request paths, files and modules for the 2.0 bundle.
+
+    Adds every node it references (entry handlers and each request hop) to ``asm``
+    and, for each request path, the real ``CALLS`` edges between consecutive hops --
+    so the graph-first validator finds all of them resolvable. Returns empty lists,
+    never raises: a graph the comprehension layer cannot walk simply reads as a bare
+    graph rather than failing the whole export.
+    """
+    empty = {"entrypoints": [], "requests": [], "files": [], "modules": []}
+    try:
+        from lachesis.planner.entrypoints import EntryPoints, _anchor_strength
+        ctx = M.ctx()
+        store, gl, index = ctx.store, ctx.store.gl, ctx.store.index
+        comp = ctx.comprehension
+    except Exception:
+        return empty
+
+    entrypoints: list[dict] = []
+    requests: list[dict] = []
+    try:
+        by_handler = EntryPoints(store).by_handler()
+        # Strongest anchor per handler, then a stable global order over handlers.
+        best = {hid: sorted(rows, key=_anchor_strength)[0]
+                for hid, rows in by_handler.items() if rows}
+        ordered = sorted(best.items(),
+                         key=lambda kv: (_anchor_strength(kv[1]),
+                                         kv[1].get("file") or "", kv[1].get("anchor_label") or "",
+                                         kv[0]))
+        used_ids: set[str] = set()
+        for handler_id, anchor in ordered:
+            if len(entrypoints) >= max_entrypoints:
+                break
+            node = gl.nodes.get(handler_id)
+            if node is None:
+                continue
+            nfile, nline = gl.loc(node)[0], gl.loc(node)[1]
+            # A code-understanding entrypoint must be openable: it needs a real
+            # file and line, or it is not a place a developer can actually begin.
+            if not nfile or not isinstance(nline, int) or nline <= 0:
+                continue
+            asm.add_node(_norm_node(gl, node), default_kind="function")
+            how = anchor.get("how")
+            label = gl.label(node)
+            eid = f"entry.{_slug(label)}"
+            if eid in used_ids:
+                eid = f"{eid}.{_slug(handler_id)}"
+            used_ids.add(eid)
+            try:
+                efile = comp._relative_path(nfile) or anchor.get("file") or nfile
+            except Exception:
+                efile = anchor.get("file") or nfile
+            entrypoints.append({
+                "id": eid,
+                "label": label,
+                "kind": _ENTRY_KIND.get(how, "entrypoint"),
+                "node_id": handler_id,
+                "file": efile,
+                "line": nline,
+            })
+
+            # A guided path is only worth showing when it actually goes somewhere:
+            # the real CALLS chain out of the entry must have more than the entry.
+            chain = _call_chain(index, gl, handler_id, chain_depth)
+            if len(chain) < 2:
+                continue
+            hops = []
+            for nid in chain:
+                cnode = gl.nodes.get(nid)
+                if cnode is None:
+                    continue
+                asm.add_node(_norm_node(gl, cnode), default_kind="function")
+                hops.append({"node_id": nid, "caption": gl.label(cnode)})
+            for a, b in zip(chain, chain[1:]):
+                asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, set(asm.nodes))
+            if len(hops) >= 2:
+                requests.append({
+                    "id": f"request.{_slug(label)}",
+                    "kind": "call-path",
+                    "description": f"Follow control from {label} through "
+                                   f"{len(hops) - 1} call(s).",
+                    "entry_node": handler_id,
+                    "hops": hops,
+                })
+    except Exception:
+        pass
+
+    files: list[dict] = []
+    try:
+        seen_paths: set[str] = set()
+        for node in index.nodes_of_kind("file"):
+            path = comp._relative_path(gl.loc(node)[0] or gl.prop(node, "file"))
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            files.append({"id": node.get("id"), "path": path})
+        files.sort(key=lambda f: f["path"])
+        if len(files) > max_files:
+            files = files[:max_files]
+    except Exception:
+        files = []
+
+    # Modules are not built here: they must partition the *final* included node
+    # pool (one unambiguous module per node, keyed by that node's file), which is
+    # only settled after candidate/capsule/entry nodes are all in and relativized.
+    return {"entrypoints": entrypoints, "requests": requests, "files": files}
+
+
+# ------------------------------------------------------- source / node enrichment
+
+_EDGE_KIND_CANON = {
+    "CALLS": "calls",
+    "VALUE_FLOWS_TO": "flows to",
+    "DYNAMIC_INPUT": "dynamic input",
+    "REACHING_DEF": "reaching def",
+    "ALIAS": "aliases",
+}
+_SOURCE_WINDOW_CONTEXT = 2
+_SOURCE_WINDOW_MAX_LINES = 60
+
+
+def _canon_edge_kind(kind: Optional[str]) -> str:
+    if not kind:
+        return "relates to"
+    return _EDGE_KIND_CANON.get(kind, str(kind).lower().replace("_", " "))
+
+
+def _dotted_module(path: Optional[str]) -> Optional[str]:
+    """A dotted module name from a repo-relative source path (best effort)."""
+    if not isinstance(path, str) or not path:
+        return None
+    p = path.replace("\\", "/")
+    for prefix in ("src/", "lib/", "./"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+    p = p.rsplit(".", 1)[0]  # drop the extension
+    if p.endswith("/__init__"):
+        p = p[: -len("/__init__")]
+    return p.strip("/").replace("/", ".") or None
+
+
+def _source_window(gl, node: dict) -> Optional[dict]:
+    """A small, highlighted source window around a node, read from disk.
+
+    Returns ``{start_line, lines, highlight_start, highlight_end}`` with 1-based
+    highlight offsets into ``lines``, or None when the file or span is unavailable.
+    Bounded to ``_SOURCE_WINDOW_MAX_LINES`` so a huge function body cannot bloat the
+    bundle; the highlight is clamped into whatever window survives that bound.
+    """
+    props = node.get("properties") or {}
+    abs_path = props.get("absolute_file") or props.get("file")
+    start = props.get("start_line")
+    end = props.get("end_line") or start
+    if not abs_path or not isinstance(start, int) or start <= 0:
+        return None
+    try:
+        text = gl._read_file(abs_path)
+    except Exception:
+        text = None
+    if not text:
+        return None
+    lines = text.splitlines()
+    if not lines:
+        return None
+    win_start = max(1, start - _SOURCE_WINDOW_CONTEXT)
+    win_end = min(len(lines), max(start, int(end or start)))
+    if win_end - win_start + 1 > _SOURCE_WINDOW_MAX_LINES:
+        win_end = win_start + _SOURCE_WINDOW_MAX_LINES - 1
+    window = lines[win_start - 1:win_end]
+    if not window:
+        return None
+    return {
+        "start_line": win_start,
+        "lines": window,
+        "highlight_start": start - win_start + 1,
+        "highlight_end": min(int(end or start), win_end) - win_start + 1,
+    }
+
+
+def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
+    """Attach comprehension detail (end_line, qualified_name, module, source window).
+
+    Mutates each bundle node in place from its graph-library twin. A node with no
+    twin (a synthetic value with no declaration) is left as-is -- it simply carries
+    no source, which the featured-path gate then accounts for honestly.
+    """
+    for node in nodes:
+        twin = gl.nodes.get(node.get("id"))
+        if twin is None:
+            continue
+        _file, _start, end_line = gl.loc(twin)
+        if isinstance(end_line, int) and end_line > 0:
+            node["end_line"] = end_line
+        module = _dotted_module(node.get("file"))
+        if module:
+            node["qualified_name"] = f"{module}.{node.get('label')}"
+        try:
+            excerpt = gl.source_excerpt(twin)
+        except Exception:
+            excerpt = ""
+        if excerpt:
+            node["snippet"] = excerpt
+        window = _source_window(gl, twin)
+        if window:
+            node["source_window"] = window
+
+
+def _has_source(node: dict) -> bool:
+    """A node a code-understanding path may feature: openable and with real text."""
+    if not node:
+        return False
+    if not isinstance(node.get("file"), str) or not node["file"].strip():
+        return False
+    line = node.get("line")
+    if not isinstance(line, int) or line <= 0:
+        return False
+    window = node.get("source_window") or {}
+    return bool(window.get("lines") or (node.get("snippet") or "").strip())
+
+
+def _canonical_edges(raw_edges: list[dict], node_ids: set[str]) -> list[dict]:
+    """Raw assembler edges -> first-class explorer edges (kind canonical + relation)."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for e in raw_edges:
+        s, t = e.get("source"), e.get("target")
+        if s not in node_ids or t not in node_ids:
+            continue
+        kind = _canon_edge_kind(e.get("kind"))
+        eid = "edge." + hashlib.sha1(
+            f"{s}\0{t}\0{kind}".encode("utf-8")).hexdigest()[:16]
+        if eid in seen:
+            continue
+        seen.add(eid)
+        dynamic = bool(e.get("dynamic"))
+        limitations = ["target resolved by dynamic dispatch"] if dynamic else []
+        out.append({
+            "id": eid,
+            "source": s,
+            "target": t,
+            "kind": kind,
+            "relation": kind,  # compatibility alias; `kind` is canonical
+            "confidence": "conservative" if dynamic else "high",
+            "dynamic": dynamic,
+            "alias": bool(e.get("alias")),
+            "limitations": limitations,
+        })
+    return out
+
+
+def _edge_label(edges_by_pair: dict, a: str, b: str) -> str:
+    e = edges_by_pair.get((a, b))
+    return e["kind"] if e else "calls"
+
+
+def _finalize_requests(raw_requests: list[dict], node_map: dict,
+                       edges_by_pair: dict) -> list[dict]:
+    """Gate + decorate guided request paths.
+
+    A path survives only when every hop is a source-backed node; then each hop gets
+    a stable id and the label of the edge that reached it, and the path gets the
+    ``source_node``/``sink_node`` endpoints (guaranteed to occur in the hops) plus an
+    honest confidence and limitation. A path with a node we cannot open is dropped
+    rather than shown without source -- the code-understanding contract is strict.
+    """
+    out: list[dict] = []
+    for req in raw_requests:
+        hops = req.get("hops") or []
+        if len(hops) < 2:
+            continue
+        if any(not _has_source(node_map.get(h.get("node_id"))) for h in hops):
+            continue
+        rid = req.get("id")
+        decorated = []
+        for i, hop in enumerate(hops, start=1):
+            nid = hop.get("node_id")
+            entry = {"id": f"{rid}:{i:02d}", "node_id": nid,
+                     "caption": hop.get("caption")}
+            if i > 1:
+                entry["edge_label"] = _edge_label(
+                    edges_by_pair, hops[i - 2].get("node_id"), nid)
+            decorated.append(entry)
+        out.append({
+            "id": rid,
+            "kind": req.get("kind") or "call-path",
+            "description": req.get("description"),
+            "entry_node": req.get("entry_node"),
+            "source_node": hops[0].get("node_id"),
+            "sink_node": hops[-1].get("node_id"),
+            "confidence": "high",
+            "limitations": ["Callees reached only by dynamic dispatch may be omitted."],
+            "hops": decorated,
+        })
+    return out
+
+
+def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]:
+    """One unambiguous module per included node, keyed by that node's file.
+
+    Every concrete (file-bearing) node lands in exactly one module -- the module of
+    its file -- so no node is ever repeated across modules. A module anchored by an
+    entrypoint carries that entry's node id, giving a reader a place to start.
+    """
+    anchor_by_file: dict[str, str] = {}
+    for ep in entrypoints:
+        f = ep.get("file")
+        if isinstance(f, str) and f not in anchor_by_file:
+            anchor_by_file[f] = ep.get("node_id")
+
+    groups: dict[str, list[str]] = {}
+    for node in nodes:
+        f = node.get("file")
+        if not isinstance(f, str) or not f.strip():
+            continue
+        module_name = _dotted_module(f) or f
+        node["module"] = module_name
+        groups.setdefault(f, []).append(node["id"])
+
+    modules: list[dict] = []
+    for path in sorted(groups):
+        module_name = _dotted_module(path) or path
+        module = {
+            "id": f"module.{_slug(module_name)}",
+            "name": module_name,
+            "path": path,
+            "node_ids": groups[path],
+        }
+        anchor = anchor_by_file.get(path)
+        if anchor:
+            module["anchor_node_id"] = anchor
+        modules.append(module)
+    return modules
+
+
 def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
                         lang: Optional[str], indexed_nodes: int,
-                        source_url_template: Optional[str] = None) -> dict:
+                        source_url_template: Optional[str] = None,
+                        comprehension: Optional[dict] = None,
+                        description: Optional[str] = None) -> dict:
     """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
 
     The security envelope remains available under ``security.findings``.  The
@@ -512,46 +929,121 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
             "limitations": list((finding.get("analysis") or {}).get("limitations") or []),
             "steps": steps,
         })
+
     graph = bundle.get("graph") or {}
+    nodes = graph.get("nodes") or []
+    node_map = {n.get("id"): n for n in nodes}
+    node_ids = set(node_map)
+    edges = _canonical_edges(graph.get("edges") or [], node_ids)
+    edges_by_pair = {(e["source"], e["target"]): e for e in edges}
+
+    comp = comprehension or {}
+    entrypoints = [e for e in (comp.get("entrypoints") or [])
+                   if e.get("node_id") in node_ids]
+    requests = _finalize_requests(comp.get("requests") or [], node_map, edges_by_pair)
+    modules = _partition_modules(nodes, entrypoints)
+
+    coverage = {
+        "scope": "repository-projection",
+        "included_nodes": len(nodes),
+        "indexed_nodes": int(indexed_nodes),
+        "limitations": [
+            "Third-party dependencies are omitted.",
+            "Dynamic dispatch targets may be incomplete.",
+            "Only representative request and value paths are included.",
+        ],
+    }
+
+    meta_out = {
+        "repository": repository,
+        "language": language,
+        "revision": revision,
+        "description": description or (
+            f"Representative request and value paths through {repository}."),
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lines": int(meta.get("loc") or 0),
+        "indexed_nodes": int(indexed_nodes),
+    }
+    if source_url_template:
+        meta_out["source_url_template"] = source_url_template
+
     v2 = {
         "format": "lachesis-explorer-bundle",
         "schema_version": "2.0",
         "analysis_projection": "code-understanding",
-        "meta": {
-            "repository": repository,
-            "language": language,
-            "revision": revision,
-            "lines": int(meta.get("loc") or 0),
-            "indexed_nodes": int(indexed_nodes),
-        },
+        "meta": meta_out,
         "graph": {
-            "nodes": graph.get("nodes") or [],
-            "edges": graph.get("edges") or [],
+            "nodes": nodes,
+            "edges": edges,
+            "files": comp.get("files") or [],
+            "modules": modules,
+            "entrypoints": entrypoints,
+            "coverage": coverage,
         },
-        "paths": {"values": values},
+        "paths": {"requests": requests, "values": values},
         "security": {"findings": findings},
     }
-    if source_url_template:
-        v2["meta"]["source_url_template"] = source_url_template
     _validate_graph_first(v2)
     return v2
 
 
 def _validate_graph_first(bundle: dict) -> None:
-    """Validate the invariants needed before publishing a 2.0 artifact."""
+    """Validate the invariants needed before publishing a 2.0 artifact.
+
+    Beyond structural integrity (every referenced id resolves), this enforces the
+    two contracts a comprehension consumer relies on: coverage is exact
+    (``included_nodes`` is literally the node count), and every node a
+    code-understanding path or entrypoint *features* is openable and carries real
+    source -- the reader is never pointed at a location it cannot show.
+    """
     if bundle.get("format") != "lachesis-explorer-bundle" or bundle.get("schema_version") != "2.0":
         raise ValueError("graph-first bundle must use Explorer schema 2.0")
     meta = bundle.get("meta") or {}
     for key in ("repository", "language", "revision"):
         if not isinstance(meta.get(key), str) or not meta[key].strip():
             raise ValueError(f"graph-first meta missing {key}")
-    nodes = (bundle.get("graph") or {}).get("nodes") or []
-    node_ids = {node.get("id") for node in nodes}
+    graph = bundle.get("graph") or {}
+    nodes = graph.get("nodes") or []
+    node_map = {node.get("id"): node for node in nodes}
+    node_ids = set(node_map)
     if not nodes or None in node_ids:
         raise ValueError("graph-first bundle has invalid nodes")
-    for edge in (bundle.get("graph") or {}).get("edges") or []:
+
+    coverage = graph.get("coverage") or {}
+    if coverage and coverage.get("included_nodes") != len(nodes):
+        raise ValueError("graph-first coverage.included_nodes must equal node count")
+
+    for edge in graph.get("edges") or []:
         if edge.get("source") not in node_ids or edge.get("target") not in node_ids:
             raise ValueError("graph-first edge references unknown node")
+
+    for entry in graph.get("entrypoints") or []:
+        nid = entry.get("node_id")
+        if nid not in node_ids:
+            raise ValueError(f"entrypoint {entry.get('id')} references unknown node")
+        if not _has_source(node_map.get(nid)):
+            raise ValueError(f"entrypoint {entry.get('id')} node has no openable source")
+
+    seen_module_nodes: set[str] = set()
+    for module in graph.get("modules") or []:
+        for nid in module.get("node_ids") or []:
+            if nid not in node_ids:
+                raise ValueError(f"module {module.get('id')} references unknown node")
+            if nid in seen_module_nodes:
+                raise ValueError(f"node {nid} appears in more than one module")
+            seen_module_nodes.add(nid)
+
+    for req in (bundle.get("paths") or {}).get("requests") or []:
+        hops = req.get("hops") or []
+        hop_ids = [h.get("node_id") for h in hops]
+        if len(hops) < 2 or any(nid not in node_ids for nid in hop_ids):
+            raise ValueError(f"request {req.get('id')} references invalid nodes")
+        if req.get("source_node") not in hop_ids or req.get("sink_node") not in hop_ids:
+            raise ValueError(f"request {req.get('id')} endpoints must occur in hops")
+        for nid in hop_ids:
+            if not _has_source(node_map.get(nid)):
+                raise ValueError(f"request {req.get('id')} hop node {nid} has no source")
+
     for path in ((bundle.get("paths") or {}).get("values") or []):
         steps = path.get("steps") or []
         if not steps or any(step.get("node_id") not in node_ids for step in steps):
@@ -564,7 +1056,10 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  per_family: int = 6, max_flows: int = 40, cone_limit: int = 80,
                  planner_depth: int = 6, planner_entrypoints: int = 0,
                  schema_version: str = "1.0",
-                 source_url_template: Optional[str] = None) -> dict:
+                 source_url_template: Optional[str] = None,
+                 description: Optional[str] = None,
+                 max_entrypoints: int = 40, chain_depth: int = 6,
+                 max_files: int = 2000) -> dict:
     """Build an explorer bundle (schema 1.0) from a built+enriched graph."""
     load = _call("load_graph", {"path": graph_path, "profile": "all"})
     census = _call("candidate_census", {})
@@ -588,8 +1083,30 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
             merged[fid] = finding
     findings = list(merged.values())
 
+    # The comprehension projection (entrypoints, guided request paths, files) adds
+    # its own real nodes/edges to the shared pool -- do it before relativizing so
+    # those files are normalized alongside the finding nodes.
+    projection: Optional[dict] = None
+    if schema_version == "2.0":
+        projection = _comprehension_projection(
+            asm, max_entrypoints=max_entrypoints, chain_depth=chain_depth,
+            max_files=max_files)
+
     _relativize_files(asm.nodes)
     _relativize_locations(findings)
+
+    if projection is not None:
+        try:
+            gl = M.ctx().store.gl
+            _enrich_graph_nodes(list(asm.nodes.values()), gl)
+        except Exception:
+            pass
+        # Keep each entrypoint's displayed file identical to its node's (post-
+        # relativization) file, so module partitioning can anchor by that file.
+        for entry in projection.get("entrypoints") or []:
+            node = asm.nodes.get(entry.get("node_id"))
+            if node and node.get("file"):
+                entry["file"] = node["file"]
 
     prov = _provenance(source_dir, census)
     finding_ids = sorted(f["finding_id"] for f in findings)
@@ -636,7 +1153,8 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
         return _graph_first_bundle(bundle, repo=repo,
                                    commit=commit or prov.get("commit_sha"), lang=lang,
                                    indexed_nodes=int(load.get("nodes") or 0),
-                                   source_url_template=source_url_template)
+                                   source_url_template=source_url_template,
+                                   comprehension=projection, description=description)
     if schema_version != "1.0":
         raise ValueError(f"unsupported Explorer schema version: {schema_version}")
     return bundle

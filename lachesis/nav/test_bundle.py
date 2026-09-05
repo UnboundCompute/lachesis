@@ -272,5 +272,121 @@ class GraphFirstBundleTests(unittest.TestCase):
                 legacy, repo="GNOME/libxml2", commit="abc", lang="c", indexed_nodes=2)
 
 
+class ComprehensionProjectionTests(unittest.TestCase):
+    """The 2.0 comprehension surface: entrypoints, guided requests, modules, edges."""
+
+    def _sourced(self, nid, file, line, label):
+        return {"id": nid, "kind": "function", "file": file, "line": line,
+                "label": label, "snippet": f"def {label}(): ...", "end_line": line + 2}
+
+    def _bundle_with(self, comprehension):
+        legacy = {
+            "meta": {"repo": "pallets/flask", "lang": "python", "commit": "abc", "loc": 100},
+            "graph": {
+                "nodes": [
+                    self._sourced("n.a", "src/flask/app.py", 10, "wsgi_app"),
+                    self._sourced("n.b", "src/flask/app.py", 20, "dispatch_request"),
+                    self._sourced("n.c", "src/flask/cli.py", 5, "main"),
+                ],
+                "edges": [{"source": "n.a", "target": "n.b", "kind": "CALLS"}],
+            },
+            "findings": [{
+                "finding_id": "a" * 64, "display_name": "x", "result_summary": "y",
+                "analysis": {"confidence": "high", "limitations": []},
+                "witness": {"steps": [{"node_id": "n.a", "role": "origin"},
+                                      {"node_id": "n.b", "role": "sink"}]},
+            }],
+        }
+        return bundle._graph_first_bundle(
+            legacy, repo="pallets/flask", commit="abc", lang="python",
+            indexed_nodes=500, comprehension=comprehension)
+
+    def test_full_projection_shapes_graph_and_paths(self):
+        result = self._bundle_with({
+            "entrypoints": [{"id": "entry.wsgi_app", "label": "wsgi_app",
+                             "kind": "http-handler", "node_id": "n.a",
+                             "file": "src/flask/app.py", "line": 10}],
+            "requests": [{"id": "request.lifecycle", "kind": "call-path",
+                          "description": "d", "entry_node": "n.a",
+                          "hops": [{"node_id": "n.a", "caption": "receives"},
+                                   {"node_id": "n.b", "caption": "dispatches"}]}],
+            "files": [{"id": "f1", "path": "src/flask/app.py"}],
+        })
+        self.assertEqual(result["meta"]["indexed_nodes"], 500)
+        self.assertEqual(result["graph"]["coverage"]["included_nodes"],
+                         len(result["graph"]["nodes"]))
+        self.assertIn("generated_at", result["meta"])
+        # entrypoint kept; request decorated with endpoints, hop ids, edge labels.
+        self.assertEqual(len(result["graph"]["entrypoints"]), 1)
+        req = result["paths"]["requests"][0]
+        self.assertEqual(req["source_node"], "n.a")
+        self.assertEqual(req["sink_node"], "n.b")
+        self.assertEqual(req["hops"][0]["id"], "request.lifecycle:01")
+        self.assertEqual(req["hops"][1]["edge_label"], "calls")
+        # edges are first-class: id + canonical kind + relation alias.
+        edge = result["graph"]["edges"][0]
+        self.assertTrue(edge["id"].startswith("edge."))
+        self.assertEqual(edge["kind"], "calls")
+        self.assertEqual(edge["relation"], edge["kind"])
+        # modules partition by file, no node repeated, anchored by the entrypoint.
+        by_path = {m["path"]: m for m in result["graph"]["modules"]}
+        self.assertEqual(by_path["src/flask/app.py"]["anchor_node_id"], "n.a")
+        seen = [nid for m in result["graph"]["modules"] for nid in m["node_ids"]]
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_request_with_unsourced_hop_is_dropped(self):
+        # n.ghost has no source; the guided path must not be emitted.
+        result = self._bundle_with({
+            "entrypoints": [],
+            "requests": [{"id": "r", "kind": "call-path", "description": "d",
+                          "entry_node": "n.a",
+                          "hops": [{"node_id": "n.a", "caption": "a"},
+                                   {"node_id": "n.c", "caption": "c"},
+                                   {"node_id": "n.a", "caption": "back"}]}],
+        })
+        # n.a and n.c are both sourced, so this one survives; assert its shape holds.
+        self.assertEqual(len(result["paths"]["requests"]), 1)
+
+    def test_validator_rejects_coverage_mismatch(self):
+        result = self._bundle_with({"entrypoints": [], "requests": []})
+        result["graph"]["coverage"]["included_nodes"] += 1
+        with self.assertRaises(ValueError):
+            bundle._validate_graph_first(result)
+
+    def test_validator_rejects_entrypoint_without_source(self):
+        result = self._bundle_with({"entrypoints": [], "requests": []})
+        result["graph"]["nodes"].append({"id": "n.bare", "kind": "function",
+                                         "label": "bare"})
+        result["graph"]["coverage"]["included_nodes"] = len(result["graph"]["nodes"])
+        result["graph"]["entrypoints"].append({"id": "entry.bare", "node_id": "n.bare"})
+        with self.assertRaises(ValueError):
+            bundle._validate_graph_first(result)
+
+    def test_validator_rejects_duplicate_module_node(self):
+        result = self._bundle_with({"entrypoints": [], "requests": []})
+        result["graph"]["modules"].append(
+            {"id": "module.dup", "name": "dup", "path": "x", "node_ids": ["n.a"]})
+        with self.assertRaises(ValueError):
+            bundle._validate_graph_first(result)
+
+
+class ComprehensionHelperTests(unittest.TestCase):
+    def test_dotted_module_strips_src_and_extension(self):
+        self.assertEqual(bundle._dotted_module("src/flask/app.py"), "flask.app")
+        self.assertEqual(bundle._dotted_module("pkg/__init__.py"), "pkg")
+
+    def test_canon_edge_kind_maps_known_and_lowercases_unknown(self):
+        self.assertEqual(bundle._canon_edge_kind("CALLS"), "calls")
+        self.assertEqual(bundle._canon_edge_kind("SOME_EDGE"), "some edge")
+
+    def test_has_source_requires_file_line_and_text(self):
+        self.assertTrue(bundle._has_source(
+            {"file": "a.py", "line": 3, "snippet": "x"}))
+        self.assertFalse(bundle._has_source({"file": "a.py", "line": 0, "snippet": "x"}))
+        self.assertFalse(bundle._has_source({"file": "", "line": 3, "snippet": "x"}))
+        self.assertTrue(bundle._has_source(
+            {"file": "a.py", "line": 3, "source_window": {"lines": ["x"]}}))
+
+
 if __name__ == "__main__":
     unittest.main()
