@@ -858,6 +858,14 @@ def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
         module = _dotted_module(node.get("file"))
         if module:
             node["qualified_name"] = f"{module}.{node.get('label')}"
+        for key in ("documentation", "docstring", "comment"):
+            try:
+                documentation = gl.prop(twin, key)
+            except Exception:
+                documentation = None
+            if isinstance(documentation, str) and documentation.strip():
+                node["documentation"] = documentation.strip()
+                break
         try:
             excerpt = gl.source_excerpt(twin)
         except Exception:

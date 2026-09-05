@@ -400,6 +400,30 @@ class ComprehensionHelperTests(unittest.TestCase):
         self.assertTrue(bundle._has_source(
             {"file": "a.py", "line": 3, "source_window": {"lines": ["x"]}}))
 
+    def test_enrich_graph_nodes_preserves_recorded_documentation(self):
+        class _Graph:
+            nodes = {"n": {"id": "n", "label": "serve",
+                            "properties": {"file": "src/app.py", "start_line": 4,
+                                           "end_line": 8, "documentation": "Serve a request."}}}
+
+            def loc(self, node):
+                props = node["properties"]
+                return props["file"], props["start_line"], props["end_line"]
+
+            def prop(self, node, key, default=None):
+                return node.get("properties", {}).get(key, default)
+
+            def source_excerpt(self, node):
+                return "serve()"
+
+            def _read_file(self, _path):
+                return "def serve():\n    pass\n"
+
+        nodes = [{"id": "n", "file": "src/app.py", "line": 4,
+                  "label": "serve", "snippet": "serve"}]
+        bundle._enrich_graph_nodes(nodes, _Graph())
+        self.assertEqual("Serve a request.", nodes[0]["documentation"])
+
     def test_count_source_lines_sums_physical_lines_dedups_and_falls_back(self):
         # a.py: 3 physical lines read off disk; b.py: unreadable, falls back to
         # its file-node span end (2); the duplicate a.py node is counted once.
