@@ -114,11 +114,26 @@ jobs:
       - name: Install Lachesis (dev)
         run: python -m pip install -e ".[dev]"
 
+      # Point the catalog resolver at the vendored tree explicitly. The corpus runner
+      # otherwise setdefault()s ATROPOS_ROOT to a sibling `../atropos` checkout, which
+      # does not exist on a runner; that nonexistent path would shadow the bundled
+      # catalog and every lifecycle table would read empty, so the census would confirm
+      # nothing. Exporting it here pre-empts the setdefault for both the build and the
+      # census, so they read the catalog we just staged.
       - name: Vendor the pinned Atropos catalog
-        run: python3 tools/vendor_atropos.py
+        run: |
+          python3 tools/vendor_atropos.py
+          echo "ATROPOS_ROOT=$PWD/lachesis/_atropos_catalog" >> "$GITHUB_ENV"
 
       - name: Build and stage the native artifacts
         run: python3 tools/stage_native.py --build
+
+      # Kuzu reserves its database file sparsely at the 8 TiB default max size; the
+      # runner's default overcommit heuristic can reject that virtual reservation
+      # (Mmap for size 8796093022208 failed). Allow overcommit so the sparse mapping
+      # succeeds -- it costs no physical memory.
+      - name: Allow memory overcommit for the Kuzu store
+        run: sudo sysctl -w vm.overcommit_memory=1
 
       - name: Run the native lifetime suite
         run: |
