@@ -358,6 +358,17 @@ def _repo_meta(source: Path) -> tuple[str | None, str | None]:
     return repo, commit
 
 
+def _load_curated_tour(path: str) -> dict:
+    """Load an OSS tour fragment without accepting a verified owner claim."""
+    config = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    curated_tour = config.get("meta", {}).get("curated_tour", config.get("curated_tour"))
+    if not isinstance(curated_tour, dict):
+        raise ValueError("curated tour file must contain meta.curated_tour")
+    curated_tour = dict(curated_tour)
+    curated_tour.pop("maintainer", None)
+    return curated_tour
+
+
 def command_trace(args: argparse.Namespace) -> int:
     """Build (or reuse) a graph and export a lachesis-explorer bundle.json."""
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
@@ -392,13 +403,7 @@ def command_trace(args: argparse.Namespace) -> int:
     curated_tour = None
     if args.curated_tour:
         try:
-            config = json.loads(Path(args.curated_tour).expanduser().read_text(encoding="utf-8"))
-            curated_tour = config.get("meta", {}).get("curated_tour", config.get("curated_tour"))
-            if not isinstance(curated_tour, dict):
-                raise ValueError("curated tour file must contain meta.curated_tour")
-            # Public repository files are not an authenticated ownership boundary.
-            curated_tour = dict(curated_tour)
-            curated_tour.pop("maintainer", None)
+            curated_tour = _load_curated_tour(args.curated_tour)
         except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, ValueError) as error:
             _stderr(f"lachesis trace: curated tour: {error}")
             return EXIT_USAGE
