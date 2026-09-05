@@ -1068,8 +1068,24 @@ def _project_curated_tour(raw: Optional[dict], values: list[dict], requests: lis
     overview = raw.get("overview")
     if isinstance(overview, dict):
         overview_description = str(overview.get("description") or "").strip()
-        if overview_description:
-            result["overview"] = {"description": overview_description[:1000]}
+        overview_result = {"description": overview_description[:1000]} if overview_description else {}
+        concepts = overview.get("concepts")
+        if isinstance(concepts, list):
+            selected_concepts = []
+            for item in concepts[:8]:
+                if not isinstance(item, dict) or not str(item.get("id") or "").strip() or not str(item.get("label") or "").strip():
+                    continue
+                concept = {"id": str(item["id"]).strip(), "label": str(item["label"]).strip()}
+                if str(item.get("description") or "").strip():
+                    concept["description"] = str(item["description"]).strip()[:300]
+                related = item.get("related_ids")
+                if isinstance(related, list) and related:
+                    concept["related_ids"] = [str(value) for value in related if str(value).strip()][:8]
+                selected_concepts.append(concept)
+            if selected_concepts:
+                overview_result["concepts"] = selected_concepts
+        if overview_result:
+            result["overview"] = overview_result
     selection = raw.get("selection")
     if isinstance(selection, dict):
         allowed = ("include_tests", "include_examples", "include_generated")

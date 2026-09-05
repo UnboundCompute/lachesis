@@ -366,13 +366,13 @@ class ComprehensionProjectionTests(unittest.TestCase):
 
     def test_curated_tour_keeps_current_paths_and_drops_stale_steps(self):
         result = self._bundle_with_tour(
-            {"entrypoints": [], "requests": [{"id": "request.lifecycle", "kind": "call-path",
+            {"entrypoints": [], "concepts": [{"id": "concept.lifecycle", "label": "Lifecycle", "description": "d", "file_paths": ["src/flask/app.py"]}], "requests": [{"id": "request.lifecycle", "kind": "call-path",
                                                 "description": "d", "entry_node": "n.a",
                                                 "hops": [{"node_id": "n.a", "caption": "a"},
                                                          {"node_id": "n.b", "caption": "b"}]}]},
             {"id": "tour.start", "title": "Start here", "description": "Read this first.",
              "maintainer": {"name": "Ignored"},
-             "overview": {"description": "Read the request lifecycle first."},
+             "overview": {"description": "Read the request lifecycle first.", "concepts": [{"id": "concept.lifecycle", "label": "Request lifecycle", "description": "The main request route."}]},
              "selection": {"include_tests": True, "include_examples": False, "include_generated": True},
              "steps": [{"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
                        {"flow_id": "request.missing"}]},
@@ -381,6 +381,7 @@ class ComprehensionProjectionTests(unittest.TestCase):
                          result["meta"]["curated_tour"]["steps"][0])
         self.assertNotIn("maintainer", result["meta"]["curated_tour"])
         self.assertEqual("Read the request lifecycle first.", result["meta"]["curated_tour"]["overview"]["description"])
+        self.assertEqual("concept.lifecycle", result["meta"]["curated_tour"]["overview"]["concepts"][0]["id"])
         self.assertEqual({"include_tests": True, "include_generated": True}, result["meta"]["curated_tour"]["selection"])
 
     def test_curated_tour_is_omitted_when_no_step_resolves(self):
