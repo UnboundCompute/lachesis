@@ -389,6 +389,19 @@ def command_trace(args: argparse.Namespace) -> int:
 
     repo, commit = _repo_meta(source)
     progress.phase("exporting bundle")
+    curated_tour = None
+    if args.curated_tour:
+        try:
+            config = json.loads(Path(args.curated_tour).expanduser().read_text(encoding="utf-8"))
+            curated_tour = config.get("meta", {}).get("curated_tour", config.get("curated_tour"))
+            if not isinstance(curated_tour, dict):
+                raise ValueError("curated tour file must contain meta.curated_tour")
+            # Public repository files are not an authenticated ownership boundary.
+            curated_tour = dict(curated_tour)
+            curated_tour.pop("maintainer", None)
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, ValueError) as error:
+            _stderr(f"lachesis trace: curated tour: {error}")
+            return EXIT_USAGE
     try:
         bundle = bundle_mod.build_bundle(
             str(graph_path),
@@ -401,6 +414,7 @@ def command_trace(args: argparse.Namespace) -> int:
             schema_version=args.schema_version,
             source_url_template=args.source_url_template,
             description=args.description,
+            curated_tour=curated_tour,
         )
     except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
         _stderr(f"lachesis trace: {error}")
@@ -971,6 +985,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="explicit HTTP(S) source template using {file}, {line}, {end_line}, {revision}")
     trace.add_argument("--description", metavar="TEXT",
                        help="one-line projection description recorded in bundle meta (2.0)")
+    trace.add_argument("--curated-tour", metavar="JSON",
+                       help="read a meta.curated_tour fragment and validate it against the exported paths")
     trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
                        help="max leads to draw from each sink family (default: 6)")
     trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",

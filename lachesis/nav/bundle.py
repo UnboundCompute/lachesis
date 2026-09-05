@@ -1022,11 +1022,58 @@ def _project_concepts(raw_concepts: list[dict], nodes: list[dict]) -> list[dict]
     return out
 
 
+def _project_curated_tour(raw: Optional[dict], values: list[dict], requests: list[dict]) -> Optional[dict]:
+    """Keep only tour steps that resolve in this exact exported projection.
+
+    Tour files are user-authored convenience metadata, not evidence. A changed
+    repository can make an old flow or anchor disappear, so stale steps are
+    omitted instead of making the entire export fail. Maintainer identity is
+    deliberately not accepted from this unauthenticated file path.
+    """
+    if not isinstance(raw, dict):
+        return None
+    title = str(raw.get("title") or "Start here").strip()
+    tour_id = str(raw.get("id") or "tour.start-here").strip()
+    if not title or not tour_id:
+        return None
+    paths = {str(path.get("id")): path for path in [*values, *requests]
+             if isinstance(path, dict) and path.get("id")}
+    steps: list[dict] = []
+    for item in raw.get("steps") or []:
+        if not isinstance(item, dict):
+            continue
+        flow_id = str(item.get("flow_id") or item.get("flowId") or "").strip()
+        path = paths.get(flow_id)
+        if not path:
+            continue
+        raw_steps = path.get("steps") if isinstance(path.get("steps"), list) else path.get("hops")
+        node_ids = {str(step.get("node_id")) for step in raw_steps or []
+                    if isinstance(step, dict) and step.get("node_id")}
+        node_id = item.get("node_id") or item.get("nodeId")
+        if node_id is not None and str(node_id) not in node_ids:
+            continue
+        step = {"flow_id": flow_id}
+        if node_id is not None:
+            step["node_id"] = str(node_id)
+        for key in ("label", "note"):
+            if item.get(key) is not None and str(item[key]).strip():
+                step[key] = str(item[key]).strip()
+        steps.append(step)
+    if not steps:
+        return None
+    result = {"id": tour_id, "title": title, "steps": steps}
+    description = str(raw.get("description") or "").strip()
+    if description:
+        result["description"] = description[:500]
+    return result
+
+
 def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
                         lang: Optional[str], indexed_nodes: int,
                         source_url_template: Optional[str] = None,
                         comprehension: Optional[dict] = None,
-                        description: Optional[str] = None) -> dict:
+                        description: Optional[str] = None,
+                        curated_tour: Optional[dict] = None) -> dict:
     """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
 
     The security envelope remains available under ``security.findings``.  The
@@ -1075,6 +1122,7 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     concepts = _project_concepts(comp.get("concepts") or [], nodes)
     core = [item for item in (comp.get("core") or [])
             if item.get("node_id") in node_ids]
+    tour = _project_curated_tour(curated_tour, values, requests)
 
     coverage = {
         "scope": "repository-projection",
@@ -1118,6 +1166,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         "paths": {"requests": requests, "values": values},
         "security": {"findings": findings},
     }
+    if tour is not None:
+        v2["meta"]["curated_tour"] = tour
     _validate_graph_first(v2)
     return v2
 
@@ -1193,6 +1243,7 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  schema_version: str = "1.0",
                  source_url_template: Optional[str] = None,
                  description: Optional[str] = None,
+                 curated_tour: Optional[dict] = None,
                  max_entrypoints: int = 40, chain_depth: int = 6,
                  max_files: int = 2000) -> dict:
     """Build an explorer bundle (schema 1.0) from a built+enriched graph."""
@@ -1299,7 +1350,8 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                                    commit=commit or prov.get("commit_sha"), lang=lang,
                                    indexed_nodes=int(load.get("nodes") or 0),
                                    source_url_template=source_url_template,
-                                   comprehension=projection, description=description)
+                                   comprehension=projection, description=description,
+                                   curated_tour=curated_tour)
     if schema_version != "1.0":
         raise ValueError(f"unsupported Explorer schema version: {schema_version}")
     return bundle

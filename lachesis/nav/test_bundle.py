@@ -301,6 +301,23 @@ class ComprehensionProjectionTests(unittest.TestCase):
             legacy, repo="pallets/flask", commit="abc", lang="python",
             indexed_nodes=500, comprehension=comprehension)
 
+    def _bundle_with_tour(self, comprehension, curated_tour):
+        legacy = {
+            "meta": {"repo": "pallets/flask", "lang": "python", "commit": "abc", "loc": 100},
+            "graph": {
+                "nodes": [self._sourced("n.a", "src/flask/app.py", 10, "wsgi_app"),
+                          self._sourced("n.b", "src/flask/app.py", 20, "dispatch_request")],
+                "edges": [{"source": "n.a", "target": "n.b", "kind": "CALLS"}],
+            },
+            "findings": [{"finding_id": "a" * 64, "display_name": "x", "result_summary": "y",
+                           "analysis": {"confidence": "high", "limitations": []},
+                           "witness": {"steps": [{"node_id": "n.a", "role": "origin"},
+                                                 {"node_id": "n.b", "role": "sink"}]}}],
+        }
+        return bundle._graph_first_bundle(
+            legacy, repo="pallets/flask", commit="abc", lang="python", indexed_nodes=500,
+            comprehension=comprehension, curated_tour=curated_tour)
+
     def test_full_projection_shapes_graph_and_paths(self):
         result = self._bundle_with({
             "entrypoints": [{"id": "entry.wsgi_app", "label": "wsgi_app",
@@ -346,6 +363,28 @@ class ComprehensionProjectionTests(unittest.TestCase):
                            "file_paths": ["src/other/missing.py"]}],
         })
         self.assertEqual([], result["graph"]["concepts"])
+
+    def test_curated_tour_keeps_current_paths_and_drops_stale_steps(self):
+        result = self._bundle_with_tour(
+            {"entrypoints": [], "requests": [{"id": "request.lifecycle", "kind": "call-path",
+                                                "description": "d", "entry_node": "n.a",
+                                                "hops": [{"node_id": "n.a", "caption": "a"},
+                                                         {"node_id": "n.b", "caption": "b"}]}]},
+            {"id": "tour.start", "title": "Start here", "description": "Read this first.",
+             "maintainer": {"name": "Ignored"},
+             "steps": [{"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
+                       {"flow_id": "request.missing"}]},
+        )
+        self.assertEqual({"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
+                         result["meta"]["curated_tour"]["steps"][0])
+        self.assertNotIn("maintainer", result["meta"]["curated_tour"])
+
+    def test_curated_tour_is_omitted_when_no_step_resolves(self):
+        result = self._bundle_with_tour(
+            {"entrypoints": [], "requests": []},
+            {"id": "tour.start", "title": "Start here", "steps": [{"flow_id": "missing"}]},
+        )
+        self.assertNotIn("curated_tour", result["meta"])
 
     def test_request_with_unsourced_hop_is_dropped(self):
         # n.ghost has no source; the guided path must not be emitted.
