@@ -372,6 +372,7 @@ class ComprehensionProjectionTests(unittest.TestCase):
                                                          {"node_id": "n.b", "caption": "b"}]}]},
             {"id": "tour.start", "title": "Start here", "description": "Read this first.",
              "maintainer": {"name": "Ignored"},
+             "overview": {"description": "Read the request lifecycle first."},
              "selection": {"include_tests": True, "include_examples": False, "include_generated": True},
              "steps": [{"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
                        {"flow_id": "request.missing"}]},
@@ -379,6 +380,7 @@ class ComprehensionProjectionTests(unittest.TestCase):
         self.assertEqual({"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
                          result["meta"]["curated_tour"]["steps"][0])
         self.assertNotIn("maintainer", result["meta"]["curated_tour"])
+        self.assertEqual("Read the request lifecycle first.", result["meta"]["curated_tour"]["overview"]["description"])
         self.assertEqual({"include_tests": True, "include_generated": True}, result["meta"]["curated_tour"]["selection"])
 
     def test_curated_tour_is_omitted_when_no_step_resolves(self):

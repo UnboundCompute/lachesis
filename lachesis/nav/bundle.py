@@ -1065,6 +1065,11 @@ def _project_curated_tour(raw: Optional[dict], values: list[dict], requests: lis
     description = str(raw.get("description") or "").strip()
     if description:
         result["description"] = description[:500]
+    overview = raw.get("overview")
+    if isinstance(overview, dict):
+        overview_description = str(overview.get("description") or "").strip()
+        if overview_description:
+            result["overview"] = {"description": overview_description[:1000]}
     selection = raw.get("selection")
     if isinstance(selection, dict):
         allowed = ("include_tests", "include_examples", "include_generated")
