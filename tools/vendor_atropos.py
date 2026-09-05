@@ -48,7 +48,7 @@ from typing import List, Optional
 # happened to be at on release day. Bumping it is a deliberate commit -- and if a local
 # sibling checkout is ahead of this pin, the pinned tag is fetched instead so the wheel
 # stays reproducible.
-ATROPOS_VERSION = "1.9.0"
+ATROPOS_VERSION = "1.10.0"
 
 # The public catalog repository. GitHub serves an immutable tarball for a tag, which is
 # what a release build with no sibling checkout fetches. No authentication is involved:
