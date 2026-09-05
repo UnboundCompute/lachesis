@@ -227,7 +227,12 @@ class Analysis:
     def _pass2_timing(label: str, started: float) -> None:
         """Emit opt-in timings for the catalog/temporal half of Pass 2."""
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
-            _LOGGER.info("pass2 %s: %.3fs", label, perf_counter() - started)
+            import resource, sys as _sys
+            _sc = 1.0 if _sys.platform == "darwin" else 1024.0  # ru_maxrss bytes(mac)/KiB(linux)
+            _s = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _sc / 1048576
+            _k = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * _sc / 1048576
+            _LOGGER.info("pass2 %s: %.3fs  peakRSS self=%.0fMB kids=%.0fMB",
+                         label, perf_counter() - started, _s, _k)
 
     @staticmethod
     def _pass2_progress(label: str, elapsed: float) -> None:
@@ -315,13 +320,15 @@ class Analysis:
         else:
             stamped, summary, complete = self._enrich_and_merge(
                 deadline=deadline, workers=workers)
+            # ``_enrich_and_merge`` now handles cap truncation per function --
+            # it drops only the capped functions' findings and reports them in
+            # ``coverage.truncated_functions``, so the returned bind is the
+            # complete, deterministic answer for this graph and is always safe
+            # to cache. (The old path treated any single capped function as a
+            # graph-wide veto and popped the whole temporal bind here, zeroing
+            # the confirmed census of an otherwise-clean graph.)
             if complete:
                 bind_cache.store(self.store, stamped, summary)
-            else:
-                # A truncated semantic skeleton would emit partial temporal observations that
-                # read as fewer bugs, not as an incomplete run. Drop it and report structural
-                # families only -- honest under-coverage beats a misleadingly thin temporal set.
-                stamped.pop("semantic_graph", None)
         return {
             "registry": default_candidate_registry(stamped, summary),
             "stamped": stamped,
@@ -337,6 +344,13 @@ class Analysis:
         from lachesis.nav.kuzu_index import materialize_graph, _sort_materialized_edges
 
         started = perf_counter()
+        # Make the control-flow branch substrate (cfg-condition nodes + branch-region
+        # edges) visible to the index before the bind reads it. On the retain=False
+        # path (`enrich`) the full dataflow overlay is deliberately never decoded into
+        # RAM, so without this the census has no conditions to classify guard dominance
+        # against. This attaches only the tiny branch slice (bounded by control
+        # structure), and is a no-op when a full overlay is already attached.
+        self.store.ensure_branch_substrate()
         index = getattr(self.store, "index", None)
         projection_fn = getattr(index, "atropos_projection", None)
         if projection_fn is not None:
@@ -415,6 +429,33 @@ class Analysis:
         materialize_started = perf_counter()
         region_edges = list(index.edges_of_kind(*_REGION_EDGE_KINDS))
         edges.extend(region_edges)
+        # Region-edge ENDPOINTS carry the two facts the guard adjudicator reads: the
+        # cfg-condition SOURCE (which size variable a branch tests) and the branch-body
+        # TARGET span (which a copy call site is placed inside for `guarded-region`).
+        # The header warm below cannot supply either. The sources are overlay-derived
+        # -- absent from Kùzu -- so ``node_headers`` returns them as empty stubs. And on
+        # the deferred-maps bind path (``enrich`` opens with ``defer_maps=True``) the
+        # promoted-header columns are never built, so ``node_headers`` returns the Kùzu
+        # body targets span-less too. Either stubbing collapses a genuinely guarded copy
+        # to a spurious ``none-observed``/``fall-through``. Warm both endpoints straight
+        # from Kùzu (batched; ``_warm_nodes`` skips ids already resident, so the
+        # overlay-cached cfg-condition sources are left intact) and seat the full,
+        # span-bearing records through the overlay-aware accessor before the
+        # ``difference`` so no stubbing path runs on them. Bounded by the program's
+        # control structure, never by its size.
+        node_getter = getattr(index, "nodes", None)
+        region_endpoints = {edge.get("source") for edge in region_edges}
+        region_endpoints.update(edge.get("target") for edge in region_edges)
+        region_endpoints.discard(None)
+        region_endpoints.difference_update(nodes)
+        if region_endpoints and node_getter is not None:
+            warmer = getattr(index, "_warm_nodes", None)
+            if warmer is not None:
+                warmer(region_endpoints)
+            for endpoint_id in region_endpoints:
+                record = node_getter.get(endpoint_id)
+                if record is not None:
+                    nodes[record["id"]] = record
         region_done = perf_counter()
         needed = {edge.get("source") for edge in region_edges}
         needed.update(edge.get("target") for edge in region_edges)
@@ -428,6 +469,22 @@ class Analysis:
             for node in delta_nodes
             if node.get("kind") == "sink"
         ]
+        # A sink's location lives on its callsite node.  Call-expression sinks bind a
+        # `call` node the Atropos projection already carries with its full span, but
+        # an assignment/subscript sink (object-integrity.prototype `obj[key]=value`)
+        # binds a `dynamic-behavior` write-site node that reaches the projection only
+        # as a position-less edge-endpoint stub (id/kind/label, empty properties),
+        # while its bound `value_id` is a synthetic access-path node with no span at
+        # all.  A stub already sits in ``nodes`` so it is not "missing" and the header
+        # warm below skips it, leaving the candidate with file/line=None even though
+        # the span is known to the index.  Collect every sink callsite so its header
+        # span can be merged in after the warm regardless of the stub.
+        sink_callsite_ids = {
+            (node.get("properties") or {}).get("callsite_id")
+            for node in delta_nodes
+            if node.get("kind") == "sink"
+            and (node.get("properties") or {}).get("callsite_id")
+        }
         seen = set()
         while work:
             batch = []
@@ -492,6 +549,32 @@ class Analysis:
                 node = index.nodes.get(node_id)
                 if node is not None:
                     nodes[node_id] = node
+
+        # Merge the source span onto every sink callsite that entered as a
+        # position-less stub (see the sink_callsite_ids comment above).  Fetch the
+        # full record rather than a header: the promoted-header map is deferred for
+        # this node kind, so only the warmed record carries the write site's real
+        # file/line.  Merge it without clobbering any property a full record already
+        # provided.  The set is one callsite per sink, so this is a small warm.
+        warmer = getattr(index, "_warm_nodes", None)
+        if sink_callsite_ids and warmer is not None:
+            warmer(sink_callsite_ids)
+            for callsite_id in sink_callsite_ids:
+                record = index.nodes.get(callsite_id)
+                if not record:
+                    continue
+                existing = nodes.get(callsite_id)
+                if existing is None:
+                    nodes[callsite_id] = record
+                    continue
+                merged = dict(existing.get("properties") or {})
+                for key, value in (record.get("properties") or {}).items():
+                    if value is not None and merged.get(key) is None:
+                        merged[key] = value
+                updated = dict(existing)
+                updated["properties"] = merged
+                nodes[callsite_id] = updated
+
         if os.environ.get("LACHESIS_PASS2_TIMINGS") == "1":
             _LOGGER.info(
                 "pass2 structural phases: regions=%.3fs cone=%.3fs warm=%.3fs "
@@ -584,7 +667,8 @@ class Analysis:
             raise RuntimeError(
                 "Pass 2 requires a fresh Pass-1 binary substrate; rebuild the graph")
         from lachesis.flow.native_translate import (
-            build_native_match_result, ensure_native_semantic_sidecar,
+            drop_capped_functions, ensure_native_match_sidecar,
+            ensure_native_semantic_sidecar, load_native_temporal,
         )
         native_sidecar = ensure_native_semantic_sidecar(
             self.store, summary.get("catalog_path"),
@@ -595,15 +679,69 @@ class Analysis:
         # honestly so the caller drops the partial skeleton (structural families only)
         # rather than caching a misleadingly thin temporal set as a complete run. The
         # match sidecar is content-addressed, so the later flow pass reuses it.
-        match_result = build_native_match_result(
+        #
+        # Convergence needs only the "any function capped" bit, so publish the match
+        # sidecar and scan it for that flag rather than parsing the whole findings
+        # protobuf -- the full parse would materialize ~350 MB of witnesses this path
+        # never reads. The flow pass still builds the complete result from the same
+        # content-addressed sidecar.
+        match_sidecar = ensure_native_match_sidecar(
             native_sidecar, summary.get("catalog_path"))
-        converged = not any(getattr(function, "capped", False)
-                            for function in match_result.functions)
+        # The Rust matcher has already related the temporal events (a free reached
+        # twice, a use of a freed object on a reachable path) into correlated
+        # findings; the analyze pass surfaces them as leads. Publish the same
+        # findings on the bind so the candidate census renders the matcher's
+        # confirmed temporal relation instead of one not-queried candidate per
+        # dereference. This reads only the compact fields (pattern/node/line/path)
+        # from the content-addressed match sidecar -- the witness bytes that
+        # dominate it are never materialized here.
+        temporal = load_native_temporal(match_sidecar)
+        # Cap-truncation is per function, so treat it per function -- not as one
+        # graph-wide veto. A function is ``capped`` when its skeleton was
+        # truncated (state budget exhausted or partial), which makes only *that*
+        # function's findings unsound: a balancing free may lie past the cut, so
+        # a reported leak/UAF there could be spurious. Drop exactly those
+        # functions' findings (honest under-coverage, surfaced as
+        # ``truncated_functions``) and keep every converged function's confirmed
+        # findings. The previous behavior -- one capped function forcing the
+        # caller to discard the entire ``native_temporal`` bind -- silently
+        # zeroed the confirmed census of an otherwise-clean graph the moment it
+        # contained a single large function.
+        capped_functions = drop_capped_functions(temporal)
+        converged = not capped_functions
         stamped["semantic_graph"] = {
             "native_sidecar": str(native_sidecar),
-            "coverage": {"converged": converged},
+            "coverage": {
+                "converged": converged,
+                "truncated_functions": capped_functions,
+            },
         }
-        return stamped, summary, converged
+        # The match sidecar carries each finding's enclosing declaration id but no
+        # file: that lives only in the Pass-1 structural store, which the census
+        # graph dict does not include. Resolve declaration id -> file:line here,
+        # where the store is in hand, so a confirmed double-free/UAF lead is
+        # locatable rather than carrying ``file: None``. Purely additive to the
+        # bind: navigation facts for a lead already emitted, never a verdict.
+        locations: dict[str, dict] = {}
+        for function in temporal.get("functions", ()):
+            for finding in function.get("findings", ()):
+                decl = finding.get("function")
+                if not decl or decl in locations:
+                    continue
+                node = self.store.node(decl)
+                props = (node or {}).get("properties") or {}
+                file = props.get("absolute_file") or props.get("file")
+                if file or props.get("start_line") is not None:
+                    locations[decl] = {"file": file, "line": props.get("start_line")}
+        if locations:
+            temporal["locations"] = locations
+        stamped["native_temporal"] = temporal
+        # Temporal was evaluated across the whole graph. Per-function cap
+        # truncation is reported in ``coverage.truncated_functions`` and the
+        # affected functions' findings were already dropped above; it is no
+        # longer a completeness veto, so the (filtered, deterministic) bind is
+        # always safe to cache and return.
+        return stamped, summary, True
 
     # -- library surface: pass 3 (analyze -> leads) ---------------------------------
 
@@ -731,7 +869,10 @@ class Analysis:
         # path requires sorting roughly two million edge dictionaries before binding, which
         # can dominate Pass 2 and keep the graph-sized object peak alive.  The indexed
         # materializer below is bounded and was already the measured ~46s path on libxml2.
-        self.store.ensure_dataflow_tier()
+        # enrich only writes the sidecars to disk; it issues no queries against the tier
+        # afterwards. Skip decoding the dataflow overlay back into Python so its ~1 GB does
+        # not sit resident on top of the semantic Pass-3 native transient the bind runs next.
+        self.store.ensure_dataflow_tier(retain_materialized=False)
         self._sync_tier()  # the tier moved under any cache built against the pre-enrich index
         bundle = self._bind_bundle(temporal=True,
                                    deadline=self._resolve_deadline(hard_stop, deadline),
@@ -906,12 +1047,20 @@ class Analysis:
     @staticmethod
     def _guard_view(inferences: dict) -> dict:
         """The guard the enclosing function places over the sink -- read straight from the
-        registry's condition inference, so ``none-observed`` stays ``none-observed`` and never
-        quietly reads as safe."""
+        registry's inferences. A guard may be a branch *condition* that names the argument
+        (``conditions``) or a validation-shaped *call* the argument passes through
+        (``guard_calls``, e.g. ``validate_redirect_uri``); either one counts as observed.
+        Absent both it stays ``none-observed`` and never quietly reads as safe. Presence is
+        neutral throughout -- a place worth reading, never a verdict that the sink is safe."""
         conditions = inferences.get("conditions") or {}
-        return {"status": conditions.get("status"),
+        guard_calls = inferences.get("guard_calls") or {}
+        statuses = (conditions.get("status"), guard_calls.get("status"))
+        status = "observed" if "observed" in statuses else (
+            conditions.get("status") or guard_calls.get("status"))
+        return {"status": status,
                 "dominance": conditions.get("dominance"),
-                "referencing_conditions": conditions.get("referencing_conditions")}
+                "referencing_conditions": conditions.get("referencing_conditions"),
+                "validation_calls": guard_calls.get("validation_calls")}
 
     def _provenance(self, sink_value: str | None, limit: int) -> dict:
         """The bounded reverse value-flow cone into the sink.
@@ -1222,8 +1371,18 @@ class LeadSet:
 
     # -- filters (each returns a new LeadSet) ---------------------------------------
 
-    def by_pattern(self, pattern: str) -> "LeadSet":
-        """Return a new result containing only leads with this pattern name."""
+    def by_pattern(self, pattern: str | None = None):
+        """Filter to one pattern, or -- called with no argument -- return the
+        pattern -> count breakdown.
+
+        The name reads two ways: as a filter (``by_pattern("mem.copy...")`` -> a new
+        LeadSet with only that pattern) and as the grouping ``summary()["by_pattern"]``
+        exposes. A bare ``by_pattern()`` used to raise TypeError, colliding with that
+        summary key; it now returns the same ``{pattern: count}`` mapping, so the natural
+        call is no longer a dead end.
+        """
+        if pattern is None:
+            return dict(Counter(lead.get("pattern") for lead in self.leads))
         return self._with(lead for lead in self.leads if lead.get("pattern") == pattern)
 
     def by_function(self, name: str, lines: tuple[int, int] | None = None) -> "LeadSet":
@@ -1238,12 +1397,26 @@ class LeadSet:
         return self._with(lead for lead in self.leads if predicate(lead))
 
     def near(self, file: str, lines: tuple[int, int] | None = None) -> "LeadSet":
-        """Leads whose enclosing function resolves to ``file`` (path, suffix, or basename),
-        optionally within an inclusive ``(lo, hi)`` line window over the sink line."""
+        """Leads located in ``file`` (path, suffix, or basename), optionally within an
+        inclusive ``(lo, hi)`` line window over the sink line.
+
+        A lead's file comes from two places: the lead may carry its own file directly
+        (scan and candidate leads do), and a flow lead that carries only its enclosing
+        function resolves that function -> file(s) via the symbol index. Match either, so
+        ``near``/``at`` work for ``scan()`` output too -- previously they consulted only
+        the function index, and a lead with no ``entry`` (every scan lead) silently
+        matched nothing.
+        """
         index = self._index()
-        return self._with(lead for lead in self.leads
-                          if _file_matches(index.get(lead.get("entry"), ()), file)
-                          and self._in_lines(lead, lines))
+
+        def _here(lead) -> bool:
+            files = set(index.get(lead.get("entry"), ()))
+            own = lead.get("file")
+            if own:
+                files.add(own)
+            return _file_matches(files, file) and self._in_lines(lead, lines)
+
+        return self._with(lead for lead in self.leads if _here(lead))
 
     def at(self, file: str, line: int) -> "LeadSet":
         """Return leads whose source location matches one file and line."""

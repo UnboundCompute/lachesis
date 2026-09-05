@@ -6,8 +6,8 @@
 //! values.  The output is the existing `atropos-binding-report` contract.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs;
+use std::io::Read;
 use std::path::Path;
 use hashbrown::HashMap;
 use prost::Message;
@@ -207,17 +207,59 @@ fn canonicalize_callees(index: &mut Index, aliases: &HashMap<(String, String), S
     }
 }
 
+/// Whether this language's frontend stamps `receiver_type` on method-call nodes.
+/// Only the Python frontend does today, so only there is a missing receiver_type
+/// on a type-keyed callsite treated as a confirmed non-instance (a conservative
+/// miss) rather than an unknown. Extend as other frontends begin emitting it.
+fn language_emits_receiver_type(language: Option<&str>) -> bool {
+    matches!(language, Some("python"))
+}
+
 fn matches(model: &Model, callee: &Callee) -> bool {
     if model.method.as_deref() != Some(callee.name.as_str()) {
         return false;
     }
-    if let (Some(expected), Some(actual)) = (model.package.as_ref(), callee.module.as_ref()) {
-        if expected != actual { return false; }
+    // A model that pins a `package` must bind to a callsite whose callee is
+    // actually resolved to that package. The old `if let (Some, Some)` made the
+    // package check fire only when the callsite happened to carry a module, so
+    // any receiver that is not a bare package-named identifier (a member chain
+    // like `this.kv.get`, or a bare `get(obj, path)` lodash-style call) had
+    // `callee.module == None` and matched on METHOD NAME ALONE -- e.g. the got
+    // SSRF sink `{package:"got", method:"get"}` bound to every `.get(...)` in the
+    // tree. Requiring the module to be present and equal whenever the model pins
+    // a package makes package-qualified sinks (got/axios/request/superagent/
+    // node-fetch, ...) sound: an unresolved receiver is a conservative miss, not
+    // a false SSRF. `receiver_type` stays optional on purpose -- the TS frontend
+    // does not emit it, so gating on it would drop every type-qualified model.
+    if let Some(expected) = model.package.as_ref() {
+        if callee.module.as_deref() != Some(expected.as_str()) {
+            return false;
+        }
     }
     if let (Some(expected), Some(actual)) =
         (model.receiver_type.as_ref(), callee.receiver_type.as_ref())
     {
         if expected != actual { return false; }
+    }
+    // A model keyed purely by receiver type -- an instance method with no
+    // `package` (invoke.Context.run, requests.Session.get, aiohttp.ClientSession
+    // .get, ...) -- asserts the receiver is an instance of that class. The type
+    // gate above only fires when BOTH sides carry a receiver_type, so a callsite
+    // with no receiver_type (a module ref `asyncio.run`, a member chain
+    // `response.headers.get`, any unresolved value) used to match on METHOD NAME
+    // alone -- binding a Session.get SSRF sink to every dict-ish `.get(...)`.
+    // When the model's frontend emits receiver_type on method calls, that absence
+    // is meaningful: the receiver is not a confirmable instance of the model's
+    // class, so a type-keyed sink must be a conservative miss, not a name-only
+    // hit. Frontends that do not emit receiver_type stay loose (else every
+    // type-qualified model would drop); the gate is keyed on the model's language,
+    // which bind_model has already matched to the callsite's language.
+    if model.package.is_none()
+        && model.receiver_type.is_some()
+        && callee.receiver_type.is_none()
+        && language_emits_receiver_type(model.language.as_deref())
+    {
+        return false;
     }
     if let (Some(expected), Some(actual)) = (model.arity, callee.arity) {
         if expected != actual { return false; }
@@ -397,7 +439,7 @@ fn simple_identifier(value: &str) -> bool {
         else { ch == '_' || ch.is_ascii_alphanumeric() })
 }
 
-fn framed_record(reader: &mut BufReader<File>) -> Result<Option<Vec<u8>>, String> {
+fn framed_record<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header) {
         Ok(()) => {},
@@ -458,8 +500,9 @@ fn string_field<'a>(bytes: &'a [u8], wanted: u32) -> Option<&'a str> {
 /// million-node graph never becomes a Python object graph and the full edge
 /// stream is not retained in Rust either.
 fn index_from_path(path: &Path) -> Result<Index, String> {
-    let file = File::open(path).map_err(|error| format!("cannot open Pass-1 input: {error}"))?;
-    let mut reader = BufReader::new(file);
+    // The Pass-1 input sidecar may be gzip-framed; open_frames sniffs the magic
+    // and streams the decode, keeping the catalog binder single-pass either way.
+    let mut reader = crate::native_graph::open_frames(path)?;
     let mut calls = Vec::<crate::graph_proto::NodeRecord>::new();
     // Property-write and computed-property-write nodes are not calls, but a
     // catalog sink can still name them: `el.innerHTML = tainted` (a static

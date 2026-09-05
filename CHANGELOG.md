@@ -7,6 +7,68 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.5.0]
+
+Scale-and-lifetime release. Two engine capabilities headline it: the build now
+federates independent shards so a large multi-language tree is analyzed within a
+bounded memory envelope, and a native temporal pipeline confirms C object-lifetime
+bugs (double-free, use-after-free) end to end rather than leaving them out of the
+taxonomy. Pre-1.0: the candidate surface, the graph schema and the query projection
+widen here; older candidate output remains readable.
+
+### Added
+
+- **Federated sharding.** Independent shard stores are federated by cross-shard USR
+  linking, so value flow, callers and callees resolve across shard boundaries. The
+  cross-shard value-flow composition runs in Pass 2/3 across all four languages
+  (C, Python, JavaScript, TypeScript), reverse resolution recovers federated
+  callers, and shards build in parallel by default. Cross-shard nodes and edges are
+  de-duplicated on COPY so the store reports true, not double-counted, totals.
+- **Native temporal lifetime pipeline (C).** A separate native path —
+  `native/clang_frontend` (C lifecycle events) → the Rust `lifetime_kernel`
+  typestate matcher → the temporal-obligation census — surfaces object-lifetime
+  families (double-free, use-after-free and their kin) that the sink taxonomy alone
+  cannot name. Double-free and use-after-free are confirmed end to end on the
+  lifetime fixtures, with no false positive on the clean control. Confirmed
+  temporal leads carry `file:line` (decl id resolved to source location).
+- **Scan from a URL.** `lachesis` accepts a git URL as the scan source and clones
+  it before building, so a one-shot scan needs no prior checkout.
+- **Graph-first Explorer bundle export and proof CLI.** Export a graph-first
+  Explorer bundle with validated trace artifacts and explicit source-link
+  templates, for offline review of a scan.
+- **Object-integrity reflection family** in the taxonomy, and type-keyed sink
+  models made sound by stamping the receiver type in Python and TypeScript so a
+  model keyed to a type binds only on that type.
+- **Guard adjudication substrate.** The C frontend emits loop and switch body
+  regions and classifies guard dominance by surfacing branch substrate to the
+  census; the validation-call guard recognizer fires on real call graphs and is
+  surfaced in the explain capsule.
+
+### Fixed
+
+- **Lifetime-kernel precision.** Closed the aggregate-copy struct double-free;
+  made cap truncation per-function instead of a graph-wide veto; stopped
+  return-may-null origins from seeding a spurious leak; stopped flagging the clean
+  realloc idiom as leak/dangling-use; and unlinked leading declarations from the
+  synthetic exit so a leading-decl no longer bypasses the exit check.
+- **Bounded-memory Linux scale.** Pass 3 shards by weakly-connected component and
+  the native semantic serialize streams, so peak RSS is bounded on a large tree;
+  the enrich shard split streams rather than buffering the whole input.
+- **Native family reporting is honest.** Unvalidated native families are reported
+  as PARTIAL leads, and native temporal findings that resolve to a non-C file are
+  dropped rather than surfaced against the wrong language.
+- **Graph wire robustness.** Lone surrogates are scrubbed instead of aborting the
+  build.
+
+### Known limitations
+
+- **Temporal confirmation is C-only.** The confirmed lifetime families run through
+  the native clang/Rust pipeline; the other languages carry the sink taxonomy but
+  not the temporal-obligation census.
+- **One open lifetime false positive.** An object that is both freed and used after
+  free can be spuriously reported leaked at function exit; this is a
+  `lifetime_kernel` state-machine issue and is tracked, not yet closed.
+
 ## [0.4.2]
 
 Packaging fix. The Atropos catalog — the data every catalog-keyed judgement reads,

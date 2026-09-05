@@ -14,7 +14,6 @@ class CliVersionTests(unittest.TestCase):
             "lachesis.cli.analyze",
             "lachesis.cli.query",
             "lachesis.planner.cli",
-            "lachesis.planner.candidate_cli",
             "lachesis.nav.mcp_server",
         )
         for module in modules:

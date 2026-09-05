@@ -61,6 +61,94 @@ def _dump(result) -> int:
     return EXIT_OK
 
 
+def _nonnegative_int(value: str) -> int:
+    """Validate a non-negative integer count (0 is allowed and means "no cap")."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
+def _rank(value: str) -> float:
+    """Validate a 0.0..1.0 rank threshold -- mirrors the same guard on `scan --min-rank`."""
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number from 0.0 to 1.0") from error
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be a number from 0.0 to 1.0")
+    return parsed
+
+
+def _gather_candidates(analysis, args, *, temporal: bool) -> dict:
+    """Return the candidate result honoring ``--limit`` past the registry's per-page cap.
+
+    The registry pages each family at up to 200 rows per call and hands back a
+    ``next_cursor`` for the rest; a CLI caller who asked for ``--limit 2000`` (or
+    ``--limit 0`` = all) otherwise saw a silent 200-row truncation. Walk the cursor
+    per family to the requested depth and stitch the pages back into the registry's own
+    result shape, so rendering and ``--json`` stay unchanged. Each call reuses the
+    cached bind bundle (keyed by temporal/hard_stop), so paging only re-slices
+    precomputed rows -- it does not re-bind the catalog.
+    """
+    want = None if args.limit == 0 else max(1, args.limit)
+
+    def call(constructor, limit, cursor):
+        return analysis.candidates(
+            temporal=temporal, hard_stop=args.hard_stop, constructor=constructor,
+            domain=args.domain, language=args.language, limit=limit,
+            detail=args.detail, cursor=cursor)
+
+    def page_family(constructor, seed):
+        rows = list(seed.get("candidates") or [])
+        cursor = seed.get("next_cursor")
+        while cursor and (want is None or len(rows) < want):
+            step = 200 if want is None else min(200, want - len(rows))
+            res = call(constructor, step, cursor)
+            rows.extend(res.get("candidates") or [])
+            cursor = res.get("next_cursor")
+        out = dict(seed)
+        out["candidates"] = rows if want is None else rows[:want]
+        out["returned"] = len(out["candidates"])
+        out["next_cursor"] = cursor
+        return out
+
+    first = call(args.constructor, 200 if want is None else min(200, want), None)
+    if "groups" in first:
+        merged = dict(first)
+        merged["groups"] = [
+            page_family(g.get("constructor"), g) for g in first["groups"]]
+        return merged
+    return page_family(args.constructor, first)
+
+
+def _filter_min_rank(result: dict, min_rank: float) -> dict:
+    """Drop candidates below ``min_rank`` in place, preserving the result shape.
+
+    ``scan`` has ``--min-rank`` but ``candidates`` did not, so the unevaluated temporal
+    placeholders (rank ``null``, treated as 0.0) could not be filtered out. A row with no
+    rank sorts as 0.0, so any positive threshold removes them; a threshold of 0.0 is a
+    no-op and returns the result untouched.
+    """
+    if min_rank <= 0:
+        return result
+
+    def keep(rows):
+        return [r for r in rows if (r.get("rank") or 0.0) >= min_rank]
+
+    if "groups" in result:
+        for group in result["groups"]:
+            group["candidates"] = keep(group.get("candidates") or [])
+            group["returned"] = len(group["candidates"])
+    else:
+        result["candidates"] = keep(result.get("candidates") or [])
+        result["returned"] = len(result["candidates"])
+    return result
+
+
 def _open(args, *, progress=None, defer_maps=False):
     """Open the graph warm, or fail with a legible message. ``~`` is expanded by ``open``."""
     from lachesis.session import Analysis
@@ -74,7 +162,14 @@ def _open(args, *, progress=None, defer_maps=False):
 def command_enrich(args: argparse.Namespace) -> int:
     """Pass 2: materialize the dataflow tier and the catalog bind to disk (``.dataflow.pb`` /
     ``.bind.pb``), so later ``analyze``/``candidates``/``explain`` on a fresh process are warm."""
+    import os
     from lachesis.cli.progress import Progress
+
+    # Run each whole-graph native pass (Pass-2 enrich, the Pass-3 semantic sidecar) in a
+    # short-lived child so its native arena is returned to the OS on exit instead of
+    # stacking with the next pass's transient. Bounds the enrich peak to the largest
+    # single pass rather than their sum; `setdefault` lets an explicit override win.
+    os.environ.setdefault("LACHESIS_ISOLATE_NATIVE", "1")
 
     with Progress(enabled=not args.json and not args.quiet) as progress:
         _native_note(progress, args)
@@ -95,8 +190,19 @@ def command_enrich(args: argparse.Namespace) -> int:
     print(f"catalog bind:  {report['bind_sidecar']}  "
           f"({'written' if report['bind_written'] else 'not cached'})")
     if not report["temporal_evaluated"]:
-        print("  ! temporal families were not evaluated within the budget -- the bind was not "
-              "fully warmed; rerun `lachesis enrich --hard-stop 0` to finish it unbounded")
+        if args.hard_stop == 0:
+            # The caller already ran unbounded (--hard-stop 0) and the temporal families
+            # still did not evaluate -- telling them to rerun the same command is the
+            # no-op they just ran. This is not a budget shortfall: the temporal pass did
+            # not complete on this graph. Say so, and do not point back at --hard-stop 0.
+            print("  ! temporal families were not evaluated even unbounded (--hard-stop 0): "
+                  "the temporal pass did not complete on this graph, so those families "
+                  "remain not-evaluated (not 'clean'). Reduce scope, or wait for the "
+                  "lifetime pass to land.")
+        else:
+            print("  ! temporal families were not evaluated within the budget -- the bind was "
+                  "not fully warmed; rerun `lachesis enrich --hard-stop 0` to finish it "
+                  "unbounded")
     return EXIT_OK
 
 
@@ -147,6 +253,15 @@ def command_analyze(args: argparse.Namespace) -> int:
                   f".dataflow.pb sidecar so analyze skips the tier), or raise --hard-stop.")
         else:
             print(f"  ! partial run: {len(summary['truncated_functions'])} functions truncated")
+    if summary["total"] == 0 and not summary["timed_out"]:
+        # analyze runs the interprocedural flow families only; a complete run that finds
+        # nothing is not "clean" -- the structural taxonomy (bounds/size/guard families) is
+        # a different pass. Point the reader there so a documented build->enrich->analyze
+        # walk does not end at a false zero when `candidates`/`scan` see 20-50 leads.
+        print(f"  0 flow leads is not 'clean': analyze covers the interprocedural flow "
+              f"families only. Run `lachesis candidates {args.graph}` (or "
+              f"`lachesis scan {args.graph}`) for the structural taxonomy those passes "
+              f"do not.")
     if summary["by_pattern"]:
         print("  by pattern: " + ", ".join(f"{name}={count}"
               for name, count in sorted(summary["by_pattern"].items())))
@@ -181,10 +296,8 @@ def command_candidates(args: argparse.Namespace) -> int:
             result = analysis.census(args.constructor, temporal=temporal,
                                      hard_stop=args.hard_stop)
         else:
-            result = analysis.candidates(
-                temporal=temporal, hard_stop=args.hard_stop,
-                constructor=args.constructor, domain=args.domain, language=args.language,
-                limit=args.limit, detail=args.detail)
+            result = _gather_candidates(analysis, args, temporal=temporal)
+            result = _filter_min_rank(result, args.min_rank)
     if args.json:
         return _dump(result)
     _render_candidates(result, census=args.census, args=args)
@@ -356,7 +469,11 @@ def add_reader_verbs(subcommands) -> None:
     candidates.add_argument("--constructor", help="pin one family (default: every family)")
     candidates.add_argument("--domain", help="restrict to one domain")
     candidates.add_argument("--language", help="restrict to one language")
-    candidates.add_argument("--limit", type=int, default=40, help="rows per family (default: 40)")
+    candidates.add_argument("--limit", type=_nonnegative_int, default=40, metavar="N",
+                            help="rows per family (default: 40; 0 = every row)")
+    candidates.add_argument("--min-rank", type=_rank, default=0.0, metavar="R", dest="min_rank",
+                            help="drop candidates ranked below R (0.0..1.0); unranked rows "
+                                 "count as 0.0")
     candidates.add_argument("--detail", choices=("brief", "compact", "full"), default="compact")
     candidates.add_argument("--census", action="store_true",
                             help="report coverage counts instead of rows")

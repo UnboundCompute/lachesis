@@ -65,22 +65,23 @@ def _workspace_root(workspace_root: Optional[str]) -> Path:
 
 def typescript_compiler_frontend(workspace_root: Optional[str] = None) -> FrontendSpec:
     root = _workspace_root(workspace_root)
-    configured_heap = os.environ.get("LACHESIS_TS_MAX_OLD_SPACE_MB", "12288")
-    try:
-        heap_mb = max(512, int(configured_heap))
-    except ValueError:
-        heap_mb = 12288
+    from ..resources import typescript_heap_mb, typescript_stack_kb
+    heap_mb = typescript_heap_mb()
+    stack_kb = typescript_stack_kb()
     return FrontendSpec(
         frontend_id="typescript-compiler-api",
         languages=("typescript", "javascript"),
         extensions=(".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"),
         command=(
-            # Node's default old-space is around 4GB, which a mid-sized application
-            # tree exhausts during analysis, before serialization is even reached: the
-            # node map, the edge list and the per-tier arrays are all live at once. The
-            # flag is advisory, so a small build still uses only what it needs, and it
-            # is spelled here rather than in NODE_OPTIONS so it shows up in `ps`.
+            # Reserve part of the shared process-tree budget for Node's native
+            # allocations and the Python parent. The flag is spelled here rather
+            # than in NODE_OPTIONS so the effective ceiling is visible in `ps`.
             "node", f"--max-old-space-size={heap_mb}",
+            # Raise V8's call-stack ceiling so the recursive AST descent does not
+            # SIGABRT on very large single bundled files (the default ~984 KiB
+            # stack overflows on deep nesting). The frontend child also raises
+            # RLIMIT_STACK (core/runner.py) so this larger stack is OS-backed.
+            f"--stack-size={stack_kb}",
             str(root / "lachesis" / "frontends" / "typescript" / "build_graph.mjs"),
             "{source_dir}", "{output_dir}",
         ),

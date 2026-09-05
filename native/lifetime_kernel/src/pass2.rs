@@ -6,12 +6,13 @@
 //! while protobuf properties remain typed for overlay-specific accessors.
 
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use hashbrown::HashMap;
 use prost::Message;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use sha2::{Digest, Sha256};
 
 use crate::graph_proto;
@@ -79,17 +80,34 @@ impl Drop for DataflowStreamWriter {
 #[derive(Default)]
 pub(crate) struct Symbols {
     values: Vec<String>,
-    lookup: FxHashMap<String, u32>,
+    lookup: FxHashMap<u64, u32>,
+    collisions: FxHashMap<u64, Vec<u32>>,
 }
 
 impl Symbols {
+    #[inline]
+    fn hash(value: &str) -> u64 {
+        let mut hasher = FxHasher::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(crate) fn intern(&mut self, value: String) -> u32 {
-        if let Some(symbol) = self.lookup.get(&value) {
-            return *symbol;
+        let hash = Self::hash(&value);
+        if let Some(symbol) = self.lookup.get(&hash).copied() {
+            if self.get(symbol) == value { return symbol; }
+            if let Some(symbol) = self.collisions.get(&hash).into_iter().flatten()
+                .copied().find(|symbol| self.get(*symbol) == value) {
+                return symbol;
+            }
         }
         let symbol = self.values.len() as u32;
-        self.lookup.insert(value.clone(), symbol);
         self.values.push(value);
+        if self.lookup.contains_key(&hash) {
+            self.collisions.entry(hash).or_default().push(symbol);
+        } else {
+            self.lookup.insert(hash, symbol);
+        }
         symbol
     }
 
@@ -97,14 +115,47 @@ impl Symbols {
         self.values.get(symbol as usize).map(String::as_str).unwrap_or("")
     }
 
-    pub(crate) fn find(&self, value: &str) -> Option<u32> { self.lookup.get(value).copied() }
+    pub(crate) fn find(&self, value: &str) -> Option<u32> {
+        let hash = Self::hash(value);
+        let symbol = self.lookup.get(&hash).copied()?;
+        if self.get(symbol) == value { return Some(symbol); }
+        self.collisions.get(&hash).into_iter().flatten().copied()
+            .find(|symbol| self.get(*symbol) == value)
+    }
+}
+
+/// A node property whose key is interned into the shared `Symbols` table.
+///
+/// Property keys repeat across the whole graph (there are only a few dozen
+/// distinct keys), so storing the `String` key on every one of the millions of
+/// retained nodes dominates the Pass-2 arena.  Interning the key to a `u32`
+/// keeps the (rarely-repeating) value untouched and cuts the per-field cost from
+/// a heap `String` to four bytes.  Output is unaffected: the dataflow stream is
+/// written from the `graph_proto` `Delta` in `absorb_native_delta` *before* the
+/// records are absorbed and interned here, so only the in-RAM retained copy
+/// shrinks.
+pub(crate) struct NodeProp {
+    /// Key interned via `Graph::symbols`; resolve with `Symbols::find`.
+    pub(crate) key: u32,
+    pub(crate) value: Option<graph_proto::Value>,
 }
 
 pub(crate) struct Node {
     pub(crate) id: u32,
     pub(crate) kind: u32,
     pub(crate) label: String,
-    pub(crate) properties: Vec<graph_proto::Field>,
+    pub(crate) properties: Vec<NodeProp>,
+}
+
+/// Intern the keys of a decoded node record's properties, moving each value
+/// across untouched.  Edges keep their `graph_proto::Field` properties because
+/// edge deduplication compares property vectors directly (`Graph::absorb`).
+fn intern_node_props(
+    symbols: &mut Symbols, fields: Vec<graph_proto::Field>,
+) -> Vec<NodeProp> {
+    fields.into_iter()
+        .map(|field| NodeProp { key: symbols.intern(field.key), value: field.value })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -131,7 +182,6 @@ pub(crate) struct Graph {
     pub(crate) edges: Vec<Edge>,
     pub(crate) node_by_id: FxHashMap<u32, usize>,
     pub(crate) outgoing: Vec<Vec<usize>>,
-    pub(crate) incoming: Vec<Vec<usize>>,
     /// Frequently queried structural fields, indexed by node position.  The
     /// original property vectors remain available to overlays that need richer
     /// fields, but control-flow no longer rescans them during every sort/walk.
@@ -139,13 +189,28 @@ pub(crate) struct Graph {
     /// Candidate edge indexes by triple.  Properties are compared only when a
     /// triple collides, matching composition's first-wins/different-properties
     /// behavior without serializing every edge during ingestion.
-    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>>,
+    pub(crate) edge_lookup: FxHashMap<(u32, u32, u32), usize>,
+    /// Additional same-triple edges are rare; keep their allocations out of
+    /// the common one-edge dedup entry.
+    pub(crate) edge_collisions: FxHashMap<(u32, u32, u32), Vec<usize>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct Delta {
     pub(crate) nodes: Vec<graph_proto::NodeRecord>,
     pub(crate) edges: Vec<graph_proto::EdgeRecord>,
+}
+
+impl Delta {
+    pub(crate) fn canonicalize(&mut self) {
+        self.nodes.sort_by(|left, right| {
+            (&left.id, &left.kind, &left.label).cmp(&(&right.id, &right.kind, &right.label))
+        });
+        self.edges.sort_by(|left, right| {
+            (&left.kind, &left.source, &left.target)
+                .cmp(&(&right.kind, &right.source, &right.target))
+        });
+    }
 }
 
 impl Graph {
@@ -175,8 +240,9 @@ impl Graph {
     pub(crate) fn node_property<'a>(
         &self, node: &'a Node, key: &str,
     ) -> Option<&'a graph_proto::Value> {
+        let symbol = self.symbols.find(key)?;
         node.properties.iter().find_map(|field| {
-            (field.key == key).then(|| field.value.as_ref()).flatten()
+            (field.key == symbol).then(|| field.value.as_ref()).flatten()
         })
     }
 
@@ -231,6 +297,20 @@ impl Graph {
         })
     }
 
+    /// Collect the text entries of a list-valued node property.  Mirrors the
+    /// free `text_list_property` used on decoded `graph_proto` records, but reads
+    /// the interned retained-node representation.
+    pub(crate) fn node_property_text_list(&self, node: &Node, key: &str) -> Vec<String> {
+        let Some(value) = self.node_property(node, key) else { return Vec::new(); };
+        let Some(graph_proto::value::Kind::List(list)) = value.kind.as_ref() else {
+            return Vec::new();
+        };
+        list.values.iter().filter_map(|item| match item.kind.as_ref()? {
+            graph_proto::value::Kind::Text(value) => Some(value.clone()),
+            _ => None,
+        }).collect()
+    }
+
     pub(crate) fn absorb(&mut self, delta: Delta) -> Result<(), String> {
         for record in delta.nodes {
             let id = self.symbols.intern(record.id);
@@ -241,33 +321,31 @@ impl Graph {
                 }
                 continue;
             }
-            let node = Node {
-                id,
-                kind: self.symbols.intern(record.kind),
-                label: record.label,
-                properties: record.properties,
-            };
+            let kind = self.symbols.intern(record.kind);
+            let properties = intern_node_props(&mut self.symbols, record.properties);
+            let node = Node { id, kind, label: record.label, properties };
             self.node_by_id.insert(id, self.nodes.len());
             self.nodes.push(node);
             self.outgoing.push(Vec::new());
-            self.incoming.push(Vec::new());
         }
         for record in delta.edges {
             let edge = make_edge(&mut self.symbols, record.kind, record.source, record.target, record.properties);
             let triple = (edge.kind, edge.source, edge.target);
-            let duplicate = self.edge_lookup.get(&triple).into_iter().flatten().any(|index| {
-                self.edges[*index].properties == edge.properties
-            });
+            let duplicate = self.edge_lookup.get(&triple).is_some_and(|index|
+                self.edges[*index].properties == edge.properties)
+                || self.edge_collisions.get(&triple).into_iter().flatten().any(|index|
+                    self.edges[*index].properties == edge.properties);
             if duplicate { continue; }
             let index = self.edges.len();
             if let Some(source) = self.node_by_id.get(&edge.source).copied() {
                 self.outgoing[source].push(index);
             }
-            if let Some(target) = self.node_by_id.get(&edge.target).copied() {
-                self.incoming[target].push(index);
-            }
             self.edges.push(edge);
-            self.edge_lookup.entry(triple).or_default().push(index);
+            if self.edge_lookup.contains_key(&triple) {
+                self.edge_collisions.entry(triple).or_default().push(index);
+            } else {
+                self.edge_lookup.insert(triple, index);
+            }
         }
         Ok(())
     }
@@ -346,9 +424,10 @@ fn frame<'a>(input: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
 }
 
 pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
-    let file = File::open(path.as_ref())
-        .map_err(|error| format!("cannot open Pass-2 input: {error}"))?;
-    let mut input = BufReader::with_capacity(1024 * 1024, file);
+    // The Pass-2 input sidecar may be gzip-framed (see sidecar_project::publish);
+    // open_frames sniffs the magic and streams the decode, so the reader never
+    // holds the whole graph in memory whether the file is raw or compressed.
+    let mut input = crate::native_graph::open_frames(path.as_ref())?;
     let header = read_stream_frame(&mut input)?;
     let document: graph_proto::Document = graph_proto::Document::decode(header.as_slice())
         .map_err(|error| format!("invalid Pass-2 input header: {error}"))?;
@@ -369,10 +448,12 @@ pub(crate) fn read_path(path: impl AsRef<Path>) -> Result<Graph, String> {
             b'N' => {
                 let record = graph_proto::NodeRecord::decode(&payload[1..])
                     .map_err(|error| format!("invalid Pass-2 node frame: {error}"))?;
-                nodes.push(Node {
-                    id: symbols.intern(record.id), kind: symbols.intern(record.kind),
-                    label: record.label, properties: record.properties,
-                });
+                let id = symbols.intern(record.id);
+                let kind = symbols.intern(record.kind);
+                let mut raw = record.properties;
+                raw.retain(|field| !drop_node_property(&field.key));
+                let properties = intern_node_props(&mut symbols, raw);
+                nodes.push(Node { id, kind, label: record.label, properties });
             }
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])
@@ -477,42 +558,54 @@ fn finish_graph(
     let mut node_by_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
     for (index, node) in nodes.iter().enumerate() { node_by_id.insert(node.id, index); }
     let mut outgoing = vec![Vec::new(); nodes.len()];
-    let mut incoming = vec![Vec::new(); nodes.len()];
     for (index, edge) in edges.iter().enumerate() {
         if let Some(source) = node_by_id.get(&edge.source) { outgoing[*source].push(index); }
-        if let Some(target) = node_by_id.get(&edge.target) { incoming[*target].push(index); }
     }
-    let mut edge_lookup: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
+    let mut edge_lookup = FxHashMap::default();
+    let mut edge_collisions: FxHashMap<(u32, u32, u32), Vec<usize>> = FxHashMap::default();
     for (index, edge) in edges.iter().enumerate() {
-        edge_lookup.entry((edge.kind, edge.source, edge.target)).or_default().push(index);
+        let triple = (edge.kind, edge.source, edge.target);
+        if edge_lookup.contains_key(&triple) {
+            edge_collisions.entry(triple).or_default().push(index);
+        } else {
+            edge_lookup.insert(triple, index);
+        }
     }
-    let node_meta = nodes.iter().map(|node| {
-        let text = |key: &str| node.properties.iter().find_map(|field| {
+    // Property keys are interned, so resolve the handful of keys read here once
+    // (an absent key never interned simply yields `None`, exactly as a missing
+    // property did before).
+    let owner_key = symbols.find("owner_function_id");
+    let function_key = symbols.find("function_id");
+    let control_key = symbols.find("control_kind");
+    let start_key = symbols.find("start_offset");
+    let end_key = symbols.find("end_offset");
+    let node_meta: Vec<NodeMeta> = nodes.iter().map(|node| {
+        let text = |key: Option<u32>| key.and_then(|key| node.properties.iter().find_map(|field| {
             if field.key != key { return None; }
             match field.value.as_ref()?.kind.as_ref()? {
                 graph_proto::value::Kind::Text(value) => Some(value.as_str()),
                 _ => None,
             }
-        });
-        let integer = |key: &str| node.properties.iter().find_map(|field| {
+        }));
+        let integer = |key: Option<u32>| key.and_then(|key| node.properties.iter().find_map(|field| {
             if field.key != key { return None; }
             match field.value.as_ref()?.kind.as_ref()? {
                 graph_proto::value::Kind::Integer(value) => Some(*value),
                 _ => None,
             }
-        });
-        let owner = text("owner_function_id").or_else(|| text("function_id"))
+        }));
+        let owner = text(owner_key).or_else(|| text(function_key))
             .and_then(|value| symbols.find(value));
-        let control_kind = text("control_kind").map(|value| symbols.intern(value.to_owned()));
+        let control_kind = text(control_key).map(str::to_owned);
         NodeMeta {
-            start_offset: integer("start_offset").unwrap_or(i64::MAX),
-            end_offset: integer("end_offset").unwrap_or(i64::MAX),
+            start_offset: integer(start_key).unwrap_or(i64::MAX),
+            end_offset: integer(end_key).unwrap_or(i64::MAX),
             owner,
-            control_kind,
+            control_kind: control_kind.map(|value| symbols.intern(value)),
         }
     }).collect();
-    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing, incoming,
-               node_meta, edge_lookup })
+    Ok(Graph { core_content_hash, symbols, nodes, edges, node_by_id, outgoing,
+               node_meta, edge_lookup, edge_collisions })
 }
 
 fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
@@ -524,6 +617,33 @@ fn read_stream_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
     reader.read_exact(&mut payload)
         .map_err(|error| format!("cannot read Pass-2 frame: {error}"))?;
     Ok(payload)
+}
+
+/// Node-property keys never read by any Pass-2 overlay (`control_flow` …
+/// `taint` — the only consumers of the graph `read_path` builds) and never
+/// emitted into a derived record.  They are large per-node source metadata
+/// (`absolute_file`, `syntax_kind`, line/column spans, symbol form/linkage, …)
+/// consumed only by the *independent raw-frame readers* — `sidecar_project`
+/// (Pass-3 substrate) and `native_graph`/`prepare` (the semantic pass) — which
+/// decode the input sidecar directly and never touch this Graph, so pruning them
+/// here leaves the substrate and semantic outputs untouched.  Dropping them
+/// before `intern_node_props` bounds the Pass-2 arena (~40% of node-property
+/// value bytes on the cS corpus) with byte-exact `dataflow.pb` output.
+///
+/// This is a DENY-list, not the `retain_*` keep-list below (which is incomplete
+/// for the live chain — it omits e.g. `language`/`callee_name`/`receiver_type`
+/// that the taint overlay reads — and is applied only in the dead `read_bytes`
+/// path).  A deny-list is fail-safe: a forgotten dead key merely stays resident,
+/// never a dropped live key.  Every entry is proven absent from every overlay
+/// source and from `pass2.rs`, so no overlay can name it in any language.
+fn drop_node_property(key: &str) -> bool {
+    matches!(key,
+        "absolute_file" | "syntax_kind" | "usr" |
+        "start_line" | "end_line" | "start_column" | "end_column" |
+        "form" | "linkage" | "param_index" | "declaration_only" |
+        "content_hash" | "provenance" | "included_because" |
+        "lines" | "is_external" | "is_system"
+    )
 }
 
 fn retain_node_property(field: &graph_proto::Field) -> bool {
@@ -588,12 +708,11 @@ pub(crate) fn read_bytes(input: &[u8]) -> Result<Graph, String> {
                     .map_err(|error| format!("invalid Pass-2 node frame: {error}"))?;
                 let mut record = record;
                 record.properties.retain(retain_node_property);
-                nodes.push(Node {
-                    id: symbols.intern(record.id),
-                    kind: symbols.intern(record.kind),
-                    label: record.label,
-                    properties: record.properties,
-                });
+                let id = symbols.intern(record.id);
+                let kind = symbols.intern(record.kind);
+                let label = record.label;
+                let properties = intern_node_props(&mut symbols, record.properties);
+                nodes.push(Node { id, kind, label, properties });
             }
             b'E' => {
                 let record = graph_proto::EdgeRecord::decode(&payload[1..])

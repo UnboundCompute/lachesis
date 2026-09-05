@@ -33,8 +33,13 @@ def _process_table() -> dict[int, tuple[int, int]]:
     return table
 
 
-def _tree_rss_kib(root: int) -> int:
-    table = _process_table()
+def _descendants(root: int, table: dict[int, tuple[int, int]] | None = None) -> set[int]:
+    """Every process transitively parented by root, discovered by walking ppid
+    (NOT process group). A child that opened its own session -- e.g. a build
+    frontend worker that calls setsid -- leaves root's process group but keeps
+    root somewhere on its ppid chain, so a ppid walk still finds it where a
+    killpg would miss it."""
+    table = _process_table() if table is None else table
     descendants = {root}
     changed = True
     while changed:
@@ -43,33 +48,65 @@ def _tree_rss_kib(root: int) -> int:
             if parent in descendants and pid not in descendants:
                 descendants.add(pid)
                 changed = True
-    return sum(table.get(pid, (0, 0))[1] for pid in descendants)
+    return descendants
+
+
+def _tree_rss_kib(root: int) -> int:
+    table = _process_table()
+    return sum(table.get(pid, (0, 0))[1] for pid in _descendants(root, table))
 
 
 def _terminate_group(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    """Kill the ENTIRE descendant tree, not just the process group. killpg
+    reaches only same-session children; a frontend worker that setsid'd into its
+    own group would survive a killpg and keep running -- concurrently with the
+    NEXT bounded_run, which risks the OOM the memory cap exists to prevent. So we
+    snapshot the whole tree by ppid BEFORE signalling (after the root dies its
+    children reparent to init and the chain is lost), then signal the group AND
+    every snapshot pid individually."""
+    root = process.pid
+    victims = _descendants(root)
+
+    def _signal_all(sig: int) -> None:
+        try:
+            os.killpg(root, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for pid in victims:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    _signal_all(signal.SIGTERM)
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pass
+    # SIGKILL the original snapshot plus anything newly spawned that is still
+    # reachable by ppid, then reap the root.
+    victims |= _descendants(root)
+    _signal_all(signal.SIGKILL)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, required=True, help="wall seconds")
     parser.add_argument("--memory-mb", type=float, required=True, help="process-tree RSS")
+    parser.add_argument("--sample-ms", type=float, default=50.0,
+                        help="RSS sampling interval in milliseconds (default: 50)")
     parser.add_argument("--report", type=Path, help="optional JSON report path")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a command is required after --")
+    if args.timeout <= 0 or args.memory_mb <= 0 or args.sample_ms <= 0:
+        parser.error("limits and --sample-ms must be greater than zero")
 
     started = time.monotonic()
     process = subprocess.Popen(command, start_new_session=True)
@@ -82,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     peak_kib = 0
     reason = "exit"
     try:
-        while process.poll() is None:
+        while True:
             elapsed = time.monotonic() - started
             rss_kib = _tree_rss_kib(process.pid)
             peak_kib = max(peak_kib, rss_kib)
@@ -94,7 +131,9 @@ def main(argv: list[str] | None = None) -> int:
                 reason = "timeout"
                 _terminate_group(process)
                 break
-            time.sleep(0.25)
+            if process.poll() is not None:
+                break
+            time.sleep(args.sample_ms / 1000)
     except KeyboardInterrupt:
         reason = "interrupted"
         _terminate_group(process)
@@ -107,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         "peak_rss_mb": round(peak_kib / 1024, 3),
         "limit_rss_mb": args.memory_mb,
         "timeout_seconds": args.timeout,
+        "sample_interval_ms": args.sample_ms,
         "termination": reason,
         "returncode": returncode,
     }

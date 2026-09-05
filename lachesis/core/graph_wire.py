@@ -7,7 +7,9 @@ produce/consume the same shards.
 """
 from __future__ import annotations
 
+import gzip
 import struct
+import sys
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -49,7 +51,18 @@ def _value(value: Any) -> graph_pb2.Value:
     elif isinstance(value, bytes):
         result.binary = value
     elif isinstance(value, str):
-        result.text = value
+        try:
+            result.text = value
+        except (UnicodeEncodeError, ValueError):
+            # A proto ``string`` field requires valid UTF-8, but a source file
+            # can legally hold a string literal with an unpaired UTF-16
+            # surrogate (a common malformed-unicode test fixture); the parser
+            # hands it to us as a ``str`` carrying that code point, and a raw
+            # assignment raises UnicodeEncodeError and aborts the whole build.
+            # Scrub only the offending code points at the wire boundary and
+            # keep the rest of the literal intact -- one bad char must not lose
+            # the file, or the repo.
+            result.text = value.encode("utf-8", "replace").decode("utf-8")
     elif isinstance(value, (list, tuple)):
         result.list.values.extend((_value(item) for item in value))
         result.list.SetInParent()
@@ -116,6 +129,32 @@ def _properties(
     return fields
 
 
+# Property keys whose text values are drawn from a small vocabulary and repeat
+# across the whole graph -- file paths (one per source file, shared by every node
+# in it), enum-like kinds, and id references (which also coincide with the node ids
+# decode_id already interns, so interning here shares those objects too). Interning
+# their values collapses the duplicates to one object per distinct string. Keys with
+# per-node-unique values (value_id ...) are deliberately absent: interning a string
+# that never repeats only adds it to the intern table for nothing. This is a
+# correctness-neutral dedup hint -- a value is unchanged by being interned, so a key
+# missing here forgoes a saving, never a result.
+_INTERN_VALUE_KEYS = frozenset({
+    "file", "absolute_file", "unit", "language",
+    "type", "kind", "syntax_kind", "event_kind", "sink_kind", "source_kind",
+    "fact_origin", "resolution", "confidence", "access_path", "model_id",
+    "owner_function_id", "enclosing_function_id", "primary_target_id",
+    "target_id", "callee", "receiver_member_id", "callsite_id",
+})
+
+
+def _intern_field(key: str, value: graph_pb2.Value) -> Any:
+    """Decode one field, interning the value when its key draws from a small vocabulary."""
+    out = _from_value(value)
+    if key in _INTERN_VALUE_KEYS and type(out) is str:
+        return sys.intern(out)
+    return out
+
+
 def _from_value(value: graph_pb2.Value) -> Any:
     kind = value.WhichOneof("kind")
     if kind == "null_value":
@@ -133,14 +172,22 @@ def _from_value(value: graph_pb2.Value) -> Any:
     if kind == "list":
         return [_from_value(item) for item in value.list.values]
     if kind == "object":
-        return {field.key: _from_value(field.value) for field in value.object.fields}
+        # Intern the property key: a graph holds the same few dozen field names
+        # (``file``, ``start_line``, ``event_kind`` ...) once per node, so without
+        # interning the same key string is reallocated hundreds of thousands of times
+        # and every copy is retained inside the property dicts. Interning collapses
+        # them to one object per name; a dict is unchanged by whether its keys are
+        # interned, so lookups, iteration order, equality, JSON and digests all match.
+        return {sys.intern(field.key): _intern_field(field.key, field.value)
+                for field in value.object.fields}
     raise ValueError("protobuf graph value has no kind")
 
 
 def _read_properties(fields, wanted: set[str] | None = None) -> dict[str, Any]:
     if wanted is None:
-        return {field.key: _from_value(field.value) for field in fields}
-    return {field.key: _from_value(field.value) for field in fields if field.key in wanted}
+        return {sys.intern(field.key): _intern_field(field.key, field.value) for field in fields}
+    return {sys.intern(field.key): _intern_field(field.key, field.value)
+            for field in fields if field.key in wanted}
 
 
 def _node_message(record: Mapping[str, Any], *, _property_cache: dict | None = None):
@@ -334,6 +381,70 @@ def read_dataflow_stream(path: Path) -> dict[str, Any]:
     return result
 
 
+def read_dataflow_branch_substrate(path: Path, *, node_kinds, edge_kinds) -> dict[str, Any]:
+    """Stream a dataflow sidecar and keep only its control-flow branch substrate.
+
+    ``read_dataflow_stream`` retains every derived record -- the whole value-flow
+    overlay, ~1 GB on a large graph. The guard adjudicator needs only a tiny slice of
+    it: the derived nodes in ``node_kinds`` (the cfg-condition nodes it keys guards
+    on) and the derived edges in ``edge_kinds`` (the branch-region edges the
+    control-flow overlay re-sources from them). This scans the sidecar frame by frame
+    and keeps just those, so peak memory is proportional to the program's control
+    structure, never its size. The return shape matches ``read_dataflow_stream`` so
+    ``Overlay.from_dict`` builds an attachable overlay from it.
+
+    Decoding every record to test its kind costs one streaming pass -- the same CPU a
+    retaining load pays -- but, unlike that load, nothing but the branch slice stays
+    resident, which is the whole point on the ``retain_materialized=False`` path.
+    """
+    node_kinds = frozenset(node_kinds)
+    edge_kinds = frozenset(edge_kinds)
+    with path.open("rb") as handle:
+        if handle.read(len(DATAFLOW_STREAM_MAGIC)) != DATAFLOW_STREAM_MAGIC:
+            raise ValueError(f"not a dataflow stream: {path}")
+        header = handle.read(FRAME.size)
+        if len(header) != FRAME.size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        (size,) = FRAME.unpack(header)
+        payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"truncated dataflow stream header: {path}")
+        message = graph_pb2.DataflowOverlay()
+        message.ParseFromString(payload)
+        result = {
+            "overlay_id": message.overlay_id, "source": message.source,
+            "version": message.version, "core_content_hash": message.core_content_hash,
+            "node_props": {}, "edge_props": {},
+            "derived_nodes": [], "derived_edges": [],
+        }
+        while True:
+            header = handle.read(FRAME.size)
+            if not header:
+                break
+            if len(header) != FRAME.size:
+                raise ValueError(f"truncated dataflow stream frame header: {path}")
+            (size,) = FRAME.unpack(header)
+            frame = handle.read(size)
+            if len(frame) != size or not frame:
+                raise ValueError(f"truncated dataflow stream frame: {path}")
+            kind, record = frame[:1], frame[1:]
+            if kind == b"N":
+                node = decode_node(record)
+                if node.get("kind") in node_kinds:
+                    result["derived_nodes"].append(node)
+            elif kind == b"E":
+                edge = decode_edge(record)
+                if edge.get("kind") in edge_kinds:
+                    result["derived_edges"].append(edge)
+            else:
+                raise ValueError(f"unknown dataflow stream record {kind!r}")
+    result["derived_nodes"].sort(key=lambda node: node["id"])
+    result["derived_edges"].sort(key=lambda edge: (
+        edge.get("kind") or "", edge.get("source") or "", edge.get("target") or "",
+    ))
+    return result
+
+
 def encode_tier(payload: Mapping[str, Any]) -> bytes:
     """Encode a frontend tier with typed node/edge records."""
     message = graph_pb2.TierPayload(
@@ -452,8 +563,19 @@ def write_frame(handle, payload: bytes) -> None:
     handle.write(FRAME.pack(len(payload)) + payload)
 
 
+_FRAME_GZIP_MAGIC = b"\x1f\x8b"
+
+
 def read_frames(path: Path) -> Iterator[bytes]:
-    with path.open("rb") as handle:
+    # The sidecar may be gzip-framed (the native writer compresses it); the gzip
+    # magic cannot collide with a raw frame's 4-byte big-endian length prefix,
+    # whose leading byte is 0x00 for any frame under 16 MiB.  gzip.open streams
+    # the decode, so a compressed sidecar is read with the same bounded memory as
+    # the raw one.
+    with path.open("rb") as probe:
+        compressed = probe.read(2) == _FRAME_GZIP_MAGIC
+    opener = gzip.open if compressed else (lambda p, mode: Path(p).open(mode))
+    with opener(path, "rb") as handle:
         while True:
             header = handle.read(FRAME.size)
             if not header:

@@ -37,6 +37,7 @@ GRAPH PIPELINE
   build      pass 1: create a named structural graph
   enrich     pass 2: warm native binary sidecars
   analyze    pass 3: inspect leads from a named graph
+  trace      export a lachesis-explorer bundle.json for a repository
 
 MORE
   candidates, query, plan, report, communities, doctor, cache, concept-model
@@ -119,7 +120,7 @@ def _native_status() -> str:
 
 def command_completion(args: argparse.Namespace) -> int:
     """Print a dependency-free completion script for the selected shell."""
-    commands = "scan explain mcp build enrich analyze candidates query plan report communities doctor cache completion"
+    commands = "scan explain mcp build enrich analyze candidates query plan trace report communities doctor cache completion"
     if args.shell == "bash":
         print(f'''_lachesis_complete() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}"
@@ -145,6 +146,12 @@ complete -c lachesis -n "__fish_seen_subcommand_from scan" -l json -l quiet -s q
 
 def command_query(args: argparse.Namespace) -> int:
     """Run the structured graph query parser without a REMAINDER passthrough."""
+    # Bind json at function entry. The except clause below references
+    # json.JSONDecodeError, and a later `import json` inside the format branch
+    # made json a function-local everywhere -- so a store-open failure hit the
+    # except with json unbound and raised UnboundLocalError instead of the clean
+    # one-line error every other verb gives on a bad graph path.
+    import json
     from lachesis.cli import query
     values = vars(args).copy()
     values["command"] = values.pop("query_command")
@@ -155,7 +162,6 @@ def command_query(args: argparse.Namespace) -> int:
         _stderr(json.dumps({"error": str(error), "query": query_args.command}))
         return EXIT_FAILURE
     if args.format == "json":
-        import json
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print(query.render_text(result), end="")
@@ -199,12 +205,31 @@ def command_plan(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- scan
 
 def command_scan(args: argparse.Namespace) -> int:
+    from lachesis.cli.source import resolve_source
+
+    # A source may be a local path or a remote git URL (optionally ``url#subdir``
+    # to scan one subtree of a monorepo). resolve_source fetches a URL into a
+    # managed temp clone and returns a cleanup hook; a local path resolves in
+    # place with a no-op cleanup. The analysis below only ever sees a local dir,
+    # and cleanup runs on every exit path (findings, error, or exception).
+    note = None if args.quiet else (lambda m: _stderr(f"  {m}"))
+    try:
+        resolved = resolve_source(args.path, note=note)
+    except (RuntimeError, ValueError) as error:
+        _stderr(f"lachesis: could not fetch source: {error}")
+        return EXIT_USAGE
+    try:
+        return _scan_source(args, resolved.path)
+    finally:
+        resolved.cleanup()
+
+
+def _scan_source(args: argparse.Namespace, source: Path) -> int:
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
                                       ensure_graph)
     from lachesis.cli.progress import Progress
     from lachesis.planner.cli import _census_line, _render
 
-    source = _resolved(args.path)
     # Progress narrates to stderr; with --json stdout has to stay a clean document, and
     # with --quiet the caller has said they want neither.
     progress = Progress(enabled=not args.quiet)
@@ -283,10 +308,19 @@ def command_scan(args: argparse.Namespace) -> int:
                 rendered = _render(lead, position)
             else:
                 observations = lead.get("observations") or {}
+                # Always surface the file. The old form printed `{symbol}:{line}` from
+                # entry/callee only, so a temporal lead -- which carries no callee and no
+                # entry -- rendered as a location-less `:6`, dropping the one coordinate a
+                # reader needs to open it. Show `file:line` (the file is in observations),
+                # keeping the symbol ahead of it when there is one.
+                symbol = (lead.get("entry") or observations.get("callee")
+                          or observations.get("site") or "")
+                where = observations.get("file") or lead.get("file") or ""
+                line = lead.get("line") or observations.get("line") or ""
+                location = f"{where}:{line}" if where else f":{line}"
                 rendered = (f"{position:>3}. [{(lead.get('rank') or 0.0):.3f}] "
                             f"{lead.get('pattern') or lead.get('constructor') or 'lead'}  "
-                            f"{lead.get('entry') or observations.get('callee', '')}:"
-                            f"{lead.get('line') or observations.get('line', '')}")
+                            f"{symbol + '  ' if symbol else ''}{location}")
             print(_color(rendered, "cyan", args.color))
             print()
         if len(shown) < len(queue):
@@ -296,6 +330,90 @@ def command_scan(args: argparse.Namespace) -> int:
                     "agent that can\nanswer them against the same graph, run: lachesis mcp")
     if args.fail_on_findings and queue:
         return EXIT_FINDINGS
+    return EXIT_OK
+
+
+# ----------------------------------------------------------------------- trace
+
+def _repo_meta(source: Path) -> tuple[str | None, str | None]:
+    """Best-effort (repo, commit) from git; either may be None."""
+    import subprocess
+
+    def git(*a: str) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(source), *a],
+                                 capture_output=True, text=True, timeout=10)
+            return (out.stdout.strip() or None) if out.returncode == 0 else None
+        except Exception:
+            return None
+
+    commit = git("rev-parse", "--short", "HEAD")
+    remote = git("config", "--get", "remote.origin.url")
+    repo = None
+    if remote:
+        slug = remote.rstrip("/").removesuffix(".git")
+        parts = slug.replace(":", "/").split("/")
+        if len(parts) >= 2:
+            repo = "/".join(parts[-2:])
+    return repo, commit
+
+
+def command_trace(args: argparse.Namespace) -> int:
+    """Build (or reuse) a graph and export a lachesis-explorer bundle.json."""
+    from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
+                                      ensure_graph)
+    from lachesis.cli.progress import Progress
+    from lachesis.nav import bundle as bundle_mod
+
+    source = _resolved(args.repo)
+    progress = Progress(enabled=not args.quiet)
+    if not args.quiet:
+        _stderr(f"lachesis trace: {source}")
+    try:
+        is_graph = source.is_dir() and (
+            source.name.endswith(".kuzu")
+            or (source / "lachesis-manifest.pb").is_file()
+            or (source / "manifest.pb").is_file()
+        )
+        if is_graph and not args.refresh:
+            graph_path = source
+        else:
+            graph_path, _ = ensure_graph(source, refresh=args.refresh,
+                                         progress=progress,
+                                         timeout_seconds=args.timeout)
+    except EnvironmentProblem as error:
+        return _report_environment(error)
+    except NoSourceFound as error:
+        _stderr(f"lachesis trace: {error}")
+        return EXIT_USAGE
+
+    repo, commit = _repo_meta(source)
+    progress.phase("exporting bundle")
+    try:
+        bundle = bundle_mod.build_bundle(
+            str(graph_path),
+            repo=args.repo_name or repo,
+            commit=args.commit or commit,
+            lang=args.lang,
+            source_dir=str(source),
+            per_family=args.per_family,
+            max_flows=args.max_flows,
+            schema_version=args.schema_version,
+            source_url_template=args.source_url_template,
+        )
+    except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
+        _stderr(f"lachesis trace: {error}")
+        return EXIT_FAILURE
+    progress.done()
+
+    out = Path(args.out).expanduser()
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))
+    graph = bundle["graph"]
+    findings = bundle.get("findings") or (bundle.get("security") or {}).get("findings") or []
+    _stderr(f"wrote {len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
+            f"{len(findings)} findings -> {out}")
     return EXIT_OK
 
 
@@ -518,6 +636,8 @@ def command_build(args: argparse.Namespace) -> int:
     from lachesis.cli import analyze
 
     forwarded = [args.source_dir, args.output_path, "--timeout", str(args.timeout)]
+    if args.memory_budget_mb is not None:
+        forwarded.extend(["--memory-budget-mb", str(args.memory_budget_mb)])
     if args.output_flag:
         forwarded.extend(["--output", args.output_flag])
     if args.frontend_out:
@@ -534,6 +654,8 @@ def command_build(args: argparse.Namespace) -> int:
         forwarded.extend(["--shard-large-packages", str(args.shard_large_packages)])
     if args.stream_shards:
         forwarded.extend(["--stream-shards", args.stream_shards])
+    for included in getattr(args, "include_paths", None) or []:
+        forwarded.extend(["--include", included])
     return analyze.main(forwarded)
 
 
@@ -671,8 +793,18 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subcommands.add_parser(
         "scan", help="report what an attacker could reach in a codebase",
         description="Index the tree if needed, then rank the reachable sensitive "
-                    "effects that no recognised guard covers.")
+                    "effects that no recognised guard covers. The source may be a "
+                    "local path or a git URL (https://…, git@…, ….git), optionally "
+                    "with a #subdir fragment to scan one subtree of a monorepo; a "
+                    "URL is shallow-cloned to a temp dir and removed when done.")
     _add_source_flags(scan)
+    # scan additionally accepts a remote URL in the same positional slot; the
+    # other source commands stay local-only, so override just scan's help here.
+    for _action in scan._actions:
+        if _action.dest == "path":
+            _action.help = ("directory or git URL to analyse (default: the current "
+                            "directory); append #subdir to scan one subtree of a repo")
+            break
     scan.add_argument("--limit", type=_nonnegative_int, default=20, metavar="N",
                       help="how many findings to print (0 = all, default 20)")
     scan.add_argument("--min-rank", type=_rank, default=0.0, metavar="R",
@@ -795,6 +927,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="keep lexical token/proof records (pruned by default)")
     build.add_argument("--timeout", type=_positive_seconds, default=300, metavar="SECONDS",
                        help="maximum seconds per frontend (default: 300)")
+    build.add_argument("--memory-budget-mb", type=_positive_int, default=None, metavar="MiB",
+                       help="total memory budget for the build process tree (default 5120). "
+                            "Sizes the frontend chunking so a Linux-scale tree builds without "
+                            "OOM; the emitted graph is identical at any budget. Same as "
+                            "LACHESIS_MEMORY_BUDGET_MB; the flag wins.")
     build.add_argument("--incremental", action="store_true",
                        help="reuse unchanged frontend bundles")
     build.add_argument("--parallel-packages", action="store_true",
@@ -805,7 +942,43 @@ def build_parser() -> argparse.ArgumentParser:
                        metavar="FILES", help="split large packages into bounded jobs")
     build.add_argument("--stream-shards", metavar="DIR",
                        help="stream frontend shards directly into the graph store")
+    build.add_argument("--include", metavar="PATH", action="append", dest="include_paths",
+                       help="also analyse this file or directory even if it is outside "
+                            "source_dir (repeatable); point it at an advisory's file so a "
+                            "narrowed scope never excludes the file the run must reach")
     build.set_defaults(handler=command_build, no_prune=False)
+
+    trace = subcommands.add_parser(
+        "trace", help="build a graph and export a lachesis-explorer bundle.json",
+        description="Point at a repository (or an existing .kuzu graph) and write a "
+                    "lachesis-explorer bundle.json: the sink families the graph carries, "
+                    "each with the reachability cone that feeds it, in the shape the "
+                    "explorer renders. Every flow is a fact, not a verdict.")
+    trace.add_argument("repo", nargs="?", default=".",
+                       help="source tree or existing graph to trace (default: .)")
+    trace.add_argument("--repo", dest="repo", metavar="PATH",
+                       help="same as the positional repo argument")
+    trace.add_argument("-o", "--out", default="bundle.json", metavar="FILE",
+                       help="bundle path to write (default: bundle.json)")
+    trace.add_argument("--repo-name", metavar="OWNER/REPO",
+                       help="override the repo slug recorded in bundle meta")
+    trace.add_argument("--commit", metavar="SHA", help="override the commit in meta")
+    trace.add_argument("--lang", metavar="LANG", help="override the language in meta")
+    trace.add_argument("--schema-version", choices=("1.0", "2.0"), default="2.0",
+                       help="Explorer bundle contract to emit (default: 2.0 graph-first)")
+    trace.add_argument("--source-url-template", metavar="URL_TEMPLATE",
+                       help="explicit HTTP(S) source template using {file}, {line}, {end_line}, {revision}")
+    trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
+                       help="max leads to draw from each sink family (default: 6)")
+    trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",
+                       help="max flows in the bundle (default: 40)")
+    trace.add_argument("--timeout", type=_positive_seconds, default=600, metavar="SECONDS",
+                       help="maximum seconds per frontend when building (default: 600)")
+    trace.add_argument("--refresh", action="store_true",
+                       help="rebuild the graph even if a current cache exists")
+    trace.add_argument("--quiet", "-q", action="store_true",
+                       help="suppress progress narration on stderr")
+    trace.set_defaults(handler=command_trace)
 
     query = subcommands.add_parser(
         "query", help="ask a focused question of a named graph",
@@ -813,7 +986,11 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("graph", help="path to a .kuzu graph")
     query.add_argument("--budget-tokens", type=_positive_int, default=12000,
                        metavar="N", help="approximate answer budget")
-    query.add_argument("--format", choices=("json", "text"), default="json")
+    # Default to text like every other verb (scan/analyze/candidates emit text unless
+    # --json). query alone used to default to json, which surprised a reader who ran it
+    # after the others; pass --format json to restore the machine-readable document.
+    query.add_argument("--format", choices=("json", "text"), default="text",
+                       help="output format (default: text; use json for a machine-readable slice)")
     query_commands = query.add_subparsers(dest="query_command", metavar="<question>",
                                           required=True)
     query_commands.add_parser("overview", help="summarize the graph")
@@ -869,7 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
 KNOWN_COMMANDS = {
     "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
-    "query", "plan", "completion",
+    "query", "plan", "completion", "trace",
 }
 
 

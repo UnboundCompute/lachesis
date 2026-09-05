@@ -38,8 +38,8 @@ from lachesis.nav.graphlib import GraphLib
 from lachesis.nav import symbol_index as si
 from lachesis.nav.overlay import Overlay, sidecar_path
 from lachesis.core.graph_wire import (
-    decode_overlay, is_dataflow_stream, read_dataflow_stream,
-    read_dataflow_stream_header,
+    decode_overlay, is_dataflow_stream, read_dataflow_branch_substrate,
+    read_dataflow_stream, read_dataflow_stream_header,
 )
 
 
@@ -87,6 +87,44 @@ def dataflow_overlay_path(graph_path: str) -> str:
     return str(graph_path).rstrip("/") + ".dataflow.pb"
 
 
+def _choose_enrich_shards(input_path: Path) -> int:
+    """How many shards to split the native Pass-2 input into (1 = whole-graph).
+
+    The whole-graph runner holds the entire input plus every overlay delta in RAM, so its
+    peak is roughly an order of magnitude above the on-disk (gzipped) input. On a large
+    tree that OOMs. Sharding by owner function bounds the peak to one shard, at a small
+    replication overhead, and is content-equivalent (see :mod:`lachesis.flow.shard_enrich`).
+
+    Control:
+      * ``LACHESIS_ENRICH_SHARDS`` -- explicit shard count; ``1`` forces the whole-graph
+        path, any value > 1 forces exactly that many shards.
+      * otherwise auto: estimate peak as ``PEAK_PER_INPUT_MB * gzipped-input-MB`` and pick
+        the fewest shards that keep it under ``LACHESIS_MEMORY_BUDGET_MB`` (default 4096),
+        never splitting until the estimated peak exceeds the budget.
+    """
+    explicit = os.environ.get("LACHESIS_ENRICH_SHARDS")
+    if explicit:
+        try:
+            return max(1, int(explicit))
+        except ValueError:
+            pass
+    try:
+        size_mb = input_path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return 1
+    # Measured on a 678k-node C graph: 61 MB gzipped input -> ~1510 MB whole-graph peak.
+    PEAK_PER_INPUT_MB = 25.0
+    try:
+        budget_mb = float(os.environ.get("LACHESIS_MEMORY_BUDGET_MB", "4096"))
+    except ValueError:
+        budget_mb = 4096.0
+    est_peak = PEAK_PER_INPUT_MB * size_mb
+    if est_peak <= budget_mb or budget_mb <= 0:
+        return 1
+    import math
+    return max(2, math.ceil(est_peak / budget_mb))
+
+
 def _dataflow_cache_matches(path: str, core_hash: str | None) -> bool:
     if not core_hash or not os.path.isfile(path):
         return False
@@ -114,6 +152,39 @@ def _load_dataflow_overlay(path: str) -> Overlay:
     sidecar = Path(path)
     payload = (read_dataflow_stream(sidecar) if is_dataflow_stream(sidecar)
                else decode_overlay(sidecar.read_bytes()))
+    return Overlay.from_dict(payload)
+
+
+# The control-flow branch substrate the guard adjudicator reads: the cfg-condition
+# nodes it keys guards on (cfg-merge kept alongside as their tiny counterpart), and
+# the branch-region edges the control-flow overlay re-sources from those conditions.
+# The edge kinds mirror ``lachesis.planner.unbounded_copy._REGION_EDGE_KINDS``; they
+# are duplicated here so the loader stays free of a planner import.
+_BRANCH_NODE_KINDS = frozenset({"cfg-condition", "cfg-merge"})
+_BRANCH_EDGE_KINDS = frozenset({
+    "TRUE_BRANCH", "FALSE_BRANCH", "LOOP_TRUE",
+    "SWITCH_CASE", "EXCEPTION_BRANCH", "SHORT_CIRCUIT_RIGHT",
+})
+
+
+def _load_branch_substrate_overlay(core_path: str) -> Overlay | None:
+    """A bounded overlay carrying only the control-flow branch substrate.
+
+    The persisted dataflow sidecar is the whole value-flow overlay (~1 GB on a large
+    graph). The guard adjudicator needs a sliver of it -- the cfg-condition nodes and
+    the branch-region edges re-sourced from them -- to classify guard dominance. This
+    streams the sidecar and keeps only that sliver, so the substrate can be attached to
+    the in-process index without ever decoding the full overlay into RAM. Returns
+    ``None`` when no sidecar exists yet or it carries no branch substrate.
+    """
+    path = dataflow_overlay_path(core_path)
+    sidecar = Path(path)
+    if not sidecar.is_file() or not is_dataflow_stream(sidecar):
+        return None
+    payload = read_dataflow_branch_substrate(
+        sidecar, node_kinds=_BRANCH_NODE_KINDS, edge_kinds=_BRANCH_EDGE_KINDS)
+    if not payload.get("derived_nodes") and not payload.get("derived_edges"):
+        return None
     return Overlay.from_dict(payload)
 
 
@@ -412,7 +483,7 @@ class GraphStore:
         cache ``store.index`` can watch this to tell when they have gone stale."""
         return bool(getattr(self, "_enriched", True))
 
-    def ensure_dataflow_tier(self, *, retain_materialized: bool = False) -> "GraphStore":
+    def ensure_dataflow_tier(self, *, retain_materialized: bool = True) -> "GraphStore":
         """Guarantee the overlay dataflow tier is present, building it if needed.
 
         Idempotent, and a no-op for a store that was built with ``--enrich`` or for an
@@ -464,14 +535,40 @@ class GraphStore:
                 catalog_path = compiled_catalog(atropos_root, core_path)
             if not _dataflow_cache_matches(native_cache, manifest.get("core_content_hash")):
                 timing("native Pass-2 starting")
-                run_pass2_path(native_input, native_cache, catalog_path)
-                timing("native Pass-2 published")
-            dataflow_overlay = _load_dataflow_overlay(native_cache)
-            merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
-            self.index.attach_overlay(merged_overlay)
-            self.overlay = merged_overlay
+                shards = _choose_enrich_shards(native_input)
+                if shards > 1:
+                    from lachesis.flow.shard_enrich import run_pass2_sharded
+                    stats = run_pass2_sharded(
+                        native_input, native_cache, catalog_path, k=shards,
+                        core_content_hash=manifest.get("core_content_hash") or "",
+                        source=str(native_input))
+                    timing(f"native Pass-2 published (sharded k={shards}, "
+                           f"repl {stats['repl_node_insertions']}/{stats['nodes']})")
+                else:
+                    run_pass2_path(native_input, native_cache, catalog_path)
+                    timing("native Pass-2 published")
+            if retain_materialized:
+                # Rebind the open index onto the decoded dataflow overlay so in-process
+                # query/bind consumers see the tier. This pins the whole overlay
+                # (node/edge props + derived nodes/edges, ~1 GB on a large graph) in
+                # Python for the life of the store -- the price of answering queries
+                # from RAM. Every no-arg caller (nav queries, planners) wants this.
+                dataflow_overlay = _load_dataflow_overlay(native_cache)
+                merged_overlay = _merge_overlays(self.overlay, dataflow_overlay)
+                self.index.attach_overlay(merged_overlay)
+                self.overlay = merged_overlay
+                self.gl = GraphLib.from_index(self.index)
+                timing("dataflow overlay attached")
+            else:
+                # The tier is fully persisted to `.dataflow.pb`; a caller that only
+                # needs the sidecars on disk (enrich) skips decoding it back into
+                # Python, keeping the dataflow overlay out of the cold-materialization
+                # peak. It never coexists with the semantic Pass-3 native transient
+                # that the bind runs next. The tier is reconstructable on demand from
+                # `native_cache` via `_load_dataflow_overlay`, so a later query path
+                # must call `ensure_dataflow_tier()` (retaining) before touching it.
+                timing("dataflow overlay materialized (not retained)")
             self.graph = None
-            self.gl = GraphLib.from_index(self.index)
             self._retained_enriched_graph = None
             self._entries = None
             self._enriched = True
@@ -479,6 +576,40 @@ class GraphStore:
         raise RuntimeError(
             "Pass 2 requires the binary sidecar emitted by a fresh Pass 1; "
             "rebuild this graph with `lachesis build`")
+
+    def ensure_branch_substrate(self) -> "GraphStore":
+        """Make the control-flow branch substrate visible to the open index cheaply.
+
+        The guard adjudicator classifies dominance from cfg-condition nodes and the
+        branch-region edges re-sourced from them. Those records are overlay-derived --
+        they live in the ``.dataflow.pb`` sidecar, never the core Kùzu store -- so on
+        the ``retain_materialized=False`` bind path (``enrich``), where the full overlay
+        is deliberately never decoded into RAM, the census has no branch substrate to
+        classify against and every guarded copy reads ``none-observed``.
+
+        This attaches a *branch-only* overlay: cfg-condition/cfg-merge nodes plus
+        region edges, streamed out of the sidecar with bounded memory (see
+        :func:`_load_branch_substrate_overlay`). Peak stays proportional to the
+        program's control structure, not its size, so it is safe to run inside the
+        cold-materialization/bind window that the full overlay must stay out of.
+
+        A no-op when an overlay is already attached (a retaining tier load, or a prior
+        call), when there is no core path (an in-memory graph), or when no dataflow
+        sidecar has been built yet. Idempotent. If a later
+        ``ensure_dataflow_tier(retain_materialized=True)`` runs, it merges from
+        ``self.overlay`` and rebinds from scratch, so it cleanly supersedes this
+        branch-only attachment without double-counting.
+        """
+        index = getattr(self, "index", None)
+        if index is None or getattr(index, "_overlay", None) is not None:
+            return self
+        core_path = getattr(self, "_core_path", None)
+        if not core_path:
+            return self
+        overlay = _load_branch_substrate_overlay(core_path)
+        if overlay is not None:
+            index.attach_overlay(overlay)
+        return self
 
     def take_retained_enriched_graph(self):
         """Return the one-shot graph retained for the immediately following bind."""

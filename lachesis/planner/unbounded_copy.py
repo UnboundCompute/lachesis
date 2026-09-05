@@ -1121,3 +1121,111 @@ class MemoryCopyCapacity:
             "frontiers": frontiers,
             "complete_for_observable_graph": True,
         }
+
+
+# The capability edges the coverage frontier reads directly from the graph. Kept
+# in one place with capabilities.py so the index-backed manifest and the dict one
+# stay in lockstep: the same edge kind witnesses value-flow, and the same branch-
+# region substrate witnesses dominance, whether the enumerator saw a dict or the
+# Kùzu index.
+from .capabilities import _CAPABILITY_EDGE, _DOMINANCE_SUBSTRATE  # noqa: E402
+
+
+def present_index_capabilities(index) -> set[str]:
+    """The optional capabilities a Kùzu index observably backs -- the disk-path
+    twin of ``capabilities.present_capabilities`` over a dict graph.
+
+    Pass 3 no longer materializes the whole typed structural graph to answer 'which
+    edge kinds exist'; it asks the index for the witnessing relations directly. A
+    raw-fact capability is present when the index carries any edge of its kind, and
+    ``dominance`` is present when any branch-region edge exists. The result is the
+    same set the dict path derives from ``graph.get('edges')`` -- neutral coverage,
+    never a filter."""
+    present: set[str] = set()
+    for capability, kind in _CAPABILITY_EDGE.items():
+        if index.edges_of_kind(kind):
+            present.add(capability)
+    for kind in _DOMINANCE_SUBSTRATE:
+        if index.edges_of_kind(kind):
+            present.add("dominance")
+            break
+    return present
+
+
+class IndexBackedGraph:
+    """A read-through view of a Kùzu ``KuzuGraphIndex`` shaped like the stamped
+    ``{nodes, edges}`` dict the candidate constructors were written against.
+
+    Pass 3 used to re-inflate the whole typed structural graph into RAM (~113 MB at
+    Suricata scale) just so the constructors could scan ``graph['nodes']`` and
+    ``graph['edges']``. But every structural fact they read -- call/expression/
+    cfg-condition nodes, value-flow and branch-region edges, AST children and
+    allocator calls -- already lives in the resident index. This adapter serves
+    those from the index instead, materializing only the small Atropos delta (the
+    sink/annotation nodes the index does not carry, sourced from ``.bind.pb``).
+
+    It is deliberately NOT a ``dict``: ``BranchRegions`` and the constructors switch
+    on ``isinstance(graph, dict)`` to take their index-native branches (``by_kind``,
+    ``node_headers``, ``_edges_with_target_spans`` ...), which this delegates to the
+    wrapped index. ``get('nodes')``/``get('edges')`` remain available for the paths
+    that still read the flat sequences (``VariableContext``'s value-flow adjacency,
+    the coverage-frontier edge-kind scan, the top-level kind scans).
+
+    Output equivalence with the dict path is exact: nodes come back through the same
+    ``_node`` reconstruction the disk navigation uses, and the Atropos delta is the
+    original stamped node dict verbatim, so every ``.get(field)`` the constructors
+    read matches byte-for-byte (see ``test_candidate_index_equivalence``)."""
+
+    def __init__(self, index, atropos_delta, capabilities) -> None:
+        self._index = index
+        # The one fact the index does not serve: the Atropos-authored nodes (sink
+        # roles and alloc-size element-count stamps). Materialized -- it is small --
+        # and their ids are excluded from the index scan so no node appears twice.
+        self._atropos_delta = list(atropos_delta or ())
+        self._atropos_ids = {n.get("id") for n in self._atropos_delta}
+        self.capabilities = set(capabilities or ())
+        self._edges_cache = None
+
+    # -- the dict-ish surface the constructors read -------------------------
+
+    def get(self, key, default=None):
+        if key == "nodes":
+            return self._iter_nodes()
+        if key == "edges":
+            return self._all_edges()
+        return default
+
+    def _iter_nodes(self):
+        """Every structural node from the index, then the Atropos delta -- each node
+        exactly once. Lazy: the adapter holds no node list, only the delta."""
+        atropos_ids = self._atropos_ids
+        for node in self._index.nodes.values():
+            if node is None:
+                continue
+            # An Atropos node is served from the delta, never from the index scan --
+            # in a freshly written store both carry it, so skip the index copy to
+            # avoid a duplicate. Match on id (authoritative) and, defensively, on the
+            # stamped origin.
+            if node.get("id") in atropos_ids:
+                continue
+            if (node.get("properties") or {}).get("fact_origin") == "atropos-model":
+                continue
+            yield node
+        yield from self._atropos_delta
+
+    def _all_edges(self):
+        """Every edge, reconstructed once from the index (base + overlay), in the
+        canonical materialized order. Cached: the constructors read the sequence
+        several times (reverse adjacency, AST children, the capability scan)."""
+        if self._edges_cache is None:
+            from ..nav.kuzu_index import materialize_edges
+            self._edges_cache = materialize_edges(self._index)
+        return self._edges_cache
+
+    # -- index-native accessors the disk branches reach for -----------------
+
+    def __getattr__(self, name):
+        # BranchRegions' index branch and any future index-native reader reach
+        # straight through to the wrapped index (by_kind, node_headers, nodes,
+        # _warm_nodes, _edges_with_target_spans, edges_of_kind, _overlay, ...).
+        return getattr(self._index, name)

@@ -13,6 +13,7 @@ literal), which the gen/kill transfer function keys on.
 
 Pure reader over a GraphStore index; no mutation, no load_graph.
 """
+import gzip
 import os
 import shutil
 import tempfile
@@ -26,6 +27,7 @@ from lachesis.core.graph_wire import (
 )
 from lachesis.core import graph_pb2, lifetime_pb2
 from lachesis.planner.unbounded_copy import BranchRegions, _REGION_EDGE_KINDS
+from lachesis import resources
 
 from lachesis.timeit import timeit
 
@@ -740,10 +742,18 @@ def write_streaming_pass1_caches(reader, graph_path, *, manifest=None,
             manifest, prune=bool(prune),
         )
         # Rust owns the binary translation projection as well.  The Python
-        # process only passes paths and does not reconstruct the substrate.
-        from lachesis.flow.native_lifetime import write_translation_facts_path
-        write_translation_facts_path(
-            substrate_cache_path(target), translation_facts_path(target))
+        # process only passes paths and does not reconstruct the substrate.  On a
+        # large graph the projection's whole-graph map is the dominant build
+        # spike, so defer it: the semantic pass recomputes the facts from this
+        # same substrate with the identical producer when the file is absent
+        # (byte-for-byte equivalent), moving the cost to the first isolated
+        # ``enrich`` instead of stacking it on the store-write transients.
+        substrate_path = substrate_cache_path(target)
+        substrate_bytes = substrate_path.stat().st_size if substrate_path.is_file() else 0
+        if not resources.defer_translation_facts(substrate_bytes):
+            from lachesis.flow.native_lifetime import write_translation_facts_path
+            write_translation_facts_path(
+                substrate_path, translation_facts_path(target))
         return
     if keep_node is None and prune is not None:
         keep_node = lambda node: not (prune and node.get("kind") in {"token", "source-span"})
@@ -959,7 +969,10 @@ def _write_translation_facts(target, result):
     fd, temp_name = tempfile.mkstemp(prefix=".pass2-facts-", dir=str(target.parent))
     try:
         with os.fdopen(fd, "wb") as handle:
-            handle.write(result.SerializeToString())
+            # Gzip the flat facts blob (level 1, fixed mtime for determinism) to
+            # match the compressed native writer; the native reader magic-sniffs
+            # the gzip header, so either writer's output reads back identically.
+            handle.write(gzip.compress(result.SerializeToString(), compresslevel=1, mtime=0))
         os.replace(temp_name, target)
     except BaseException:
         try:

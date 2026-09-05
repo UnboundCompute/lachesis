@@ -545,9 +545,10 @@ class Resolver:
         try:
             import kuzu
 
-            from .kuzu_store import db_file
+            from .kuzu_store import _kuzu_db_kwargs, db_file
 
-            connection = kuzu.Connection(kuzu.Database(db_file(db_dir)))
+            connection = kuzu.Connection(
+                kuzu.Database(db_file(db_dir), **_kuzu_db_kwargs()))
         except Exception:
             return 0
         written = 0

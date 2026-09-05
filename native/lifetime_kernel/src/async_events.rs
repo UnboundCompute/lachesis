@@ -5,38 +5,6 @@ use hashbrown::{HashMap, HashSet};
 use crate::graph_proto;
 use crate::pass2::{self, Delta, Graph};
 
-fn value_text(value: &graph_proto::Value) -> Option<&str> {
-    match value.kind.as_ref()? {
-        graph_proto::value::Kind::Text(value) => Some(value),
-        _ => None,
-    }
-}
-
-fn property<'a>(node: &'a pass2::Node, key: &str) -> Option<&'a graph_proto::Value> {
-    node.properties.iter().find_map(|field| {
-        (field.key == key).then(|| field.value.as_ref()).flatten()
-    })
-}
-
-fn text<'a>(node: &'a pass2::Node, key: &str) -> Option<&'a str> {
-    property(node, key).and_then(value_text)
-}
-
-fn list_text(node: &pass2::Node, key: &str) -> Vec<String> {
-    property(node, key).and_then(|value| match value.kind.as_ref()? {
-        graph_proto::value::Kind::List(list) => Some(list.values.iter().filter_map(value_text)
-            .map(str::to_owned).collect()),
-        _ => None,
-    }).unwrap_or_default()
-}
-
-fn integer(node: &pass2::Node, key: &str) -> Option<i64> {
-    property(node, key).and_then(|value| match value.kind.as_ref()? {
-        graph_proto::value::Kind::Integer(value) => Some(*value),
-        _ => None,
-    })
-}
-
 fn list_field(key: &str, values: &[String]) -> graph_proto::Field {
     graph_proto::Field { key: key.to_owned(), value: Some(graph_proto::Value {
         kind: Some(graph_proto::value::Kind::List(graph_proto::ListValue {
@@ -75,16 +43,16 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
 
     for (index, node) in graph.nodes.iter().enumerate() {
         match graph.kind(node.kind) {
-            "argument" => if let Some(call) = text(node, "callsite_id").and_then(|id| graph.symbol(id)) {
+            "argument" => if let Some(call) = graph.node_property_text(node, "callsite_id").and_then(|id| graph.symbol(id)) {
                 arguments_by_call.entry(call).or_default().push(index);
             },
             "function-effect" => {
-                if text(node, "effect_kind") == Some("runtime-call") {
+                if graph.node_property_text(node, "effect_kind") == Some("runtime-call") {
                     has_runtime_effect = true;
                     effects.push(index);
                 }
             },
-            "expression" | "operation" => if text(node, "operator") == Some("await") {
+            "expression" | "operation" => if graph.node_property_text(node, "operator") == Some("await") {
                 await_operations.push(index);
             },
             _ => {}
@@ -130,12 +98,12 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
 
     for effect_index in effects {
         let effect = &graph.nodes[effect_index];
-        let Some(call_id) = text(effect, "callsite_id").and_then(|id| graph.symbol(id)) else { continue };
+        let Some(call_id) = graph.node_property_text(effect, "callsite_id").and_then(|id| graph.symbol(id)) else { continue };
         let Some(call_index) = graph.node_by_id.get(&call_id).copied() else { continue };
         let mut arguments = arguments_by_call.get(&call_id).cloned().unwrap_or_default();
-        arguments.sort_by_key(|index| integer(&graph.nodes[*index], "position").unwrap_or(-1));
-        let behaviors = list_text(effect, "behaviors");
-        let callback_position = integer(effect, "callback_argument").map(|value| if value < 0 { value + arguments.len() as i64 } else { value });
+        arguments.sort_by_key(|index| graph.node_property_i64(&graph.nodes[*index], "position").unwrap_or(-1));
+        let behaviors = graph.node_property_text_list(effect, "behaviors");
+        let callback_position = graph.node_property_i64(effect, "callback_argument").map(|value| if value < 0 { value + arguments.len() as i64 } else { value });
         let callback = callback_position.and_then(|position| usize::try_from(position).ok()).and_then(|position| arguments.get(position)).copied();
         let mut targets = Vec::new();
         if let Some(callback_index) = callback {
@@ -164,12 +132,12 @@ pub(crate) fn enrich(graph: &Graph) -> Delta {
                 else if behaviors.iter().any(|value| value == "promise-rejection") { Some("rejected") }
                 else if behaviors.iter().any(|value| value == "promise-finalizer") { Some("finally") } else { None };
             if let Some(completion) = completion {
-                let source = text(&graph.nodes[call_index], "value_id").unwrap_or(&call_text).to_owned();
+                let source = graph.node_property_text(&graph.nodes[call_index], "value_id").unwrap_or(&call_text).to_owned();
                 add_edge("ASYNC_CONTINUES_AT", source, target_text, evidence.clone(), vec![pass2::text_field("completion", completion)]);
             }
         }
-        let receiver = text(effect, "receiver_value_id").map(str::to_owned);
-        let name = text(effect, "event_name").unwrap_or("*").to_owned();
+        let receiver = graph.node_property_text(effect, "receiver_value_id").map(str::to_owned);
+        let name = graph.node_property_text(effect, "event_name").unwrap_or("*").to_owned();
         if behaviors.iter().any(|value| value == "event-registration" || value == "queue-consumer") && !targets.is_empty() {
             let category = if behaviors.iter().any(|value| value == "queue-consumer") { "message-queue" } else { "event" };
             let event = add_event(category, receiver.clone(), name.clone(), &evidence);

@@ -147,6 +147,12 @@ SINK_TAXONOMY: dict[str, dict] = {
                 "constructor": "object-integrity.prototype.keys",
                 "obligation_cwe": ("CWE-1321",),
             },
+            "reflection": {
+                "kinds": ("unsafe-reflection",),
+                "obligation": "attacker input does not select which class, attribute, or module is loaded or invoked",
+                "constructor": "object-integrity.reflection.trust",
+                "obligation_cwe": ("CWE-470",),
+            },
         },
     },
     "filesystem": {

@@ -58,8 +58,91 @@ jobs:
       - name: Install Lachesis (${{ matrix.extras }})
         run: python -m pip install -e ".[${{ matrix.extras }}]"
 
+      # The catalog-keyed temporal logic tests read the sink/lifecycle tables from a
+      # bundled catalog; without it they see an empty table and misjudge. Stage the
+      # pinned catalog so those tests run against real data. The native-binary tests
+      # skip themselves here (no kernel is built in this job) via native_lifetime.available().
+      - name: Vendor the pinned Atropos catalog
+        run: python3 tools/vendor_atropos.py
+
       - name: Run the local parity gate
         run: make check
+
+  # The checks matrix runs the pure-Python suite; its native-dependent tests skip
+  # themselves because no lifetime kernel is staged there. This job is where the native
+  # temporal pipeline is actually exercised: it builds the Rust lifetime kernel and the
+  # C frontend, provides a libclang for the frontend to load at runtime, stages the
+  # catalog, and runs the four test files that drive the kernel end to end (federated
+  # shard build/merge and the FP/FN corpus gate). A break in the native path shows up
+  # here rather than silently skipping.
+  native:
+    name: native (lifetime kernel + C frontend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install the TypeScript compiler the TS frontend loads
+        run: npm ci
+
+      # The C frontend loads libclang at runtime (clang-sys "runtime" feature, clang 17
+      # API), and the corpus fixtures are compiled by clang itself. Install both and point
+      # the loader at the matching libclang so no host default (a newer/older libclang) is
+      # picked up instead.
+      - name: Install clang 17 and libclang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-17 libclang-17-dev
+          echo "LIBCLANG_PATH=/usr/lib/llvm-17/lib" >> "$GITHUB_ENV"
+
+      - name: Upgrade pip (editable installs need pip >= 21.3)
+        run: python -m pip install --upgrade pip
+
+      - name: Install Lachesis (dev)
+        run: python -m pip install -e ".[dev]"
+
+      # Point the catalog resolver at the vendored tree explicitly. The corpus runner
+      # otherwise setdefault()s ATROPOS_ROOT to a sibling `../atropos` checkout, which
+      # does not exist on a runner; that nonexistent path would shadow the bundled
+      # catalog and every lifecycle table would read empty, so the census would confirm
+      # nothing. Exporting it here pre-empts the setdefault for both the build and the
+      # census, so they read the catalog we just staged.
+      - name: Vendor the pinned Atropos catalog
+        run: |
+          python3 tools/vendor_atropos.py
+          echo "ATROPOS_ROOT=$PWD/lachesis/_atropos_catalog" >> "$GITHUB_ENV"
+
+      - name: Build and stage the native artifacts
+        run: python3 tools/stage_native.py --build
+
+      # Kuzu reserves its store's address space by mmap-ing a sparse file at an 8 TiB
+      # default when a database opens; the runner cannot satisfy that mapping even
+      # with overcommit allowed (Mmap for size 8796093022208 failed), so cap the
+      # reservation for the tiny corpus/shard graphs. LACHESIS_KUZU_MAX_DB_SIZE is a
+      # power-of-two byte ceiling (2 GiB here) honoured at every store open; the
+      # graphs are kilobytes, so the emitted store is byte-identical to the default.
+      - name: Run the native lifetime suite
+        env:
+          LACHESIS_KUZU_MAX_DB_SIZE: "2147483648"
+        run: |
+          python -m pytest -q \
+            lachesis/planner/test_temporal_native.py \
+            lachesis/nav/test_federation.py \
+            lachesis/test_cross_tu_merge.py \
+            lachesis/planner/test_lifetime_corpus.py
 
   # A green checks job says nothing about what a user gets from PyPI: it runs from a
   # checkout, with an editable install, a node_modules and the repository root on

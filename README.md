@@ -17,14 +17,15 @@ Install with `python -m pip install lachesis-cpg`, then use `import lachesis` or
 
 A symbol index (LSP, ctags, SCIP) tells you *where a name appears*. Lachesis tells you
 *how a value moves* — does this request parameter reach that SQL call, which of these two
-near-identical functions checks its input first, what can flow into this buffer. It parses
-a codebase with real compilers, not regexes, builds one graph with a full dataflow layer
-(value-flow, points-to, taint, aliasing), and answers questions from that graph — on the
-command line, as a Python library, or over MCP to an AI agent.
+near-identical functions checks its input first, what can flow into this buffer, where a C
+object is freed twice or used after free. It parses a codebase with real compilers, not
+regexes, builds one graph with a full dataflow layer (value-flow, points-to, taint,
+aliasing) and a native temporal pass for C object lifetimes, and answers questions from that
+graph — on the command line, as a Python library, or over MCP to an AI agent. Large,
+multi-language trees build as parallel shards linked into one graph within a bounded memory
+envelope.
 
-[![Lachesis flags SQL injection on a live pull request](docs/media/lachesis-demo-poster.png)](https://github.com/UnboundCompute/lachesis-action-demo/pull/5)
-
-A 55-second walkthrough: a Flask control plane where three handlers reach the same SQL sink
+A worked example: a Flask control plane where three handlers reach the same SQL sink
 unguarded while two siblings authorize first. Lachesis follows the value, flags the three,
 and names their guarded twins — [**see it live on the pull request →**](https://github.com/UnboundCompute/lachesis-action-demo/pull/5). Scan your own repo on every PR with the
 [Lachesis Security Scan Action](https://github.com/UnboundCompute/lachesis-action).
@@ -39,6 +40,10 @@ investigate, not a verdict:
 python -m pip install lachesis-cpg
 lachesis ./my-project
 ```
+
+The source can also be a git URL — `lachesis https://github.com/owner/repo`, optionally with
+a `#subdir` fragment to scan one subtree of a monorepo. A URL is shallow-cloned to a temp
+directory and removed when the scan finishes.
 
 ```
   ✓ compiling (0.7s)
@@ -79,6 +84,14 @@ lachesis enrich  graph.kuzu                   # pass 2 — warm the dataflow + c
 lachesis analyze graph.kuzu --summary         # pass 3 — the leads, rolled up by bug shape
 lachesis explain graph.kuzu tree.c:1487       # one call: the whole evidence chain for a site
 ```
+
+The rest of the surface is verbs under the same entrypoint: `candidates` (the obligation
+census over the whole taxonomy), `query` (targeted reads — `find-entity`, `function`,
+`value-history`, `call`, `security-path`, `handler-security`, …), `plan` (a change-impact
+capsule for one site), `report` and `communities` (rollups), `trace` (build a graph and
+export a lachesis-explorer `bundle.json` — every sink family with the reachability cone that
+feeds it), plus `mcp`, `doctor`, `cache`, `concept-model`, and `completion`. `lachesis
+<verb> --help` documents each.
 
 For a large tree, build core-only and cap the wall clock — each frontend shard streams
 straight into Kùzu instead of composing a graph-sized Python object, and `enrich` reads
@@ -134,9 +147,11 @@ or as MCP tools an agent drives directly:
 | Does this source reach that sink? | `reaches`, a labeled witness path or an honest "no" |
 | What does this pointer point to? What aliases it? | `points_to`, `aliases` |
 | Where does untrusted input reach a dangerous sink? | `taint`, source→sink witnesses folded from the Atropos catalog onto this graph's nodes |
+| Is this C object freed twice, or used after it's freed? | the native temporal lifetime pass, a typestate matcher over C object lifecycles that confirms double-free / use-after-free with a path witness |
 | Which entrypoints reach sensitive effects without a recognized guard? | `scan`, the leads with census/frontier counts (questions, not verdicts) |
-| What are the leads, and where do they land? | `analyze` / `leads_summary` / `leads_at`, held warm and filtered by pattern, function, or `file:line` |
+| What are the leads, and where do they land? | `analyze` / `candidates` / `leads_summary` / `leads_at`, the obligation census held warm and filtered by pattern, function, or `file:line` |
 | The full evidence for one site, in one call | `explain`, chaining census → candidate → provenance → guard → source |
+| A shareable map of every sink family and what feeds it | `trace`, a lachesis-explorer `bundle.json` — each family with its reachability cone |
 
 Every answer carries a confidence and an origin. An `exact` edge is resolved; a
 `conservative` one is a deliberate over-approximation the tool tells you about rather than
@@ -239,6 +254,22 @@ safety-obligation sites, scored and matched against bug shapes. It is **bounded*
 rather than hanging, so a large graph can't stall a call. An empty result over a partial
 run reads as *not evaluated*, never *clean*.
 
+Two capabilities sit alongside the three passes:
+
+**Native temporal lifetime pass (C).** Guard-and-taint shapes catch what *reaches* a sink,
+but a double-free or use-after-free is a property of an object's *lifecycle*, not a single
+node. A native pipeline handles it — a Clang frontend emits per-object lifecycle events
+(alloc / free / use / return), a Rust typestate kernel matches those event streams, and the
+result is folded back onto the graph as confirmed temporal candidates carrying a path
+witness. It confirms double-free and use-after-free on C today without false positives on the
+clean control paths.
+
+**Federated sharding.** A large, multi-language tree is built as parallel shards — each
+frontend streams straight into its own store — that are then linked into one graph by
+cross-shard symbol (USR) resolution, so value-flow, callers, and callees still cross shard
+boundaries. This keeps a monorepo-scale build inside a bounded memory envelope instead of
+composing a graph-sized object in memory.
+
 ```
   source tree
       |
@@ -300,23 +331,29 @@ Semantic `concept_search` is optional and separate — opt in with
 
 Recently shipped:
 
+- [x] **Native temporal lifetime detection (C).** A Clang frontend + Rust typestate kernel confirm double-free and use-after-free on C object lifecycles, with a path witness and no false positives on the clean control paths — a class of bug the guard/taint shapes structurally can't see.
+- [x] **Federated sharding.** Large, multi-language trees build as parallel per-frontend shards linked into one graph by cross-shard symbol (USR) resolution, keeping a monorepo-scale build inside a bounded memory envelope while value-flow and calls still cross shard boundaries.
+- [x] **Scan a git URL directly.** `lachesis https://…#subdir` shallow-clones, scans one subtree of a monorepo, and cleans up after itself — no manual checkout.
+- [x] **Graph-first Explorer bundle.** `lachesis trace` exports a lachesis-explorer `bundle.json`: every sink family with the reachability cone that feeds it, in the shape the explorer renders.
 - [x] **One reader, three front doors.** The `lachesis.Analysis` library class is the single implementation; a `lachesis <verb>` subcommand and an MCP tool sit over each method — no hand-written graph-loading script on any surface.
 - [x] **Bounded analysis.** Pass 3 takes a `hard_stop` budget and returns partial, flagged leads instead of hanging; the census a graph pays for once is cached as a sidecar so the next process opens warm.
 - [x] **Zero-config MCP.** `lachesis mcp` starts with no graph path; `build_graph` compiles, caches, and attaches on demand, and overlapping requests are serialized around the store.
-- [x] **A smaller front door.** One default command (`lachesis <path>`), one result noun everywhere (`lead`), and a five-name library API (`scan`, `Analysis`, `LeadSet`, `Deadline`, `AnalysisError`) — so the first command and the first import are obvious.
 
 Near-term, roughly in order:
 
-- [ ] **Monorepo-scale builds.** `--parallel-packages` compiles each package on its own so very large TypeScript trees don't exceed the compiler's internal limits; making that the smooth default is active work.
+- [ ] **Cross-function temporal shapes.** Extend the lifetime pass past a single function so free-in-one / use-in-another patterns match across a call seam, riding the value-flow edge the graph already carries.
 - [ ] **Bounded security signal.** Reworking the guard-analysis tools to fold the same per-seed, on-demand cone the dataflow tools already use, so they run on a large graph without a whole-graph pass.
 - [ ] **The reachability query, first-class.** "Can attacker input reach this sink" as a single call returning a witness path or a bounded no, across file, package, and language boundaries.
 
 ## Status
 
-Lachesis is early and moving fast. The graph model, the store, and the navigation and MCP
-layer work today and are held to a parity test suite that checks the columnar store answers
-every tool identically to the same graph held whole in memory. The schema and tool set may
-still shift before 1.0; the [`CHANGELOG`](./CHANGELOG.md) calls out changes explicitly.
+Lachesis is early and moving fast. The graph model, the store, the navigation and MCP layer,
+and the native temporal lifetime pass work today and are held to a parity test suite that
+checks the columnar store answers every tool identically to the same graph held whole in
+memory. The temporal pass is C-only for now and matches within a single function; one known
+false positive (a leak reported on an object that is both freed and used-after-free) is
+tracked. The schema and tool set may still shift before 1.0; the
+[`CHANGELOG`](./CHANGELOG.md) calls out changes explicitly.
 
 ## License
 

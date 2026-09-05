@@ -1,6 +1,6 @@
 [package]
 name = "lachesis-lifetime-kernel"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 
 [lib]
@@ -15,6 +15,7 @@ hashbrown = "0.15"
 sha2 = "0.10"
 roaring = "0.10"
 memmap2 = "0.9"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [build-dependencies]
 prost-build = "0.13"

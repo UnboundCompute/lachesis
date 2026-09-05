@@ -25,6 +25,106 @@ from lachesis.pipeline import (run_project,
 from lachesis.projections import build_layered_graph, write_layered_graph
 
 
+def _reap_stale_stream_temp(min_age_hours: float = 2.0) -> None:
+    """Remove orphaned streamed-build scratch from a prior run that died before cleanup.
+
+    A streamed build stages its frontend shards under a ``lachesis-stream-*`` /
+    ``kuzu_stream_stage_*`` directory in the system temp dir, held by a
+    :class:`~tempfile.TemporaryDirectory` that deletes it on normal exit. But a build
+    killed by SIGKILL -- an OOM kill, an RSS watchdog, a hard ``^C^C`` -- never runs that
+    cleanup, so its multi-GB scratch is orphaned in place and accumulates across runs.
+
+    This reaps only entries older than ``min_age_hours``: a concurrently running build's
+    scratch has a fresh mtime and is left untouched, so the age gate makes the sweep safe
+    without inspecting open file handles. Best-effort and silent -- a temp dir that cannot
+    be read or removed (a race with another reaper, a permission quirk) is skipped, never
+    fatal to the build that triggered the sweep.
+    """
+    import shutil
+    import time
+
+    root = tempfile.gettempdir()
+    cutoff = time.time() - min_age_hours * 3600.0
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for name in entries:
+        if not (name.startswith("lachesis-stream-")
+                or name.startswith(".lachesis-stream-")
+                or name.startswith("kuzu_stream_stage_")):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isdir(path) or os.path.getmtime(path) > cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _pid_is_live(pid: int) -> bool:
+    """True if a process with ``pid`` currently exists (signal 0 probes, kills nothing)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — treat as live, never reap its scratch.
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _reap_inplace_build_scratch(output_path: str, min_age_hours: float = 2.0) -> None:
+    """Remove orphaned build scratch left *beside the target graph* by a SIGKILLed run.
+
+    Unlike the system-temp scratch swept by :func:`_reap_stale_stream_temp`, several build
+    stages stage multi-GB intermediates in the *output directory itself* (next to the
+    ``.kuzu`` target): the native Pass-1 sidecar projector writes ``.pass1-<label>-<pid>``
+    node/edge files (``sidecar_project.rs``) and the Kùzu store stages ``.lachesis-stream-*``
+    / ``.lachesis-nodeunits-*`` directories there (``kuzu_store.py``). Their cleanup runs
+    only on a normal exit, so an OOM kill, an RSS/disk watchdog, or a hard ``^C^C`` orphans
+    them in place — this session saw ~8.4 GB of ``.pass1-*`` plus a 554 MB ``.lachesis-*``
+    survive a single killed build, exactly defeating the disk-health invariant.
+
+    The ``.pass1-*-<pid>`` names carry the producing PID, so those are reaped precisely: an
+    entry is removed only when its PID is no longer live, which is safe even while another
+    build runs concurrently (its files carry a different, live PID). The PID-less
+    ``.lachesis-*`` entries fall back to the same ``min_age_hours`` mtime gate used for the
+    temp sweep. Best-effort and silent: an entry that cannot be read or removed is skipped.
+    """
+    import shutil
+    import time
+
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    cutoff = time.time() - min_age_hours * 3600.0
+    try:
+        entries = os.listdir(out_dir)
+    except OSError:
+        return
+    for name in entries:
+        path = os.path.join(out_dir, name)
+        try:
+            if name.startswith(".pass1-"):
+                # ".pass1-<label>-<pid>": reap only if the producing process is gone.
+                tail = name.rsplit("-", 1)[-1]
+                if not tail.isdigit() or _pid_is_live(int(tail)):
+                    continue
+            elif name.startswith(".lachesis-stream-") or name.startswith(".lachesis-nodeunits-"):
+                if os.path.getmtime(path) > cutoff:
+                    continue
+            else:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            continue
+
+
 def _positive_int(value: str) -> int:
     """Argparse type that prevents silently useless zero/negative limits."""
     try:
@@ -134,9 +234,48 @@ def _run(argv: list[str] | None = None) -> None:
         "--stream-shards", metavar="DIR", default=None,
         help="stream core-only frontend shards directly into Kùzu",
     )
+    parser.add_argument(
+        "--memory-budget-mb", type=_positive_int, default=None, metavar="MiB",
+        help="total memory budget for the whole build process tree, in MiB. The C "
+             "frontend is compiled in bounded per-chunk processes and the store is "
+             "written with bounded RSS, so a Linux-scale tree builds without OOM; this "
+             "is the single knob that sizes the chunking. The default (5120) suits a "
+             "laptop; raise it on a big box to compile more translation units per chunk "
+             "(fewer, larger frontend processes) and lower it on a constrained runner. "
+             "Equivalent to setting LACHESIS_MEMORY_BUDGET_MB; the flag wins if both "
+             "are given. The emitted graph is identical at any budget -- only where the "
+             "chunk boundaries fall, and thus peak memory, changes.",
+    )
+    parser.add_argument(
+        "--include", metavar="PATH", action="append", default=None, dest="include_paths",
+        help="also analyse this file or directory, even when it lies outside "
+             "source_dir. Repeatable. This is the guided-scope guarantee: when a build "
+             "is narrowed to a sub-tree to fit the time budget, point --include at the "
+             "advisory's vulnerable file (or its directory) so the one file the run "
+             "exists to reach is never scoped out. An explicitly named file is always "
+             "kept; a directory is walked with the same ignore rules as source_dir.",
+    )
     args = parser.parse_args(argv)
+    # Validate the source tree up front. Without this the streaming build path
+    # happily runs against a nonexistent path or a single file, finds no frontend
+    # to stream, and still exits 0 with "Streamed 0 frontends" -- a silent empty
+    # graph that every later verb then "succeeds" against. Fail here the way the
+    # scan/index path already does (cli/indexer.py: "is not a directory").
+    if not os.path.isdir(args.source_dir):
+        parser.error(
+            f"source_dir is not a directory: {args.source_dir}\n"
+            "  build reads a source tree; point it at an existing directory "
+            "(a single file or a typo'd path cannot be built).")
     if args.output_flag is not None:
         args.output_path = args.output_flag
+    # The memory budget drives frontend chunk sizing (resources.c_chunk_files) and the
+    # TypeScript heap ceiling, both of which read the environment at build time. Setting
+    # it here -- before any pipeline call -- lets the flag stand in for the env var; the
+    # flag wins so an explicit `--memory-budget-mb` is never silently shadowed by an
+    # inherited LACHESIS_MEMORY_BUDGET_MB. An explicit LACHESIS_C_CHUNK_FILES still
+    # overrides the derived chunk size, exactly as it does without the flag.
+    if args.memory_budget_mb is not None:
+        os.environ["LACHESIS_MEMORY_BUDGET_MB"] = str(args.memory_budget_mb)
     if args.parallel_packages and args.incremental:
         parser.error("--parallel-packages and --incremental cannot be combined: the "
             "incremental manifest keys bundles by frontend, not by package")
@@ -152,6 +291,15 @@ def _run(argv: list[str] | None = None) -> None:
         parser.error("--reduced/--layered-out are not available in the native-only build path")
     if args.stream_shards and args.parallel_packages and args.max_workers not in (None, 1):
         parser.error("streamed package shards are serialized; use --max-workers 1")
+    include_paths = args.include_paths or []
+    if include_paths and args.parallel_packages:
+        parser.error("--include is not supported with --parallel-packages: the package "
+            "partition keys jobs by their path under source_dir, so a path outside it "
+            "has no package to join. Scope with a sub-directory (the serial path) and "
+            "point --include at the advisory file instead")
+    for included in include_paths:
+        if not os.path.exists(included):
+            parser.error(f"--include path does not exist: {included}")
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
     # same output defaults before the streaming branch as the ordinary path below.
     # Previously the early return skipped this block and made --stream-shards run
@@ -170,8 +318,13 @@ def _run(argv: list[str] | None = None) -> None:
         else:
             readers, snapshots = run_project_streaming(
                 args.source_dir, args.stream_shards, frontend_out,
-                timeout_seconds=args.timeout,
+                timeout_seconds=args.timeout, include_paths=include_paths,
             )
+        if not snapshots:
+            parser.error(
+                f"no supported source files under {args.source_dir}: refusing "
+                "to write an empty graph. Point build at a tree containing C, "
+                "Python, or TypeScript sources.")
         stored = write_kuzu_shards(
             CompositeShardReader(readers), args.output_path, snapshots,
             prune=args.prune,
@@ -200,6 +353,13 @@ def _run(argv: list[str] | None = None) -> None:
     # separate values. The compile runs unenriched and this folds the overlay itself.
     compile_enrich = False
 
+    # Reap orphaned scratch from any prior build that was SIGKILLed (OOM/watchdog/^C^C)
+    # before it could self-clean, so neither the system temp dir nor the output directory
+    # accumulates multi-GB leftovers run over run. Covers every build mode: the streamed,
+    # parallel, and incremental paths all stage intermediates that a hard kill orphans.
+    _reap_stale_stream_temp()
+    _reap_inplace_build_scratch(args.output_path)
+
     # Core-only builds do not need a materialized Python graph. Keep frontend
     # records in binary shards and stream them directly into Kùzu to bound RSS.
     if (
@@ -213,8 +373,13 @@ def _run(argv: list[str] | None = None) -> None:
             frontend_out = args.frontend_out or os.path.join(stream_root, "frontends")
             readers, snapshots = run_project_streaming(
                 args.source_dir, stream_root, frontend_out,
-                timeout_seconds=args.timeout,
+                timeout_seconds=args.timeout, include_paths=include_paths,
             )
+            if not snapshots:
+                parser.error(
+                    f"no supported source files under {args.source_dir}: refusing "
+                    "to write an empty graph. Point build at a tree containing C, "
+                    "Python, or TypeScript sources.")
             stored = write_kuzu_shards(
                 CompositeShardReader(readers), args.output_path, snapshots,
                 prune=args.prune,
@@ -241,11 +406,13 @@ def _run(argv: list[str] | None = None) -> None:
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, frontend_out,
                                                    enrich=compile_enrich,
-                                                   timeout_seconds=args.timeout)
+                                                   timeout_seconds=args.timeout,
+                                                   include_paths=include_paths)
     else:
         graph, snapshots = run_project(args.source_dir, frontend_out,
                                        enrich=compile_enrich,
-                                       timeout_seconds=args.timeout)
+                                       timeout_seconds=args.timeout,
+                                       include_paths=include_paths)
     build_fingerprint = None
     if args.incremental and frontend_out:
         manifest_path = default_manifest_path(frontend_out)
@@ -277,7 +444,7 @@ def _run(argv: list[str] | None = None) -> None:
         source_dir=args.source_dir if args.reduced else None,
         # Hashed rather than assumed: the store records what the tree was at build time,
         # so a load can tell whether an already-joined cache still describes it.
-        source_content_hash=(source_content_hash(args.source_dir)
+        source_content_hash=(source_content_hash(args.source_dir, include_paths=include_paths)
                              if args.reduced else None),
         build_fingerprint=build_fingerprint,
     )

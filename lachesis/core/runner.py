@@ -8,13 +8,91 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from .contract import ContractError, FrontendSnapshot, FrontendSpec
 from . import graph_pb2
 from .graph_wire import WIRE_FORMAT_VERSION, decode_node, iter_tier_records
-from .shards import ShardSetWriter
+from .shards import ShardReader, ShardSetWriter
 from .snapshot import load_manifest, load_snapshot
+
+try:  # POSIX only; supported deployments are POSIX runners.
+    import resource as _resource
+except ImportError:  # pragma: no cover - non-POSIX
+    _resource = None
+
+# Target OS stack for a frontend child. A recursive compiler descent over a
+# very large single source file needs more than the default 8 MiB; this backs
+# the raised V8 --stack-size so the parse unwinds instead of hitting the guard
+# page. Clamped to the hard limit; macOS ignores it for the main thread (its
+# 8 MiB is fixed), so it is a Linux-facing lever, harmless where it has no effect.
+_FRONTEND_STACK_TARGET_BYTES = 256 * 1024 * 1024
+
+
+def _raise_frontend_stack_limit() -> None:
+    """Raise the soft RLIMIT_STACK toward a large ceiling in the forked child.
+
+    Runs as a ``preexec_fn`` (after fork, before exec). Uses only the
+    module-level ``_resource`` handle and no imports, so it is safe to call in
+    the child of a multi-threaded parent. Best-effort: any failure leaves the
+    default stack, and --stack-size still stays within its conservative ceiling.
+    """
+    if _resource is None:
+        return
+    try:
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_STACK)
+        target = _FRONTEND_STACK_TARGET_BYTES
+        if hard != _resource.RLIM_INFINITY:
+            target = min(target, hard)
+        if soft == _resource.RLIM_INFINITY or soft >= target:
+            return
+        _resource.setrlimit(_resource.RLIMIT_STACK, (target, hard))
+    except (ValueError, OSError):
+        pass
+
+
+def _describe_exit(returncode: int) -> str:
+    """Human-readable classification of a nonzero frontend exit.
+
+    A negative return code is death by signal. SIGABRT (from V8's fatal
+    handler on a native stack overflow) is the giant-single-file failure mode,
+    so it gets an actionable hint instead of an opaque ``exited -6``.
+    """
+    if returncode >= 0:
+        return f"exited {returncode}"
+    signum = -returncode
+    try:
+        signame = signal.Signals(signum).name
+    except ValueError:
+        signame = f"signal {signum}"
+    detail = f"killed by {signame}"
+    if signum == int(signal.SIGABRT):
+        detail += (
+            " (likely a native stack overflow parsing a very large single "
+            "source file; raise LACHESIS_TS_STACK_KB or scope the build to a "
+            "subdirectory)"
+        )
+    return detail
+
+
+def _is_reference_read(message) -> bool:
+    """True for the reverse-direction dataflow read a reference emits.
+
+    A `DeclRefExpr`/`MemberRef` emits a pair over one seam: `REFERS_TO`
+    (use -> declaration) and `VALUE_FLOWS_TO(reason=read)` (declaration ->
+    use).  The ownership filter keeps an edge in the shard that owns its
+    *source*, which keeps the REFERS_TO (source is the local use) but drops
+    the read (source is the declaration, which lives in another shard when
+    the reference crosses a translation unit).  The read is nonetheless
+    emitted only by the frontend that sees the use, so the use shard is its
+    true owner: this predicate lets that shard retain it by *target*.
+    """
+    if message.kind != "VALUE_FLOWS_TO":
+        return False
+    for prop in message.properties:
+        if prop.key == "reason":
+            return prop.value.text == "read"
+    return False
 
 
 def _run_frontend_command(
@@ -29,6 +107,7 @@ def _run_frontend_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=(os.name == "posix"),
+        preexec_fn=_raise_frontend_stack_limit if os.name == "posix" else None,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -117,6 +196,51 @@ def _stream_bundle_to_shard(
     node_count = edge_count = 0
     retained_node_ids: set[str] = set()
     try:
+        if frontend_id == "clang-c" and raw_manifest_path.is_file():
+            # The native Clang frontend emits one raw shard (nodes.pb/edges.pb) that
+            # already carries each record's tier, not the per-tier files the loop below
+            # expects.  Its bundle manifest has no ``tiers`` entry, so that loop would
+            # iterate nothing and complete an empty shard -- the ownership-filtered path
+            # can therefore never reach the verbatim fast path above.  Read the raw shard
+            # directly and apply the filter here; surviving records are re-serialised
+            # unchanged, matching the fast path for everything that is kept.
+            reader = ShardReader(raw_shard)
+            for payload in reader.raw_nodes():
+                node = None
+                if keep_node is not None:
+                    # Applied while the protobuf record is live, so a package-sharded
+                    # build discards imported dependency views without materialising a
+                    # bundle -- the owning chunk emits the canonical record.
+                    node = decode_node(payload)
+                    if not keep_node(node):
+                        continue
+                message = graph_pb2.NodeRecord()
+                message.ParseFromString(payload)
+                node_id = node["id"] if node is not None else message.id
+                writer.add_node_payload(message.SerializeToString())
+                retained_node_ids.add(node_id)
+                node_count += 1
+            for payload in reader.raw_edges():
+                message = graph_pb2.EdgeRecord()
+                message.ParseFromString(payload)
+                if keep_node is not None and message.source not in retained_node_ids:
+                    # A reference read is owned by the use site (its target), not
+                    # its source declaration, which may live in another shard.
+                    if not (_is_reference_read(message)
+                            and message.target in retained_node_ids):
+                        continue
+                writer.add_edge_payload(message.SerializeToString())
+                edge_count += 1
+            shard_set.complete(str(shard_id), writer)
+            snapshot = FrontendSnapshot(
+                frontend_id=frontend_id,
+                contract_version=manifest.get("frontend_contract_version", manifest.get("version")),
+                languages=tuple(manifest.get("languages", ())),
+                capabilities=dict(manifest.get("capabilities", {})),
+                manifest=manifest, nodes=[], edges=[], stdout=stdout, stderr=stderr,
+                released=True, _released_node_count=node_count, _released_edge_count=edge_count,
+            )
+            return snapshot
         for tier_name, tier_path in ((item.get("tier"), os.path.join(output_dir, item.get("file", "")))
                                      for item in manifest.get("tiers", [])):
             for collection, payload in iter_tier_records(tier_path, raw=True):
@@ -142,7 +266,11 @@ def _stream_bundle_to_shard(
                 message.source_tier = tier_name
                 message.relationship_class = collection
                 if keep_node is not None and message.source not in retained_node_ids:
-                    continue
+                    # A reference read is owned by the use site (its target), not
+                    # its source declaration, which may live in another shard.
+                    if not (_is_reference_read(message)
+                            and message.target in retained_node_ids):
+                        continue
                 writer.add_edge_payload(message.SerializeToString())
                 edge_count += 1
         shard_set.complete(str(shard_id), writer)
@@ -197,7 +325,13 @@ def run_frontend(
     timeout_seconds: int = 300,
     roots: Optional[Sequence[str]] = None,
     keep_node: Optional[Callable[[dict], bool]] = None,
+    shard_root: Optional[str] = None,
+    extra_environment: Optional[Mapping[str, str]] = None,
 ) -> FrontendSnapshot:
+    # ``shard_root`` overrides LACHESIS_SHARD_ROOT for this one invocation without
+    # mutating the shared process environment, so a chunked build can stream each
+    # chunk into its own isolated shard set (and run chunks concurrently later)
+    # instead of every chunk racing on one global destination directory.
     started = time.perf_counter()
 
     def report(snapshot: FrontendSnapshot) -> FrontendSnapshot:
@@ -210,10 +344,10 @@ def run_frontend(
             )
         return snapshot
 
+    effective_shard_root = shard_root or os.environ.get("LACHESIS_SHARD_ROOT")
     if _in_process_applies(frontend, output_dir):
         snapshot = frontend.in_process(source_dir, roots)
-        _persist_shard(snapshot, os.environ.get("LACHESIS_SHARD_ROOT"),
-                       keep_node=keep_node)
+        _persist_shard(snapshot, effective_shard_root, keep_node=keep_node)
         return report(snapshot)
     temporary = None
     if output_dir is None:
@@ -222,6 +356,10 @@ def run_frontend(
     os.makedirs(output_dir, exist_ok=True)
     environment = os.environ.copy()
     environment.update(frontend.environment)
+    if extra_environment:
+        environment.update(extra_environment)
+    if shard_root is not None:
+        environment["LACHESIS_SHARD_ROOT"] = shard_root
     # When discovery hands us an explicit root set (test files already excluded),
     # write it beside the output and point the frontend at it so a frontend that
     # re-walks the tree compiles exactly this list — one discovery, no drift.
@@ -244,13 +382,14 @@ def run_frontend(
         )
         if completed.returncode != 0:
             raise ContractError(
-                f"frontend {frontend.frontend_id} exited {completed.returncode}\n"
+                f"frontend {frontend.frontend_id} "
+                f"{_describe_exit(completed.returncode)}\n"
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
-        shard_root = environment.get("LACHESIS_SHARD_ROOT")
-        if shard_root:
+        resolved_shard_root = environment.get("LACHESIS_SHARD_ROOT")
+        if resolved_shard_root:
             snapshot = _stream_bundle_to_shard(
-                output_dir, shard_root, completed.stdout, completed.stderr,
+                output_dir, resolved_shard_root, completed.stdout, completed.stderr,
                 keep_node=keep_node,
             )
         else:

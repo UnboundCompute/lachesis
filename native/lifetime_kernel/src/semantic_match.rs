@@ -6,8 +6,10 @@
 //! strings on every CFG transfer.
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use prost::Message;
 
 use crate::lifetime_proto;
 
@@ -101,12 +103,23 @@ fn trace_witness(
 /// only a few objects.  Keeping sorted handles avoids cloning a dense bitset
 /// sized to every object in every worklist state and retains deterministic
 /// hashing/equality.
+// The handle vector is shared behind an `Rc` so cloning a worklist state is a
+// refcount bump, not a copy of all nine sorted-handle sets.  A state carries
+// eleven of these and up to `MAX_STATES` distinct states are retained in
+// `seen`; most transitions touch one or two sets, so the unchanged ones share
+// one allocation across every derived state.  Mutation goes through
+// `Rc::make_mut`, which copies on write only when a set is actually shared, so
+// contents - and therefore state equality, hashing and matcher output - are
+// unchanged.  `Rc<Vec<u32>>` compares and hashes by pointed-to contents, so the
+// derived `Eq`/`Hash` used for state dedup keep their exact meaning.  States
+// never leave a single `match_function` call, so the non-atomic `Rc` never
+// crosses the rayon function-parallel boundary.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct MarkSet(Vec<u32>);
+struct MarkSet(Rc<Vec<u32>>);
 
 impl MarkSet {
     fn empty(_object_count: usize) -> Self {
-        Self(Vec::new())
+        Self(Rc::new(Vec::new()))
     }
 
     #[inline]
@@ -117,14 +130,14 @@ impl MarkSet {
     #[inline]
     fn insert(&mut self, value: u32) {
         if let Err(index) = self.0.binary_search(&value) {
-            self.0.insert(index, value);
+            Rc::make_mut(&mut self.0).insert(index, value);
         }
     }
 
     #[inline]
     fn remove(&mut self, value: u32) {
         if let Ok(index) = self.0.binary_search(&value) {
-            self.0.remove(index);
+            Rc::make_mut(&mut self.0).remove(index);
         }
     }
 
@@ -133,11 +146,11 @@ impl MarkSet {
     }
 
     fn union(&self, other: &Self) -> Self {
-        let mut values = self.0.clone();
+        let mut values: Vec<u32> = (*self.0).clone();
         for value in other.iter() {
             if let Err(index) = values.binary_search(&value) { values.insert(index, value); }
         }
-        Self(values)
+        Self(Rc::new(values))
     }
 }
 
@@ -372,22 +385,25 @@ fn match_function(
     // Keep the metadata needed by seam traversal beside the adjacency entry.
     // Looking it up by scanning `function.edges` inside the state worklist made
     // stitched matching O(states * edges) on large functions/stitched graphs.
+    // Borrow the guard/binding/seam metadata from `function.edges`; the
+    // function is borrowed for the whole match and outlives the worklist, so a
+    // per-edge owned copy of every guard proof and seam binding is wasted.
     let mut guarded_outgoing: Vec<Vec<(
         usize,
-        Vec<lifetime_proto::GuardProof>,
-        Vec<lifetime_proto::NativeSeamBinding>,
-        String,
-        String,
+        &[lifetime_proto::GuardProof],
+        &[lifetime_proto::NativeSeamBinding],
+        &str,
+        &str,
     )>> = vec![Vec::new(); function.nodes.len()];
     for edge in &function.edges {
         if let (Some(source), Some(target)) = (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str())) {
             outgoing[*source].push(*target);
             guarded_outgoing[*source].push((
                 *target,
-                edge.guards.clone(),
-                edge.bindings.clone(),
-                edge.seam_kind.clone(),
-                edge.return_to.clone(),
+                edge.guards.as_slice(),
+                edge.bindings.as_slice(),
+                edge.seam_kind.as_str(),
+                edge.return_to.as_str(),
             ));
         }
     }
@@ -561,7 +577,24 @@ fn match_function(
                 uninitialized.remove(object);
                 escaped.remove(object);
                 realloc_lost.remove(object);
-                origins.insert(object);
+                // A `return-may-null` origin is the fallback heuristic for an
+                // uncatalogued pointer-returning call (fopen, opendir, popen,
+                // SSL_new, a borrowed getter): we do not KNOW it returns an
+                // owned allocation, and its companion releaser (fclose, ...) is
+                // likewise uncatalogued, so it must not seed a leak obligation
+                // -- doing so flags every such value as leaked at exit even
+                // when it is released through its uncatalogued companion. The
+                // object still entered `nullable` above, so null-deref /
+                // unchecked-return-deref / use-after-free stay live for it;
+                // only confidently-owned origins (catalogued `Kind::Alloc`:
+                // malloc/calloc/strdup..., access "deref"; and taint `source`
+                // clobbers) reach the leak scan over `origins`. A resolved
+                // allocator wrapper is unaffected: it takes prepare.rs's
+                // summary path, emitting a real `Alloc` effect, not this
+                // heuristic.
+                if node.access != "return-may-null" {
+                    origins.insert(object);
+                }
             },
             "RELEASE" | "memory.free" => if let Some(object) = object_id {
                 // A release through a slot proven to contain null is a no-op.
@@ -691,18 +724,18 @@ fn match_function(
                 }
             }
         }
-        for (target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
+        for &(target, guards, seam_bindings, seam_kind, return_to) in &guarded_outgoing[index] {
             let mut next_returns = returns.clone();
             if seam_kind == "call" {
                 if !return_to.is_empty() {
-                    let Some(continuation) = by_id.get(return_to.as_str()).copied() else {
+                    let Some(continuation) = by_id.get(return_to).copied() else {
                         continue;
                     };
                     next_returns.push(continuation);
                 }
             } else if seam_kind == "return" {
                 let Some(continuation) = next_returns.pop() else { continue };
-                if continuation != *target { continue; }
+                if continuation != target { continue; }
             }
             let mut next_bindings = bindings.clone();
             for binding in seam_bindings {
@@ -808,7 +841,7 @@ fn match_function(
             }
             if !contradiction {
                 let mut next_state = StateKey {
-                    node: *target, returns: next_returns, bindings: next_bindings,
+                    node: target, returns: next_returns, bindings: next_bindings,
                     guards: next_guards.iter().map(|guard|
                         (guard.kind.clone(), guard.value.clone())).collect(),
                     released: released.clone(), origins: next_origins, nulls: next_nulls,
@@ -817,9 +850,9 @@ fn match_function(
                     pointer_arithmetic: pointer_arithmetic.clone(), escaped: next_escaped,
                     realloc_lost: realloc_lost.clone(),
                 };
-                if function.nodes[*target].event_kind == "LOOP" {
+                if function.nodes[target].event_kind == "LOOP" {
                     const LOOP_WIDEN_LIMIT: usize = 32;
-                    let key = (*target, next_state.returns.clone());
+                    let key = (target, next_state.returns.clone());
                     let bucket = loop_buckets.entry(key).or_default();
                     if bucket.len() >= LOOP_WIDEN_LIMIT {
                         let prior = bucket.remove(0);
@@ -855,12 +888,15 @@ fn match_function(
 }
 
 pub(crate) fn match_result(
-    result: lifetime_proto::NativeSemanticResult,
+    mut result: lifetime_proto::NativeSemanticResult,
 ) -> lifetime_proto::NativeTemporalResult {
-    let had_skeletons = !result.skeletons.is_empty();
-    let temporal_skeletons: Vec<_> = result.skeletons.iter()
+    // Take the skeletons by value: the temporal branch consumes them and the
+    // fall-through branches never read them, so moving avoids cloning every
+    // skeleton (each owning a token vector of strings) out of the result.
+    let skeletons = std::mem::take(&mut result.skeletons);
+    let had_skeletons = !skeletons.is_empty();
+    let temporal_skeletons: Vec<_> = skeletons.into_iter()
         .filter(|skeleton| skeleton.kind != "reach")
-        .cloned()
         .collect();
     if had_skeletons {
         let mut matched = match_skeletons(temporal_skeletons);
@@ -930,14 +966,22 @@ pub(crate) fn match_result_with_catalog(
     // path-sensitive temporal automaton.  Passing both kinds to
     // `match_result` makes a reach sink look like a lifecycle event and can
     // produce duplicate or spurious temporal findings.
-    let reach_skeletons: Vec<_> = result.skeletons.iter()
-        .filter(|skeleton| skeleton.kind == "reach")
-        .cloned().collect();
-    let sink_graphs: Vec<_> = result.skeletons.iter()
-        .filter(|skeleton| skeleton.kind == "reach-graph")
-        .cloned().collect();
-    result.skeletons.retain(|skeleton|
-        skeleton.kind != "reach" && skeleton.kind != "reach-graph");
+    // Partition the skeletons by moving them out of the result exactly once:
+    // reach and reach-graph skeletons go to their own matchers, the remainder
+    // stays in the result for the temporal automaton. Preserves per-bucket
+    // order (and therefore ordinals) while avoiding two cloned copies plus a
+    // retain realloc of the skeleton set.
+    let mut reach_skeletons = Vec::new();
+    let mut sink_graphs = Vec::new();
+    let mut temporal_skeletons = Vec::new();
+    for skeleton in std::mem::take(&mut result.skeletons) {
+        match skeleton.kind.as_str() {
+            "reach" => reach_skeletons.push(skeleton),
+            "reach-graph" => sink_graphs.push(skeleton),
+            _ => temporal_skeletons.push(skeleton),
+        }
+    }
+    result.skeletons = temporal_skeletons;
     let mut matched = match_result(result);
     matched.functions.extend(reach_skeletons.iter().enumerate()
         .filter_map(|(ordinal, skeleton)| match_reach_skeleton(skeleton, catalog, ordinal)));
@@ -960,6 +1004,173 @@ pub(crate) fn match_result_with_catalog(
         }
     }
     matched
+}
+
+/// Read one base-128 varint from `buf` at `*pos`, advancing `*pos`.
+/// Returns None on a truncated/overlong varint.
+fn stream_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        if *pos >= buf.len() || shift >= 64 { return None; }
+        let byte = buf[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 { return Some(result); }
+        shift += 7;
+    }
+}
+
+/// Streaming Pass-3 matcher: decode and match the sidecar one skeleton at a
+/// time instead of materializing the whole `NativeSemanticResult`.
+///
+/// This is the memory-bounded twin of `match_result_with_catalog` for the
+/// common skeleton path.  The decode of the full sidecar is what makes the
+/// enrich peak scale with the whole graph (skeletons dominate its bytes), yet
+/// the skeleton path matches every skeleton independently and never reads the
+/// `functions`/`seams` payload at all.  So we walk the top-level protobuf wire
+/// form over a read-only mapping, decode each `skeletons` (field 5) entry on its
+/// own, route it to the same per-skeleton matcher `match_result_with_catalog`
+/// would (reach / reach-graph / temporal), keep only the compact finding, and
+/// drop the skeleton before reading the next.  Peak memory is then the largest
+/// single skeleton plus the accumulated findings -- constant in graph size.
+///
+/// The output is byte-identical to `match_result_with_catalog`: the same
+/// per-skeleton functions produce the findings, per-bucket ordinals are assigned
+/// in the same encounter order, the buckets are concatenated in the same order
+/// (temporal, then reach, then reach-graph), the global `complete` flag caps the
+/// temporal functions exactly as `match_result` does, and the catalog enable
+/// filter is applied identically.
+///
+/// Returns `None` when the sidecar takes a branch that genuinely needs the
+/// `functions`/`seams` payload -- i.e. no temporal skeletons exist, so
+/// `match_result` would fall through to the stitched or per-function path.  The
+/// caller then decodes the whole sidecar once and runs the original matcher, so
+/// that (rarer, non-skeleton) path stays exactly as before.
+pub(crate) fn match_streaming(
+    bytes: &[u8],
+    catalog: Option<&crate::atropos_proto::PatternCatalog>,
+) -> Option<lifetime_proto::NativeTemporalResult> {
+    const FIELD_COMPLETE: u64 = 2; // NativeSemanticResult.complete (bool)
+    const FIELD_SKELETONS: u64 = 5; // NativeSemanticResult.skeletons (repeated)
+
+    // Test/diagnostic hook: force the whole-sidecar fallback so the two decode
+    // paths can be compared on identical input. Off by default and byte-
+    // transparent -- the fallback produces the same result as this function.
+    if std::env::var_os("LACHESIS_FORCE_FULL_DECODE").is_some() { return None; }
+
+    let mut temporal = Vec::new();
+    let mut reach = Vec::new();
+    let mut sinks = Vec::new();
+    let (mut temporal_ord, mut reach_ord, mut sink_ord) = (0usize, 0usize, 0usize);
+    let mut any_skeleton = false;
+    let mut complete = true; // proto3 bool default; overwritten if the field is present
+
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let key = stream_varint(bytes, &mut pos)?;
+        let field = key >> 3;
+        let wire = key & 7;
+        match wire {
+            0 => {
+                let value = stream_varint(bytes, &mut pos)?;
+                if field == FIELD_COMPLETE { complete = value != 0; }
+            }
+            1 => { pos = pos.checked_add(8)?; if pos > bytes.len() { return None; } }
+            5 => { pos = pos.checked_add(4)?; if pos > bytes.len() { return None; } }
+            2 => {
+                let len = stream_varint(bytes, &mut pos)? as usize;
+                let end = pos.checked_add(len)?;
+                if end > bytes.len() { return None; }
+                if field == FIELD_SKELETONS {
+                    let skeleton =
+                        lifetime_proto::NativeFlowSkeleton::decode(&bytes[pos..end]).ok()?;
+                    any_skeleton = true;
+                    match catalog {
+                        // With a catalog, `match_result_with_catalog` partitions
+                        // by kind before matching; mirror that routing exactly.
+                        Some(cat) => match skeleton.kind.as_str() {
+                            "reach" => {
+                                if let Some(f) = match_reach_skeleton(&skeleton, cat, reach_ord) {
+                                    reach.push(f);
+                                }
+                                reach_ord += 1;
+                            }
+                            "reach-graph" => {
+                                if let Some(f) = match_sink_relations(&skeleton, cat, sink_ord) {
+                                    sinks.push(f);
+                                }
+                                sink_ord += 1;
+                            }
+                            _ => {
+                                if let Some(f) = match_skeleton(&skeleton, temporal_ord) {
+                                    temporal.push(f);
+                                }
+                                temporal_ord += 1;
+                            }
+                        },
+                        // Without a catalog, `match_result` drops "reach"
+                        // skeletons and runs every other kind through the
+                        // temporal automaton.
+                        None => if skeleton.kind != "reach" {
+                            if let Some(f) = match_skeleton(&skeleton, temporal_ord) {
+                                temporal.push(f);
+                            }
+                            temporal_ord += 1;
+                        },
+                    }
+                } else {
+                    pos = end;
+                    continue;
+                }
+                pos = end;
+            }
+            _ => return None, // unknown wire type: fall back to the full decoder
+        }
+    }
+
+    // Decide whether `match_result` would have taken a skeleton branch. With a
+    // catalog that is "any temporal (non-reach, non-reach-graph) skeleton";
+    // without one it is "any skeleton at all". If not, the real matcher needs
+    // the functions/seams payload, so signal the caller to fall back.
+    let took_skeleton_branch = if catalog.is_some() { temporal_ord > 0 } else { any_skeleton };
+    if !took_skeleton_branch { return None; }
+
+    // `match_result` caps every temporal function when the run is incomplete;
+    // it applies this to the `match_skeletons` output only, before the reach and
+    // reach-graph buckets are appended.
+    if !complete {
+        for function in &mut temporal { function.capped = true; }
+    }
+
+    // Concatenation order matches `match_result_with_catalog`: temporal (the
+    // `match_result` return), then reach, then reach-graph.
+    let mut functions = temporal;
+    functions.append(&mut reach);
+    functions.append(&mut sinks);
+    let mut matched = lifetime_proto::NativeTemporalResult { functions };
+
+    // The catalog enable filter, identical to `match_result_with_catalog`.
+    if let Some(catalog) = catalog {
+        let enabled: HashSet<&str> = catalog.patterns.iter()
+            .filter_map(|pattern| (!pattern.matcher_pattern.is_empty())
+                .then_some(pattern.matcher_pattern.as_str()))
+            .collect();
+        if !enabled.is_empty() {
+            for function in &mut matched.functions {
+                function.findings.retain(|finding| enabled.contains(finding.pattern.as_str()));
+                for finding in &mut function.findings {
+                    if let Some(pattern) = catalog.patterns.iter()
+                        .find(|pattern| pattern.matcher_pattern == finding.pattern) {
+                        finding.pattern_id = pattern.id.clone();
+                        finding.evaluator = pattern.evaluator.clone();
+                        finding.tier = pattern.tier;
+                    }
+                }
+            }
+        }
+    }
+    Some(matched)
 }
 
 fn match_sink_relations(

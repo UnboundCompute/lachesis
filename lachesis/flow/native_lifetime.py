@@ -9,6 +9,8 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -73,6 +75,58 @@ def _require_library():
     return library
 
 
+# -- native-pass process isolation ---------------------------------------------
+#
+# A whole-graph native pass (Pass-2 enrich, the Pass-3 semantic sidecar) allocates
+# a large transient inside the Rust arena and, on return, the system allocator keeps
+# those freed pages resident rather than returning them to the OS. Two such passes
+# run back to back during `enrich`, so the second transient lands on top of the
+# first's retained arena and the peak is the *sum*, not the max -- measured ~2.1 GB
+# on a store where each pass alone needs ~1.3 GB.
+#
+# Both passes speak to Rust purely through file paths (input/catalog in, sidecar
+# out), so running one in a short-lived child process is transparent: the child
+# writes the identical sidecar and exits, and the OS reclaims its entire heap. The
+# transients then never coexist and the peak is bounded by the single largest pass,
+# which is what lets `enrich` scale to a Linux-sized graph. Opt-in via
+# ``LACHESIS_ISOLATE_NATIVE`` so small-graph and interactive callers keep the
+# in-process path and its ~1s-per-pass spawn cost.
+_ISOLATE_ENV = "LACHESIS_ISOLATE_NATIVE"
+
+
+def _isolation_requested() -> bool:
+    return os.environ.get(_ISOLATE_ENV, "") not in ("", "0")
+
+
+def _run_isolated(op: str, input_path, output_path, catalog_path) -> bool:
+    """Run native pass ``op`` in a child process when isolation is requested.
+
+    Returns True when the pass was handled in a child (the caller must not also run
+    it in-process); False when the caller should fall through to the in-process FFI.
+    Raises the same ``RuntimeError`` the in-process path raises on a non-zero status.
+    """
+    if not _isolation_requested():
+        return False
+    child_env = dict(os.environ)
+    # The child re-enters this module; clear the flag so it runs the pass in-process
+    # instead of spawning a grandchild forever.
+    child_env.pop(_ISOLATE_ENV, None)
+    # Guarantee the child can import `lachesis` however the parent was launched
+    # (editable install, PYTHONPATH, or a source checkout): prepend the repo root.
+    repo_root = str(Path(__file__).resolve().parents[2])
+    existing = child_env.get("PYTHONPATH", "")
+    if repo_root not in existing.split(os.pathsep):
+        child_env["PYTHONPATH"] = repo_root + (os.pathsep + existing if existing else "")
+    argv = [sys.executable, "-m", "lachesis.flow.native_worker", op,
+            os.fspath(input_path), os.fspath(output_path),
+            os.fspath(catalog_path) if catalog_path is not None else ""]
+    completed = subprocess.run(argv, env=child_env)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"native pass {op!r} (isolated) failed with exit code {completed.returncode}")
+    return True
+
+
 def _call_path(symbol: str, input_path: str | os.PathLike[str], response_type,
                operation: str):
     library = _require_library()
@@ -106,6 +160,8 @@ def write_translation_facts_path(sidecar_path: str | os.PathLike[str],
 def run_pass2_path(input_path: str | os.PathLike[str],
                    output_path: str | os.PathLike[str],
                    catalog_path: str | os.PathLike[str] | None = None) -> None:
+    if _run_isolated("pass2", input_path, output_path, catalog_path):
+        return
     library = _require_library()
     function = library.lachesis_pass2_run_path
     function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -193,6 +249,8 @@ def summaries_path(facts_path, catalog_path, output_path):
 
 def write_semantic_path(input_path, output_path, catalog_path=None) -> None:
     """Publish the Rust semantic sidecars without decoding them in Python."""
+    if _run_isolated("semantic", input_path, output_path, catalog_path):
+        return
     library = _require_library()
     function = library.lachesis_lifetime_semantic_path
     function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -212,7 +270,17 @@ def match_semantic_path(input_path: str | os.PathLike[str],
     Only filenames cross this boundary.  Rust maps the input and writes a
     ``NativeTemporalResult`` protobuf; Python callers can decode that result
     without reconstructing the semantic graph or invoking the legacy matcher.
+
+    The Pass-3 matcher is the largest native pass on the enrich path -- it walks
+    the whole semantic graph's temporal families -- and its native arena stays
+    resident in-process after the FFI returns.  Run it in a short-lived child
+    when isolation is requested, exactly as ``run_pass2_path`` and
+    ``write_semantic_path`` do, so that arena is handed back to the OS on child
+    exit instead of stacking on the Python parent's peak.  The child writes the
+    identical sidecar, so isolation is byte-transparent.
     """
+    if _run_isolated("match", input_path, output_path, catalog_path):
+        return
     library = _require_library()
     function = library.lachesis_lifetime_match_semantic_path
     function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]

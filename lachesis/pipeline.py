@@ -97,12 +97,26 @@ def _combine_graphs(
     }, len(dangling)
 
 
-def source_inventory(source_dir: str, include_tests: bool = True) -> List[str]:
+def source_inventory(
+    source_dir: str,
+    include_tests: bool = True,
+    include_paths: Sequence[str] = (),
+) -> List[str]:
     """Discover every supported source file, including tests and specifications.
 
     Complete compiler coverage is the default: a function must not disappear merely
     because its path looks like a test. Callers that explicitly need a production-only
     inventory may still pass ``include_tests=False``.
+
+    ``include_paths`` names extra files or directories to fold into the inventory even
+    when they lie *outside* ``source_dir``. This is the guided-scope guarantee: when a
+    build is deliberately narrowed to a sub-tree to fit a time budget, the advisory's
+    vulnerable file can be scoped down to yet be sure it is analysed, so scoping never
+    silently excludes the one file the run exists to reach. An explicitly named file is
+    always kept (the test-path heuristic never drops it); an explicitly named directory
+    is walked with the same ignore rules as ``source_dir``. Paths already discovered
+    under ``source_dir`` are not duplicated. With no ``include_paths`` the result is
+    byte-for-byte the historical inventory of ``source_dir`` alone.
     """
     # node_modules has a Python counterpart in every direction: an installed
     # virtualenv, a build cache, and a tool cache. Walking any of them analyses
@@ -140,31 +154,63 @@ def source_inventory(source_dir: str, include_tests: bool = True) -> List[str]:
     is_test = None
     if not include_tests:
         from lachesis.nav.symbol_index import is_test_path as is_test
-    source_root = os.path.realpath(os.path.abspath(source_dir))
-    result = []
-    for root, directories, files in os.walk(os.path.abspath(source_dir)):
-        directories[:] = sorted(
-            name for name in directories
-            if name not in ignored
-            and os.path.realpath(os.path.join(root, name)) != vendored_typescript
-        )
-        for name in sorted(files):
-            path = os.path.join(root, name)
-            # Directory links are not traversed by os.walk, but file links are
-            # returned as ordinary files and the compiler follows them. Keep a
-            # link that resolves inside the requested project, while refusing to
-            # pull arbitrary files from outside it into the graph or its cache key.
-            if os.path.islink(path):
-                target = os.path.realpath(path)
-                try:
-                    inside = os.path.commonpath((source_root, target)) == source_root
-                except ValueError:  # different drives on Windows
-                    inside = False
-                if not inside:
+
+    def _walk(base_dir: str, containment_root: str) -> List[str]:
+        collected = []
+        for root, directories, files in os.walk(base_dir):
+            directories[:] = sorted(
+                name for name in directories
+                if name not in ignored
+                and os.path.realpath(os.path.join(root, name)) != vendored_typescript
+            )
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                # Directory links are not traversed by os.walk, but file links are
+                # returned as ordinary files and the compiler follows them. Keep a
+                # link that resolves inside the requested project, while refusing to
+                # pull arbitrary files from outside it into the graph or its cache key.
+                if os.path.islink(path):
+                    target = os.path.realpath(path)
+                    try:
+                        inside = os.path.commonpath((containment_root, target)) == containment_root
+                    except ValueError:  # different drives on Windows
+                        inside = False
+                    if not inside:
+                        continue
+                if is_test is not None and is_test(path):
                     continue
-            if is_test is not None and is_test(path):
+                collected.append(path)
+        return collected
+
+    source_root = os.path.realpath(os.path.abspath(source_dir))
+    result = _walk(os.path.abspath(source_dir), source_root)
+    if not include_paths:
+        return result
+    # Fold in the explicitly requested paths, deduplicating against what the walk of
+    # ``source_dir`` already found (by resolved identity, so a symlink or a `.` prefix
+    # cannot smuggle a file in twice). An explicit *file* is kept unconditionally --
+    # the caller has named it, so the test-path heuristic must not veto it -- while an
+    # explicit *directory* is walked under the same rules as ``source_dir`` with itself
+    # as the containment root, so its own in-tree links resolve. Extras are appended
+    # after the base inventory in sorted order, leaving the empty-``include_paths`` case
+    # (handled by the early return above) exactly as it was.
+    seen = {os.path.realpath(path) for path in result}
+    extra = []
+    for raw in include_paths:
+        target = os.path.abspath(raw)
+        if os.path.isdir(target):
+            candidates = _walk(target, os.path.realpath(target))
+        elif os.path.isfile(target):
+            candidates = [target]
+        else:
+            raise FrontendError(f"included path does not exist: {raw}")
+        for path in candidates:
+            resolved = os.path.realpath(path)
+            if resolved in seen:
                 continue
-            result.append(path)
+            seen.add(resolved)
+            extra.append(path)
+    result.extend(sorted(extra))
     return result
 
 
@@ -211,6 +257,7 @@ def run_project(
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
     include_tests: bool = True,
+    include_paths: Sequence[str] = (),
     *,
     enrich: bool = False,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
@@ -218,7 +265,9 @@ def run_project(
 
     Discovery includes test/specification files by default; the complete per-frontend
     file list is handed to each frontend as its explicit root set, so a frontend that
-    re-walks the tree cannot silently change the inventory.
+    re-walks the tree cannot silently change the inventory. ``include_paths`` folds
+    extra files or directories (e.g. an advisory's file outside a narrowed scope) into
+    that inventory.
 
     The removed ``enrich=True`` build-time overlay mode is rejected; native Pass 2
     runs only after the binary store has been written.
@@ -226,7 +275,8 @@ def run_project(
     _reject_removed_enrich(enrich)
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
-    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    groups = registry.partition(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     snapshots = []
     for frontend_id in sorted(groups):
         frontend = registry.get(frontend_id)
@@ -250,6 +300,40 @@ def run_project(
     return graph, snapshots
 
 
+# Frontends whose one-process-per-invocation working set grows with the number of
+# translation units, so a Linux-scale tree must be split into bounded chunks. The
+# compiler-backed C frontend is the only one today; the TS/JS frontend bounds itself
+# through V8's heap ceiling and package sharding instead.
+_CHUNKED_FRONTENDS = frozenset({"clang-c"})
+
+
+def _include_directories(roots: Sequence[str]) -> List[str]:
+    """Every directory that holds a C source or header in ``roots``, sorted.
+
+    A chunk compiles only a subset of the tree's translation units, so the native
+    frontend's own include-path derivation (parent directories of the files it is
+    handed) would miss headers owned by another chunk. Handing it the whole tree's
+    directories restores single-process include resolution without a compile
+    database; with one the per-TU database arguments still take precedence.
+    """
+    directories = {os.path.dirname(os.path.abspath(path)) for path in roots}
+    return sorted(directory for directory in directories if directory)
+
+
+def _frontend_invocations(frontend_id, roots, chunk_size):
+    """Split one frontend's roots into ``(chunk_index, chunk_count, roots)`` units.
+
+    A frontend that is not memory-bound by translation-unit count, or a root set
+    that already fits one chunk, yields a single unit identical to the unchunked
+    build so small and mid-size projects are unaffected.
+    """
+    if frontend_id not in _CHUNKED_FRONTENDS or chunk_size < 1 or len(roots) <= chunk_size:
+        return [(0, 1, list(roots))]
+    chunks = [roots[start:start + chunk_size] for start in range(0, len(roots), chunk_size)]
+    count = len(chunks)
+    return [(index, count, list(chunk)) for index, chunk in enumerate(chunks)]
+
+
 def run_project_streaming(
     source_dir: str,
     shard_root: str,
@@ -257,51 +341,84 @@ def run_project_streaming(
     registry: Optional[FrontendRegistry] = None,
     timeout_seconds: int = 300,
     include_tests: bool = True,
+    include_paths: Sequence[str] = (),
 ):
     """Run frontends one at a time and return shard readers plus metadata.
 
     This core-only path deliberately never composes frontend payloads. Each validated
     snapshot is persisted by the common runner, released, and represented afterward
-    only by its shard-set reader and manifest metadata.
+    only by its shard-set reader and manifest metadata. ``include_paths`` folds extra
+    files or directories into the discovered inventory (the guided-scope guarantee).
     """
     source_dir = os.path.abspath(source_dir)
     shard_root = os.path.abspath(shard_root)
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry()
-    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    groups = registry.partition(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     snapshots = []
     readers = []
+    from .resources import c_chunk_files, frontend_jobs as configured_frontend_jobs
+    chunk_size = c_chunk_files()
     previous = os.environ.get("LACHESIS_SHARD_ROOT")
     os.environ["LACHESIS_SHARD_ROOT"] = shard_root
     try:
+        # Expand each frontend into one or more chunk invocations. A chunk streams
+        # into its own isolated shard set; the store-write pass stitches every set
+        # (cross-chunk symbol edges included) into one graph, so the emitted graph
+        # does not depend on where the chunk boundaries fall -- only the peak memory
+        # of the frontend process does. Unchunked frontends keep one invocation
+        # whose shard set lives at the historical <shard_root>/<frontend_id> path,
+        # leaving small and mid-size builds byte-for-byte unchanged.
         frontend_jobs = []
         for frontend_id in sorted(groups):
             frontend = registry.get(frontend_id)
-            frontend_output = os.path.join(output_root, frontend_id)
-            frontend_jobs.append((frontend_id, frontend, frontend_output,
-                                  groups[frontend_id]))
+            roots = groups[frontend_id]
+            units = _frontend_invocations(frontend_id, roots, chunk_size)
+            include_dirs = _include_directories(roots) if len(units) > 1 else None
+            for index, count, chunk_roots in units:
+                if count == 1:
+                    invocation_shard_root = shard_root
+                    frontend_output = os.path.join(output_root, frontend_id)
+                    extra_environment = None
+                else:
+                    invocation_shard_root = os.path.join(
+                        shard_root, f"{frontend_id}.chunk-{index:05d}")
+                    frontend_output = os.path.join(
+                        output_root, f"{frontend_id}.chunk-{index:05d}")
+                    extra_environment = {"LACHESIS_INCLUDE_DIRS_FILE": os.path.join(
+                        invocation_shard_root, "include-dirs.txt")}
+                    os.makedirs(invocation_shard_root, exist_ok=True)
+                    with open(extra_environment["LACHESIS_INCLUDE_DIRS_FILE"], "w") as handle:
+                        handle.write("\n".join(include_dirs or ()))
+                reader_path = os.path.join(invocation_shard_root, frontend_id, "shards.pb")
+                frontend_jobs.append((frontend, frontend_output, chunk_roots,
+                                      invocation_shard_root, extra_environment, reader_path))
 
         def run_frontend_job(job):
-            _frontend_id, frontend, frontend_output, roots = job
+            frontend, frontend_output, chunk_roots, invocation_shard_root, extra_environment, _ = job
             return run_frontend(
-                frontend, source_dir, frontend_output, timeout_seconds, roots=roots,
+                frontend, source_dir, frontend_output, timeout_seconds,
+                roots=chunk_roots, shard_root=invocation_shard_root,
+                extra_environment=extra_environment,
             )
 
-        # Frontends are isolated subprocesses and publish disjoint shard sets.  Run
-        # them concurrently so the slowest compiler, rather than the sum of all
-        # compiler times, sets the Pass-1 wall clock.  The Kuzu materializer still
-        # starts only after all snapshots are released, preserving its memory cap.
-        if len(frontend_jobs) > 1:
+        # Compiler heaps share one process-tree budget. Serial execution is the
+        # safe default -- it is exactly what bounds peak memory when a large tree
+        # is split into chunks; an explicitly larger LACHESIS_FRONTEND_JOBS retains
+        # the output-identical parallel schedule for runners with a larger budget.
+        workers = min(len(frontend_jobs), configured_frontend_jobs())
+        if workers > 1:
             from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=len(frontend_jobs)) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 frontend_snapshots = list(pool.map(run_frontend_job, frontend_jobs))
         else:
-            frontend_snapshots = [run_frontend_job(frontend_jobs[0])]
+            frontend_snapshots = [run_frontend_job(job) for job in frontend_jobs]
 
-        for (frontend_id, _frontend, _frontend_output, _roots), snapshot in zip(
-                frontend_jobs, frontend_snapshots):
+        for job, snapshot in zip(frontend_jobs, frontend_snapshots):
+            reader_path = job[-1]
             snapshots.append(snapshot)
-            readers.append(ShardSetReader(os.path.join(shard_root, frontend_id, "shards.pb")))
+            readers.append(ShardSetReader(reader_path))
             snapshot.release()
     finally:
         if previous is None:
@@ -432,7 +549,11 @@ def _group_digests(files: Iterable[str], source_dir: str) -> Dict[str, str]:
             for path in sorted(files)}
 
 
-def source_content_hash(source_dir: str, include_tests: bool = True) -> str:
+def source_content_hash(
+    source_dir: str,
+    include_tests: bool = True,
+    include_paths: Sequence[str] = (),
+) -> str:
     """One digest over every source file a build of ``source_dir`` would see.
 
     The validity key for anything derived from a compile of this tree. A reduced store
@@ -442,8 +563,9 @@ def source_content_hash(source_dir: str, include_tests: bool = True) -> str:
     and unlike an mtime it does not go stale in either direction: a touched file with
     unchanged content keeps the cache, and a restored older file loses it.
     """
-    digests = _group_digests(source_inventory(source_dir, include_tests=include_tests),
-                            os.path.abspath(source_dir))
+    digests = _group_digests(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths),
+        os.path.abspath(source_dir))
     digest = hashlib.sha256()
     for path in sorted(digests):
         digest.update(path.encode("utf-8"))
@@ -533,6 +655,7 @@ def run_project_incremental(
     timeout_seconds: int = 300,
     include_tests: bool = True,
     manifest_path: Optional[str] = None,
+    include_paths: Sequence[str] = (),
     *,
     enrich: bool = True,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
@@ -550,7 +673,8 @@ def run_project_incremental(
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry()
     manifest_path = manifest_path or default_manifest_path(output_root)
-    groups = registry.partition(source_inventory(source_dir, include_tests=include_tests))
+    groups = registry.partition(
+        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
     prior = _load_manifest(manifest_path)
 
     snapshots: List[FrontendSnapshot] = []
