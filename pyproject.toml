@@ -40,10 +40,14 @@ classifiers = [
 dependencies = ["kuzu>=0.11,<0.12", "pyarrow>=17,<26", "protobuf>=6.30,<7"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pyyaml>=6"]
 # Runtime only. Model weights are fetched separately by `lachesis concept-model
 # download`; neither FastEmbed nor the model is part of the core wheel.
 concept-search = ["fastembed>=0.8,<0.9"]
+# Project configuration (`lachesis.yml`). PyYAML is imported lazily and only when a
+# config file is actually present, so the stdlib-only core is unaffected for anyone
+# who never writes one; a present-but-unparseable file is a hard, explained error.
+config = ["pyyaml>=6"]
 
 [project.scripts]
 # One entrypoint. The reader is a single `lachesis` with subcommands; every pass

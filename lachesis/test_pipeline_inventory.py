@@ -76,6 +76,49 @@ class SourceInventoryTests(unittest.TestCase):
             self.assertIn(str(test_file.resolve()),
                           {os.path.realpath(p) for p in kept})
 
+    def _tree(self, root: Path) -> None:
+        (root / "src" / "pkg").mkdir(parents=True)
+        (root / "tests").mkdir()
+        (root / "examples").mkdir()
+        (root / "docs").mkdir()
+        (root / "src" / "pkg" / "app.py").write_text("def a():\n    return 1\n", "utf-8")
+        # A product module whose name merely contains a keyword must survive.
+        (root / "src" / "pkg" / "testing.py").write_text("def t():\n    return 1\n", "utf-8")
+        (root / "tests" / "test_app.py").write_text("def test():\n    pass\n", "utf-8")
+        (root / "examples" / "demo.py").write_text("def d():\n    return 1\n", "utf-8")
+        (root / "docs" / "conf.py").write_text("x = 1\n", "utf-8")
+        (root / "conftest.py").write_text("import pytest\n", "utf-8")
+
+    def test_path_filter_drops_nonproduct_by_default(self):
+        from lachesis.config import Config
+        with tempfile.TemporaryDirectory() as project:
+            root = Path(project)
+            self._tree(root)
+            kept = {os.path.relpath(p, root)
+                    for p in source_inventory(str(root), path_filter=Config().build.paths)}
+            self.assertEqual(kept, {os.path.join("src", "pkg", "app.py"),
+                                    os.path.join("src", "pkg", "testing.py")})
+
+    def test_no_path_filter_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as project:
+            root = Path(project)
+            self._tree(root)
+            kept = {os.path.relpath(p, root) for p in source_inventory(str(root))}
+            self.assertIn("conftest.py", kept)
+            self.assertIn(os.path.join("tests", "test_app.py"), kept)
+
+    def test_content_hash_tracks_the_filtered_set(self):
+        # The cache-validity key must describe exactly the file set the build sees, or a
+        # filtered build could hit a stale cache written by an unfiltered one.
+        from lachesis.config import Config
+        from lachesis.pipeline import source_content_hash
+        with tempfile.TemporaryDirectory() as project:
+            root = Path(project)
+            self._tree(root)
+            unfiltered = source_content_hash(str(root))
+            filtered = source_content_hash(str(root), path_filter=Config().build.paths)
+            self.assertNotEqual(unfiltered, filtered)
+
 
 if __name__ == "__main__":
     unittest.main()

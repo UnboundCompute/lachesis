@@ -224,6 +224,19 @@ class ValidateTests(unittest.TestCase):
 
 
 class GraphFirstBundleTests(unittest.TestCase):
+    def _comprehension(self):
+        # A code-understanding bundle must carry a production entrypoint and a
+        # >= 3-hop source-backed path; the legacy nodes (source@3, sink@8) back both.
+        return {
+            "entrypoints": [{"id": "entry.source", "label": "input", "kind": "parameter",
+                             "node_id": "source", "file": "src/a.c", "line": 3}],
+            "requests": [{"id": "request.flow", "kind": "call-path", "description": "d",
+                          "entry_node": "source",
+                          "hops": [{"node_id": "source", "caption": "receives"},
+                                   {"node_id": "sink", "caption": "executes"},
+                                   {"node_id": "source", "caption": "returns"}]}],
+        }
+
     def _legacy_bundle(self):
         return {
             "meta": {"repo": "GNOME/libxml2", "lang": "c", "commit": "abc", "loc": 42},
@@ -251,6 +264,7 @@ class GraphFirstBundleTests(unittest.TestCase):
     def test_graph_first_uses_v2_contract_and_supported_source_placeholders(self):
         result = bundle._graph_first_bundle(
             self._legacy_bundle(), repo="GNOME/libxml2", commit="abc", lang="c", indexed_nodes=99,
+            comprehension=self._comprehension(),
             source_url_template="https://github.com/GNOME/libxml2/blob/{revision}/{file}#L{line}")
         self.assertEqual(result["schema_version"], "2.0")
         self.assertEqual(result["meta"]["indexed_nodes"], 99)
@@ -261,7 +275,8 @@ class GraphFirstBundleTests(unittest.TestCase):
 
     def test_graph_first_does_not_guess_source_host(self):
         result = bundle._graph_first_bundle(
-            self._legacy_bundle(), repo="group/project", commit="abc", lang="c", indexed_nodes=2)
+            self._legacy_bundle(), repo="group/project", commit="abc", lang="c", indexed_nodes=2,
+            comprehension=self._comprehension())
         self.assertNotIn("source_url_template", result["meta"])
 
     def test_graph_first_rejects_invalid_path_reference(self):
@@ -278,6 +293,27 @@ class ComprehensionProjectionTests(unittest.TestCase):
     def _sourced(self, nid, file, line, label):
         return {"id": nid, "kind": "function", "file": file, "line": line,
                 "label": label, "snippet": f"def {label}(): ...", "end_line": line + 2}
+
+    # A valid code-understanding bundle always has a production entrypoint and a
+    # source-backed path of >= 3 hops (the NR2 contract). The helpers inject these
+    # defaults so a test focused on some other facet (concepts, tour, module dup)
+    # still builds a contract-valid base; a test provides its own to override.
+    def _default_entrypoints(self):
+        return [{"id": "entry.wsgi_app", "label": "wsgi_app", "kind": "http-handler",
+                 "node_id": "n.a", "file": "src/flask/app.py", "line": 10}]
+
+    def _default_requests(self):
+        return [{"id": "request.baseline", "kind": "call-path", "description": "baseline",
+                 "entry_node": "n.a",
+                 "hops": [{"node_id": "n.a", "caption": "receives"},
+                          {"node_id": "n.b", "caption": "dispatches"},
+                          {"node_id": "n.a", "caption": "returns"}]}]
+
+    def _with_defaults(self, comprehension):
+        comp = dict(comprehension)
+        comp.setdefault("entrypoints", self._default_entrypoints())
+        comp.setdefault("requests", self._default_requests())
+        return comp
 
     def _bundle_with(self, comprehension):
         legacy = {
@@ -299,7 +335,24 @@ class ComprehensionProjectionTests(unittest.TestCase):
         }
         return bundle._graph_first_bundle(
             legacy, repo="pallets/flask", commit="abc", lang="python",
-            indexed_nodes=500, comprehension=comprehension)
+            indexed_nodes=500, comprehension=self._with_defaults(comprehension))
+
+    def _bundle_with_tour(self, comprehension, curated_tour):
+        legacy = {
+            "meta": {"repo": "pallets/flask", "lang": "python", "commit": "abc", "loc": 100},
+            "graph": {
+                "nodes": [self._sourced("n.a", "src/flask/app.py", 10, "wsgi_app"),
+                          self._sourced("n.b", "src/flask/app.py", 20, "dispatch_request")],
+                "edges": [{"source": "n.a", "target": "n.b", "kind": "CALLS"}],
+            },
+            "findings": [{"finding_id": "a" * 64, "display_name": "x", "result_summary": "y",
+                           "analysis": {"confidence": "high", "limitations": []},
+                           "witness": {"steps": [{"node_id": "n.a", "role": "origin"},
+                                                 {"node_id": "n.b", "role": "sink"}]}}],
+        }
+        return bundle._graph_first_bundle(
+            legacy, repo="pallets/flask", commit="abc", lang="python", indexed_nodes=500,
+            comprehension=self._with_defaults(comprehension), curated_tour=curated_tour)
 
     def test_full_projection_shapes_graph_and_paths(self):
         result = self._bundle_with({
@@ -309,10 +362,12 @@ class ComprehensionProjectionTests(unittest.TestCase):
             "requests": [{"id": "request.lifecycle", "kind": "call-path",
                           "description": "d", "entry_node": "n.a",
                           "hops": [{"node_id": "n.a", "caption": "receives"},
-                                   {"node_id": "n.b", "caption": "dispatches"}]}],
+                                   {"node_id": "n.b", "caption": "dispatches"},
+                                   {"node_id": "n.c", "caption": "runs"}]}],
             "files": [{"id": "f1", "path": "src/flask/app.py"}],
             "concepts": [{"id": "concept.flask", "label": "flask", "description": "d",
                            "file_paths": ["src/flask/app.py"]}],
+            "core": [{"node_id": "n.a", "label": "wsgi_app", "degree": 4}],
         })
         self.assertEqual(result["meta"]["indexed_nodes"], 500)
         self.assertEqual(result["graph"]["coverage"]["included_nodes"],
@@ -322,7 +377,7 @@ class ComprehensionProjectionTests(unittest.TestCase):
         self.assertEqual(len(result["graph"]["entrypoints"]), 1)
         req = result["paths"]["requests"][0]
         self.assertEqual(req["source_node"], "n.a")
-        self.assertEqual(req["sink_node"], "n.b")
+        self.assertEqual(req["sink_node"], "n.c")
         self.assertEqual(req["hops"][0]["id"], "request.lifecycle:01")
         self.assertEqual(req["hops"][1]["edge_label"], "calls")
         # edges are first-class: id + canonical kind + relation alias.
@@ -336,19 +391,46 @@ class ComprehensionProjectionTests(unittest.TestCase):
         seen = [nid for m in result["graph"]["modules"] for nid in m["node_ids"]]
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(["n.a", "n.b"], result["graph"]["concepts"][0]["node_ids"])
+        self.assertEqual(["n.a"], [item["node_id"] for item in result["graph"]["core"]])
 
     def test_concept_without_included_nodes_is_dropped(self):
         result = self._bundle_with({
-            "entrypoints": [], "requests": [],
             "concepts": [{"id": "concept.missing", "label": "missing",
                            "file_paths": ["src/other/missing.py"]}],
         })
         self.assertEqual([], result["graph"]["concepts"])
 
+    def test_curated_tour_keeps_current_paths_and_drops_stale_steps(self):
+        result = self._bundle_with_tour(
+            {"concepts": [{"id": "concept.lifecycle", "label": "Lifecycle", "description": "d", "file_paths": ["src/flask/app.py"]}], "requests": [{"id": "request.lifecycle", "kind": "call-path",
+                                                "description": "d", "entry_node": "n.a",
+                                                "hops": [{"node_id": "n.a", "caption": "a"},
+                                                         {"node_id": "n.b", "caption": "b"},
+                                                         {"node_id": "n.a", "caption": "c"}]}]},
+            {"id": "tour.start", "title": "Start here", "description": "Read this first.",
+             "maintainer": {"name": "Ignored"},
+             "overview": {"description": "Read the request lifecycle first.", "concepts": [{"id": "concept.lifecycle", "label": "Request lifecycle", "description": "The main request route."}]},
+             "selection": {"include_tests": True, "include_examples": False, "include_generated": True},
+             "steps": [{"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
+                       {"flow_id": "request.missing"}]},
+        )
+        self.assertEqual({"flow_id": "request.lifecycle", "node_id": "n.a", "label": "Lifecycle"},
+                         result["meta"]["curated_tour"]["steps"][0])
+        self.assertNotIn("maintainer", result["meta"]["curated_tour"])
+        self.assertEqual("Read the request lifecycle first.", result["meta"]["curated_tour"]["overview"]["description"])
+        self.assertEqual("concept.lifecycle", result["meta"]["curated_tour"]["overview"]["concepts"][0]["id"])
+        self.assertEqual({"include_tests": True, "include_generated": True}, result["meta"]["curated_tour"]["selection"])
+
+    def test_curated_tour_is_omitted_when_no_step_resolves(self):
+        result = self._bundle_with_tour(
+            {},
+            {"id": "tour.start", "title": "Start here", "steps": [{"flow_id": "missing"}]},
+        )
+        self.assertNotIn("curated_tour", result["meta"])
+
     def test_request_with_unsourced_hop_is_dropped(self):
         # n.ghost has no source; the guided path must not be emitted.
         result = self._bundle_with({
-            "entrypoints": [],
             "requests": [{"id": "r", "kind": "call-path", "description": "d",
                           "entry_node": "n.a",
                           "hops": [{"node_id": "n.a", "caption": "a"},
@@ -359,22 +441,25 @@ class ComprehensionProjectionTests(unittest.TestCase):
         self.assertEqual(len(result["paths"]["requests"]), 1)
 
     def test_validator_rejects_coverage_mismatch(self):
-        result = self._bundle_with({"entrypoints": [], "requests": []})
+        result = self._bundle_with({})
         result["graph"]["coverage"]["included_nodes"] += 1
         with self.assertRaises(ValueError):
             bundle._validate_graph_first(result)
 
     def test_validator_rejects_entrypoint_without_source(self):
-        result = self._bundle_with({"entrypoints": [], "requests": []})
+        result = self._bundle_with({})
+        # Valid 2.0 location types but no openable source ("" / 0): the entrypoint
+        # check must still reject it for lacking a real location.
         result["graph"]["nodes"].append({"id": "n.bare", "kind": "function",
-                                         "label": "bare"})
+                                         "label": "bare", "file": "", "line": 0,
+                                         "end_line": 0})
         result["graph"]["coverage"]["included_nodes"] = len(result["graph"]["nodes"])
         result["graph"]["entrypoints"].append({"id": "entry.bare", "node_id": "n.bare"})
         with self.assertRaises(ValueError):
             bundle._validate_graph_first(result)
 
     def test_validator_rejects_duplicate_module_node(self):
-        result = self._bundle_with({"entrypoints": [], "requests": []})
+        result = self._bundle_with({})
         result["graph"]["modules"].append(
             {"id": "module.dup", "name": "dup", "path": "x", "node_ids": ["n.a"]})
         with self.assertRaises(ValueError):
@@ -397,6 +482,30 @@ class ComprehensionHelperTests(unittest.TestCase):
         self.assertFalse(bundle._has_source({"file": "", "line": 3, "snippet": "x"}))
         self.assertTrue(bundle._has_source(
             {"file": "a.py", "line": 3, "source_window": {"lines": ["x"]}}))
+
+    def test_enrich_graph_nodes_preserves_recorded_documentation(self):
+        class _Graph:
+            nodes = {"n": {"id": "n", "label": "serve",
+                            "properties": {"file": "src/app.py", "start_line": 4,
+                                           "end_line": 8, "documentation": "Serve a request."}}}
+
+            def loc(self, node):
+                props = node["properties"]
+                return props["file"], props["start_line"], props["end_line"]
+
+            def prop(self, node, key, default=None):
+                return node.get("properties", {}).get(key, default)
+
+            def source_excerpt(self, node):
+                return "serve()"
+
+            def _read_file(self, _path):
+                return "def serve():\n    pass\n"
+
+        nodes = [{"id": "n", "file": "src/app.py", "line": 4,
+                  "label": "serve", "snippet": "serve"}]
+        bundle._enrich_graph_nodes(nodes, _Graph())
+        self.assertEqual("Serve a request.", nodes[0]["documentation"])
 
     def test_count_source_lines_sums_physical_lines_dedups_and_falls_back(self):
         # a.py: 3 physical lines read off disk; b.py: unreadable, falls back to

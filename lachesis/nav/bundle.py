@@ -30,11 +30,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from lachesis.nav import mcp_server as M
+
+try:
+    from lachesis.config import is_nonproduct as _is_nonproduct
+except Exception:  # config is pure-stdlib and same-package, so this should not fail;
+    _is_nonproduct = None  # if it ever does, the gate fails open (keeps everything).
 
 BUNDLE_VERSION = "1.0"
 FINDING_SCHEMA_VERSION = "0.1"
@@ -43,6 +49,26 @@ _HEX64 = 64
 
 def _call(name: str, args: dict) -> Any:
     return json.loads(M.call_tool(name, args, "json"))
+
+
+def _is_nonproduct_path(path: Optional[str]) -> bool:
+    """True when a source path is test/example/docs/benchmark scaffolding.
+
+    The featured comprehension surfaces (entrypoints, request roots, the core spine)
+    describe what the *product* does, so scaffolding must never seed them. Build-time
+    exclusion normally keeps such files out of the graph entirely, but the exporter
+    must not rely on that -- run against a graph built without exclusion, an uncalled
+    ``test_*`` function is an in-degree-0 callable and would otherwise rank as a
+    top-of-stack driver, refeaturing exactly the tests the classifier is meant to
+    drop. Reuses the same classifier the build filter uses, so the two agree; fails
+    open (keeps the node) only if the classifier is somehow unavailable.
+    """
+    if not path or _is_nonproduct is None:
+        return False
+    try:
+        return bool(_is_nonproduct(path))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------- identity
@@ -523,38 +549,719 @@ def _norm_node(gl, node: dict) -> dict:
             "kind": gl.kind(node.get("id")), "file": file, "line": line}
 
 
-def _call_chain(index, gl, start_id: str, depth: int) -> list[str]:
-    """A single deterministic CALLS chain out of ``start_id`` (source order).
+# The request lifecycle a reader wants is the *success* path; error, teardown and
+# logging branches are real but secondary, so we only derank them when choosing the
+# primary hop -- never drop them. Word-token match (not raw substring) over the
+# identifier keeps this generic and framework-agnostic: it is a vocabulary of
+# English failure/teardown verbs, never a hardcoded symbol from one library.
+_LIFECYCLE_ERROR_TOKENS = frozenset({
+    "exception", "error", "err", "teardown", "cleanup", "abort", "raise",
+    "rollback", "fail", "reject", "panic", "warn", "log", "logging",
+})
+_CALL_EDGE_KINDS = ("CALLS", "INVOKES", "MAY_INVOKE")
 
-    At each hop we descend into the callee that itself calls the most -- the branch
-    most likely to keep telling the request's story -- breaking ties by label so the
-    walk is reproducible. Cycles are cut by the visited set; a leaf ends the chain.
-    This invents no ordering: every consecutive pair is a real ``CALLS`` edge.
+# A special-case/fallback branch is real but is not the lifecycle a reader opens the
+# bundle to follow: an auto-generated default reply, a not-found placeholder, an
+# unsupported-method stub. Deranked (never dropped) below error branches when picking
+# the primary hop, so the spine stays on the ordinary request rather than diving into
+# a corner case. Generic English morphology -- matches ``make_default_options_response``
+# or ``handle_not_found`` in any codebase, not a symbol from one framework.
+_LIFECYCLE_FALLBACK_TOKENS = frozenset({
+    "default", "fallback", "options", "notfound", "missing", "unsupported",
+    "unavailable", "placeholder", "noop", "stub", "unknown",
+})
+
+# A request lifecycle culminates in *constructing the thing it returns* -- a response,
+# a rendered page, a serialized result. We recognise that terminus by morphology so the
+# spine ends there rather than in a routing corner: a construction verb applied to a
+# result noun. Generic across codebases (``make_response``, ``build_result``,
+# ``render_page``, ``serialize_output``), never a hardcoded framework symbol.
+_RESULT_CONSTRUCTION_VERBS = frozenset({
+    "make", "build", "create", "construct", "render", "format", "compose",
+    "produce", "generate", "new", "serialize", "encode", "write", "emit",
+})
+_RESULT_NOUNS = frozenset({
+    "response", "reply", "result", "output", "answer", "payload", "body",
+    "page", "document", "content", "view", "html", "json", "template",
+})
+
+
+def _identifier_tokens(name: Optional[str]) -> list[str]:
+    """Lowercased word tokens of an identifier, splitting snake_case and camelCase.
+
+    ``full_dispatch_request`` -> ``[full, dispatch, request]``; ``makeResponse`` ->
+    ``[make, response]``; ``__call__`` -> ``[call]``; ``HTTPServer`` -> ``[http,
+    server]``. The atom every generic morphology check below reasons over, so a rule
+    keys off whole words rather than raw substrings (no ``err`` inside ``inherit``).
     """
-    chain = [start_id]
-    seen = {start_id}
-    cur = start_id
-    for _ in range(max(0, depth - 1)):
-        nxt: list[dict] = []
+    return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|\d+",
+                                          str(name or ""))]
+
+
+def _is_fallback_name(name: Optional[str]) -> bool:
+    return bool(_LIFECYCLE_FALLBACK_TOKENS.intersection(_identifier_tokens(name)))
+
+
+def _is_result_construction(name: Optional[str]) -> bool:
+    """True when an identifier reads as 'construct the returned result'.
+
+    Requires both a construction verb and a result noun as whole tokens, and is not a
+    fallback/error name -- so ``make_response`` and ``render_page`` qualify while a
+    special-case ``make_default_options_response`` (fallback) and a plain
+    ``process_response`` (no construction verb) do not.
+    """
+    toks = set(_identifier_tokens(name))
+    if _LIFECYCLE_ERROR_TOKENS.intersection(toks) or _LIFECYCLE_FALLBACK_TOKENS.intersection(toks):
+        return False
+    return bool(_RESULT_CONSTRUCTION_VERBS.intersection(toks) and _RESULT_NOUNS.intersection(toks))
+
+
+# Generic leading-verb -> third-person phrase, so a hop caption reads as what the
+# step *does* rather than as a bare symbol. Keyed off the identifier's action token,
+# it renders any codebase's ``make_*``/``parse_*``/``dispatch_*`` the same way -- a
+# vocabulary of English verbs, never a per-framework symbol table.
+_VERB_READS_AS = {
+    "make": "builds", "build": "builds", "create": "creates", "construct": "constructs",
+    "new": "creates", "render": "renders", "format": "formats", "compose": "assembles",
+    "produce": "produces", "generate": "generates", "prepare": "prepares", "wrap": "wraps",
+    "get": "reads", "fetch": "fetches", "load": "loads", "read": "reads", "find": "finds",
+    "lookup": "looks up", "resolve": "resolves", "select": "selects", "match": "matches",
+    "search": "searches", "query": "queries", "collect": "collects", "gather": "gathers",
+    "dispatch": "dispatches", "route": "routes", "handle": "handles", "process": "processes",
+    "run": "runs", "execute": "runs", "exec": "runs", "invoke": "invokes", "call": "calls",
+    "apply": "applies", "perform": "performs", "iter": "iterates over",
+    "parse": "parses", "decode": "decodes", "deserialize": "deserializes", "unpack": "unpacks",
+    "encode": "encodes", "serialize": "serializes", "dump": "serializes", "pack": "packs",
+    "write": "writes", "save": "saves", "store": "stores", "persist": "persists",
+    "send": "sends", "emit": "emits", "flush": "flushes", "commit": "commits",
+    "validate": "validates", "check": "checks", "verify": "verifies", "ensure": "ensures",
+    "sign": "signs", "unsign": "verifies the signature on", "hash": "hashes",
+    "init": "initializes", "initialize": "initializes", "setup": "sets up",
+    "configure": "configures", "register": "registers", "bind": "binds", "connect": "connects",
+    "open": "opens", "close": "closes", "push": "pushes", "pop": "pops",
+    "add": "adds", "append": "appends", "remove": "removes", "delete": "deletes",
+    "update": "updates", "set": "sets", "reset": "resets", "clear": "clears",
+    "preprocess": "preprocesses", "postprocess": "post-processes", "finalize": "finalizes",
+    "convert": "converts", "transform": "transforms", "normalize": "normalizes",
+}
+# Modifier/adjective tokens that decorate an identifier without naming its action or
+# object; dropped from a caption so ``full_dispatch_request`` reads "dispatches the
+# request", not "dispatches the full request".
+_CAPTION_FILLER = frozenset({
+    "full", "do", "self", "the", "internal", "impl", "inner", "raw", "safe",
+    "unsafe", "sync", "async", "maybe", "try", "helper", "default", "real",
+})
+
+
+def _readable_caption(name: Optional[str], *, is_entry: bool = False) -> str:
+    """A short human phrase for a hop: what the step does, from its name's morphology.
+
+    Finds the leading action verb (past any modifier like ``full``/``do``) and renders
+    it in the third person over the remaining object tokens: ``make_response`` ->
+    "builds the response", ``full_dispatch_request`` -> "dispatches the request",
+    ``parse_args`` -> "parses the args". A name with no recognised verb reads as its
+    humanized noun phrase (an entry as the place to "start"). Never a framework table --
+    the same rule renders any codebase, and it degrades to the bare symbol on anything
+    it cannot parse, so it only ever adds a hint, never hides the identifier.
+    """
+    toks = _identifier_tokens(name)
+    if not toks:
+        return str(name or "step")
+    verb_i = None
+    for i, tok in enumerate(toks):
+        if tok in _VERB_READS_AS:
+            verb_i = i
+            break
+        if tok not in _CAPTION_FILLER:
+            break  # a leading noun-style token: not a verb-first name
+    if verb_i is not None:
+        phrase = _VERB_READS_AS[toks[verb_i]]
+        obj = [t for t in toks[verb_i + 1:] if t not in _CAPTION_FILLER]
+        return f"{phrase} the {' '.join(obj)}" if obj else phrase
+    human = " ".join(t for t in toks if t not in _CAPTION_FILLER) or " ".join(toks)
+    return f"starts at {human}" if is_entry else human
+
+# Modules that are real product code but *peripheral* to the request lifecycle a
+# reader wants first: the command-line front door, generic string/util helpers, the
+# in-tree test harness (``testing.py`` -- kept in the graph, but never the headline
+# lifecycle). A framework's CLI command has a long, valid execution story, so pure
+# spine length floats it above the web path; demoting these modules as lifecycle
+# *roots* keeps them in the bundle while letting the dispatch spine lead. Matched on
+# the file's basename stem so it stays language-agnostic (cli.py, cli.js, cli.ts).
+_PERIPHERAL_MODULE_STEMS = frozenset({
+    "cli", "__main__", "__main", "cmd", "cmdline", "commands", "command",
+    "utils", "util", "helpers", "helper", "testing", "compat", "_compat",
+})
+
+
+def _is_peripheral_module_path(path: Optional[str]) -> bool:
+    """True when a file is product code but off the primary request lifecycle.
+
+    A soft signal for *ranking* only -- never for inclusion. The stem set is generic
+    (a CLI front-door, string/util helpers, the test harness); a segment named
+    ``commands`` catches a management-command package regardless of file name.
+    """
+    if not path:
+        return False
+    p = str(path).replace("\\", "/")
+    stem = p.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    if stem in _PERIPHERAL_MODULE_STEMS:
+        return True
+    segments = p.lower().split("/")
+    return "commands" in segments[:-1]
+
+
+def _is_error_name(name: Optional[str]) -> bool:
+    return bool(_LIFECYCLE_ERROR_TOKENS.intersection(_identifier_tokens(name)))
+
+
+# How many module areas the concept list surfaces. Concepts are the "areas" a reader
+# would name (the request lifecycle, templates, sessions, the CLI); we bound them so a
+# large tree stays legible while a small one is not padded.
+_MAX_CONCEPTS = 12
+
+
+def _module_stem(path: Optional[str]) -> str:
+    """The bare module name of a source path: ``pkg/sessions.py`` -> ``sessions``."""
+    base = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] or base
+
+
+def _concept_label(path: Optional[str], stem_counts) -> str:
+    """A concept's display label from its module path.
+
+    The module stem alone (``sessions``, ``templating``, ``cli``) is the area name a
+    reader recognises. Widen to ``parent · stem`` only to break a genuine collision --
+    ``app.py`` and ``sansio/app.py`` both stem to ``app`` -- so labels stay short but
+    never ambiguous. Generic over any layout; never a per-framework name table.
+    """
+    p = str(path or "").replace("\\", "/")
+    if p.startswith("src/"):
+        p = p[4:]
+    stem = _module_stem(p)
+    if stem_counts.get(stem, 0) > 1 and "/" in p:
+        parent = p.rsplit("/", 2)[-2]
+        if parent:
+            return f"{parent} · {stem}"
+    return stem
+
+
+def _story_fn_openable(fn: dict) -> bool:
+    """A story step a reader can open: a real product file and a positive line.
+
+    ``execution_story`` reports unresolved/external callees with a null file; those
+    are honest frontier markers, never places to root or continue a lifecycle spine.
+    """
+    line = fn.get("line")
+    return bool(fn.get("file")) and isinstance(line, int) and line > 0
+
+
+def _reach2(index, node_id: str) -> int:
+    """Distinct callees within two CALLS hops -- a cheap 'does this drive control?'.
+
+    An orchestration root (a WSGI ``__call__``, a CLI ``main``) fans out into a
+    broad two-hop cone; a leaf utility barely moves. Ranking candidate roots by this
+    before paying for a full execution story elevates the real lifecycles without
+    naming any framework. Bounded by the graph's own fan-out, so it stays cheap.
+    """
+    try:
+        one = {t.get("id") for t in index.targets(node_id, *_CALL_EDGE_KINDS)
+               if t.get("id")}
+    except Exception:
+        return 0
+    total = set(one)
+    for mid in one:
         try:
-            nxt = [n for n in index.targets(cur, "CALLS")
-                   if n.get("id") and n["id"] not in seen]
+            total.update(t.get("id") for t in index.targets(mid, *_CALL_EDGE_KINDS)
+                         if t.get("id"))
         except Exception:
-            break
-        if not nxt:
-            break
+            continue
+    total.discard(node_id)
+    return len(total)
 
-        def out_degree(node: dict) -> int:
+
+# Source-extension -> coarse language family. JavaScript and TypeScript are one
+# family (the same web frontend, the same event/handler surface); the C headers
+# and sources are one family. Used only to answer "what language is this repo
+# primarily", so the grouping is deliberately coarse.
+_LANG_BY_EXT = {
+    "py": "python", "pyi": "python", "pyx": "python",
+    "js": "web", "jsx": "web", "mjs": "web", "cjs": "web",
+    "ts": "web", "tsx": "web", "mts": "web", "cts": "web",
+    "c": "c", "h": "c", "cc": "c", "cpp": "c", "cxx": "c",
+    "hpp": "c", "hh": "c", "hxx": "c",
+}
+
+
+def _language_family(path: Optional[str]) -> Optional[str]:
+    """The coarse language family of a source path, or None if unrecognised."""
+    if not isinstance(path, str):
+        return None
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in base:
+        return None
+    return _LANG_BY_EXT.get(base.rsplit(".", 1)[-1].lower())
+
+
+def _primary_language_family(index, gl) -> Optional[str]:
+    """The dominant product-source language family of the graph, or None.
+
+    Counts product (non-scaffolding) source files by family and returns the family
+    that is a strict majority. A repo with no clear majority — a genuinely polyglot
+    tree — returns None, which disables the language gate so nothing is dropped.
+
+    This is the notion the entrypoint and request-lifecycle selection was missing:
+    on a multi-language repository (a Python framework that ships bundled JavaScript
+    admin widgets under ``static/``) the JS event handlers otherwise fill every
+    featured slot, so a newcomer sees a JS widget toolkit instead of the Python
+    request path. The gate keeps the projection in the language the repo actually is.
+    """
+    counts: dict[str, int] = {}
+    try:
+        for node in index.nodes_of_kind("file"):
+            f = gl.loc(node)[0] or gl.prop(node, "file")
+            if not f or _is_nonproduct_path(f):
+                continue
+            fam = _language_family(f)
+            if fam:
+                counts[fam] = counts.get(fam, 0) + 1
+    except Exception:
+        return None
+    if not counts:
+        return None
+    top = max(counts, key=lambda k: counts[k])
+    if counts[top] * 2 <= sum(counts.values()):
+        return None  # no strict majority -> polyglot -> do not gate
+    return top
+
+
+def _descend_trampoline(index, gl, nid: str, *,
+                        primary_family: Optional[str] = None, limit: int = 4) -> str:
+    """Skip thin forwarders so a lifecycle root is the real orchestrator.
+
+    A WSGI ``Flask.__call__`` is a one-line trampoline: ``return self.wsgi_app(...)``.
+    Rooting the story at it prepends a meaningless hop and, worse, makes the *entry*
+    of the request the trampoline rather than the dispatcher a reader wants named.
+    While the current node forwards to exactly one product callee of the repo's
+    dominant language (a single direct CALLS target), descend to it. Bounded by
+    ``limit`` and a ``seen`` set so a mutually-recursive pair can never loop.
+    """
+    seen = {nid}
+    for _ in range(limit):
+        try:
+            callees = [t.get("id") for t in index.targets(nid, "CALLS") if t.get("id")]
+        except Exception:
+            return nid
+        openable = []
+        for cid in callees:
+            if cid in seen:
+                continue
+            node = gl.nodes.get(cid)
+            if node is None:
+                continue
+            f, l = gl.loc(node)[0], gl.loc(node)[1]
+            if not f or not isinstance(l, int) or l <= 0 or _is_nonproduct_path(f):
+                continue
+            if primary_family is not None:
+                fam = _language_family(f)
+                if fam is not None and fam != primary_family:
+                    continue
+            openable.append(cid)
+        if len(openable) != 1:
+            return nid
+        nid = openable[0]
+        seen.add(nid)
+    return nid
+
+
+def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int,
+                     primary_family: Optional[str] = None) -> list[str]:
+    """Candidate roots for request-lifecycle stories, best driver first.
+
+    Two sources, deduped in priority order: the planner's entry handlers (already
+    ranked upstream), then every product callable that nothing else in the product
+    calls -- an in-degree-0 top-of-stack (a WSGI ``__call__``, an event loop, a
+    public API orchestrator). The in-degree-0 set is ordered by two-hop reach so the
+    orchestration roots precede the many leaf helpers that also happen to be
+    uncalled once tests are excluded. Truncated to ``cap`` so the story pass is
+    bounded regardless of codebase size.
+    """
+    # Both sources feed one ranked candidate pool. A planner handler is *not* an
+    # automatic front-of-line: a framework like Click emits dozens of thin decorator
+    # handlers (``version_option``, ``argument``) that each spin a valid but peripheral
+    # story, and if they were kept ahead of the drivers they would fill ``cap`` and
+    # starve the real dispatcher (``Command.main``, in-degree-0, widest cone) out of the
+    # pass entirely. Ranking every candidate by two-hop reach means the widest-cone
+    # lifecycle always survives the cap; the downstream story pass re-ranks the
+    # survivors, so this ordering governs only *which* candidates it gets to see.
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _consider(nid: str, node: Optional[dict]) -> None:
+        if not nid or nid in seen:
+            return
+        f = gl.loc(node)[0] if node is not None else None
+        if node is None or _is_nonproduct_path(f):
+            return  # a test/example handler is not a product lifecycle root
+        if primary_family is not None:
+            fam = _language_family(f)
+            if fam is not None and fam != primary_family:
+                return  # a non-primary-language handler (bundled JS in a Python repo)
+        seen.add(nid)
+        candidates.append((_reach2(index, nid), nid))
+
+    for hid in handler_ids:
+        _consider(hid, gl.nodes.get(hid) if hid else None)
+
+    try:
+        callable_nodes = list(index.nodes_of_kind("function", "method", "constructor"))
+    except Exception:
+        callable_nodes = []
+    for node in callable_nodes:
+        nid = node.get("id")
+        if not nid or nid in seen:
+            continue
+        f, l = gl.loc(node)[0], gl.loc(node)[1]
+        if not f or not isinstance(l, int) or l <= 0:
+            continue
+        # An uncalled test_* function is in-degree-0; exclude scaffolding so it never
+        # ranks as a top-of-stack driver on a graph built without build-time exclusion.
+        if _is_nonproduct_path(f):
+            continue
+        # ...and never a non-primary-language driver: a bundled JS handler in a
+        # Python repo is in-degree-0 too, but it is not this repo's request path.
+        if primary_family is not None:
+            fam = _language_family(f)
+            if fam is not None and fam != primary_family:
+                continue
+        try:
+            out = sum(1 for _ in index.targets(nid, *_CALL_EDGE_KINDS))
+            if out < 1:
+                continue
+            inn = sum(1 for _ in index.sources(nid, *_CALL_EDGE_KINDS))
+        except Exception:
+            continue
+        if inn == 0:
+            # An in-degree-0 root is often a thin WSGI/entry trampoline (Flask.__call__,
+            # Click's BaseCommand.__call__); descend to the real orchestrator it forwards
+            # to *before* ranking, so the driver is ordered by the dispatcher's own
+            # control cone (Click's main reaches far more than its one-line __call__) and
+            # the lifecycle is named at the dispatcher rather than the forwarder.
+            driver = _descend_trampoline(index, gl, nid, primary_family=primary_family)
+            _consider(driver, gl.nodes.get(driver))
+
+    candidates.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [nid for _, nid in candidates][:cap]
+
+
+def _hop_semantics(via: str, branch: dict) -> dict:
+    """Per-hop reader facts from an execution-story step: how it is reached and
+    whether it decides. ``reached_via`` names the call-seam boundary (a direct call
+    vs a dynamic dispatch the graph resolved), and the branch summary flags a hop
+    that forks control -- the decision points a newcomer traces. All derived from
+    real story structure; absent facts are simply omitted so hops stay compact.
+    """
+    out: dict = {}
+    v = via or ""
+    if v == "entry":
+        out["reached_via"] = "entry"
+    elif v == "direct":
+        out["reached_via"] = "direct call"
+    elif v.startswith("indirect:"):
+        out["reached_via"] = f"dynamic dispatch ({v.split(':', 1)[1] or 'resolved'})"
+    elif v:
+        out["reached_via"] = v
+    count = branch.get("count") or 0
+    if count:
+        out["decides"] = True
+        out["branch_count"] = count
+        kinds = branch.get("kinds") or []
+        if kinds:
+            out["decision_kinds"] = kinds
+    return out
+
+
+def _story_spine(story: dict, index, gl, *, max_hops: int) -> tuple[list[str], list[str], dict]:
+    """Linearize an execution story into (primary success spine, all functions, meta).
+
+    The story is a call tree keyed by (caller -> function). The spine walks from the
+    entry always choosing the direct-edge, deepest-subtree callee, deranking obvious
+    error/teardown branches, so it follows the happy path (a WSGI entry down through
+    dispatch to the response) rather than wandering into a handler. Every consecutive
+    pair on the spine is a real edge the story observed; cycles are cut by ``seen``.
+    Returns the ordered spine node ids, the flat set of every function id the story
+    touched (the raw material for the architecture core), and a per-spine-node
+    semantics map (how each hop is reached, whether it branches).
+
+    ``index``/``gl`` let the walk recover call edges the story *tree* attached to a
+    different parent (see ``_candidate_children``): the story visits each function
+    once, so a genuine callee can hang off an earlier caller than the one whose body
+    actually makes the call, and a tree-only walk could never reach it.
+    """
+    steps = story.get("steps") or []
+    entry = (story.get("entry") or {}).get("node_id")
+    if not entry:
+        return [], [], {}
+    children: dict[str, list[tuple[int, dict, str]]] = {}
+    functions: dict[str, dict] = {}
+    branches: dict[str, dict] = {}
+    for step in steps:
+        fn = step.get("function") or {}
+        fid = fn.get("node_id")
+        if not fid:
+            continue
+        functions[fid] = fn
+        # Per-function control facts: how many decision points the body has and which
+        # control kinds -- surfaced on the hop as its decision signal.
+        rows = step.get("branches") or []
+        kinds = sorted({r.get("control") for r in rows if r.get("control")})
+        branches[fid] = {"count": step.get("branch_count") or 0, "kinds": kinds}
+        caller = (step.get("caller") or {}).get("node_id")
+        if caller:
+            children.setdefault(caller, []).append(
+                (step.get("sequence", 0), fn, step.get("via") or ""))
+
+    def _candidate_children(node_id: str) -> list[tuple[dict, str]]:
+        """Callees to consider when extending the spine from ``node_id``.
+
+        The execution story is a *tree*: each function is attached under its
+        first-discovered caller, so a real callee can hang off a different parent
+        than the one whose body makes the call. Flask's ``finalize_request`` (which
+        builds the response) lands under ``handle_exception`` in the tree, not under
+        ``full_dispatch_request`` whose call actually reaches it -- so a walk over
+        story-children alone can never route the spine to the response terminus.
+        Recover the missing edges from the graph: every genuine callee of
+        ``node_id`` that the story itself visited becomes a candidate, carrying its
+        story fn record and a via classified from the edge kind. This invents no
+        nodes (only functions already in the story are admitted) and no edges the
+        graph does not hold; it merely lets the spine follow the real call an
+        earlier caller happened to be credited with in the tree.
+        """
+        out: list[tuple[dict, str]] = []
+        story_ids: set[str] = set()
+        for _seq, fn, via in sorted(children.get(node_id, []), key=lambda t: t[0]):
+            cid = fn.get("node_id")
+            if cid:
+                story_ids.add(cid)
+            out.append((fn, via))
+        try:
+            direct = {t.get("id") for t in index.targets(node_id, _CALL_EDGE_KINDS[0])
+                      if t.get("id")}
+            callees = [t.get("id") for t in index.targets(node_id, *_CALL_EDGE_KINDS)
+                       if t.get("id")]
+        except Exception:
+            return out
+        added: set[str] = set()
+        for t in callees:
+            if t in story_ids or t in added or t not in functions:
+                continue
+            added.add(t)
+            out.append((functions[t],
+                        "direct" if t in direct else "indirect:may_invoke"))
+        return out
+
+    memo: dict[str, int] = {}
+
+    def subtree(nid: str, guard: frozenset) -> int:
+        if nid in memo:
+            return memo[nid]
+        if nid in guard:
+            return 0
+        deeper = guard | {nid}
+        total = 0
+        for _, fn, _via in children.get(nid, []):
+            cid = fn.get("node_id")
+            if cid:
+                total += 1 + subtree(cid, deeper)
+        # Only cache when no guard cycle influenced the count (guard was the path
+        # to nid); good enough as a heuristic ranker and keeps the walk bounded.
+        memo[nid] = total
+        return total
+
+    reach_memo: dict[str, bool] = {}
+
+    def reaches_result(nid: str, guard: frozenset) -> bool:
+        """Does this subtree build the value the request returns? A response, a
+        rendered page, a serialized result -- recognised by morphology (see
+        ``_is_result_construction``), so the spine can end at the response terminus
+        rather than in a routing corner. Bounded and cycle-guarded like ``subtree``.
+        """
+        if nid in reach_memo:
+            return reach_memo[nid]
+        if nid in guard:
+            return False
+        if _is_result_construction((functions.get(nid) or {}).get("name")):
+            reach_memo[nid] = True
+            return True
+        deeper = guard | {nid}
+        found = any(cid and reaches_result(cid, deeper)
+                    for _, fn, _via in children.get(nid, [])
+                    for cid in (fn.get("node_id"),))
+        reach_memo[nid] = found
+        return found
+
+    spine = [entry]
+    seen = {entry}
+    cur = entry
+    meta: dict[str, dict] = {entry: _hop_semantics("entry", branches.get(entry) or {})}
+    while len(spine) < max_hops:
+        kids = [(fn, via)
+                for fn, via in _candidate_children(cur)
+                if fn.get("node_id") not in seen and _story_fn_openable(fn)]
+        if not kids:
+            break
+        # Rank each candidate hop, best first, by five generic signals:
+        #  1. a direct CALLS edge is the real control flow; ``indirect:may_invoke``
+        #     hops are duck-typed over-approximations (a session deserialize, a JSON
+        #     dump that *might* run), so direct wins;
+        #  2. error/teardown branches derank (real, but not the success path);
+        #  3. special-case/fallback branches derank next (an auto OPTIONS reply, a
+        #     not-found stub -- a corner, not the ordinary request);
+        #  4. a branch that reaches the response/result construction is preferred, so
+        #     the spine ends where the request builds what it returns
+        #     (full_dispatch_request -> finalize_request -> make_response) rather than
+        #     tunnelling into the widest routing subtree and stopping at a corner;
+        #  5. the deepest subtree breaks any remaining tie.
+        # Every signal is morphology over the identifier, never a framework symbol.
+        pick = max(kids, key=lambda kv: (
+            1 if kv[1] == "direct" else 0,
+            0 if _is_error_name(kv[0].get("name")) else 1,
+            0 if _is_fallback_name(kv[0].get("name")) else 1,
+            1 if reaches_result(kv[0].get("node_id"), frozenset()) else 0,
+            subtree(kv[0].get("node_id"), frozenset())))
+        nid = pick[0].get("node_id")
+        meta[nid] = _hop_semantics(pick[1], branches.get(nid) or {})
+        cur = nid
+        seen.add(nid)
+        spine.append(nid)
+    ordered_functions = [fid for fid in functions if _story_fn_openable(functions[fid])]
+    return spine, ordered_functions, meta
+
+
+def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], *,
+                          max_requests: int, max_core: int,
+                          max_hops: int,
+                          primary_family: Optional[str] = None) -> tuple[list[dict], list[dict]]:
+    """Request lifecycles and the architecture core, from bounded execution stories.
+
+    Runs a bounded forward execution story from each candidate driver (see
+    ``_lifecycle_roots``), ranks them by how much real control each covers (spine
+    length, then breadth), and keeps the deepest few as guided request paths -- each
+    the success spine of one story, every consecutive hop a real observed edge. A
+    shallower story whose root already sits inside a kept spine is skipped, so we do
+    not emit both ``__call__ -> wsgi_app -> ...`` and its ``wsgi_app -> ...`` suffix.
+    The union of every kept story's functions, bounded, becomes the core spine a
+    newcomer reads first. Best-effort: any failure yields empty lists, never raises.
+    """
+    requests: list[dict] = []
+    core: list[dict] = []
+    try:
+        roots = _lifecycle_roots(index, gl, handler_ids, cap=30,
+                                 primary_family=primary_family)
+    except Exception:
+        return requests, core
+
+    ranked: list[tuple[int, int, int, int, str, list[str], list[str], dict]] = []
+    for root in roots:
+        try:
+            story = _call("execution_story",
+                          {"entry": root, "max_depth": max_hops + 2,
+                           "max_steps": 120, "format": "json"})
+        except Exception:
+            continue
+        if not isinstance(story, dict):
+            continue
+        spine, functions, meta = _story_spine(story, index, gl, max_hops=max_hops)
+        if len(spine) < 2:
+            continue
+        # A peripheral root (a CLI command, a util helper) still yields a long, valid
+        # story, so ranking on spine length alone floats it above the web request path
+        # a reader opened the bundle to see. Demote by the root's module so the primary
+        # dispatch lifecycle leads; the peripheral path is kept, just not first.
+        root_file = gl.loc(gl.nodes.get(root))[0] if gl.nodes.get(root) else None
+        demote = 1 if _is_peripheral_module_path(root_file) else 0
+        # The dispatcher a reader wants first is the top-of-stack that drives the most
+        # code, not whichever helper happens to keep the longest in-library spine. The
+        # true lifecycle (Flask.wsgi_app, Click's Command.main -> invoke) exits to
+        # external user code quickly, so its openable spine is *short* even though its
+        # control cone is the widest; a string helper (secho -> echo -> isatty) stays
+        # in-library and spins a longer spine. Ranking by 2-hop reach first puts the
+        # real driver on top; spine length only breaks ties between comparable drivers.
+        reach = _reach2(index, root)
+        ranked.append((demote, -reach, len(spine), len(functions), root, spine, functions, meta))
+
+    # Primary lifecycles first (widest control cone), then deepest, then broadest.
+    ranked.sort(key=lambda row: (row[0], row[1], -row[2], -row[3], row[4]))
+
+    node_ids = set(asm.nodes)
+    covered: set[str] = set()
+    core_ids: set[str] = set()
+    used_ids: set[str] = set()
+    for _, _, _, _, root, spine, functions, meta in ranked:
+        if len(requests) >= max_requests:
+            break
+        if root in covered:  # a redundant suffix of a spine already shown
+            continue
+        hops: list[dict] = []
+        chain_ids: list[str] = []
+        for nid in spine:
+            node = gl.nodes.get(nid)
+            if node is None:
+                continue
+            asm.add_node(_norm_node(gl, node), default_kind="function")
+            node_ids.add(nid)
+            label = gl.label(node)
+            # ``caption`` stays the exact symbol (a reader can grep it); ``reads_as``
+            # adds a human phrase derived from the symbol's morphology, so the hop
+            # says what the step does ("dispatches the request") without hiding the
+            # identifier. First hop on the spine is the entry -- phrased as a start.
+            hop = {"node_id": nid, "caption": label,
+                   "reads_as": _readable_caption(label, is_entry=not hops)}
+            hop.update(meta.get(nid) or {})
+            hops.append(hop)
+            chain_ids.append(nid)
+        if len(hops) < 2:
+            continue
+        for a, b in zip(chain_ids, chain_ids[1:]):
+            asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, node_ids)
+        covered.update(chain_ids)
+        root_label = gl.label(gl.nodes.get(root)) or "entry"
+        rid = f"request.{_slug(root_label)}"
+        if rid in used_ids:
+            rid = f"{rid}.{_slug(root)}"
+        used_ids.add(rid)
+        requests.append({
+            "id": rid,
+            "kind": "call-path",
+            "description": f"Request lifecycle from {root_label} through "
+                           f"{len(hops) - 1} call(s).",
+            "entry_node": root,
+            "hops": hops,
+        })
+        # The architecture core draws from every kept story's functions, spine first.
+        for nid in [*chain_ids, *(f for f in functions if f not in chain_ids)]:
+            if len(core_ids) >= max_core:
+                break
+            if nid in core_ids:
+                continue
+            node = gl.nodes.get(nid)
+            if node is None:
+                continue
+            f, l = gl.loc(node)[0], gl.loc(node)[1]
+            if not f or not isinstance(l, int) or l <= 0:
+                continue
+            if _is_nonproduct_path(f):
+                continue  # keep scaffolding off the architecture core
+            asm.add_node(_norm_node(gl, node), default_kind="function")
+            node_ids.add(nid)
             try:
-                return len(index.targets(node["id"], "CALLS"))
+                degree = sum(1 for _ in index.targets(nid, *_CALL_EDGE_KINDS))
             except Exception:
-                return 0
-
-        pick = min(nxt, key=lambda n: (-out_degree(n), gl.label(n), n["id"]))
-        cur = pick["id"]
-        seen.add(cur)
-        chain.append(cur)
-    return chain
+                degree = 0
+            core.append({"node_id": nid, "label": gl.label(node),
+                         "file": f, "line": l, "degree": degree})
+            core_ids.add(nid)
+    return requests, core
 
 
 def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
@@ -567,7 +1274,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     never raises: a graph the comprehension layer cannot walk simply reads as a bare
     graph rather than failing the whole export.
     """
-    empty = {"entrypoints": [], "requests": [], "files": [], "modules": [], "concepts": []}
+    empty = {"entrypoints": [], "requests": [], "files": [], "modules": [], "concepts": [], "core": []}
     try:
         from lachesis.planner.entrypoints import EntryPoints, _anchor_strength
         ctx = M.ctx()
@@ -576,8 +1283,15 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         return empty
 
+    # The repo's dominant product language. A multi-language tree (a Python framework
+    # that bundles JavaScript admin widgets) otherwise features the wrong language:
+    # its JS event handlers rank as entrypoints and fill every request flow. Gating to
+    # the primary family keeps the projection in the language the repo actually is.
+    primary_family = _primary_language_family(index, gl)
+
     entrypoints: list[dict] = []
     requests: list[dict] = []
+    used_ids: set[str] = set()
     try:
         by_handler = EntryPoints(store).by_handler()
         # Strongest anchor per handler, then a stable global order over handlers.
@@ -587,7 +1301,6 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                          key=lambda kv: (_anchor_strength(kv[1]),
                                          kv[1].get("file") or "", kv[1].get("anchor_label") or "",
                                          kv[0]))
-        used_ids: set[str] = set()
         for handler_id, anchor in ordered:
             if len(entrypoints) >= max_entrypoints:
                 break
@@ -599,6 +1312,15 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
             # file and line, or it is not a place a developer can actually begin.
             if not nfile or not isinstance(nline, int) or nline <= 0:
                 continue
+            # ...and it must be product code -- never a test/example handler.
+            if _is_nonproduct_path(nfile):
+                continue
+            # ...and in the repo's primary language -- never a bundled JS admin
+            # widget standing in for the request path of a Python framework.
+            if primary_family is not None:
+                fam = _language_family(nfile)
+                if fam is not None and fam != primary_family:
+                    continue
             asm.add_node(_norm_node(gl, node), default_kind="function")
             how = anchor.get("how")
             label = gl.label(node)
@@ -618,32 +1340,65 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                 "file": efile,
                 "line": nline,
             })
-
-            # A guided path is only worth showing when it actually goes somewhere:
-            # the real CALLS chain out of the entry must have more than the entry.
-            chain = _call_chain(index, gl, handler_id, chain_depth)
-            if len(chain) < 2:
-                continue
-            hops = []
-            for nid in chain:
-                cnode = gl.nodes.get(nid)
-                if cnode is None:
-                    continue
-                asm.add_node(_norm_node(gl, cnode), default_kind="function")
-                hops.append({"node_id": nid, "caption": gl.label(cnode)})
-            for a, b in zip(chain, chain[1:]):
-                asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, set(asm.nodes))
-            if len(hops) >= 2:
-                requests.append({
-                    "id": f"request.{_slug(label)}",
-                    "kind": "call-path",
-                    "description": f"Follow control from {label} through "
-                                   f"{len(hops) - 1} call(s).",
-                    "entry_node": handler_id,
-                    "hops": hops,
-                })
     except Exception:
         pass
+
+    # Guided request paths are no longer a greedy CALLS walk out of each exported
+    # symbol -- that surfaced leaf utilities (render_template) and never the request
+    # lifecycle. Instead root them at the real top-of-stack drivers and follow the
+    # success spine of each one's bounded execution story (wsgi __call__ -> wsgi_app
+    # -> full_dispatch_request -> dispatch_request -> ...). The same stories yield the
+    # architecture core, so both are built together below.
+    handler_ids = [entry["node_id"] for entry in entrypoints]
+    requests, core = _lifecycle_projection(
+        asm, index, gl, handler_ids,
+        max_requests=8, max_core=32, max_hops=max(2, chain_depth),
+        primary_family=primary_family)
+
+    # Promote each lifecycle root to an entrypoint. ``by_handler`` only recognises
+    # module-level public helpers, so a framework's real request driver -- a WSGI
+    # ``Flask.wsgi_app``, an event loop -- is *never* an anchored handler and would
+    # otherwise be a request whose entry is nowhere in the entrypoint set. These
+    # drivers are the truest "begin reading here" nodes, so they lead the list. This
+    # also gives a library with no anchored handler at all (itsdangerous) a real,
+    # source-backed entrypoint, which the code-understanding contract requires.
+    entry_node_ids = {entry["node_id"] for entry in entrypoints}
+    promoted: list[dict] = []
+    for req in requests:
+        root = req.get("entry_node")
+        if not root or root in entry_node_ids:
+            continue
+        node = gl.nodes.get(root)
+        if node is None:
+            continue
+        nfile, nline = gl.loc(node)[0], gl.loc(node)[1]
+        if not nfile or not isinstance(nline, int) or nline <= 0:
+            continue
+        if _is_nonproduct_path(nfile):
+            continue
+        if primary_family is not None:
+            fam = _language_family(nfile)
+            if fam is not None and fam != primary_family:
+                continue
+        entry_node_ids.add(root)
+        label = gl.label(node)
+        eid = f"entry.{_slug(label)}"
+        if eid in used_ids:
+            eid = f"{eid}.{_slug(root)}"
+        used_ids.add(eid)
+        try:
+            efile = comp._relative_path(nfile) or nfile
+        except Exception:
+            efile = nfile
+        promoted.append({
+            "id": eid,
+            "label": label,
+            "kind": "request-lifecycle",
+            "node_id": root,
+            "file": efile,
+            "line": nline,
+        })
+    entrypoints = promoted + entrypoints
 
     files: list[dict] = []
     try:
@@ -660,23 +1415,44 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         files = []
 
+    # Concepts are the module *areas* a newcomer would name: the request lifecycle,
+    # routing, request context, templates, sessions, the CLI. Call-community
+    # clustering is too coarse here -- a flat single-package framework (every file in
+    # one directory) collapses into one giant community, so the whole request path,
+    # templating and session code read as a single undifferentiated blob. Derive areas
+    # from the *modules* instead: one concept per product file, ranked by how much it
+    # defines (definition count, then path for a stable order), capped at
+    # ``_MAX_CONCEPTS``. Fully generic -- the busiest modules of any codebase are its
+    # areas, named by their own path, never a framework symbol table -- and it degrades
+    # to an empty list, never raises. Ranking on the definition count alone keeps this a
+    # single cheap node scan (no per-node graph query), so it stays bounded on a large
+    # tree where an edge lookup per function would dominate the export.
     concepts: list[dict] = []
     try:
-        architecture = comp.architecture_map(max_communities=8, max_files_per_community=20)
-        for index, community in enumerate(architecture.get("communities") or []):
-            paths = [str(path) for path in community.get("files") or [] if path]
-            if not paths:
+        import collections as _collections
+        defs: "_collections.Counter" = _collections.Counter()
+        for node in index.nodes_of_kind("function", "method", "constructor"):
+            f = gl.loc(node)[0]
+            if not f or _is_nonproduct_path(f):
                 continue
-            first = paths[0]
-            directory = first.rsplit("/", 1)[0] if "/" in first else first
-            if directory.startswith("src/"):
-                directory = directory[4:]
-            label = directory.replace("/", " · ") or first
+            if primary_family is not None:
+                fam = _language_family(f)
+                if fam is not None and fam != primary_family:
+                    continue  # keep the concept list in the repo's own language
+            try:
+                rel = comp._relative_path(f) or f
+            except Exception:
+                rel = f
+            defs[rel] += 1
+        ranked_modules = sorted(defs.items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ranked_modules[:_MAX_CONCEPTS]
+        stem_counts = _collections.Counter(_module_stem(rel) for rel, _ in top)
+        for rel, n in top:
             concepts.append({
-                "id": f"concept.{_slug(community.get('id') or index)}",
-                "label": label,
-                "description": f"Connected code area spanning {len(paths)} file(s).",
-                "file_paths": paths,
+                "id": f"concept.{_slug(rel)}",
+                "label": _concept_label(rel, stem_counts),
+                "description": f"The {_module_stem(rel)} module ({n} definition(s)).",
+                "file_paths": [rel],
             })
     except Exception:
         concepts = []
@@ -685,7 +1461,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     # pool (one unambiguous module per node, keyed by that node's file), which is
     # only settled after candidate/capsule/entry nodes are all in and relativized.
     return {"entrypoints": entrypoints, "requests": requests, "files": files,
-            "concepts": concepts}
+            "concepts": concepts, "core": core}
 
 
 # ------------------------------------------------------- source / node enrichment
@@ -810,6 +1586,33 @@ def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
         module = _dotted_module(node.get("file"))
         if module:
             node["qualified_name"] = f"{module}.{node.get('label')}"
+        # Scope: the enclosing callable every node lives in (problem #6 -- scope was
+        # absent on most nodes). owner_function returns the node itself when it is
+        # already a callable, so a function/method reports the module it belongs to,
+        # while an operand or a value reports the function that contains it. This is
+        # the container a frontend groups by, never an empty field.
+        try:
+            owner = gl.owner_function(twin)
+        except Exception:
+            owner = None
+        scope = None
+        if owner is not None and owner.get("id") != twin.get("id"):
+            owner_file, _os, _oe = gl.loc(owner)
+            owner_module = _dotted_module(owner_file)
+            owner_label = gl.label(owner)
+            scope = f"{owner_module}.{owner_label}" if owner_module else owner_label
+        if not scope:
+            scope = module
+        if scope:
+            node["scope"] = scope
+        for key in ("documentation", "docstring", "comment"):
+            try:
+                documentation = gl.prop(twin, key)
+            except Exception:
+                documentation = None
+            if isinstance(documentation, str) and documentation.strip():
+                node["documentation"] = documentation.strip()
+                break
         try:
             excerpt = gl.source_excerpt(twin)
         except Exception:
@@ -892,6 +1695,14 @@ def _finalize_requests(raw_requests: list[dict], node_map: dict,
             nid = hop.get("node_id")
             entry = {"id": f"{rid}:{i:02d}", "node_id": nid,
                      "caption": hop.get("caption")}
+            if hop.get("reads_as"):
+                entry["reads_as"] = hop["reads_as"]
+            # Carry the story-derived hop semantics (how this hop is reached, whether
+            # it forks control) through decoration so a reader sees the call-seam and
+            # decision points, not just an ordered list of names.
+            for key in ("reached_via", "decides", "branch_count", "decision_kinds"):
+                if hop.get(key) is not None:
+                    entry[key] = hop[key]
             if i > 1:
                 entry["edge_label"] = _edge_label(
                     edges_by_pair, hops[i - 2].get("node_id"), nid)
@@ -928,6 +1739,11 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
         f = node.get("file")
         if not isinstance(f, str) or not f.strip():
             continue
+        # Non-product files (tests, docs, examples, vendored deps, generated output)
+        # must not surface as modules a reader is invited to explore. The same gate the
+        # entrypoint/request selection uses, applied to the module partition.
+        if _is_nonproduct_path(f):
+            continue
         module_name = _dotted_module(f) or f
         node["module"] = module_name
         groups.setdefault(f, []).append(node["id"])
@@ -949,12 +1765,23 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
 
 
 def _project_concepts(raw_concepts: list[dict], nodes: list[dict]) -> list[dict]:
-    """Keep architecture concepts honest to the final included node pool."""
+    """Keep architecture concepts honest to the final included node pool.
+
+    A concept is dropped entirely when every file it spans is non-product, and its
+    node set is restricted to product files, so a vendored dependency
+    (``node_modules · typescript · lib``), a build config (``rollup.config.js``), or a
+    docs/scripts tree never surfaces as an architecture concept — even on a graph
+    built without build-time exclusion.
+    """
     out: list[dict] = []
     for concept in raw_concepts or []:
-        paths = {str(path) for path in concept.get("file_paths") or [] if path}
+        paths = {str(path) for path in concept.get("file_paths") or [] if path
+                 and not _is_nonproduct_path(str(path))}
+        if not paths:
+            continue
         node_ids = [node["id"] for node in nodes
-                    if isinstance(node.get("file"), str) and node.get("file") in paths]
+                    if isinstance(node.get("file"), str) and node.get("file") in paths
+                    and not _is_nonproduct_path(node.get("file"))]
         if not node_ids:
             continue
         out.append({
@@ -966,11 +1793,107 @@ def _project_concepts(raw_concepts: list[dict], nodes: list[dict]) -> list[dict]
     return out
 
 
+def _project_curated_tour(raw: Optional[dict], values: list[dict], requests: list[dict]) -> Optional[dict]:
+    """Keep only tour steps that resolve in this exact exported projection.
+
+    Tour files are user-authored convenience metadata, not evidence. A changed
+    repository can make an old flow or anchor disappear, so stale steps are
+    omitted instead of making the entire export fail. Maintainer identity is
+    deliberately not accepted from this unauthenticated file path.
+    """
+    if not isinstance(raw, dict):
+        return None
+    title = str(raw.get("title") or "Start here").strip()
+    tour_id = str(raw.get("id") or "tour.start-here").strip()
+    if not title or not tour_id:
+        return None
+    paths = {str(path.get("id")): path for path in [*values, *requests]
+             if isinstance(path, dict) and path.get("id")}
+    steps: list[dict] = []
+    for item in raw.get("steps") or []:
+        if not isinstance(item, dict):
+            continue
+        flow_id = str(item.get("flow_id") or item.get("flowId") or "").strip()
+        path = paths.get(flow_id)
+        if not path:
+            continue
+        raw_steps = path.get("steps") if isinstance(path.get("steps"), list) else path.get("hops")
+        node_ids = {str(step.get("node_id")) for step in raw_steps or []
+                    if isinstance(step, dict) and step.get("node_id")}
+        node_id = item.get("node_id") or item.get("nodeId")
+        if node_id is not None and str(node_id) not in node_ids:
+            continue
+        step = {"flow_id": flow_id}
+        if node_id is not None:
+            step["node_id"] = str(node_id)
+        for key in ("label", "note"):
+            if item.get(key) is not None and str(item[key]).strip():
+                step[key] = str(item[key]).strip()
+        steps.append(step)
+    if not steps:
+        return None
+    result = {"id": tour_id, "title": title, "steps": steps}
+    description = str(raw.get("description") or "").strip()
+    if description:
+        result["description"] = description[:500]
+    overview = raw.get("overview")
+    if isinstance(overview, dict):
+        overview_description = str(overview.get("description") or "").strip()
+        overview_result = {"description": overview_description[:1000]} if overview_description else {}
+        concepts = overview.get("concepts")
+        if isinstance(concepts, list):
+            selected_concepts = []
+            for item in concepts[:8]:
+                if not isinstance(item, dict) or not str(item.get("id") or "").strip() or not str(item.get("label") or "").strip():
+                    continue
+                concept = {"id": str(item["id"]).strip(), "label": str(item["label"]).strip()}
+                if str(item.get("description") or "").strip():
+                    concept["description"] = str(item["description"]).strip()[:300]
+                related = item.get("related_ids")
+                if isinstance(related, list) and related:
+                    concept["related_ids"] = [str(value) for value in related if str(value).strip()][:8]
+                selected_concepts.append(concept)
+            if selected_concepts:
+                overview_result["concepts"] = selected_concepts
+        if overview_result:
+            result["overview"] = overview_result
+    selection = raw.get("selection")
+    if isinstance(selection, dict):
+        allowed = ("include_tests", "include_examples", "include_generated")
+        selected = {key: value for key, value in selection.items() if key in allowed and isinstance(value, bool) and value}
+        if selected:
+            result["selection"] = selected
+    return result
+
+
+def _normalize_node_location(node: dict) -> None:
+    """Coerce a node's ``file``/``line``/``end_line`` to their 2.0 field types in place.
+
+    Synthetic nodes (heap locations, summary objects) have no source and were
+    emitting ``file: null, line: null``; the 2.0 contract is ``file: ""`` and
+    ``line: 0`` -- a real absence, not a missing key of unknown type -- so a reader
+    can uniformly test ``line > 0`` for openability. ``end_line`` is made mandatory
+    and never less than ``line`` (a single-line span when no wider extent is known,
+    ``0`` for synthetics). Normalizing null to ""/0 does not change which nodes count
+    as source-backed: ``_has_source`` already rejects an empty file and a non-positive
+    line, so featured-path and entrypoint selection are unaffected.
+    """
+    file = node.get("file")
+    node["file"] = file if isinstance(file, str) and file.strip() else ""
+    line = node.get("line")
+    line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else 0
+    node["line"] = line
+    end = node.get("end_line")
+    node["end_line"] = end if (isinstance(end, int) and not isinstance(end, bool)
+                               and end >= line) else line
+
+
 def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
                         lang: Optional[str], indexed_nodes: int,
                         source_url_template: Optional[str] = None,
                         comprehension: Optional[dict] = None,
-                        description: Optional[str] = None) -> dict:
+                        description: Optional[str] = None,
+                        curated_tour: Optional[dict] = None) -> dict:
     """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
 
     The security envelope remains available under ``security.findings``.  The
@@ -982,7 +1905,19 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     language = str(lang or meta.get("lang") or "unknown")
     revision = str(commit or meta.get("commit") or "unknown")
     findings = bundle.get("findings") or []
+    # `security.findings` stays exhaustive (passed through untouched below); only the
+    # *featured* value paths are cleaned. Two hygiene rules (problems #7 and #8):
+    #   #7  A value path that visits fewer than two distinct nodes has not moved --
+    #       it is a bare def-use artifact (a traceback local `tb`, a file handle `f`,
+    #       `config_file`, `tb.tb_frame`), not a behavior. Featuring it as one is the
+    #       reported defect. Genuine flows (`hashlib.sha1`, `send_file`, `re.split`,
+    #       `Markup`) always traverse a source and a distinct sink, so the two-distinct
+    #       -node floor drops exactly the artifacts and keeps every real flow, including
+    #       the minimal two-step call-argument flows.
+    #   #8  Identical paths (same endpoints and same ordered node ids) are collapsed to
+    #       one; the graph often yields the same def-use twice from different findings.
     values = []
+    seen_paths: set[tuple] = set()
     for finding in findings:
         witness = finding.get("witness") or {}
         steps = witness.get("steps") or []
@@ -991,14 +1926,23 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         finding_id = str(finding.get("finding_id") or "")
         if not finding_id:
             continue
+        step_ids = tuple(step.get("node_id") for step in steps)
+        if len({sid for sid in step_ids if sid}) < 2:
+            continue  # #7: a path that never leaves one node is not a behavior
+        source_node = steps[0].get("node_id")
+        sink_node = steps[-1].get("node_id")
+        dedupe_key = (source_node, sink_node, step_ids)
+        if dedupe_key in seen_paths:
+            continue  # #8: same endpoints and same ordered hops -- one is enough
+        seen_paths.add(dedupe_key)
         path_id = f"value:{finding_id}"
         values.append({
             "id": path_id,
             "kind": "value-flow",
             "name": finding.get("display_name") or "value path",
             "description": finding.get("result_summary") or "Exporter-provided value path",
-            "source_node": steps[0].get("node_id"),
-            "sink_node": steps[-1].get("node_id"),
+            "source_node": source_node,
+            "sink_node": sink_node,
             "confidence": (finding.get("analysis") or {}).get("confidence"),
             "limitations": list((finding.get("analysis") or {}).get("limitations") or []),
             "steps": steps,
@@ -1006,6 +1950,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
 
     graph = bundle.get("graph") or {}
     nodes = graph.get("nodes") or []
+    for node in nodes:
+        _normalize_node_location(node)
     node_map = {n.get("id"): n for n in nodes}
     node_ids = set(node_map)
     edges = _canonical_edges(graph.get("edges") or [], node_ids)
@@ -1017,6 +1963,9 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     requests = _finalize_requests(comp.get("requests") or [], node_map, edges_by_pair)
     modules = _partition_modules(nodes, entrypoints)
     concepts = _project_concepts(comp.get("concepts") or [], nodes)
+    core = [item for item in (comp.get("core") or [])
+            if item.get("node_id") in node_ids]
+    tour = _project_curated_tour(curated_tour, values, requests)
 
     coverage = {
         "scope": "repository-projection",
@@ -1054,11 +2003,14 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
             "modules": modules,
             "concepts": concepts,
             "entrypoints": entrypoints,
+            "core": core,
             "coverage": coverage,
         },
         "paths": {"requests": requests, "values": values},
         "security": {"findings": findings},
     }
+    if tour is not None:
+        v2["meta"]["curated_tour"] = tour
     _validate_graph_first(v2)
     return v2
 
@@ -1085,6 +2037,22 @@ def _validate_graph_first(bundle: dict) -> None:
     if not nodes or None in node_ids:
         raise ValueError("graph-first bundle has invalid nodes")
 
+    # Every node carries the concrete 2.0 location types -- ``file`` a string
+    # (``""`` when absent), ``line`` and ``end_line`` non-negative ints with the
+    # span never inverted. Synthetic nodes (heap locations) legitimately report
+    # ``""``/``0``; what is rejected is the earlier ``null`` leak, which left the
+    # field's type undefined for consumers.
+    for node in nodes:
+        nid = node.get("id")
+        if not isinstance(node.get("file"), str):
+            raise ValueError(f"node {nid} file must be a string")
+        line = node.get("line")
+        if not isinstance(line, int) or isinstance(line, bool) or line < 0:
+            raise ValueError(f"node {nid} line must be an int >= 0")
+        end = node.get("end_line")
+        if not isinstance(end, int) or isinstance(end, bool) or end < line:
+            raise ValueError(f"node {nid} end_line must be an int >= line")
+
     coverage = graph.get("coverage") or {}
     if coverage and coverage.get("included_nodes") != len(nodes):
         raise ValueError("graph-first coverage.included_nodes must equal node count")
@@ -1099,6 +2067,21 @@ def _validate_graph_first(bundle: dict) -> None:
             raise ValueError(f"entrypoint {entry.get('id')} references unknown node")
         if not _has_source(node_map.get(nid)):
             raise ValueError(f"entrypoint {entry.get('id')} node has no openable source")
+
+    # A comprehension-first projection is meaningless without a boundary to enter
+    # from and a path with enough hops to be a story. An empty entrypoint set (the
+    # ItsDangerous case) or paths that never exceed a bare def-use pair defeat the
+    # whole projection, so they are rejected here rather than shipped as a hollow
+    # bundle. Request hops are already proven source-backed above, so a >=3-hop
+    # request is a source-backed path of three or more hops by construction.
+    if bundle.get("analysis_projection") == "code-understanding":
+        if not (graph.get("entrypoints") or []):
+            raise ValueError(
+                "code-understanding projection requires at least one production entrypoint")
+        requests = (bundle.get("paths") or {}).get("requests") or []
+        if not any(len(req.get("hops") or []) >= 3 for req in requests):
+            raise ValueError(
+                "code-understanding projection requires a source-backed path of >= 3 hops")
 
     seen_module_nodes: set[str] = set()
     for module in graph.get("modules") or []:
@@ -1134,6 +2117,7 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  schema_version: str = "1.0",
                  source_url_template: Optional[str] = None,
                  description: Optional[str] = None,
+                 curated_tour: Optional[dict] = None,
                  max_entrypoints: int = 40, chain_depth: int = 6,
                  max_files: int = 2000) -> dict:
     """Build an explorer bundle (schema 1.0) from a built+enriched graph."""
@@ -1240,7 +2224,8 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                                    commit=commit or prov.get("commit_sha"), lang=lang,
                                    indexed_nodes=int(load.get("nodes") or 0),
                                    source_url_template=source_url_template,
-                                   comprehension=projection, description=description)
+                                   comprehension=projection, description=description,
+                                   curated_tour=curated_tour)
     if schema_version != "1.0":
         raise ValueError(f"unsupported Explorer schema version: {schema_version}")
     return bundle
