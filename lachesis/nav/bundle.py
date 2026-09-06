@@ -114,6 +114,26 @@ def _finding_id(sink_kind: Optional[str], file: Optional[str],
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _semantic_fact(observations: dict) -> Optional[dict]:
+    """Project optional Atropos identity without inventing a semantic fact.
+
+    The explorer can link a finding to the Atropos reference only when the
+    candidate observation actually carried the model identity. Keep this
+    envelope additive and omit it for findings that have no catalog binding.
+    """
+    model_id = observations.get("atropos_model_id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        return None
+    fact = {"provider": "atropos", "model_id": model_id}
+    for source_key, public_key in (("access_path", "access_path"),
+                                   ("role", "role"),
+                                   ("cwe", "cwe")):
+        value = observations.get(source_key)
+        if value not in (None, "", []):
+            fact[public_key] = value
+    return fact
+
+
 # --------------------------------------------------------------------- helpers
 
 def _nonempty_constructors(census: dict) -> list[str]:
@@ -417,7 +437,7 @@ def _candidate_findings(census: dict, asm: _Assembler, *, per_family: int,
             limitations = ["candidate lead; no guard-differential capsule"]
             if reach and reach != "confirmed":
                 limitations.append(f"input reachability {reach}")
-            findings[fid] = {
+            finding = {
                 "schema_version": FINDING_SCHEMA_VERSION,
                 "finding_id": fid,
                 "status": "lead",
@@ -438,6 +458,10 @@ def _candidate_findings(census: dict, asm: _Assembler, *, per_family: int,
                 "result_summary": f"{len(env_nodes)} nodes, {len(env_edges)} edges "
                                   f"reach {obs.get('sink_kind') or cid}",
             }
+            semantic = _semantic_fact(obs)
+            if semantic:
+                finding["semantic"] = semantic
+            findings[fid] = finding
     return findings
 
 

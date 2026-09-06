@@ -74,6 +74,28 @@ class FindingIdTests(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class SemanticFactTests(unittest.TestCase):
+    def test_projects_atropos_binding_fields(self):
+        self.assertEqual(
+            bundle._semantic_fact({
+                "atropos_model_id": "c.std.memcpy.a2",
+                "access_path": "Argument[2]",
+                "role": "sink",
+                "cwe": ["CWE-787"],
+            }),
+            {
+                "provider": "atropos",
+                "model_id": "c.std.memcpy.a2",
+                "access_path": "Argument[2]",
+                "role": "sink",
+                "cwe": ["CWE-787"],
+            },
+        )
+
+    def test_omits_unbound_semantics(self):
+        self.assertIsNone(bundle._semantic_fact({"sink_kind": "memory.copy"}))
+
+
 class StepsFromPathTests(unittest.TestCase):
     def test_roles_origin_transform_sink(self):
         steps = bundle._steps_from_path(
