@@ -27,6 +27,7 @@ come from the public planner constructor.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -545,8 +546,85 @@ def _norm_node(gl, node: dict) -> dict:
         file, line = loc[0], loc[1]
     except Exception:
         pass
+    if not (isinstance(file, str) and file.strip()):
+        afile, aline = _anchor_location(gl, node)
+        if afile:
+            file = afile
+            if not (isinstance(line, int) and line > 0):
+                line = aline
     return {"id": node.get("id"), "name": gl.label(node),
             "kind": gl.kind(node.get("id")), "file": file, "line": line}
+
+
+# Synthetic dataflow nodes (heap objects/locations, interprocedural-context bindings)
+# carry no source location of their own -- gl.loc() returns (None, None). They do,
+# however, reference the real site they derive from through their properties: a heap
+# object names the function that owns its allocation, a context binding names the
+# call-site it flows through, a heap location names the object it is a field/index of.
+# Following those references to a located node gives every synthetic node a real
+# file:line -- better for a reader than a blank, and required by the bundle contract,
+# which rejects a node with an empty file.
+# Structural references first (the owning function, the call-site, the parent
+# object), then evidence -- the concrete frontend nodes the inference was drawn from,
+# which always carry a location. Evidence is a list; the rest are scalar ids.
+_ANCHOR_PROPERTY_KEYS = (
+    "owner_function_id", "function_id", "callsite_id", "call_id",
+    "object_id", "parameter_id", "argument_id", "context_id", "evidence_ids",
+)
+
+
+def _anchor_ids(value: Any) -> list[str]:
+    """Node ids a property references. A reference may be a scalar id or a list of
+    them; kuzu stores some list properties as their ``repr`` string, so parse that."""
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str) and item]
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.startswith("[") or text.startswith("("):
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                return []
+            if isinstance(parsed, (list, tuple)):
+                return [item for item in parsed if isinstance(item, str) and item]
+            return []
+        return [text]
+    return []
+
+
+def _anchor_location(gl, node: dict) -> tuple[Optional[str], Optional[int]]:
+    """Best-effort (repo-relative file, line) for a location-less synthetic node,
+    resolved from the real site it references. (None, None) when nothing resolves."""
+    seen: set[str] = set()
+
+    def resolve(node_id: str, depth: int) -> tuple[Optional[str], Optional[int]]:
+        if not node_id or node_id in seen or depth > 6:
+            return (None, None)
+        seen.add(node_id)
+        target = gl.nodes.get(node_id)
+        if target is None:
+            return (None, None)
+        try:
+            file, line, _end = gl.loc(target)
+        except Exception:
+            file, line = None, None
+        if isinstance(file, str) and file.strip():
+            return (file, line)
+        props = target.get("properties", {}) or {}
+        for key in _ANCHOR_PROPERTY_KEYS:
+            for ref in _anchor_ids(props.get(key)):
+                resolved = resolve(ref, depth + 1)
+                if resolved[0]:
+                    return resolved
+        return (None, None)
+
+    props = node.get("properties", {}) or {}
+    for key in _ANCHOR_PROPERTY_KEYS:
+        for ref in _anchor_ids(props.get(key)):
+            resolved = resolve(ref, 0)
+            if resolved[0]:
+                return resolved
+    return (None, None)
 
 
 # The request lifecycle a reader wants is the *success* path; error, teardown and
@@ -833,6 +911,100 @@ def _primary_language_family(index, gl) -> Optional[str]:
     if counts[top] * 2 <= sum(counts.values()):
         return None  # no strict majority -> polyglot -> do not gate
     return top
+
+
+# Source-extension -> the *specific* display language a reader recognises. Unlike
+# ``_LANG_BY_EXT`` (which coarsens js and ts into one "web" family for projection
+# gating), this keeps javascript and typescript distinct because it answers a
+# different question: the single word shown as ``meta.language``.
+_LANG_NAME_BY_EXT = {
+    "py": "python", "pyi": "python", "pyx": "python",
+    "js": "javascript", "jsx": "javascript", "mjs": "javascript", "cjs": "javascript",
+    "ts": "typescript", "tsx": "typescript", "mts": "typescript", "cts": "typescript",
+    "c": "c", "h": "c", "cc": "c++", "cpp": "c++", "cxx": "c++",
+    "hpp": "c++", "hh": "c++", "hxx": "c++",
+    "go": "go", "rs": "rust", "rb": "ruby", "java": "java", "kt": "kotlin",
+    "php": "php", "cs": "c#", "swift": "swift",
+}
+
+
+def _language_name(path: Optional[str]) -> Optional[str]:
+    """The specific display language of a source path, or None if unrecognised."""
+    if not isinstance(path, str):
+        return None
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in base:
+        return None
+    return _LANG_NAME_BY_EXT.get(base.rsplit(".", 1)[-1].lower())
+
+
+def _primary_language_name(index, gl) -> Optional[str]:
+    """The repo's dominant *product* language as a display word, or None.
+
+    Counts product (non-scaffolding) source files by specific language and returns
+    the plurality. This is the honest answer to ``meta.language``: it is read off
+    the repo's own files, so a repository that ships only JavaScript is labelled
+    ``javascript`` even when a handful of the toolchain's own ``.d.ts`` stubs leak
+    into the graph (they are ``_is_nonproduct_path`` scaffolding and never counted).
+    The earlier ``census.atropos.languages[0]`` was an aggregate over *all* indexed
+    files, so a single ``.d.ts`` flipped express from javascript to typescript --
+    the reported defect. Returns None (caller keeps its fallback) only when no
+    product source file has a recognised extension.
+    """
+    counts: dict[str, int] = {}
+    try:
+        for node in index.nodes_of_kind("file"):
+            f = gl.loc(node)[0] or gl.prop(node, "file")
+            if not f or _is_nonproduct_path(f):
+                continue
+            name = _language_name(f)
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    except Exception:
+        return None
+    if not counts:
+        return None
+    return max(counts, key=lambda k: (counts[k], k))
+
+
+# Featured "start here / read next" surfaces and the trust evidence list must name
+# something a reader can act on -- a function, a method, a real sink. A def-use
+# artifact instead names a single-letter local (``f``, ``e``), a traceback-walking
+# internal (``tb``, ``tb.tb_frame``, ``tb.tb_next``), a bare file handle (``f.read``),
+# an interpreter-internal attribute (``self.__dict__[name]``, ``__code__``), or an
+# anonymous callback (``<anonymous@571>``). Surfacing these as "places to start" or as
+# security "evidence" is the reported noise (B4/D7): they are real nodes in a flow but
+# meaningless as a heading. This predicate flags them so the featured surfaces can
+# demote them while the exhaustive ``security.findings`` envelope keeps every node.
+_NOISE_LOCALS = {
+    "tb", "f", "e", "ex", "exc", "err", "cb", "fn", "fp", "fh", "fd",
+    "config_file", "traceback", "frame",
+}
+
+
+def _is_noise_surface(label: Optional[str]) -> bool:
+    """True when a node label is an internal/local artifact, not a nameable surface."""
+    if not isinstance(label, str):
+        return False
+    name = label.strip()
+    if not name:
+        return False
+    # Anonymous callbacks/lambdas the frontend names positionally.
+    if name.startswith("<anonymous") or name.startswith("<lambda") or name.startswith("("):
+        return True
+    lowered = name.lower()
+    # Traceback-walking chains and file-handle reads (``tb``, ``tb.tb_frame``,
+    # ``f.read``): the root of the attribute chain is a noise local.
+    root = lowered.split("[", 1)[0].split("(", 1)[0].split(".", 1)[0].strip()
+    if root in _NOISE_LOCALS:
+        return True
+    # ``self.__dict__[...]`` / dunder-internal access surfaced as a symbol.
+    if "__dict__" in lowered or "__code__" in lowered or "f_code" in lowered or "f_globals" in lowered:
+        return True
+    # A single non-dunder character (``f``, ``e``) is a local, never a public surface.
+    if len(name) == 1 and name.isalpha():
+        return True
+    return False
 
 
 def _descend_trampoline(index, gl, nid: str, *,
@@ -1404,8 +1576,15 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     try:
         seen_paths: set[str] = set()
         for node in index.nodes_of_kind("file"):
-            path = comp._relative_path(gl.loc(node)[0] or gl.prop(node, "file"))
-            if not path or path in seen_paths:
+            raw = gl.loc(node)[0] or gl.prop(node, "file")
+            # Scaffolding and vendored/toolchain files (the compiler's own
+            # ``node_modules/typescript/lib/*.d.ts`` stubs) must not appear in the
+            # file inventory a reader browses -- test the raw path before
+            # relativization strips the ``node_modules`` marker that identifies them.
+            if _is_nonproduct_path(raw):
+                continue
+            path = comp._relative_path(raw)
+            if not path or path in seen_paths or _is_nonproduct_path(path):
                 continue
             seen_paths.add(path)
             files.append({"id": node.get("id"), "path": path})
@@ -1456,6 +1635,47 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
             })
     except Exception:
         concepts = []
+
+    # Module anchors (B7): guarantee the architecture map shows *every* product
+    # module, not only those the request-lifecycle spine happens to traverse.
+    # ``_partition_modules`` builds one module per file that owns an *included* node,
+    # so a core module a newcomer expects (flask.globals -> request/session/g,
+    # flask.views -> View/MethodView, flask.wrappers -> Request/Response) silently
+    # vanished from the map whenever no featured path passed through it -- 10 of
+    # flask's 24 modules were dropped. The fix is to seed one representative, openable
+    # definition from each otherwise-unrepresented product module into the shared
+    # pool, so the module surfaces with a real "begin reading here" node. The module
+    # validator requires every module node to be an included node, so the map can only
+    # be completed by adding these anchors, not by inventing empty modules.
+    try:
+        import collections as _collections2
+        # A file is already represented when any pool node (candidate, capsule, entry,
+        # request hop) lives in it. Pool files are still absolute here (relativization
+        # runs later), matching ``gl.loc``'s absolute paths.
+        represented = {n.get("file") for n in asm.nodes.values() if n.get("file")}
+        # Best openable definition per product file: prefer a type, then the earliest
+        # top-of-file definition, so the anchor is the module's most recognisable name.
+        _KIND_RANK = {"class": 0, "constructor": 1, "function": 2, "method": 3}
+        best_anchor: dict[str, dict] = {}
+        best_rank: dict[str, tuple] = {}
+        for node in index.nodes_of_kind("class", "constructor", "function", "method"):
+            f, l = gl.loc(node)[0], gl.loc(node)[1]
+            if not f or not isinstance(l, int) or l <= 0 or _is_nonproduct_path(f):
+                continue
+            if f in represented:
+                continue  # module already has an included node -- no anchor needed
+            if primary_family is not None:
+                fam = _language_family(f)
+                if fam is not None and fam != primary_family:
+                    continue  # keep the map in the repo's own language
+            rank = (_KIND_RANK.get(gl.kind(node.get("id")), 4), l)
+            if f not in best_rank or rank < best_rank[f]:
+                best_rank[f] = rank
+                best_anchor[f] = node
+        for node in best_anchor.values():
+            asm.add_node(_norm_node(gl, node), default_kind="function")
+    except Exception:
+        pass
 
     # Modules are not built here: they must partition the *final* included node
     # pool (one unambiguous module per node, keyed by that node's file), which is
@@ -1553,6 +1773,13 @@ def _count_source_lines(index, gl) -> int:
         if not key or key in seen:
             continue
         seen.add(key)
+        # Scaffolding and vendored/toolchain files must not inflate the repo's line
+        # count -- the compiler's own ``typescript/lib/*.d.ts`` stubs added ~45k lines
+        # to express's real 2,773 (a 17x overcount). Test both the display and
+        # absolute path so the ``node_modules`` marker and the ``.d.ts`` suffix are
+        # each caught.
+        if _is_nonproduct_path(props.get("file")) or _is_nonproduct_path(abs_path):
+            continue
         count = 0
         if abs_path:
             try:
@@ -1605,6 +1832,16 @@ def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
             scope = module
         if scope:
             node["scope"] = scope
+        # A synthetic node (heap object/location, interprocedural-context binding)
+        # reaches this projection with no file of its own. Anchor it to the real site
+        # it derives from so it opens at a real location instead of a blank the bundle
+        # contract would reject.
+        if not (isinstance(node.get("file"), str) and node["file"].strip()):
+            anchor_file, anchor_line = _anchor_location(gl, twin)
+            if anchor_file:
+                node["file"] = anchor_file
+                if not (isinstance(node.get("line"), int) and node["line"] > 0):
+                    node["line"] = anchor_line
         for key in ("documentation", "docstring", "comment"):
             try:
                 documentation = gl.prop(twin, key)
@@ -1902,11 +2139,32 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     """
     meta = bundle.get("meta") or {}
     repository = str(repo or meta.get("repo") or "unknown")
+    # meta.language must name the repo's *own* dominant language (B1). The passed
+    # ``lang``/``meta.lang`` derives from ``census.atropos.languages[0]``, an aggregate
+    # over every indexed file, so a single leaked ``.d.ts`` stub flipped express from
+    # javascript to typescript. Prefer the plurality language of the product source
+    # files read straight off the graph; fall back to the caller's value only when the
+    # graph cannot decide (unrecognised extensions).
     language = str(lang or meta.get("lang") or "unknown")
+    try:
+        ctx = M.ctx()
+        graph_lang = _primary_language_name(ctx.store.index, ctx.store.gl)
+        if graph_lang:
+            language = graph_lang
+    except Exception:
+        pass
     revision = str(commit or meta.get("commit") or "unknown")
     findings = bundle.get("findings") or []
-    # `security.findings` stays exhaustive (passed through untouched below); only the
-    # *featured* value paths are cleaned. Two hygiene rules (problems #7 and #8):
+    # `security.findings` stays exhaustive, but each finding whose featured surface is
+    # an internal/local artifact (a traceback local `tb`, a file handle `f`, an
+    # anonymous callback) is marked `low_signal` so the trust view can demote it from
+    # "what evidence needs a closer read" without losing it from the envelope (D7). The
+    # real surfaces (`send_file`, `Markup`, `hashlib.sha1`, `re.split`) are left
+    # unflagged and lead the list.
+    for finding in findings:
+        if _is_noise_surface(finding.get("display_name")):
+            finding["low_signal"] = True
+    # Only the *featured* value paths are cleaned. Two hygiene rules (problems #7 and #8):
     #   #7  A value path that visits fewer than two distinct nodes has not moved --
     #       it is a bare def-use artifact (a traceback local `tb`, a file handle `f`,
     #       `config_file`, `tb.tb_frame`), not a behavior. Featuring it as one is the
@@ -1916,6 +2174,12 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     #       the minimal two-step call-argument flows.
     #   #8  Identical paths (same endpoints and same ordered node ids) are collapsed to
     #       one; the graph often yields the same def-use twice from different findings.
+    #   #9  A path whose featured surface is an internal/local artifact -- a traceback
+    #       walk (`tb`, `tb.tb_frame`), a bare file handle (`f`, `f.read`), an anonymous
+    #       callback (`<anonymous@571>`) -- is not a place to start reading (B4/D7). It
+    #       is flagged `low_signal` on the exhaustive finding (below) and dropped from
+    #       the featured value paths here, so "places to start / read next" name real
+    #       surfaces (`res.download`, `hashlib.sha1`, `send_file`) instead of locals.
     values = []
     seen_paths: set[tuple] = set()
     for finding in findings:
@@ -1929,6 +2193,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         step_ids = tuple(step.get("node_id") for step in steps)
         if len({sid for sid in step_ids if sid}) < 2:
             continue  # #7: a path that never leaves one node is not a behavior
+        if _is_noise_surface(finding.get("display_name")):
+            continue  # #9: internal/local artifact, not a featurable surface
         source_node = steps[0].get("node_id")
         sink_node = steps[-1].get("node_id")
         dedupe_key = (source_node, sink_node, step_ids)
