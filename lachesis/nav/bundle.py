@@ -558,6 +558,35 @@ _LIFECYCLE_ERROR_TOKENS = (
 )
 _CALL_EDGE_KINDS = ("CALLS", "INVOKES", "MAY_INVOKE")
 
+# Modules that are real product code but *peripheral* to the request lifecycle a
+# reader wants first: the command-line front door, generic string/util helpers, the
+# in-tree test harness (``testing.py`` -- kept in the graph, but never the headline
+# lifecycle). A framework's CLI command has a long, valid execution story, so pure
+# spine length floats it above the web path; demoting these modules as lifecycle
+# *roots* keeps them in the bundle while letting the dispatch spine lead. Matched on
+# the file's basename stem so it stays language-agnostic (cli.py, cli.js, cli.ts).
+_PERIPHERAL_MODULE_STEMS = frozenset({
+    "cli", "__main__", "__main", "cmd", "cmdline", "commands", "command",
+    "utils", "util", "helpers", "helper", "testing", "compat", "_compat",
+})
+
+
+def _is_peripheral_module_path(path: Optional[str]) -> bool:
+    """True when a file is product code but off the primary request lifecycle.
+
+    A soft signal for *ranking* only -- never for inclusion. The stem set is generic
+    (a CLI front-door, string/util helpers, the test harness); a segment named
+    ``commands`` catches a management-command package regardless of file name.
+    """
+    if not path:
+        return False
+    p = str(path).replace("\\", "/")
+    stem = p.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    if stem in _PERIPHERAL_MODULE_STEMS:
+        return True
+    segments = p.lower().split("/")
+    return "commands" in segments[:-1]
+
 
 def _is_error_name(name: Optional[str]) -> bool:
     n = str(name or "").lower()
@@ -704,21 +733,33 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int,
     uncalled once tests are excluded. Truncated to ``cap`` so the story pass is
     bounded regardless of codebase size.
     """
-    roots: list[str] = []
+    # Both sources feed one ranked candidate pool. A planner handler is *not* an
+    # automatic front-of-line: a framework like Click emits dozens of thin decorator
+    # handlers (``version_option``, ``argument``) that each spin a valid but peripheral
+    # story, and if they were kept ahead of the drivers they would fill ``cap`` and
+    # starve the real dispatcher (``Command.main``, in-degree-0, widest cone) out of the
+    # pass entirely. Ranking every candidate by two-hop reach means the widest-cone
+    # lifecycle always survives the cap; the downstream story pass re-ranks the
+    # survivors, so this ordering governs only *which* candidates it gets to see.
+    candidates: list[tuple[int, str]] = []
     seen: set[str] = set()
-    for hid in handler_ids:
-        if hid and hid not in seen:
-            seen.add(hid)
-            node = gl.nodes.get(hid)
-            if node is not None and _is_nonproduct_path(gl.loc(node)[0]):
-                continue  # a test/example handler is not a product lifecycle root
-            if node is not None and primary_family is not None:
-                fam = _language_family(gl.loc(node)[0])
-                if fam is not None and fam != primary_family:
-                    continue  # a non-primary-language handler (bundled JS in a Python repo)
-            roots.append(hid)
 
-    drivers: list[tuple[int, str]] = []
+    def _consider(nid: str, node: Optional[dict]) -> None:
+        if not nid or nid in seen:
+            return
+        f = gl.loc(node)[0] if node is not None else None
+        if node is None or _is_nonproduct_path(f):
+            return  # a test/example handler is not a product lifecycle root
+        if primary_family is not None:
+            fam = _language_family(f)
+            if fam is not None and fam != primary_family:
+                return  # a non-primary-language handler (bundled JS in a Python repo)
+        seen.add(nid)
+        candidates.append((_reach2(index, nid), nid))
+
+    for hid in handler_ids:
+        _consider(hid, gl.nodes.get(hid) if hid else None)
+
     try:
         callable_nodes = list(index.nodes_of_kind("function", "method", "constructor"))
     except Exception:
@@ -748,41 +789,75 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int,
         except Exception:
             continue
         if inn == 0:
-            drivers.append((_reach2(index, nid), nid))
-    drivers.sort(key=lambda pair: (-pair[0], pair[1]))
-    for _, nid in drivers:
-        # An in-degree-0 root is often a thin WSGI/entry trampoline; descend to the
-        # real orchestrator it forwards to so the lifecycle is named at the dispatcher.
-        nid = _descend_trampoline(index, gl, nid, primary_family=primary_family)
-        if nid not in seen:
-            seen.add(nid)
-            roots.append(nid)
-    return roots[:cap]
+            # An in-degree-0 root is often a thin WSGI/entry trampoline (Flask.__call__,
+            # Click's BaseCommand.__call__); descend to the real orchestrator it forwards
+            # to *before* ranking, so the driver is ordered by the dispatcher's own
+            # control cone (Click's main reaches far more than its one-line __call__) and
+            # the lifecycle is named at the dispatcher rather than the forwarder.
+            driver = _descend_trampoline(index, gl, nid, primary_family=primary_family)
+            _consider(driver, gl.nodes.get(driver))
+
+    candidates.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [nid for _, nid in candidates][:cap]
 
 
-def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
-    """Linearize an execution story into (primary success spine, all functions).
+def _hop_semantics(via: str, branch: dict) -> dict:
+    """Per-hop reader facts from an execution-story step: how it is reached and
+    whether it decides. ``reached_via`` names the call-seam boundary (a direct call
+    vs a dynamic dispatch the graph resolved), and the branch summary flags a hop
+    that forks control -- the decision points a newcomer traces. All derived from
+    real story structure; absent facts are simply omitted so hops stay compact.
+    """
+    out: dict = {}
+    v = via or ""
+    if v == "entry":
+        out["reached_via"] = "entry"
+    elif v == "direct":
+        out["reached_via"] = "direct call"
+    elif v.startswith("indirect:"):
+        out["reached_via"] = f"dynamic dispatch ({v.split(':', 1)[1] or 'resolved'})"
+    elif v:
+        out["reached_via"] = v
+    count = branch.get("count") or 0
+    if count:
+        out["decides"] = True
+        out["branch_count"] = count
+        kinds = branch.get("kinds") or []
+        if kinds:
+            out["decision_kinds"] = kinds
+    return out
+
+
+def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str], dict]:
+    """Linearize an execution story into (primary success spine, all functions, meta).
 
     The story is a call tree keyed by (caller -> function). The spine walks from the
-    entry always choosing the deepest-subtree callee, deranking obvious error/
-    teardown branches, so it follows the happy path (a WSGI entry down through
+    entry always choosing the direct-edge, deepest-subtree callee, deranking obvious
+    error/teardown branches, so it follows the happy path (a WSGI entry down through
     dispatch to the response) rather than wandering into a handler. Every consecutive
     pair on the spine is a real edge the story observed; cycles are cut by ``seen``.
-    Returns the ordered spine node ids and the flat set of every function id the
-    story touched (the raw material for the architecture core).
+    Returns the ordered spine node ids, the flat set of every function id the story
+    touched (the raw material for the architecture core), and a per-spine-node
+    semantics map (how each hop is reached, whether it branches).
     """
     steps = story.get("steps") or []
     entry = (story.get("entry") or {}).get("node_id")
     if not entry:
-        return [], []
+        return [], [], {}
     children: dict[str, list[tuple[int, dict, str]]] = {}
     functions: dict[str, dict] = {}
+    branches: dict[str, dict] = {}
     for step in steps:
         fn = step.get("function") or {}
         fid = fn.get("node_id")
         if not fid:
             continue
         functions[fid] = fn
+        # Per-function control facts: how many decision points the body has and which
+        # control kinds -- surfaced on the hop as its decision signal.
+        rows = step.get("branches") or []
+        kinds = sorted({r.get("control") for r in rows if r.get("control")})
+        branches[fid] = {"count": step.get("branch_count") or 0, "kinds": kinds}
         caller = (step.get("caller") or {}).get("node_id")
         if caller:
             children.setdefault(caller, []).append(
@@ -809,6 +884,7 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
     spine = [entry]
     seen = {entry}
     cur = entry
+    meta: dict[str, dict] = {entry: _hop_semantics("entry", branches.get(entry) or {})}
     while len(spine) < max_hops:
         kids = [(fn, via)
                 for _, fn, via in sorted(children.get(cur, []), key=lambda t: t[0])
@@ -826,11 +902,12 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
             0 if _is_error_name(kv[0].get("name")) else 1,
             subtree(kv[0].get("node_id"), frozenset())))
         nid = pick[0].get("node_id")
+        meta[nid] = _hop_semantics(pick[1], branches.get(nid) or {})
         cur = nid
         seen.add(nid)
         spine.append(nid)
     ordered_functions = [fid for fid in functions if _story_fn_openable(functions[fid])]
-    return spine, ordered_functions
+    return spine, ordered_functions, meta
 
 
 def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], *,
@@ -856,7 +933,7 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
     except Exception:
         return requests, core
 
-    ranked: list[tuple[int, int, str, list[str], list[str]]] = []
+    ranked: list[tuple[int, int, int, int, str, list[str], list[str], dict]] = []
     for root in roots:
         try:
             story = _call("execution_story",
@@ -866,19 +943,33 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
             continue
         if not isinstance(story, dict):
             continue
-        spine, functions = _story_spine(story, max_hops=max_hops)
+        spine, functions, meta = _story_spine(story, max_hops=max_hops)
         if len(spine) < 2:
             continue
-        ranked.append((len(spine), len(functions), root, spine, functions))
+        # A peripheral root (a CLI command, a util helper) still yields a long, valid
+        # story, so ranking on spine length alone floats it above the web request path
+        # a reader opened the bundle to see. Demote by the root's module so the primary
+        # dispatch lifecycle leads; the peripheral path is kept, just not first.
+        root_file = gl.loc(gl.nodes.get(root))[0] if gl.nodes.get(root) else None
+        demote = 1 if _is_peripheral_module_path(root_file) else 0
+        # The dispatcher a reader wants first is the top-of-stack that drives the most
+        # code, not whichever helper happens to keep the longest in-library spine. The
+        # true lifecycle (Flask.wsgi_app, Click's Command.main -> invoke) exits to
+        # external user code quickly, so its openable spine is *short* even though its
+        # control cone is the widest; a string helper (secho -> echo -> isatty) stays
+        # in-library and spins a longer spine. Ranking by 2-hop reach first puts the
+        # real driver on top; spine length only breaks ties between comparable drivers.
+        reach = _reach2(index, root)
+        ranked.append((demote, -reach, len(spine), len(functions), root, spine, functions, meta))
 
-    # Deepest, then broadest, wins attention; stable by root id for reproducibility.
-    ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    # Primary lifecycles first (widest control cone), then deepest, then broadest.
+    ranked.sort(key=lambda row: (row[0], row[1], -row[2], -row[3], row[4]))
 
     node_ids = set(asm.nodes)
     covered: set[str] = set()
     core_ids: set[str] = set()
     used_ids: set[str] = set()
-    for _, _, root, spine, functions in ranked:
+    for _, _, _, _, root, spine, functions, meta in ranked:
         if len(requests) >= max_requests:
             break
         if root in covered:  # a redundant suffix of a spine already shown
@@ -891,7 +982,9 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
                 continue
             asm.add_node(_norm_node(gl, node), default_kind="function")
             node_ids.add(nid)
-            hops.append({"node_id": nid, "caption": gl.label(node)})
+            hop = {"node_id": nid, "caption": gl.label(node)}
+            hop.update(meta.get(nid) or {})
+            hops.append(hop)
             chain_ids.append(nid)
         if len(hops) < 2:
             continue
@@ -1352,6 +1445,12 @@ def _finalize_requests(raw_requests: list[dict], node_map: dict,
             nid = hop.get("node_id")
             entry = {"id": f"{rid}:{i:02d}", "node_id": nid,
                      "caption": hop.get("caption")}
+            # Carry the story-derived hop semantics (how this hop is reached, whether
+            # it forks control) through decoration so a reader sees the call-seam and
+            # decision points, not just an ordered list of names.
+            for key in ("reached_via", "decides", "branch_count", "decision_kinds"):
+                if hop.get(key) is not None:
+                    entry[key] = hop[key]
             if i > 1:
                 entry["edge_label"] = _edge_label(
                     edges_by_pair, hops[i - 2].get("node_id"), nid)
