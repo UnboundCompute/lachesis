@@ -31,6 +31,24 @@ class ClassifierTests(unittest.TestCase):
                      "src/foo_test.py", "a/thing.spec.ts", "a/thing.test.js"):
             self.assertTrue(config.is_nonproduct(path), path)
 
+    def test_drops_vendored_generated_and_build_config(self):
+        # Dependencies, generated output, and build configs are not product source;
+        # a graph over an application has no business modelling them. Language-agnostic,
+        # so one rule covers Python/TS/JS/C at once.
+        for path in ("dist/bundle.js", "scripts/check-dist-rules.py",
+                     "lib/parser.min.js", "assets/app.min.css",
+                     "lib/stringify.d.ts", "types/index.d.ts",
+                     "rollup.config.js", "webpack.config.ts", "vite.config.mjs",
+                     "jest.config.cjs"):
+            self.assertTrue(config.is_nonproduct(path), path)
+
+    def test_generated_patterns_do_not_over_match_product(self):
+        # A normal ``.ts`` module, a bare ``config.js`` (no ``<name>.config.js``
+        # shape), and a product module under ``distributed/`` must all survive.
+        for path in ("src/reader.ts", "lib/config.js", "src/distributed/queue.py",
+                     "src/scripting/engine.py"):
+            self.assertFalse(config.is_nonproduct(path), path)
+
 
 class GlobTests(unittest.TestCase):
     def test_bare_segment_matches_anywhere(self):

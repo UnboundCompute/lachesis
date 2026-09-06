@@ -598,7 +598,63 @@ def _reach2(index, node_id: str) -> int:
     return len(total)
 
 
-def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int) -> list[str]:
+# Source-extension -> coarse language family. JavaScript and TypeScript are one
+# family (the same web frontend, the same event/handler surface); the C headers
+# and sources are one family. Used only to answer "what language is this repo
+# primarily", so the grouping is deliberately coarse.
+_LANG_BY_EXT = {
+    "py": "python", "pyi": "python", "pyx": "python",
+    "js": "web", "jsx": "web", "mjs": "web", "cjs": "web",
+    "ts": "web", "tsx": "web", "mts": "web", "cts": "web",
+    "c": "c", "h": "c", "cc": "c", "cpp": "c", "cxx": "c",
+    "hpp": "c", "hh": "c", "hxx": "c",
+}
+
+
+def _language_family(path: Optional[str]) -> Optional[str]:
+    """The coarse language family of a source path, or None if unrecognised."""
+    if not isinstance(path, str):
+        return None
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in base:
+        return None
+    return _LANG_BY_EXT.get(base.rsplit(".", 1)[-1].lower())
+
+
+def _primary_language_family(index, gl) -> Optional[str]:
+    """The dominant product-source language family of the graph, or None.
+
+    Counts product (non-scaffolding) source files by family and returns the family
+    that is a strict majority. A repo with no clear majority — a genuinely polyglot
+    tree — returns None, which disables the language gate so nothing is dropped.
+
+    This is the notion the entrypoint and request-lifecycle selection was missing:
+    on a multi-language repository (a Python framework that ships bundled JavaScript
+    admin widgets under ``static/``) the JS event handlers otherwise fill every
+    featured slot, so a newcomer sees a JS widget toolkit instead of the Python
+    request path. The gate keeps the projection in the language the repo actually is.
+    """
+    counts: dict[str, int] = {}
+    try:
+        for node in index.nodes_of_kind("file"):
+            f = gl.loc(node)[0] or gl.prop(node, "file")
+            if not f or _is_nonproduct_path(f):
+                continue
+            fam = _language_family(f)
+            if fam:
+                counts[fam] = counts.get(fam, 0) + 1
+    except Exception:
+        return None
+    if not counts:
+        return None
+    top = max(counts, key=lambda k: counts[k])
+    if counts[top] * 2 <= sum(counts.values()):
+        return None  # no strict majority -> polyglot -> do not gate
+    return top
+
+
+def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int,
+                     primary_family: Optional[str] = None) -> list[str]:
     """Candidate roots for request-lifecycle stories, best driver first.
 
     Two sources, deduped in priority order: the planner's entry handlers (already
@@ -617,6 +673,10 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int) -> list[str
             node = gl.nodes.get(hid)
             if node is not None and _is_nonproduct_path(gl.loc(node)[0]):
                 continue  # a test/example handler is not a product lifecycle root
+            if node is not None and primary_family is not None:
+                fam = _language_family(gl.loc(node)[0])
+                if fam is not None and fam != primary_family:
+                    continue  # a non-primary-language handler (bundled JS in a Python repo)
             roots.append(hid)
 
     drivers: list[tuple[int, str]] = []
@@ -635,6 +695,12 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int) -> list[str
         # ranks as a top-of-stack driver on a graph built without build-time exclusion.
         if _is_nonproduct_path(f):
             continue
+        # ...and never a non-primary-language driver: a bundled JS handler in a
+        # Python repo is in-degree-0 too, but it is not this repo's request path.
+        if primary_family is not None:
+            fam = _language_family(f)
+            if fam is not None and fam != primary_family:
+                continue
         try:
             out = sum(1 for _ in index.targets(nid, *_CALL_EDGE_KINDS))
             if out < 1:
@@ -718,7 +784,8 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
 
 def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], *,
                           max_requests: int, max_core: int,
-                          max_hops: int) -> tuple[list[dict], list[dict]]:
+                          max_hops: int,
+                          primary_family: Optional[str] = None) -> tuple[list[dict], list[dict]]:
     """Request lifecycles and the architecture core, from bounded execution stories.
 
     Runs a bounded forward execution story from each candidate driver (see
@@ -733,7 +800,8 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
     requests: list[dict] = []
     core: list[dict] = []
     try:
-        roots = _lifecycle_roots(index, gl, handler_ids, cap=30)
+        roots = _lifecycle_roots(index, gl, handler_ids, cap=30,
+                                 primary_family=primary_family)
     except Exception:
         return requests, core
 
@@ -837,6 +905,12 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         return empty
 
+    # The repo's dominant product language. A multi-language tree (a Python framework
+    # that bundles JavaScript admin widgets) otherwise features the wrong language:
+    # its JS event handlers rank as entrypoints and fill every request flow. Gating to
+    # the primary family keeps the projection in the language the repo actually is.
+    primary_family = _primary_language_family(index, gl)
+
     entrypoints: list[dict] = []
     requests: list[dict] = []
     try:
@@ -863,6 +937,12 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
             # ...and it must be product code -- never a test/example handler.
             if _is_nonproduct_path(nfile):
                 continue
+            # ...and in the repo's primary language -- never a bundled JS admin
+            # widget standing in for the request path of a Python framework.
+            if primary_family is not None:
+                fam = _language_family(nfile)
+                if fam is not None and fam != primary_family:
+                    continue
             asm.add_node(_norm_node(gl, node), default_kind="function")
             how = anchor.get("how")
             label = gl.label(node)
@@ -894,7 +974,8 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     handler_ids = [entry["node_id"] for entry in entrypoints]
     requests, core = _lifecycle_projection(
         asm, index, gl, handler_ids,
-        max_requests=8, max_core=32, max_hops=max(2, chain_depth))
+        max_requests=8, max_core=32, max_hops=max(2, chain_depth),
+        primary_family=primary_family)
 
     files: list[dict] = []
     try:
@@ -915,7 +996,12 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     try:
         architecture = comp.architecture_map(max_communities=8, max_files_per_community=20)
         for idx, community in enumerate(architecture.get("communities") or []):
-            paths = [str(path) for path in community.get("files") or [] if path]
+            # Filter non-product files *before* deriving the label and file set: a
+            # community that mixes json5's ``lib/*.js`` with the vendored TypeScript
+            # compiler under ``node_modules`` must be labelled ``lib``, not
+            # ``… · node_modules · typescript · lib`` off the first (vendored) path.
+            paths = [str(path) for path in community.get("files") or []
+                     if path and not _is_nonproduct_path(str(path))]
             if not paths:
                 continue
             first = paths[0]
@@ -1206,6 +1292,11 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
         f = node.get("file")
         if not isinstance(f, str) or not f.strip():
             continue
+        # Non-product files (tests, docs, examples, vendored deps, generated output)
+        # must not surface as modules a reader is invited to explore. The same gate the
+        # entrypoint/request selection uses, applied to the module partition.
+        if _is_nonproduct_path(f):
+            continue
         module_name = _dotted_module(f) or f
         node["module"] = module_name
         groups.setdefault(f, []).append(node["id"])
@@ -1227,12 +1318,23 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
 
 
 def _project_concepts(raw_concepts: list[dict], nodes: list[dict]) -> list[dict]:
-    """Keep architecture concepts honest to the final included node pool."""
+    """Keep architecture concepts honest to the final included node pool.
+
+    A concept is dropped entirely when every file it spans is non-product, and its
+    node set is restricted to product files, so a vendored dependency
+    (``node_modules · typescript · lib``), a build config (``rollup.config.js``), or a
+    docs/scripts tree never surfaces as an architecture concept — even on a graph
+    built without build-time exclusion.
+    """
     out: list[dict] = []
     for concept in raw_concepts or []:
-        paths = {str(path) for path in concept.get("file_paths") or [] if path}
+        paths = {str(path) for path in concept.get("file_paths") or [] if path
+                 and not _is_nonproduct_path(str(path))}
+        if not paths:
+            continue
         node_ids = [node["id"] for node in nodes
-                    if isinstance(node.get("file"), str) and node.get("file") in paths]
+                    if isinstance(node.get("file"), str) and node.get("file") in paths
+                    and not _is_nonproduct_path(node.get("file"))]
         if not node_ids:
             continue
         out.append({

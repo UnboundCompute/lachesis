@@ -45,11 +45,26 @@ CONFIG_FILENAMES = ("lachesis.yml", "lachesis.yaml", ".lachesis.yml", ".lachesis
 
 # The built-in "non-product" exclusion set. A path is non-product when any of its
 # directory segments is one of these scaffolding names, or when its basename is a
-# test module. Matching is on path *segments* and basenames, never on substrings,
-# so product files whose name merely contains a keyword — ``testing.py``,
+# test module, a vendored dependency, a generated/minified artifact, or a build
+# config. Matching is on path *segments* and basenames, never on substrings, so
+# product files whose name merely contains a keyword — ``testing.py``,
 # ``templating.py``, ``documentation.py`` — are kept. Validated against the pallets
 # /flask tree: of 83 .py files it drops exactly the 41 tests + 17 examples + 1 doc
 # and keeps all 24 ``src/flask`` modules.
+#
+# The set is deliberately language-agnostic — it classifies *paths*, so one rule
+# covers Python, TypeScript, JavaScript and C at once. It is the same default a
+# review confirmed the graph itself must honor (not only the bundle export): a
+# code-property graph over an application has no business modelling a vendored
+# dependency, a build output tree, or a generated bundle — a bug found inside one
+# is not actionable in the analysed repo, and the noise drowns the product signal
+# for comprehension and for security triage alike. Dependencies (``node_modules``,
+# ``vendor``, ``third_party``, ``site-packages``), build/CI tooling (``scripts``),
+# generated output (``dist``), minified/declaration/build-config artifacts
+# (``*.min.js``, ``*.d.ts``, ``*.config.js``) are therefore all dropped by default.
+# Any of it is recoverable with an explicit ``build.include`` allow-list or by
+# clearing ``build.exclude`` — the opt-in escape hatch for deliberately auditing a
+# dependency.
 #
 # Kept as a single compiled regex (rather than a glob list) because it is the
 # default applied on every build and both the builder and the exporter consult
@@ -63,11 +78,18 @@ _NONPRODUCT_SEGMENTS = (
     r"fixtures?", r"testdata", r"test[_-]?data", r"__mocks__", r"mocks",
     r"vendor", r"vendored", r"third[_-]?party", r"node_modules", r"site-packages",
     r"\.tox", r"\.nox", r"\.venv", r"venv",
+    r"dist", r"scripts",
 )
 _NONPRODUCT_BASENAMES = (
     r"conftest\.py",
     r"test_[^/]*\.py", r"[^/]*_test\.py",
     r"[^/]*\.spec\.[a-z]+", r"[^/]*\.test\.[a-z]+",
+    # Generated / vendored / build-config artifacts: a minified bundle, a
+    # TypeScript declaration file, and the common ``*.config.js`` build configs
+    # (rollup/webpack/vite/babel/jest/…) are outputs and scaffolding, not source.
+    r"[^/]*\.min\.[a-z0-9]+",
+    r"[^/]*\.d\.ts",
+    r"[^/]*\.config\.(?:js|cjs|mjs|ts)",
 )
 NONPRODUCT_RE = re.compile(
     r"(?:^|/)(?:" + "|".join(_NONPRODUCT_SEGMENTS) + r")(?:/|$)"
