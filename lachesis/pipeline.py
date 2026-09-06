@@ -4,7 +4,10 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from .config import PathFilter
 
 from .core.contract import ContractError as FrontendError, FrontendSnapshot
 from .core.composition import _EdgeKeys
@@ -101,12 +104,21 @@ def source_inventory(
     source_dir: str,
     include_tests: bool = True,
     include_paths: Sequence[str] = (),
+    path_filter: Optional["PathFilter"] = None,
 ) -> List[str]:
     """Discover every supported source file, including tests and specifications.
 
     Complete compiler coverage is the default: a function must not disappear merely
     because its path looks like a test. Callers that explicitly need a production-only
     inventory may still pass ``include_tests=False``.
+
+    ``path_filter`` is the general form of that opt-out. When supplied (the CLI resolves
+    one from ``lachesis.yml``, whose built-in default excludes tests, examples, docs,
+    fixtures, benchmarks and vendored trees), a walked file is dropped when the filter
+    reports its repo-relative path as excluded. It never vetoes an *explicitly named*
+    ``include_paths`` file — the guided-scope guarantee that a deliberately scoped file
+    is always analysed outranks the exclusion default — but it does apply while walking
+    an explicitly named ``include_paths`` *directory*, matching the main walk.
 
     ``include_paths`` names extra files or directories to fold into the inventory even
     when they lie *outside* ``source_dir``. This is the guided-scope guarantee: when a
@@ -179,6 +191,13 @@ def source_inventory(
                         continue
                 if is_test is not None and is_test(path):
                     continue
+                if path_filter is not None:
+                    # Match on the repo-relative, forward-slashed display form so the
+                    # decision is independent of where the tree lives on disk and lines
+                    # up with the ``display_path`` the frontend later records.
+                    rel = os.path.relpath(path, containment_root)
+                    if path_filter.excluded(rel):
+                        continue
                 collected.append(path)
         return collected
 
@@ -260,6 +279,7 @@ def run_project(
     include_paths: Sequence[str] = (),
     *,
     enrich: bool = False,
+    path_filter: Optional["PathFilter"] = None,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
     """Run selected frontends and compose the canonical core graph.
 
@@ -276,7 +296,8 @@ def run_project(
     source_dir = os.path.abspath(source_dir)
     registry = registry or default_registry()
     groups = registry.partition(
-        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
+        source_inventory(source_dir, include_tests=include_tests,
+                         include_paths=include_paths, path_filter=path_filter))
     snapshots = []
     for frontend_id in sorted(groups):
         frontend = registry.get(frontend_id)
@@ -342,6 +363,7 @@ def run_project_streaming(
     timeout_seconds: int = 300,
     include_tests: bool = True,
     include_paths: Sequence[str] = (),
+    path_filter: Optional["PathFilter"] = None,
 ):
     """Run frontends one at a time and return shard readers plus metadata.
 
@@ -355,7 +377,8 @@ def run_project_streaming(
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry()
     groups = registry.partition(
-        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
+        source_inventory(source_dir, include_tests=include_tests,
+                         include_paths=include_paths, path_filter=path_filter))
     snapshots = []
     readers = []
     from .resources import c_chunk_files, frontend_jobs as configured_frontend_jobs
@@ -438,6 +461,7 @@ def run_project_streaming_parallel(
     *,
     max_files_per_package: Optional[int] = None,
     workspace_root: Optional[str] = None,
+    path_filter: Optional["PathFilter"] = None,
 ):
     """Stream package/shard compiler jobs without composing their snapshots.
 
@@ -454,11 +478,13 @@ def run_project_streaming_parallel(
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry(workspace_root)
     packages = detect_packages(
-        source_dir, source_inventory(source_dir, include_tests=include_tests),
+        source_dir,
+        source_inventory(source_dir, include_tests=include_tests, path_filter=path_filter),
     )
     packages = split_large_packages(source_dir, packages, max_files_per_package)
     jobs = package_jobs(source_dir, output_root, registry,
-                        include_tests=include_tests, packages=packages)
+                        include_tests=include_tests, packages=packages,
+                        path_filter=path_filter)
     if not jobs:
         supported = sorted({
             extension for item in registry.frontends for extension in item.extensions
@@ -553,6 +579,7 @@ def source_content_hash(
     source_dir: str,
     include_tests: bool = True,
     include_paths: Sequence[str] = (),
+    path_filter: Optional["PathFilter"] = None,
 ) -> str:
     """One digest over every source file a build of ``source_dir`` would see.
 
@@ -564,7 +591,8 @@ def source_content_hash(
     unchanged content keeps the cache, and a restored older file loses it.
     """
     digests = _group_digests(
-        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths),
+        source_inventory(source_dir, include_tests=include_tests,
+                         include_paths=include_paths, path_filter=path_filter),
         os.path.abspath(source_dir))
     digest = hashlib.sha256()
     for path in sorted(digests):
@@ -658,6 +686,7 @@ def run_project_incremental(
     include_paths: Sequence[str] = (),
     *,
     enrich: bool = True,
+    path_filter: Optional["PathFilter"] = None,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot]]:
     """Like ``run_project`` but reuse a frontend's prior on-disk bundle when none of
     its source files changed, recompiling only the frontends that did.
@@ -674,7 +703,8 @@ def run_project_incremental(
     registry = registry or default_registry()
     manifest_path = manifest_path or default_manifest_path(output_root)
     groups = registry.partition(
-        source_inventory(source_dir, include_tests=include_tests, include_paths=include_paths))
+        source_inventory(source_dir, include_tests=include_tests,
+                         include_paths=include_paths, path_filter=path_filter))
     prior = _load_manifest(manifest_path)
 
     snapshots: List[FrontendSnapshot] = []
@@ -735,6 +765,7 @@ def package_jobs(
     registry: FrontendRegistry,
     include_tests: bool = True,
     packages: Optional[Dict[str, List[str]]] = None,
+    path_filter: Optional["PathFilter"] = None,
 ) -> List[Tuple[str, str, str, str, List[str]]]:
     """The (frontend_id, package, compile_root, output_dir, roots) units of a build.
 
@@ -753,7 +784,8 @@ def package_jobs(
     output_root = os.path.abspath(output_root)
     if packages is None:
         packages = detect_packages(
-            source_dir, source_inventory(source_dir, include_tests=include_tests),
+            source_dir,
+            source_inventory(source_dir, include_tests=include_tests, path_filter=path_filter),
         )
     jobs = []
     for (frontend_id, package), roots in registry.partition_by_package(packages).items():
@@ -862,6 +894,7 @@ def run_project_parallel(
     max_workers: Optional[int] = None,
     max_files_per_package: Optional[int] = None,
     workspace_root: Optional[str] = None,
+    path_filter: Optional["PathFilter"] = None,
 ) -> Tuple[CodeGraph, List[FrontendSnapshot], int]:
     """Compile each (frontend, package) unit in its own process, then compose.
 
@@ -888,11 +921,13 @@ def run_project_parallel(
     output_root = os.path.abspath(output_root)
     registry = registry or default_registry(workspace_root)
     packages = detect_packages(
-        source_dir, source_inventory(source_dir, include_tests=include_tests),
+        source_dir,
+        source_inventory(source_dir, include_tests=include_tests, path_filter=path_filter),
     )
     packages = split_large_packages(source_dir, packages, max_files_per_package)
     jobs = package_jobs(source_dir, output_root, registry,
-                        include_tests=include_tests, packages=packages)
+                        include_tests=include_tests, packages=packages,
+                        path_filter=path_filter)
     if not jobs:
         supported = sorted({
             extension for item in registry.frontends for extension in item.extensions

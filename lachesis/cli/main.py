@@ -676,6 +676,10 @@ def command_build(args: argparse.Namespace) -> int:
         forwarded.extend(["--stream-shards", args.stream_shards])
     for included in getattr(args, "include_paths", None) or []:
         forwarded.extend(["--include", included])
+    if getattr(args, "config", None):
+        forwarded.extend(["--config", args.config])
+    if getattr(args, "all_sources", False):
+        forwarded.append("--all-sources")
     return analyze.main(forwarded)
 
 
@@ -966,6 +970,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="also analyse this file or directory even if it is outside "
                             "source_dir (repeatable); point it at an advisory's file so a "
                             "narrowed scope never excludes the file the run must reach")
+    build.add_argument("--config", metavar="FILE", default=None,
+                       help="lachesis.yml to control this build (default: search upward "
+                            "from source_dir). Its built-in default excludes tests, "
+                            "examples, docs, fixtures, benchmarks and vendored trees.")
+    build.add_argument("--all-sources", action="store_true",
+                       help="compile the whole tree, including tests/examples/docs/vendor "
+                            "(disables the non-product exclusion; wins over any config)")
     build.set_defaults(handler=command_build, no_prune=False)
 
     trace = subcommands.add_parser(
