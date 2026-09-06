@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -523,38 +524,264 @@ def _norm_node(gl, node: dict) -> dict:
             "kind": gl.kind(node.get("id")), "file": file, "line": line}
 
 
-def _call_chain(index, gl, start_id: str, depth: int) -> list[str]:
-    """A single deterministic CALLS chain out of ``start_id`` (source order).
+# The request lifecycle a reader wants is the *success* path; error, teardown and
+# logging branches are real but secondary, so we only derank them when choosing the
+# primary hop -- never drop them. Substring match keeps this language-agnostic.
+_LIFECYCLE_ERROR_TOKENS = (
+    "exception", "error", "teardown", "cleanup", "abort", "log_",
+    "handle_http", "raise_", "rollback", "finalize_request",
+)
+_CALL_EDGE_KINDS = ("CALLS", "INVOKES", "MAY_INVOKE")
 
-    At each hop we descend into the callee that itself calls the most -- the branch
-    most likely to keep telling the request's story -- breaking ties by label so the
-    walk is reproducible. Cycles are cut by the visited set; a leaf ends the chain.
-    This invents no ordering: every consecutive pair is a real ``CALLS`` edge.
+
+def _is_error_name(name: Optional[str]) -> bool:
+    n = str(name or "").lower()
+    return any(tok in n for tok in _LIFECYCLE_ERROR_TOKENS)
+
+
+def _story_fn_openable(fn: dict) -> bool:
+    """A story step a reader can open: a real product file and a positive line.
+
+    ``execution_story`` reports unresolved/external callees with a null file; those
+    are honest frontier markers, never places to root or continue a lifecycle spine.
     """
-    chain = [start_id]
-    seen = {start_id}
-    cur = start_id
-    for _ in range(max(0, depth - 1)):
-        nxt: list[dict] = []
+    line = fn.get("line")
+    return bool(fn.get("file")) and isinstance(line, int) and line > 0
+
+
+def _reach2(index, node_id: str) -> int:
+    """Distinct callees within two CALLS hops -- a cheap 'does this drive control?'.
+
+    An orchestration root (a WSGI ``__call__``, a CLI ``main``) fans out into a
+    broad two-hop cone; a leaf utility barely moves. Ranking candidate roots by this
+    before paying for a full execution story elevates the real lifecycles without
+    naming any framework. Bounded by the graph's own fan-out, so it stays cheap.
+    """
+    try:
+        one = {t.get("id") for t in index.targets(node_id, *_CALL_EDGE_KINDS)
+               if t.get("id")}
+    except Exception:
+        return 0
+    total = set(one)
+    for mid in one:
         try:
-            nxt = [n for n in index.targets(cur, "CALLS")
-                   if n.get("id") and n["id"] not in seen]
+            total.update(t.get("id") for t in index.targets(mid, *_CALL_EDGE_KINDS)
+                         if t.get("id"))
         except Exception:
-            break
-        if not nxt:
-            break
+            continue
+    total.discard(node_id)
+    return len(total)
 
-        def out_degree(node: dict) -> int:
+
+def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int) -> list[str]:
+    """Candidate roots for request-lifecycle stories, best driver first.
+
+    Two sources, deduped in priority order: the planner's entry handlers (already
+    ranked upstream), then every product callable that nothing else in the product
+    calls -- an in-degree-0 top-of-stack (a WSGI ``__call__``, an event loop, a
+    public API orchestrator). The in-degree-0 set is ordered by two-hop reach so the
+    orchestration roots precede the many leaf helpers that also happen to be
+    uncalled once tests are excluded. Truncated to ``cap`` so the story pass is
+    bounded regardless of codebase size.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+    for hid in handler_ids:
+        if hid and hid not in seen:
+            seen.add(hid)
+            roots.append(hid)
+
+    drivers: list[tuple[int, str]] = []
+    try:
+        callable_nodes = list(index.nodes_of_kind("function", "method", "constructor"))
+    except Exception:
+        callable_nodes = []
+    for node in callable_nodes:
+        nid = node.get("id")
+        if not nid or nid in seen:
+            continue
+        f, l = gl.loc(node)[0], gl.loc(node)[1]
+        if not f or not isinstance(l, int) or l <= 0:
+            continue
+        try:
+            out = sum(1 for _ in index.targets(nid, *_CALL_EDGE_KINDS))
+            if out < 1:
+                continue
+            inn = sum(1 for _ in index.sources(nid, *_CALL_EDGE_KINDS))
+        except Exception:
+            continue
+        if inn == 0:
+            drivers.append((_reach2(index, nid), nid))
+    drivers.sort(key=lambda pair: (-pair[0], pair[1]))
+    for _, nid in drivers:
+        if nid not in seen:
+            seen.add(nid)
+            roots.append(nid)
+    return roots[:cap]
+
+
+def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
+    """Linearize an execution story into (primary success spine, all functions).
+
+    The story is a call tree keyed by (caller -> function). The spine walks from the
+    entry always choosing the deepest-subtree callee, deranking obvious error/
+    teardown branches, so it follows the happy path (a WSGI entry down through
+    dispatch to the response) rather than wandering into a handler. Every consecutive
+    pair on the spine is a real edge the story observed; cycles are cut by ``seen``.
+    Returns the ordered spine node ids and the flat set of every function id the
+    story touched (the raw material for the architecture core).
+    """
+    steps = story.get("steps") or []
+    entry = (story.get("entry") or {}).get("node_id")
+    if not entry:
+        return [], []
+    children: dict[str, list[tuple[int, dict]]] = {}
+    functions: dict[str, dict] = {}
+    for step in steps:
+        fn = step.get("function") or {}
+        fid = fn.get("node_id")
+        if not fid:
+            continue
+        functions[fid] = fn
+        caller = (step.get("caller") or {}).get("node_id")
+        if caller:
+            children.setdefault(caller, []).append((step.get("sequence", 0), fn))
+
+    memo: dict[str, int] = {}
+
+    def subtree(nid: str, guard: frozenset) -> int:
+        if nid in memo:
+            return memo[nid]
+        if nid in guard:
+            return 0
+        deeper = guard | {nid}
+        total = 0
+        for _, fn in children.get(nid, []):
+            cid = fn.get("node_id")
+            if cid:
+                total += 1 + subtree(cid, deeper)
+        # Only cache when no guard cycle influenced the count (guard was the path
+        # to nid); good enough as a heuristic ranker and keeps the walk bounded.
+        memo[nid] = total
+        return total
+
+    spine = [entry]
+    seen = {entry}
+    cur = entry
+    while len(spine) < max_hops:
+        kids = [fn for _, fn in sorted(children.get(cur, []), key=lambda pair: pair[0])
+                if fn.get("node_id") not in seen and _story_fn_openable(fn)]
+        if not kids:
+            break
+        pick = max(kids, key=lambda fn: (
+            0 if _is_error_name(fn.get("name")) else 1,
+            subtree(fn.get("node_id"), frozenset())))
+        nid = pick.get("node_id")
+        cur = nid
+        seen.add(nid)
+        spine.append(nid)
+    ordered_functions = [fid for fid in functions if _story_fn_openable(functions[fid])]
+    return spine, ordered_functions
+
+
+def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], *,
+                          max_requests: int, max_core: int,
+                          max_hops: int) -> tuple[list[dict], list[dict]]:
+    """Request lifecycles and the architecture core, from bounded execution stories.
+
+    Runs a bounded forward execution story from each candidate driver (see
+    ``_lifecycle_roots``), ranks them by how much real control each covers (spine
+    length, then breadth), and keeps the deepest few as guided request paths -- each
+    the success spine of one story, every consecutive hop a real observed edge. A
+    shallower story whose root already sits inside a kept spine is skipped, so we do
+    not emit both ``__call__ -> wsgi_app -> ...`` and its ``wsgi_app -> ...`` suffix.
+    The union of every kept story's functions, bounded, becomes the core spine a
+    newcomer reads first. Best-effort: any failure yields empty lists, never raises.
+    """
+    requests: list[dict] = []
+    core: list[dict] = []
+    try:
+        roots = _lifecycle_roots(index, gl, handler_ids, cap=30)
+    except Exception:
+        return requests, core
+
+    ranked: list[tuple[int, int, str, list[str], list[str]]] = []
+    for root in roots:
+        try:
+            story = _call("execution_story",
+                          {"entry": root, "max_depth": max_hops + 2,
+                           "max_steps": 120, "format": "json"})
+        except Exception:
+            continue
+        if not isinstance(story, dict):
+            continue
+        spine, functions = _story_spine(story, max_hops=max_hops)
+        if len(spine) < 2:
+            continue
+        ranked.append((len(spine), len(functions), root, spine, functions))
+
+    # Deepest, then broadest, wins attention; stable by root id for reproducibility.
+    ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
+
+    node_ids = set(asm.nodes)
+    covered: set[str] = set()
+    core_ids: set[str] = set()
+    used_ids: set[str] = set()
+    for _, _, root, spine, functions in ranked:
+        if len(requests) >= max_requests:
+            break
+        if root in covered:  # a redundant suffix of a spine already shown
+            continue
+        hops: list[dict] = []
+        chain_ids: list[str] = []
+        for nid in spine:
+            node = gl.nodes.get(nid)
+            if node is None:
+                continue
+            asm.add_node(_norm_node(gl, node), default_kind="function")
+            node_ids.add(nid)
+            hops.append({"node_id": nid, "caption": gl.label(node)})
+            chain_ids.append(nid)
+        if len(hops) < 2:
+            continue
+        for a, b in zip(chain_ids, chain_ids[1:]):
+            asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, node_ids)
+        covered.update(chain_ids)
+        root_label = gl.label(gl.nodes.get(root)) or "entry"
+        rid = f"request.{_slug(root_label)}"
+        if rid in used_ids:
+            rid = f"{rid}.{_slug(root)}"
+        used_ids.add(rid)
+        requests.append({
+            "id": rid,
+            "kind": "call-path",
+            "description": f"Request lifecycle from {root_label} through "
+                           f"{len(hops) - 1} call(s).",
+            "entry_node": root,
+            "hops": hops,
+        })
+        # The architecture core draws from every kept story's functions, spine first.
+        for nid in [*chain_ids, *(f for f in functions if f not in chain_ids)]:
+            if len(core_ids) >= max_core:
+                break
+            if nid in core_ids:
+                continue
+            node = gl.nodes.get(nid)
+            if node is None:
+                continue
+            f, l = gl.loc(node)[0], gl.loc(node)[1]
+            if not f or not isinstance(l, int) or l <= 0:
+                continue
+            asm.add_node(_norm_node(gl, node), default_kind="function")
+            node_ids.add(nid)
             try:
-                return len(index.targets(node["id"], "CALLS"))
+                degree = sum(1 for _ in index.targets(nid, *_CALL_EDGE_KINDS))
             except Exception:
-                return 0
-
-        pick = min(nxt, key=lambda n: (-out_degree(n), gl.label(n), n["id"]))
-        cur = pick["id"]
-        seen.add(cur)
-        chain.append(cur)
-    return chain
+                degree = 0
+            core.append({"node_id": nid, "label": gl.label(node),
+                         "file": f, "line": l, "degree": degree})
+            core_ids.add(nid)
+    return requests, core
 
 
 def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
@@ -618,32 +845,19 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                 "file": efile,
                 "line": nline,
             })
-
-            # A guided path is only worth showing when it actually goes somewhere:
-            # the real CALLS chain out of the entry must have more than the entry.
-            chain = _call_chain(index, gl, handler_id, chain_depth)
-            if len(chain) < 2:
-                continue
-            hops = []
-            for nid in chain:
-                cnode = gl.nodes.get(nid)
-                if cnode is None:
-                    continue
-                asm.add_node(_norm_node(gl, cnode), default_kind="function")
-                hops.append({"node_id": nid, "caption": gl.label(cnode)})
-            for a, b in zip(chain, chain[1:]):
-                asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, set(asm.nodes))
-            if len(hops) >= 2:
-                requests.append({
-                    "id": f"request.{_slug(label)}",
-                    "kind": "call-path",
-                    "description": f"Follow control from {label} through "
-                                   f"{len(hops) - 1} call(s).",
-                    "entry_node": handler_id,
-                    "hops": hops,
-                })
     except Exception:
         pass
+
+    # Guided request paths are no longer a greedy CALLS walk out of each exported
+    # symbol -- that surfaced leaf utilities (render_template) and never the request
+    # lifecycle. Instead root them at the real top-of-stack drivers and follow the
+    # success spine of each one's bounded execution story (wsgi __call__ -> wsgi_app
+    # -> full_dispatch_request -> dispatch_request -> ...). The same stories yield the
+    # architecture core, so both are built together below.
+    handler_ids = [entry["node_id"] for entry in entrypoints]
+    requests, core = _lifecycle_projection(
+        asm, index, gl, handler_ids,
+        max_requests=8, max_core=32, max_hops=max(2, chain_depth))
 
     files: list[dict] = []
     try:
@@ -663,7 +877,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     concepts: list[dict] = []
     try:
         architecture = comp.architecture_map(max_communities=8, max_files_per_community=20)
-        for index, community in enumerate(architecture.get("communities") or []):
+        for idx, community in enumerate(architecture.get("communities") or []):
             paths = [str(path) for path in community.get("files") or [] if path]
             if not paths:
                 continue
@@ -673,61 +887,13 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                 directory = directory[4:]
             label = directory.replace("/", " · ") or first
             concepts.append({
-                "id": f"concept.{_slug(community.get('id') or index)}",
+                "id": f"concept.{_slug(community.get('id') or idx)}",
                 "label": label,
                 "description": f"Connected code area spanning {len(paths)} file(s).",
                 "file_paths": paths,
             })
     except Exception:
         concepts = []
-
-    # Add a small, source-backed architecture spine to the shared node pool. This
-    # is intentionally independent from security candidates: a newcomer needs the
-    # central control path even when no finding happens to touch it. Hubs ranks real
-    # call-graph declarations, and the walk below adds only real CALLS edges.
-    core: list[dict] = []
-    try:
-        from lachesis.nav.hubs import Hubs
-        hubs = Hubs(gl, resolved_only=True).top(8)
-        core_ids: set[str] = set()
-        for hub in hubs:
-            hub_id = hub.get("node_id")
-            node = gl.nodes.get(hub_id)
-            if node is None:
-                continue
-            hub_file, hub_line, _ = gl.loc(node)
-            if (not hub_file or not isinstance(hub_line, int) or hub_line <= 0
-                    or re.search(r"(?:^|/)(?:tests?|examples?|fixtures?|benchmarks?|docs?)(?:/|$)",
-                                 str(hub_file), re.IGNORECASE)):
-                continue
-            chain = _call_chain(index, gl, hub_id, 4)
-            chain_nodes = [gl.nodes.get(nid) for nid in chain]
-            # Do not remove a middle hop and then connect its neighbors: that
-            # would turn a real multi-hop walk into an invented relationship.
-            if any(
-                cnode is None
-                or not gl.loc(cnode)[0]
-                or not isinstance(gl.loc(cnode)[1], int)
-                or gl.loc(cnode)[1] <= 0
-                or re.search(r"(?:^|/)(?:tests?|examples?|fixtures?|benchmarks?|docs?)(?:/|$)",
-                             str(gl.loc(cnode)[0]), re.IGNORECASE)
-                for cnode in chain_nodes
-            ):
-                chain = [hub_id]
-                chain_nodes = [node]
-            for nid, cnode in zip(chain, chain_nodes):
-                if len(core_ids) >= 32 or cnode is None:
-                    break
-                asm.add_node(_norm_node(gl, cnode), default_kind="function")
-                core_ids.add(nid)
-            for a, b in zip(chain, chain[1:]):
-                asm.add_edge({"src": a, "tgt": b, "kind": "CALLS"}, set(asm.nodes))
-            if hub_id in core_ids:
-                core.append({"node_id": hub_id, "label": gl.label(node),
-                             "file": hub_file, "line": hub_line,
-                             "degree": int(hub.get("degree") or 0)})
-    except Exception:
-        core = []
 
     # Modules are not built here: they must partition the *final* included node
     # pool (one unambiguous module per node, keyed by that node's file), which is
@@ -858,6 +1024,25 @@ def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
         module = _dotted_module(node.get("file"))
         if module:
             node["qualified_name"] = f"{module}.{node.get('label')}"
+        # Scope: the enclosing callable every node lives in (problem #6 -- scope was
+        # absent on most nodes). owner_function returns the node itself when it is
+        # already a callable, so a function/method reports the module it belongs to,
+        # while an operand or a value reports the function that contains it. This is
+        # the container a frontend groups by, never an empty field.
+        try:
+            owner = gl.owner_function(twin)
+        except Exception:
+            owner = None
+        scope = None
+        if owner is not None and owner.get("id") != twin.get("id"):
+            owner_file, _os, _oe = gl.loc(owner)
+            owner_module = _dotted_module(owner_file)
+            owner_label = gl.label(owner)
+            scope = f"{owner_module}.{owner_label}" if owner_module else owner_label
+        if not scope:
+            scope = module
+        if scope:
+            node["scope"] = scope
         for key in ("documentation", "docstring", "comment"):
             try:
                 documentation = gl.prop(twin, key)
@@ -1112,7 +1297,19 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     language = str(lang or meta.get("lang") or "unknown")
     revision = str(commit or meta.get("commit") or "unknown")
     findings = bundle.get("findings") or []
+    # `security.findings` stays exhaustive (passed through untouched below); only the
+    # *featured* value paths are cleaned. Two hygiene rules (problems #7 and #8):
+    #   #7  A value path that visits fewer than two distinct nodes has not moved --
+    #       it is a bare def-use artifact (a traceback local `tb`, a file handle `f`,
+    #       `config_file`, `tb.tb_frame`), not a behavior. Featuring it as one is the
+    #       reported defect. Genuine flows (`hashlib.sha1`, `send_file`, `re.split`,
+    #       `Markup`) always traverse a source and a distinct sink, so the two-distinct
+    #       -node floor drops exactly the artifacts and keeps every real flow, including
+    #       the minimal two-step call-argument flows.
+    #   #8  Identical paths (same endpoints and same ordered node ids) are collapsed to
+    #       one; the graph often yields the same def-use twice from different findings.
     values = []
+    seen_paths: set[tuple] = set()
     for finding in findings:
         witness = finding.get("witness") or {}
         steps = witness.get("steps") or []
@@ -1121,14 +1318,23 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         finding_id = str(finding.get("finding_id") or "")
         if not finding_id:
             continue
+        step_ids = tuple(step.get("node_id") for step in steps)
+        if len({sid for sid in step_ids if sid}) < 2:
+            continue  # #7: a path that never leaves one node is not a behavior
+        source_node = steps[0].get("node_id")
+        sink_node = steps[-1].get("node_id")
+        dedupe_key = (source_node, sink_node, step_ids)
+        if dedupe_key in seen_paths:
+            continue  # #8: same endpoints and same ordered hops -- one is enough
+        seen_paths.add(dedupe_key)
         path_id = f"value:{finding_id}"
         values.append({
             "id": path_id,
             "kind": "value-flow",
             "name": finding.get("display_name") or "value path",
             "description": finding.get("result_summary") or "Exporter-provided value path",
-            "source_node": steps[0].get("node_id"),
-            "sink_node": steps[-1].get("node_id"),
+            "source_node": source_node,
+            "sink_node": sink_node,
             "confidence": (finding.get("analysis") or {}).get("confidence"),
             "limitations": list((finding.get("analysis") or {}).get("limitations") or []),
             "steps": steps,
