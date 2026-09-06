@@ -2,9 +2,9 @@
 
 # Lachesis
 
-**A compiler-precise code graph you can ask questions about: how data moves, who calls what, what reaches a sink. C, Python, and TypeScript, all in one graph.**
+**Lachesis reads your code and builds a map of it. Then you can ask the map questions, like who calls this function, where does this value go, and can bad input reach a dangerous spot.**
 
-Install with `python -m pip install lachesis-cpg`, then use `import lachesis` or the `lachesis` command.
+It works on C, Python, and TypeScript/JavaScript, all in one map.
 
 [![PyPI](https://img.shields.io/pypi/v/lachesis-cpg)](https://pypi.org/project/lachesis-cpg/)
 [![Python](https://img.shields.io/pypi/pyversions/lachesis-cpg)](https://pypi.org/project/lachesis-cpg/)
@@ -15,35 +15,32 @@ Install with `python -m pip install lachesis-cpg`, then use `import lachesis` or
 [![Glama](https://glama.ai/mcp/servers/UnboundCompute/lachesis/badges/score.svg)](https://glama.ai/mcp/servers/UnboundCompute/lachesis)
 [![Security Scan](https://img.shields.io/badge/security-Lachesis-8250df)](https://github.com/UnboundCompute/lachesis-action)
 
-A symbol index (LSP, ctags, SCIP) tells you *where a name appears*. Lachesis tells you
-*how a value moves* — does this request parameter reach that SQL call, which of these two
-near-identical functions checks its input first, what can flow into this buffer, where a C
-object is freed twice or used after free. It parses a codebase with real compilers, not
-regexes, builds one graph with a full dataflow layer (value-flow, points-to, taint,
-aliasing) and a native temporal pass for C object lifetimes, and answers questions from that
-graph — on the command line, as a Python library, or over MCP to an AI agent. Large,
-multi-language trees build as parallel shards linked into one graph within a bounded memory
-envelope.
+## What is this?
 
-A worked example: a Flask control plane where three handlers reach the same SQL sink
-unguarded while two siblings authorize first. Lachesis follows the value, flags the three,
-and names their guarded twins — [**see it live on the pull request →**](https://github.com/UnboundCompute/lachesis-action-demo/pull/5). Scan your own repo on every PR with the
-[Lachesis Security Scan Action](https://github.com/UnboundCompute/lachesis-action).
+Search tools like grep tell you *where a word shows up* in your code. Lachesis is
+different. It follows the actual data. It can tell you where a value came from,
+where it goes next, and whether a request from the outside can reach something
+dangerous, like a database call with no login check in front of it.
 
-## Quickstart
+To do this it reads your code the same way a compiler does, not by guessing with
+text patterns. So it doesn't miss a call just because a name was renamed or
+imported in a weird way.
 
-Install, then point it at a repo. One command builds and caches the graph and prints the
-**leads** — the reachable sensitive operations that no guard covers, each a question to
-investigate, not a verdict:
+You can use it three ways: as a command in your terminal, as a Python library, or
+as an [MCP](https://modelcontextprotocol.io) server that an AI agent can talk to.
+
+## Quick start
+
+Install it, then point it at a folder:
 
 ```bash
 python -m pip install lachesis-cpg
 lachesis ./my-project
 ```
 
-The source can also be a git URL — `lachesis https://github.com/owner/repo`, optionally with
-a `#subdir` fragment to scan one subtree of a monorepo. A URL is shallow-cloned to a temp
-directory and removed when the scan finishes.
+It builds the map, saves it, and prints the **leads**. A lead is a spot where
+outside input can reach something sensitive with no check in the way. Each lead is
+a question to look into, not a final answer.
 
 ```
   ✓ compiling (0.7s)
@@ -52,119 +49,83 @@ directory and removed when the scan finishes.
 
 2 leads (lens=all)
   1. [0.810] handleWebhook (http/webhook.ts:10, route) -> findById(documentId) [database]
-     prove or kill: a caller that passes no recognized guard can read or write data
-     through findById(documentId) starting from handleWebhook at http/webhook.ts:10
+     a caller that passes no recognized guard can read or write data
+     through findById(documentId) starting from handleWebhook
   2. [0.810] handleWebhook (http/webhook.ts:10, route) -> findById(invoiceId) [database]
-     unknown: this function branches on something; an owner/tenant comparison would not
-     be recognized as a guard by name and is not modeled here
+     this function branches on something, but no login-style check is seen here
 ```
 
-That second lead is the point: `handleWebhook` reaches two near-identical database calls,
-and Lachesis tells them apart by *following the value*, not by matching a name. To hand the
-same codebase to an agent that can chase these down, serve it over MCP:
+You can also give it a git URL instead of a folder:
+`lachesis https://github.com/owner/repo`. It downloads the code to a temp folder,
+scans it, and cleans up after.
+
+The first scan of a project is slow. After that the map is cached under
+`~/.lachesis/cache`, so every run after is fast.
+
+## The three ways to use it
+
+**Terminal.** One `lachesis` command. `lachesis ./repo` is the easy front door.
+If you want more control, the steps map to three passes:
 
 ```bash
-lachesis mcp ./my-project        # zero-config: the agent builds and queries the graph itself
+lachesis build   ./my-project graph.kuzu     # step 1: read the code, build the map
+lachesis enrich  graph.kuzu                   # step 2: work out the data flow
+lachesis analyze graph.kuzu --summary         # step 3: print the leads
+lachesis explain graph.kuzu tree.c:1487       # show all the evidence for one spot
 ```
 
-The first run of a project is slow; graphs are cached under `~/.lachesis/cache` and every
-run after is fast.
-
-## Three ways in: CLI, library, MCP
-
-The same capability set is a command, a Python method, and an MCP tool — no surface is a
-second-class citizen, and none makes you hand-write a graph-loading script.
-
-**CLI** — one `lachesis` entrypoint. `scan` is the front door; when you want to name a
-graph and drive it yourself, the verbs mirror the three build passes:
-
-```bash
-lachesis build   ./my-project graph.kuzu     # pass 1 — the structural graph
-lachesis enrich  graph.kuzu                   # pass 2 — warm the dataflow + catalog sidecars
-lachesis analyze graph.kuzu --summary         # pass 3 — the leads, rolled up by bug shape
-lachesis explain graph.kuzu tree.c:1487       # one call: the whole evidence chain for a site
-```
-
-The rest of the surface is verbs under the same entrypoint: `candidates` (the obligation
-census over the whole taxonomy), `query` (targeted reads — `find-entity`, `function`,
-`value-history`, `call`, `security-path`, `handler-security`, …), `plan` (a change-impact
-capsule for one site), `report` and `communities` (rollups), `trace` (build a graph and
-export a lachesis-explorer `bundle.json` — every sink family with the reachability cone that
-feeds it), plus `mcp`, `doctor`, `cache`, `concept-model`, and `completion`. `lachesis
-<verb> --help` documents each.
-
-For a large tree, build core-only and cap the wall clock — each frontend shard streams
-straight into Kùzu instead of composing a graph-sized Python object, and `enrich` reads
-the sidecars this leaves behind rather than re-parsing the source:
-
-```bash
-lachesis build ./my-project graph.kuzu --prune --timeout 3600
-```
-
-On a full libxml2 tree that cold build is ~28 s and ~1 GiB peak RSS across all three
-languages. The streaming layout, sidecar formats, and memory/timing knobs are in
-[`docs/scaling.md`](./docs/scaling.md).
-
-**Library** — a warm session: open (or build) once, ask many times, nothing recomputed
-between questions.
+**Python library.** Open the map once, then ask it as many questions as you want.
 
 ```python
 import lachesis
 
 a = lachesis.Analysis.build("./my-project", "graph.kuzu", enrich=True)
-leads = a.scan(hard_stop=120)                  # bounded scan → a LeadSet held in memory
-print(leads.summary())                         # {'total': ..., 'by_pattern': {...}, 'timed_out': False}
+leads = a.scan()
+print(leads.summary())
 
-for lead in leads.near("tree.c", (1480, 1500)):   # filter the held leads, no recompute
-    print(lead.pattern, lead.entry, lead.line)
-
-print(a.explain_sink("tree.c", 1487))          # the whole evidence chain for one site
+print(a.explain_sink("tree.c", 1487))   # all the evidence for one spot
 ```
 
-`scan` returns a `LeadSet` with `.summary()`, `.by_pattern()`, `.by_function()`,
-`.near()` / `.at()`, `.top()`, `.to_json()`, and typed iteration — the leads stay in the
-session, so a follow-up question is a filter, not a second pass. Bounded by default: with no `hard_stop`
-it still caps its own wall clock and returns partial, flagged leads rather than hanging.
-Runnable one-file scripts for each operation are in [`examples/`](./examples/README.md).
+Runnable example scripts are in [`examples/`](./examples/README.md).
 
-**MCP** — every verb above is also a tool an agent drives directly (`build_graph`,
-`enrich`, `flow_pass`, `explain`, and the in-memory `leads_*` queries) over the same warm
-session. See [MCP](#mcp).
+**MCP (for AI agents).** Start the server and an agent can build and query the map
+on its own:
+
+```bash
+lachesis mcp ./my-project
+```
+
+See [MCP](#mcp) below for setup in Cursor, VS Code, Claude, and Docker.
 
 ## What you can ask
 
-Once a graph is built, these are the moves — from the command line, the `Analysis` library,
-or as MCP tools an agent drives directly:
+Once the map is built, these are the moves. They work from the terminal, the
+Python library, or as MCP tools an agent uses:
 
-| You want to know | The move |
+| You want to know | The tool |
 |---|---|
-| What is this subsystem built around? | `hubs`, the highest-degree functions (no name knowledge needed) |
-| Where is this symbol? | `search` |
-| Who calls this? What does it call? | `callers`, `callees` (direct and indirect dispatch) |
-| Show me the actual source | `read_body`, exact bytes by offset |
+| What is this part of the code built around? | `hubs` |
+| Where is this name? | `search` |
+| Who calls this? What does it call? | `callers`, `callees` |
+| Show me the real source | `read_body` |
 | What's in this file or folder? | `open_file`, `open_folder` |
-| Where does this value go? What feeds this sink? | `flow`, `sources_of` |
-| Does this source reach that sink? | `reaches`, a labeled witness path or an honest "no" |
-| What does this pointer point to? What aliases it? | `points_to`, `aliases` |
-| Where does untrusted input reach a dangerous sink? | `taint`, source→sink witnesses folded from the Atropos catalog onto this graph's nodes |
-| Is this C object freed twice, or used after it's freed? | the native temporal lifetime pass, a typestate matcher over C object lifecycles that confirms double-free / use-after-free with a path witness |
-| Which entrypoints reach sensitive effects without a recognized guard? | `scan`, the leads with census/frontier counts (questions, not verdicts) |
-| What are the leads, and where do they land? | `analyze` / `candidates` / `leads_summary` / `leads_at`, the obligation census held warm and filtered by pattern, function, or `file:line` |
-| The full evidence for one site, in one call | `explain`, chaining census → candidate → provenance → guard → source |
-| A shareable map of every sink family and what feeds it | `trace`, a lachesis-explorer `bundle.json` — each family with its reachability cone |
+| Where does this value go? What feeds this spot? | `flow`, `sources_of` |
+| Does this input reach that spot? | `reaches` (gives a path, or a clear no) |
+| What does this pointer point at? | `points_to`, `aliases` |
+| Where does outside input reach something dangerous? | `taint` |
+| Is this C object freed twice, or used after it's freed? | the C lifetime pass |
+| Which entrypoints reach sensitive spots with no check? | `scan` (the leads) |
+| All the evidence for one spot, in one call | `explain` |
 
-Every answer carries a confidence and an origin. An `exact` edge is resolved; a
-`conservative` one is a deliberate over-approximation the tool tells you about rather than
-hiding. You read the results as evidence, not as verdicts.
+Every answer comes with how sure it is. Some links are exact. Some are a safe
+guess, and Lachesis tells you when it's guessing instead of hiding it. Read the
+answers as evidence, not as a verdict.
 
 ## MCP
 
-Use `lachesis mcp` from the same environment that built the graph. You can hand it an
-absolute `graph.kuzu` path, but you don't have to: start it with no argument and the agent
-builds its own graph on demand with `build_graph` — point it at a repo and it compiles,
-caches, and attaches in one call (an unchanged tree is served from cache; `refresh: true`
-forces a rebuild). Overlapping requests are serialized around the single store, so a
-concurrent call can't tear the server down mid-flight.
+Run `lachesis mcp` from the same place you built the map. You can hand it a
+`graph.kuzu` path, but you don't have to. Start it with no argument and the agent
+builds its own map when you point it at a repo.
 
 **One click** (uses `uvx`, no install step):
 
@@ -172,8 +133,7 @@ concurrent call can't tear the server down mid-flight.
 &nbsp;
 [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Lachesis-0098FF?logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=lachesis&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22--from%22%2C%22lachesis-cpg%22%2C%22lachesis%22%2C%22mcp%22%5D%7D)
 
-Or configure any client by hand — drop one of these into your MCP client's config
-(Claude Desktop, Cursor, Claude Code). If the package is already installed:
+Or set it up by hand. If the package is already installed:
 
 ```json
 {
@@ -183,7 +143,7 @@ Or configure any client by hand — drop one of these into your MCP client's con
 }
 ```
 
-Or with no install step, letting `uvx` fetch it on first run:
+Or let `uvx` fetch it on first run, no install:
 
 ```json
 {
@@ -193,7 +153,7 @@ Or with no install step, letting `uvx` fetch it on first run:
 }
 ```
 
-Or as a container — no Python, Node, or clang on the host, all three frontends in the image:
+Or run it in Docker, with all three languages already in the image:
 
 ```json
 {
@@ -207,90 +167,48 @@ Or as a container — no Python, Node, or clang on the host, all three frontends
 }
 ```
 
-Mount your project (here `/src`) and point `build_graph` at it. In VS Code use
-`${workspaceFolder}` for the mount source. The image is published for linux/amd64 and
-linux/arm64; `:edge` tracks `main`, and each release also publishes an `:x.y.z` tag.
-More client and troubleshooting notes are in
-[`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
+More client notes are in [`docs/queries.md`](./docs/queries.md#the-lachesis-mcp-server).
 
 ## Languages
 
-Three frontends, each backed by a real compiler or the language's own parser, never a
-heuristic grammar.
+Each language is read by a real compiler or its own parser, never a text guess.
 
-| Language | Engine | Extensions |
+| Language | Read with | File types |
 |---|---|---|
-| TypeScript / JavaScript | the TypeScript compiler API, with the type checker | `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` |
-| Python | CPython's own `ast` + `symtable` (standard library only) | `.py` `.pyi` |
-| C | Clang, via its AST dump | `.c` `.h` |
+| TypeScript / JavaScript | the TypeScript compiler | `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` |
+| Python | Python's own `ast` + `symtable` | `.py` `.pyi` |
+| C | Clang | `.c` `.h` |
 
-A mixed tree is **one graph, not three**. Lachesis picks a frontend per file, composes the
-results into a single node and edge set, and runs the same analysis over all of it — a
-Python caller and a TypeScript callee sit in the same store and the same tools answer over
-both.
+A mixed project is **one map, not three**. A Python function and a TypeScript
+function it calls sit in the same map, and the same tools work across both.
 
-Two honest limits, stated up front: Python has no type checker, so it resolves attribute
-calls lexically and says so (`types: none`); C reads one translation unit at a time, so it
-won't follow a call through a function-pointer table it never sees. Each frontend declares
-what it actually knows, and a validator holds it to that claim.
+Two limits worth knowing. Python has no type checker, so it matches attribute
+calls by name. C reads one file at a time, so it won't follow a call through a
+function-pointer table it never sees. Each language says what it can and can't do.
 
-## How it's built
+## How it works
 
-Lachesis works in three passes, and each is a verb.
+Lachesis works in three steps, and each one is a command.
 
-**Pass 1 — `build`** parses the source with real compilers into the *core tier*: syntax,
-symbols, and calls. This is the fast part, and all most navigation needs.
+1. **build**: read the code with real compilers into a plain map of symbols and
+   calls. This is the fast part, and it's all most navigation needs.
+2. **enrich**: work out how data flows through the map. This isn't done at build
+   time. A question only computes the part of the flow it needs, then caches it.
+3. **analyze**: run over the map and print the leads. These are sensitive spots,
+   scored and matched to known bug shapes. It has a time limit, so a big project
+   can't hang.
 
-**Pass 2 — `enrich`** materializes the *dataflow tier* — value-flow, points-to, taint,
-aliasing — a pure function of the core graph, so it is never written at build time. You
-rarely run it by hand: any query that needs value-flow folds in just the *cone* around its
-seed and caches it beside the store, so nothing pays for a whole-graph pass it never asked
-about. `enrich` is the one-shot "warm it all now" for a batch job, persisting the tier and
-catalog bind as `.dataflow.pb` / `.bind.pb` sidecars so a later, fresh process opens warm.
+There's also a **C lifetime pass**. Some bugs, like freeing the same object twice
+or using it after it's freed, aren't about one spot. They're about the whole life
+of an object. A separate pass tracks each C object being allocated, freed, and
+used, and reports double-free and use-after-free with a path showing how it
+happens.
 
-**Pass 3 — `analyze`** runs the flow pass over the enriched graph and produces the leads:
-safety-obligation sites, scored and matched against bug shapes. It is **bounded** — a
-`hard_stop` budget caps the wall clock and returns partial leads with `timed_out=True`
-rather than hanging, so a large graph can't stall a call. An empty result over a partial
-run reads as *not evaluated*, never *clean*.
+The map is saved as a folder (`graph.kuzu`). It holds an embedded database plus a
+small index file. That folder *is* the map. Every tool reads it directly.
 
-Two capabilities sit alongside the three passes:
-
-**Native temporal lifetime pass (C).** Guard-and-taint shapes catch what *reaches* a sink,
-but a double-free or use-after-free is a property of an object's *lifecycle*, not a single
-node. A native pipeline handles it — a Clang frontend emits per-object lifecycle events
-(alloc / free / use / return), a Rust typestate kernel matches those event streams, and the
-result is folded back onto the graph as confirmed temporal candidates carrying a path
-witness. It confirms double-free and use-after-free on C today without false positives on the
-clean control paths.
-
-**Federated sharding.** A large, multi-language tree is built as parallel shards — each
-frontend streams straight into its own store — that are then linked into one graph by
-cross-shard symbol (USR) resolution, so value-flow, callers, and callees still cross shard
-boundaries. This keeps a monorepo-scale build inside a bounded memory envelope instead of
-composing a graph-sized object in memory.
-
-```
-  source tree
-      |
-      v  build  (pass 1)
-  frontends        real compilers parse each language into
-      |            syntax, symbols, calls  (the core tier)
-      v  enrich (pass 2, on demand or all-at-once)
-  kuzu store       staged Parquet, bulk-copied into an embedded
-      |            columnar graph DB; dataflow tier folded in as a
-      |            cone around each seed, cached beside the store
-      v  analyze (pass 3, bounded)
-  nav  (+ MCP)     hubs, search, callers/callees, read_body, flow,
-                   reaches, sources_of, points_to, aliases, scan,
-                   explain, leads — over one warm session
-```
-
-`graph.kuzu` is a directory: the embedded database plus a manifest. That *is* the graph.
-Every tool reads it directly, and `lachesis mcp` serves the same tools over stdio for any
-MCP-capable client. Large-build, monorepo, and CI tuning — including cold-build memory and
-timing on a full libxml2 graph — live in [`docs/scaling.md`](./docs/scaling.md); the graph
-model is in [`docs/graph-model.md`](./docs/graph-model.md).
+More detail is in [`docs/graph-model.md`](./docs/graph-model.md) (what's in the
+map) and [`docs/scaling.md`](./docs/scaling.md) (big repos, memory, and speed).
 
 ## Install
 
@@ -298,72 +216,58 @@ model is in [`docs/graph-model.md`](./docs/graph-model.md).
 python -m pip install lachesis-cpg
 ```
 
-The release-tested Python window is 3.10–3.12 (the CI matrix). Python analysis needs
-nothing beyond the package; TypeScript/JavaScript builds need `node` on `PATH` and C
-builds need `clang` — a missing one comes back as an actionable error, not a crash.
+Works on Python 3.10–3.12. Python analysis needs nothing extra. Scanning
+TypeScript/JavaScript needs `node` on your PATH, and C needs `clang`. If one is
+missing you get a clear message, not a crash.
 
-To work from a clone (the contributor workflow, and how you build the TypeScript frontend
-from checked-out sources):
+To work from a clone (for contributors):
 
 ```bash
 git clone https://github.com/UnboundCompute/lachesis && cd lachesis
-python -m pip install --upgrade pip     # editable installs need pip >= 21.3
-python -m pip install -e ".[dev]"       # builder, nav, MCP server, tests
-npm ci                                   # install the locked TypeScript compiler dependency
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+npm ci
 cargo build --release --manifest-path native/clang_frontend/Cargo.toml
 ```
 
-Runtime dependencies are just `kuzu` and `pyarrow`; everything else is standard library.
-Node 20+ must be on your PATH for the TS frontend. In a source checkout, the C frontend
-automatically uses the release Rust binary above; without that binary it uses the
-portable Clang frontend. Run the frontend parity gate CI uses with `make check`.
-Semantic `concept_search` is optional and separate — opt in with
-`pip install -e ".[concept-search]"`, then `lachesis concept-model download`.
-
 ## Where to go next
 
-- **[`examples/`](./examples/README.md)**: a five-minute walkthrough on a bundled fixture, plus one runnable `.py` script per library operation.
-- **[`docs/graph-model.md`](./docs/graph-model.md)**: what's in the graph — node kinds, edge kinds, and tiers.
-- **[`docs/queries.md`](./docs/queries.md)**: every way to ask a question, both `lachesis query` and the MCP tools.
-- **[`docs/scaling.md`](./docs/scaling.md)**: large-build, monorepo, and CI-runner tuning; managing the local graph cache.
+- [`examples/`](./examples/README.md): a five-minute walkthrough plus a runnable script per feature.
+- [`docs/graph-model.md`](./docs/graph-model.md): what's in the map.
+- [`docs/queries.md`](./docs/queries.md): every way to ask a question.
+- [`docs/scaling.md`](./docs/scaling.md): big repos, memory, and CI.
 
 ## Roadmap
 
-Recently shipped:
+Done recently:
 
-- [x] **Native temporal lifetime detection (C).** A Clang frontend + Rust typestate kernel confirm double-free and use-after-free on C object lifecycles, with a path witness and no false positives on the clean control paths — a class of bug the guard/taint shapes structurally can't see.
-- [x] **Federated sharding.** Large, multi-language trees build as parallel per-frontend shards linked into one graph by cross-shard symbol (USR) resolution, keeping a monorepo-scale build inside a bounded memory envelope while value-flow and calls still cross shard boundaries.
-- [x] **Scan a git URL directly.** `lachesis https://…#subdir` shallow-clones, scans one subtree of a monorepo, and cleans up after itself — no manual checkout.
-- [x] **Graph-first Explorer bundle.** `lachesis trace` exports a lachesis-explorer `bundle.json`: every sink family with the reachability cone that feeds it, in the shape the explorer renders.
-- [x] **One reader, three front doors.** The `lachesis.Analysis` library class is the single implementation; a `lachesis <verb>` subcommand and an MCP tool sit over each method — no hand-written graph-loading script on any surface.
-- [x] **Bounded analysis.** Pass 3 takes a `hard_stop` budget and returns partial, flagged leads instead of hanging; the census a graph pays for once is cached as a sidecar so the next process opens warm.
-- [x] **Zero-config MCP.** `lachesis mcp` starts with no graph path; `build_graph` compiles, caches, and attaches on demand, and overlapping requests are serialized around the store.
+- [x] **C lifetime bugs.** Finds double-free and use-after-free on C objects, with a path showing how, and no false alarms on the clean paths.
+- [x] **Big repos.** Large multi-language trees build in parallel pieces and link into one map, staying inside a set memory budget.
+- [x] **Scan a git URL directly.** Point it at `https://…`, it downloads, scans, and cleans up.
+- [x] **One tool, three front doors.** The same code powers the terminal command, the Python library, and the MCP tools.
 
-Near-term, roughly in order:
+Coming next:
 
-- [ ] **Cross-function temporal shapes.** Extend the lifetime pass past a single function so free-in-one / use-in-another patterns match across a call seam, riding the value-flow edge the graph already carries.
-- [ ] **Bounded security signal.** Reworking the guard-analysis tools to fold the same per-seed, on-demand cone the dataflow tools already use, so they run on a large graph without a whole-graph pass.
-- [ ] **The reachability query, first-class.** "Can attacker input reach this sink" as a single call returning a witness path or a bounded no, across file, package, and language boundaries.
+- [ ] **C lifetime bugs across functions**: free in one function, use in another.
+- [ ] **A single "can this input reach this spot?" question** that returns a path or a clear no, across files and languages.
 
 ## Status
 
-Lachesis is early and moving fast. The graph model, the store, the navigation and MCP layer,
-and the native temporal lifetime pass work today and are held to a parity test suite that
-checks the columnar store answers every tool identically to the same graph held whole in
-memory. The temporal pass is C-only for now and matches within a single function; one known
-false positive (a leak reported on an object that is both freed and used-after-free) is
-tracked. The schema and tool set may still shift before 1.0; the
-[`CHANGELOG`](./CHANGELOG.md) calls out changes explicitly.
+Lachesis is early and moving fast. The map, the storage, the navigation and MCP
+tools, and the C lifetime pass all work today and are checked by a test suite. The
+lifetime pass is C-only for now and works within one function. One known false
+alarm is tracked. The tools may still change before 1.0; the
+[`CHANGELOG`](./CHANGELOG.md) lists changes.
 
 ## License
 
-AGPL-3.0. See [`LICENSE`](./LICENSE). You're free to use, study, modify, and share it,
-commercially included; run a modified version as a network service and you make your
-modified source available to its users. If that doesn't fit — say, embedding in a closed
-product — a separate commercial license may be available. See
+AGPL-3.0. See [`LICENSE`](./LICENSE). You can use, study, change, and share it,
+including for commercial use. If you run a changed version as a network service,
+you have to share your changed source with its users. If that doesn't fit your
+case, a separate commercial license may be an option. See
 [`CONTRIBUTING.md`](./CONTRIBUTING.md) or open an issue.
 
 ## Security
 
-Found a vulnerability? Please don't open a public issue; see [`SECURITY.md`](./SECURITY.md)
-for private reporting.
+Found a security bug? Please don't open a public issue. See
+[`SECURITY.md`](./SECURITY.md) for how to report it privately.

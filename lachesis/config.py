@@ -76,6 +76,7 @@ _NONPRODUCT_SEGMENTS = (
     r"docs?", r"documentation",
     r"benchmarks?", r"bench", r"perf",
     r"fixtures?", r"testdata", r"test[_-]?data", r"__mocks__", r"mocks",
+    r"test[_-]?d",  # tsd type-test dir (``test-d/``): type assertions, not product
     r"vendor", r"vendored", r"third[_-]?party", r"node_modules", r"site-packages",
     r"\.tox", r"\.nox", r"\.venv", r"venv",
     r"dist", r"scripts",
@@ -90,6 +91,10 @@ _NONPRODUCT_BASENAMES = (
     r"[^/]*\.min\.[a-z0-9]+",
     r"[^/]*\.d\.ts",
     r"[^/]*\.config\.(?:js|cjs|mjs|ts)",
+    # Task-runner build scripts (gulp/grunt): tooling that drives a build, not the
+    # product's own source, and never a module a reader should be pointed at.
+    r"gulpfile\.[cm]?[jt]s",
+    r"gruntfile\.[cm]?[jt]s",
 )
 NONPRODUCT_RE = re.compile(
     r"(?:^|/)(?:" + "|".join(_NONPRODUCT_SEGMENTS) + r")(?:/|$)"
