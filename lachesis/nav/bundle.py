@@ -78,6 +78,28 @@ def _basename(path: Optional[str]) -> str:
     return os.path.basename(path) if isinstance(path, str) and path else ""
 
 
+def _finding_primary_file(finding: dict, node_map: dict) -> Optional[str]:
+    """Repo-relative path of a finding's featured surface (its sink), or None.
+
+    Used to keep the trust view a *product* security surface (H12): the exhaustive
+    envelope carries findings located anywhere the graph reaches, including
+    type-test and test scaffolding (`test-d/…`, `test_*.py`, `*.spec.*`), which are
+    not a surface a maintainer ships. We resolve the file from the witness sink node
+    (walking from the last step back to the first node that carries a path) rather
+    than ``finding['locations']``, because ``locations`` records only a basename
+    while the graph node carries the repo-relative path ``_is_nonproduct_path``
+    classifies over. Returns None when no step resolves, so the caller fails open.
+    """
+    steps = (finding.get("witness") or {}).get("steps") or []
+    for step in reversed(steps):
+        node = node_map.get(step.get("node_id"))
+        if node:
+            path = node.get("file") or node.get("absolute_file")
+            if path:
+                return path
+    return None
+
+
 def _finding_id(sink_kind: Optional[str], file: Optional[str],
                 symbol: Optional[str]) -> str:
     """Content-derived, line-independent identity for a sink.
@@ -530,8 +552,22 @@ _ENTRY_KIND = {
 
 
 def _slug(text: str) -> str:
-    """A stable, id-safe slug from a symbol label (never empty)."""
-    keep = [c.lower() if (c.isalnum() or c == ".") else "." for c in str(text or "")]
+    """A stable, id-safe slug from a symbol label (never empty).
+
+    The underscore is preserved, not folded to the dot separator. It is an
+    id-safe character and it is semantically load-bearing: a Python private
+    module ``click._utils`` and its public twin ``click.utils`` must not collapse
+    onto the same slug. When they did, the derived ``id`` was no longer injective
+    and the duplicate-id guard in both apps rejected the *entire* bundle for any
+    package carrying a ``foo``/``_foo`` pair (``utils``/``_utils``,
+    ``compat``/``_compat``) -- a ubiquitous convention. Folding also stripped a
+    leading underscore, so ``_termui_impl`` mangled into ``termui.impl`` (a
+    phantom ``termui.impl`` child). Keeping the underscore fixes both: the map is
+    now injective over inputs differing in alphanumerics or underscores, and it
+    stops rewriting the module hierarchy. Only genuinely unsafe characters (path
+    separators, punctuation, spaces) become dot separators.
+    """
+    keep = [c.lower() if (c.isalnum() or c in "._") else "." for c in str(text or "")]
     s = "".join(keep).strip(".")
     while ".." in s:
         s = s.replace("..", ".")
@@ -1436,6 +1472,31 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
     return requests, core
 
 
+def _api_rank(anchor: dict) -> tuple:
+    """Public-API preference used to break ties *within* an anchor tier (H7).
+
+    ``_anchor_strength`` already orders the tiers (route > callback > exported), so a
+    route-anchored framework (flask, express) never reaches this and cannot regress.
+    It matters inside the ``exported-entry`` tier, where "exported callable nothing
+    calls" is a coarse net: a getattr-dispatched visitor family -- jinja's
+    ``CodeGenerator.visit_CallBlock`` / ``visit_For`` and its ~48 siblings -- is
+    exported and never statically called, so it otherwise floods "a useful place to
+    start" ahead of the real public surface (``Environment``, ``Template``). A
+    newcomer starts from a class/decorator/factory, not one dispatch method, so we
+    prefer, in order: a class/interface, then a plain function, then a constructor,
+    then a method; and within any kind, demote dunder and dispatch-prefixed names
+    (``visit_*``/``_*``) below ordinary public names. Ordering only -- which
+    entrypoints exist is unchanged.
+    """
+    kind = (anchor.get("anchor_kind") or "").lower()
+    kind_rank = {"class": 0, "interface": 0, "enum": 0, "type": 0,
+                 "function": 1, "constructor": 2, "method": 3}.get(kind, 4)
+    label = (anchor.get("anchor_label") or "")
+    leaf = label.rsplit(".", 1)[-1] if "." in label else label
+    dispatchy = 1 if (leaf.startswith("visit_") or leaf.startswith("_")) else 0
+    return (dispatchy, kind_rank)
+
+
 def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                               chain_depth: int, max_files: int) -> dict:
     """Entrypoints, guided request paths, files and modules for the 2.0 bundle.
@@ -1470,7 +1531,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
         best = {hid: sorted(rows, key=_anchor_strength)[0]
                 for hid, rows in by_handler.items() if rows}
         ordered = sorted(best.items(),
-                         key=lambda kv: (_anchor_strength(kv[1]),
+                         key=lambda kv: (_anchor_strength(kv[1]), _api_rank(kv[1]),
                                          kv[1].get("file") or "", kv[1].get("anchor_label") or "",
                                          kv[0]))
         for handler_id, anchor in ordered:
@@ -1653,12 +1714,18 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
         # request hop) lives in it. Pool files are still absolute here (relativization
         # runs later), matching ``gl.loc``'s absolute paths.
         represented = {n.get("file") for n in asm.nodes.values() if n.get("file")}
-        # Best openable definition per product file: prefer a type, then the earliest
-        # top-of-file definition, so the anchor is the module's most recognisable name.
-        _KIND_RANK = {"class": 0, "constructor": 1, "function": 2, "method": 3}
+        # Best openable definition per product file: prefer a type/class, then the
+        # earliest top-of-file definition, so the anchor is the module's most
+        # recognisable name. Interface/type/enum are included so a *type-only*
+        # TypeScript module -- a ``types/options.ts`` that declares the public
+        # ``Options`` config object but no runtime code -- is seeded and surfaces as a
+        # module, instead of being dropped for owning no function/class node.
+        _KIND_RANK = {"class": 0, "interface": 1, "constructor": 2,
+                      "type": 3, "enum": 3, "function": 4, "method": 5}
         best_anchor: dict[str, dict] = {}
         best_rank: dict[str, tuple] = {}
-        for node in index.nodes_of_kind("class", "constructor", "function", "method"):
+        for node in index.nodes_of_kind("class", "constructor", "function", "method",
+                                        "interface", "type", "enum"):
             f, l = gl.loc(node)[0], gl.loc(node)[1]
             if not f or not isinstance(l, int) or l <= 0 or _is_nonproduct_path(f):
                 continue
@@ -1668,7 +1735,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                 fam = _language_family(f)
                 if fam is not None and fam != primary_family:
                     continue  # keep the map in the repo's own language
-            rank = (_KIND_RANK.get(gl.kind(node.get("id")), 4), l)
+            rank = (_KIND_RANK.get(gl.kind(node.get("id")), 6), l)
             if f not in best_rank or rank < best_rank[f]:
                 best_rank[f] = rank
                 best_anchor[f] = node
@@ -1711,7 +1778,14 @@ def _dotted_module(path: Optional[str]) -> Optional[str]:
     for prefix in ("src/", "lib/", "./"):
         if p.startswith(prefix):
             p = p[len(prefix):]
-    p = p.rsplit(".", 1)[0]  # drop the extension
+    # Drop the extension. A TypeScript declaration file carries a *double*
+    # extension (``index.d.ts``); splitting on the last dot alone leaves ``index.d``
+    # and names the module after a stray ``d``. Treat ``.d.ts`` as one unit so the
+    # module reads as ``index``, not ``index.d``.
+    if p[-5:].lower() == ".d.ts":
+        p = p[:-5]
+    else:
+        p = p.rsplit(".", 1)[0]
     if p.endswith("/__init__"):
         p = p[: -len("/__init__")]
     return p.strip("/").replace("/", ".") or None
@@ -1958,12 +2032,30 @@ def _finalize_requests(raw_requests: list[dict], node_map: dict,
     return out
 
 
+# The node kinds that are genuine *declarations* a reader would count as a module's
+# API surface -- a definition they can open and read -- across the languages the
+# frontends cover (Python/C: class/function/method/enum; TypeScript adds the pure
+# type surface interface/type). Everything else a module owns (heap objects, value
+# nodes, interprocedural-context bindings) is dataflow projection, not a definition.
+_DEFINITION_KINDS = frozenset({
+    "class", "constructor", "function", "method", "interface", "type", "enum",
+})
+
+
 def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]:
     """One unambiguous module per included node, keyed by that node's file.
 
     Every concrete (file-bearing) node lands in exactly one module -- the module of
     its file -- so no node is ever repeated across modules. A module anchored by an
     entrypoint carries that entry's node id, giving a reader a place to start.
+
+    Each module reports both a ``definition_count`` (declarations it owns) and a
+    ``symbol_count`` (all projected nodes), and the list is ordered by declarations
+    first. The two counts must stay distinct: a module's total projected-node count
+    mixes declarations with dataflow/heap nodes, so a tiny but dataflow-heavy file
+    (jinja2.bccache: 6 real definitions, ~47 value/heap nodes) otherwise outweighs a
+    large one (jinja2.compiler: 34 definitions) on every "start here" surface. Ranking
+    by declarations puts the module a newcomer should read first at the top.
     """
     anchor_by_file: dict[str, str] = {}
     for ep in entrypoints:
@@ -1971,6 +2063,7 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
         if isinstance(f, str) and f not in anchor_by_file:
             anchor_by_file[f] = ep.get("node_id")
 
+    kind_by_id = {n.get("id"): (n.get("kind") or "") for n in nodes}
     groups: dict[str, list[str]] = {}
     for node in nodes:
         f = node.get("file")
@@ -1988,16 +2081,24 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
     modules: list[dict] = []
     for path in sorted(groups):
         module_name = _dotted_module(path) or path
+        node_ids = groups[path]
+        definition_count = sum(1 for nid in node_ids
+                               if kind_by_id.get(nid) in _DEFINITION_KINDS)
         module = {
             "id": f"module.{_slug(module_name)}",
             "name": module_name,
             "path": path,
-            "node_ids": groups[path],
+            "node_ids": node_ids,
+            "definition_count": definition_count,
+            "symbol_count": len(node_ids),
         }
         anchor = anchor_by_file.get(path)
         if anchor:
             module["anchor_node_id"] = anchor
         modules.append(module)
+    # Declarations first (the reader's "how big / where to start" signal), then a
+    # stable dotted-name order so equal-sized modules keep a deterministic layout.
+    modules.sort(key=lambda m: (-m["definition_count"], m["name"]))
     return modules
 
 
@@ -2130,6 +2231,7 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
                         source_url_template: Optional[str] = None,
                         comprehension: Optional[dict] = None,
                         description: Optional[str] = None,
+                        purpose: Optional[str] = None,
                         curated_tour: Optional[dict] = None) -> dict:
     """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
 
@@ -2154,7 +2256,24 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     except Exception:
         pass
     revision = str(commit or meta.get("commit") or "unknown")
+
+    graph = bundle.get("graph") or {}
+    nodes = graph.get("nodes") or []
+    for node in nodes:
+        _normalize_node_location(node)
+    node_map = {n.get("id"): n for n in nodes}
+    node_ids = set(node_map)
+
     findings = bundle.get("findings") or []
+    # H12: drop findings whose featured surface (the sink) lives in test/non-product
+    # scaffolding before anything else looks at them. The exhaustive envelope reaches
+    # wherever the graph does -- a graph built without the non-product filter carries
+    # `test-d/…` type-tests and `test_*` sinks -- but a *security* surface a maintainer
+    # is asked to trust must describe the product, not its tests. `_is_nonproduct_path`
+    # fails open (unknown file -> keep), so a finding is dropped only when its sink is
+    # positively classified scaffolding.
+    findings = [f for f in findings
+                if not _is_nonproduct_path(_finding_primary_file(f, node_map))]
     # `security.findings` stays exhaustive, but each finding whose featured surface is
     # an internal/local artifact (a traceback local `tb`, a file handle `f`, an
     # anonymous callback) is marked `low_signal` so the trust view can demote it from
@@ -2214,12 +2333,6 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
             "steps": steps,
         })
 
-    graph = bundle.get("graph") or {}
-    nodes = graph.get("nodes") or []
-    for node in nodes:
-        _normalize_node_location(node)
-    node_map = {n.get("id"): n for n in nodes}
-    node_ids = set(node_map)
     edges = _canonical_edges(graph.get("edges") or [], node_ids)
     edges_by_pair = {(e["source"], e["target"]): e for e in edges}
 
@@ -2254,6 +2367,13 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         "lines": int(meta.get("loc") or 0),
         "indexed_nodes": int(indexed_nodes),
     }
+    # The repo's own one-line purpose ("what is this?"), read from its package
+    # manifest or README. Distinct from ``description`` (which names what this
+    # *projection* contains): this answers what the repository is, the first thing a
+    # newcomer or a README badge needs. Omitted entirely when the tree declares none,
+    # so the field's presence always means a real, source-derived summary.
+    if purpose:
+        meta_out["purpose"] = purpose
     if source_url_template:
         meta_out["source_url_template"] = source_url_template
 
@@ -2375,6 +2495,114 @@ def _validate_graph_first(bundle: dict) -> None:
             raise ValueError("graph-first path references invalid nodes")
 
 
+def _clean_purpose(text: Optional[str]) -> Optional[str]:
+    """Collapse a candidate purpose to one bounded, human line, or None.
+
+    Strips markup noise that would read badly as a headline: leading Markdown
+    heading/quote/list markers, inline emphasis and code ticks, and image/badge
+    lines. Whitespace is collapsed to single spaces and the result is capped so a
+    stray long paragraph cannot bloat the bundle or the landing view.
+    """
+    if not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    s = re.sub(r"[`*_]+", "", s)                    # inline emphasis / code ticks
+    s = re.sub(r"^\s*[#>\-*+]+\s*", "", s)          # heading / quote / list markers
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > 240:
+        s = s[:237].rstrip() + "…"
+    return s or None
+
+
+def _project_purpose(source_dir: Optional[str]) -> Optional[str]:
+    """A real one-line "what is this repo" from the source tree, best effort.
+
+    Neither app could answer "what is this?" for a newcomer because the bundle
+    never carried the project's own description -- only a generic per-projection
+    boilerplate. This reads the repo's own declared purpose from the places a repo
+    states it: the package manifest's ``description`` (npm/PyPI/Cargo/Composer)
+    first, since it is authored to be exactly a one-line summary, then the README's
+    first real paragraph as a fallback. Returns None (not a guess) when the tree
+    declares nothing, so the caller keeps the honest boilerplate.
+    """
+    if not source_dir or not os.path.isdir(source_dir):
+        return None
+
+    def _read(name: str) -> Optional[str]:
+        try:
+            with open(os.path.join(source_dir, name), encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:
+            return None
+
+    # 1) Package manifests -- authored to be a one-line summary.
+    raw = _read("package.json") or _read("composer.json")
+    if raw:
+        try:
+            desc = (json.loads(raw) or {}).get("description")
+            cleaned = _clean_purpose(desc)
+            if cleaned:
+                return cleaned
+        except Exception:
+            pass
+    for toml_name, tables in (("pyproject.toml", (("project",), ("tool", "poetry"))),
+                              ("Cargo.toml", (("package",),))):
+        raw = _read(toml_name)
+        if not raw:
+            continue
+        try:
+            import tomllib
+            data = tomllib.loads(raw)
+        except Exception:
+            continue
+        for path in tables:
+            node = data
+            for key in path:
+                node = node.get(key) if isinstance(node, dict) else None
+            if isinstance(node, dict):
+                cleaned = _clean_purpose(node.get("description"))
+                if cleaned:
+                    return cleaned
+    raw = _read("setup.cfg")
+    if raw:
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read_string(raw)
+            if cp.has_section("metadata"):
+                cleaned = _clean_purpose(cp["metadata"].get("description")
+                                         or cp["metadata"].get("summary"))
+                if cleaned:
+                    return cleaned
+        except Exception:
+            pass
+
+    # 2) README first real paragraph -- skip headings, badges, images, and blanks.
+    for readme in ("README.md", "README.rst", "README.txt", "README",
+                   "readme.md", "Readme.md"):
+        text = _read(readme)
+        if not text:
+            continue
+        for block in re.split(r"\n\s*\n", text):
+            line = block.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if line.startswith("#") or line.startswith("==") or line.startswith("--"):
+                continue  # a heading (the project name), not the description
+            if low.startswith("![") or low.startswith("[![") or "shields.io" in low:
+                continue  # a badge / image row
+            if line.startswith("<") and line.endswith(">"):
+                continue  # a bare HTML tag line (e.g. a centered logo block)
+            cleaned = _clean_purpose(line.splitlines()[0])
+            if cleaned and len(cleaned) >= 12:
+                return cleaned
+        break  # only the first README that exists is authoritative
+    return None
+
+
 def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  commit: Optional[str] = None, lang: Optional[str] = None,
                  loc: Optional[int] = None, source_dir: Optional[str] = None,
@@ -2491,6 +2719,7 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                                    indexed_nodes=int(load.get("nodes") or 0),
                                    source_url_template=source_url_template,
                                    comprehension=projection, description=description,
+                                   purpose=_project_purpose(source_dir),
                                    curated_tour=curated_tour)
     if schema_version != "1.0":
         raise ValueError(f"unsupported Explorer schema version: {schema_version}")
