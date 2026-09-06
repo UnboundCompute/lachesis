@@ -653,6 +653,45 @@ def _primary_language_family(index, gl) -> Optional[str]:
     return top
 
 
+def _descend_trampoline(index, gl, nid: str, *,
+                        primary_family: Optional[str] = None, limit: int = 4) -> str:
+    """Skip thin forwarders so a lifecycle root is the real orchestrator.
+
+    A WSGI ``Flask.__call__`` is a one-line trampoline: ``return self.wsgi_app(...)``.
+    Rooting the story at it prepends a meaningless hop and, worse, makes the *entry*
+    of the request the trampoline rather than the dispatcher a reader wants named.
+    While the current node forwards to exactly one product callee of the repo's
+    dominant language (a single direct CALLS target), descend to it. Bounded by
+    ``limit`` and a ``seen`` set so a mutually-recursive pair can never loop.
+    """
+    seen = {nid}
+    for _ in range(limit):
+        try:
+            callees = [t.get("id") for t in index.targets(nid, "CALLS") if t.get("id")]
+        except Exception:
+            return nid
+        openable = []
+        for cid in callees:
+            if cid in seen:
+                continue
+            node = gl.nodes.get(cid)
+            if node is None:
+                continue
+            f, l = gl.loc(node)[0], gl.loc(node)[1]
+            if not f or not isinstance(l, int) or l <= 0 or _is_nonproduct_path(f):
+                continue
+            if primary_family is not None:
+                fam = _language_family(f)
+                if fam is not None and fam != primary_family:
+                    continue
+            openable.append(cid)
+        if len(openable) != 1:
+            return nid
+        nid = openable[0]
+        seen.add(nid)
+    return nid
+
+
 def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int,
                      primary_family: Optional[str] = None) -> list[str]:
     """Candidate roots for request-lifecycle stories, best driver first.
@@ -712,6 +751,9 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int,
             drivers.append((_reach2(index, nid), nid))
     drivers.sort(key=lambda pair: (-pair[0], pair[1]))
     for _, nid in drivers:
+        # An in-degree-0 root is often a thin WSGI/entry trampoline; descend to the
+        # real orchestrator it forwards to so the lifecycle is named at the dispatcher.
+        nid = _descend_trampoline(index, gl, nid, primary_family=primary_family)
         if nid not in seen:
             seen.add(nid)
             roots.append(nid)
@@ -733,7 +775,7 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
     entry = (story.get("entry") or {}).get("node_id")
     if not entry:
         return [], []
-    children: dict[str, list[tuple[int, dict]]] = {}
+    children: dict[str, list[tuple[int, dict, str]]] = {}
     functions: dict[str, dict] = {}
     for step in steps:
         fn = step.get("function") or {}
@@ -743,7 +785,8 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
         functions[fid] = fn
         caller = (step.get("caller") or {}).get("node_id")
         if caller:
-            children.setdefault(caller, []).append((step.get("sequence", 0), fn))
+            children.setdefault(caller, []).append(
+                (step.get("sequence", 0), fn, step.get("via") or ""))
 
     memo: dict[str, int] = {}
 
@@ -754,7 +797,7 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
             return 0
         deeper = guard | {nid}
         total = 0
-        for _, fn in children.get(nid, []):
+        for _, fn, _via in children.get(nid, []):
             cid = fn.get("node_id")
             if cid:
                 total += 1 + subtree(cid, deeper)
@@ -767,14 +810,22 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str]]:
     seen = {entry}
     cur = entry
     while len(spine) < max_hops:
-        kids = [fn for _, fn in sorted(children.get(cur, []), key=lambda pair: pair[0])
+        kids = [(fn, via)
+                for _, fn, via in sorted(children.get(cur, []), key=lambda t: t[0])
                 if fn.get("node_id") not in seen and _story_fn_openable(fn)]
         if not kids:
             break
-        pick = max(kids, key=lambda fn: (
-            0 if _is_error_name(fn.get("name")) else 1,
-            subtree(fn.get("node_id"), frozenset())))
-        nid = pick.get("node_id")
+        # A direct CALLS edge is the real control flow; ``indirect:may_invoke`` hops
+        # are duck-typed over-approximations (a session deserialize, a JSON dump that
+        # *might* run). Preferring direct keeps the spine on the dispatch chain
+        # (wsgi_app -> full_dispatch_request -> dispatch_request) instead of wandering
+        # into a serialization detour that only looks bigger. Error/teardown branches
+        # derank next, then the deepest subtree breaks the remaining tie.
+        pick = max(kids, key=lambda kv: (
+            1 if kv[1] == "direct" else 0,
+            0 if _is_error_name(kv[0].get("name")) else 1,
+            subtree(kv[0].get("node_id"), frozenset())))
+        nid = pick[0].get("node_id")
         cur = nid
         seen.add(nid)
         spine.append(nid)
@@ -913,6 +964,7 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
 
     entrypoints: list[dict] = []
     requests: list[dict] = []
+    used_ids: set[str] = set()
     try:
         by_handler = EntryPoints(store).by_handler()
         # Strongest anchor per handler, then a stable global order over handlers.
@@ -922,7 +974,6 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
                          key=lambda kv: (_anchor_strength(kv[1]),
                                          kv[1].get("file") or "", kv[1].get("anchor_label") or "",
                                          kv[0]))
-        used_ids: set[str] = set()
         for handler_id, anchor in ordered:
             if len(entrypoints) >= max_entrypoints:
                 break
@@ -976,6 +1027,51 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
         asm, index, gl, handler_ids,
         max_requests=8, max_core=32, max_hops=max(2, chain_depth),
         primary_family=primary_family)
+
+    # Promote each lifecycle root to an entrypoint. ``by_handler`` only recognises
+    # module-level public helpers, so a framework's real request driver -- a WSGI
+    # ``Flask.wsgi_app``, an event loop -- is *never* an anchored handler and would
+    # otherwise be a request whose entry is nowhere in the entrypoint set. These
+    # drivers are the truest "begin reading here" nodes, so they lead the list. This
+    # also gives a library with no anchored handler at all (itsdangerous) a real,
+    # source-backed entrypoint, which the code-understanding contract requires.
+    entry_node_ids = {entry["node_id"] for entry in entrypoints}
+    promoted: list[dict] = []
+    for req in requests:
+        root = req.get("entry_node")
+        if not root or root in entry_node_ids:
+            continue
+        node = gl.nodes.get(root)
+        if node is None:
+            continue
+        nfile, nline = gl.loc(node)[0], gl.loc(node)[1]
+        if not nfile or not isinstance(nline, int) or nline <= 0:
+            continue
+        if _is_nonproduct_path(nfile):
+            continue
+        if primary_family is not None:
+            fam = _language_family(nfile)
+            if fam is not None and fam != primary_family:
+                continue
+        entry_node_ids.add(root)
+        label = gl.label(node)
+        eid = f"entry.{_slug(label)}"
+        if eid in used_ids:
+            eid = f"{eid}.{_slug(root)}"
+        used_ids.add(eid)
+        try:
+            efile = comp._relative_path(nfile) or nfile
+        except Exception:
+            efile = nfile
+        promoted.append({
+            "id": eid,
+            "label": label,
+            "kind": "request-lifecycle",
+            "node_id": root,
+            "file": efile,
+            "line": nline,
+        })
+    entrypoints = promoted + entrypoints
 
     files: list[dict] = []
     try:
