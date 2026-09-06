@@ -37,6 +37,11 @@ from typing import Any, Optional
 
 from lachesis.nav import mcp_server as M
 
+try:
+    from lachesis.config import is_nonproduct as _is_nonproduct
+except Exception:  # config is pure-stdlib and same-package, so this should not fail;
+    _is_nonproduct = None  # if it ever does, the gate fails open (keeps everything).
+
 BUNDLE_VERSION = "1.0"
 FINDING_SCHEMA_VERSION = "0.1"
 _HEX64 = 64
@@ -44,6 +49,26 @@ _HEX64 = 64
 
 def _call(name: str, args: dict) -> Any:
     return json.loads(M.call_tool(name, args, "json"))
+
+
+def _is_nonproduct_path(path: Optional[str]) -> bool:
+    """True when a source path is test/example/docs/benchmark scaffolding.
+
+    The featured comprehension surfaces (entrypoints, request roots, the core spine)
+    describe what the *product* does, so scaffolding must never seed them. Build-time
+    exclusion normally keeps such files out of the graph entirely, but the exporter
+    must not rely on that -- run against a graph built without exclusion, an uncalled
+    ``test_*`` function is an in-degree-0 callable and would otherwise rank as a
+    top-of-stack driver, refeaturing exactly the tests the classifier is meant to
+    drop. Reuses the same classifier the build filter uses, so the two agree; fails
+    open (keeps the node) only if the classifier is somehow unavailable.
+    """
+    if not path or _is_nonproduct is None:
+        return False
+    try:
+        return bool(_is_nonproduct(path))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------- identity
@@ -589,6 +614,9 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int) -> list[str
     for hid in handler_ids:
         if hid and hid not in seen:
             seen.add(hid)
+            node = gl.nodes.get(hid)
+            if node is not None and _is_nonproduct_path(gl.loc(node)[0]):
+                continue  # a test/example handler is not a product lifecycle root
             roots.append(hid)
 
     drivers: list[tuple[int, str]] = []
@@ -602,6 +630,10 @@ def _lifecycle_roots(index, gl, handler_ids: list[str], *, cap: int) -> list[str
             continue
         f, l = gl.loc(node)[0], gl.loc(node)[1]
         if not f or not isinstance(l, int) or l <= 0:
+            continue
+        # An uncalled test_* function is in-degree-0; exclude scaffolding so it never
+        # ranks as a top-of-stack driver on a graph built without build-time exclusion.
+        if _is_nonproduct_path(f):
             continue
         try:
             out = sum(1 for _ in index.targets(nid, *_CALL_EDGE_KINDS))
@@ -772,6 +804,8 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
             f, l = gl.loc(node)[0], gl.loc(node)[1]
             if not f or not isinstance(l, int) or l <= 0:
                 continue
+            if _is_nonproduct_path(f):
+                continue  # keep scaffolding off the architecture core
             asm.add_node(_norm_node(gl, node), default_kind="function")
             node_ids.add(nid)
             try:
@@ -825,6 +859,9 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
             # A code-understanding entrypoint must be openable: it needs a real
             # file and line, or it is not a place a developer can actually begin.
             if not nfile or not isinstance(nline, int) or nline <= 0:
+                continue
+            # ...and it must be product code -- never a test/example handler.
+            if _is_nonproduct_path(nfile):
                 continue
             asm.add_node(_norm_node(gl, node), default_kind="function")
             how = anchor.get("how")
