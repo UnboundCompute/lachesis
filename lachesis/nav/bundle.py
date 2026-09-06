@@ -551,12 +551,135 @@ def _norm_node(gl, node: dict) -> dict:
 
 # The request lifecycle a reader wants is the *success* path; error, teardown and
 # logging branches are real but secondary, so we only derank them when choosing the
-# primary hop -- never drop them. Substring match keeps this language-agnostic.
-_LIFECYCLE_ERROR_TOKENS = (
-    "exception", "error", "teardown", "cleanup", "abort", "log_",
-    "handle_http", "raise_", "rollback", "finalize_request",
-)
+# primary hop -- never drop them. Word-token match (not raw substring) over the
+# identifier keeps this generic and framework-agnostic: it is a vocabulary of
+# English failure/teardown verbs, never a hardcoded symbol from one library.
+_LIFECYCLE_ERROR_TOKENS = frozenset({
+    "exception", "error", "err", "teardown", "cleanup", "abort", "raise",
+    "rollback", "fail", "reject", "panic", "warn", "log", "logging",
+})
 _CALL_EDGE_KINDS = ("CALLS", "INVOKES", "MAY_INVOKE")
+
+# A special-case/fallback branch is real but is not the lifecycle a reader opens the
+# bundle to follow: an auto-generated default reply, a not-found placeholder, an
+# unsupported-method stub. Deranked (never dropped) below error branches when picking
+# the primary hop, so the spine stays on the ordinary request rather than diving into
+# a corner case. Generic English morphology -- matches ``make_default_options_response``
+# or ``handle_not_found`` in any codebase, not a symbol from one framework.
+_LIFECYCLE_FALLBACK_TOKENS = frozenset({
+    "default", "fallback", "options", "notfound", "missing", "unsupported",
+    "unavailable", "placeholder", "noop", "stub", "unknown",
+})
+
+# A request lifecycle culminates in *constructing the thing it returns* -- a response,
+# a rendered page, a serialized result. We recognise that terminus by morphology so the
+# spine ends there rather than in a routing corner: a construction verb applied to a
+# result noun. Generic across codebases (``make_response``, ``build_result``,
+# ``render_page``, ``serialize_output``), never a hardcoded framework symbol.
+_RESULT_CONSTRUCTION_VERBS = frozenset({
+    "make", "build", "create", "construct", "render", "format", "compose",
+    "produce", "generate", "new", "serialize", "encode", "write", "emit",
+})
+_RESULT_NOUNS = frozenset({
+    "response", "reply", "result", "output", "answer", "payload", "body",
+    "page", "document", "content", "view", "html", "json", "template",
+})
+
+
+def _identifier_tokens(name: Optional[str]) -> list[str]:
+    """Lowercased word tokens of an identifier, splitting snake_case and camelCase.
+
+    ``full_dispatch_request`` -> ``[full, dispatch, request]``; ``makeResponse`` ->
+    ``[make, response]``; ``__call__`` -> ``[call]``; ``HTTPServer`` -> ``[http,
+    server]``. The atom every generic morphology check below reasons over, so a rule
+    keys off whole words rather than raw substrings (no ``err`` inside ``inherit``).
+    """
+    return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|\d+",
+                                          str(name or ""))]
+
+
+def _is_fallback_name(name: Optional[str]) -> bool:
+    return bool(_LIFECYCLE_FALLBACK_TOKENS.intersection(_identifier_tokens(name)))
+
+
+def _is_result_construction(name: Optional[str]) -> bool:
+    """True when an identifier reads as 'construct the returned result'.
+
+    Requires both a construction verb and a result noun as whole tokens, and is not a
+    fallback/error name -- so ``make_response`` and ``render_page`` qualify while a
+    special-case ``make_default_options_response`` (fallback) and a plain
+    ``process_response`` (no construction verb) do not.
+    """
+    toks = set(_identifier_tokens(name))
+    if _LIFECYCLE_ERROR_TOKENS.intersection(toks) or _LIFECYCLE_FALLBACK_TOKENS.intersection(toks):
+        return False
+    return bool(_RESULT_CONSTRUCTION_VERBS.intersection(toks) and _RESULT_NOUNS.intersection(toks))
+
+
+# Generic leading-verb -> third-person phrase, so a hop caption reads as what the
+# step *does* rather than as a bare symbol. Keyed off the identifier's action token,
+# it renders any codebase's ``make_*``/``parse_*``/``dispatch_*`` the same way -- a
+# vocabulary of English verbs, never a per-framework symbol table.
+_VERB_READS_AS = {
+    "make": "builds", "build": "builds", "create": "creates", "construct": "constructs",
+    "new": "creates", "render": "renders", "format": "formats", "compose": "assembles",
+    "produce": "produces", "generate": "generates", "prepare": "prepares", "wrap": "wraps",
+    "get": "reads", "fetch": "fetches", "load": "loads", "read": "reads", "find": "finds",
+    "lookup": "looks up", "resolve": "resolves", "select": "selects", "match": "matches",
+    "search": "searches", "query": "queries", "collect": "collects", "gather": "gathers",
+    "dispatch": "dispatches", "route": "routes", "handle": "handles", "process": "processes",
+    "run": "runs", "execute": "runs", "exec": "runs", "invoke": "invokes", "call": "calls",
+    "apply": "applies", "perform": "performs", "iter": "iterates over",
+    "parse": "parses", "decode": "decodes", "deserialize": "deserializes", "unpack": "unpacks",
+    "encode": "encodes", "serialize": "serializes", "dump": "serializes", "pack": "packs",
+    "write": "writes", "save": "saves", "store": "stores", "persist": "persists",
+    "send": "sends", "emit": "emits", "flush": "flushes", "commit": "commits",
+    "validate": "validates", "check": "checks", "verify": "verifies", "ensure": "ensures",
+    "sign": "signs", "unsign": "verifies the signature on", "hash": "hashes",
+    "init": "initializes", "initialize": "initializes", "setup": "sets up",
+    "configure": "configures", "register": "registers", "bind": "binds", "connect": "connects",
+    "open": "opens", "close": "closes", "push": "pushes", "pop": "pops",
+    "add": "adds", "append": "appends", "remove": "removes", "delete": "deletes",
+    "update": "updates", "set": "sets", "reset": "resets", "clear": "clears",
+    "preprocess": "preprocesses", "postprocess": "post-processes", "finalize": "finalizes",
+    "convert": "converts", "transform": "transforms", "normalize": "normalizes",
+}
+# Modifier/adjective tokens that decorate an identifier without naming its action or
+# object; dropped from a caption so ``full_dispatch_request`` reads "dispatches the
+# request", not "dispatches the full request".
+_CAPTION_FILLER = frozenset({
+    "full", "do", "self", "the", "internal", "impl", "inner", "raw", "safe",
+    "unsafe", "sync", "async", "maybe", "try", "helper", "default", "real",
+})
+
+
+def _readable_caption(name: Optional[str], *, is_entry: bool = False) -> str:
+    """A short human phrase for a hop: what the step does, from its name's morphology.
+
+    Finds the leading action verb (past any modifier like ``full``/``do``) and renders
+    it in the third person over the remaining object tokens: ``make_response`` ->
+    "builds the response", ``full_dispatch_request`` -> "dispatches the request",
+    ``parse_args`` -> "parses the args". A name with no recognised verb reads as its
+    humanized noun phrase (an entry as the place to "start"). Never a framework table --
+    the same rule renders any codebase, and it degrades to the bare symbol on anything
+    it cannot parse, so it only ever adds a hint, never hides the identifier.
+    """
+    toks = _identifier_tokens(name)
+    if not toks:
+        return str(name or "step")
+    verb_i = None
+    for i, tok in enumerate(toks):
+        if tok in _VERB_READS_AS:
+            verb_i = i
+            break
+        if tok not in _CAPTION_FILLER:
+            break  # a leading noun-style token: not a verb-first name
+    if verb_i is not None:
+        phrase = _VERB_READS_AS[toks[verb_i]]
+        obj = [t for t in toks[verb_i + 1:] if t not in _CAPTION_FILLER]
+        return f"{phrase} the {' '.join(obj)}" if obj else phrase
+    human = " ".join(t for t in toks if t not in _CAPTION_FILLER) or " ".join(toks)
+    return f"starts at {human}" if is_entry else human
 
 # Modules that are real product code but *peripheral* to the request lifecycle a
 # reader wants first: the command-line front door, generic string/util helpers, the
@@ -589,8 +712,38 @@ def _is_peripheral_module_path(path: Optional[str]) -> bool:
 
 
 def _is_error_name(name: Optional[str]) -> bool:
-    n = str(name or "").lower()
-    return any(tok in n for tok in _LIFECYCLE_ERROR_TOKENS)
+    return bool(_LIFECYCLE_ERROR_TOKENS.intersection(_identifier_tokens(name)))
+
+
+# How many module areas the concept list surfaces. Concepts are the "areas" a reader
+# would name (the request lifecycle, templates, sessions, the CLI); we bound them so a
+# large tree stays legible while a small one is not padded.
+_MAX_CONCEPTS = 12
+
+
+def _module_stem(path: Optional[str]) -> str:
+    """The bare module name of a source path: ``pkg/sessions.py`` -> ``sessions``."""
+    base = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] or base
+
+
+def _concept_label(path: Optional[str], stem_counts) -> str:
+    """A concept's display label from its module path.
+
+    The module stem alone (``sessions``, ``templating``, ``cli``) is the area name a
+    reader recognises. Widen to ``parent · stem`` only to break a genuine collision --
+    ``app.py`` and ``sansio/app.py`` both stem to ``app`` -- so labels stay short but
+    never ambiguous. Generic over any layout; never a per-framework name table.
+    """
+    p = str(path or "").replace("\\", "/")
+    if p.startswith("src/"):
+        p = p[4:]
+    stem = _module_stem(p)
+    if stem_counts.get(stem, 0) > 1 and "/" in p:
+        parent = p.rsplit("/", 2)[-2]
+        if parent:
+            return f"{parent} · {stem}"
+    return stem
 
 
 def _story_fn_openable(fn: dict) -> bool:
@@ -828,7 +981,7 @@ def _hop_semantics(via: str, branch: dict) -> dict:
     return out
 
 
-def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str], dict]:
+def _story_spine(story: dict, index, gl, *, max_hops: int) -> tuple[list[str], list[str], dict]:
     """Linearize an execution story into (primary success spine, all functions, meta).
 
     The story is a call tree keyed by (caller -> function). The spine walks from the
@@ -839,6 +992,11 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str], d
     Returns the ordered spine node ids, the flat set of every function id the story
     touched (the raw material for the architecture core), and a per-spine-node
     semantics map (how each hop is reached, whether it branches).
+
+    ``index``/``gl`` let the walk recover call edges the story *tree* attached to a
+    different parent (see ``_candidate_children``): the story visits each function
+    once, so a genuine callee can hang off an earlier caller than the one whose body
+    actually makes the call, and a tree-only walk could never reach it.
     """
     steps = story.get("steps") or []
     entry = (story.get("entry") or {}).get("node_id")
@@ -863,6 +1021,45 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str], d
             children.setdefault(caller, []).append(
                 (step.get("sequence", 0), fn, step.get("via") or ""))
 
+    def _candidate_children(node_id: str) -> list[tuple[dict, str]]:
+        """Callees to consider when extending the spine from ``node_id``.
+
+        The execution story is a *tree*: each function is attached under its
+        first-discovered caller, so a real callee can hang off a different parent
+        than the one whose body makes the call. Flask's ``finalize_request`` (which
+        builds the response) lands under ``handle_exception`` in the tree, not under
+        ``full_dispatch_request`` whose call actually reaches it -- so a walk over
+        story-children alone can never route the spine to the response terminus.
+        Recover the missing edges from the graph: every genuine callee of
+        ``node_id`` that the story itself visited becomes a candidate, carrying its
+        story fn record and a via classified from the edge kind. This invents no
+        nodes (only functions already in the story are admitted) and no edges the
+        graph does not hold; it merely lets the spine follow the real call an
+        earlier caller happened to be credited with in the tree.
+        """
+        out: list[tuple[dict, str]] = []
+        story_ids: set[str] = set()
+        for _seq, fn, via in sorted(children.get(node_id, []), key=lambda t: t[0]):
+            cid = fn.get("node_id")
+            if cid:
+                story_ids.add(cid)
+            out.append((fn, via))
+        try:
+            direct = {t.get("id") for t in index.targets(node_id, _CALL_EDGE_KINDS[0])
+                      if t.get("id")}
+            callees = [t.get("id") for t in index.targets(node_id, *_CALL_EDGE_KINDS)
+                       if t.get("id")]
+        except Exception:
+            return out
+        added: set[str] = set()
+        for t in callees:
+            if t in story_ids or t in added or t not in functions:
+                continue
+            added.add(t)
+            out.append((functions[t],
+                        "direct" if t in direct else "indirect:may_invoke"))
+        return out
+
     memo: dict[str, int] = {}
 
     def subtree(nid: str, guard: frozenset) -> int:
@@ -881,25 +1078,56 @@ def _story_spine(story: dict, *, max_hops: int) -> tuple[list[str], list[str], d
         memo[nid] = total
         return total
 
+    reach_memo: dict[str, bool] = {}
+
+    def reaches_result(nid: str, guard: frozenset) -> bool:
+        """Does this subtree build the value the request returns? A response, a
+        rendered page, a serialized result -- recognised by morphology (see
+        ``_is_result_construction``), so the spine can end at the response terminus
+        rather than in a routing corner. Bounded and cycle-guarded like ``subtree``.
+        """
+        if nid in reach_memo:
+            return reach_memo[nid]
+        if nid in guard:
+            return False
+        if _is_result_construction((functions.get(nid) or {}).get("name")):
+            reach_memo[nid] = True
+            return True
+        deeper = guard | {nid}
+        found = any(cid and reaches_result(cid, deeper)
+                    for _, fn, _via in children.get(nid, [])
+                    for cid in (fn.get("node_id"),))
+        reach_memo[nid] = found
+        return found
+
     spine = [entry]
     seen = {entry}
     cur = entry
     meta: dict[str, dict] = {entry: _hop_semantics("entry", branches.get(entry) or {})}
     while len(spine) < max_hops:
         kids = [(fn, via)
-                for _, fn, via in sorted(children.get(cur, []), key=lambda t: t[0])
+                for fn, via in _candidate_children(cur)
                 if fn.get("node_id") not in seen and _story_fn_openable(fn)]
         if not kids:
             break
-        # A direct CALLS edge is the real control flow; ``indirect:may_invoke`` hops
-        # are duck-typed over-approximations (a session deserialize, a JSON dump that
-        # *might* run). Preferring direct keeps the spine on the dispatch chain
-        # (wsgi_app -> full_dispatch_request -> dispatch_request) instead of wandering
-        # into a serialization detour that only looks bigger. Error/teardown branches
-        # derank next, then the deepest subtree breaks the remaining tie.
+        # Rank each candidate hop, best first, by five generic signals:
+        #  1. a direct CALLS edge is the real control flow; ``indirect:may_invoke``
+        #     hops are duck-typed over-approximations (a session deserialize, a JSON
+        #     dump that *might* run), so direct wins;
+        #  2. error/teardown branches derank (real, but not the success path);
+        #  3. special-case/fallback branches derank next (an auto OPTIONS reply, a
+        #     not-found stub -- a corner, not the ordinary request);
+        #  4. a branch that reaches the response/result construction is preferred, so
+        #     the spine ends where the request builds what it returns
+        #     (full_dispatch_request -> finalize_request -> make_response) rather than
+        #     tunnelling into the widest routing subtree and stopping at a corner;
+        #  5. the deepest subtree breaks any remaining tie.
+        # Every signal is morphology over the identifier, never a framework symbol.
         pick = max(kids, key=lambda kv: (
             1 if kv[1] == "direct" else 0,
             0 if _is_error_name(kv[0].get("name")) else 1,
+            0 if _is_fallback_name(kv[0].get("name")) else 1,
+            1 if reaches_result(kv[0].get("node_id"), frozenset()) else 0,
             subtree(kv[0].get("node_id"), frozenset())))
         nid = pick[0].get("node_id")
         meta[nid] = _hop_semantics(pick[1], branches.get(nid) or {})
@@ -943,7 +1171,7 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
             continue
         if not isinstance(story, dict):
             continue
-        spine, functions, meta = _story_spine(story, max_hops=max_hops)
+        spine, functions, meta = _story_spine(story, index, gl, max_hops=max_hops)
         if len(spine) < 2:
             continue
         # A peripheral root (a CLI command, a util helper) still yields a long, valid
@@ -982,7 +1210,13 @@ def _lifecycle_projection(asm: "_Assembler", index, gl, handler_ids: list[str], 
                 continue
             asm.add_node(_norm_node(gl, node), default_kind="function")
             node_ids.add(nid)
-            hop = {"node_id": nid, "caption": gl.label(node)}
+            label = gl.label(node)
+            # ``caption`` stays the exact symbol (a reader can grep it); ``reads_as``
+            # adds a human phrase derived from the symbol's morphology, so the hop
+            # says what the step does ("dispatches the request") without hiding the
+            # identifier. First hop on the spine is the entry -- phrased as a start.
+            hop = {"node_id": nid, "caption": label,
+                   "reads_as": _readable_caption(label, is_entry=not hops)}
             hop.update(meta.get(nid) or {})
             hops.append(hop)
             chain_ids.append(nid)
@@ -1181,28 +1415,44 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         files = []
 
+    # Concepts are the module *areas* a newcomer would name: the request lifecycle,
+    # routing, request context, templates, sessions, the CLI. Call-community
+    # clustering is too coarse here -- a flat single-package framework (every file in
+    # one directory) collapses into one giant community, so the whole request path,
+    # templating and session code read as a single undifferentiated blob. Derive areas
+    # from the *modules* instead: one concept per product file, ranked by how much it
+    # defines (definition count, then path for a stable order), capped at
+    # ``_MAX_CONCEPTS``. Fully generic -- the busiest modules of any codebase are its
+    # areas, named by their own path, never a framework symbol table -- and it degrades
+    # to an empty list, never raises. Ranking on the definition count alone keeps this a
+    # single cheap node scan (no per-node graph query), so it stays bounded on a large
+    # tree where an edge lookup per function would dominate the export.
     concepts: list[dict] = []
     try:
-        architecture = comp.architecture_map(max_communities=8, max_files_per_community=20)
-        for idx, community in enumerate(architecture.get("communities") or []):
-            # Filter non-product files *before* deriving the label and file set: a
-            # community that mixes json5's ``lib/*.js`` with the vendored TypeScript
-            # compiler under ``node_modules`` must be labelled ``lib``, not
-            # ``… · node_modules · typescript · lib`` off the first (vendored) path.
-            paths = [str(path) for path in community.get("files") or []
-                     if path and not _is_nonproduct_path(str(path))]
-            if not paths:
+        import collections as _collections
+        defs: "_collections.Counter" = _collections.Counter()
+        for node in index.nodes_of_kind("function", "method", "constructor"):
+            f = gl.loc(node)[0]
+            if not f or _is_nonproduct_path(f):
                 continue
-            first = paths[0]
-            directory = first.rsplit("/", 1)[0] if "/" in first else first
-            if directory.startswith("src/"):
-                directory = directory[4:]
-            label = directory.replace("/", " · ") or first
+            if primary_family is not None:
+                fam = _language_family(f)
+                if fam is not None and fam != primary_family:
+                    continue  # keep the concept list in the repo's own language
+            try:
+                rel = comp._relative_path(f) or f
+            except Exception:
+                rel = f
+            defs[rel] += 1
+        ranked_modules = sorted(defs.items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ranked_modules[:_MAX_CONCEPTS]
+        stem_counts = _collections.Counter(_module_stem(rel) for rel, _ in top)
+        for rel, n in top:
             concepts.append({
-                "id": f"concept.{_slug(community.get('id') or idx)}",
-                "label": label,
-                "description": f"Connected code area spanning {len(paths)} file(s).",
-                "file_paths": paths,
+                "id": f"concept.{_slug(rel)}",
+                "label": _concept_label(rel, stem_counts),
+                "description": f"The {_module_stem(rel)} module ({n} definition(s)).",
+                "file_paths": [rel],
             })
     except Exception:
         concepts = []
@@ -1445,6 +1695,8 @@ def _finalize_requests(raw_requests: list[dict], node_map: dict,
             nid = hop.get("node_id")
             entry = {"id": f"{rid}:{i:02d}", "node_id": nid,
                      "caption": hop.get("caption")}
+            if hop.get("reads_as"):
+                entry["reads_as"] = hop["reads_as"]
             # Carry the story-derived hop semantics (how this hop is reached, whether
             # it forks control) through decoration so a reader sees the call-seam and
             # decision points, not just an ordered list of names.
