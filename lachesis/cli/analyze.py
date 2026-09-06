@@ -255,6 +255,20 @@ def _run(argv: list[str] | None = None) -> None:
              "exists to reach is never scoped out. An explicitly named file is always "
              "kept; a directory is walked with the same ignore rules as source_dir.",
     )
+    parser.add_argument(
+        "--config", metavar="FILE", default=None,
+        help="path to a lachesis.yml config file. When omitted, the tree is searched "
+             "upward from source_dir for lachesis.yml (or .yaml/.lachesis.* variants). "
+             "The config sets what a build ingests, size caps, and runtime knobs; its "
+             "built-in default excludes tests, examples, docs, fixtures, benchmarks and "
+             "vendored trees from the graph.",
+    )
+    parser.add_argument(
+        "--all-sources", action="store_true",
+        help="disable the default non-product exclusion and compile the whole tree -- "
+             "tests, examples, docs and vendored code included. Equivalent to a config "
+             "with `build.exclude: []`, and wins over any config file for this run.",
+    )
     args = parser.parse_args(argv)
     # Validate the source tree up front. Without this the streaming build path
     # happily runs against a nonexistent path or a single file, finds no frontend
@@ -300,6 +314,27 @@ def _run(argv: list[str] | None = None) -> None:
     for included in include_paths:
         if not os.path.exists(included):
             parser.error(f"--include path does not exist: {included}")
+    # Resolve the project config (lachesis.yml). Its build.paths filter carries the
+    # non-product exclusion default -- tests, examples, docs, fixtures, benchmarks and
+    # vendored trees are dropped from the graph unless the tree opts back in with
+    # `build.exclude: []`/an allow-list, or this run passes --all-sources. The filter is
+    # threaded into every build variant *and* into source_content_hash, so a filtered
+    # build and its cache-validity key describe the very same file set. Any config knob
+    # that mirrors an env var (the `runtime:` block, atropos root) is applied to the
+    # environment here, before the first pipeline call reads it; setdefault keeps an
+    # inherited env var winning over the file, matching the documented precedence.
+    from lachesis import config as _config
+    try:
+        cfg = _config.load(start=args.source_dir, explicit=args.config)
+    except _config.ConfigError as error:
+        parser.error(str(error))
+    for warning in cfg.warnings:
+        print(f"lachesis config: {warning}", file=sys.stderr)
+    if cfg.source:
+        print(f"lachesis: using config {cfg.source}", file=sys.stderr)
+    _config.apply_runtime_env(cfg)
+    # --all-sources wins over the file: complete coverage, no exclusion.
+    path_filter = None if args.all_sources else cfg.build.paths
     # --prune deletes pure-lexical/proof records at the store boundary, so apply the
     # same output defaults before the streaming branch as the ordinary path below.
     # Previously the early return skipped this block and made --stream-shards run
@@ -314,11 +349,13 @@ def _run(argv: list[str] | None = None) -> None:
                 args.source_dir, args.stream_shards, frontend_out,
                 timeout_seconds=args.timeout,
                 max_files_per_package=args.shard_large_packages,
+                path_filter=path_filter,
             )
         else:
             readers, snapshots = run_project_streaming(
                 args.source_dir, args.stream_shards, frontend_out,
                 timeout_seconds=args.timeout, include_paths=include_paths,
+                path_filter=path_filter,
             )
         if not snapshots:
             parser.error(
@@ -374,6 +411,7 @@ def _run(argv: list[str] | None = None) -> None:
             readers, snapshots = run_project_streaming(
                 args.source_dir, stream_root, frontend_out,
                 timeout_seconds=args.timeout, include_paths=include_paths,
+                path_filter=path_filter,
             )
             if not snapshots:
                 parser.error(
@@ -402,17 +440,20 @@ def _run(argv: list[str] | None = None) -> None:
             args.source_dir, frontend_out, enrich=compile_enrich,
             max_workers=args.max_workers, timeout_seconds=args.timeout,
             max_files_per_package=args.shard_large_packages,
+            path_filter=path_filter,
         )
     elif args.incremental:
         graph, snapshots = run_project_incremental(args.source_dir, frontend_out,
                                                    enrich=compile_enrich,
                                                    timeout_seconds=args.timeout,
-                                                   include_paths=include_paths)
+                                                   include_paths=include_paths,
+                                                   path_filter=path_filter)
     else:
         graph, snapshots = run_project(args.source_dir, frontend_out,
                                        enrich=compile_enrich,
                                        timeout_seconds=args.timeout,
-                                       include_paths=include_paths)
+                                       include_paths=include_paths,
+                                       path_filter=path_filter)
     build_fingerprint = None
     if args.incremental and frontend_out:
         manifest_path = default_manifest_path(frontend_out)
@@ -444,7 +485,8 @@ def _run(argv: list[str] | None = None) -> None:
         source_dir=args.source_dir if args.reduced else None,
         # Hashed rather than assumed: the store records what the tree was at build time,
         # so a load can tell whether an already-joined cache still describes it.
-        source_content_hash=(source_content_hash(args.source_dir, include_paths=include_paths)
+        source_content_hash=(source_content_hash(args.source_dir, include_paths=include_paths,
+                                                  path_filter=path_filter)
                              if args.reduced else None),
         build_fingerprint=build_fingerprint,
     )

@@ -1,7 +1,10 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 
-from lachesis.cli.main import build_parser
+from lachesis.cli.main import _load_curated_tour, build_parser
 
 
 class CliArgumentTests(unittest.TestCase):
@@ -28,7 +31,21 @@ class CliArgumentTests(unittest.TestCase):
             with self.subTest(option=option, value=value):
                 with self.assertRaises(SystemExit) as raised:
                     parser.parse_args(["scan", option, value])
-                self.assertEqual(raised.exception.code, 2)
+                    self.assertEqual(raised.exception.code, 2)
+
+    def test_curated_tour_argument_and_loader_strip_unverified_identity(self):
+        args = build_parser().parse_args(["trace", "--curated-tour", "lachesis-tour.json"])
+        self.assertEqual(args.curated_tour, "lachesis-tour.json")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tour.json"
+            path.write_text(json.dumps({"meta": {"curated_tour": {
+                "id": "tour.start", "title": "Start here",
+                "maintainer": {"name": "Untrusted", "verified": True},
+                "steps": [{"flow_id": "request.main"}],
+            }}}), encoding="utf-8")
+            loaded = _load_curated_tour(str(path))
+        self.assertNotIn("maintainer", loaded)
+        self.assertEqual("tour.start", loaded["id"])
 
 
 if __name__ == "__main__":

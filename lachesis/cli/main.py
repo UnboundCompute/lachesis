@@ -358,6 +358,17 @@ def _repo_meta(source: Path) -> tuple[str | None, str | None]:
     return repo, commit
 
 
+def _load_curated_tour(path: str) -> dict:
+    """Load an OSS tour fragment without accepting a verified owner claim."""
+    config = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    curated_tour = config.get("meta", {}).get("curated_tour", config.get("curated_tour"))
+    if not isinstance(curated_tour, dict):
+        raise ValueError("curated tour file must contain meta.curated_tour")
+    curated_tour = dict(curated_tour)
+    curated_tour.pop("maintainer", None)
+    return curated_tour
+
+
 def command_trace(args: argparse.Namespace) -> int:
     """Build (or reuse) a graph and export a lachesis-explorer bundle.json."""
     from lachesis.cli.indexer import (EnvironmentProblem, NoSourceFound,
@@ -389,6 +400,13 @@ def command_trace(args: argparse.Namespace) -> int:
 
     repo, commit = _repo_meta(source)
     progress.phase("exporting bundle")
+    curated_tour = None
+    if args.curated_tour:
+        try:
+            curated_tour = _load_curated_tour(args.curated_tour)
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, ValueError) as error:
+            _stderr(f"lachesis trace: curated tour: {error}")
+            return EXIT_USAGE
     try:
         bundle = bundle_mod.build_bundle(
             str(graph_path),
@@ -401,6 +419,7 @@ def command_trace(args: argparse.Namespace) -> int:
             schema_version=args.schema_version,
             source_url_template=args.source_url_template,
             description=args.description,
+            curated_tour=curated_tour,
         )
     except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
         _stderr(f"lachesis trace: {error}")
@@ -657,6 +676,10 @@ def command_build(args: argparse.Namespace) -> int:
         forwarded.extend(["--stream-shards", args.stream_shards])
     for included in getattr(args, "include_paths", None) or []:
         forwarded.extend(["--include", included])
+    if getattr(args, "config", None):
+        forwarded.extend(["--config", args.config])
+    if getattr(args, "all_sources", False):
+        forwarded.append("--all-sources")
     return analyze.main(forwarded)
 
 
@@ -947,6 +970,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="also analyse this file or directory even if it is outside "
                             "source_dir (repeatable); point it at an advisory's file so a "
                             "narrowed scope never excludes the file the run must reach")
+    build.add_argument("--config", metavar="FILE", default=None,
+                       help="lachesis.yml to control this build (default: search upward "
+                            "from source_dir). Its built-in default excludes tests, "
+                            "examples, docs, fixtures, benchmarks and vendored trees.")
+    build.add_argument("--all-sources", action="store_true",
+                       help="compile the whole tree, including tests/examples/docs/vendor "
+                            "(disables the non-product exclusion; wins over any config)")
     build.set_defaults(handler=command_build, no_prune=False)
 
     trace = subcommands.add_parser(
@@ -971,6 +1001,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="explicit HTTP(S) source template using {file}, {line}, {end_line}, {revision}")
     trace.add_argument("--description", metavar="TEXT",
                        help="one-line projection description recorded in bundle meta (2.0)")
+    trace.add_argument("--curated-tour", metavar="JSON",
+                       help="read a meta.curated_tour fragment and validate it against the exported paths")
     trace.add_argument("--per-family", type=_positive_int, default=6, metavar="N",
                        help="max leads to draw from each sink family (default: 6)")
     trace.add_argument("--max-flows", type=_positive_int, default=40, metavar="N",

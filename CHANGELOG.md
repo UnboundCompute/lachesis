@@ -7,6 +7,55 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.5.2]
+
+Code-understanding release. 0.5.1 gave the 2.0 Explorer bundle a comprehension
+layer; this release makes that layer read like something a newcomer could follow and
+scopes it to the code that actually ships. A project can now declare what is and is
+not its own source, and the guided request walks, hop captions and concept areas are
+reworked so the projection reads as prose over the real call graph rather than a wall
+of symbols. Version, projection and build-scoping only: no graph-schema, query-engine
+or candidate-surface changes, and the schema 1.0 security bundle is unchanged.
+
+### Added
+
+- **`lachesis.yml` project configuration.** A repository can declare its own build and
+  export knobs in a single `lachesis.yml` at the tree root, resolved from the analysis
+  root upward. Vendored, generated, build-config and test/example scaffolding are
+  excluded from the build and from the export projection by default, so the graph and
+  the comprehension surface describe the product code rather than its dependencies and
+  fixtures; the defaults are overridable per project.
+- **Human-readable hop captions.** Each hop in a guided request walk keeps its exact
+  symbol (still greppable) and gains a `reads_as` phrase derived from the symbol's own
+  morphology — a leading action verb rendered over its object tokens — so a reader
+  follows the lifecycle in plain language without losing the identifier.
+- **Module-centric concepts.** `graph.concepts` are now the module areas a newcomer
+  would name — one per product file, ranked by how much it defines and labelled by its
+  own module stem — replacing the single coarse call-community that a flat package
+  collapsed into.
+- **Curated tour manifests and recorded symbol documentation** are consumed by the
+  export when present, and a bounded, source-backed core spine is exported for
+  exploration.
+
+### Changed
+
+- **Request lifecycles root at the real dispatcher and reach their result.** A guided
+  request now begins at the function that actually dispatches the work rather than the
+  thin entry trampoline, and the spine is routed forward — over edges recovered from
+  the call graph, not just the story tree — to the hop that constructs the returned
+  result. Lifecycle roots are ranked by their control cone so the genuine dispatcher
+  leads. Entrypoints, request roots and concepts are gated to the repository's primary
+  language so the projection stays in the repo's own idiom. This changes 2.0
+  comprehension output by design; the strict source-backing on every emitted hop is
+  unchanged.
+
+### Fixed
+
+- Node locations are normalized (a null file, line or end-line reads as `""`/`0`
+  rather than a missing key), and the code-understanding contract is enforced — a
+  code-understanding projection with no openable entrypoints is rejected rather than
+  emitted empty.
+
 ## [0.5.1]
 
 Explorer-bundle comprehension release. The graph-first 2.0 Explorer bundle already
