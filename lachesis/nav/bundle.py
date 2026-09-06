@@ -1419,6 +1419,28 @@ def _project_curated_tour(raw: Optional[dict], values: list[dict], requests: lis
     return result
 
 
+def _normalize_node_location(node: dict) -> None:
+    """Coerce a node's ``file``/``line``/``end_line`` to their 2.0 field types in place.
+
+    Synthetic nodes (heap locations, summary objects) have no source and were
+    emitting ``file: null, line: null``; the 2.0 contract is ``file: ""`` and
+    ``line: 0`` -- a real absence, not a missing key of unknown type -- so a reader
+    can uniformly test ``line > 0`` for openability. ``end_line`` is made mandatory
+    and never less than ``line`` (a single-line span when no wider extent is known,
+    ``0`` for synthetics). Normalizing null to ""/0 does not change which nodes count
+    as source-backed: ``_has_source`` already rejects an empty file and a non-positive
+    line, so featured-path and entrypoint selection are unaffected.
+    """
+    file = node.get("file")
+    node["file"] = file if isinstance(file, str) and file.strip() else ""
+    line = node.get("line")
+    line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else 0
+    node["line"] = line
+    end = node.get("end_line")
+    node["end_line"] = end if (isinstance(end, int) and not isinstance(end, bool)
+                               and end >= line) else line
+
+
 def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[str],
                         lang: Optional[str], indexed_nodes: int,
                         source_url_template: Optional[str] = None,
@@ -1481,6 +1503,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
 
     graph = bundle.get("graph") or {}
     nodes = graph.get("nodes") or []
+    for node in nodes:
+        _normalize_node_location(node)
     node_map = {n.get("id"): n for n in nodes}
     node_ids = set(node_map)
     edges = _canonical_edges(graph.get("edges") or [], node_ids)
@@ -1566,6 +1590,22 @@ def _validate_graph_first(bundle: dict) -> None:
     if not nodes or None in node_ids:
         raise ValueError("graph-first bundle has invalid nodes")
 
+    # Every node carries the concrete 2.0 location types -- ``file`` a string
+    # (``""`` when absent), ``line`` and ``end_line`` non-negative ints with the
+    # span never inverted. Synthetic nodes (heap locations) legitimately report
+    # ``""``/``0``; what is rejected is the earlier ``null`` leak, which left the
+    # field's type undefined for consumers.
+    for node in nodes:
+        nid = node.get("id")
+        if not isinstance(node.get("file"), str):
+            raise ValueError(f"node {nid} file must be a string")
+        line = node.get("line")
+        if not isinstance(line, int) or isinstance(line, bool) or line < 0:
+            raise ValueError(f"node {nid} line must be an int >= 0")
+        end = node.get("end_line")
+        if not isinstance(end, int) or isinstance(end, bool) or end < line:
+            raise ValueError(f"node {nid} end_line must be an int >= line")
+
     coverage = graph.get("coverage") or {}
     if coverage and coverage.get("included_nodes") != len(nodes):
         raise ValueError("graph-first coverage.included_nodes must equal node count")
@@ -1580,6 +1620,21 @@ def _validate_graph_first(bundle: dict) -> None:
             raise ValueError(f"entrypoint {entry.get('id')} references unknown node")
         if not _has_source(node_map.get(nid)):
             raise ValueError(f"entrypoint {entry.get('id')} node has no openable source")
+
+    # A comprehension-first projection is meaningless without a boundary to enter
+    # from and a path with enough hops to be a story. An empty entrypoint set (the
+    # ItsDangerous case) or paths that never exceed a bare def-use pair defeat the
+    # whole projection, so they are rejected here rather than shipped as a hollow
+    # bundle. Request hops are already proven source-backed above, so a >=3-hop
+    # request is a source-backed path of three or more hops by construction.
+    if bundle.get("analysis_projection") == "code-understanding":
+        if not (graph.get("entrypoints") or []):
+            raise ValueError(
+                "code-understanding projection requires at least one production entrypoint")
+        requests = (bundle.get("paths") or {}).get("requests") or []
+        if not any(len(req.get("hops") or []) >= 3 for req in requests):
+            raise ValueError(
+                "code-understanding projection requires a source-backed path of >= 3 hops")
 
     seen_module_nodes: set[str] = set()
     for module in graph.get("modules") or []:
