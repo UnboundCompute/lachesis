@@ -2043,11 +2043,20 @@ _DEFINITION_KINDS = frozenset({
 
 
 def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]:
-    """One unambiguous module per included node, keyed by that node's file.
+    """One unambiguous module per dotted module name, so module ids stay injective.
 
     Every concrete (file-bearing) node lands in exactly one module -- the module of
-    its file -- so no node is ever repeated across modules. A module anchored by an
-    entrypoint carries that entry's node id, giving a reader a place to start.
+    its dotted name -- so no node is ever repeated across modules. A module anchored
+    by an entrypoint carries that entry's node id, giving a reader a place to start.
+
+    Grouping by dotted *name* rather than by file is what keeps the derived module
+    ``id`` injective. Several source files can share one dotted module name -- a C
+    header and its implementation (``cJSON.h`` + ``cJSON.c`` -> ``cJSON``) are the
+    canonical case, since a header+impl are one translation unit -- and if each file
+    became its own module they would collide on ``module.cjson`` and both apps' own
+    duplicate-id guard blanks the whole bundle. Merging by name makes the collision
+    structurally impossible for any language while presenting the header and impl as
+    the single unit they are.
 
     Each module reports both a ``definition_count`` (declarations it owns) and a
     ``symbol_count`` (all projected nodes), and the list is ordered by declarations
@@ -2064,7 +2073,11 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
             anchor_by_file[f] = ep.get("node_id")
 
     kind_by_id = {n.get("id"): (n.get("kind") or "") for n in nodes}
+    # Group by dotted module name. Track each contributing file's node count so a
+    # representative path can be chosen deterministically (below), and preserve the
+    # order node ids are first seen so output stays stable across runs.
     groups: dict[str, list[str]] = {}
+    files_by_module: dict[str, dict[str, int]] = {}
     for node in nodes:
         f = node.get("file")
         if not isinstance(f, str) or not f.strip():
@@ -2076,12 +2089,26 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
             continue
         module_name = _dotted_module(f) or f
         node["module"] = module_name
-        groups.setdefault(f, []).append(node["id"])
+        groups.setdefault(module_name, []).append(node["id"])
+        counts = files_by_module.setdefault(module_name, {})
+        counts[f] = counts.get(f, 0) + 1
+
+    def _is_header(path: str) -> bool:
+        return path.rsplit(".", 1)[-1].lower() in ("h", "hpp", "hh", "hxx")
+
+    def _representative_file(name: str) -> str:
+        # Prefer a non-header implementation file (the header only declares); among
+        # equals, the file contributing the most nodes; ties broken by path so the
+        # choice is deterministic.
+        counts = files_by_module.get(name, {})
+        if not counts:
+            return name
+        return min(counts, key=lambda p: (_is_header(p), -counts[p], p))
 
     modules: list[dict] = []
-    for path in sorted(groups):
-        module_name = _dotted_module(path) or path
-        node_ids = groups[path]
+    for module_name in sorted(groups):
+        node_ids = groups[module_name]
+        path = _representative_file(module_name)
         definition_count = sum(1 for nid in node_ids
                                if kind_by_id.get(nid) in _DEFINITION_KINDS)
         module = {
@@ -2092,7 +2119,14 @@ def _partition_modules(nodes: list[dict], entrypoints: list[dict]) -> list[dict]
             "definition_count": definition_count,
             "symbol_count": len(node_ids),
         }
+        # Anchor on any contributing file that carries an entrypoint (prefer the
+        # representative path's own anchor when it has one).
         anchor = anchor_by_file.get(path)
+        if not anchor:
+            for f in files_by_module.get(module_name, {}):
+                anchor = anchor_by_file.get(f)
+                if anchor:
+                    break
         if anchor:
             module["anchor_node_id"] = anchor
         modules.append(module)
@@ -2516,6 +2550,31 @@ def _clean_purpose(text: Optional[str]) -> Optional[str]:
     return s or None
 
 
+def _purpose_search_dirs(source_dir: str, max_levels: int = 6) -> list[str]:
+    """Directories to look for the project's declared purpose, closest first.
+
+    The graph is often built over a *subdirectory* of the repo (``src/requests``,
+    the TS ``source/`` tree, a C library folder) while the manifest and README that
+    state what the project is live at the repo root. So the search must ascend from
+    ``source_dir`` toward the root -- closest directory first, so a genuinely more
+    specific description near the sources still wins over a monorepo-root one -- and
+    stop at the repository boundary (a ``.git`` entry) or after a bounded number of
+    levels, so it never wanders above the checkout.
+    """
+    dirs: list[str] = []
+    cur = os.path.abspath(source_dir)
+    for _ in range(max_levels):
+        dirs.append(cur)
+        # A ``.git`` entry marks the repo root: include this dir, then stop.
+        if os.path.exists(os.path.join(cur, ".git")):
+            break
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        cur = parent
+    return dirs
+
+
 def _project_purpose(source_dir: Optional[str]) -> Optional[str]:
     """A real one-line "what is this repo" from the source tree, best effort.
 
@@ -2524,15 +2583,27 @@ def _project_purpose(source_dir: Optional[str]) -> Optional[str]:
     boilerplate. This reads the repo's own declared purpose from the places a repo
     states it: the package manifest's ``description`` (npm/PyPI/Cargo/Composer)
     first, since it is authored to be exactly a one-line summary, then the README's
-    first real paragraph as a fallback. Returns None (not a guess) when the tree
+    first real paragraph as a fallback. The search ascends from ``source_dir`` to
+    the repo root, because the graph is frequently built over a subdirectory while
+    the manifest/README sit at the root. Returns None (not a guess) when the tree
     declares nothing, so the caller keeps the honest boilerplate.
     """
     if not source_dir or not os.path.isdir(source_dir):
         return None
 
+    for base in _purpose_search_dirs(source_dir):
+        found = _project_purpose_in(base)
+        if found:
+            return found
+    return None
+
+
+def _project_purpose_in(base_dir: str) -> Optional[str]:
+    """Read a declared purpose from the manifests/README of a single directory."""
+
     def _read(name: str) -> Optional[str]:
         try:
-            with open(os.path.join(source_dir, name), encoding="utf-8") as fh:
+            with open(os.path.join(base_dir, name), encoding="utf-8") as fh:
                 return fh.read()
         except Exception:
             return None
