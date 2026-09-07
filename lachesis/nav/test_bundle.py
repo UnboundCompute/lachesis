@@ -498,6 +498,16 @@ class ComprehensionHelperTests(unittest.TestCase):
         self.assertNotEqual(bundle._slug("click.utils"), bundle._slug("click._utils"))
         self.assertEqual(bundle._slug("click._utils"), "click._utils")
 
+    def test_partition_keeps_type_only_modules_and_definition_counts(self):
+        nodes = [
+            {"id": "n.type", "kind": "interface", "file": "types/options.ts"},
+            {"id": "n.test", "kind": "interface", "file": "test-d/options.ts"},
+        ]
+        modules = bundle._partition_modules(nodes, [])
+        self.assertEqual(["types.options"], [module["name"] for module in modules])
+        self.assertEqual(1, modules[0]["definition_count"])
+        self.assertEqual(["n.type"], modules[0]["node_ids"])
+
     def test_canon_edge_kind_maps_known_and_lowercases_unknown(self):
         self.assertEqual(bundle._canon_edge_kind("CALLS"), "calls")
         self.assertEqual(bundle._canon_edge_kind("SOME_EDGE"), "some edge")
