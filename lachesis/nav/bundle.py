@@ -1768,6 +1768,36 @@ def _comprehension_projection(asm: "_Assembler", *, max_entrypoints: int,
     except Exception:
         pass
 
+    # Module adjacency (the Map's region-to-region edges) is derived downstream by
+    # attributing each graph edge's endpoints to their modules. Left to the guided
+    # projection alone that is starved: a request/value walk only emits the CALLS
+    # edges that happen to fall between *consecutive* hops of one path, so a real
+    # cross-module call between two included declarations that never shared a single
+    # guided path is dropped and the two modules read as unrelated. Repair it from
+    # the full graph: for every declaration already in the pool, add its real CALLS
+    # edges to any other pooled declaration. This invents nothing -- every edge is a
+    # compiler-resolved call between two nodes the bundle already carries -- and adds
+    # no nodes, so the node budget is untouched while adjacency stops being a
+    # sampling artifact. Value/dataflow nodes carry no declaration and simply never
+    # match, so they are excluded from module-boundary accounting for free.
+    try:
+        pooled = set(asm.nodes)
+        _DECL_KINDS = ("function", "method", "constructor", "class")
+        decl_ids = [nid for nid in pooled
+                    if (gl.kind(nid) or asm.nodes[nid].get("kind")) in _DECL_KINDS]
+        for nid in decl_ids:
+            try:
+                targets = index.targets(nid, "CALLS")
+            except Exception:
+                continue
+            for tgt in targets:
+                tid = tgt.get("id")
+                if tid and tid in pooled and tid != nid:
+                    asm.add_edge({"src": nid, "tgt": tid, "kind": "CALLS"},
+                                 pooled)
+    except Exception:
+        pass
+
     # Modules are not built here: they must partition the *final* included node
     # pool (one unambiguous module per node, keyed by that node's file), which is
     # only settled after candidate/capsule/entry nodes are all in and relativized.
@@ -1916,20 +1946,33 @@ def _enrich_graph_nodes(nodes: list[dict], gl) -> None:
         # already a callable, so a function/method reports the module it belongs to,
         # while an operand or a value reports the function that contains it. This is
         # the container a frontend groups by, never an empty field.
+        #
+        # The Explorer 2.0 contract (docs/GRAPH_EXPLORER_BUNDLE.schema.json #/$defs/
+        # scope, enforced by scripts/verify-bundles.mjs) types scope as a structured
+        # object of path-boundary context -- {module, label, kind, ...} -- not a bare
+        # qualname string. Emit that object: the module the node lives in, plus the
+        # enclosing callable's label and kind when the node sits inside one. Every
+        # field is a non-empty string or omitted, so the object always validates.
         try:
             owner = gl.owner_function(twin)
         except Exception:
             owner = None
-        scope = None
+        scope_module = module
+        owner_label = owner_kind = None
         if owner is not None and owner.get("id") != twin.get("id"):
             owner_file, _os, _oe = gl.loc(owner)
-            owner_module = _dotted_module(owner_file)
-            owner_label = gl.label(owner)
-            scope = f"{owner_module}.{owner_label}" if owner_module else owner_label
-        if not scope:
-            scope = module
-        if scope:
-            node["scope"] = scope
+            scope_module = _dotted_module(owner_file) or module
+            owner_label = gl.label(owner) or None
+            owner_kind = owner.get("kind") or None
+        scope_obj = {}
+        if scope_module:
+            scope_obj["module"] = scope_module
+        if owner_label:
+            scope_obj["label"] = owner_label
+        if owner_kind:
+            scope_obj["kind"] = owner_kind
+        if scope_obj:
+            node["scope"] = scope_obj
         # A synthetic node (heap object/location, interprocedural-context binding)
         # reaches this projection with no file of its own. Anchor it to the real site
         # it derives from so it opens at a real location instead of a blank the bundle
@@ -2290,7 +2333,8 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
                         comprehension: Optional[dict] = None,
                         description: Optional[str] = None,
                         purpose: Optional[str] = None,
-                        curated_tour: Optional[dict] = None) -> dict:
+                        curated_tour: Optional[dict] = None,
+                        semantic: bool = True) -> dict:
     """Adapt the assembled evidence into Explorer's graph-first 2.0 contract.
 
     The security envelope remains available under ``security.findings``.  The
@@ -2415,6 +2459,26 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
         ],
     }
 
+    # Reduced-coverage state. A full code-understanding projection needs a
+    # production entrypoint to enter from and a source-backed path of >= 3 hops to
+    # tell a story; a findings-free or shallow tree (p-queue, parson) legitimately
+    # has neither. Rather than leak an exporter exception, mark the bundle reduced
+    # and record the concrete limitation, so the graph still ships as a valid
+    # structural map. The strict entrypoint/hop gate in ``_validate_graph_first``
+    # is skipped when this flag is set; all other invariants still hold.
+    has_entrypoints = bool(entrypoints)
+    has_guided_path = any(len(req.get("hops") or []) >= 3 for req in requests)
+    if not (has_entrypoints and has_guided_path):
+        coverage["reduced"] = True
+        if not has_entrypoints:
+            coverage["limitations"].append(
+                "No production entrypoint was found; this is a structural map "
+                "without a guided request path.")
+        if not has_guided_path:
+            coverage["limitations"].append(
+                "No source-backed path of three or more hops was available; "
+                "guided request paths are omitted.")
+
     meta_out = {
         "repository": repository,
         "language": language,
@@ -2455,6 +2519,23 @@ def _graph_first_bundle(bundle: dict, *, repo: Optional[str], commit: Optional[s
     }
     if tour is not None:
         v2["meta"]["curated_tour"] = tour
+    # Offline semantic enrichment: an additive, advisory comprehension overlay
+    # (meaning-based module labels, node neighbours, facet tags, a 2-D layout,
+    # cross-cutting concerns, ...) derived from the concept-search card vectors.
+    # It decorates the already-built nodes/modules/concepts in place and adds a
+    # top-level ``enrichment`` block. It is available-gated, never forced: with no
+    # local model the call is a no-op and the bundle ships as the structural
+    # projection produced it. It never raises into the export and never touches the
+    # judge -- it only annotates and arranges the compiler-precise structure.
+    if semantic:
+        try:
+            from . import bundle_enrich
+            overlay = bundle_enrich.enrich(
+                M.ctx().store, nodes, modules, concepts, entrypoints)
+            if overlay:
+                v2["enrichment"] = overlay
+        except Exception:
+            pass
     _validate_graph_first(v2)
     return v2
 
@@ -2512,13 +2593,17 @@ def _validate_graph_first(bundle: dict) -> None:
         if not _has_source(node_map.get(nid)):
             raise ValueError(f"entrypoint {entry.get('id')} node has no openable source")
 
-    # A comprehension-first projection is meaningless without a boundary to enter
-    # from and a path with enough hops to be a story. An empty entrypoint set (the
-    # ItsDangerous case) or paths that never exceed a bare def-use pair defeat the
-    # whole projection, so they are rejected here rather than shipped as a hollow
-    # bundle. Request hops are already proven source-backed above, so a >=3-hop
-    # request is a source-backed path of three or more hops by construction.
-    if bundle.get("analysis_projection") == "code-understanding":
+    # A full comprehension-first projection needs a boundary to enter from and a
+    # path with enough hops to be a story. An empty entrypoint set (the
+    # ItsDangerous case) or paths that never exceed a bare def-use pair defeat that
+    # projection -- but they do not defeat the bundle. When the builder could not
+    # assemble a guided path it marks ``coverage.reduced`` and records the concrete
+    # limitation; such a bundle ships as a valid structural map and is exempt from
+    # this gate. Only a bundle that *claims* full coverage must satisfy it, so a
+    # hollow bundle can never masquerade as a complete one. Request hops are
+    # already proven source-backed above, so a >=3-hop request is a source-backed
+    # path of three or more hops by construction.
+    if bundle.get("analysis_projection") == "code-understanding" and not coverage.get("reduced"):
         if not (graph.get("entrypoints") or []):
             raise ValueError(
                 "code-understanding projection requires at least one production entrypoint")
@@ -2708,7 +2793,7 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                  description: Optional[str] = None,
                  curated_tour: Optional[dict] = None,
                  max_entrypoints: int = 40, chain_depth: int = 6,
-                 max_files: int = 2000) -> dict:
+                 max_files: int = 2000, semantic: bool = True) -> dict:
     """Build an explorer bundle (schema 1.0) from a built+enriched graph."""
     load = _call("load_graph", {"path": graph_path, "profile": "all"})
     census = _call("candidate_census", {})
@@ -2815,7 +2900,7 @@ def build_bundle(graph_path: str, *, repo: Optional[str] = None,
                                    source_url_template=source_url_template,
                                    comprehension=projection, description=description,
                                    purpose=_project_purpose(source_dir),
-                                   curated_tour=curated_tour)
+                                   curated_tour=curated_tour, semantic=semantic)
     if schema_version != "1.0":
         raise ValueError(f"unsupported Explorer schema version: {schema_version}")
     return bundle
@@ -2881,7 +2966,13 @@ def validate(bundle: dict) -> None:
     findings = bundle.get("findings")
     if not isinstance(nodes, list) or not nodes:
         raise ValueError("bundle has no nodes")
-    if not isinstance(findings, list) or not findings:
+    # A code-understanding bundle is a valid artifact with zero security findings
+    # (a clean or shallow repository): the graph carries the value, and the
+    # explorer contract treats ``security.findings: []`` as legal. Only the type
+    # is required here; the per-finding integrity loop below simply no-ops on an
+    # empty list. Never abort export just because nothing security-relevant
+    # surfaced.
+    if not isinstance(findings, list):
         raise ValueError("bundle has no findings")
     ids = set()
     for n in nodes:

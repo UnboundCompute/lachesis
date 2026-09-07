@@ -8,7 +8,11 @@ from typing import Iterable
 from .capabilities import ALL_CAPABILITIES, VALID_CAPABILITY_LEVELS
 from .contract import ContractError, FrontendSnapshot
 from .identities import identity_namespace, validate_identity
-from .provenance import inference_provenance_errors, source_provenance_errors
+from .provenance import (
+    SOURCE_PROVENANCE_FIELDS,
+    inference_provenance_errors,
+    source_provenance_errors,
+)
 from .schema import (
     CANONICAL_EDGE_KINDS,
     CANONICAL_NODE_KINDS,
@@ -135,6 +139,34 @@ def _tier_violation(mode: str, message: str) -> None:
         )
 
 
+def _is_external_reference(properties: dict) -> bool:
+    """A declaration-only reference to a symbol defined outside this snapshot.
+
+    In a whole-tree build every ``from lib import target`` (and every C ``extern``
+    with a definition in the tree) resolves to a real, source-backed declaration,
+    so this predicate is false and the full source-provenance contract applies. In
+    a *partial or federated* build -- a single package traced on its own, or one
+    shard of many -- the defining module is absent, and the frontend emits a
+    declaration-only placeholder (the Python analogue of a C ``extern`` prototype)
+    keyed by the import's path-independent ``usr`` so a query-time linker can
+    rejoin it to the defining shard. Such a stub has a callable ``kind`` but, by
+    construction, *no source span in this snapshot*: it names a definition it does
+    not contain. Requiring it to carry a compiler provenance it cannot have would
+    abort every partial or sharded export -- the exact ``trace`` failure this
+    guards against -- so it is exempt from the source-provenance requirement.
+
+    The exemption is deliberately narrow: it fires only for a node that both marks
+    itself ``declaration_only`` *and* carries no source provenance at all. A
+    node with a partial provenance set is a genuine defect and still fails, and a
+    real (source-backed) declaration is never exempted -- its identity is never
+    discarded, only its absent-by-design source span is not demanded.
+    """
+    if not properties.get("declaration_only"):
+        return False
+    return not any(properties.get(field) is not None
+                   for field in SOURCE_PROVENANCE_FIELDS)
+
+
 def _validate_v2(snapshot: FrontendSnapshot) -> None:
     node_ids = _validate_common(snapshot)
     tier_mode = tier_validation_mode()
@@ -169,7 +201,7 @@ def _validate_v2(snapshot: FrontendSnapshot) -> None:
             raise ContractError(
                 f"v2 frontend node {node_id} is outside namespace {snapshot.frontend_id}"
             )
-        if kind in SOURCE_DERIVED_NODE_KINDS:
+        if kind in SOURCE_DERIVED_NODE_KINDS and not _is_external_reference(properties):
             missing = source_provenance_errors(properties)
             if missing:
                 raise ContractError(

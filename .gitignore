@@ -62,3 +62,7 @@ lachesis/_atropos_catalog/
 
 *.pb
 *.kuzu
+
+# Local benchmark harness (datasets, run logs, results/target lists,
+# analysis scripts) -- kept off the public tree.
+benchmark/

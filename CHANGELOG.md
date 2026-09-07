@@ -7,6 +7,37 @@ Lachesis is pre-1.0. Until 1.0 the graph schema, the query surface and the MCP t
 may change between minor versions; those changes are called out here explicitly rather
 than left for you to discover.
 
+## [0.5.3]
+
+Navigation and bounded-export release. This release keeps the compiler-precise graph
+and security evidence contract intact while making the navigation layer more useful for
+readers and safer for partial or federated source snapshots.
+
+### Added
+
+- **Meaning-oriented navigation.** `lachesis search` and `lachesis similar` provide
+  optional local-model semantic ranking with an explicit lexical fallback when the
+  model is unavailable. Community summaries can include semantic labels and exemplars.
+- **Advisory bundle enrichment.** Optional node, module, concept, and bundle annotations
+  carry related symbols, tags, coherence, affinity, and reading-order hints without
+  changing the compiler-derived graph facts.
+
+### Changed
+
+- **Partial-snapshot provenance.** Declaration-only external references are accepted
+  without inventing source spans, while source-backed nodes continue to require the
+  complete provenance contract.
+- **Navigation projection.** Cross-module adjacency and structured scope information
+  are preserved for Explorer consumers, and `trace --repo` reliably honors the explicit
+  repository option. Semantic enrichment can be disabled with `--no-semantic`.
+- **Bounded resource policy.** The accepted memory-budget floor is 768 MiB, with the
+  documented host-RSS ceiling kept separate from that sizing input.
+
+### Fixed
+
+- Added regression coverage for external-reference provenance, semantic enrichment,
+  CLI argument handling, graph projection, and Explorer bundle compatibility.
+
 ## [0.5.2]
 
 Code-understanding release. 0.5.1 gave the 2.0 Explorer bundle a comprehension

@@ -52,11 +52,18 @@ class ConceptSearchTests(unittest.TestCase):
         self.assertTrue(status["install"].startswith("python -m pip install"))
         self.assertEqual(2, len(semantic_cards(_store())))
 
-    def test_missing_runtime_is_an_instruction_not_a_download(self):
+    def test_missing_runtime_falls_back_to_lexical_with_an_instruction(self):
+        # Search must always answer: with the runtime absent it degrades to identifier
+        # relevance rather than erroring out, and it never attempts a download. The
+        # index still names why meaning-based search is off and how to enable it, so the
+        # result stays an instruction, not a dead end.
         with patch("lachesis.nav.concept.importlib.util.find_spec", return_value=None):
             answer = ConceptSearch(_store()).search("input validation")
-        self.assertEqual("concept-runtime-missing", answer["error"])
-        self.assertIn("concept-model download", answer["download"])
+        self.assertNotIn("error", answer)
+        self.assertEqual("lexical-fallback", answer["index"]["strategy"])
+        self.assertEqual("concept-runtime-missing", answer["index"]["semantic"])
+        self.assertIn("concept-model download", answer["index"]["download"])
+        self.assertTrue(answer["results"])
 
     def test_explicit_download_then_offline_search_and_index_cache(self):
         fake_module = types.SimpleNamespace(TextEmbedding=_FakeEmbedding)

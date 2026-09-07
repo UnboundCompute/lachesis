@@ -117,7 +117,7 @@ TOOL_ORDER = (
     "type_explain", "component_boundary", "indirect_targets",
     "architecture_map", "execution_story",
     "change_context", "tests_for", "spec_links",
-    "concept_search", "context_pack",
+    "concept_search", "find_similar", "context_pack",
     "scan", "wrapper_model", "guard_dominance", "counterexample", "invariant_trace",
     "representation_roundtrip", "cross_boundary_paths", "range_analysis",
     "object_lifecycle", "error_path_summary",
@@ -316,6 +316,49 @@ def _seeds(store, token):
 def _seed(store, token):
     seeds = _seeds(store, token)
     return seeds[0] if seeds else None
+
+
+def _did_you_mean(c, token, k=5):
+    """Nearest concept-search names to a token the lexical index could not resolve.
+
+    This is the one deliberate place embeddings touch name resolution, and they only
+    ever *suggest*: the seed still comes from `_seeds` (exact/lexical), so a fuzzy guess
+    can never silently redirect callers/read_body/etc. onto the wrong node. It degrades
+    to nothing -- not an error -- when the model is absent or the token is a bare id."""
+    if not token:
+        return None
+    try:
+        res = c.concepts(DEFAULT_MODEL).search(token, limit=k)
+    except Exception:
+        return None
+    if res.get("index", {}).get("strategy") != "embedding-global":
+        return None
+    hits = [{"name": h["name"], "node_id": h["node_id"], "kind": h.get("kind"),
+             "file": h.get("file"), "line": h.get("line"), "score": h["score"]}
+            for h in res.get("results", [])]
+    return hits or None
+
+
+def _label_semantically(c, partitions):
+    """Attach a semantic exemplar to each community, in place, when a model is present.
+
+    The structural `label` (highest-degree member) stays exactly as-is; this only *adds*
+    `semantic_label` — the member nearest the community's vector centroid — plus a couple
+    of `exemplars`. It reads the members already in each row, so it never widens the query,
+    and it is a no-op (no key added) when embeddings are unavailable: the map degrades to
+    its structural labelling, never errors."""
+    try:
+        concepts = c.concepts(DEFAULT_MODEL)
+    except Exception:
+        return
+    for row in partitions:
+        ids = [m["node_id"] for m in row.get("members", []) if m.get("node_id")]
+        if not ids:
+            continue
+        exemplars = concepts.representatives(ids, k=3)
+        if exemplars:
+            row["semantic_label"] = exemplars[0]["name"]
+            row["exemplars"] = exemplars
 
 
 def _parse_at(value):
@@ -717,6 +760,19 @@ TOOLS = [
          "offset": {"type": "integer", "default": 0},
          "model": {"type": "string", "default": "BAAI/bge-small-en-v1.5"}},
          "required": ["query"]}},
+    {"name": "find_similar",
+     "description": "Read-only. Given one declaration (by node id or exact name), return the "
+                    "declarations most like it by meaning — a 'what else looks like this' over the "
+                    "same local embedding model as concept_search, reusing its cached vectors (no "
+                    "re-embedding). A retrieval lead only: useful for finding sibling handlers, "
+                    "copy-paste variants, or the peers of a function under review. Offline-only; "
+                    "with no model installed it returns an explanatory note, not results.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "node id or exact declaration name to anchor on"},
+         "limit": {"type": "integer", "default": 15},
+         "min_score": {"type": "number", "default": 0.0},
+         "model": {"type": "string", "default": "BAAI/bge-small-en-v1.5"}},
+         "required": ["name"]}},
     {"name": "guards_top",
      "description": "The N most guard-shaped functions, ranked by derived guard signal, with no "
                     "name knowledge needed — a security-hunting entry point (for the spine of an "
@@ -1164,11 +1220,21 @@ def _semantic_lifecycle_report(c, args):
             "lifetime": bundle.get("lifetime", {})}
 
 
-def _wrapper_model(store, token, limit=50):
-    """Infer wrapper roles from nearby callee names and graph effects."""
+def _wrapper_model(c, store, token, limit=50):
+    """Infer wrapper roles from nearby callee names and graph effects.
+
+    The role inference is name-heuristic over resolved callees. When the local embedding
+    model is present, it is *complemented* (never replaced) by `semantic_peers`: the
+    functions that behave most like this one by card similarity. Those are suggestion-only,
+    human-in-loop leads for labelling a wrapper's siblings/variants -- they change no
+    registry fact and carry no verdict, so the judge path is untouched."""
     seeds = _seeds(store, token)
     if not seeds:
-        return {"move": "wrapper_model", "error": f"no function named {token!r}"}
+        err = {"move": "wrapper_model", "error": f"no function named {token!r}"}
+        dym = _did_you_mean(c, token)
+        if dym:
+            err["did_you_mean"] = dym
+        return err
     rows = []
     role_words = {
         "allocator": ("alloc", "malloc", "calloc", "realloc", "new", "create"),
@@ -1187,9 +1253,32 @@ def _wrapper_model(store, token, limit=50):
             rows.append({"wrapper": _ref(store, seed), "callee": callee,
                          "roles": roles, "confidence": "heuristic-name",
                          "evidence": "resolved callee name"})
-    return {"move": "wrapper_model", "functions": [_ref(store, s) for s in seeds],
-            "wrappers": rows[:limit], "count": len(rows),
-            "interpretation": "inference only; no registry facts were changed"}
+    result = {"move": "wrapper_model", "functions": [_ref(store, s) for s in seeds],
+              "wrappers": rows[:limit], "count": len(rows),
+              "interpretation": "inference only; no registry facts were changed"}
+    peers = []
+    try:
+        concepts = c.concepts(DEFAULT_MODEL)
+        seen_peer = set(seeds)
+        for seed in seeds:
+            sim = concepts.find_similar(seed, limit=8)
+            if sim.get("index", {}).get("strategy") != "embedding-global":
+                break  # no model -> no semantic complement; leave the name inference alone
+            for row in sim.get("results", []):
+                if row["node_id"] in seen_peer:
+                    continue
+                seen_peer.add(row["node_id"])
+                peers.append({"name": row["name"], "node_id": row["node_id"],
+                              "kind": row.get("kind"), "file": row.get("file"),
+                              "line": row.get("line"), "score": row["score"]})
+    except Exception:
+        peers = []
+    if peers:
+        peers.sort(key=lambda p: -p["score"])
+        result["semantic_peers"] = peers[:max(1, limit)]
+        result["semantic_note"] = ("behaviourally similar functions (suggestion only, "
+                                   "human-in-loop; changes no registry fact, no verdict)")
+    return result
 
 
 def _guard_dominance(store, args):
@@ -1412,9 +1501,19 @@ def call_tool(name, args, format=None):
     if name == "context_pack":
         semantic = c.concepts(DEFAULT_MODEL).search(
             args["question"], limit=max(6, int(args.get("max_symbols", 6)) * 3))
+        strategy = semantic.get("index", {}).get("strategy")
         semantic_hits = semantic.get("results", []) if "error" not in semantic else []
-        semantic_status = (f"ready:{semantic.get('model')}" if semantic_hits
-                           else semantic.get("error", "no-semantic-matches"))
+        # Report what the seeds actually are. `search` always answers now: with the model
+        # it is meaning-based; without it, it degrades to identifier relevance. Those
+        # lexical hits are still useful seeds, but they must not be labelled `ready` --
+        # that would claim a semantic lift the pack did not get.
+        if strategy == "embedding-global":
+            semantic_status = f"ready:{semantic.get('model')}"
+        elif strategy == "lexical-fallback":
+            semantic_status = "lexical-fallback:" + str(
+                semantic.get("index", {}).get("semantic", "model-unavailable"))
+        else:
+            semantic_status = semantic.get("error", "no-semantic-matches")
         result = c.comprehension.context_pack(
             args["question"], max_symbols=int(args.get("max_symbols", 6)),
             max_neighbors=int(args.get("max_neighbors", 30)),
@@ -1431,6 +1530,15 @@ def call_tool(name, args, format=None):
             args["query"], limit=int(args.get("limit", 20)),
             min_score=float(args.get("min_score", 0.0)),
             offset=int(args.get("offset", 0)))
+        return _emit(name, result, fmt, offset, limit)
+    if name == "find_similar":
+        anchor = args.get("name") or args.get("node_id") or args.get("query")
+        if not anchor:
+            return _emit(name, {"error": "find_similar needs a declaration to anchor on; "
+                                         "pass it as `name` (a node id or exact name)"}, fmt)
+        result = c.concepts(args.get("model", DEFAULT_MODEL)).find_similar(
+            anchor, limit=int(args.get("limit", 15)),
+            min_score=float(args.get("min_score", 0.0)))
         return _emit(name, result, fmt, offset, limit)
 
     if name == "scan":
@@ -1488,7 +1596,7 @@ def call_tool(name, args, format=None):
             result["suppressions"] = scan["suppressions"]
         return _emit(name, result, fmt, offset, limit)
     if name == "wrapper_model":
-        return _emit(name, _wrapper_model(store, args["function"],
+        return _emit(name, _wrapper_model(c, store, args["function"],
                                           int(args.get("limit", 50))), fmt, offset, limit)
     if name == "guard_dominance":
         return _emit(name, _guard_dominance(store, args), fmt, offset, limit)
@@ -1532,6 +1640,7 @@ def call_tool(name, args, format=None):
         result = comm.summary(n=int(args.get("n", 20)),
                               members=int(args.get("members", 8)),
                               min_size=int(args.get("min_size", 2)))
+        _label_semantically(c, result.get("partitions", []))
         return _emit(name, {"move": "communities", **result}, fmt, offset, limit)
     if name == "search":
         # A tool literally called `search` invites `query`/`q` -- an LLM client reaches
@@ -1545,11 +1654,32 @@ def call_tool(name, args, format=None):
                                          "it as `name` (aliases: `query`, `q`)"}, fmt)
         page = si.search_page(store.entries, term, "fuzzy",
                               int(args.get("limit", 25)), int(args.get("offset", 0)))
+        # A multi-word term reads as a description, not a name -- the case a lexical name
+        # match answers worst. When the local model is present, append the concept hits
+        # the name match missed, so `search("verify a password")` still finds the right
+        # function. Single-token lookups stay purely lexical (and the fast seed-resolution
+        # path is untouched); a missing model degrades concept search to lexical, and the
+        # dedup then leaves the page exactly as it was.
+        if len(term.split()) > 1 and int(args.get("offset", 0)) == 0:
+            semantic = c.concepts(DEFAULT_MODEL).search(term, limit=10)
+            if semantic.get("index", {}).get("strategy") == "embedding-global":
+                seen = {hit["node_id"] for hit in page["hits"]}
+                extra = [{"node_id": hit["node_id"], "name": hit["name"],
+                          "kind": hit.get("kind"), "file": hit.get("file"),
+                          "line": hit.get("line"), "score": hit["score"]}
+                         for hit in semantic["results"] if hit["node_id"] not in seen][:5]
+                if extra:
+                    page["semantic_hits"] = extra
+                    page["semantic"] = f"meaning-based recall, model {semantic['model']}"
         return _emit(name, page, fmt, offset, limit)
     if name in ("callers", "callees"):
         seeds = _seeds(store, args["name"])
         if not seeds:
-            return _emit(name, {"error": f"no node named {args['name']!r}"}, fmt)
+            err = {"error": f"no node named {args['name']!r}"}
+            dym = _did_you_mean(c, args["name"])
+            if dym:
+                err["did_you_mean"] = dym
+            return _emit(name, err, fmt)
         direct_only = bool(args.get("direct_only"))
         move = si.callers if name == "callers" else si.callees
         # Every homonym, unioned — not the first one. `callers("funcA")` returning only
@@ -1576,7 +1706,11 @@ def call_tool(name, args, format=None):
         seed = args.get("node_id") if store.node(args.get("node_id") or "") \
             else _seed(store, args.get("name") or "")
         if not seed:
-            return _emit(name, {"error": f"no node named {args.get('name') or args.get('node_id')!r}"}, fmt)
+            err = {"error": f"no node named {args.get('name') or args.get('node_id')!r}"}
+            dym = _did_you_mean(c, args.get("name") or "")
+            if dym:
+                err["did_you_mean"] = dym
+            return _emit(name, err, fmt)
         node = store.node(seed)
         f, sl, el = gl.loc(node)
         body = gl.source_text(node)

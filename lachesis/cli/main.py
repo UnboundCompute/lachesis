@@ -376,7 +376,7 @@ def command_trace(args: argparse.Namespace) -> int:
     from lachesis.cli.progress import Progress
     from lachesis.nav import bundle as bundle_mod
 
-    source = _resolved(args.repo)
+    source = _resolved(args.repo_opt or args.repo)
     progress = Progress(enabled=not args.quiet)
     if not args.quiet:
         _stderr(f"lachesis trace: {source}")
@@ -420,6 +420,7 @@ def command_trace(args: argparse.Namespace) -> int:
             source_url_template=args.source_url_template,
             description=args.description,
             curated_tour=curated_tour,
+            semantic=getattr(args, "semantic", True),
         )
     except Exception as error:  # noqa: BLE001 - CLI turns export errors into one line
         _stderr(f"lachesis trace: {error}")
@@ -464,6 +465,24 @@ def _load_store_for(args: argparse.Namespace, verb: str):
     return store, None, source
 
 
+def _label_communities_semantically(store, partitions) -> None:
+    """Add a `semantic_label` (centroid exemplar) to each partition, in place.
+
+    Additive and optional: the structural `label` is untouched, and when the local
+    embedding model is absent this is a silent no-op, so `communities` still prints its
+    structural map. Reuses the cached card vectors -- nothing is embedded here."""
+    if not partitions:
+        return
+    from lachesis.nav.concept import ConceptSearch, DEFAULT_MODEL
+    concepts = ConceptSearch(store, DEFAULT_MODEL)
+    for row in partitions:
+        ids = [m["node_id"] for m in row.get("members", []) if m.get("node_id")]
+        exemplars = concepts.representatives(ids, k=3) if ids else None
+        if exemplars:
+            row["semantic_label"] = exemplars[0]["name"]
+            row["exemplars"] = exemplars
+
+
 def command_communities(args: argparse.Namespace) -> int:
     store, failure, _ = _load_store_for(args, "communities")
     if store is None:
@@ -472,6 +491,7 @@ def command_communities(args: argparse.Namespace) -> int:
     comm = Communities(store.gl, include_dispatch=args.include_dispatch)
     result = comm.summary(n=args.limit or 20, members=args.members,
                           min_size=args.min_size)
+    _label_communities_semantically(store, result.get("partitions", []))
     if args.json:
         import json
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -483,7 +503,8 @@ def command_communities(args: argparse.Namespace) -> int:
         names = ", ".join(f"{m['name']} ({m['degree']})" for m in result["connectors"])
         print(f"cross-cutting connectors lifted out: {names}")
     for r in result["partitions"]:
-        print(f"\n  #{r['id']}  {r['label']}  "
+        about = f"  ~ {r['semantic_label']}" if r.get("semantic_label") else ""
+        print(f"\n  #{r['id']}  {r['label']}{about}  "
               f"({r['size']} funcs, cohesion {r['cohesion']})")
         for m in r["members"]:
             print(f"      {m['degree']:4}  {m['name']}  {m['handle'] or ''}")
@@ -508,6 +529,73 @@ def command_report(args: argparse.Namespace) -> int:
     out.write_text(text, encoding="utf-8")
     _stderr()
     _stderr(f"wrote {out} ({len(text.splitlines())} lines)")
+    return EXIT_OK
+
+
+# -------------------------------------------------------------------------- search
+
+def command_search(args: argparse.Namespace) -> int:
+    """Rank symbols by what a query means, not just the words it shares with a name.
+
+    With the local model present this is a cosine over the whole graph, so an intent
+    phrasing finds the right function even when it shares no token with the name. Without
+    the model it falls back to identifier relevance, so the verb always answers."""
+    store, failure, _ = _load_store_for(args, "search")
+    if store is None:
+        return failure
+    from lachesis.nav.concept import ConceptSearch
+    result = ConceptSearch(store, args.model).search(
+        args.query, limit=args.limit, min_score=args.min_score)
+    if args.json:
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    strategy = result["index"]["strategy"]
+    if strategy == "lexical-fallback":
+        _stderr(f"search: semantic model unavailable "
+                f"({result['index'].get('semantic')}); ranking by identifier relevance. "
+                f"Run `lachesis concept-model download` to enable meaning-based search.")
+    _stderr()
+    print(f"{result['count']} of {result['total']} matches for {args.query!r}  "
+          f"[{strategy}]")
+    for hit in result["results"]:
+        location = f"{hit.get('file') or '?'}:{hit.get('line') or '?'}"
+        print(f"  {hit['score']:.3f}  {hit['name']}  ({location})")
+    return EXIT_OK
+
+
+def command_similar(args: argparse.Namespace) -> int:
+    """List the declarations most like a given one by meaning.
+
+    Nearest-neighbour over the same cached card vectors `search` builds -- nothing is
+    re-embedded. Useful for finding sibling handlers, copy-paste variants, or the peers
+    of a function under review. Similarity is inherently semantic, so with no model
+    installed this reports that plainly rather than inventing lexical neighbours."""
+    store, failure, _ = _load_store_for(args, "similar")
+    if store is None:
+        return failure
+    from lachesis.nav.concept import ConceptSearch
+    result = ConceptSearch(store, args.model).find_similar(
+        args.anchor, limit=args.limit, min_score=args.min_score)
+    if args.json:
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    if result["index"]["strategy"] != "embedding-global":
+        _stderr(f"similar: semantic model unavailable "
+                f"({result['index'].get('semantic')}). "
+                f"Run `lachesis concept-model download` to enable it.")
+        return EXIT_OK
+    if "error" in result:
+        _stderr(f"similar: {result['error']}")
+        return EXIT_USAGE
+    anchor = result["anchor_node"]
+    _stderr()
+    print(f"nearest to {anchor['name']}  "
+          f"({anchor.get('file') or '?'}:{anchor.get('line') or '?'})")
+    for hit in result["results"]:
+        location = f"{hit.get('file') or '?'}:{hit.get('line') or '?'}"
+        print(f"  {hit['score']:.3f}  {hit['name']}  ({location})")
     return EXIT_OK
 
 
@@ -871,6 +959,44 @@ def build_parser() -> argparse.ArgumentParser:
                              help="write the full result to stdout as JSON")
     communities.set_defaults(handler=command_communities)
 
+    search = subcommands.add_parser(
+        "search", help="find symbols by meaning, not just matching names",
+        description="Index the tree if needed, then rank functions and types by how well "
+                    "they match a natural-language query. With the optional local model "
+                    "installed this searches by meaning (an intent phrasing finds the "
+                    "right symbol even when it shares no word with the name); without it, "
+                    "search falls back to identifier relevance.")
+    _add_source_flags(search)
+    search.add_argument("query", help="what to look for, in plain words")
+    search.add_argument("--limit", type=_nonnegative_int, default=15, metavar="N",
+                        help="how many matches to print (default 15)")
+    search.add_argument("--min-score", type=float, default=0.0, metavar="S",
+                        help="drop matches scoring below S")
+    search.add_argument("--model", default="BAAI/bge-small-en-v1.5",
+                        help="local embedding model (default: BAAI/bge-small-en-v1.5)")
+    search.add_argument("--json", action="store_true",
+                        help="write the full result to stdout as JSON")
+    search.set_defaults(handler=command_search)
+
+    similar = subcommands.add_parser(
+        "similar", help="find declarations most like a given one, by meaning",
+        description="Index the tree if needed, then rank declarations by how much they "
+                    "resemble one you name — nearest-neighbour over the same local "
+                    "embedding vectors `search` builds. Handy for finding sibling handlers, "
+                    "copy-paste variants, or the peers of a function under review. Requires "
+                    "the optional local model; without it, it says so rather than guessing.")
+    _add_source_flags(similar)
+    similar.add_argument("anchor", help="a node id or exact declaration name to compare against")
+    similar.add_argument("--limit", type=_nonnegative_int, default=15, metavar="N",
+                         help="how many neighbours to print (default 15)")
+    similar.add_argument("--min-score", type=float, default=0.0, metavar="S",
+                         help="drop neighbours scoring below S")
+    similar.add_argument("--model", default="BAAI/bge-small-en-v1.5",
+                         help="local embedding model (default: BAAI/bge-small-en-v1.5)")
+    similar.add_argument("--json", action="store_true",
+                         help="write the full result to stdout as JSON")
+    similar.set_defaults(handler=command_similar)
+
     report = subcommands.add_parser(
         "report", help="write a Markdown architecture report for a codebase",
         description="Index the tree if needed, then assemble a one-page architecture "
@@ -985,9 +1111,14 @@ def build_parser() -> argparse.ArgumentParser:
                     "lachesis-explorer bundle.json: the sink families the graph carries, "
                     "each with the reachability cone that feeds it, in the shape the "
                     "explorer renders. Every flow is a fact, not a verdict.")
-    trace.add_argument("repo", nargs="?", default=".",
+    trace.add_argument("repo", nargs="?", default=None,
                        help="source tree or existing graph to trace (default: .)")
-    trace.add_argument("--repo", dest="repo", metavar="PATH",
+    # The flag must NOT share ``dest`` with the positional: argparse fills the
+    # ``nargs="?"`` positional's default *after* storing the option, so a shared
+    # dest lets an absent positional clobber ``--repo`` back to the default and the
+    # requested tree is silently replaced by the current directory. Keep them
+    # separate and reconcile in the handler (flag wins, then positional, then cwd).
+    trace.add_argument("--repo", dest="repo_opt", metavar="PATH",
                        help="same as the positional repo argument")
     trace.add_argument("-o", "--out", default="bundle.json", metavar="FILE",
                        help="bundle path to write (default: bundle.json)")
@@ -1011,6 +1142,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="maximum seconds per frontend when building (default: 600)")
     trace.add_argument("--refresh", action="store_true",
                        help="rebuild the graph even if a current cache exists")
+    trace.add_argument("--no-semantic", dest="semantic", action="store_false",
+                       help="skip the optional semantic enrichment overlay (meaning-based "
+                            "module labels, node neighbours, tags, layout); it is applied "
+                            "automatically when a local concept-search model is present")
+    trace.set_defaults(semantic=True)
     trace.add_argument("--quiet", "-q", action="store_true",
                        help="suppress progress narration on stderr")
     trace.set_defaults(handler=command_trace)
@@ -1081,7 +1217,7 @@ def build_parser() -> argparse.ArgumentParser:
 KNOWN_COMMANDS = {
     "scan", "communities", "report", "mcp", "cache", "doctor",
     "concept-model", "enrich", "analyze", "candidates", "explain", "build",
-    "query", "plan", "completion", "trace",
+    "query", "plan", "completion", "trace", "search", "similar",
 }
 
 

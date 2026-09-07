@@ -184,9 +184,18 @@ class ValidateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bundle.validate(b)
 
-    def test_empty_findings_rejected(self):
+    def test_empty_findings_accepted(self):
+        # A code-understanding bundle is valid with zero security findings: a
+        # clean or shallow repository has nothing security-relevant to report, and
+        # the graph is the value. Export must not abort over an empty findings
+        # list (only a non-list is rejected).
         b = self._bundle()
         b["findings"] = []
+        bundle.validate(b)  # no raise
+
+    def test_non_list_findings_rejected(self):
+        b = self._bundle()
+        b["findings"] = None
         with self.assertRaises(ValueError):
             bundle.validate(b)
 
@@ -462,6 +471,34 @@ class ComprehensionProjectionTests(unittest.TestCase):
         # n.a and n.c are both sourced, so this one survives; assert its shape holds.
         self.assertEqual(len(result["paths"]["requests"]), 1)
 
+    def test_missing_entrypoint_yields_reduced_bundle(self):
+        # A shallow / findings-free tree (the p-queue, parson cases) may carry no
+        # production entrypoint. Rather than leak an exporter exception, the
+        # builder ships a valid reduced-coverage structural map that records the
+        # concrete limitation.
+        result = self._bundle_with({"entrypoints": []})
+        self.assertTrue(result["graph"]["coverage"]["reduced"])
+        self.assertEqual([], result["graph"]["entrypoints"])
+        self.assertTrue(any("entrypoint" in lim.lower()
+                            for lim in result["graph"]["coverage"]["limitations"]))
+        # A reduced bundle is exempt from the full-projection gate but still
+        # satisfies every other invariant.
+        bundle._validate_graph_first(result)
+
+    def test_no_guided_path_yields_reduced_bundle(self):
+        # An entrypoint but no source-backed path of >= 3 hops (parson: many call
+        # nodes, no deep request chain) is likewise reduced, not rejected.
+        result = self._bundle_with({
+            "requests": [{"id": "r", "kind": "call-path", "description": "d",
+                          "entry_node": "n.a",
+                          "hops": [{"node_id": "n.a", "caption": "a"},
+                                   {"node_id": "n.b", "caption": "b"}]}],
+        })
+        self.assertTrue(result["graph"]["coverage"]["reduced"])
+        self.assertTrue(any("hops" in lim.lower() or "hop" in lim.lower()
+                            for lim in result["graph"]["coverage"]["limitations"]))
+        bundle._validate_graph_first(result)
+
     def test_validator_rejects_coverage_mismatch(self):
         result = self._bundle_with({})
         result["graph"]["coverage"]["included_nodes"] += 1
@@ -577,6 +614,58 @@ class ComprehensionHelperTests(unittest.TestCase):
                 return text
 
         self.assertEqual(bundle._count_source_lines(_Index(), _GL()), 5)
+
+
+class EnrichGraphNodesScopeTests(unittest.TestCase):
+    """Node scope must be the structured object the Explorer 2.0 contract expects.
+
+    docs/GRAPH_EXPLORER_BUNDLE.schema.json #/$defs/scope (enforced by the Explorer
+    verifier scripts/verify-bundles.mjs::validateScope) types scope as an object of
+    path-boundary context. The exporter used to emit a bare qualname string, which the
+    Explorer rejects with "scope must be an object"; these pin the object shape.
+    """
+
+    class _GL:
+        def __init__(self, twins):
+            self.nodes = {t["id"]: t for t in twins}
+
+        def loc(self, node):
+            props = node.get("properties", {})
+            return (props.get("file"), props.get("start_line"), props.get("end_line"))
+
+        def label(self, node):
+            return str(node.get("label", ""))
+
+        def owner_function(self, node):
+            if node.get("kind") in ("function", "method", "constructor"):
+                return node
+            owner_id = node.get("properties", {}).get("owner_function_id")
+            return self.nodes.get(owner_id)
+
+        def prop(self, node, key, default=None):
+            return node.get("properties", {}).get(key, default)
+
+        def source_excerpt(self, node, max_len=400):
+            return ""
+
+    def test_operand_scope_is_an_object_naming_its_enclosing_callable(self):
+        owner = {"id": "fn", "kind": "function", "label": "_lazy_sha1",
+                 "properties": {"file": "flask/sessions.py", "start_line": 10}}
+        operand = {"id": "op", "kind": "value", "label": "sha1",
+                   "properties": {"file": "flask/sessions.py", "start_line": 12,
+                                  "owner_function_id": "fn"}}
+        node = {"id": "op", "kind": "value", "file": "flask/sessions.py", "line": 12, "label": "sha1"}
+        bundle._enrich_graph_nodes([node], self._GL([owner, operand]))
+        self.assertEqual(node["scope"], {"module": "flask.sessions", "label": "_lazy_sha1", "kind": "function"})
+
+    def test_module_level_callable_scope_is_an_object_with_just_the_module(self):
+        fn = {"id": "fn", "kind": "function", "label": "create_app",
+              "properties": {"file": "flask/app.py", "start_line": 3}}
+        node = {"id": "fn", "kind": "function", "file": "flask/app.py", "line": 3, "label": "create_app"}
+        bundle._enrich_graph_nodes([node], self._GL([fn]))
+        # owner_function returns the callable itself, so there is no inner label to add.
+        self.assertEqual(node["scope"], {"module": "flask.app"})
+        self.assertIsInstance(node["scope"], dict)
 
 
 if __name__ == "__main__":
