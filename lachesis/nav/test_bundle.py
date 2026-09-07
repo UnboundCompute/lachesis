@@ -493,6 +493,11 @@ class ComprehensionHelperTests(unittest.TestCase):
         self.assertEqual(bundle._dotted_module("src/flask/app.py"), "flask.app")
         self.assertEqual(bundle._dotted_module("pkg/__init__.py"), "pkg")
 
+    def test_module_slug_preserves_private_module_identity(self):
+        # Public/private module twins must remain distinct in graph.modules IDs.
+        self.assertNotEqual(bundle._slug("click.utils"), bundle._slug("click._utils"))
+        self.assertEqual(bundle._slug("click._utils"), "click._utils")
+
     def test_canon_edge_kind_maps_known_and_lowercases_unknown(self):
         self.assertEqual(bundle._canon_edge_kind("CALLS"), "calls")
         self.assertEqual(bundle._canon_edge_kind("SOME_EDGE"), "some edge")
