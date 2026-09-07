@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import sys
 import tempfile
 import types
@@ -8,6 +9,15 @@ from unittest.mock import patch
 
 from . import bundle_enrich
 from .graph_store import GraphStore
+
+# The enrichment maths (SVD layout, cosine neighbours, centroids) run on numpy,
+# which reaches the machine only with the concept-search extra -- FastEmbed pulls
+# it in. The tests below mock the heavy embedder but still need the lightweight
+# array library for the real precompute path; where it is absent (a bare
+# ``pip install -e .[dev]`` such as the CI checks matrix) the pass is a documented
+# no-op, so they skip rather than assert the no-op is the enriched result. This
+# mirrors how the native-kernel tests skip themselves when no kernel is staged.
+_HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 
 
 class _FakeEmbedding:
@@ -77,6 +87,7 @@ class BundleEnrichTests(unittest.TestCase):
         self.assertNotIn("related", nodes[0])
         self.assertNotIn("semantic_label", modules[0])
 
+    @unittest.skipUnless(_HAS_NUMPY, "enrichment maths require numpy (concept-search extra)")
     def test_enrichment_decorates_structure_in_place(self):
         fake_module = types.SimpleNamespace(TextEmbedding=_FakeEmbedding)
         nodes, modules, concepts = _bundle_objects()
@@ -115,6 +126,7 @@ class BundleEnrichTests(unittest.TestCase):
         # Per-concept: a coherence score is recorded.
         self.assertIn("coherence", concepts[0])
 
+    @unittest.skipUnless(_HAS_NUMPY, "enrichment maths require numpy (concept-search extra)")
     def test_overlay_is_json_serialisable(self):
         import json
         fake_module = types.SimpleNamespace(TextEmbedding=_FakeEmbedding)
