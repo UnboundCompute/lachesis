@@ -508,6 +508,11 @@ class ComprehensionHelperTests(unittest.TestCase):
         self.assertEqual(1, modules[0]["definition_count"])
         self.assertEqual(["n.type"], modules[0]["node_ids"])
 
+    def test_api_rank_prefers_public_class_over_dispatch_method(self):
+        public_class = {"anchor_kind": "class", "anchor_label": "Environment"}
+        dispatch_method = {"anchor_kind": "method", "anchor_label": "visit_For"}
+        self.assertLess(bundle._api_rank(public_class), bundle._api_rank(dispatch_method))
+
     def test_canon_edge_kind_maps_known_and_lowercases_unknown(self):
         self.assertEqual(bundle._canon_edge_kind("CALLS"), "calls")
         self.assertEqual(bundle._canon_edge_kind("SOME_EDGE"), "some edge")
