@@ -40,9 +40,13 @@ See `qa-stress-test/reports/CLAUDE-ENGINE-HANDOFF.md` and
 
 ## Bounded acceptance
 
-Use local fixtures only. Keep each run under 90 seconds and 768 MB, cap flows
-to three per family, and place graph stores, caches, and output bundles under a
-unique temporary directory. Remove that directory in a `finally`/trap after
+Use local fixtures only. Keep each run under 90 seconds, set
+`LACHESIS_MEMORY_BUDGET_MB=768` (the accepted floor, which also minimizes peak
+RSS), and provision ~1.5 GiB of host memory: the budget is a sizing input, not a
+hard cap, and a bounded Flask-scale preflight peaks at ~1290 MiB of process-tree
+RSS at that setting (see `arachne/docs/scaling.md`). Cap flows to three per
+family, and place graph stores, caches, and output bundles under a unique
+temporary directory. Remove that directory in a `finally`/trap after
 each run. Do not run AWS or retain generated graph databases in this repository.
 
 Acceptance must include:

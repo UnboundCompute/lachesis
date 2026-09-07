@@ -162,11 +162,24 @@ that `--prune` discards later.
 ## Three-pass resource and equivalence gate
 
 Production execution uses a 5 GiB total process-tree budget by default. Override it with
-`LACHESIS_MEMORY_BUDGET_MB`; values below 1024 MiB are rejected because the compiler and graph
-store cannot operate reliably inside that envelope. Compiler frontends run serially by default
-so independent C and TypeScript heaps cannot multiply past the shared budget. A runner with a
-larger configured budget can opt into output-identical compiler concurrency with
-`LACHESIS_FRONTEND_JOBS`.
+`LACHESIS_MEMORY_BUDGET_MB`; values below 768 MiB are rejected. 768 MiB is the knee below which
+the budget stops governing its dominant derived sub-limit: the TypeScript old-space is sized at
+70% of the budget with a hard 512 MiB floor, so below ~731 MiB that share drops under the floor
+and the budget no longer controls the tightest pass (at 512 the heap floor alone would consume
+the whole budget). Compiler frontends run serially by default so independent C and TypeScript
+heaps cannot multiply past the shared budget. A runner with a larger configured budget can opt
+into output-identical compiler concurrency with `LACHESIS_FRONTEND_JOBS`.
+
+The budget is a **sizing input**, not a hard resident-set cap: it derives the sub-limits above
+(and the Kùzu buffer pool at 40%, the C chunk size, the translation-facts defer threshold), but
+nothing in the engine enforces `RLIMIT_AS` or a watchdog against it, so the process tree's actual
+peak RSS can and does exceed the configured number. Because the two largest derived terms scale
+with the budget (TS old-space at 70%, Kùzu pool at 40%), the *smallest* accepted budget also
+yields the *smallest* peak: a bounded Flask preflight
+(`--per-family 3 --max-flows 3 --schema-version 2.0`) peaks at ~1290 MiB of process-tree RSS at
+`LACHESIS_MEMORY_BUDGET_MB=768`, rising to ~1650 MiB at 1024 and 2048. Provision the host memory
+ceiling from the measured peak of the target workflow (≈1.5 GiB for a Flask-scale preflight), not
+from the budget number itself.
 
 The TypeScript old-space ceiling is derived from 70% of the shared budget (3584 MiB at the
 default), reserving the remainder for Node native allocations and the parent process. An
