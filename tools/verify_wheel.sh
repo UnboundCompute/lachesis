@@ -113,8 +113,9 @@ export function handle(request: Request): string {
   return findById(request.body.id);
 }
 TS
-./v/bin/lachesis build project /tmp/verify-wheel.kuzu
-./v/bin/lachesis query --format text /tmp/verify-wheel.kuzu overview | tee overview.txt
+wheel_graph="$workspace/verify-wheel.kuzu"
+./v/bin/lachesis build project "$wheel_graph"
+./v/bin/lachesis query --format text "$wheel_graph" overview | tee overview.txt
 grep -q "typescript" overview.txt \
   || { echo "FAIL: TypeScript was not analysed -- vendored compiler not reachable" >&2; exit 1; }
 
@@ -128,7 +129,8 @@ def lookup(identifier):
 def handle(request):
     return lookup(request["id"])
 PY
-./v/bin/lachesis build pyproject_src /tmp/verify-wheel-py.kuzu
+python_graph="$workspace/verify-wheel-py.kuzu"
+./v/bin/lachesis build pyproject_src "$python_graph"
 
 say "the MCP server speaks MCP over stdio"
 ./v/bin/python - <<'PY'

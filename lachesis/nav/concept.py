@@ -22,9 +22,8 @@ from .graphlib import CALLABLE_KINDS, camel_tokens
 
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
-INDEX_VERSION = 8
+INDEX_VERSION = 9
 EMBED_BATCH_SIZE = 32
-RICH_RERANK_CANDIDATES = 32
 CARD_KINDS = frozenset((*CALLABLE_KINDS, "class", "interface", "type", "record", "enum"))
 _NON_APPLICATION_PATH = re.compile(
     r"(^|/)(node_modules|vendor|vendors|third_party|third-party|tests?|__tests__|js_tests)(/|$)"
@@ -264,39 +263,56 @@ class ConceptSearch:
         self._embedder = None
         self._index_file: Path | None = None
         self._card_tokens: list[frozenset[str]] | None = None
+        # None when the model is ready; otherwise the runtime/download status that
+        # explains why search fell back to lexical ranking.
+        self._embed_status: dict | None = None
 
     def _ensure_index(self):
         if self._index is not None:
             return self._index, None
-        embedder, error = _load_embedder(self.model)
-        if error:
-            return None, error
         cards = semantic_cards(self.store)
+        # The embedder is optional. When it is missing the index still serves the
+        # lexical fallback, so a missing model degrades search rather than failing it.
+        embedder, self._embed_status = _load_embedder(self.model)
         fingerprint = _fingerprint(self.store, cards, self.model)
         path = _index_path(fingerprint, self.model)
+        payload = None
         if path.is_file():
             try:
                 with gzip.open(path, "rt", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-                if payload.get("fingerprint") == fingerprint:
-                    self._embedder, self._index, self._index_file = embedder, payload, path
-                    return payload, None
+                    loaded = json.load(handle)
+                if loaded.get("fingerprint") == fingerprint:
+                    payload = loaded
             except (OSError, ValueError):
-                pass
-        payload = {"version": INDEX_VERSION, "model": self.model,
-                   "fingerprint": fingerprint, "cards": cards, "rich_vectors": {}}
-        _write_index(path, payload)
+                payload = None
+        if payload is None:
+            payload = {"version": INDEX_VERSION, "model": self.model,
+                       "fingerprint": fingerprint, "cards": cards, "vectors": {}}
+            _write_index(path, payload)
         self._embedder, self._index, self._index_file = embedder, payload, path
+        # With the model present, embed every card once and persist the vectors. Ranking
+        # is then a cosine over the whole corpus, so the lexical pass never caps recall --
+        # the fix for intent queries whose answer sits outside any lexical shortlist. The
+        # embed is a one-time, fingerprint-keyed cost; later searches only embed the query.
+        if embedder is not None:
+            vectors = payload.setdefault("vectors", {})
+            missing = [card for card in cards if card["node_id"] not in vectors]
+            if missing:
+                generated = _embed_documents(
+                    embedder, ["passage: " + card["text"] for card in missing])
+                vectors.update({card["node_id"]: vector
+                                for card, vector in zip(missing, generated)})
+                _write_index(path, payload)
         return payload, None
 
-    def search(self, query: str, limit: int = 20, min_score: float = 0.0,
-               offset: int = 0) -> dict:
-        payload, error = self._ensure_index()
-        if error:
-            return {"move": "concept_search", "query": query, **error}
-        query_vector = _norm(next(iter(self._embedder.embed(["query: " + query]))))
+    def _lexical_relevance(self, cards: list[dict], query: str) -> list[float]:
+        """IDF-weighted query-token overlap per card, normalised to [0, 1].
+
+        Always computed: it is the whole ranking when the model is absent, and a small
+        exact-identifier bonus when it is present so a typed symbol name stays pinned.
+        """
         if self._card_tokens is None:
-            self._card_tokens = [_search_tokens(card["text"]) for card in payload["cards"]]
+            self._card_tokens = [_search_tokens(card["text"]) for card in cards]
         query_tokens = _search_tokens(query)
         document_count = max(1, len(self._card_tokens))
         frequencies = {token: sum(token in tokens for tokens in self._card_tokens)
@@ -304,39 +320,42 @@ class ConceptSearch:
         weights = {token: math.log((document_count + 1) / (frequencies[token] + 1)) + 1
                    for token in query_tokens}
         denominator = sum(weights.values()) or 1.0
-        coarse = []
-        for card, tokens in zip(payload["cards"], self._card_tokens):
-            score = sum(weight for token, weight in weights.items() if token in tokens)
-            coarse.append((score / denominator, card))
-        coarse.sort(key=lambda item: (-item[0], item[1].get("file") or "",
-                                      item[1].get("line") or 0, item[1]["node_id"]))
+        return [sum(weight for token, weight in weights.items() if token in tokens)
+                / denominator for tokens in self._card_tokens]
 
-        # Richly rerank a stable prefix, then append the remaining lexical order.
-        # Pagination therefore reaches the whole corpus without changing earlier pages,
-        # while no query embeds more than this fixed, inspectable amount of source.
-        shortlist = coarse[:RICH_RERANK_CANDIDATES]
-        rich_vectors = payload.setdefault("rich_vectors", {})
-        missing = [card for _score, card in shortlist if card["node_id"] not in rich_vectors]
-        if missing:
-            generated = _embed_documents(
-                self._embedder, ["passage: " + card["text"] for card in missing],
-            )
-            rich_vectors.update({card["node_id"]: vector
-                                 for card, vector in zip(missing, generated)})
-            if self._index_file is not None:
-                _write_index(self._index_file, payload)
-        reranked = []
-        for coarse_score, card in shortlist:
-            vector = rich_vectors.get(card["node_id"])
-            rich_score = (sum(left * right for left, right in zip(query_vector, vector))
-                          if vector else coarse_score)
-            score = 0.35 * coarse_score + 0.65 * rich_score
-            reranked.append((score, card, "rich"))
-        reranked.sort(key=lambda item: (-item[0], item[1].get("file") or "",
-                                        item[1].get("line") or 0, item[1]["node_id"]))
-        ranked = reranked + [(score, card, "structural")
-                             for score, card in coarse[RICH_RERANK_CANDIDATES:]]
-        ranked = [item for item in ranked if item[0] >= min_score]
+    def search(self, query: str, limit: int = 20, min_score: float = 0.0,
+               offset: int = 0) -> dict:
+        payload, error = self._ensure_index()
+        if error:
+            return {"move": "concept_search", "query": query, **error}
+        cards = payload["cards"]
+        lexical = self._lexical_relevance(cards, query)
+        vectors = payload.get("vectors") or {}
+
+        if self._embedder is not None and vectors:
+            query_vector = _norm(next(iter(self._embedder.embed(["query: " + query]))))
+            query_tokens = _search_tokens(query)
+            typed = query.strip().casefold()
+            strategy = "embedding-global"
+            scored = []
+            for card in cards:
+                vector = vectors.get(card["node_id"])
+                cosine = (sum(left * right for left, right in zip(query_vector, vector))
+                          if vector else 0.0)
+                # A small lexical bonus keeps an exactly- or prefix-typed identifier at the
+                # top; it never outweighs a strong semantic match on an intent query.
+                name = (card.get("name") or "").casefold()
+                bonus = (0.15 if name and typed == name else
+                         0.05 if name and any(name == token or name.startswith(token)
+                                              for token in query_tokens) else 0.0)
+                scored.append((cosine + bonus, card, "embedding"))
+        else:
+            strategy = "lexical-fallback"
+            scored = [(score, card, "lexical") for score, card in zip(lexical, cards)]
+
+        scored.sort(key=lambda item: (-item[0], item[1].get("file") or "",
+                                      item[1].get("line") or 0, item[1]["node_id"]))
+        ranked = [item for item in scored if item[0] >= min_score]
         start, size = max(0, offset), max(1, limit)
         page = ranked[start:start + size]
         results = [{k: v for k, v in card.items() if k != "text"} |
@@ -345,14 +364,154 @@ class ConceptSearch:
                    for score, card, tier in page]
         next_offset = start + len(results)
         has_more = next_offset < len(ranked)
+        index = {"documents": len(cards), "fingerprint": payload["fingerprint"],
+                 "strategy": strategy, "vectors_cached": len(vectors)}
+        if self._embed_status:
+            # Keep the fallback actionable: name why meaning-based search is off *and*
+            # how to turn it on, so a lexical-fallback answer still points the way.
+            index["semantic"] = self._embed_status.get("error", "unavailable")
+            for hint in ("download", "install"):
+                if self._embed_status.get(hint):
+                    index[hint] = self._embed_status[hint]
         return {"move": "concept_search", "query": query, "model": self.model,
-                "index": {"documents": len(payload["cards"]),
-                          "fingerprint": payload["fingerprint"],
-                          "strategy": "lexical-structural-global-plus-rich-rerank",
-                          "rich_rerank_candidates": min(
-                              RICH_RERANK_CANDIDATES, len(payload["cards"])),
-                          "rich_vectors_cached": len(rich_vectors)},
+                "index": index,
                 "count": len(results), "total": len(ranked), "results": results,
                 "page": {"total": len(ranked), "offset": start,
                          "returned": len(results), "has_more": has_more,
                          "next_offset": next_offset if has_more else None}}
+
+    def find_similar(self, anchor: str, limit: int = 15,
+                     min_score: float = 0.0) -> dict:
+        """Cards nearest an anchor node by cosine over the cached card vectors.
+
+        Purely a reuse of the vectors `search` already persisted -- nothing is re-embedded.
+        The anchor is matched as a node id first, then by exact card name, so both
+        `find_similar("flask.helpers.make_response")` and `find_similar("make_response")`
+        work. This is strictly a retrieval lead (a "what else looks like this"): it never
+        resolves a seed for the judge path. Without a model there are no vectors and hence
+        no notion of similarity, so it returns an explanatory note rather than guessing.
+        """
+        payload, error = self._ensure_index()
+        if error:
+            return {"move": "find_similar", "anchor": anchor, **error}
+        cards = payload["cards"]
+        vectors = payload.get("vectors") or {}
+        if self._embedder is None or not vectors:
+            note = (self._embed_status or {}).get("error") if self._embed_status else \
+                "no cached vectors; run `lachesis concept-model download` to enable"
+            return {"move": "find_similar", "anchor": anchor, "model": self.model,
+                    "index": {"documents": len(cards), "strategy": "unavailable",
+                              "vectors_cached": len(vectors), "semantic": note},
+                    "count": 0, "total": 0, "results": []}
+
+        by_id = {card["node_id"]: card for card in cards}
+        anchor_card = by_id.get(anchor)
+        if anchor_card is None:
+            folded = anchor.strip().casefold()
+            anchor_card = next((card for card in cards
+                                if (card.get("name") or "").casefold() == folded), None)
+        anchor_vector = vectors.get(anchor_card["node_id"]) if anchor_card else None
+        if anchor_vector is None:
+            return {"move": "find_similar", "anchor": anchor, "model": self.model,
+                    "error": f"no indexed node matches {anchor!r} "
+                             "(pass a node id or an exact declaration name)",
+                    "index": {"documents": len(cards), "strategy": "embedding-global",
+                              "vectors_cached": len(vectors)},
+                    "count": 0, "total": 0, "results": []}
+
+        anchor_id = anchor_card["node_id"]
+        scored = []
+        for card in cards:
+            if card["node_id"] == anchor_id:
+                continue
+            vector = vectors.get(card["node_id"])
+            if not vector:
+                continue
+            cosine = sum(left * right for left, right in zip(anchor_vector, vector))
+            scored.append((cosine, card))
+        scored.sort(key=lambda item: (-item[0], item[1].get("file") or "",
+                                      item[1].get("line") or 0, item[1]["node_id"]))
+        ranked = [item for item in scored if item[0] >= min_score]
+        page = ranked[:max(1, limit)]
+        results = [{k: v for k, v in card.items() if k != "text"} |
+                   {"score": round(score, 6), "ranking_tier": "embedding",
+                    "summary": card["text"][:500]}
+                   for score, card in page]
+        return {"move": "find_similar", "anchor": anchor, "model": self.model,
+                "anchor_node": {"node_id": anchor_id, "name": anchor_card.get("name"),
+                                "kind": anchor_card.get("kind"),
+                                "file": anchor_card.get("file"),
+                                "line": anchor_card.get("line")},
+                "index": {"documents": len(cards), "fingerprint": payload["fingerprint"],
+                          "strategy": "embedding-global", "vectors_cached": len(vectors)},
+                "count": len(results), "total": len(ranked), "results": results}
+
+    def representatives(self, node_ids, k: int = 3) -> list[dict] | None:
+        """The members nearest the vector centroid of a set of nodes -- its exemplars.
+
+        Given the members of a community (or any node set), average their cached card
+        vectors and return the k members closest to that mean. That closest member reads
+        as 'what this cluster is mostly about', a semantic complement to the structural
+        highest-degree label. Reuses cached vectors only; embeds nothing. Returns None
+        when there is no model (so a caller keeps its structural label untouched) rather
+        than an error -- this is a labelling nicety, never a load-bearing result.
+        """
+        payload, error = self._ensure_index()
+        if error or self._embedder is None:
+            return None
+        vectors = payload.get("vectors") or {}
+        present = [(nid, vectors[nid]) for nid in dict.fromkeys(node_ids)
+                   if nid in vectors]
+        if not present:
+            return None
+        dimensions = len(present[0][1])
+        centroid = [0.0] * dimensions
+        for _, vector in present:
+            for i, value in enumerate(vector):
+                centroid[i] += value
+        centroid = _norm([value / len(present) for value in centroid])
+        by_id = {card["node_id"]: card for card in payload["cards"]}
+        scored = sorted(((sum(a * b for a, b in zip(centroid, vector)), nid)
+                         for nid, vector in present), reverse=True)
+        exemplars = []
+        for score, nid in scored[:max(1, k)]:
+            card = by_id.get(nid, {})
+            exemplars.append({"node_id": nid, "name": card.get("name"),
+                              "kind": card.get("kind"), "file": card.get("file"),
+                              "line": card.get("line"), "score": round(score, 6)})
+        return exemplars
+
+    def vector_matrix(self):
+        """(cards, {node_id: vector}) from the cached index, or None without a model.
+
+        A read-only accessor over the vectors ``search`` already persisted, for a
+        caller that builds a comprehension overlay (the offline bundle enrichment)
+        rather than running a single query. It reuses the fingerprint-keyed cache and
+        embeds nothing beyond the one-time card indexing. Returns None when there is no
+        local model or no cached vectors, so the caller degrades to a structure-only
+        artifact rather than forcing a download. The vectors are already L2-normalised,
+        so a dot product between any two is their cosine similarity.
+        """
+        payload, error = self._ensure_index()
+        if error or self._embedder is None:
+            return None
+        vectors = payload.get("vectors") or {}
+        if not vectors:
+            return None
+        return payload["cards"], vectors
+
+    def embed_queries(self, texts) -> list[list[float]] | None:
+        """Embed short intent phrases with search's ``query:`` prefix; None without a model.
+
+        Used to place cards against a small fixed vocabulary of behavioural facets (a
+        tagging pass), following the same asymmetric query/passage convention ``search``
+        uses so a facet phrase and a card are compared the way a query and a passage are.
+        Returns None when there is no model so the caller simply omits tags.
+        """
+        payload, error = self._ensure_index()
+        if error or self._embedder is None:
+            return None
+        texts = list(texts)
+        if not texts:
+            return []
+        return _embed_documents(self._embedder, ["query: " + text for text in texts])

@@ -418,6 +418,14 @@ const analysisSourceFiles = [...new Map(
   normalize(left.fileName).localeCompare(normalize(right.fileName)),
 );
 const analysisFileNames = analysisSourceFiles.map((sf) => normalize(sf.fileName));
+// The authoritative set of files this analysis decided to index: the project
+// roots (under the requested source dir) plus the bounded first-party dependency
+// declarations already vetted above. Secondary callers of `ensureSourceFile` (a
+// referenced declaration, an imported module, a scope owner) resolve into the
+// full TypeScript program, which also contains the compiler's own standard-library
+// `lib.*.d.ts` and any external `.d.ts` we deliberately excluded. Membership here
+// is the gate that keeps those out of the file inventory.
+const analysisFileSet = new Set(analysisFileNames);
 
 const nodes = new Map();
 const edges = [];
@@ -509,6 +517,16 @@ function ensureSourceFile(sourceFile, includedBecause = "project-root") {
   if (!sourceFile) return null;
   const absolute = normalize(sourceFile.fileName);
   if (sourceFileIds.has(absolute)) return sourceFileIds.get(absolute);
+  // Only files inside the analysis set become source nodes. A referenced type,
+  // an imported module, or a scope owner can resolve to a file outside it -- above
+  // all the TypeScript compiler's own `lib.*.d.ts`, which a JavaScript project pulls
+  // in for type inference but does not contain. Recording those would inflate the
+  // file inventory and every line/LOC metric derived from it and skew the dominant
+  // language. The explicit default-library check restates the primary rule so the
+  // compiler stdlib is excluded even if the analysis set is ever widened.
+  if (!analysisFileSet.has(absolute) || program.isSourceFileDefaultLibrary(sourceFile)) {
+    return null;
+  }
   const id = stableId("file", absolute);
   const provenance = sourceProvenance(absolute);
   addNode("T0", id, "file", relative(absolute), {

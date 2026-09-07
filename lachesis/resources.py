@@ -7,7 +7,17 @@ from typing import Optional
 
 
 DEFAULT_MEMORY_BUDGET_MB = 5120
-MIN_MEMORY_BUDGET_MB = 1024
+# The smallest budget at which the process-tree budget still *governs* its dominant
+# derived sub-limit rather than being a number the engine cannot honor. The TS
+# frontend's V8 old-space is sized at 70% of the budget with a hard 512 MiB floor
+# (`typescript_heap_mb`); below ~731 MiB that 70% share drops under 512 and the heap
+# clamps to its floor, so the budget stops controlling the tightest pass and, at
+# 512, the heap floor alone equals the entire budget -- leaving nothing for the Node
+# process around it. 768 is the documented preflight ceiling and sits just above that
+# knee (768*0.7 = 537 > 512), so the split stays live and the reserve for the parent
+# and Node base is real. Values below this are rejected because the engine could not
+# truthfully keep a whole build under them, not merely as a round-number guard.
+MIN_MEMORY_BUDGET_MB = 768
 
 
 def memory_budget_mb() -> int:
