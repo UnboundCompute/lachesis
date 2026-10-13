@@ -22,7 +22,7 @@ jobs:
       id-token: write   # required to mint the OIDC token
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The release workflow uploads the wheels/sdist to PyPI in parallel with
       # this job, and the registry rejects a server.json whose package version
