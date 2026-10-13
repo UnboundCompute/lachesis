@@ -9,6 +9,6 @@
   },
   "type": "module",
   "devDependencies": {
-    "typescript": "^5.4"
+    "typescript": "^7.0"
   }
 }
